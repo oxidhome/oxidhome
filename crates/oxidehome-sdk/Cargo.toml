@@ -1,0 +1,15 @@
+[package]
+name = "oxidehome-sdk"
+description = "OxidHome plugin SDK — types and helpers for authoring WASM component plugins in Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

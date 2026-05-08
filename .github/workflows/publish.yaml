@@ -1,0 +1,63 @@
+name: Publish
+
+on:
+  push:
+    tags: [ "**/v[0-9]+.[0-9]+.[0-9]+" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: read-all
+
+jobs:
+  Checks:
+    uses: ./.github/workflows/checks.yaml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+  Publish:
+    needs: Checks
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      - name: Parse tag
+        id: parse
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          package="${tag%/v*}"
+          version="${tag##*/v}"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag $tag -> package=$package version=$version"
+      - name: Verify Cargo.toml version matches tag
+        env:
+          PKG: ${{ steps.parse.outputs.package }}
+          VER: ${{ steps.parse.outputs.version }}
+        run: |
+          local_version=$(cargo pkgid --package "$PKG" 2>/dev/null | sed -E 's/.*[#@]//') || {
+            echo "::error::Package $PKG not found in workspace"
+            exit 1
+          }
+          if [ "$local_version" != "$VER" ]; then
+            echo "::error::Tag $PKG/v$VER but Cargo.toml has $PKG@$local_version"
+            exit 1
+          fi
+      - name: Verify crate is in publishable set
+        env:
+          PKG: ${{ steps.parse.outputs.package }}
+          PUBLISH_LIST: ${{ needs.Checks.outputs.publish }}
+        run: |
+          if ! jq -e --arg pkg "$PKG" 'index($pkg)' <<<"$PUBLISH_LIST" >/dev/null; then
+            echo "::error::$PKG is not in the publishable set: $PUBLISH_LIST"
+            echo "::error::Either publish=false in Cargo.toml or this version is already on crates.io."
+            exit 1
+          fi
+      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+        id: auth
+      - name: Publish
+        env:
+          PKG: ${{ steps.parse.outputs.package }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --all-features --package "$PKG" --verbose

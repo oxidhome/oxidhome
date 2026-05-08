@@ -1,0 +1,2 @@
+[alias]
+install-tools = "install cargo-deny cargo-llvm-cov cargo-machete cargo-nextest cargo-action-fmt"
