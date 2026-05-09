@@ -18,6 +18,7 @@
 //! test invokes `cargo build --target wasm32-wasip2 --locked` against
 //! it before instantiating.
 
+#[path = "support.rs"]
 mod support;
 
 use std::time::Duration;

@@ -18,6 +18,7 @@
 //! switch, calls `drain_events()` on the recorder, and asserts the
 //! recorder emitted a log line that names the `switch` topic.
 
+#[path = "support.rs"]
 mod support;
 
 use std::sync::{Arc, Mutex};

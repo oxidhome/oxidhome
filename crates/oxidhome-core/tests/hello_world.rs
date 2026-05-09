@@ -12,6 +12,7 @@
 //! warm one — same trade-off the Phase 4 examples doc accepts
 //! (`.claude/docs/04_examples.md`).
 
+#[path = "support.rs"]
 mod support;
 
 use std::path::PathBuf;
