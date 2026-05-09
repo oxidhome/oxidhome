@@ -49,16 +49,28 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo build --package oxidhome-sdk --target wasm32-wasip2 --all-targets --verbose
+  ExamplesBuildJob:
+    name: Build examples for wasm32-wasip2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - name: Build examples/hello-world
+        # `--locked` so a drifted lockfile fails CI loudly instead of
+        # being silently resolved on the runner.
+        working-directory: examples/hello-world
+        run: cargo build --target wasm32-wasip2 --locked --verbose
   Build:
     name: Build
     needs:
       - BuildJob
       - WasmBuildJob
+      - ExamplesBuildJob
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - name: Check status
-        if: ${{ needs.BuildJob.result != 'success' || needs.WasmBuildJob.result != 'success' }}
+        if: ${{ needs.BuildJob.result != 'success' || needs.WasmBuildJob.result != 'success' || needs.ExamplesBuildJob.result != 'success' }}
         run: exit 1
   Format:
     name: Check Rust code formatting
@@ -121,8 +133,21 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo install-tools
+      - name: Pre-build hello-world example for wasm32-wasip2
+        # `oxidhome-core`'s integration test invokes `cargo build` on
+        # `examples/hello-world`. Doing it once up front primes the
+        # cache and surfaces wasm build failures with a clearer error
+        # than the one buried in the test output. `--locked` matches
+        # both the test invocation and the dedicated `ExamplesBuildJob`.
+        working-directory: examples/hello-world
+        run: cargo build --target wasm32-wasip2 --locked
       - name: Run tests
-        run: cargo llvm-cov nextest ${{ matrix.args }} --all-targets --no-fail-fast --no-tests=pass --verbose
+        # `--all-features` flips every world feature on for `oxidhome-wit`
+        # so all four worlds' compile-only smoke tests run; the other
+        # crates have no features beyond default so the flag is a no-op
+        # for them.
+        working-directory: ${{ github.workspace }}
+        run: cargo llvm-cov nextest ${{ matrix.args }} --all-features --all-targets --no-fail-fast --no-tests=pass --verbose
       - name: Prepare coverage report
         if: ${{ !cancelled() }}
         run: cargo llvm-cov report --lcov --output-path coverage.lcov

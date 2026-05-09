@@ -24,3 +24,14 @@ pedantic = { level = "warn", priority = -1 }
 [workspace.dependencies]
 oxidhome-sdk = { path = "crates/oxidhome-sdk", version = "0.1.0" }
 oxidhome-wit = { path = "crates/oxidhome-wit", version = "0.1.0" }
+
+# Shared external deps. Phase 2 adds tokio + tracing; the runtime/logging
+# decisions in 00_OVERVIEW.md make these workspace-wide.
+anyhow = "1.0.102"
+# `thiserror` per the cross-cutting decision in 00_OVERVIEW.md ("thiserror
+# in libraries") joins this list when the first crate gains a typed
+# error — likely `oxidhome-manifest` in Phase 4. Until then it would
+# trip cargo-machete.
+tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "sync", "fs"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "registry"] }

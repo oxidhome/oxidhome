@@ -13,6 +13,18 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Plugin authors enable exactly **one** world feature on guest (wasm)
+# builds — wit-bindgen embeds one component-type custom section per
+# `generate!` invocation, and `wasm-component-ld` rejects binaries with
+# more than one world's metadata. Tests on native targets enable all
+# four to validate every world's bindings.
+default = ["plugin"]
+plugin = []
+streaming-plugin = []
+ai-plugin = []
+streaming-ai-plugin = []
+
 [dependencies]
 # Pinned to an exact version. Cross-crate ABI surfaces are sensitive — a
 # silent minor bump in bindgen output could break either side. Bumps land

@@ -1,0 +1,50 @@
+//! The [`Plugin`] trait — what every standard-world plugin implements.
+
+use crate::bindings::oxidhome::plugin::{
+    devices::{Command, CommandResult},
+    events::Event,
+    types::Error,
+};
+
+/// Lifecycle and event entry points for a standard-world plugin.
+///
+/// Implementors carry their own state behind `&mut self`; the
+/// [`plugin!`](crate::plugin) macro stores the instance in a
+/// thread-local cell, constructs it via [`Default`] on `init`, and
+/// drops it on `shutdown`.
+///
+/// `on_event`, `execute_command`, and `tick` have sensible defaults
+/// (no-op or "unavailable" reply) so simple plugins only override the
+/// methods they care about.
+pub trait Plugin: Default + 'static {
+    /// Called once after the host instantiates the component, before
+    /// any other callback. Return `Err` to abort instantiation.
+    ///
+    /// # Errors
+    ///
+    /// Plugins return an `Err(message)` to signal that initialization
+    /// could not complete; the host treats this as a fatal load
+    /// failure and the instance is dropped.
+    fn init(&mut self) -> Result<(), String>;
+
+    /// Called once before the host drops the component instance. The
+    /// instance is dropped immediately after this call returns.
+    fn shutdown(&mut self);
+
+    /// Delivered by the host for every event matching one of this
+    /// plugin's subscriptions. Default no-op.
+    fn on_event(&mut self, _event: Event) {}
+
+    /// Invoked when the host routes a command to a device this plugin
+    /// owns. Default returns
+    /// [`Error::Unavailable`] — override to handle real commands.
+    fn execute_command(&mut self, _device: String, _cmd: Command) -> CommandResult {
+        CommandResult::Err(Error::Unavailable(
+            "execute-command not implemented by this plugin".into(),
+        ))
+    }
+
+    /// Called on the cadence the manifest's `tick_interval_ms` requests.
+    /// Default no-op for plugins that don't poll.
+    fn tick(&mut self) {}
+}

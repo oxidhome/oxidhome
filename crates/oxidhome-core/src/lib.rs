@@ -1,9 +1,17 @@
 //! `OxidHome` host runtime — library surface.
 //!
-//! `oxidhome-core` is primarily a binary, but the runtime building blocks
-//! live in this library so integration tests and (later) the
-//! `oxidhome-test-host` harness can compose a host without spinning up the
-//! daemon. Phase 1 only wires the host-side WIT bindings; real runtime
-//! pieces land in Phase 2+.
+//! `oxidhome-core` ships a binary, but the runtime building blocks live
+//! here so integration tests and (later) the `oxidhome-test-host`
+//! harness can compose a host without spinning up the daemon.
+
+// `oxidhome-core` is a host-internal runtime crate; its public surface
+// stabilizes only at Phase 11 (external API). Until then, every public
+// fn returning `Result` would need a `# Errors` section that's almost
+// always restating "the operation failed" — defer the doc churn until
+// the API is settled.
+#![allow(clippy::missing_errors_doc)]
 
 pub mod host_impl;
+pub mod runtime;
+
+pub use runtime::{Engine, PluginInstance};
