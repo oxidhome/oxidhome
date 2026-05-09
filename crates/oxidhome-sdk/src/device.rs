@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn into_devicinfo_consumes_builder() {
+    fn into_deviceinfo_consumes_builder() {
         let d = Device::new("d-1", "Switch").manufacturer("Acme");
         let info: DeviceInfo = d.into();
         assert_eq!(info.manufacturer.as_deref(), Some("Acme"));
