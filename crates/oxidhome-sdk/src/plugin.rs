@@ -48,3 +48,81 @@ pub trait Plugin: Default + 'static {
     /// Default no-op for plugins that don't poll.
     fn tick(&mut self) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bindings::oxidhome::plugin::events::{Event, EventPayload, StateChange};
+
+    #[derive(Default)]
+    struct Stub {
+        inits: u32,
+        shutdowns: u32,
+        on_events: u32,
+        ticks: u32,
+    }
+
+    impl Plugin for Stub {
+        fn init(&mut self) -> Result<(), String> {
+            self.inits += 1;
+            Ok(())
+        }
+        fn shutdown(&mut self) {
+            self.shutdowns += 1;
+        }
+        fn on_event(&mut self, _event: Event) {
+            self.on_events += 1;
+        }
+        fn tick(&mut self) {
+            self.ticks += 1;
+        }
+    }
+
+    fn state_change_event() -> Event {
+        Event {
+            device: None,
+            timestamp: 0,
+            payload: EventPayload::StateChanged(StateChange {
+                capability: "switch".into(),
+                fields: Vec::new(),
+            }),
+        }
+    }
+
+    /// `execute_command` has no override here: assert the trait
+    /// default returns `Error::Unavailable` so plugins that don't
+    /// own commands surface a clear error to the host instead of
+    /// trapping.
+    #[test]
+    fn default_execute_command_returns_unavailable() {
+        let mut p = Stub::default();
+        let result = p.execute_command(
+            "d-1".into(),
+            Command {
+                capability: "switch".into(),
+                action: "toggle".into(),
+                args: Vec::new(),
+            },
+        );
+        match result {
+            CommandResult::Err(Error::Unavailable(_)) => {}
+            other => panic!("expected Err(Unavailable), got {other:?}"),
+        }
+    }
+
+    /// Verify the stub forwards each callback exactly once, so the
+    /// trait shape itself is exercised end-to-end (`init` → `on_event`
+    /// → `tick` → `shutdown`).
+    #[test]
+    fn lifecycle_round_trip_increments_counters() {
+        let mut p = Stub::default();
+        p.init().expect("init");
+        p.on_event(state_change_event());
+        p.tick();
+        p.shutdown();
+        assert_eq!(p.inits, 1);
+        assert_eq!(p.on_events, 1);
+        assert_eq!(p.ticks, 1);
+        assert_eq!(p.shutdowns, 1);
+    }
+}

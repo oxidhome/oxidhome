@@ -155,3 +155,231 @@ macro_rules! plugin {
         $crate::__plugin_impl!($ty);
     };
 }
+
+#[cfg(test)]
+mod tests {
+    //! Drive every `run_*` helper directly. `cargo test` runs each
+    //! `#[test]` on its own thread, so the `thread_local!` cells
+    //! below start `None` for every case — no manual cleanup
+    //! between tests.
+
+    use super::*;
+    use crate::bindings::oxidhome::plugin::devices::{Command, CommandResult};
+    use crate::bindings::oxidhome::plugin::events::{Event, EventPayload, StateChange};
+    use crate::bindings::oxidhome::plugin::types::{Error, Value};
+
+    #[derive(Default)]
+    struct Counter {
+        init_count: u32,
+        shutdown_count: u32,
+        events: Vec<Event>,
+        commands: Vec<(String, Command)>,
+        ticks: u32,
+        /// If true, `init` returns `Err`; the cell should stay `None`
+        /// after the failed attempt.
+        fail_init: bool,
+    }
+
+    impl crate::Plugin for Counter {
+        fn init(&mut self) -> Result<(), String> {
+            self.init_count += 1;
+            if self.fail_init {
+                Err("forced".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn shutdown(&mut self) {
+            self.shutdown_count += 1;
+        }
+        fn on_event(&mut self, event: Event) {
+            self.events.push(event);
+        }
+        fn execute_command(&mut self, device: String, cmd: Command) -> CommandResult {
+            self.commands.push((device, cmd));
+            CommandResult::Ok
+        }
+        fn tick(&mut self) {
+            self.ticks += 1;
+        }
+    }
+
+    fn state_changed() -> Event {
+        Event {
+            device: None,
+            timestamp: 0,
+            payload: EventPayload::StateChanged(StateChange {
+                capability: "switch".into(),
+                fields: Vec::new(),
+            }),
+        }
+    }
+
+    fn command() -> Command {
+        Command {
+            capability: "switch".into(),
+            action: "toggle".into(),
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn run_init_creates_and_stores_instance() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        run_init::<Counter>(&CELL).expect("init");
+        CELL.with(|c| {
+            let p = c.borrow();
+            assert_eq!(p.as_ref().expect("present").init_count, 1);
+        });
+    }
+
+    #[test]
+    fn run_init_rejects_double_init() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        run_init::<Counter>(&CELL).unwrap();
+        let err = run_init::<Counter>(&CELL).unwrap_err();
+        assert!(
+            err.contains("Plugin::init called while a previous instance is still live"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A plugin whose `init` always errors — used to exercise
+    /// `run_init`'s "`outcome.is_err()` ⇒ leave slot empty" branch
+    /// without polluting [`Counter`] (which the rest of these tests
+    /// expect to construct via `Default`).
+    #[derive(Default)]
+    struct AlwaysFail;
+
+    impl crate::Plugin for AlwaysFail {
+        fn init(&mut self) -> Result<(), String> {
+            Err("nope".into())
+        }
+        fn shutdown(&mut self) {}
+    }
+
+    #[test]
+    fn run_init_failure_leaves_slot_empty() {
+        thread_local! {
+            static FAIL_CELL: RefCell<Option<AlwaysFail>> = const { RefCell::new(None) };
+        }
+        let err = run_init::<AlwaysFail>(&FAIL_CELL).unwrap_err();
+        assert_eq!(err, "nope");
+        // Cell stays empty so the host can retry without tripping
+        // the double-init guard.
+        FAIL_CELL.with(|c| assert!(c.borrow().is_none()));
+    }
+
+    #[test]
+    fn run_shutdown_runs_and_clears_slot() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        run_init::<Counter>(&CELL).unwrap();
+        run_shutdown::<Counter>(&CELL);
+        CELL.with(|c| assert!(c.borrow().is_none()));
+    }
+
+    #[test]
+    fn run_shutdown_on_empty_slot_is_a_noop() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        // No init beforehand — must not panic.
+        run_shutdown::<Counter>(&CELL);
+        CELL.with(|c| assert!(c.borrow().is_none()));
+    }
+
+    #[test]
+    fn run_on_event_forwards_to_plugin() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        run_init::<Counter>(&CELL).unwrap();
+        run_on_event::<Counter>(&CELL, state_changed());
+        CELL.with(|c| {
+            let p = c.borrow();
+            let p = p.as_ref().expect("instance");
+            assert_eq!(p.events.len(), 1);
+        });
+    }
+
+    #[test]
+    fn run_on_event_before_init_is_a_noop() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        // Skipping init, the cell is None — must not panic.
+        run_on_event::<Counter>(&CELL, state_changed());
+        CELL.with(|c| assert!(c.borrow().is_none()));
+    }
+
+    #[test]
+    fn run_execute_command_uninitialized_returns_unavailable() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        let result = run_execute_command::<Counter>(&CELL, "d-1".into(), command());
+        match result {
+            CommandResult::Err(Error::Unavailable(msg)) => {
+                assert!(msg.contains("plugin not initialized"));
+            }
+            other => panic!("expected Err(Unavailable), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_execute_command_forwards_after_init() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        run_init::<Counter>(&CELL).unwrap();
+        let result = run_execute_command::<Counter>(&CELL, "d-1".into(), command());
+        assert!(matches!(result, CommandResult::Ok));
+        CELL.with(|c| {
+            let p = c.borrow();
+            assert_eq!(p.as_ref().unwrap().commands.len(), 1);
+        });
+    }
+
+    #[test]
+    fn run_tick_forwards_after_init() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        run_init::<Counter>(&CELL).unwrap();
+        run_tick::<Counter>(&CELL);
+        run_tick::<Counter>(&CELL);
+        CELL.with(|c| {
+            let p = c.borrow();
+            assert_eq!(p.as_ref().unwrap().ticks, 2);
+        });
+    }
+
+    #[test]
+    fn run_tick_before_init_is_a_noop() {
+        thread_local! {
+            static CELL: RefCell<Option<Counter>> = const { RefCell::new(None) };
+        }
+        run_tick::<Counter>(&CELL);
+        CELL.with(|c| assert!(c.borrow().is_none()));
+    }
+
+    /// Reference an unused field to keep `Value` linked into the
+    /// test binary so the import path doesn't get pruned by
+    /// dead-code elimination — the `command()` helper above is what
+    /// covers `Value::*` constructors in practice.
+    #[test]
+    fn value_variants_construct_cleanly() {
+        let _ = Value::BoolVal(true);
+        let _ = Value::IntVal(42);
+        let _ = Value::FloatVal(1.5);
+        let _ = Value::StringVal("s".into());
+        let _ = Value::BytesVal(vec![1, 2, 3]);
+        let _ = Value::JsonVal("{}".into());
+    }
+}

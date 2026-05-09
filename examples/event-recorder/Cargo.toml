@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "event-recorder"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "OxidHome example plugin: subscribes to every event and logs each one — used to exercise the plugin-side `on-event` delivery path."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oxidhome-sdk = { path = "../../crates/oxidhome-sdk" }
+
+[lints.rust]
+unsafe_code = "deny"

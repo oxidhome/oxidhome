@@ -8,7 +8,12 @@ use tracing::{Instrument, info_span};
 use wasmtime::Store;
 use wasmtime::component::{Component, HasSelf, Linker};
 
+use tokio::sync::broadcast::error::TryRecvError;
+
 use crate::host_impl::plugin::Plugin as PluginBindings;
+use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::events::Event;
+use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
 
 use super::Engine;
 use super::state::PluginState;
@@ -60,7 +65,7 @@ impl PluginInstance {
                 || "plugin".to_string(),
                 |s| s.to_string_lossy().into_owned(),
             );
-            let state = PluginState::new(instance_id);
+            let state = PluginState::new(instance_id, engine.devices(), engine.events());
             let mut store = Store::new(engine.raw(), state);
 
             let bindings = PluginBindings::instantiate_async(&mut store, &component, &linker)
@@ -104,6 +109,91 @@ impl PluginInstance {
         }
         .instrument(span)
         .await
+    }
+
+    /// Call the plugin's exported `execute-command` for a device this
+    /// instance owns. Phase 3's host-side command routing (in tests
+    /// today, in the API/MCP layers later) looks up the device's
+    /// owner in [`DeviceRegistry`](crate::DeviceRegistry) and calls
+    /// this method on the matching [`PluginInstance`].
+    pub async fn execute_command(
+        &mut self,
+        device: DeviceId,
+        cmd: Command,
+    ) -> anyhow::Result<CommandResult> {
+        let span = info_span!(
+            "plugin.execute_command",
+            instance_id = %self.store.data().instance_id,
+            device_id = %device,
+            capability = %cmd.capability,
+            action = %cmd.action,
+        );
+        async {
+            self.bindings
+                .call_execute_command(&mut self.store, &device, &cmd)
+                .await
+                .map_err(anyhow::Error::from)
+                .context("invoking plugin execute-command")
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Drain every pending event across this instance's subscriptions
+    /// and dispatch matches into the plugin's `on-event` export.
+    /// Returns the number of events delivered.
+    ///
+    /// Phase 3's "host calls `on-event` on the subscriber" plumbing
+    /// without the per-instance task model that Phase 6 introduces.
+    /// The caller (today: an integration test; tomorrow: a per-
+    /// instance tokio task that owns the `Store` and `select!`s
+    /// between control commands and bus events) decides when to
+    /// drive delivery; the polling shape is a stepping stone, not
+    /// the final scheduler.
+    pub async fn drain_events(&mut self) -> anyhow::Result<usize> {
+        // Two-phase to dodge the conflicting borrow: collecting from
+        // `subscriptions` mutably borrows `self.store.data_mut()`,
+        // but `call_on_event` needs `&mut self.store` exclusively.
+        let pending = self.collect_pending_events();
+        let mut delivered = 0;
+        for ev in pending {
+            self.bindings
+                .call_on_event(&mut self.store, &ev)
+                .await
+                .map_err(anyhow::Error::from)
+                .context("invoking plugin on-event")?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// Pull every available event off each subscription's receiver,
+    /// applying the per-subscription filter. Empty/closed/lagged
+    /// receivers are skipped silently — the lag counter from
+    /// `tokio::sync::broadcast::error::RecvError::Lagged` is the
+    /// signal a real driver should surface; here we just continue.
+    fn collect_pending_events(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        let state = self.store.data_mut();
+        for sub in &mut state.subscriptions {
+            loop {
+                match sub.receiver.try_recv() {
+                    Ok(ev) => {
+                        if sub.matches(&ev) {
+                            events.push(ev);
+                        }
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                    // `Lagged(n)` means we missed `n` events; the
+                    // receiver itself stays usable and the loop falls
+                    // through to the next `try_recv`. Phase 5d's
+                    // durable history will let a real driver catch
+                    // back up; we just keep draining.
+                    Err(TryRecvError::Lagged(_)) => {}
+                }
+            }
+        }
+        events
     }
 
     /// The instance id this state was built with. Currently the plugin's

@@ -15,9 +15,25 @@ authors.workspace = true
 # via `package.include`, or pre-generate Rust source. See
 # .claude/docs/01_wit.md and .claude/docs/03_core.md.
 publish = false
+# Integration tests are listed explicitly below so cargo doesn't
+# auto-pick `tests/support.rs` as a no-op test target. `support.rs`
+# is a shared helper module pulled in by each test via `#[path]`.
+autotests = false
 
 [lints]
 workspace = true
+
+[[test]]
+name = "hello_world"
+path = "tests/hello_world.rs"
+
+[[test]]
+name = "simulated_switch"
+path = "tests/simulated_switch.rs"
+
+[[test]]
+name = "event_dispatch"
+path = "tests/event_dispatch.rs"
 
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
