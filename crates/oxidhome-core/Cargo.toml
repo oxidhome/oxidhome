@@ -24,13 +24,22 @@ workspace = true
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
 # the `wit-bindgen` pin policy in oxidhome-wit.
 #
-# `wasmtime-wasi` / `wasmtime-wasi-http` will join this list in Phase 2/7
-# when the host actually wires up WASI imports. The Phase 1 host bindgen
-# generates fresh WASI types — see `host_impl::mod` for the rationale.
+# `wasmtime-wasi-http` joins this list in Phase 7 when streaming plugins
+# need outgoing HTTP. Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli,
+# random, …) so libstd-pulled WASI imports resolve.
 wasmtime = { version = "=44.0.1", default-features = false, features = [
   "runtime",
   "component-model",
   "async",
   "cranelift",
   "std",
+  # `anyhow` here flips on `From<wasmtime::Error> for anyhow::Error` so
+  # the host-runtime `?` plumbing keeps working with `anyhow::Result`.
+  "anyhow",
 ] }
+wasmtime-wasi = { version = "=44.0.1", default-features = false, features = ["p2"] }
+anyhow.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "registry"] }

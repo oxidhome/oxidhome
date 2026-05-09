@@ -1,0 +1,28 @@
+# Standalone workspace so the example builds for `wasm32-wasip2` without
+# pulling the host (`oxidhome-core`) into the wasm build graph. The host
+# uses `cargo build --target wasm32-wasip2` against this workspace from
+# the integration test; CI gets a dedicated `BuildExamples` job.
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "hello-world"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "OxidHome example plugin: logs hello on init, bye on shutdown."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Path-back into the parent workspace's SDK. Examples deliberately don't
+# share the parent Cargo.lock — they pin themselves and their own
+# resolver state matches what an external plugin author would see.
+oxidhome-sdk = { path = "../../crates/oxidhome-sdk" }
+
+[lints.rust]
+unsafe_code = "deny"

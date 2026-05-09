@@ -20,3 +20,6 @@ workspace = true
 
 [dependencies]
 oxidhome-wit.workspace = true
+# Re-exported so plugin authors can use `oxidhome_sdk::tracing::info!` etc.
+# without adding tracing as a direct dep. Pinned at workspace level.
+tracing.workspace = true

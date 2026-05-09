@@ -15,15 +15,25 @@
 #![allow(clippy::all, clippy::pedantic)]
 
 /// Standard plugin world: device integrations, automations, no raw I/O.
+///
+/// `pub_export_macro: true` lifts the world's `__export_plugin_impl` macro
+/// to crate root via `#[macro_export]` so `oxidhome-sdk`'s `plugin!` macro
+/// can invoke it from an external crate. Safe here because the `plugin`
+/// world doesn't share any exported interfaces with another world (the
+/// `streaming` interface is the only shared export, and lives only in the
+/// streaming-{plugin,ai-plugin} worlds).
+#[cfg(feature = "plugin")]
 pub mod plugin {
     wit_bindgen::generate!({
         path: "../../wit",
         world: "plugin",
         generate_all,
+        pub_export_macro: true,
     });
 }
 
 /// Streaming plugin world: adds host-media + WASI sockets/HTTP.
+#[cfg(feature = "streaming-plugin")]
 pub mod streaming_plugin {
     wit_bindgen::generate!({
         path: "../../wit",
@@ -33,6 +43,7 @@ pub mod streaming_plugin {
 }
 
 /// AI plugin world: adds host-managed inference.
+#[cfg(feature = "ai-plugin")]
 pub mod ai_plugin {
     wit_bindgen::generate!({
         path: "../../wit",
@@ -42,6 +53,7 @@ pub mod ai_plugin {
 }
 
 /// Streaming + AI plugin world: streaming I/O combined with inference.
+#[cfg(feature = "streaming-ai-plugin")]
 pub mod streaming_ai_plugin {
     wit_bindgen::generate!({
         path: "../../wit",
