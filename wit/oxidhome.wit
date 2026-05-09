@@ -40,8 +40,8 @@ interface types {
   /// are not comparable across restarts or with other clocks.
   type monotonic-ms = u64;
 
-  /// Stable identifier for a device within oxidhome-core. Assigned by the
-  /// host when the plugin registers a device.
+  /// Stable identifier for a device within the host's device registry.
+  /// Assigned by the host when the plugin registers a device.
   type device-id = string;
 
   /// Plugin-instance-local identifier the plugin uses to refer to its own
@@ -162,9 +162,11 @@ interface capabilities {
     extension(string),
   }
 
-  /// Current state for a stateful capability. Carried as an optional
-  /// snapshot at device registration and as the payload of state-changed
-  /// events. Stateless capabilities (button, video-stream, audio-stream,
+  /// Current state for a stateful capability. Carried as the optional
+  /// `initial-state` snapshot on `device-info` at registration time.
+  /// Subsequent updates flow through `events::state-change`, which uses a
+  /// looser capability-name + key-value field bag rather than this typed
+  /// variant. Stateless capabilities (button, video-stream, audio-stream,
   /// extension) have no entry here.
   variant capability-state {
     switch(switchable),
@@ -202,8 +204,9 @@ interface devices {
     metadata: list<key-value>,
   }
 
-  /// A command sent from oxidhome-core → device (via plugin).
-  /// Capability name + arguments. The plugin matches on capability + action.
+  /// A command sent from the host → device (via the plugin that owns the
+  /// device). Capability name + arguments. The plugin matches on
+  /// capability + action.
   record command {
     /// Capability name: `"switch"`, `"dimmer"`, `"color-light"`, etc.
     capability: string,
