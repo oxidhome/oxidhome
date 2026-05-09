@@ -12,55 +12,13 @@
 //! warm one — same trade-off the Phase 4 examples doc accepts
 //! (`.claude/docs/04_examples.md`).
 
+mod support;
+
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use oxidhome_core::{Engine, PluginInstance};
 use tracing_subscriber::layer::SubscriberExt as _;
-
-/// Workspace root of the `OxidHome` repo, derived from the test's own
-/// `CARGO_MANIFEST_DIR`. The example workspace lives at
-/// `<workspace>/examples/hello-world/`.
-fn workspace_root() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("crates/oxidhome-core has a workspace root")
-        .to_path_buf()
-}
-
-/// Builds `examples/hello-world` for `wasm32-wasip2` and returns the
-/// resulting component path. Uses the example's own `target/`
-/// directory — separate from the host's, since the workspaces are
-/// distinct.
-fn build_hello_world() -> PathBuf {
-    let example_dir = workspace_root().join("examples").join("hello-world");
-    // `--locked` so the test fails if `examples/hello-world/Cargo.lock`
-    // is out of date — drifted dependencies should be a deliberate
-    // update, not something that silently lands during a test run.
-    // Strip coverage-instrumentation env vars before running the
-    // child build. Under `cargo llvm-cov`, `RUSTFLAGS` /
-    // `CARGO_ENCODED_RUSTFLAGS` carry `-Cinstrument-coverage`, which
-    // the `wasm32-wasip2` toolchain rejects (no `profiler_builtins`).
-    // Coverage of the *host* test process is unaffected — the env
-    // we pass to the child is what controls *its* compilation.
-    let status = Command::new("cargo")
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("LLVM_PROFILE_FILE")
-        .args(["build", "--target", "wasm32-wasip2", "--locked"])
-        .current_dir(&example_dir)
-        .status()
-        .expect("invoking cargo build for hello-world");
-    assert!(status.success(), "hello-world build failed: {status}");
-    example_dir
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("debug")
-        .join("hello_world.wasm")
-}
 
 /// `tracing` writer adapter that captures every line emitted by the
 /// fmt layer into a shared buffer. The test inspects the buffer after
@@ -107,7 +65,7 @@ async fn hello_world_round_trip() {
     );
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let wasm_path = build_hello_world();
+    let wasm_path: PathBuf = support::build_example("hello-world", "hello_world.wasm");
     assert!(wasm_path.is_file(), "missing build artifact: {wasm_path:?}");
 
     let engine = Engine::new().expect("engine");

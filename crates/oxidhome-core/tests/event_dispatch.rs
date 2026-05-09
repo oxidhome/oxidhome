@@ -18,41 +18,13 @@
 //! switch, calls `drain_events()` on the recorder, and asserts the
 //! recorder emitted a log line that names the `switch` topic.
 
-use std::path::PathBuf;
-use std::process::Command;
+mod support;
+
 use std::sync::{Arc, Mutex};
 
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::Command as WitCommand;
 use oxidhome_core::{Engine, PluginInstance};
 use tracing_subscriber::layer::SubscriberExt as _;
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn build_example(dir: &str, artifact: &str) -> PathBuf {
-    let example_dir = workspace_root().join("examples").join(dir);
-    // Same env-stripping as the other integration tests — keeps
-    // `wasm32-wasip2` builds working under `cargo llvm-cov`.
-    let status = Command::new("cargo")
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("LLVM_PROFILE_FILE")
-        .args(["build", "--target", "wasm32-wasip2", "--locked"])
-        .current_dir(&example_dir)
-        .status()
-        .expect("invoking cargo build");
-    assert!(status.success(), "{dir} build failed: {status}");
-    example_dir
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("debug")
-        .join(artifact)
-}
 
 #[derive(Clone, Default)]
 struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
@@ -86,8 +58,8 @@ async fn drain_events_dispatches_to_plugin_on_event() {
     );
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let switch_wasm = build_example("simulated-switch", "simulated_switch.wasm");
-    let recorder_wasm = build_example("event-recorder", "event_recorder.wasm");
+    let switch_wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let recorder_wasm = support::build_example("event-recorder", "event_recorder.wasm");
 
     let engine = Engine::new().expect("engine");
 

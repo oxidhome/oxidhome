@@ -18,8 +18,8 @@
 //! test invokes `cargo build --target wasm32-wasip2 --locked` against
 //! it before instantiating.
 
-use std::path::PathBuf;
-use std::process::Command;
+mod support;
+
 use std::time::Duration;
 
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::{
@@ -29,42 +29,11 @@ use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::EventPayload;
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
 use oxidhome_core::{Engine, PluginInstance};
 
-fn workspace_root() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("crates/oxidhome-core has a workspace root")
-        .to_path_buf()
-}
-
-fn build_simulated_switch() -> PathBuf {
-    let example_dir = workspace_root().join("examples").join("simulated-switch");
-    // See `tests/hello_world.rs` for the rationale on stripping the
-    // coverage-instrumentation env: `wasm32-wasip2` has no
-    // `profiler_builtins` and would fail to link if RUSTFLAGS leaks
-    // `-Cinstrument-coverage` from `cargo llvm-cov`.
-    let status = Command::new("cargo")
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("LLVM_PROFILE_FILE")
-        .args(["build", "--target", "wasm32-wasip2", "--locked"])
-        .current_dir(&example_dir)
-        .status()
-        .expect("invoking cargo build for simulated-switch");
-    assert!(status.success(), "simulated-switch build failed: {status}");
-    example_dir
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("debug")
-        .join("simulated_switch.wasm")
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn simulated_switch_round_trip() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let wasm = build_simulated_switch();
+    let wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
     assert!(wasm.is_file(), "missing build artifact: {wasm:?}");
 
     let engine = Engine::new().expect("engine");
