@@ -79,39 +79,56 @@ impl DeviceRegistry {
         id
     }
 
-    /// Replace an already-registered device's info. Errors with
-    /// `Error::NotFound` if the id isn't known. Doesn't change the
-    /// owner — re-registration under a new owner has to go through
-    /// `remove` + `register`.
-    pub async fn update(&self, id: &DeviceId, info: DeviceInfo) -> Result<(), WitError> {
+    /// Replace an already-registered device's info, **scoped to the
+    /// caller's plugin instance**. The WIT `host-devices` interface
+    /// scopes every read/write to the calling plugin's own devices —
+    /// a mismatched (or missing) owner returns `Error::NotFound`,
+    /// deliberately indistinguishable from "id never existed" so a
+    /// malicious plugin can't probe for other plugins' device ids.
+    /// Doesn't change the owner; re-registration under a new owner
+    /// has to go through `remove` + `register`.
+    pub async fn update(
+        &self,
+        owner_instance: &str,
+        id: &DeviceId,
+        info: DeviceInfo,
+    ) -> Result<(), WitError> {
         let mut guard = self.inner.write().await;
         match guard.get_mut(id) {
-            Some(meta) => {
+            Some(meta) if meta.owner_instance == owner_instance => {
                 meta.info = info;
                 Ok(())
             }
-            None => Err(WitError::NotFound(format!("device {id} not registered"))),
+            // Either no entry, or it exists under a different owner.
+            // Both collapse to NotFound to avoid leaking existence.
+            _ => Err(WitError::NotFound(format!("device {id} not registered"))),
         }
     }
 
-    /// Drop a device from the registry. Errors with `Error::NotFound`
-    /// if the id isn't known.
-    pub async fn remove(&self, id: &DeviceId) -> Result<(), WitError> {
-        match self.inner.write().await.remove(id) {
-            Some(_) => Ok(()),
-            None => Err(WitError::NotFound(format!("device {id} not registered"))),
+    /// Drop a device from the registry, **scoped to the caller's
+    /// plugin instance** (see [`Self::update`] for rationale). Returns
+    /// `Error::NotFound` if the id is missing *or* owned by another
+    /// instance.
+    pub async fn remove(&self, owner_instance: &str, id: &DeviceId) -> Result<(), WitError> {
+        let mut guard = self.inner.write().await;
+        match guard.get(id) {
+            Some(meta) if meta.owner_instance == owner_instance => {
+                guard.remove(id);
+                Ok(())
+            }
+            _ => Err(WitError::NotFound(format!("device {id} not registered"))),
         }
     }
 
-    /// Look up a device by id, returning a snapshot of its metadata.
-    /// Errors with `Error::NotFound` if the id isn't known.
-    pub async fn get(&self, id: &DeviceId) -> Result<DeviceMeta, WitError> {
-        self.inner
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| WitError::NotFound(format!("device {id} not registered")))
+    /// Look up a device by id, **scoped to the caller's plugin
+    /// instance** (see [`Self::update`] for rationale). Returns a
+    /// snapshot of the metadata or `Error::NotFound`.
+    pub async fn get(&self, owner_instance: &str, id: &DeviceId) -> Result<DeviceMeta, WitError> {
+        let guard = self.inner.read().await;
+        match guard.get(id) {
+            Some(meta) if meta.owner_instance == owner_instance => Ok(meta.clone()),
+            _ => Err(WitError::NotFound(format!("device {id} not registered"))),
+        }
     }
 
     /// Snapshot of every registered device. Allocates — fine for the
@@ -124,3 +141,57 @@ impl DeviceRegistry {
 /// Bundle the registry into a shared `Arc` for [`Engine`] /
 /// [`PluginState`](crate::runtime::PluginState) clones.
 pub type SharedDeviceRegistry = Arc<DeviceRegistry>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_info() -> DeviceInfo {
+        DeviceInfo {
+            local_id: String::new(),
+            name: String::new(),
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            capabilities: Vec::new(),
+            initial_state: Vec::new(),
+            metadata: Vec::new(),
+        }
+    }
+
+    /// `update`/`remove`/`get` must reject calls from a non-owner
+    /// instance with `NotFound`, indistinguishable from "id never
+    /// existed". The bug would let plugin B mutate plugin A's
+    /// devices.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_instance_access_is_rejected() {
+        let reg = DeviceRegistry::new();
+        let id = reg.register("alpha".into(), empty_info()).await;
+
+        // Owner — happy path.
+        reg.get("alpha", &id).await.expect("owner can get");
+        reg.update("alpha", &id, empty_info())
+            .await
+            .expect("owner can update");
+
+        // Non-owner — `NotFound`, regardless of method.
+        let err = reg.get("beta", &id).await.unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)), "got {err:?}");
+        let err = reg.update("beta", &id, empty_info()).await.unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)), "got {err:?}");
+        let err = reg.remove("beta", &id).await.unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)), "got {err:?}");
+
+        // After a non-owner remove attempt, the device is still there
+        // for its real owner.
+        reg.get("alpha", &id)
+            .await
+            .expect("device still owned by alpha");
+
+        // Owner can finally remove.
+        reg.remove("alpha", &id).await.expect("owner can remove");
+        reg.get("alpha", &id)
+            .await
+            .expect_err("device gone after remove");
+    }
+}

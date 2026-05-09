@@ -131,11 +131,11 @@ impl host_devices::Host for PluginState {
     }
 
     async fn update_device(&mut self, id: DeviceId, info: DeviceInfo) -> Result<(), WitError> {
-        self.devices.update(&id, info).await
+        self.devices.update(&self.instance_id, &id, info).await
     }
 
     async fn remove_device(&mut self, id: DeviceId) -> Result<(), WitError> {
-        let outcome = self.devices.remove(&id).await;
+        let outcome = self.devices.remove(&self.instance_id, &id).await;
         if outcome.is_ok() {
             tracing::debug!(
                 instance_id = %self.instance_id,
@@ -147,7 +147,10 @@ impl host_devices::Host for PluginState {
     }
 
     async fn get_device(&mut self, id: DeviceId) -> Result<DeviceInfo, WitError> {
-        self.devices.get(&id).await.map(|meta| meta.info)
+        self.devices
+            .get(&self.instance_id, &id)
+            .await
+            .map(|meta| meta.info)
     }
 }
 

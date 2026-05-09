@@ -28,9 +28,12 @@ use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventFilter};
 use crate::host_impl::plugin::oxidhome::plugin::types::SubscriptionId;
 
 /// How many events the broadcast channel buffers per subscriber. Slow
-/// subscribers that miss this many events get a `RecvError::Lagged`
-/// and have to resubscribe — Phase 5d's durable history is what makes
-/// catching up cheap if a subscriber drops behind.
+/// subscribers that miss this many events get a
+/// [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged)
+/// reporting how many events were skipped; the receiver itself stays
+/// usable (tokio's broadcast channel doesn't invalidate it). Phase 5d's
+/// durable history is what makes catching up cheap if a subscriber
+/// drops far behind.
 const BUS_CAPACITY: usize = 256;
 
 /// Live pub/sub for plugin-published events.
@@ -123,8 +126,14 @@ pub struct EventSubscription {
 impl EventSubscription {
     /// Returns whether `event` matches this subscription's filter.
     /// Both filter fields are optional; `None` matches everything.
-    /// Topic comparison uses the same shape `events::event-filter`
-    /// declares: exact match for capability/topic strings.
+    ///
+    /// Topic semantics follow the WIT comment on
+    /// `events::event-filter.topic`: capability events
+    /// (`state-changed`, `button`, `inference`) use **exact** match
+    /// on the capability/topic name; **custom events** use **prefix**
+    /// match against `custom-event.topic` so a subscription to
+    /// `"automation."` catches every `automation.morning`,
+    /// `automation.evening`, etc.
     #[must_use]
     pub fn matches(&self, event: &Event) -> bool {
         if let Some(device) = &self.filter.device
@@ -132,22 +141,27 @@ impl EventSubscription {
         {
             return false;
         }
-        if let Some(topic) = &self.filter.topic
-            && topic_of(event).as_str() != topic
-        {
-            return false;
+        if let Some(topic) = &self.filter.topic {
+            use crate::host_impl::plugin::oxidhome::plugin::events::EventPayload;
+            let matches_topic = match &event.payload {
+                EventPayload::Custom(c) => c.topic.starts_with(topic),
+                _ => topic_of(event) == topic.as_str(),
+            };
+            if !matches_topic {
+                return false;
+            }
         }
         true
     }
 }
 
-fn topic_of(event: &Event) -> String {
+fn topic_of(event: &Event) -> &str {
     use crate::host_impl::plugin::oxidhome::plugin::events::EventPayload;
     match &event.payload {
-        EventPayload::StateChanged(sc) => sc.capability.clone(),
-        EventPayload::Button(_) => "button".to_string(),
-        EventPayload::Inference(_) => "inference".to_string(),
-        EventPayload::Custom(c) => c.topic.clone(),
+        EventPayload::StateChanged(sc) => &sc.capability,
+        EventPayload::Button(_) => "button",
+        EventPayload::Inference(_) => "inference",
+        EventPayload::Custom(c) => &c.topic,
     }
 }
 
@@ -157,3 +171,86 @@ fn topic_of(event: &Event) -> String {
 /// "everything in `PluginState` clones from `Engine`" pattern
 /// uniform.
 pub type SharedEventBus = Arc<EventBus>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload, StateChange,
+    };
+
+    fn state_change(device: &str, capability: &str) -> Event {
+        Event {
+            device: Some(device.into()),
+            timestamp: 0,
+            payload: EventPayload::StateChanged(StateChange {
+                capability: capability.into(),
+                fields: Vec::new(),
+            }),
+        }
+    }
+
+    fn custom(device: Option<&str>, topic: &str) -> Event {
+        Event {
+            device: device.map(Into::into),
+            timestamp: 0,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: topic.into(),
+                payload: String::new(),
+            }),
+        }
+    }
+
+    fn subscription(filter: EventFilter) -> EventSubscription {
+        EventBus::new().subscribe(filter)
+    }
+
+    /// Capability events use exact match — a filter for `"switch"`
+    /// matches `state-changed { capability: "switch" }` but not
+    /// `"switchable-thingy"`.
+    #[test]
+    fn capability_topics_match_exactly() {
+        let s = subscription(EventFilter {
+            device: None,
+            topic: Some("switch".into()),
+        });
+        assert!(s.matches(&state_change("d-1", "switch")));
+        assert!(!s.matches(&state_change("d-1", "switch-extra")));
+        assert!(!s.matches(&state_change("d-1", "sensor")));
+    }
+
+    /// Custom events use prefix match — a filter for `"automation."`
+    /// catches `automation.morning` and `automation.evening` but not
+    /// `automatic`. The WIT comment on `event-filter.topic` is the
+    /// load-bearing spec here.
+    #[test]
+    fn custom_topics_match_by_prefix() {
+        let s = subscription(EventFilter {
+            device: None,
+            topic: Some("automation.".into()),
+        });
+        assert!(s.matches(&custom(None, "automation.morning")));
+        assert!(s.matches(&custom(None, "automation.evening")));
+        assert!(!s.matches(&custom(None, "automatic")));
+        assert!(!s.matches(&custom(None, "switch")));
+    }
+
+    /// Device filter narrows independently of topic. Both fields
+    /// `None` matches everything.
+    #[test]
+    fn device_filter_narrows() {
+        let only_d1 = subscription(EventFilter {
+            device: Some("d-1".into()),
+            topic: None,
+        });
+        assert!(only_d1.matches(&state_change("d-1", "switch")));
+        assert!(!only_d1.matches(&state_change("d-2", "switch")));
+
+        let all = subscription(EventFilter {
+            device: None,
+            topic: None,
+        });
+        assert!(all.matches(&state_change("d-1", "switch")));
+        assert!(all.matches(&custom(None, "anything")));
+    }
+}
