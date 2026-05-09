@@ -1,0 +1,20 @@
+[package]
+name = "oxidhome-wit"
+description = "OxidHome guest-side WIT bindings (wit-bindgen output for the four plugin worlds). Internal crate; consumed by oxidhome-sdk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pinned to an exact version. Cross-crate ABI surfaces are sensitive — a
+# silent minor bump in bindgen output could break either side. Bumps land
+# as deliberate PRs that re-run both bindgens. See .claude/docs/01_wit.md.
+wit-bindgen = "=0.57.1"

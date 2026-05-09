@@ -8,8 +8,15 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# `oxidhome-sdk` depends on the internal `oxidhome-wit` crate; cargo can't
+# publish a crate that path-depends on an unpublished one. Both stay
+# unpublished through 0.x; Phase 11 flips them on together when we cut the
+# first SDK release intended for external plugin authors. See
+# .claude/docs/01_wit.md and .claude/docs/02_sdk.md.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
+oxidhome-wit.workspace = true

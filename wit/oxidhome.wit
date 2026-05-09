@@ -1,44 +1,26 @@
 // oxidhome.wit
 //
-// Plugin interface for OxidHome.
+// Plugin interface for OxidHome. Source of truth for the host/plugin
+// contract; everything else generates code from this file.
 //
-// STATUS: 0.1 DRAFT — pre-Phase-1 redesign.
+// The contract is split into focused interfaces. Plugins compose what they
+// need by importing the appropriate world.
 //
-// The contract here is a starting point and known to need three structural
-// fixes before any plugin code is written against it. They are scheduled
-// for Phase 1 (see .claude/docs/01_wit.md, milestone 1.1):
-//
-//   1. Split the monolithic `host` interface into `host-devices`,
-//      `host-events`, `host-config`, `host-media`. Today `start-pipeline`
-//      and `open-pipe` are reachable from the base `plugin` world, which
-//      undermines the documented capability gating for media.
-//
-//   2. Capability gating is at the call site, not at instantiation. Every
-//      world import must be linked for a component to instantiate; the
-//      manifest authorizes calls and unauthorized calls return
-//      `error::permission-denied(...)`. The current doc strings that
-//      suggest "capability is enforced by the manifest" are correct in
-//      spirit but the implementation contract is at the call site.
-//
-//   3. Separate capability *spec* from device *state*. Today
-//      `capability::switch(switchable)` carries the switch's current
-//      `state: bool`, conflating registration shape with current state.
-//      Split into `capability-spec` (what the device can do) and
-//      `capability-state` (what its current state is, flowing via events).
-//
-// Until those land, this WIT is the right intent but not the final shape.
-//
-// The structure splits surface area into focused interfaces; plugins
-// compose what they need by importing the appropriate world.
-//
-// Three plugin worlds are defined:
+// Four plugin worlds are defined:
 //   - plugin              — standard device integrations and automations
-//   - streaming-plugin    — adds WASI sockets/HTTP for long-lived I/O
-//   - streaming-ai-plugin — adds inference for ML-driven plugins
+//   - streaming-plugin    — adds host-media + WASI sockets/HTTP for long-lived I/O
+//   - ai-plugin           — adds inference for ML-driven plugins
+//   - streaming-ai-plugin — combines streaming + inference
 //
-// Importing a WASI interface does NOT grant access to it. Capabilities
-// are enforced by the oxidhome-core based on the plugin manifest the user
-// approved at install time.
+// ── Capability gating ────────────────────────────────────────────────────
+// Importing an interface does NOT grant access to it. A component built for
+// the `plugin` world MUST satisfy every world import — the host cannot
+// refuse to link an import without making the component fail to instantiate
+// outright. Capability enforcement therefore happens at the **call site**:
+// every host call goes through a permission gate that consults the manifest
+// the user approved at install time, and unauthorized calls return
+// `error::permission-denied(...)`. Manifests, gating policy, and the audit
+// trail live in oxidhome-core.
 
 package oxidhome:plugin@0.1.0;
 
@@ -58,8 +40,8 @@ interface types {
   /// are not comparable across restarts or with other clocks.
   type monotonic-ms = u64;
 
-  /// Stable identifier for a device within the oxidhome-core. Assigned by the oxidhome-core
-  /// when the plugin registers a device.
+  /// Stable identifier for a device within oxidhome-core. Assigned by the
+  /// host when the plugin registers a device.
   type device-id = string;
 
   /// Plugin-instance-local identifier the plugin uses to refer to its own
@@ -95,10 +77,14 @@ interface types {
 
 // ─────────────────────────────────────────────────────────────────────────
 // Capabilities — the reusable units that devices compose from
+//
+// Capability *spec* (what a device CAN do) is separated from capability
+// *state* (what its current state is). Devices register a list of specs;
+// state flows through events.
 // ─────────────────────────────────────────────────────────────────────────
 
 interface capabilities {
-  /// Discrete on/off control.
+  /// Discrete on/off state.
   record switchable {
     state: bool,
   }
@@ -131,36 +117,60 @@ interface capabilities {
     single-press,
     double-press,
     long-press,
-    rotated(f64),  // delta, positive = clockwise
+    /// Rotational delta; positive values are clockwise.
+    rotated(f64),
   }
 
-  /// A reference to a media stream the oxidhome-core can pull from. The plugin
-  /// publishes the stream out-of-band (RTSP URL, WebRTC offer, etc.);
-  /// this record describes how to find it.
-  record media-stream-ref {
-    /// "rtsp", "webrtc", "hls", "mjpeg", etc.
-    transport: string,
-    /// Transport-specific locator (URL, signaling token, etc.).
-    locator: string,
-    /// Codec hint, e.g. "h264", "opus".
-    codec: option<string>,
-    /// Optional resolution for video.
-    width: option<u32>,
-    height: option<u32>,
+  /// Spec hints for a color-capable light: which color models the device
+  /// supports and the Kelvin range when color-temp is supported.
+  record color-light-spec {
+    /// Whether full HSV control is supported.
+    supports-hsv: bool,
+    /// Whether color-temperature control is supported.
+    supports-color-temp: bool,
+    /// Kelvin range when supports-color-temp is true. None on either side
+    /// means "unspecified".
+    color-temp-min-kelvin: option<u32>,
+    color-temp-max-kelvin: option<u32>,
   }
 
-  /// A capability descriptor. Lists what a device supports.
-  /// Open-ended via the `extension` arm so plugin authors can add new
-  /// capability types without waiting for the core spec.
-  variant capability {
+  /// Spec hints for a sensor: unit and reasonable display range.
+  record sensor-spec {
+    /// Unit string ("celsius", "percent", "lux", ...).
+    unit: string,
+    /// Optional reasonable range for UIs and validation.
+    min: option<f64>,
+    max: option<f64>,
+  }
+
+  /// What a device CAN do. Lists at registration time; describes shape, not
+  /// current value. Open-ended via the `extension` arm so plugin authors
+  /// can add new capability kinds without waiting for the core spec.
+  variant capability-spec {
+    switch,
+    dimmer,
+    color-light(color-light-spec),
+    sensor(sensor-spec),
+    button,
+    /// The device exposes a video stream. Plugins set up the actual stream
+    /// via the streaming-plugin world's `setup-pipeline` export.
+    video-stream,
+    /// The device exposes an audio stream. See video-stream.
+    audio-stream,
+    /// Capability name; semantics negotiated separately. Consumers that
+    /// don't recognize the name simply ignore the capability.
+    extension(string),
+  }
+
+  /// Current state for a stateful capability. Carried as an optional
+  /// snapshot at device registration and as the payload of state-changed
+  /// events. Stateless capabilities (button, video-stream, audio-stream,
+  /// extension) have no entry here.
+  variant capability-state {
     switch(switchable),
     dimmer(dimmable),
     color-light(color),
     sensor(measurement),
-    button,
-    video-stream(media-stream-ref),
-    audio-stream(media-stream-ref),
-    extension(string),  // capability name; semantics negotiated separately
   }
 }
 
@@ -171,17 +181,23 @@ interface capabilities {
 
 interface devices {
   use types.{device-id, local-id, key-value, error};
-  use capabilities.{capability};
+  use capabilities.{capability-spec, capability-state};
 
   record device-info {
     local-id: local-id,
-    /// Human-readable name. The oxidhome-core may let the user override this.
+    /// Human-readable name. Users may override this through the host UI.
     name: string,
     /// Manufacturer / model / firmware, when known.
     manufacturer: option<string>,
     model: option<string>,
     firmware: option<string>,
-    capabilities: list<capability>,
+    /// What the device can do. Pure shape data — current values flow
+    /// through events.
+    capabilities: list<capability-spec>,
+    /// Optional snapshot of state at registration time, one entry per
+    /// stateful capability the plugin can already report. Empty list means
+    /// "state will arrive via events".
+    initial-state: list<capability-state>,
     /// Free-form metadata the plugin wants persisted with the device.
     metadata: list<key-value>,
   }
@@ -189,28 +205,31 @@ interface devices {
   /// A command sent from oxidhome-core → device (via plugin).
   /// Capability name + arguments. The plugin matches on capability + action.
   record command {
-    capability: string,   // "switch", "dimmer", "color-light", ...
-    action: string,       // "set", "toggle", "increment", ...
+    /// Capability name: `"switch"`, `"dimmer"`, `"color-light"`, etc.
+    capability: string,
+    /// Action verb: `"set"`, `"toggle"`, `"increment"`, etc.
+    action: string,
     args: list<key-value>,
   }
 
   variant command-result {
     ok,
-    ok-with-state(list<key-value>),  // device returned new state inline
+    /// Device returned new state inline alongside the OK.
+    ok-with-state(list<key-value>),
     err(error),
   }
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────
-// Events — pub/sub between plugins and the oxidhome-core's event bus
+// Events — pub/sub between plugins and the host's event bus
 // ─────────────────────────────────────────────────────────────────────────
 
 interface events {
   use types.{device-id, unix-ms, key-value, subscription-id};
   use capabilities.{button-event};
 
-  /// Events the oxidhome-core delivers, or that plugins publish.
+  /// Events the host delivers, or that plugins publish.
   variant event-payload {
     /// A device's state changed (sensor reading, switch flipped, etc.).
     state-changed(state-change),
@@ -230,7 +249,8 @@ interface events {
 
   record custom-event {
     topic: string,
-    payload: string,  // JSON-encoded
+    /// JSON-encoded payload.
+    payload: string,
   }
 
   /// Inference results delivered from a pipeline tap.
@@ -246,8 +266,11 @@ interface events {
   }
 
   record event {
-    /// Empty when the event isn't tied to a specific device (e.g. plugin lifecycle).
+    /// Empty when the event isn't tied to a specific device (e.g. plugin
+    /// lifecycle).
     device: option<device-id>,
+    /// Plugin-supplied wall-clock timestamp. The host records its own
+    /// receive time separately for trust-sensitive ordering and retention.
     timestamp: unix-ms,
     payload: event-payload,
   }
@@ -265,14 +288,16 @@ interface events {
 
 // ─────────────────────────────────────────────────────────────────────────
 // Storage — small persistent KV scoped to the plugin instance
+//
+// Imported by every plugin world. Capability gated at the call site:
+// instances without a `storage_quota_kb` declared in their manifest see
+// `error::permission-denied(...)` on every call. Quota is enforced
+// transactionally; over-quota writes return permission-denied.
 // ─────────────────────────────────────────────────────────────────────────
 
 interface storage {
   use types.{value, error};
 
-  /// Per-instance KV store. Host enforces size quotas.
-  /// For larger blobs, plugins should use the oxidhome-core's blob-store interface
-  /// (separate; not in 0.1).
   get: func(key: string) -> result<option<value>, error>;
   set: func(key: string, val: value) -> result<_, error>;
   delete: func(key: string) -> result<_, error>;
@@ -293,7 +318,7 @@ interface logging {
 // ─────────────────────────────────────────────────────────────────────────
 // Media — pipeline descriptions for streaming plugins
 //
-// The principle: WASM plugins describe media pipelines; the oxidhome-core runs them
+// The principle: WASM plugins describe media pipelines; the host runs them
 // natively. This keeps codec work out of WASM (where it would be slow and
 // can't reach hardware accelerators) while letting plugins handle the
 // fiddly proprietary protocol parts where Rust-in-WASM shines.
@@ -304,9 +329,9 @@ interface media {
 
   /// A source of media bytes.
   variant media-source {
-    /// Standard URL the oxidhome-core can open directly: rtsp://, http://, file://
+    /// Standard URL the host can open directly: rtsp://, http://, file://
     url(string),
-    /// Plugin produces bytes via an oxidhome-core-managed pipe. Used for proprietary
+    /// Plugin produces bytes via a host-managed pipe. Used for proprietary
     /// protocols where the plugin must do auth/decryption/re-framing
     /// before bytes can enter a standard pipeline.
     plugin-pipe(plugin-pipe-config),
@@ -322,37 +347,41 @@ interface media {
     parameters: list<key-value>,
   }
 
-  /// A pipeline step the oxidhome-core should apply after the source.
+  /// A pipeline step the host should apply after the source.
   variant pipeline-step {
     /// Demux/depacketize using a named handler.
     demux(string),
     /// Decode the video. Host may use hardware acceleration.
     decode-video,
-    /// Re-encode video to a target codec (used when consumer needs different codec).
+    /// Re-encode video to a target codec (used when consumer needs
+    /// different codec).
     encode-video(encode-params),
     /// Transcode audio.
     transcode-audio(audio-params),
     /// Apply per-frame filtering (downscale, crop, overlay).
     filter(filter-config),
-    /// Tap the pipeline to feed frames into an oxidhome-core-managed ML model.
+    /// Tap the pipeline to feed frames into a host-managed ML model.
     /// Inference results are delivered to the plugin as events.
     inference-tap(inference-tap-config),
   }
 
   record encode-params {
-    codec: string,           // "h264", "h265", "vp9"
+    /// Target codec: `"h264"`, `"h265"`, `"vp9"`, etc.
+    codec: string,
     bitrate-kbps: option<u32>,
     keyframe-interval: option<u32>,
   }
 
   record audio-params {
-    codec: string,           // "opus", "aac", "pcm"
+    /// Target codec: `"opus"`, `"aac"`, `"pcm"`, etc.
+    codec: string,
     sample-rate: option<u32>,
     channels: option<u8>,
   }
 
   record filter-config {
-    name: string,            // "scale", "crop", "overlay", ...
+    /// Filter name: `"scale"`, `"crop"`, `"overlay"`, etc.
+    name: string,
     parameters: list<key-value>,
   }
 
@@ -370,31 +399,40 @@ interface media {
     tap-point: tap-point,
     /// Event topic to publish results under.
     event-topic: string,
-    /// Optional preprocessing applied by the oxidhome-core before inference.
+    /// Optional preprocessing applied by the host before inference.
     preprocessing: list<preprocessing-step>,
   }
 
   enum tap-point {
-    /// After decode — raw decoded frames available. Normal choice for vision.
+    /// After decode — raw decoded frames available. Normal choice for
+    /// vision.
     post-decode,
-    /// After all filtering steps. Used when filtering changes what the model sees.
+    /// After all filtering steps. Used when filtering changes what the
+    /// model sees.
     post-filter,
   }
 
   variant preprocessing-step {
-    resize(tuple<u32, u32>),         // (width, height)
+    /// Resize to (width, height).
+    resize(tuple<u32, u32>),
+    /// Letterbox to (width, height) — preserves aspect ratio with padding.
     letterbox(tuple<u32, u32>),
-    normalize(tuple<f32, f32>),      // (mean, std)
+    /// Per-channel normalize with (mean, std).
+    normalize(tuple<f32, f32>),
     to-rgb,
     to-bgr,
   }
 
-  /// What the oxidhome-core should expose this stream as, downstream.
+  /// What the host should expose this stream as, downstream.
   variant output-sink {
-    rtsp(string),                       // path under oxidhome-core's RTSP server
-    webrtc,                             // oxidhome-core adds a WebRTC track for on-demand peers
-    hls(string),                        // path under oxidhome-core's HLS server
-    record-to-storage(string),          // recording profile name
+    /// Path under the host's RTSP server.
+    rtsp(string),
+    /// The host adds a WebRTC track for on-demand peers.
+    webrtc,
+    /// Path under the host's HLS server.
+    hls(string),
+    /// Recording-profile name; the host records to storage under that profile.
+    record-to-storage(string),
   }
 
   enum activation-policy {
@@ -406,7 +444,7 @@ interface media {
     motion-triggered,
   }
 
-  /// Full pipeline description the plugin hands to the oxidhome-core.
+  /// Full pipeline description the plugin hands to the host.
   record media-pipeline {
     source: media-source,
     steps: list<pipeline-step>,
@@ -414,14 +452,14 @@ interface media {
     activation: activation-policy,
   }
 
-  /// A handle to a running pipeline the oxidhome-core owns.
+  /// A handle to a running pipeline the host owns.
   resource pipeline-handle {
     stop: func();
     update: func(pipeline: media-pipeline) -> result<_, error>;
   }
 
   /// A writer for a plugin-pipe source. Plugin writes pre-framed bytes
-  /// into this; oxidhome-core's pipeline consumes them.
+  /// into this; the host's pipeline consumes them.
   resource pipe-writer {
     /// Write a chunk of pre-framed bytes (matching the format declared in
     /// the plugin-pipe-config). Returns bytes written.
@@ -433,11 +471,12 @@ interface media {
 
 
 // ─────────────────────────────────────────────────────────────────────────
-// Inference — oxidhome-core-managed ML model access for AI plugins
+// Inference — host-managed ML model access for AI plugins
 //
 // Models are first-class platform resources, not application code. The
-// oxidhome-core loads, runs, and accelerates them; plugins request inference and
-// orchestrate around the results.
+// host loads, runs, and accelerates them; plugins request inference and
+// orchestrate around the results. Capability gated at the call site by
+// the manifest's declared model dependencies.
 // ─────────────────────────────────────────────────────────────────────────
 
 interface inference {
@@ -447,7 +486,8 @@ interface inference {
 
   record tensor-spec {
     name: string,
-    shape: list<s32>,    // -1 for dynamic dims
+    /// Shape in elements per dim. `-1` denotes a dynamic dimension.
+    shape: list<s32>,
     dtype: tensor-dtype,
   }
 
@@ -478,42 +518,58 @@ interface inference {
     info: func() -> model-info;
   }
 
-  /// Plugin asks the oxidhome-core to load a model from the registry.
+  /// Plugin asks the host to load a model from the registry.
   /// Returns a handle the plugin uses for inference.
   load-model: func(name: string, version: option<string>) -> result<model, error>;
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────
-// The oxidhome-core interface — what plugins import (call into the core)
+// Host imports — split by concern so plugin worlds compose only what they
+// can use. Capability is gated at the call site (see header comment).
 // ─────────────────────────────────────────────────────────────────────────
 
-interface host {
-  use types.{device-id, value, key-value, subscription-id, error};
+/// Device lifecycle: announce devices the plugin manages, look them up.
+interface host-devices {
+  use types.{device-id, error};
   use devices.{device-info};
-  use events.{event, event-filter};
-  use media.{media-pipeline, pipeline-handle, plugin-pipe-config, pipe-writer};
 
-  // ── Device lifecycle (plugin announces what it manages) ──────────────
   register-device: func(info: device-info) -> result<device-id, error>;
   update-device:   func(id: device-id, info: device-info) -> result<_, error>;
   remove-device:   func(id: device-id) -> result<_, error>;
+  /// Look up a device the plugin previously registered. Returns
+  /// `error::not-found(...)` if the id is unknown to this plugin.
+  get-device:      func(id: device-id) -> result<device-info, error>;
+}
 
-  // ── Event bus ────────────────────────────────────────────────────────
+/// Event bus pub/sub. Subscribed events are delivered via the plugin's
+/// exported `on-event(...)`.
+interface host-events {
+  use types.{subscription-id, error};
+  use events.{event, event-filter};
+
   publish-event: func(ev: event) -> result<_, error>;
   subscribe:     func(filter: event-filter) -> result<subscription-id, error>;
   unsubscribe:   func(id: subscription-id) -> result<_, error>;
-  // Subscribed events are delivered via the plugin's exported on-event().
+}
 
-  // ── Configuration the user set for this instance ─────────────────────
-  /// Look up a single config value. Both `get-config` and `list-config`
-  /// return values via the shared `value` variant; callers can pattern-match
-  /// without special-casing the two paths.
-  get-config: func(key: string) -> result<option<value>, error>;
+/// Per-instance configuration the user set for this plugin instance.
+interface host-config {
+  use types.{value, key-value, error};
+
+  /// Look up a single config value.
+  get-config:  func(key: string) -> result<option<value>, error>;
   list-config: func() -> result<list<key-value>, error>;
+}
 
-  // ── Media pipelines (streaming plugins) ──────────────────────────────
-  /// Hand a pipeline description to the oxidhome-core. Host runs it natively.
+/// Media pipeline orchestration. Imported only by the streaming worlds —
+/// reachability is what gives the standard `plugin` world its no-raw-I/O
+/// guarantee. Capability is still gated by the manifest at the call site.
+interface host-media {
+  use types.{device-id, error};
+  use media.{media-pipeline, pipeline-handle, plugin-pipe-config, pipe-writer};
+
+  /// Hand a pipeline description to the host. Host runs it natively.
   start-pipeline: func(
     device: device-id,
     pipeline: media-pipeline,
@@ -533,9 +589,11 @@ interface host {
 
 /// Standard plugin world. Most plugins (switches, sensors, hubs, automation
 /// rules) use this. No raw I/O — communication is via the event bus and
-/// oxidhome-core calls.
+/// the split host-* imports.
 world plugin {
-  import host;
+  import host-devices;
+  import host-events;
+  import host-config;
   import storage;
   import logging;
 
@@ -547,7 +605,7 @@ world plugin {
   export init: func() -> result<_, string>;
   export shutdown: func();
 
-  // Event delivery from oxidhome-core's bus to the plugin
+  // Event delivery from the host's bus to the plugin
   export on-event: func(ev: event);
 
   // Commands targeting devices the plugin owns
@@ -556,19 +614,13 @@ world plugin {
     cmd: command,
   ) -> command-result;
 
-  // Optional periodic tick for plugins that poll. Host calls based on
-  // plugin manifest's requested interval. Plugins that don't need it
-  // can return immediately.
+  // Optional periodic tick for plugins that poll. Host calls based on the
+  // plugin manifest's requested interval. Plugins that don't need it can
+  // return immediately.
   export tick: func();
 }
 
-/// Streaming plugin world — extends the standard world with WASI sockets/HTTP
-/// and the ability to set up media pipelines. Used for cameras, voice
-/// assistants, network bridges, etc. that need long-lived I/O.
-///
-/// Capabilities are still gated by the manifest; importing these interfaces
-/// doesn't grant them.
-/// Exports of the streaming-plugin world, packaged as an interface so the
+/// Exports unique to the streaming world, packaged as an interface so the
 /// world can `export streaming` without re-`use`-ing types that the
 /// `include plugin` already pulled in (which would shadow).
 interface streaming {
@@ -576,12 +628,17 @@ interface streaming {
   use media.{media-pipeline};
 
   /// Plugin sets up its media pipeline(s) for a given device. Called by
-  /// the oxidhome-core after device registration when streaming is needed.
+  /// the host after device registration when streaming is needed.
   setup-pipeline: func(device: device-id) -> result<media-pipeline, string>;
 }
 
+/// Streaming plugin world — extends the standard world with WASI
+/// sockets/HTTP and host-media for cameras, voice assistants, network
+/// bridges. Capability is still gated by the manifest; importing these
+/// interfaces doesn't grant them.
 world streaming-plugin {
   include plugin;
+  import host-media;
   import wasi:sockets/tcp@0.2.0;
   import wasi:sockets/udp@0.2.0;
   import wasi:http/outgoing-handler@0.2.0;
@@ -589,17 +646,16 @@ world streaming-plugin {
   export streaming;
 }
 
-/// Streaming + AI plugin world — adds inference for plugins that combine
-/// streaming I/O with ML model access (e.g., camera + person detection
-/// orchestration plugin).
-world streaming-ai-plugin {
-  include streaming-plugin;
+/// AI plugin world — adds inference without streaming, for plugins that
+/// run ML on sensor data, anomaly detection, etc.
+world ai-plugin {
+  include plugin;
   import inference;
 }
 
-/// AI plugin world — adds inference without streaming, for plugins that
-/// run ML on sensor data, run anomaly detection, etc.
-world ai-plugin {
-  include plugin;
+/// Streaming + AI plugin world — combines streaming I/O with ML model
+/// access (e.g., a camera plugin that orchestrates person detection).
+world streaming-ai-plugin {
+  include streaming-plugin;
   import inference;
 }

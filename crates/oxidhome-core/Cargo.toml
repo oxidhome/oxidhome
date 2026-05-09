@@ -8,8 +8,29 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# `oxidhome-core`'s host bindgen reads `wit/` at the workspace root, which
+# the published tarball can't see (`path: "../../wit"` escapes the crate
+# root). Keeping `publish = false` for 0.x sidesteps the packaging problem
+# until Phase 11 — at which point we either bundle `wit/` into the package
+# via `package.include`, or pre-generate Rust source. See
+# .claude/docs/01_wit.md and .claude/docs/03_core.md.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
+# Pinned exactly. Wasmtime's component-model API surface evolves; we want
+# silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
+# the `wit-bindgen` pin policy in oxidhome-wit.
+#
+# `wasmtime-wasi` / `wasmtime-wasi-http` will join this list in Phase 2/7
+# when the host actually wires up WASI imports. The Phase 1 host bindgen
+# generates fresh WASI types — see `host_impl::mod` for the rationale.
+wasmtime = { version = "=44.0.1", default-features = false, features = [
+  "runtime",
+  "component-model",
+  "async",
+  "cranelift",
+  "std",
+] }
