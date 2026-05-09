@@ -21,14 +21,25 @@ use std::sync::Arc;
 use anyhow::Context;
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
+use crate::state::{DeviceRegistry, EventBus};
+
 /// Process-wide Wasmtime engine. Components are compiled once per engine
 /// and instantiated cheaply across many [`PluginInstance`]s — wrap this
 /// in an [`Arc`] and share. The engine is configured for the component
 /// model with async host functions so calls into wasm can suspend
 /// (Phase 7+ will use this for sockets/HTTP).
+///
+/// Beyond the Wasmtime engine, [`Engine`] carries the singletons every
+/// plugin instance shares: the [`DeviceRegistry`] (Phase 3) and the
+/// [`EventBus`] (Phase 3). They live behind `Arc` so each
+/// [`PluginInstance`] can take its own clone at load time, and so
+/// host-side listeners (test harnesses, the future external API,
+/// MCP) can subscribe / inspect without going through wasm.
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<WasmtimeEngine>,
+    devices: Arc<DeviceRegistry>,
+    events: Arc<EventBus>,
 }
 
 impl Engine {
@@ -46,10 +57,29 @@ impl Engine {
                 .map_err(anyhow::Error::from)
                 .context("constructing wasmtime engine")?,
         );
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            devices: Arc::new(DeviceRegistry::new()),
+            events: Arc::new(EventBus::new()),
+        })
     }
 
     pub(crate) fn raw(&self) -> &WasmtimeEngine {
         &self.inner
+    }
+
+    /// Shared device registry. Use this from host-side code (tests,
+    /// API handlers) to look up or list devices without going through
+    /// the WIT host-import path.
+    #[must_use]
+    pub fn devices(&self) -> Arc<DeviceRegistry> {
+        Arc::clone(&self.devices)
+    }
+
+    /// Shared event bus. Use this to subscribe a host-side listener
+    /// (test harness, external API, MCP) to plugin-published events.
+    #[must_use]
+    pub fn events(&self) -> Arc<EventBus> {
+        Arc::clone(&self.events)
     }
 }

@@ -52,13 +52,16 @@ jobs:
   ExamplesBuildJob:
     name: Build examples for wasm32-wasip2
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        example: [hello-world, simulated-switch]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-      - name: Build examples/hello-world
+      - name: Build examples/${{ matrix.example }}
         # `--locked` so a drifted lockfile fails CI loudly instead of
         # being silently resolved on the runner.
-        working-directory: examples/hello-world
+        working-directory: examples/${{ matrix.example }}
         run: cargo build --target wasm32-wasip2 --locked --verbose
   Build:
     name: Build
@@ -134,12 +137,18 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo install-tools
       - name: Pre-build hello-world example for wasm32-wasip2
-        # `oxidhome-core`'s integration test invokes `cargo build` on
-        # `examples/hello-world`. Doing it once up front primes the
-        # cache and surfaces wasm build failures with a clearer error
-        # than the one buried in the test output. `--locked` matches
-        # both the test invocation and the dedicated `ExamplesBuildJob`.
+        # `oxidhome-core`'s Phase 2 integration test invokes
+        # `cargo build` on `examples/hello-world`. Pre-building primes
+        # the cache and surfaces wasm build failures with a clearer
+        # error than the one buried in the test output. `--locked`
+        # matches both the test invocation and `ExamplesBuildJob`.
         working-directory: examples/hello-world
+        run: cargo build --target wasm32-wasip2 --locked
+      - name: Pre-build simulated-switch example for wasm32-wasip2
+        # Same shape as hello-world above — Phase 3's
+        # `simulated_switch_round_trip` integration test uses this
+        # artifact.
+        working-directory: examples/simulated-switch
         run: cargo build --target wasm32-wasip2 --locked
       - name: Run tests
         # `--all-features` flips every world feature on for `oxidhome-wit`

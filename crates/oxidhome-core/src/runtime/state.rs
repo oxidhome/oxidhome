@@ -3,9 +3,12 @@
 //!
 //! Every host import the plugin world declares (`host-devices`,
 //! `host-events`, `host-config`, `storage`, `logging`) is implemented
-//! against this struct. Phase 2 only makes `logging` functional; the
-//! rest return [`Error::Unavailable`] until their owning phases land
-//! per `.claude/docs/03_core.md`.
+//! against this struct. Phase 3 makes `host-devices`, `host-events`,
+//! and `logging` fully functional; `host-config` returns empty until
+//! Phase 4 wires the manifest, and `storage` returns
+//! [`Error::Unavailable`] until Phase 5a's SQLite-backed KV.
+
+use std::sync::Arc;
 
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -20,6 +23,7 @@ use crate::host_impl::plugin::oxidhome::plugin::{
     storage, types,
     types::{DeviceId, Error as WitError, KeyValue, SubscriptionId, Value as WitValue},
 };
+use crate::state::{DeviceRegistry, EventBus, EventSubscription};
 
 /// Identifier the host assigns to a plugin instance — Phase 6 fleshes
 /// this out (manifest-driven IDs, multi-instance dedup). Phase 2 uses
@@ -28,9 +32,10 @@ pub type InstanceId = String;
 
 /// Host data carried inside the wasmtime [`Store`](wasmtime::Store).
 ///
-/// Held mutably by every host-import callback. Phase 2 only uses
-/// `instance_id` (for log span context) and the WASI ctx (so plugin
-/// libstd doesn't error on init).
+/// Held mutably by every host-import callback. The registry + event
+/// bus are shared with the [`Engine`](crate::Engine) via `Arc`; the
+/// per-instance subscription bookkeeping (`subscriptions`) lives here
+/// alongside the WASI context.
 pub struct PluginState {
     /// Stable id for the plugin instance — currently the plugin's
     /// filename stem; Phase 6 swaps for the manifest-declared id.
@@ -43,18 +48,35 @@ pub struct PluginState {
     /// `wasi:clocks` etc. by virtue of being compiled with std; the
     /// host has to satisfy them in the Linker.
     pub wasi: WasiCtx,
+    /// Shared device registry — Phase 3.
+    pub devices: Arc<DeviceRegistry>,
+    /// Shared event bus — Phase 3.
+    pub events: Arc<EventBus>,
+    /// Per-instance subscription bookkeeping. Phase 3 stores the
+    /// subscription metadata so [`unsubscribe`](host_events::Host::unsubscribe)
+    /// can find and drop it; the receiver itself isn't drained yet
+    /// (per-instance dispatch loop is Phase 6 — see
+    /// `crate::state::events`).
+    pub subscriptions: Vec<EventSubscription>,
 }
 
 impl PluginState {
-    /// Default builder — inheritable stdio so plugin panic prints
-    /// reach the host operator's terminal during Phase 2 development.
-    pub fn new(instance_id: impl Into<InstanceId>) -> Self {
+    /// Build a fresh state for one plugin instance. `devices` /
+    /// `events` come from the parent [`Engine`](crate::Engine).
+    pub fn new(
+        instance_id: impl Into<InstanceId>,
+        devices: Arc<DeviceRegistry>,
+        events: Arc<EventBus>,
+    ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
         Self {
             instance_id: instance_id.into(),
             table: ResourceTable::new(),
             wasi: wasi.build(),
+            devices,
+            events,
+            subscriptions: Vec::new(),
         }
     }
 }
@@ -69,10 +91,7 @@ impl WasiView for PluginState {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Host trait impls for the `plugin` world. Phase 2 only makes `logging`
-// functional. The rest stub with [`Error::Unavailable`] so plugins that
-// reach for them get a clear permission-denied-style error instead of
-// an obscure trap.
+// Host trait impls for the `plugin` world.
 //
 // `types`, `capabilities`, `devices`, `events` are *data* interfaces
 // (no functions), but wasmtime's bindgen still generates an empty
@@ -85,38 +104,85 @@ impl capabilities::Host for PluginState {}
 impl devices::Host for PluginState {}
 impl events::Host for PluginState {}
 
-const NOT_IMPL: &str = "not implemented in Phase 2";
+const NOT_IMPL: &str = "not implemented in Phase 3";
 
 fn unavailable() -> WitError {
     WitError::Unavailable(NOT_IMPL.into())
 }
 
+// ── Devices ──────────────────────────────────────────────────────────
+//
+// Phase 3 makes the device registry calls fully functional. Ownership
+// is tracked so commands can be routed back to the registering
+// instance. Phase 4 layers in the manifest's `declares_devices`
+// capability gate (so a plugin that didn't declare a capability gets
+// `permission-denied` on register-device); Phase 6 adds multi-
+// instance lifecycle and crash-isolated re-registration.
+
 impl host_devices::Host for PluginState {
-    async fn register_device(&mut self, _info: DeviceInfo) -> Result<DeviceId, WitError> {
-        Err(unavailable())
+    async fn register_device(&mut self, info: DeviceInfo) -> Result<DeviceId, WitError> {
+        let id = self.devices.register(self.instance_id.clone(), info).await;
+        tracing::debug!(
+            instance_id = %self.instance_id,
+            device_id = %id,
+            "registered device"
+        );
+        Ok(id)
     }
-    async fn update_device(&mut self, _id: DeviceId, _info: DeviceInfo) -> Result<(), WitError> {
-        Err(unavailable())
+
+    async fn update_device(&mut self, id: DeviceId, info: DeviceInfo) -> Result<(), WitError> {
+        self.devices.update(&id, info).await
     }
-    async fn remove_device(&mut self, _id: DeviceId) -> Result<(), WitError> {
-        Err(unavailable())
+
+    async fn remove_device(&mut self, id: DeviceId) -> Result<(), WitError> {
+        let outcome = self.devices.remove(&id).await;
+        if outcome.is_ok() {
+            tracing::debug!(
+                instance_id = %self.instance_id,
+                device_id = %id,
+                "removed device"
+            );
+        }
+        outcome
     }
-    async fn get_device(&mut self, _id: DeviceId) -> Result<DeviceInfo, WitError> {
-        Err(unavailable())
+
+    async fn get_device(&mut self, id: DeviceId) -> Result<DeviceInfo, WitError> {
+        self.devices.get(&id).await.map(|meta| meta.info)
     }
 }
 
+// ── Events ───────────────────────────────────────────────────────────
+//
+// `publish-event` fans out via the bus's broadcast channel. `subscribe`
+// records the filter in `PluginState::subscriptions` and returns a
+// real id; the per-instance task that drains the receiver and calls
+// `on-event` lands in Phase 6, so subscriptions are bookkeeping until
+// then. `unsubscribe` removes the entry.
+
 impl host_events::Host for PluginState {
-    async fn publish_event(&mut self, _ev: Event) -> Result<(), WitError> {
-        Err(unavailable())
+    async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
+        let _delivered = self.events.publish(ev);
+        Ok(())
     }
-    async fn subscribe(&mut self, _filter: EventFilter) -> Result<SubscriptionId, WitError> {
-        Err(unavailable())
+
+    async fn subscribe(&mut self, filter: EventFilter) -> Result<SubscriptionId, WitError> {
+        let subscription = self.events.subscribe(filter);
+        let id = subscription.id;
+        self.subscriptions.push(subscription);
+        Ok(id)
     }
-    async fn unsubscribe(&mut self, _id: SubscriptionId) -> Result<(), WitError> {
-        Err(unavailable())
+
+    async fn unsubscribe(&mut self, id: SubscriptionId) -> Result<(), WitError> {
+        let before = self.subscriptions.len();
+        self.subscriptions.retain(|s| s.id != id);
+        if self.subscriptions.len() == before {
+            return Err(WitError::NotFound(format!("subscription {id} not found")));
+        }
+        Ok(())
     }
 }
+
+// ── Config / storage / logging — see header. ─────────────────────────
 
 impl host_config::Host for PluginState {
     async fn get_config(&mut self, _key: String) -> Result<Option<WitValue>, WitError> {
@@ -144,9 +210,6 @@ impl storage::Host for PluginState {
 
 impl logging::Host for PluginState {
     async fn log(&mut self, level: WitLevel, message: String) {
-        // Phase 2: forward as a tracing event tagged with the instance
-        // id so host operators can correlate plugin output. Phase 5c
-        // plugs the SQLite log store onto the same tracing layer.
         let instance_id = self.instance_id.as_str();
         match level {
             WitLevel::Trace => tracing::trace!(instance_id, "{message}"),

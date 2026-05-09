@@ -9,6 +9,8 @@ use wasmtime::Store;
 use wasmtime::component::{Component, HasSelf, Linker};
 
 use crate::host_impl::plugin::Plugin as PluginBindings;
+use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
 
 use super::Engine;
 use super::state::PluginState;
@@ -60,7 +62,7 @@ impl PluginInstance {
                 || "plugin".to_string(),
                 |s| s.to_string_lossy().into_owned(),
             );
-            let state = PluginState::new(instance_id);
+            let state = PluginState::new(instance_id, engine.devices(), engine.events());
             let mut store = Store::new(engine.raw(), state);
 
             let bindings = PluginBindings::instantiate_async(&mut store, &component, &linker)
@@ -101,6 +103,34 @@ impl PluginInstance {
                 .await
                 .map_err(anyhow::Error::from)
                 .context("invoking plugin shutdown")
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Call the plugin's exported `execute-command` for a device this
+    /// instance owns. Phase 3's host-side command routing (in tests
+    /// today, in the API/MCP layers later) looks up the device's
+    /// owner in [`DeviceRegistry`](crate::DeviceRegistry) and calls
+    /// this method on the matching [`PluginInstance`].
+    pub async fn execute_command(
+        &mut self,
+        device: DeviceId,
+        cmd: Command,
+    ) -> anyhow::Result<CommandResult> {
+        let span = info_span!(
+            "plugin.execute_command",
+            instance_id = %self.store.data().instance_id,
+            device_id = %device,
+            capability = %cmd.capability,
+            action = %cmd.action,
+        );
+        async {
+            self.bindings
+                .call_execute_command(&mut self.store, &device, &cmd)
+                .await
+                .map_err(anyhow::Error::from)
+                .context("invoking plugin execute-command")
         }
         .instrument(span)
         .await

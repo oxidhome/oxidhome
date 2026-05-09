@@ -13,5 +13,7 @@
 
 pub mod host_impl;
 pub mod runtime;
+pub mod state;
 
 pub use runtime::{Engine, PluginInstance};
+pub use state::{DeviceMeta, DeviceRegistry, EventBus, EventSubscription};

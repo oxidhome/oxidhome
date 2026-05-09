@@ -44,6 +44,11 @@ pub use tracing;
 /// `oxidhome-wit`.
 pub use oxidhome_wit::plugin as bindings;
 
+mod device;
+pub use device::Device;
+
+pub mod host;
+
 mod plugin;
 pub use plugin::Plugin;
 
