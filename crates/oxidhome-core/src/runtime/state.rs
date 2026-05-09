@@ -4,7 +4,7 @@
 //! Every host import the plugin world declares (`host-devices`,
 //! `host-events`, `host-config`, `storage`, `logging`) is implemented
 //! against this struct. Phase 2 only makes `logging` functional; the
-//! rest return `error::unavailable(...)` until their owning phases land
+//! rest return [`Error::Unavailable`] until their owning phases land
 //! per `.claude/docs/03_core.md`.
 
 use wasmtime::component::ResourceTable;
@@ -37,7 +37,7 @@ pub struct PluginState {
     pub instance_id: InstanceId,
     /// Resource handles owned by this store. Required by Wasmtime's
     /// component model; populated when Phase 5 introduces blob/model
-    /// resource handing.
+    /// resource handling.
     pub table: ResourceTable,
     /// WASI p2 context. Plugin's libstd pulls in `wasi:io`, `wasi:cli`,
     /// `wasi:clocks` etc. by virtue of being compiled with std; the
@@ -70,7 +70,7 @@ impl WasiView for PluginState {
 
 // ─────────────────────────────────────────────────────────────────────
 // Host trait impls for the `plugin` world. Phase 2 only makes `logging`
-// functional. The rest stub with `Error::Unavailable` so plugins that
+// functional. The rest stub with [`Error::Unavailable`] so plugins that
 // reach for them get a clear permission-denied-style error instead of
 // an obscure trap.
 //

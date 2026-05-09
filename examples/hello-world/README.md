@@ -12,7 +12,9 @@ drag `wasm32-wasip2` targets through its graph.
 
 From this directory:
 
-    cargo build --target wasm32-wasip2
+```shell
+cargo build --target wasm32-wasip2
+```
 
 The resulting component is at
 `target/wasm32-wasip2/debug/hello_world.wasm`.
@@ -21,8 +23,10 @@ The resulting component is at
 
 From the **OxidHome workspace root**:
 
-    cargo run -p oxidhome-core -- \
-        examples/hello-world/target/wasm32-wasip2/debug/hello_world.wasm
+```shell
+cargo run -p oxidhome-core -- \
+    examples/hello-world/target/wasm32-wasip2/debug/hello_world.wasm
+```
 
 The host loads the component, calls its exported `init` then
 `shutdown`, and exits.

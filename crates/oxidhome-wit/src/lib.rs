@@ -14,6 +14,79 @@
 
 #![allow(clippy::all, clippy::pedantic)]
 
+// ── Feature-set sanity checks ───────────────────────────────────────────
+//
+// Per-world features exist because each `wit_bindgen::generate!` embeds a
+// component-type custom section in the resulting wasm; `wasm-component-ld`
+// rejects guest binaries carrying multiple worlds' metadata. The errors
+// below catch misconfiguration at compile time so callers see a clear
+// message instead of a deep linker failure.
+
+#[cfg(not(any(
+    feature = "plugin",
+    feature = "streaming-plugin",
+    feature = "ai-plugin",
+    feature = "streaming-ai-plugin",
+)))]
+compile_error!(
+    "oxidhome-wit requires at least one world feature: \
+     plugin, streaming-plugin, ai-plugin, or streaming-ai-plugin"
+);
+
+// On wasm targets, world features are mutually exclusive — exactly one
+// must be enabled. Native targets (tests, host bindgen) freely enable
+// all four.
+#[cfg(all(
+    target_family = "wasm",
+    feature = "plugin",
+    feature = "streaming-plugin"
+))]
+compile_error!(
+    "oxidhome-wit features `plugin` and `streaming-plugin` are mutually \
+     exclusive on wasm targets — pick exactly one"
+);
+#[cfg(all(target_family = "wasm", feature = "plugin", feature = "ai-plugin"))]
+compile_error!(
+    "oxidhome-wit features `plugin` and `ai-plugin` are mutually exclusive \
+     on wasm targets — pick exactly one"
+);
+#[cfg(all(
+    target_family = "wasm",
+    feature = "plugin",
+    feature = "streaming-ai-plugin"
+))]
+compile_error!(
+    "oxidhome-wit features `plugin` and `streaming-ai-plugin` are mutually \
+     exclusive on wasm targets — pick exactly one"
+);
+#[cfg(all(
+    target_family = "wasm",
+    feature = "streaming-plugin",
+    feature = "ai-plugin"
+))]
+compile_error!(
+    "oxidhome-wit features `streaming-plugin` and `ai-plugin` are mutually \
+     exclusive on wasm targets — pick exactly one"
+);
+#[cfg(all(
+    target_family = "wasm",
+    feature = "streaming-plugin",
+    feature = "streaming-ai-plugin"
+))]
+compile_error!(
+    "oxidhome-wit features `streaming-plugin` and `streaming-ai-plugin` are \
+     mutually exclusive on wasm targets — pick exactly one"
+);
+#[cfg(all(
+    target_family = "wasm",
+    feature = "ai-plugin",
+    feature = "streaming-ai-plugin"
+))]
+compile_error!(
+    "oxidhome-wit features `ai-plugin` and `streaming-ai-plugin` are mutually \
+     exclusive on wasm targets — pick exactly one"
+);
+
 /// Standard plugin world: device integrations, automations, no raw I/O.
 ///
 /// `pub_export_macro: true` lifts the world's `__export_plugin_impl` macro

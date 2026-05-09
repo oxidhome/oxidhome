@@ -108,13 +108,18 @@ async fn hello_world_round_trip() {
     let output = String::from_utf8(captured.lock().expect("capture lock").clone())
         .expect("captured bytes are utf-8");
 
+    // Match the message position specifically: tracing's fmt layer
+    // renders `<span>: <message> <fields...>`, so `: hello ` is unique
+    // to the init line. A bare `output.contains("hello")` would match
+    // the `instance_id="hello_world"` field on either line and miss a
+    // missing init message.
     assert!(
-        output.contains("hello"),
-        "expected `hello` in captured output, got:\n{output}"
+        output.contains(": hello "),
+        "expected init message `: hello ` in captured output, got:\n{output}"
     );
     assert!(
-        output.contains("bye"),
-        "expected `bye` in captured output, got:\n{output}"
+        output.contains(": bye "),
+        "expected shutdown message `: bye ` in captured output, got:\n{output}"
     );
     assert!(
         output.contains("instance_id=\"hello_world\""),
