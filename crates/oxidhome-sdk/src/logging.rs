@@ -83,11 +83,32 @@ struct MessageVisitor {
     extras: String,
 }
 
+impl MessageVisitor {
+    /// Route a single (`field`, formatted-value) pair to either
+    /// [`Self::message`] or [`Self::extras`]. Centralizing the
+    /// dispatch ensures every `record_*` method handles
+    /// `field.name() == "message"` identically — a primitive
+    /// `tracing::info!(message = 42)` ends up in `message`, not
+    /// `extras`.
+    fn push(&mut self, field: &Field, value: core::fmt::Arguments<'_>) {
+        if field.name() == "message" {
+            let _ = write!(&mut self.message, "{value}");
+        } else {
+            if !self.extras.is_empty() {
+                self.extras.push(' ');
+            }
+            let _ = write!(&mut self.extras, "{}={value}", field.name());
+        }
+    }
+}
+
 impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
+        // The default `tracing::info!(...)` macro formats the
+        // format-string output through `Debug` and records it as the
+        // `message` field. Other fields recorded as `Debug` get the
+        // `key={value:?}` shape.
         if field.name() == "message" {
-            // The default tracing macros put the format-string output
-            // through Debug; unwrap that into a plain string.
             let _ = write!(&mut self.message, "{value:?}");
             // tracing's Debug formatting for &str yields `"the str"` with
             // quotes; strip a single matching pair if present.
@@ -101,47 +122,28 @@ impl Visit for MessageVisitor {
             if !self.extras.is_empty() {
                 self.extras.push(' ');
             }
-            let _ = write!(&mut self.extras, "{}={:?}", field.name(), value);
+            let _ = write!(&mut self.extras, "{}={value:?}", field.name());
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message.push_str(value);
-        } else {
-            if !self.extras.is_empty() {
-                self.extras.push(' ');
-            }
-            let _ = write!(&mut self.extras, "{}={}", field.name(), value);
-        }
+        self.push(field, format_args!("{value}"));
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        if !self.extras.is_empty() {
-            self.extras.push(' ');
-        }
-        let _ = write!(&mut self.extras, "{}={}", field.name(), value);
+        self.push(field, format_args!("{value}"));
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if !self.extras.is_empty() {
-            self.extras.push(' ');
-        }
-        let _ = write!(&mut self.extras, "{}={}", field.name(), value);
+        self.push(field, format_args!("{value}"));
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        if !self.extras.is_empty() {
-            self.extras.push(' ');
-        }
-        let _ = write!(&mut self.extras, "{}={}", field.name(), value);
+        self.push(field, format_args!("{value}"));
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        if !self.extras.is_empty() {
-            self.extras.push(' ');
-        }
-        let _ = write!(&mut self.extras, "{}={}", field.name(), value);
+        self.push(field, format_args!("{value}"));
     }
 }
 

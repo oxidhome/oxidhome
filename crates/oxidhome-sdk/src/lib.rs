@@ -15,6 +15,11 @@
 //!
 //! impl oxidhome_sdk::Plugin for HelloWorld {
 //!     fn init(&mut self) -> Result<(), String> {
+//!         // Install the `tracing` ↔ host `logging` bridge so the
+//!         // events below reach the host. Idempotent — the host runs
+//!         // each instance in its own wasm store, and the test harness
+//!         // can call `init()` more than once across tests.
+//!         let _ = oxidhome_sdk::logging::init();
 //!         oxidhome_sdk::tracing::info!("hello");
 //!         Ok(())
 //!     }
