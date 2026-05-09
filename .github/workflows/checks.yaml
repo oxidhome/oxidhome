@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        example: [hello-world, simulated-switch]
+        example: [hello-world, simulated-switch, event-recorder]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
@@ -149,6 +149,12 @@ jobs:
         # `simulated_switch_round_trip` integration test uses this
         # artifact.
         working-directory: examples/simulated-switch
+        run: cargo build --target wasm32-wasip2 --locked
+      - name: Pre-build event-recorder example for wasm32-wasip2
+        # Phase 3's `event_dispatch` integration test pairs the
+        # recorder with the switch above to exercise the plugin-side
+        # `on-event` dispatch path.
+        working-directory: examples/event-recorder
         run: cargo build --target wasm32-wasip2 --locked
       - name: Run tests
         # `--all-features` flips every world feature on for `oxidhome-wit`

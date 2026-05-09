@@ -52,11 +52,13 @@ pub struct PluginState {
     pub devices: Arc<DeviceRegistry>,
     /// Shared event bus — Phase 3.
     pub events: Arc<EventBus>,
-    /// Per-instance subscription bookkeeping. Phase 3 stores the
-    /// subscription metadata so [`unsubscribe`](host_events::Host::unsubscribe)
-    /// can find and drop it; the receiver itself isn't drained yet
-    /// (per-instance dispatch loop is Phase 6 — see
-    /// `crate::state::events`).
+    /// Per-instance subscriptions: filter + receiver per active
+    /// `host-events::subscribe` call. Drained by
+    /// [`PluginInstance::drain_events`](crate::PluginInstance::drain_events),
+    /// which calls the plugin's `on-event` export for each match.
+    /// Phase 3 ships the polling-drain shape; Phase 6 wraps the same
+    /// data in a per-instance tokio task so delivery is automatic
+    /// without an explicit driver.
     pub subscriptions: Vec<EventSubscription>,
 }
 
@@ -157,10 +159,11 @@ impl host_devices::Host for PluginState {
 // ── Events ───────────────────────────────────────────────────────────
 //
 // `publish-event` fans out via the bus's broadcast channel. `subscribe`
-// records the filter in `PluginState::subscriptions` and returns a
-// real id; the per-instance task that drains the receiver and calls
-// `on-event` lands in Phase 6, so subscriptions are bookkeeping until
-// then. `unsubscribe` removes the entry.
+// records the filter + receiver in `PluginState::subscriptions` and
+// returns a real id; `PluginInstance::drain_events` picks them up and
+// calls `on-event` on the plugin. Phase 6 wraps the same shape in a
+// per-instance tokio task so delivery happens automatically.
+// `unsubscribe` removes the entry.
 
 impl host_events::Host for PluginState {
     async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
@@ -220,6 +223,278 @@ impl logging::Host for PluginState {
             WitLevel::Info => tracing::info!(instance_id, "{message}"),
             WitLevel::Warn => tracing::warn!(instance_id, "{message}"),
             WitLevel::Error => tracing::error!(instance_id, "{message}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Direct unit tests on the host trait impls. These bypass the
+    //! WIT round-trip — `host_devices::Host`, `host_events::Host`,
+    //! `host_config::Host`, `storage::Host`, and `logging::Host` are
+    //! plain async methods we can call from a `#[tokio::test]`. The
+    //! integration tests under `tests/` cover the full
+    //! Wasmtime-driven path; these fill in the corner cases (the
+    //! Phase 2 stubs, error variants, multi-instance ownership) that
+    //! the integration scenarios don't reach.
+    //!
+    //! `flavor = "current_thread"` matches the integration tests
+    //! and keeps the WASI ctx happy without needing a multi-thread
+    //! runtime.
+    #![allow(clippy::semicolon_if_nothing_returned)]
+
+    use super::*;
+    use crate::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, EventPayload, StateChange,
+    };
+
+    fn empty_device(local: &str) -> DeviceInfo {
+        DeviceInfo {
+            local_id: local.into(),
+            name: local.into(),
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            capabilities: Vec::new(),
+            initial_state: Vec::new(),
+            metadata: Vec::new(),
+        }
+    }
+
+    fn fresh_state(instance_id: &str) -> PluginState {
+        PluginState::new(
+            instance_id,
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+        )
+    }
+
+    fn shared_state(
+        instance_id: &str,
+        registry: Arc<DeviceRegistry>,
+        bus: Arc<EventBus>,
+    ) -> PluginState {
+        PluginState::new(instance_id, registry, bus)
+    }
+
+    // ── host-devices ──────────────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_register_then_get_returns_owned_info() {
+        let mut state = fresh_state("alpha");
+        let id = host_devices::Host::register_device(&mut state, empty_device("d-1"))
+            .await
+            .expect("register");
+        let info = host_devices::Host::get_device(&mut state, id.clone())
+            .await
+            .expect("get");
+        assert_eq!(info.local_id, "d-1");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_get_unknown_returns_not_found() {
+        let mut state = fresh_state("alpha");
+        let err = host_devices::Host::get_device(&mut state, "ghost".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_update_on_other_instance_returns_not_found() {
+        let registry = Arc::new(DeviceRegistry::new());
+        let bus = Arc::new(EventBus::new());
+        let mut alpha = shared_state("alpha", registry.clone(), bus.clone());
+        let mut beta = shared_state("beta", registry.clone(), bus.clone());
+
+        let id = host_devices::Host::register_device(&mut alpha, empty_device("d-1"))
+            .await
+            .expect("alpha register");
+
+        // Beta sees it as not-found whether it tries to update,
+        // remove, or get — owner check collapses every mismatch.
+        let err = host_devices::Host::update_device(&mut beta, id.clone(), empty_device("d-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)));
+        let err = host_devices::Host::remove_device(&mut beta, id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)));
+        let err = host_devices::Host::get_device(&mut beta, id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)));
+
+        // Alpha still owns it.
+        host_devices::Host::get_device(&mut alpha, id)
+            .await
+            .expect("alpha still owns");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_remove_then_update_fails() {
+        let mut state = fresh_state("alpha");
+        let id = host_devices::Host::register_device(&mut state, empty_device("d-1"))
+            .await
+            .unwrap();
+        host_devices::Host::remove_device(&mut state, id.clone())
+            .await
+            .expect("remove");
+        let err = host_devices::Host::update_device(&mut state, id.clone(), empty_device("d-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)));
+    }
+
+    // ── host-events ───────────────────────────────────────────────
+
+    fn state_change_event(device: &str) -> Event {
+        Event {
+            device: Some(device.into()),
+            timestamp: 0,
+            payload: EventPayload::StateChanged(StateChange {
+                capability: "switch".into(),
+                fields: Vec::new(),
+            }),
+        }
+    }
+
+    fn custom_event(topic: &str) -> Event {
+        Event {
+            device: None,
+            timestamp: 0,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: topic.into(),
+                payload: String::new(),
+            }),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_reaches_external_subscriber() {
+        let registry = Arc::new(DeviceRegistry::new());
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe_all();
+        let mut state = shared_state("alpha", registry, bus);
+
+        host_events::Host::publish_event(&mut state, state_change_event("d-1"))
+            .await
+            .expect("publish");
+
+        let ev = sub.receiver.try_recv().expect("event delivered");
+        assert_eq!(ev.device.as_deref(), Some("d-1"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_subscribe_and_unsubscribe_round_trip() {
+        let mut state = fresh_state("alpha");
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let id = host_events::Host::subscribe(&mut state, filter)
+            .await
+            .expect("subscribe");
+        assert_eq!(state.subscriptions.len(), 1);
+
+        host_events::Host::unsubscribe(&mut state, id)
+            .await
+            .expect("unsubscribe");
+        assert!(state.subscriptions.is_empty());
+
+        let err = host_events::Host::unsubscribe(&mut state, id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_subscription_filter_drops_non_matches() {
+        let mut state = fresh_state("alpha");
+        let id = host_events::Host::subscribe(
+            &mut state,
+            EventFilter {
+                device: None,
+                topic: Some("automation.".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Publish two custom events; only the prefixed one matches.
+        host_events::Host::publish_event(&mut state, custom_event("automation.morning"))
+            .await
+            .unwrap();
+        host_events::Host::publish_event(&mut state, custom_event("switch"))
+            .await
+            .unwrap();
+
+        let sub = state.subscriptions.iter_mut().find(|s| s.id == id).unwrap();
+        let ev1 = sub.receiver.try_recv().unwrap();
+        assert!(sub.matches(&ev1));
+        let ev2 = sub.receiver.try_recv().unwrap();
+        assert!(!sub.matches(&ev2));
+        // Both arrive on the wire (broadcast is unfiltered); the
+        // per-subscription filter is what `matches` checks.
+    }
+
+    // ── host-config / storage / logging ───────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_config_returns_empty() {
+        let mut state = fresh_state("alpha");
+        // `Value` doesn't impl `PartialEq` (the WIT-generated variant
+        // carries a `list<u8>` arm and bindgen leaves Eq off), so use
+        // `is_none()` rather than `assert_eq!(.., None)`.
+        assert!(
+            host_config::Host::get_config(&mut state, "anything".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            host_config::Host::list_config(&mut state)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_methods_all_unavailable() {
+        let mut state = fresh_state("alpha");
+        for outcome in [
+            storage::Host::get(&mut state, "k".into()).await,
+            storage::Host::set(&mut state, "k".into(), WitValue::BoolVal(true))
+                .await
+                .map(|()| None),
+            storage::Host::delete(&mut state, "k".into())
+                .await
+                .map(|()| None),
+            storage::Host::list_keys(&mut state, "p".into())
+                .await
+                .map(|_| None),
+        ] {
+            let err = outcome.unwrap_err();
+            assert!(matches!(err, WitError::Unavailable(_)), "got {err:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn logging_dispatches_each_level() {
+        // Just exercise every match arm so coverage reports it; no
+        // assertion is needed on the tracing output, the test fails
+        // only if a level path panics.
+        let mut state = fresh_state("alpha");
+        for level in [
+            WitLevel::Trace,
+            WitLevel::Debug,
+            WitLevel::Info,
+            WitLevel::Warn,
+            WitLevel::Error,
+        ] {
+            logging::Host::log(&mut state, level, format!("msg-{level:?}")).await;
         }
     }
 }
