@@ -112,13 +112,19 @@ async fn hello_world_round_trip() {
     // to the init line. A bare `output.contains("hello")` would match
     // the `instance_id="hello_world"` field on either line and miss a
     // missing init message.
+    let hello_at = output.find(": hello ").unwrap_or_else(|| {
+        panic!("expected init message `: hello ` in captured output, got:\n{output}")
+    });
+    let bye_at = output.find(": bye ").unwrap_or_else(|| {
+        panic!("expected shutdown message `: bye ` in captured output, got:\n{output}")
+    });
+    // Lifecycle sequencing: `hello` (init) must precede `bye`
+    // (shutdown). If the host accidentally wired init/shutdown
+    // backwards, both substrings would still be present, so the
+    // ordering check is what makes the test fail loudly.
     assert!(
-        output.contains(": hello "),
-        "expected init message `: hello ` in captured output, got:\n{output}"
-    );
-    assert!(
-        output.contains(": bye "),
-        "expected shutdown message `: bye ` in captured output, got:\n{output}"
+        hello_at < bye_at,
+        "expected init `hello` (at {hello_at}) to precede shutdown `bye` (at {bye_at}), got:\n{output}"
     );
     assert!(
         output.contains("instance_id=\"hello_world\""),
