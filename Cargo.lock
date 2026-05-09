@@ -941,7 +941,6 @@ name = "oxidhome-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
