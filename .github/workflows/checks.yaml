@@ -56,8 +56,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - name: Build examples/hello-world
+        # `--locked` so a drifted lockfile fails CI loudly instead of
+        # being silently resolved on the runner.
         working-directory: examples/hello-world
-        run: cargo build --target wasm32-wasip2 --verbose
+        run: cargo build --target wasm32-wasip2 --locked --verbose
   Build:
     name: Build
     needs:
@@ -135,9 +137,10 @@ jobs:
         # `oxidhome-core`'s integration test invokes `cargo build` on
         # `examples/hello-world`. Doing it once up front primes the
         # cache and surfaces wasm build failures with a clearer error
-        # than the one buried in the test output.
+        # than the one buried in the test output. `--locked` matches
+        # both the test invocation and the dedicated `ExamplesBuildJob`.
         working-directory: examples/hello-world
-        run: cargo build --target wasm32-wasip2
+        run: cargo build --target wasm32-wasip2 --locked
       - name: Run tests
         # `--all-features` flips every world feature on for `oxidhome-wit`
         # so all four worlds' compile-only smoke tests run; the other

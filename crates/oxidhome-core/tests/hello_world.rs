@@ -37,8 +37,11 @@ fn workspace_root() -> PathBuf {
 /// distinct.
 fn build_hello_world() -> PathBuf {
     let example_dir = workspace_root().join("examples").join("hello-world");
+    // `--locked` so the test fails if `examples/hello-world/Cargo.lock`
+    // is out of date — drifted dependencies should be a deliberate
+    // update, not something that silently lands during a test run.
     let status = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2"])
+        .args(["build", "--target", "wasm32-wasip2", "--locked"])
         .current_dir(&example_dir)
         .status()
         .expect("invoking cargo build for hello-world");
@@ -73,7 +76,12 @@ impl std::io::Write for CapturedWriter {
     }
 }
 
-#[tokio::test]
+// `flavor = "current_thread"` because the test installs a thread-local
+// `tracing::subscriber::set_default` to capture log output. The default
+// multi-thread runtime would poll the future on a worker thread that
+// doesn't carry the subscriber, dropping the captured lines and making
+// the test flaky.
+#[tokio::test(flavor = "current_thread")]
 async fn hello_world_round_trip() {
     let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
     let writer = CapturedWriter(captured.clone());
