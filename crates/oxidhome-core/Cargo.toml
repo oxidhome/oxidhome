@@ -1,5 +1,5 @@
 [package]
-name = "oxidehome-core"
+name = "oxidhome-core"
 description = "OxidHome host runtime — loads WASM component plugins and exposes the device/event/media APIs."
 version.workspace = true
 edition.workspace = true

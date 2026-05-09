@@ -1,0 +1,12 @@
+# WIT dependency manifest for OxidHome.
+#
+# Updated via `wit-deps update`; reproduced via `wit-deps lock`.
+# The resulting `wit/deps/` directory and `wit/deps.lock` file are
+# committed to the repo so CI doesn't need network access to validate
+# `wit/oxidhome.wit` and downstream bindgen runs.
+
+# WASI 0.2 packages used by the streaming and streaming-ai plugin worlds.
+# Pinned to the v0.2.0 release of each repository.
+sockets = "https://github.com/WebAssembly/wasi-sockets/archive/v0.2.0.tar.gz"
+http = "https://github.com/WebAssembly/wasi-http/archive/v0.2.0.tar.gz"
+clocks = "https://github.com/WebAssembly/wasi-clocks/archive/v0.2.0.tar.gz"
