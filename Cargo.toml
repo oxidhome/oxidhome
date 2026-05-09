@@ -12,7 +12,10 @@ homepage = "https://github.com/oxidhome/oxidhome"
 authors = ["The OxidHome Contributors"]
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `unsafe` is denied by default. Crates and individual blocks may opt in
+# with `#[allow(unsafe_code)]`, but every such use must be documented with
+# a `// SAFETY:` comment justifying it. See CONTRIBUTING.md for the policy.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -79,8 +79,10 @@ wasm-tools component wit wit/oxidhome.wit
 - **Edition:** Rust 2024 (or the latest stable edition the workspace declares).
 - **Formatting:** `cargo fmt` enforced in CI.
 - **Linting:** `cargo clippy --all-targets -- -D warnings` enforced in CI.
-- **Unsafe code:** `#![forbid(unsafe_code)]` in plugin SDK and high-level crates. `unsafe` is allowed in the host where
-  unavoidable, with a `// SAFETY:` comment explaining why.
+- **Unsafe code:** avoid it. The workspace sets `unsafe_code = "deny"` so it is forbidden by default everywhere. In rare,
+  well-justified cases (e.g., FFI, performance-critical primitives with no safe alternative) a specific block may opt in
+  with `#[allow(unsafe_code)]`. Every such use must carry a `// SAFETY:` comment that explains the invariants the caller
+  must uphold and why they hold here. PRs introducing new unsafe code are reviewed with extra scrutiny.
 - **Errors:** `thiserror` for libraries, `anyhow` for binaries. No `unwrap()` or `expect()` in non-test code without a
   good reason in a comment.
 - **Async:** `tokio` runtime. Wasmtime async features enabled. No blocking calls inside async contexts.

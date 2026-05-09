@@ -41,15 +41,24 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
-      - run: cargo build ${{ matrix.args }} --target wasm32-wasip2 --all-targets --verbose
+      - run: cargo build ${{ matrix.args }} --all-targets --verbose
+  WasmBuildJob:
+    name: Build SDK for wasm32-wasip2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      - run: cargo build --package oxidehome-sdk --target wasm32-wasip2 --all-targets --verbose
   Build:
     name: Build
-    needs: BuildJob
+    needs:
+      - BuildJob
+      - WasmBuildJob
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - name: Check status
-        if: ${{ needs.BuildJob.result != 'success' }}
+        if: ${{ needs.BuildJob.result != 'success' || needs.WasmBuildJob.result != 'success' }}
         run: exit 1
   Format:
     name: Check Rust code formatting
@@ -65,8 +74,18 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
       - run: cargo install-tools
-      - run: cargo clippy --target wasm32-wasip2 --all-features --all-targets --verbose -- --deny warnings
-      - run: cargo clippy --target wasm32-wasip2 --all-features --all-targets --quiet --message-format=json | cargo-action-fmt
+      - run: cargo clippy --all-features --all-targets --verbose -- --deny warnings
+      - run: cargo clippy --all-features --all-targets --quiet --message-format=json | cargo-action-fmt
+        if: failure()
+  WasmClippy:
+    name: Check SDK with Clippy for wasm32-wasip2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      - run: cargo install-tools
+      - run: cargo clippy --package oxidehome-sdk --target wasm32-wasip2 --all-features --all-targets --verbose -- --deny warnings
+      - run: cargo clippy --package oxidehome-sdk --target wasm32-wasip2 --all-features --all-targets --quiet --message-format=json | cargo-action-fmt
         if: failure()
   TestsJob:
     name: Tests per crate
@@ -152,6 +171,7 @@ jobs:
       - Build
       - Format
       - Clippy
+      - WasmClippy
       - Tests
       - Deps
       - Publish

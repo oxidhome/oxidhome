@@ -1,3 +1,3 @@
 fn main() {
-    println!("oxidhome-oxidehome-core: not yet implemented");
+    println!("oxidehome-core: not yet implemented");
 }

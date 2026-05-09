@@ -24,8 +24,15 @@ package oxidhome:plugin@0.1.0;
 // ─────────────────────────────────────────────────────────────────────────
 
 interface types {
-  /// Monotonic milliseconds since plugin instance start, or unix-ms — oxidehome-core decides.
-  type timestamp = u64;
+  /// Wall-clock milliseconds since the Unix epoch. Use this for anything
+  /// that crosses process or system boundaries (events, persisted records,
+  /// correlations with external systems).
+  type unix-ms = u64;
+
+  /// Monotonic milliseconds since plugin instance start. Use this for
+  /// measuring durations and intervals within a single plugin run; values
+  /// are not comparable across restarts or with other clocks.
+  type monotonic-ms = u64;
 
   /// Stable identifier for a device within the oxidehome-core. Assigned by the oxidehome-core
   /// when the plugin registers a device.
@@ -35,7 +42,6 @@ interface types {
   /// devices before/after registration.
   type local-id = string;
 
-  type event-id = string;
   type subscription-id = u64;
 
   variant value {
@@ -177,7 +183,7 @@ interface devices {
 // ─────────────────────────────────────────────────────────────────────────
 
 interface events {
-  use types.{device-id, timestamp, key-value, subscription-id};
+  use types.{device-id, unix-ms, key-value, subscription-id};
   use capabilities.{button-event};
 
   /// Events the oxidehome-core delivers, or that plugins publish.
@@ -211,14 +217,14 @@ interface events {
     model: string,
     /// JSON-encoded structured output (detections, classes, embeddings).
     payload: string,
-    /// Frame timestamp, if applicable.
-    frame-timestamp: option<timestamp>,
+    /// Frame timestamp (unix-ms), if applicable.
+    frame-timestamp: option<unix-ms>,
   }
 
   record event {
     /// Empty when the event isn't tied to a specific device (e.g. plugin lifecycle).
     device: option<device-id>,
-    timestamp: timestamp,
+    timestamp: unix-ms,
     payload: event-payload,
   }
 
@@ -276,7 +282,7 @@ interface media {
   variant media-source {
     /// Standard URL the oxidehome-core can open directly: rtsp://, http://, file://
     url(string),
-    /// Plugin produces bytes via a oxidehome-core-managed pipe. Used for proprietary
+    /// Plugin produces bytes via an oxidehome-core-managed pipe. Used for proprietary
     /// protocols where the plugin must do auth/decryption/re-framing
     /// before bytes can enter a standard pipeline.
     plugin-pipe(plugin-pipe-config),
@@ -304,7 +310,7 @@ interface media {
     transcode-audio(audio-params),
     /// Apply per-frame filtering (downscale, crop, overlay).
     filter(filter-config),
-    /// Tap the pipeline to feed frames into a oxidehome-core-managed ML model.
+    /// Tap the pipeline to feed frames into an oxidehome-core-managed ML model.
     /// Inference results are delivered to the plugin as events.
     inference-tap(inference-tap-config),
   }
@@ -459,7 +465,7 @@ interface inference {
 // ─────────────────────────────────────────────────────────────────────────
 
 interface host {
-  use types.{device-id, key-value, subscription-id, error};
+  use types.{device-id, value, key-value, subscription-id, error};
   use devices.{device-info};
   use events.{event, event-filter};
   use media.{media-pipeline, pipeline-handle, plugin-pipe-config, pipe-writer};
@@ -476,7 +482,10 @@ interface host {
   // Subscribed events are delivered via the plugin's exported on-event().
 
   // ── Configuration the user set for this instance ─────────────────────
-  get-config: func(key: string) -> result<option<string>, error>;
+  /// Look up a single config value. Both `get-config` and `list-config`
+  /// return values via the shared `value` variant; callers can pattern-match
+  /// without special-casing the two paths.
+  get-config: func(key: string) -> result<option<value>, error>;
   list-config: func() -> result<list<key-value>, error>;
 
   // ── Media pipelines (streaming plugins) ──────────────────────────────
