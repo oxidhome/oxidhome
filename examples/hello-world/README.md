@@ -1,0 +1,61 @@
+# hello-world
+
+The smallest possible OxidHome plugin: logs `hello` on `init` and `bye`
+on `shutdown`. Used as the Phase 2 integration-test fixture proving the
+host can load a `.wasm` component, instantiate it, and round-trip
+through the WIT `logging` import.
+
+The example lives in its own Cargo workspace so the host build doesn't
+drag `wasm32-wasip2` targets through its graph.
+
+## Build
+
+From this directory:
+
+    cargo build --target wasm32-wasip2
+
+The resulting component is at
+`target/wasm32-wasip2/debug/hello_world.wasm`.
+
+## Run via the host
+
+From the **OxidHome workspace root**:
+
+    cargo run -p oxidhome-core -- \
+        examples/hello-world/target/wasm32-wasip2/debug/hello_world.wasm
+
+The host loads the component, calls its exported `init` then
+`shutdown`, and exits.
+
+## Verify
+
+You should see two `tracing` log lines on stdout, in order:
+
+    INFO plugin.init{instance_id=hello_world}: oxidhome_core::runtime::state: hello instance_id="hello_world"
+    INFO plugin.shutdown{instance_id=hello_world}: oxidhome_core::runtime::state: bye instance_id="hello_world"
+
+What each piece tells you:
+
+- `plugin.init{...}` / `plugin.shutdown{...}` — the `tracing::Span`
+  the host opens around each lifecycle call.
+- `hello` / `bye` — the message the plugin emitted via
+  `oxidhome_sdk::tracing::info!(...)`. The plugin's subscriber
+  forwarded it through the WIT `logging::log` import; the host's
+  `logging::Host` impl re-emitted it as a host-side `tracing::info!`,
+  which is what stdout receives.
+- `instance_id="hello_world"` — added by the host's logging impl,
+  derived from the plugin's filename stem (Phase 6 swaps in the
+  manifest-declared id).
+
+If you only see one line, or `bye` arrives before `hello`, something in
+the lifecycle bridge is broken — the integration test
+(`crates/oxidhome-core/tests/hello_world.rs`) asserts the same shape.
+
+## Inspect the component (optional)
+
+`wasm-tools` decodes which world the component implements:
+
+    wasm-tools component wit target/wasm32-wasip2/debug/hello_world.wasm
+
+Look for `world root` exporting `init`, `shutdown`, `on-event`,
+`execute-command`, `tick` — the standard `oxidhome:plugin/plugin` world.
