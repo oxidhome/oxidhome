@@ -36,7 +36,12 @@ fn workspace_root() -> PathBuf {
 
 fn build_example(dir: &str, artifact: &str) -> PathBuf {
     let example_dir = workspace_root().join("examples").join(dir);
+    // Same env-stripping as the other integration tests — keeps
+    // `wasm32-wasip2` builds working under `cargo llvm-cov`.
     let status = Command::new("cargo")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("LLVM_PROFILE_FILE")
         .args(["build", "--target", "wasm32-wasip2", "--locked"])
         .current_dir(&example_dir)
         .status()

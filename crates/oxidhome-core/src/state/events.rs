@@ -7,12 +7,14 @@
 //!   Phase 12 MCP server) — they call [`EventBus::subscribe_all`] and
 //!   poll the returned [`broadcast::Receiver`].
 //! - **Plugin instances** subscribing via the WIT `host-events`
-//!   import — Phase 3 accepts these (returns a real
-//!   `subscription-id`, stores the matching filter on the
-//!   plugin's [`PluginState`](crate::runtime::PluginState)) but does
-//!   *not* yet drive `on-event` delivery to the plugin. That loop
-//!   lands in Phase 6 alongside the per-instance task model;
-//!   subscriptions are bookkeeping until then.
+//!   import — `subscribe`/`unsubscribe` mint a real
+//!   `subscription-id`, store the filter + receiver on the plugin's
+//!   [`PluginState`](crate::runtime::PluginState), and
+//!   [`PluginInstance::drain_events`](crate::PluginInstance::drain_events)
+//!   delivers matching events into the plugin's `on-event` export.
+//!   Phase 3 ships the polling-drain shape; Phase 6 wraps the same
+//!   collection step inside a per-instance tokio task so delivery is
+//!   automatic without an explicit driver.
 //!
 //! Phase 5d wires a parallel durable layer (the `SQLite` event-history
 //! store) so the CLI/UI can answer "what happened yesterday". Live

@@ -158,3 +158,123 @@ impl MessageVisitor {
         self.message
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Drives [`MessageVisitor`] through `tracing`'s real callsite
+    //! plumbing by installing a tiny [`Subscriber`] that records the
+    //! formatted output for each event. `tracing::Field` is opaque,
+    //! so going through `tracing::info!(...)` is the only way to
+    //! exercise every `record_*` arm with a real `Field` reference.
+    //!
+    //! These tests cover [`MessageVisitor`] and [`wit_level`].
+    //! [`HostLogBridge::event`] and [`init`] both call into the
+    //! wit-bindgen `host_logging::log` import which has no native
+    //! implementation; that surface is exercised end-to-end by the
+    //! `oxidhome-core` `hello_world` integration test instead.
+
+    use std::sync::{Arc, Mutex};
+
+    use tracing::Subscriber;
+
+    use super::{MessageVisitor, WitLevel, wit_level};
+
+    /// Recorder subscriber: captures every event's `(level, message)`
+    /// after running it through [`MessageVisitor`]. The shared
+    /// `events` `Arc<Mutex>` lets the test reach the captured data
+    /// after `with_default` consumes the subscriber by value.
+    struct Capture {
+        events: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.finish()));
+        }
+    }
+
+    fn capture(emit: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let cap = Capture {
+            events: Arc::clone(&events),
+        };
+        tracing::subscriber::with_default(cap, emit);
+        std::mem::take(&mut *events.lock().unwrap())
+    }
+
+    #[test]
+    fn captures_str_message_without_quotes() {
+        let events = capture(|| tracing::info!("hello world"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, tracing::Level::INFO);
+        assert_eq!(events[0].1, "hello world");
+    }
+
+    #[test]
+    fn captures_format_string_message() {
+        let n = 7;
+        let events = capture(|| tracing::warn!("count={n}"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, tracing::Level::WARN);
+        assert_eq!(events[0].1, "count=7");
+    }
+
+    #[test]
+    fn primitive_message_field_routes_to_message_not_extras() {
+        // Regression for the bug where `tracing::info!(message = 42)`
+        // ended up in `extras` because the primitive recorders
+        // didn't special-case the `message` field.
+        let events = capture(|| {
+            tracing::info!(message = 42);
+        });
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, "42");
+    }
+
+    #[test]
+    fn additional_fields_render_in_extras() {
+        let events = capture(|| {
+            tracing::info!(user_id = 42, ok = true, "auth check");
+        });
+        assert_eq!(events.len(), 1);
+        let msg = &events[0].1;
+        assert!(msg.starts_with("auth check"), "got {msg}");
+        assert!(msg.contains("user_id=42"), "got {msg}");
+        assert!(msg.contains("ok=true"), "got {msg}");
+    }
+
+    #[test]
+    fn float_and_str_fields_route_to_extras() {
+        let events = capture(|| {
+            tracing::info!(ratio = 0.25_f64, label = "kitchen", "metrics");
+        });
+        assert_eq!(events.len(), 1);
+        let msg = &events[0].1;
+        assert!(msg.contains("ratio=0.25"));
+        assert!(msg.contains("label=kitchen"));
+    }
+
+    #[test]
+    fn each_level_maps_to_wit_level() {
+        assert!(matches!(wit_level(tracing::Level::TRACE), WitLevel::Trace));
+        assert!(matches!(wit_level(tracing::Level::DEBUG), WitLevel::Debug));
+        assert!(matches!(wit_level(tracing::Level::INFO), WitLevel::Info));
+        assert!(matches!(wit_level(tracing::Level::WARN), WitLevel::Warn));
+        assert!(matches!(wit_level(tracing::Level::ERROR), WitLevel::Error));
+    }
+}

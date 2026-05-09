@@ -8,6 +8,22 @@
 //! [`DeviceInfo`]) and a single import path
 //! (`oxidhome_sdk::host::register_device`) instead of the deep
 //! `bindings::oxidhome::plugin::host_devices::register_device`.
+//!
+//! ## Coverage
+//!
+//! These functions are deliberately not unit-tested on the native
+//! target. They forward into wit-bindgen-generated import stubs
+//! (`bindings::oxidhome::plugin::{host_devices, host_events}::*`)
+//! that resolve only inside a wasm component instantiated by a
+//! Wasmtime host — calling them from a native test binary would be
+//! a link-time unresolved symbol. End-to-end coverage for the
+//! Phase 3 device + event surface lives in
+//! `oxidhome-core/tests/{simulated_switch,event_dispatch}.rs`,
+//! which builds the `simulated-switch` / `event-recorder` examples
+//! against this exact module and drives the round-trip through
+//! Wasmtime. The plan calls this out as the "boilerplate /
+//! hard-to-mock IO" exemption category in
+//! `.claude/docs/00_OVERVIEW.md`.
 
 use crate::bindings::oxidhome::plugin::devices::DeviceInfo;
 use crate::bindings::oxidhome::plugin::events::{
@@ -123,9 +139,11 @@ pub fn publish_custom_event(
 }
 
 /// Subscribe to events. The returned [`SubscriptionId`] is what
-/// [`unsubscribe`] later references. Phase 3 stores the subscription
-/// host-side but doesn't yet drive `on-event` delivery — that arrives
-/// with Phase 6's per-instance dispatch loop.
+/// [`unsubscribe`] later references. Matching events are delivered
+/// to the plugin's `on-event` export by the host's
+/// `PluginInstance::drain_events` driver; Phase 3 polls the drain
+/// explicitly, Phase 6 wraps it in a per-instance tokio task so
+/// delivery is automatic.
 ///
 /// # Errors
 ///

@@ -40,7 +40,16 @@ fn build_hello_world() -> PathBuf {
     // `--locked` so the test fails if `examples/hello-world/Cargo.lock`
     // is out of date — drifted dependencies should be a deliberate
     // update, not something that silently lands during a test run.
+    // Strip coverage-instrumentation env vars before running the
+    // child build. Under `cargo llvm-cov`, `RUSTFLAGS` /
+    // `CARGO_ENCODED_RUSTFLAGS` carry `-Cinstrument-coverage`, which
+    // the `wasm32-wasip2` toolchain rejects (no `profiler_builtins`).
+    // Coverage of the *host* test process is unaffected — the env
+    // we pass to the child is what controls *its* compilation.
     let status = Command::new("cargo")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("LLVM_PROFILE_FILE")
         .args(["build", "--target", "wasm32-wasip2", "--locked"])
         .current_dir(&example_dir)
         .status()

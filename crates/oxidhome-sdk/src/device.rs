@@ -120,3 +120,85 @@ impl From<Device> for DeviceInfo {
         d.info
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bindings::oxidhome::plugin::capabilities::{
+        CapabilityState, ColorLightSpec, SensorSpec, Switchable,
+    };
+    use crate::bindings::oxidhome::plugin::types::Value;
+
+    #[test]
+    fn new_starts_with_minimal_info() {
+        let d = Device::new("local-1", "Living Room");
+        let info = d.info();
+        assert_eq!(info.local_id, "local-1");
+        assert_eq!(info.name, "Living Room");
+        assert!(info.manufacturer.is_none());
+        assert!(info.model.is_none());
+        assert!(info.firmware.is_none());
+        assert!(info.capabilities.is_empty());
+        assert!(info.initial_state.is_empty());
+        assert!(info.metadata.is_empty());
+    }
+
+    #[test]
+    fn fluent_setters_populate_each_field() {
+        let info = Device::new("d-1", "Light")
+            .manufacturer("Acme")
+            .model("X-1")
+            .firmware("1.0.0")
+            .capability(CapabilitySpec::Switch)
+            .capability(CapabilitySpec::ColorLight(ColorLightSpec {
+                supports_hsv: true,
+                supports_color_temp: false,
+                color_temp_min_kelvin: None,
+                color_temp_max_kelvin: None,
+            }))
+            .initial_state(CapabilityState::Switch(Switchable { state: false }))
+            .metadata(KeyValue {
+                key: "room".into(),
+                value: Value::StringVal("living".into()),
+            })
+            .build();
+
+        assert_eq!(info.manufacturer.as_deref(), Some("Acme"));
+        assert_eq!(info.model.as_deref(), Some("X-1"));
+        assert_eq!(info.firmware.as_deref(), Some("1.0.0"));
+        assert_eq!(info.capabilities.len(), 2);
+        assert!(matches!(info.capabilities[0], CapabilitySpec::Switch));
+        assert!(matches!(
+            info.capabilities[1],
+            CapabilitySpec::ColorLight(_)
+        ));
+        assert_eq!(info.initial_state.len(), 1);
+        assert!(matches!(
+            info.initial_state[0],
+            CapabilityState::Switch(Switchable { state: false })
+        ));
+        assert_eq!(info.metadata.len(), 1);
+        assert_eq!(info.metadata[0].key, "room");
+    }
+
+    #[test]
+    fn capabilities_and_initial_state_append_in_order() {
+        let info = Device::new("d-1", "Sensor")
+            .capability(CapabilitySpec::Sensor(SensorSpec {
+                unit: "celsius".into(),
+                min: Some(-40.0),
+                max: Some(125.0),
+            }))
+            .capability(CapabilitySpec::Button)
+            .build();
+        assert!(matches!(info.capabilities[0], CapabilitySpec::Sensor(_)));
+        assert!(matches!(info.capabilities[1], CapabilitySpec::Button));
+    }
+
+    #[test]
+    fn into_devicinfo_consumes_builder() {
+        let d = Device::new("d-1", "Switch").manufacturer("Acme");
+        let info: DeviceInfo = d.into();
+        assert_eq!(info.manufacturer.as_deref(), Some("Acme"));
+    }
+}

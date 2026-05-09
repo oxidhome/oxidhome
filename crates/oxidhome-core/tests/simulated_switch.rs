@@ -40,7 +40,14 @@ fn workspace_root() -> PathBuf {
 
 fn build_simulated_switch() -> PathBuf {
     let example_dir = workspace_root().join("examples").join("simulated-switch");
+    // See `tests/hello_world.rs` for the rationale on stripping the
+    // coverage-instrumentation env: `wasm32-wasip2` has no
+    // `profiler_builtins` and would fail to link if RUSTFLAGS leaks
+    // `-Cinstrument-coverage` from `cargo llvm-cov`.
     let status = Command::new("cargo")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("LLVM_PROFILE_FILE")
         .args(["build", "--target", "wasm32-wasip2", "--locked"])
         .current_dir(&example_dir)
         .status()
