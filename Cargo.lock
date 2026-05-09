@@ -3,9 +3,9 @@
 version = 4
 
 [[package]]
-name = "oxidehome-core"
+name = "oxidhome-core"
 version = "0.1.0"
 
 [[package]]
-name = "oxidehome-sdk"
+name = "oxidhome-sdk"
 version = "0.1.0"

@@ -1,0 +1,60 @@
+name: WIT deps
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"   # Mondays 04:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: read-all
+
+jobs:
+  Update:
+    name: Update WIT dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      - name: Install wit-deps-cli and wasm-tools
+        run: cargo install-tools
+      - name: Update WIT deps
+        run: wit-deps update
+      - name: Validate WIT
+        run: wasm-tools component wit wit/
+      - name: Detect changes
+        id: changes
+        run: |
+          if git diff --quiet -- wit/deps wit/deps.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No WIT dep changes."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git status --short -- wit/deps wit/deps.lock
+          fi
+      - name: Open pull request
+        if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          branch: chore/update-wit-deps
+          delete-branch: true
+          add-paths: |
+            wit/deps
+            wit/deps.lock
+          commit-message: |
+            chore(wit): update WIT deps via wit-deps update
+          title: "chore(wit): update WIT deps"
+          body: |
+            Automated weekly update of `wit/deps/` via `wit-deps update`.
+
+            Verified locally in CI with `wasm-tools component wit wit/`.
+
+            If this PR causes WIT validation regressions in `checks.yaml`, the source
+            change is upstream — investigate before merging.
+          labels: |
+            wit
+            dependencies

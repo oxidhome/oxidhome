@@ -1,6 +1,8 @@
 # OxidHome Architecture
 
 > **Status:** Pre-implementation design document. This captures the architectural decisions made before writing code. Expect refinements as the implementation progresses.
+>
+> **Source of truth for the plan:** the per-crate plan files under `.claude/docs/` (start at `00_OVERVIEW.md`). Where this document and the plans disagree, the plans are current. Sections below that are explicitly settled or moved are flagged inline.
 
 ## Mission
 
@@ -222,11 +224,15 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 
 ## What's deliberately not in 0.1
 
-These are flagged as future work, not omissions to fix immediately:
+> **Updated by plan:** the items below have been re-scoped. See `.claude/docs/00_OVERVIEW.md` for the current phase plan.
+>
+> - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
+> - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 11's external API. See the "Auth & actor identity" cross-cutting decision in `00_OVERVIEW.md`.
+> - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode). See Appendix A in `00_OVERVIEW.md`.
+
+The remaining items below are still deferred:
 
 - **Inter-plugin communication** beyond the event bus (large design space; ship without first)
-- **Host-side blob storage** for camera snapshots, recordings, large config (definitely needed; not 0.1)
-- **Authentication / user identity in commands** — was this a homeowner or a guest? Important for locks
 - **Resource handles for devices** (Component Model supports them; useful for capability-scoped device access)
 - **Versioned migration policy** for SDK evolution
 - **Model registry implementation** (start with external AI services + user-provided ONNX)
@@ -234,13 +240,16 @@ These are flagged as future work, not omissions to fix immediately:
 
 ## Open questions
 
-Tagged for explicit decisions later:
+> **Updated by plan:** several of these have been resolved. See `.claude/docs/00_OVERVIEW.md` for the current state.
+>
+> - **Plugin manifest schema** — *settled* TOML (sketch in `.claude/docs/07_manifest.md`).
+> - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release; see "WIT / SDK versioning" in `00_OVERVIEW.md`.
+> - **Storage backend** — *settled* SQLite (`00_OVERVIEW.md` Appendix A).
+> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 11) + MCP server first-class (Phase 12, plan: `08_mcp.md`). GraphQL/gRPC remain out of scope.
 
-- **Plugin manifest schema** — TOML? format details for declaring capabilities, network targets, instance config schema
+Still open:
+
 - **Model registry hosting** — official curated registry vs. HuggingFace pull-through vs. self-host only
-- **WIT versioning policy** — how do plugins built against `oxidhome:plugin@0.1` keep working when 0.2 ships?
-- **UI / API surface** — REST? GraphQL? Both? gRPC for service-to-service?
-- **Storage backend** — embedded (sqlite/sled/redb) for the device registry and event history
 - **Discovery / mDNS** — should the core handle this, or each protocol plugin?
 - **Trust model for plugins themselves** — signing? official registry? ad-hoc install with warnings?
 
