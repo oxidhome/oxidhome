@@ -12,7 +12,6 @@
 //! warm one — same trade-off the Phase 4 examples doc accepts
 //! (`.claude/docs/04_examples.md`).
 
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -102,9 +101,9 @@ async fn hello_world_round_trip() {
     instance.init().await.expect("init");
     instance.shutdown().await.expect("shutdown");
 
-    // Flush any buffered fmt layer writes.
-    let _ = std::io::stdout().flush();
-
+    // tracing-subscriber's fmt layer writes to the configured writer
+    // synchronously per event, so by the time `init`/`shutdown` return,
+    // the captured buffer already holds both lines — no flush needed.
     let output = String::from_utf8(captured.lock().expect("capture lock").clone())
         .expect("captured bytes are utf-8");
 

@@ -26,6 +26,17 @@ pub fn run_init<P: crate::Plugin>(
 ) -> Result<(), String> {
     cell.with(|cell| {
         let mut slot = cell.borrow_mut();
+        // The lifecycle is `init -> ... -> shutdown` per the trait
+        // contract. A second `init` without an intervening `shutdown`
+        // would silently drop the previous plugin (skipping its
+        // shutdown side effects), so we surface the contract
+        // violation as an error instead of overwriting.
+        if slot.is_some() {
+            return Err(String::from(
+                "Plugin::init called while a previous instance is still live; \
+                 call Plugin::shutdown first",
+            ));
+        }
         let mut p = <P as Default>::default();
         let outcome = crate::Plugin::init(&mut p);
         if outcome.is_ok() {

@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let wasm_path: PathBuf = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("usage: oxidhome <plugin.wasm>"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: {} <plugin.wasm>", env!("CARGO_BIN_NAME")))?;
 
     let engine = Engine::new()?;
     let mut instance = PluginInstance::load(&engine, &wasm_path)
