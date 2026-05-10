@@ -53,11 +53,11 @@ Plugin manifests declare whether the plugin is **singleton** (Zigbee coordinator
 
 The WIT defines multiple worlds, each adding capabilities on top of the previous:
 
-| World | Purpose | Examples |
-|-------|---------|----------|
-| `plugin` | Standard device integrations, automations, logic. No raw I/O. | Switch drivers, sensor adapters, scene controllers, automation rules |
-| `streaming-plugin` | Adds WASI sockets and HTTP for long-lived I/O. | Cameras, MQTT bridges, voice assistants, network discovery |
-| `ai-plugin` / `streaming-ai-plugin` | Adds the `inference` import for using host-managed ML models. | Person detection, audio classification, anomaly detection |
+| World                               | Purpose                                                       | Examples                                                             |
+|-------------------------------------|---------------------------------------------------------------|----------------------------------------------------------------------|
+| `plugin`                            | Standard device integrations, automations, logic. No raw I/O. | Switch drivers, sensor adapters, scene controllers, automation rules |
+| `streaming-plugin`                  | Adds WASI sockets and HTTP for long-lived I/O.                | Cameras, MQTT bridges, voice assistants, network discovery           |
+| `ai-plugin` / `streaming-ai-plugin` | Adds the `inference` import for using host-managed ML models. | Person detection, audio classification, anomaly detection            |
 
 Importing a WASI interface does **not** grant access to it. Capabilities are gated by the plugin manifest the user approves at install time. The host enforces network allowlists, filesystem scopes, model access, etc. per instance.
 
@@ -122,14 +122,14 @@ A streaming plugin's `setup-pipeline` returns a `media-pipeline` describing:
 
 ### How it handles real-world cameras
 
-| Camera type | What the plugin does | Where bytes go |
-|-------------|---------------------|----------------|
-| Standard ONVIF | Discovers RTSP URL via WS-Discovery | Host opens URL directly; bytes never enter WASM |
-| Tapo / Reolink / proprietary auth + standard codec | Runs vendor handshake, strips proprietary framing, re-frames as RTP, writes to host pipe | Bytes pass through WASM as RTP packets (cheap), host pipeline takes over |
-| Cloud-only camera | Authenticates against vendor cloud, requests stream URL | If standard URL: easy case. If requires vendor SDK: error, user needs the native bridge |
-| Encrypted vendor stream | Runs key derivation; either decrypts in WASM or hands key to host | Per-frame work native if decryption is heavy |
-| Codec mismatch (H.265 from camera, H.264 needed by WebRTC) | Pipeline includes `decode-video` + `encode-video` steps | Host does both natively, with hardware acceleration |
-| MJPEG-only ancient camera | Pulls JPEGs over HTTP, writes to host pipe with format hint | Host decodes/re-encodes natively |
+| Camera type                                                | What the plugin does                                                                     | Where bytes go                                                                          |
+|------------------------------------------------------------|------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
+| Standard ONVIF                                             | Discovers RTSP URL via WS-Discovery                                                      | Host opens URL directly; bytes never enter WASM                                         |
+| Tapo / Reolink / proprietary auth + standard codec         | Runs vendor handshake, strips proprietary framing, re-frames as RTP, writes to host pipe | Bytes pass through WASM as RTP packets (cheap), host pipeline takes over                |
+| Cloud-only camera                                          | Authenticates against vendor cloud, requests stream URL                                  | If standard URL: easy case. If requires vendor SDK: error, user needs the native bridge |
+| Encrypted vendor stream                                    | Runs key derivation; either decrypts in WASM or hands key to host                        | Per-frame work native if decryption is heavy                                            |
+| Codec mismatch (H.265 from camera, H.264 needed by WebRTC) | Pipeline includes `decode-video` + `encode-video` steps                                  | Host does both natively, with hardware acceleration                                     |
+| MJPEG-only ancient camera                                  | Pulls JPEGs over HTTP, writes to host pipe with format hint                              | Host decodes/re-encodes natively                                                        |
 
 ### The native bridge escape hatch
 
@@ -151,11 +151,11 @@ WASM cannot effectively run real-time ML inference on video. wasi-nn lets WASM p
 
 ### The three AI patterns OxidHome supports
 
-| Pattern | Where it runs | When to use |
-|---------|---------------|-------------|
-| External AI service | Plugin is a thin HTTP client to Frigate/Ollama/CodeProject.AI/cloud APIs | Day one. User runs the AI service themselves. |
+| Pattern                                 | Where it runs                                                                                                    | When to use                                     |
+|-----------------------------------------|------------------------------------------------------------------------------------------------------------------|-------------------------------------------------|
+| External AI service                     | Plugin is a thin HTTP client to Frigate/Ollama/CodeProject.AI/cloud APIs                                         | Day one. User runs the AI service themselves.   |
 | Host-managed model + WASM orchestration | Plugin requests model, host runs it natively (ONNX Runtime / TensorRT / Core ML / OpenVINO), plugin gets results | Polished real-time inference. Some 0.x version. |
-| Native AI bridge | Closed vendor SDKs, exotic accelerators | Last resort, same shape as native camera bridge |
+| Native AI bridge                        | Closed vendor SDKs, exotic accelerators                                                                          | Last resort, same shape as native camera bridge |
 
 ### The `inference-tap` pipeline step
 
@@ -227,7 +227,7 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 > **Updated by plan:** the items below have been re-scoped. See `.claude/docs/00_OVERVIEW.md` for the current phase plan.
 >
 > - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
-> - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 11's external API. See the "Auth & actor identity" cross-cutting decision in `00_OVERVIEW.md`.
+> - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API. See the "Auth & actor identity" cross-cutting decision in `00_OVERVIEW.md`.
 > - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode). See Appendix A in `00_OVERVIEW.md`.
 
 The remaining items below are still deferred:
@@ -245,7 +245,7 @@ The remaining items below are still deferred:
 > - **Plugin manifest schema** — *settled* TOML (sketch in `.claude/docs/07_manifest.md`).
 > - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release; see "WIT / SDK versioning" in `00_OVERVIEW.md`.
 > - **Storage backend** — *settled* SQLite (`00_OVERVIEW.md` Appendix A).
-> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 11) + MCP server first-class (Phase 12, plan: `08_mcp.md`). GraphQL/gRPC remain out of scope.
+> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 12) + MCP server first-class (Phase 13, plan: `09_mcp.md`). GraphQL/gRPC remain out of scope.
 
 Still open:
 
