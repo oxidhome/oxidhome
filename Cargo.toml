@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/oxidhome-core", "crates/oxidhome-sdk", "crates/oxidhome-wit"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -22,8 +22,8 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-oxidhome-sdk = { path = "crates/oxidhome-sdk", version = "0.1.0" }
-oxidhome-wit = { path = "crates/oxidhome-wit", version = "0.1.0" }
+oxidhome-sdk = { path = "crates/oxidhome-sdk", version = "0.1.1" }
+oxidhome-wit = { path = "crates/oxidhome-wit", version = "0.1.1" }
 
 # Shared external deps. Phase 2 adds tokio + tracing; the runtime/logging
 # decisions in 00_OVERVIEW.md make these workspace-wide.
