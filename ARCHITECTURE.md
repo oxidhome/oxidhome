@@ -222,8 +222,9 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 
 ## What's deliberately not in 0.1
 
-> **Re-scoped since the initial draft.** The items below changed
-> status from "deferred" as the design firmed up:
+> **Re-scoped since the initial draft.** The items below have moved
+> out of the deferred list — either pulled into 0.1 scope or
+> settled with a concrete plan as the design firmed up:
 >
 > - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
 > - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API.
