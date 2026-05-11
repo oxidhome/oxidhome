@@ -1,8 +1,6 @@
 # OxidHome Architecture
 
-> **Status:** Pre-implementation design document. This captures the architectural decisions made before writing code. Expect refinements as the implementation progresses.
->
-> **Source of truth for the plan:** the per-crate plan files under `.claude/docs/` (start at `00_OVERVIEW.md`). Where this document and the plans disagree, the plans are current. Sections below that are explicitly settled or moved are flagged inline.
+> **Status:** Pre-implementation design document. This captures the architectural decisions made before writing code. Expect refinements as the implementation progresses. Sections explicitly settled or moved by later work are flagged inline.
 
 ## Mission
 
@@ -224,11 +222,11 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 
 ## What's deliberately not in 0.1
 
-> **Updated by plan:** the items below have been re-scoped. See `.claude/docs/00_OVERVIEW.md` for the current phase plan.
+> **Updated by plan:** the items below have been re-scoped.
 >
 > - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
-> - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API. See the "Auth & actor identity" cross-cutting decision in `00_OVERVIEW.md`.
-> - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode). See Appendix A in `00_OVERVIEW.md`.
+> - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API.
+> - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode).
 
 The remaining items below are still deferred:
 
@@ -240,12 +238,12 @@ The remaining items below are still deferred:
 
 ## Open questions
 
-> **Updated by plan:** several of these have been resolved. See `.claude/docs/00_OVERVIEW.md` for the current state.
+> **Updated by plan:** several of these have been resolved.
 >
-> - **Plugin manifest schema** — *settled* TOML (sketch in `.claude/docs/07_manifest.md`).
-> - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release; see "WIT / SDK versioning" in `00_OVERVIEW.md`.
-> - **Storage backend** — *settled* SQLite (`00_OVERVIEW.md` Appendix A).
-> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 12), web UI as the primary surface (Phase 13, plan: `09_ui.md`; the SvelteKit shell lives in the separate `oxidhome/ui` repo and the JS plugin-author package in `oxidhome/ui-sdk`), MCP server first-class (Phase 14, plan: `10_mcp.md`). GraphQL/gRPC remain out of scope.
+> - **Plugin manifest schema** — *settled* TOML.
+> - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release.
+> - **Storage backend** — *settled* SQLite.
+> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 12), web UI as the primary surface (Phase 13; the SvelteKit shell lives in the separate `oxidhome/ui` repo and the JS plugin-author package in `oxidhome/ui-sdk`), MCP server first-class (Phase 14). GraphQL/gRPC remain out of scope.
 
 Still open:
 
