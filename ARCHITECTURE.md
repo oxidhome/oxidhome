@@ -1,6 +1,6 @@
 # OxidHome Architecture
 
-> **Status:** Pre-implementation design document. This captures the architectural decisions made before writing code. Expect refinements as the implementation progresses. Sections explicitly settled or moved by later work are flagged inline.
+> **Status:** Initial architectural design document — captures the design decisions that shape the codebase. The implementation is in active development; sections explicitly settled, re-scoped, or superseded as the code progresses are flagged inline.
 
 ## Mission
 
