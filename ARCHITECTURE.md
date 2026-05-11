@@ -229,10 +229,10 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 > - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
 > - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API.
 > - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode).
+> - **Inter-plugin communication beyond the event bus** — *now in scope* as Phase 7. Services + a synchronous cross-plugin `call-service` host import + per-instance Wasmtime sandbox limits ship together; the motivation comes from the embedded scripting-plugin design (Rhai/Lua hosts where automation instances expose commands and call each other).
 
 The remaining items below are still deferred:
 
-- **Inter-plugin communication** beyond the event bus (large design space; ship without first)
 - **Resource handles for devices** (Component Model supports them; useful for capability-scoped device access)
 - **Versioned migration policy** for SDK evolution
 - **Model registry implementation** (start with external AI services + user-provided ONNX)
