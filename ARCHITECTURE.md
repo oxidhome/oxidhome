@@ -1,8 +1,6 @@
 # OxidHome Architecture
 
-> **Status:** Pre-implementation design document. This captures the architectural decisions made before writing code. Expect refinements as the implementation progresses.
->
-> **Source of truth for the plan:** the per-crate plan files under `.claude/docs/` (start at `00_OVERVIEW.md`). Where this document and the plans disagree, the plans are current. Sections below that are explicitly settled or moved are flagged inline.
+> **Status:** Initial architectural design document — captures the design decisions that shape the codebase. The implementation is in active development; sections explicitly settled, re-scoped, or superseded as the code progresses are flagged inline.
 
 ## Mission
 
@@ -224,15 +222,17 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 
 ## What's deliberately not in 0.1
 
-> **Updated by plan:** the items below have been re-scoped. See `.claude/docs/00_OVERVIEW.md` for the current phase plan.
+> **Re-scoped since the initial draft.** The items below have moved
+> out of the deferred list — either pulled into 0.1 scope or
+> settled with a concrete plan as the design firmed up:
 >
 > - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
-> - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API. See the "Auth & actor identity" cross-cutting decision in `00_OVERVIEW.md`.
-> - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode). See Appendix A in `00_OVERVIEW.md`.
+> - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API.
+> - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode).
+> - **Inter-plugin communication beyond the event bus** — *now in scope* as Phase 7. Services + a synchronous cross-plugin `call-service` host import + per-instance Wasmtime sandbox limits ship together; the motivation comes from the embedded scripting-plugin design (Rhai/Lua hosts where automation instances expose commands and call each other).
 
 The remaining items below are still deferred:
 
-- **Inter-plugin communication** beyond the event bus (large design space; ship without first)
 - **Resource handles for devices** (Component Model supports them; useful for capability-scoped device access)
 - **Versioned migration policy** for SDK evolution
 - **Model registry implementation** (start with external AI services + user-provided ONNX)
@@ -240,12 +240,14 @@ The remaining items below are still deferred:
 
 ## Open questions
 
-> **Updated by plan:** several of these have been resolved. See `.claude/docs/00_OVERVIEW.md` for the current state.
+> **Resolved since the initial draft.** Items below are no longer
+> open — capturing the decisions inline so this section stays useful
+> as a delta against the original questions:
 >
-> - **Plugin manifest schema** — *settled* TOML (sketch in `.claude/docs/07_manifest.md`).
-> - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release; see "WIT / SDK versioning" in `00_OVERVIEW.md`.
-> - **Storage backend** — *settled* SQLite (`00_OVERVIEW.md` Appendix A).
-> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 12) + MCP server first-class (Phase 13, plan: `09_mcp.md`). GraphQL/gRPC remain out of scope.
+> - **Plugin manifest schema** — *settled* TOML.
+> - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release.
+> - **Storage backend** — *settled* SQLite.
+> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 12), web UI as the primary surface (Phase 13; the SvelteKit shell lives in the separate `oxidhome/ui` repo and the JS plugin-author package in `oxidhome/ui-sdk`), MCP server first-class (Phase 14). GraphQL/gRPC remain out of scope.
 
 Still open:
 
