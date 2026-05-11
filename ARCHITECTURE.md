@@ -222,7 +222,8 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 
 ## What's deliberately not in 0.1
 
-> **Updated by plan:** the items below have been re-scoped.
+> **Re-scoped since the initial draft.** The items below changed
+> status from "deferred" as the design firmed up:
 >
 > - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
 > - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API.
@@ -238,7 +239,9 @@ The remaining items below are still deferred:
 
 ## Open questions
 
-> **Updated by plan:** several of these have been resolved.
+> **Resolved since the initial draft.** Items below are no longer
+> open — capturing the decisions inline so this section stays useful
+> as a delta against the original questions:
 >
 > - **Plugin manifest schema** — *settled* TOML.
 > - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release.
