@@ -245,7 +245,7 @@ The remaining items below are still deferred:
 > - **Plugin manifest schema** — *settled* TOML (sketch in `.claude/docs/07_manifest.md`).
 > - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release; see "WIT / SDK versioning" in `00_OVERVIEW.md`.
 > - **Storage backend** — *settled* SQLite (`00_OVERVIEW.md` Appendix A).
-> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 12) + MCP server first-class (Phase 13, plan: `09_mcp.md`). GraphQL/gRPC remain out of scope.
+> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 12), web UI as the primary surface (Phase 13, plan: `09_ui.md`; the SvelteKit shell lives in the separate `oxidhome/ui` repo and the JS plugin-author package in `oxidhome/ui-sdk`), MCP server first-class (Phase 14, plan: `10_mcp.md`). GraphQL/gRPC remain out of scope.
 
 Still open:
 
