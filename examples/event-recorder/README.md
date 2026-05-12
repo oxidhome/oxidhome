@@ -25,7 +25,7 @@ this plugin is most useful inside the integration test:
 
 ```shell
 # from the OxidHome workspace root
-cargo test -p oxidhome-core --test event_dispatch
+cargo nextest run -p oxidhome-core --test event_dispatch
 ```
 
 The test loads `simulated-switch` and `event-recorder`, drives a

@@ -65,8 +65,10 @@ To build and test:
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+cargo nextest run --workspace
 ```
+
+(CI runs `cargo llvm-cov nextest` under the hood; `cargo nextest run` matches that locally. `cargo test --workspace` also works but produces less readable output and isn't what CI sees.)
 
 To validate the WIT file:
 

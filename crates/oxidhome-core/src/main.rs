@@ -3,7 +3,8 @@
 //! Loads one `.wasm` plugin component, runs `init()` → `shutdown()`,
 //! prints the round-trip on stdout via `tracing-subscriber`. Phase 6+
 //! grows this into a real daemon with multi-instance lifecycle, the
-//! external API (Phase 11), and the MCP server (Phase 12).
+//! external API (Phase 12), the UI (Phase 13), and the MCP server
+//! (Phase 14).
 
 use std::path::PathBuf;
 
