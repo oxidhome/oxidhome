@@ -3,8 +3,8 @@
 //! A tokio [`broadcast`] channel fans every `publish-event` call out
 //! to every subscriber. Subscriptions today are:
 //!
-//! - **Host-side listeners** (test harness, Phase 11 external API,
-//!   Phase 12 MCP server) — they call [`EventBus::subscribe_all`] and
+//! - **Host-side listeners** (test harness, Phase 12 external API,
+//!   Phase 14 MCP server) — they call [`EventBus::subscribe_all`] and
 //!   poll the returned [`broadcast::Receiver`].
 //! - **Plugin instances** subscribing via the WIT `host-events`
 //!   import — `subscribe`/`unsubscribe` mint a real

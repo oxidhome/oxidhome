@@ -4,8 +4,7 @@
 //! macro that wires the trait to the wit-bindgen-generated guest exports
 //! for the standard `plugin` world, and a [`logging::init`] bridge that
 //! forwards `tracing` events to the host's `logging` import. Streaming /
-//! AI worlds + structured fields + storage helpers land in later phases
-//! per `.claude/docs/02_sdk.md`.
+//! AI worlds + structured fields + storage helpers land in later phases.
 //!
 //! # Hello world
 //!

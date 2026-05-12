@@ -9,8 +9,8 @@
 //! so the host build doesn't drag wasm targets through its graph; the
 //! test invokes `cargo build` against that workspace and resolves the
 //! `.wasm` artifact at a stable path. Slow on a cold cache, fast on a
-//! warm one — same trade-off the Phase 4 examples doc accepts
-//! (`.claude/docs/04_examples.md`).
+//! warm one — accepted trade-off for the example-driven integration
+//! tests.
 
 #[path = "support.rs"]
 mod support;

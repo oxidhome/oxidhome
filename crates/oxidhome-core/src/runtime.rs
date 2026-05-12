@@ -7,8 +7,7 @@
 //! - [`PluginInstance`] is the host-side handle to one running plugin
 //!   instance: load → init → (callbacks) → shutdown.
 //!
-//! Lifecycle, multi-instance, and crash isolation land in Phase 6
-//! (`.claude/docs/03_core.md`).
+//! Lifecycle, multi-instance, and crash isolation land in Phase 6.
 
 mod instance;
 mod state;
@@ -27,7 +26,7 @@ use crate::state::{DeviceRegistry, EventBus};
 /// and instantiated cheaply across many [`PluginInstance`]s — wrap this
 /// in an [`Arc`] and share. The engine is configured for the component
 /// model with async host functions so calls into wasm can suspend
-/// (Phase 7+ will use this for sockets/HTTP).
+/// (Phase 8+ will use this for sockets/HTTP).
 ///
 /// Beyond the Wasmtime engine, [`Engine`] carries the singletons every
 /// plugin instance shares: the [`DeviceRegistry`] (Phase 3) and the

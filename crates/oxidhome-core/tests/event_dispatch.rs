@@ -1,9 +1,8 @@
 //! Phase 3 plugin-side event-dispatch test.
 //!
 //! Confirms `PluginInstance::drain_events()` actually delivers
-//! bus events to a plugin's `on-event` export, which is the
-//! "host calls `on-event` on the subscriber" half of the Phase 3
-//! plan from `.claude/docs/03_core.md`.
+//! bus events to a plugin's `on-event` export — the "host calls
+//! `on-event` on the subscriber" half of Phase 3.
 //!
 //! Two plugins:
 //!
