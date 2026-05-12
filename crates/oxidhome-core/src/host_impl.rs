@@ -31,7 +31,7 @@
 //!   `plugin` has none, `streaming-plugin` has the media pair,
 //!   `ai-plugin` has model, and `streaming-ai-plugin` has all three.
 //! - **WASI imports** are *not* remapped, even though they will be in
-//!   Phase 7 when streaming plugins start using sockets/HTTP. Some
+//!   Phase 8 when streaming plugins start using sockets/HTTP. Some
 //!   WASI interfaces (`wasi:sockets/network`, `wasi:http/types`) carry
 //!   `@unstable` features whose `add_to_linker` signatures take a
 //!   `LinkOptions` parameter; remapping them via `with:` made our
