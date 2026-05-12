@@ -201,7 +201,7 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 ### Host → Plugin
 
 - **Lifecycle** — `init()`, `shutdown()`
-- **Event delivery** — the host buffers matching events on the subscriber's per-instance queue. A host-side helper (`PluginInstance::drain_events()`) walks the queue after every host-driven entry point (`init`, `execute-command`, `tick`) and calls the plugin's `on-event` export once per buffered event. There is no separate `drain-events` export on the plugin world. This polling-drain shape preserves the single-threaded per-`Store` WASM contract — no host call ever re-enters the plugin from a separate task — and avoids needing a streaming export on the plugin world.
+- **Event delivery** — the host buffers matching events on the subscriber's per-instance queue. A host-side helper (`PluginInstance::drain_events()`) walks that queue and invokes the plugin's `on-event` export once per buffered event. There is no separate `drain-events` export on the plugin world. Phase 3 ships the helper; *when* to call it is the caller's choice today — integration tests invoke it explicitly after each host-driven step. The intended future driver is a per-instance tokio task that owns the `Store` and `select!`s between control commands and bus events, draining automatically after each entry point (`init`, `execute-command`, `tick`); that scheduler lands with Phase 6's per-instance lifecycle. The polling-drain shape preserves the single-threaded per-`Store` WASM contract — no host call ever re-enters the plugin from a separate task — and avoids needing a streaming export on the plugin world.
 - **Commands** — `execute-command(device, cmd)` for actions targeting plugin's devices
 - **Periodic** — `tick()` for plugins that genuinely need a heartbeat (most should be event-driven)
 
@@ -278,7 +278,7 @@ Settled engineering choices that shape the codebase, captured here so they survi
 
 ### Async + Wasmtime embedding
 
-- **Wasmtime async + tokio.** Single tokio multi-thread runtime in `oxidhome-core`; Wasmtime stores hold a `tokio::runtime::Handle` for spawning host-side work.
+- **Wasmtime async + tokio.** Single tokio multi-thread runtime in `oxidhome-core`, entered via `#[tokio::main]` in the host binary; host imports rely on the ambient runtime that installs. Plumbing a `tokio::runtime::Handle` through the Wasmtime store data so host imports can cleanly spawn background work without leaning on the ambient runtime is an open Phase-2 follow-up (see the open question in the `oxidhome-core` per-crate plan).
 - **Single-threaded contract per `Store`.** One `wasmtime::Store` per `PluginInstance`. Concurrent invocations of the same instance are serialized; cross-instance work runs in parallel.
 - **`bindgen!` async syntax** is `imports: { default: async }` (modern wasmtime), not the deprecated `async: true`.
 - **Resource-path syntax** in `with:` mappings uses `interface.type` (dot), not `interface/type` (slash): e.g. `oxidhome:plugin/media.pipeline-handle`.

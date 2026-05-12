@@ -38,7 +38,7 @@
 //!   bindgen emit 2-arg call sites against the runtime's 3-arg
 //!   functions. Wiring this up correctly belongs with the work that
 //!   actually instantiates plugins against a `Linker` (Phase 2 +
-//!   Phase 7) — bindgen here generates fresh WASI types instead,
+//!   Phase 8) — bindgen here generates fresh WASI types instead,
 //!   which is fine for the compile-only validation Phase 1 needs.
 
 #![allow(missing_docs, clippy::all, clippy::pedantic)]

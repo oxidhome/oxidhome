@@ -56,8 +56,10 @@ impl PluginInstance {
             // host-events, host-config, storage, logging. All wired
             // through the bindgen-generated `add_to_linker` against
             // `PluginState`. As of Phase 3, logging + host-devices +
-            // host-events are functional; host-config and storage still
-            // stub with `Error::Unavailable` (Phase 4 / Phase 5).
+            // host-events are functional; `storage::*` still returns
+            // `Error::Unavailable` (Phase 5a wires the real KV);
+            // `host-config::*` returns empty `Ok` values (`Ok(None)` /
+            // empty list) until Phase 4 wires the real config source.
             PluginBindings::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(anyhow::Error::from)
                 .context("adding plugin world host imports to linker")?;
