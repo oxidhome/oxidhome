@@ -65,6 +65,8 @@ To run it:
 cargo nextest run -p oxidhome-core --test simulated_switch
 ```
 
+Needs `cargo-nextest` (covered by the workspace's `cargo install-tools` alias — see `CONTRIBUTING.md`). If you'd rather not install it, `cargo test -p oxidhome-core --test simulated_switch` works on a default Rust setup.
+
 ## Inspect the component (optional)
 
 ```shell

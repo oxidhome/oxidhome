@@ -28,6 +28,8 @@ this plugin is most useful inside the integration test:
 cargo nextest run -p oxidhome-core --test event_dispatch
 ```
 
+Needs `cargo-nextest` (covered by the workspace's `cargo install-tools` alias — see `CONTRIBUTING.md`). If you'd rather not install it, `cargo test -p oxidhome-core --test event_dispatch` works on a default Rust setup.
+
 The test loads `simulated-switch` and `event-recorder`, drives a
 `switch::toggle` on the switch, calls `drain_events()` on the
 recorder, and asserts the recorder's `on_event` logged the matching
