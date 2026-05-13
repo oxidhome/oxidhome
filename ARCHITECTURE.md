@@ -255,25 +255,18 @@ Still open:
 - **Discovery / mDNS** — should the core handle this, or each protocol plugin?
 - **Trust model for plugins themselves** — signing? official registry? ad-hoc install with warnings?
 
-## Implementation conventions
+## Implementation decisions
 
 Settled engineering choices that shape the codebase, captured here so they survive when transient planning docs do not.
 
-### Toolchain
-
-- **Rust 1.95, edition 2024.** Pinned in `rust-toolchain.toml`. Plugins build for `wasm32-wasip2`; the host builds for its native triple.
-- **Workspace lint `unsafe_code = "deny"`.** Per-block opt-in only, with a documented `// SAFETY:` comment.
-- **Exact-pinning policy** for the two crates we can't tolerate silent bumps in: `wit-bindgen` (in `oxidhome-wit`) and `wasmtime` (in `oxidhome-core`). Bumps land as their own PR.
-
-### Crate layout
+### Bindgen and publication
 
 - **`oxidhome-wit`** — the single bindgen crate, with **per-world Cargo features**: `plugin`, `streaming-plugin`, `ai-plugin`, `streaming-ai-plugin`. Each world's module tree is `#[cfg(feature = "...")]`-gated so a plugin that only uses one world doesn't trip `wasm-component-ld`'s "multiple component-type metadata sections" linker error. Host and SDK both depend on it.
 - **Publication policy.** All three crates (`oxidhome-wit`, `oxidhome-sdk`, `oxidhome-core`) carry `publish = false` through 0.x. Path dependencies and a workspace-root `wit/` directory make publishing impossible without packaging changes anyway, and pre-1.0 we want zero friction iterating on the WIT. The three flip publishable together at the first SDK release intended for external plugin authors. Re-evaluate sooner only if a second-language SDK (Go, JS) needs a versioned `oxidhome-wit` artifact to bindgen against.
-- **No `mod.rs` files.** Prefer `<module_name>.rs` siblings to `<module_name>/` directories (e.g. `host_impl.rs`, not `host_impl/mod.rs`).
+- **Exact-pinning policy.** `wit-bindgen` (in `oxidhome-wit`) and `wasmtime` (in `oxidhome-core`) are pinned because silent minor bumps can change generated bindings or runtime embedding behavior.
 
-### Error handling and observability
+### Observability
 
-- **`thiserror` in published libraries, `anyhow` in binaries and host-internal libs.** Applied from Phase 2 onward. The criterion is *external consumption*: a crate that ships a typed error contract to outside authors (`oxidhome-sdk`, `oxidhome-wit`, `oxidhome-manifest` once it ships) uses `thiserror`. A crate that is binary-or-test-only — `oxidhome-core` has a library target, but it exists so the in-process integration tests (and the future `oxidhome-test-host`, Phase 11) can compose against the runtime, not for external consumers — follows the binary convention and returns `anyhow::Result` at its API boundaries. Re-evaluate when an `oxidhome-core` library surface is genuinely consumed from outside the workspace — likely when the test-harness phase forces an explicit core-lib / core-bin split.
 - **`tracing` for logging — never `log`.** Spans cross every host-call boundary from Phase 2 onward; retrofitting is painful. From Phase 5c, a SQLite-backed `tracing::Subscriber` layer also persists structured events so they're queryable through the CLI/API.
 
 ### Async + Wasmtime embedding
@@ -283,21 +276,9 @@ Settled engineering choices that shape the codebase, captured here so they survi
 - **`bindgen!` async syntax** is `imports: { default: async }` (modern wasmtime), not the deprecated `async: true`.
 - **Resource-path syntax** in `with:` mappings uses `interface.type` (dot), not `interface/type` (slash): e.g. `oxidhome:plugin/media.pipeline-handle`.
 
-### Testing
-
-- **`#[tokio::test(flavor = "current_thread")]`** for tests that rely on thread-local `tracing` subscribers.
-- **Integration tests that shell out to `cargo`** use the `spawn_clean_cargo` helper (`crates/oxidhome-core/tests/support.rs`), which strips `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, and the rest of `cargo-llvm-cov`'s instrumentation env vars. Otherwise a nested `cargo build --target wasm32-wasip2` inherits `-Cinstrument-coverage` and tries to instrument the wasm guest.
-- **Target ≥ 85% line coverage** per crate, tracked in Codecov. Tests land in the same PR as the code; drops below 85% are justified in the PR description.
-
-## Licensing
-
-- **Code**: dual MIT / Apache-2.0 (Rust ecosystem standard)
-- **Articles, documentation, written content**: CC BY 4.0
-- Each repository declares its own license; these are the org defaults.
-
 ## North-star principles
 
-When in doubt during implementation, these are the tiebreakers:
+These are the architectural tiebreakers:
 
 1. **Security over convenience.** A capability-gated, sandboxed plugin model is the whole point. Don't add escape hatches that defeat the model. When you need an escape hatch (native bridges), make it explicit and visible.
 
