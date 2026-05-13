@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/oxidhome-core", "crates/oxidhome-sdk", "crates/oxidhome-wit"]
+members = [
+  "crates/oxidhome-core",
+  "crates/oxidhome-manifest",
+  "crates/oxidhome-sdk",
+  "crates/oxidhome-wit",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,16 +27,17 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
+oxidhome-manifest = { path = "crates/oxidhome-manifest", version = "0.1.0" }
 oxidhome-sdk = { path = "crates/oxidhome-sdk", version = "0.1.0" }
 oxidhome-wit = { path = "crates/oxidhome-wit", version = "0.1.0" }
 
-# Shared external deps. Phase 2 adds tokio + tracing; the runtime/logging
-# decisions in 00_OVERVIEW.md make these workspace-wide.
+# Shared external deps.
 anyhow = "1.0.102"
-# `thiserror` per the cross-cutting decision in 00_OVERVIEW.md ("thiserror
-# in libraries") joins this list when the first crate gains a typed
-# error — likely `oxidhome-manifest` in Phase 4. Until then it would
-# trip cargo-machete.
+ipnet = { version = "2.12.0", default-features = false, features = ["serde", "std"] }
+semver = { version = "1.0.28", default-features = false, features = ["serde", "std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "sync", "fs"] }
+toml = { version = "1.1.2", default-features = false, features = ["display", "parse", "serde", "std"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "registry"] }
