@@ -10,9 +10,9 @@ homepage.workspace = true
 authors.workspace = true
 # `oxidhome-sdk` depends on the internal `oxidhome-wit` crate; cargo can't
 # publish a crate that path-depends on an unpublished one. Both stay
-# unpublished through 0.x; Phase 11 flips them on together when we cut the
-# first SDK release intended for external plugin authors. See
-# .claude/docs/01_wit.md and .claude/docs/02_sdk.md.
+# unpublished through 0.x and flip publishable together at the first SDK
+# release intended for external plugin authors. See the publication-policy
+# note in ARCHITECTURE.md "Implementation conventions".
 publish = false
 
 [lints]

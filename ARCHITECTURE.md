@@ -201,7 +201,7 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 ### Host → Plugin
 
 - **Lifecycle** — `init()`, `shutdown()`
-- **Event delivery** — `on-event(event)` for subscribed events
+- **Event delivery** — the host buffers matching events on the subscriber's per-instance queue. A host-side helper (`PluginInstance::drain_events()`) walks that queue and invokes the plugin's `on-event` export once per buffered event. There is no separate `drain-events` export on the plugin world. Phase 3 ships the helper; *when* to call it is the caller's choice today — integration tests invoke it explicitly after each host-driven step. The intended future driver is a per-instance tokio task that owns the `Store` and `select!`s between control commands and bus events, draining automatically after each entry point (`init`, `execute-command`, `tick`); that scheduler lands with Phase 6's per-instance lifecycle. The polling-drain shape preserves the single-threaded per-`Store` WASM contract — no host call ever re-enters the plugin from a separate task — and avoids needing a streaming export on the plugin world.
 - **Commands** — `execute-command(device, cmd)` for actions targeting plugin's devices
 - **Periodic** — `tick()` for plugins that genuinely need a heartbeat (most should be event-driven)
 
@@ -254,6 +254,40 @@ Still open:
 - **Model registry hosting** — official curated registry vs. HuggingFace pull-through vs. self-host only
 - **Discovery / mDNS** — should the core handle this, or each protocol plugin?
 - **Trust model for plugins themselves** — signing? official registry? ad-hoc install with warnings?
+
+## Implementation conventions
+
+Settled engineering choices that shape the codebase, captured here so they survive when transient planning docs do not.
+
+### Toolchain
+
+- **Rust 1.95, edition 2024.** Pinned in `rust-toolchain.toml`. Plugins build for `wasm32-wasip2`; the host builds for its native triple.
+- **Workspace lint `unsafe_code = "deny"`.** Per-block opt-in only, with a documented `// SAFETY:` comment.
+- **Exact-pinning policy** for the two crates we can't tolerate silent bumps in: `wit-bindgen` (in `oxidhome-wit`) and `wasmtime` (in `oxidhome-core`). Bumps land as their own PR.
+
+### Crate layout
+
+- **`oxidhome-wit`** — the single bindgen crate, with **per-world Cargo features**: `plugin`, `streaming-plugin`, `ai-plugin`, `streaming-ai-plugin`. Each world's module tree is `#[cfg(feature = "...")]`-gated so a plugin that only uses one world doesn't trip `wasm-component-ld`'s "multiple component-type metadata sections" linker error. Host and SDK both depend on it.
+- **Publication policy.** All three crates (`oxidhome-wit`, `oxidhome-sdk`, `oxidhome-core`) carry `publish = false` through 0.x. Path dependencies and a workspace-root `wit/` directory make publishing impossible without packaging changes anyway, and pre-1.0 we want zero friction iterating on the WIT. The three flip publishable together at the first SDK release intended for external plugin authors. Re-evaluate sooner only if a second-language SDK (Go, JS) needs a versioned `oxidhome-wit` artifact to bindgen against.
+- **No `mod.rs` files.** Prefer `<module_name>.rs` siblings to `<module_name>/` directories (e.g. `host_impl.rs`, not `host_impl/mod.rs`).
+
+### Error handling and observability
+
+- **`thiserror` in published libraries, `anyhow` in binaries and host-internal libs.** Applied from Phase 2 onward. The criterion is *external consumption*: a crate that ships a typed error contract to outside authors (`oxidhome-sdk`, `oxidhome-wit`, `oxidhome-manifest` once it ships) uses `thiserror`. A crate that is binary-or-test-only — `oxidhome-core` has a library target, but it exists so the in-process integration tests (and the future `oxidhome-test-host`, Phase 11) can compose against the runtime, not for external consumers — follows the binary convention and returns `anyhow::Result` at its API boundaries. Re-evaluate when an `oxidhome-core` library surface is genuinely consumed from outside the workspace — likely when the test-harness phase forces an explicit core-lib / core-bin split.
+- **`tracing` for logging — never `log`.** Spans cross every host-call boundary from Phase 2 onward; retrofitting is painful. From Phase 5c, a SQLite-backed `tracing::Subscriber` layer also persists structured events so they're queryable through the CLI/API.
+
+### Async + Wasmtime embedding
+
+- **Wasmtime async + tokio.** Single tokio multi-thread runtime in `oxidhome-core`, entered via `#[tokio::main]` in the host binary; host imports rely on the ambient runtime that installs. Plumbing a `tokio::runtime::Handle` through the Wasmtime store data so host imports can cleanly spawn background work without leaning on the ambient runtime is an open Phase-2 follow-up (see the open question in the `oxidhome-core` per-crate plan).
+- **Single-threaded contract per `Store`.** One `wasmtime::Store` per `PluginInstance`. Concurrent invocations of the same instance are serialized; cross-instance work runs in parallel.
+- **`bindgen!` async syntax** is `imports: { default: async }` (modern wasmtime), not the deprecated `async: true`.
+- **Resource-path syntax** in `with:` mappings uses `interface.type` (dot), not `interface/type` (slash): e.g. `oxidhome:plugin/media.pipeline-handle`.
+
+### Testing
+
+- **`#[tokio::test(flavor = "current_thread")]`** for tests that rely on thread-local `tracing` subscribers.
+- **Integration tests that shell out to `cargo`** use the `spawn_clean_cargo` helper (`crates/oxidhome-core/tests/support.rs`), which strips `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, and the rest of `cargo-llvm-cov`'s instrumentation env vars. Otherwise a nested `cargo build --target wasm32-wasip2` inherits `-Cinstrument-coverage` and tries to instrument the wasm guest.
+- **Target ≥ 85% line coverage** per crate, tracked in Codecov. Tests land in the same PR as the code; drops below 85% are justified in the PR description.
 
 ## Licensing
 

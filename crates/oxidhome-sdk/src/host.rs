@@ -21,9 +21,8 @@
 //! `oxidhome-core/tests/{simulated_switch,event_dispatch}.rs`,
 //! which builds the `simulated-switch` / `event-recorder` examples
 //! against this exact module and drives the round-trip through
-//! Wasmtime. The plan calls this out as the "boilerplate /
-//! hard-to-mock IO" exemption category in
-//! `.claude/docs/00_OVERVIEW.md`.
+//! Wasmtime. This is the "boilerplate / hard-to-mock IO" exemption
+//! category from the project-wide coverage policy.
 
 use crate::bindings::oxidhome::plugin::devices::DeviceInfo;
 use crate::bindings::oxidhome::plugin::events::{

@@ -28,5 +28,6 @@ streaming-ai-plugin = []
 [dependencies]
 # Pinned to an exact version. Cross-crate ABI surfaces are sensitive — a
 # silent minor bump in bindgen output could break either side. Bumps land
-# as deliberate PRs that re-run both bindgens. See .claude/docs/01_wit.md.
+# as deliberate PRs that re-run both bindgens. See the exact-pinning
+# policy in ARCHITECTURE.md "Implementation conventions".
 wit-bindgen = "=0.57.1"

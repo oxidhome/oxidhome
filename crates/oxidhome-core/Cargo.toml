@@ -11,9 +11,10 @@ authors.workspace = true
 # `oxidhome-core`'s host bindgen reads `wit/` at the workspace root, which
 # the published tarball can't see (`path: "../../wit"` escapes the crate
 # root). Keeping `publish = false` for 0.x sidesteps the packaging problem
-# until Phase 11 — at which point we either bundle `wit/` into the package
-# via `package.include`, or pre-generate Rust source. See
-# .claude/docs/01_wit.md and .claude/docs/03_core.md.
+# until the first SDK release for external plugin authors — at which point
+# we either bundle `wit/` into the package via `package.include`, or pre-
+# generate Rust source. See the publication-policy note in ARCHITECTURE.md
+# "Implementation conventions".
 publish = false
 # Integration tests are listed explicitly below so cargo doesn't
 # auto-pick `tests/support.rs` as a no-op test target. `support.rs`
@@ -40,7 +41,7 @@ path = "tests/event_dispatch.rs"
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
 # the `wit-bindgen` pin policy in oxidhome-wit.
 #
-# `wasmtime-wasi-http` joins this list in Phase 7 when streaming plugins
+# `wasmtime-wasi-http` joins this list in Phase 8 when streaming plugins
 # need outgoing HTTP. Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli,
 # random, …) so libstd-pulled WASI imports resolve.
 wasmtime = { version = "=44.0.1", default-features = false, features = [

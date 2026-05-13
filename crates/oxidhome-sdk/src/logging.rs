@@ -6,11 +6,10 @@
 //!
 //! Phase 2 forwards level + a formatted message only — `logging::log`
 //! takes `(level, string)` in the 0.1 WIT. Structured fields land in
-//! Phase 5 when the WIT grows a `fields` parameter (see
-//! `.claude/docs/01_wit.md` Phase 5 entry); the bridge will start
-//! forwarding fields then. Until then, fields are formatted into the
-//! message string by `tracing-subscriber`'s default formatter, so they
-//! aren't lost — they just aren't typed on the wire.
+//! Phase 5 when the WIT grows a `fields` parameter; the bridge will
+//! start forwarding fields then. Until then, fields are formatted into
+//! the message string by `tracing-subscriber`'s default formatter, so
+//! they aren't lost — they just aren't typed on the wire.
 
 use core::fmt::Write as _;
 

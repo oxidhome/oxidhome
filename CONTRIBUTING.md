@@ -56,17 +56,18 @@ they're not personal.
 
 You'll need:
 
-- Rust (stable, latest)
-- A WASI-capable target: `rustup target add wasm32-wasip2`
-- [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools): `cargo install wasm-tools`
-- [`wit-bindgen-cli`](https://github.com/bytecodealliance/wit-bindgen): `cargo install wit-bindgen-cli`
+- Rust — pinned to the version in [`rust-toolchain.toml`](rust-toolchain.toml) (1.95.0 at the moment, with `rustfmt`, `clippy`, `llvm-tools-preview`, and the `wasm32-wasip2` target). `rustup` reads that file automatically inside the workspace, so just having `rustup` installed is enough.
+- The CI toolchain — `cargo install-tools` (alias defined in `.cargo/config.toml`) installs `cargo-deny`, `cargo-llvm-cov`, `cargo-machete`, `cargo-nextest`, `cargo-action-fmt`, `wit-deps-cli`, and `wasm-tools` with `--locked`. One command, same versions as CI.
+- [`wit-bindgen-cli`](https://github.com/bytecodealliance/wit-bindgen): `cargo install wit-bindgen-cli` (separate; not yet in the install-tools alias).
 
 To build and test:
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+cargo nextest run --workspace
 ```
+
+(CI runs `cargo llvm-cov nextest` under the hood; `cargo nextest run` matches that locally. `cargo test --workspace` also works on a default Rust setup if you'd rather not install `cargo-nextest`, but the output is less readable and isn't what CI sees.)
 
 To validate the WIT file:
 

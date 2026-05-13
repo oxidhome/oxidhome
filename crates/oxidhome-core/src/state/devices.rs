@@ -8,8 +8,8 @@
 //! The registry is `Arc<RwLock<…>>`-friendly: many readers (host-call
 //! handlers, the future API/MCP surface) share access, occasional
 //! writers (register / update / remove) take exclusive access. Phase
-//! 5a swaps the in-memory `HashMap` for the `SQLite`-backed store
-//! described in `.claude/docs/03_core.md` Appendix A.
+//! 5a swaps the in-memory `HashMap` for a `SQLite`-backed store
+//! (see the storage-backend appendix in the plan).
 
 use std::collections::HashMap;
 use std::sync::Arc;

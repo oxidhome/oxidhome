@@ -5,7 +5,7 @@
 //! harness can compose a host without spinning up the daemon.
 
 // `oxidhome-core` is a host-internal runtime crate; its public surface
-// stabilizes only at Phase 11 (external API). Until then, every public
+// stabilizes only at Phase 12 (external API). Until then, every public
 // fn returning `Result` would need a `# Errors` section that's almost
 // always restating "the operation failed" — defer the doc churn until
 // the API is settled.

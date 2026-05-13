@@ -25,34 +25,34 @@
 //!
 //! - **Plugin-defined resources** (`pipeline-handle`, `pipe-writer`,
 //!   `model`) map to the placeholder host structs in this module.
-//!   Phase 8 replaces the media handles with real pipeline state;
-//!   Phase 9 does the same for the inference model. Each world only
+//!   Phase 9 replaces the media handles with real pipeline state;
+//!   Phase 10 does the same for the inference model. Each world only
 //!   declares the mappings whose interfaces it actually imports —
 //!   `plugin` has none, `streaming-plugin` has the media pair,
 //!   `ai-plugin` has model, and `streaming-ai-plugin` has all three.
 //! - **WASI imports** are *not* remapped, even though they will be in
-//!   Phase 7 when streaming plugins start using sockets/HTTP. Some
+//!   Phase 8 when streaming plugins start using sockets/HTTP. Some
 //!   WASI interfaces (`wasi:sockets/network`, `wasi:http/types`) carry
 //!   `@unstable` features whose `add_to_linker` signatures take a
 //!   `LinkOptions` parameter; remapping them via `with:` made our
 //!   bindgen emit 2-arg call sites against the runtime's 3-arg
 //!   functions. Wiring this up correctly belongs with the work that
 //!   actually instantiates plugins against a `Linker` (Phase 2 +
-//!   Phase 7) — bindgen here generates fresh WASI types instead,
+//!   Phase 8) — bindgen here generates fresh WASI types instead,
 //!   which is fine for the compile-only validation Phase 1 needs.
 
 #![allow(missing_docs, clippy::all, clippy::pedantic)]
 
 /// Placeholder for a running media pipeline owned by the host. Real
-/// pipeline state lands in Phase 8 (`media::Pipeline`).
+/// pipeline state lands in Phase 9 (`media::Pipeline`).
 pub struct HostPipelineHandle;
 
 /// Placeholder for a host-side writer feeding a `plugin-pipe` source.
-/// Backed by a tokio mpsc channel in Phase 8.
+/// Backed by a tokio mpsc channel in Phase 9.
 pub struct HostPipeWriter;
 
 /// Placeholder for a loaded ML model handle. Real `ort`-backed handle
-/// lands in Phase 9 (`inference::ModelRegistry`).
+/// lands in Phase 10 (`inference::ModelRegistry`).
 pub struct HostModel;
 
 /// Standard plugin world — no raw I/O. No resource mappings needed

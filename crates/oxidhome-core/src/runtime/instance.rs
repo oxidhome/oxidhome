@@ -45,7 +45,7 @@ impl PluginInstance {
 
             // WASI p2 satisfies the `wasi:cli`, `wasi:io`, `wasi:clocks`
             // etc. imports the plugin's libstd pulls in. Plugin world
-            // doesn't expose WASI to the plugin author yet (Phase 7
+            // doesn't expose WASI to the plugin author yet (Phase 8
             // does, via the streaming-plugin world), but the
             // libstd-driven imports still need a real implementation.
             wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -55,8 +55,11 @@ impl PluginInstance {
             // Host imports declared by the `plugin` world: host-devices,
             // host-events, host-config, storage, logging. All wired
             // through the bindgen-generated `add_to_linker` against
-            // `PluginState`. Phase 2 only logging is functional — the
-            // others stub with `Error::Unavailable`.
+            // `PluginState`. As of Phase 3, logging + host-devices +
+            // host-events are functional; `storage::*` still returns
+            // `Error::Unavailable` (Phase 5a wires the real KV);
+            // `host-config::*` returns empty `Ok` values (`Ok(None)` /
+            // empty list) until Phase 4 wires the real config source.
             PluginBindings::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(anyhow::Error::from)
                 .context("adding plugin world host imports to linker")?;

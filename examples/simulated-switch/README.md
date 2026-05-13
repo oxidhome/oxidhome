@@ -35,7 +35,7 @@ The component is at
 
 The Phase 2 host binary loads the plugin, calls `init`, then
 `shutdown` — it has no command-line surface for sending commands or
-subscribing to events yet (Phase 11 lands the CLI). Useful as a smoke
+subscribing to events yet (Phase 12 lands the CLI). Useful as a smoke
 check that the plugin loads and registers cleanly:
 
 ```shell
@@ -62,8 +62,10 @@ To run it:
 
 ```shell
 # from the OxidHome workspace root
-cargo test -p oxidhome-core --test simulated_switch
+cargo nextest run -p oxidhome-core --test simulated_switch
 ```
+
+Needs `cargo-nextest` (covered by the workspace's `cargo install-tools` alias — see `CONTRIBUTING.md`). If you'd rather not install it, `cargo test -p oxidhome-core --test simulated_switch` works on a default Rust setup.
 
 ## Inspect the component (optional)
 
