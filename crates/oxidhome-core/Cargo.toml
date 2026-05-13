@@ -14,7 +14,7 @@ authors.workspace = true
 # until the first SDK release for external plugin authors — at which point
 # we either bundle `wit/` into the package via `package.include`, or pre-
 # generate Rust source. See the publication-policy note in ARCHITECTURE.md
-# "Implementation conventions".
+# "Implementation decisions".
 publish = false
 # Integration tests are listed explicitly below so cargo doesn't
 # auto-pick `tests/support.rs` as a no-op test target. `support.rs`

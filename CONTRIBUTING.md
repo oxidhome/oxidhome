@@ -41,13 +41,15 @@ depend on; we're cautious about changes pre-1.0 and very cautious post-1.0.
 
 ### Submitting code
 
-1. **Fork and branch.** Branch from `main`. Use a descriptive branch name (`feat/event-bus-filtering`,
-   `fix/wasmtime-config-leak`).
-2. **Match the existing style.** Run `cargo fmt` and `cargo clippy --all-targets -- -D warnings` before pushing.
+1. **Fork and branch.** Branch from `main`; never commit directly to `main`. Use a descriptive branch name matching the
+   dominant change (`feat/event-bus-filtering`, `fix/wasmtime-config-leak`, `docs/repository-guide`).
+2. **Match the existing style.** Run `cargo fmt` and `cargo clippy --all-features --all-targets -- -D warnings`
+   before pushing.
 3. **Test what you change.** Unit tests for new logic, integration tests for new host/plugin interactions.
-4. **Write meaningful commits.** Conventional Commits style is appreciated but not required (`feat:`, `fix:`, `docs:`,
-   `refactor:`).
-5. **Open a pull request** with a description of what changed and why. Link related issues.
+4. **Write meaningful commits.** Use concise scoped prefixes (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`) and pass
+   `-s` so each commit carries a `Signed-off-by` trailer.
+5. **Open a pull request** with a description of what changed and why. Link related issues. Keep verification details in
+   CI rather than adding a separate "test plan" section.
 
 PR reviews focus on correctness, design fit with the architecture, and code clarity. Expect requests for changes;
 they're not personal.
@@ -64,7 +66,7 @@ To build and test:
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace
+cargo nextest run --workspace --all-features
 ```
 
 (CI runs `cargo llvm-cov nextest` under the hood; `cargo nextest run` matches that locally. `cargo test --workspace` also works on a default Rust setup if you'd rather not install `cargo-nextest`, but the output is less readable and isn't what CI sees.)
@@ -72,20 +74,20 @@ cargo nextest run --workspace
 To validate the WIT file:
 
 ```sh
-wasm-tools component wit wit/oxidhome.wit
+wasm-tools component wit wit/
 ```
 
 ## Code conventions
 
 - **Edition:** Rust 2024 (or the latest stable edition the workspace declares).
 - **Formatting:** `cargo fmt` enforced in CI.
-- **Linting:** `cargo clippy --all-targets -- -D warnings` enforced in CI.
+- **Linting:** `cargo clippy --all-features --all-targets -- -D warnings` enforced in CI.
 - **Unsafe code:** avoid it. The workspace sets `unsafe_code = "deny"` so it is forbidden by default everywhere. In rare,
   well-justified cases (e.g., FFI, performance-critical primitives with no safe alternative) a specific block may opt in
   with `#[allow(unsafe_code)]`. Every such use must carry a `// SAFETY:` comment that explains the invariants the caller
   must uphold and why they hold here. PRs introducing new unsafe code are reviewed with extra scrutiny.
-- **Errors:** `thiserror` for libraries, `anyhow` for binaries. No `unwrap()` or `expect()` in non-test code without a
-  good reason in a comment.
+- **Errors:** `thiserror` for published library APIs; `anyhow` for binaries and host-internal crates. No `unwrap()` or
+  `expect()` in non-test code without a good reason in a comment.
 - **Async:** `tokio` runtime. Wasmtime async features enabled. No blocking calls inside async contexts.
 - **Logging:** `tracing` (not `log`). Spans for cross-component flows.
 - **Public API:** every public item gets a doc comment. `cargo doc --no-deps` should produce useful output.
