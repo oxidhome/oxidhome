@@ -389,26 +389,31 @@ fn resolve_int(
     override_val: Option<&toml::Value>,
     errors: &mut Vec<ValidationError>,
 ) -> Option<ConfigValue> {
+    // Override and default are distinct error categories:
+    // override-present-but-wrong-type pushes `TypeMismatch` and stops
+    // (the field isn't "missing"); no-override-and-no-default pushes
+    // `Required`. Without this split a single bad override produced
+    // *two* errors (TypeMismatch + Required) which read as
+    // contradictory.
     let val = if let Some(v) = override_val {
-        if let Some(n) = v.as_integer() {
-            Some(n)
-        } else {
+        let Some(n) = v.as_integer() else {
             errors.push(ValidationError::ConfigTypeMismatch {
                 path: path.to_owned(),
                 expected: "int",
                 got: type_name(v),
             });
-            None
-        }
+            return None;
+        };
+        n
     } else {
-        default
+        let Some(d) = default else {
+            errors.push(ValidationError::ConfigRequired {
+                path: path.to_owned(),
+            });
+            return None;
+        };
+        d
     };
-    let val = val.or_else(|| {
-        errors.push(ValidationError::ConfigRequired {
-            path: path.to_owned(),
-        });
-        None
-    })?;
     check_range(path, val, min, max, errors);
     Some(ConfigValue::Int(val))
 }
@@ -421,35 +426,38 @@ fn resolve_float(
     override_val: Option<&toml::Value>,
     errors: &mut Vec<ValidationError>,
 ) -> Option<ConfigValue> {
+    // Same split as `resolve_int` — see the comment there for why
+    // override-vs-default needs distinct error paths.
     let val = if let Some(v) = override_val {
-        // Accept TOML integer literals (`ratio = 1`) for float fields,
-        // matching the schema parser (`take_float`). Without this,
-        // `min = 1` works in the manifest but `ratio = 1` in a user
-        // override fails with a confusing type mismatch. Precision
-        // loss is theoretically possible for `|n| > 2^53` but the
-        // values we see in practice are small constants.
         match v {
-            toml::Value::Float(n) => Some(*n),
+            toml::Value::Float(n) => *n,
+            // Accept TOML integer literals (`ratio = 1`) for float
+            // fields, matching the schema parser (`take_float`).
+            // Without this, `min = 1` works in the manifest but
+            // `ratio = 1` in a user override fails with a confusing
+            // type mismatch. Precision loss is theoretically possible
+            // for `|n| > 2^53` but the values we see in practice are
+            // small constants.
             #[allow(clippy::cast_precision_loss)]
-            toml::Value::Integer(n) => Some(*n as f64),
+            toml::Value::Integer(n) => *n as f64,
             _ => {
                 errors.push(ValidationError::ConfigTypeMismatch {
                     path: path.to_owned(),
                     expected: "float",
                     got: type_name(v),
                 });
-                None
+                return None;
             }
         }
     } else {
-        default
+        let Some(d) = default else {
+            errors.push(ValidationError::ConfigRequired {
+                path: path.to_owned(),
+            });
+            return None;
+        };
+        d
     };
-    let val = val.or_else(|| {
-        errors.push(ValidationError::ConfigRequired {
-            path: path.to_owned(),
-        });
-        None
-    })?;
     // NaN / ±inf comparisons against the declared bounds are always
     // false, so reject non-finite overrides explicitly rather than
     // letting them slip into `InstanceConfig`.
@@ -509,26 +517,28 @@ fn resolve_enum(
         });
         return None;
     }
-    let candidate: Option<String> = if let Some(v) = override_val {
-        if let Some(s) = v.as_str() {
-            Some(s.to_owned())
-        } else {
+    // Same override-vs-default split as `resolve_int` — a wrong-type
+    // override stops at `TypeMismatch` rather than also emitting
+    // `Required`.
+    let val: String = if let Some(v) = override_val {
+        let Some(s) = v.as_str() else {
             errors.push(ValidationError::ConfigTypeMismatch {
                 path: path.to_owned(),
                 expected: "string",
                 got: type_name(v),
             });
-            None
-        }
+            return None;
+        };
+        s.to_owned()
     } else {
-        default.map(ToOwned::to_owned)
+        let Some(d) = default else {
+            errors.push(ValidationError::ConfigRequired {
+                path: path.to_owned(),
+            });
+            return None;
+        };
+        d.to_owned()
     };
-    let val = candidate.or_else(|| {
-        errors.push(ValidationError::ConfigRequired {
-            path: path.to_owned(),
-        });
-        None
-    })?;
     if !values.iter().any(|allowed| allowed == &val) {
         errors.push(ValidationError::ConfigEnumOutOfRange {
             path: path.to_owned(),
@@ -1047,6 +1057,72 @@ max = 1
                 ..
             }
         )));
+    }
+
+    /// A wrong-type override should emit `TypeMismatch` *only* — never
+    /// also `Required`. Previously the `val.or_else(push)?` shape
+    /// couldn't tell "no value" from "already-errored" and pushed both,
+    /// which reads as contradictory ("expected float, got string" +
+    /// "required field has no value").
+    #[test]
+    fn type_mismatch_does_not_also_emit_required() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "i".into(),
+            ConfigField {
+                ty: ConfigFieldType::Int {
+                    default: None,
+                    min: None,
+                    max: None,
+                },
+                description: None,
+            },
+        );
+        fields.insert(
+            "f".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: None,
+                    min: None,
+                    max: None,
+                },
+                description: None,
+            },
+        );
+        fields.insert(
+            "e".into(),
+            ConfigField {
+                ty: ConfigFieldType::Enum {
+                    values: vec!["a".into(), "b".into()],
+                    default: None,
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        let overrides: toml::Value = toml::from_str(
+            r#"
+i = "oops"
+f = "oops"
+e = 42
+"#,
+        )
+        .unwrap();
+        let errs = merge(&m, &overrides).unwrap_err();
+        // Exactly one TypeMismatch per field, no spurious Required.
+        let mismatches = errs
+            .iter()
+            .filter(|e| matches!(e, ValidationError::ConfigTypeMismatch { .. }))
+            .count();
+        let requires = errs
+            .iter()
+            .filter(|e| matches!(e, ValidationError::ConfigRequired { .. }))
+            .count();
+        assert_eq!(mismatches, 3, "one TypeMismatch per field: got {errs:?}");
+        assert_eq!(
+            requires, 0,
+            "no Required on type-mismatch path: got {errs:?}"
+        );
     }
 
     #[test]
