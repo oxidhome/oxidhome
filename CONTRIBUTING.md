@@ -73,7 +73,7 @@ cargo nextest run --workspace --all-features
 To validate the WIT file:
 
 ```sh
-wasm-tools component wit wit/oxidhome.wit
+wasm-tools component wit wit/
 ```
 
 ## Code conventions
