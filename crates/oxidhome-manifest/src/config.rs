@@ -1257,6 +1257,8 @@ max = 1
         assert_eq!(type_name(&Value::Boolean(true)), "bool");
         assert_eq!(type_name(&Value::Array(vec![])), "array");
         assert_eq!(type_name(&Value::Table(toml::value::Table::new())), "table");
+        let dt: toml::value::Datetime = "1979-05-27T07:32:00Z".parse().unwrap();
+        assert_eq!(type_name(&Value::Datetime(dt)), "datetime");
     }
 
     #[test]
