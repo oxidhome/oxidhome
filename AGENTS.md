@@ -13,7 +13,7 @@ top-level directories.
 - `cargo build --workspace`: builds all workspace crates.
 - `cargo nextest run --workspace --all-features`: runs the workspace test suite; prefer this over `cargo test`.
 - `cargo fmt --all`: formats Rust code.
-- `cargo clippy --all-targets -- -D warnings`: runs lints with warnings treated as errors.
+- `cargo clippy --all-features --all-targets -- -D warnings`: runs lints with warnings treated as errors.
 - `cargo deny check` audits licenses, advisories, bans, and sources using `deny.toml`.
 - `cargo machete` checks for unused dependencies before dependency cleanup.
 - `wasm-tools component wit wit/`: validates the full WIT package and vendored deps.

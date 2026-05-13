@@ -43,7 +43,8 @@ depend on; we're cautious about changes pre-1.0 and very cautious post-1.0.
 
 1. **Fork and branch.** Branch from `main`; never commit directly to `main`. Use a descriptive branch name matching the
    dominant change (`feat/event-bus-filtering`, `fix/wasmtime-config-leak`, `docs/repository-guide`).
-2. **Match the existing style.** Run `cargo fmt` and `cargo clippy --all-targets -- -D warnings` before pushing.
+2. **Match the existing style.** Run `cargo fmt` and `cargo clippy --all-features --all-targets -- -D warnings`
+   before pushing.
 3. **Test what you change.** Unit tests for new logic, integration tests for new host/plugin interactions.
 4. **Write meaningful commits.** Use concise scoped prefixes (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`) and pass
    `-s` so each commit carries a `Signed-off-by` trailer.
@@ -80,7 +81,7 @@ wasm-tools component wit wit/
 
 - **Edition:** Rust 2024 (or the latest stable edition the workspace declares).
 - **Formatting:** `cargo fmt` enforced in CI.
-- **Linting:** `cargo clippy --all-targets -- -D warnings` enforced in CI.
+- **Linting:** `cargo clippy --all-features --all-targets -- -D warnings` enforced in CI.
 - **Unsafe code:** avoid it. The workspace sets `unsafe_code = "deny"` so it is forbidden by default everywhere. In rare,
   well-justified cases (e.g., FFI, performance-critical primitives with no safe alternative) a specific block may opt in
   with `#[allow(unsafe_code)]`. Every such use must carry a `// SAFETY:` comment that explains the invariants the caller
