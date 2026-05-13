@@ -173,20 +173,28 @@ fn reject_whitespace(token: &str, raw: &str) -> Result<(), NetworkRuleParseError
 }
 
 /// Split off an optional trailing `:port` token. Returns `(host, None)`
-/// when no `:` appears, `(host, Some(port_str))` otherwise. IPv6 in
-/// CIDR form (e.g. `2001:db8::/32`) has no port and is correctly
-/// detected as such because the last colon is inside the address.
+/// when no `:` appears, `(host, Some(port_str))` otherwise. IPv6
+/// literals and CIDRs (e.g. `2001:db8::1`, `2001:db8::/32`) are
+/// detected as port-less here because their last colon sits inside
+/// the address — the host gets the whole string and `parse_host`
+/// hands it off to `IpAddr` / `IpNet`.
 fn split_host_port(rest: &str) -> (&str, Option<&str>) {
-    // If the candidate "port" portion contains `/` it's actually part
-    // of a CIDR, not a port — treat the whole thing as host.
     if let Some(idx) = rest.rfind(':') {
         let (host, after_colon) = rest.split_at(idx);
         let port_str = &after_colon[1..];
-        // Reject `:port` parses for IPv6 CIDRs / addresses (which have
-        // multiple `:`s) by requiring the host side to not also contain
-        // a `:` outside brackets. Phase 8 may revisit if IPv6 literals
-        // are needed; for 0.1, IPv6 must be expressed as a CIDR
-        // (e.g. `2001:db8::/32`) without a port suffix.
+        // If the candidate "host" side still contains `:`, it's an
+        // IPv6 form (multiple colons) — there's no port suffix here,
+        // so hand the whole thing back as the host and let
+        // `parse_host` validate it. Same if the candidate "port"
+        // contains `/`: that's a CIDR mask sitting where we'd expect
+        // a port number, so the whole `rest` is the host string.
+        //
+        // Limitation: this means tcp/udp/any rules can't carry an
+        // explicit port for IPv6 today (`tcp://2001:db8::/32:*` would
+        // need bracketed syntax). HTTPS works because the default
+        // port `:443` is supplied without parsing a `:port` suffix.
+        // Phase 8 will add `[…]/…:*` bracketed syntax when the
+        // streaming-plugin enforcer needs explicit-port IPv6.
         if host.contains(':') || port_str.contains('/') {
             return (rest, None);
         }
