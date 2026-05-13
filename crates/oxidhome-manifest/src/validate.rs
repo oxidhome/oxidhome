@@ -16,14 +16,13 @@ use crate::manifest::PluginManifest;
 /// to fix.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ValidationError {
-    #[error(
-        "unsupported manifest_version {got}; the highest version this build knows is {known_max}"
-    )]
-    UnsupportedManifestVersion { got: u32, known_max: u32 },
+    #[error("unsupported manifest_version {got}; this build supports only {supported:?}")]
+    UnsupportedManifestVersion { got: u32, supported: Vec<u32> },
 
     #[error(
         "plugin.id `{got}` does not match the reverse-DNS shape \
-         (`[a-z0-9][a-z0-9-]*(\\.[a-z0-9-]+)+` — e.g. `example.simulated-switch`)"
+         (`[a-z0-9][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)+` — every label must start with \
+         `[a-z0-9]`; e.g. `example.simulated-switch`)"
     )]
     InvalidPluginId { got: String },
 
@@ -60,6 +59,22 @@ pub enum ValidationError {
 
     #[error("config field `{path}`: enum has no `values` declared")]
     ConfigEnumEmpty { path: String },
+
+    #[error("config field `{path}`: declared range is invalid (min={min:?} > max={max:?})")]
+    ConfigIntRangeInvalid { path: String, min: i64, max: i64 },
+
+    #[error("config field `{path}`: declared range is invalid (min={min:?} > max={max:?})")]
+    ConfigFloatRangeInvalid { path: String, min: f64, max: f64 },
+
+    #[error(
+        "config field `{path}`: float `{role}` is not finite ({got}). NaN and ±inf are not \
+         valid config values."
+    )]
+    ConfigFloatNotFinite {
+        path: String,
+        role: &'static str,
+        got: f64,
+    },
 
     // --- merge-time errors. Validation calls don't emit these, but
     //     `merge` reuses the same vocabulary so the surfacing layer can
@@ -98,9 +113,11 @@ pub enum ValidationError {
     ConfigOverrideShape { path: String },
 }
 
-/// Highest `manifest_version` this build recognises. Bump when a new
-/// version is added (and keep deserialization for the old one).
-pub const KNOWN_MAX_MANIFEST_VERSION: u32 = 1;
+/// Every `manifest_version` this build accepts. Add to this list when
+/// a new manifest schema is introduced (and keep deserialization for
+/// the old one, per the format-evolution policy in the per-crate
+/// plan).
+pub const SUPPORTED_MANIFEST_VERSIONS: &[u32] = &[1];
 
 /// Run every check against `m` and collect all findings.
 ///
@@ -112,10 +129,10 @@ pub const KNOWN_MAX_MANIFEST_VERSION: u32 = 1;
 pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
 
-    if m.manifest_version > KNOWN_MAX_MANIFEST_VERSION {
+    if !SUPPORTED_MANIFEST_VERSIONS.contains(&m.manifest_version) {
         errors.push(ValidationError::UnsupportedManifestVersion {
             got: m.manifest_version,
-            known_max: KNOWN_MAX_MANIFEST_VERSION,
+            supported: SUPPORTED_MANIFEST_VERSIONS.to_vec(),
         });
     }
 
@@ -146,69 +163,13 @@ fn validate_config_field(path: &str, field: &ConfigField, errors: &mut Vec<Valid
     match &field.ty {
         ConfigFieldType::Bool { .. } | ConfigFieldType::String { .. } => {}
         ConfigFieldType::Int { default, min, max } => {
-            if let Some(d) = default {
-                if let Some(min) = min
-                    && d < min
-                {
-                    errors.push(ValidationError::ConfigIntDefaultOutOfRange {
-                        path: path.to_owned(),
-                        got: *d,
-                        min: Some(*min),
-                        max: *max,
-                    });
-                }
-                if let Some(max) = max
-                    && d > max
-                {
-                    errors.push(ValidationError::ConfigIntDefaultOutOfRange {
-                        path: path.to_owned(),
-                        got: *d,
-                        min: *min,
-                        max: Some(*max),
-                    });
-                }
-            }
+            validate_int_field(path, *default, *min, *max, errors);
         }
         ConfigFieldType::Float { default, min, max } => {
-            if let Some(d) = default {
-                if let Some(min) = min
-                    && d < min
-                {
-                    errors.push(ValidationError::ConfigFloatDefaultOutOfRange {
-                        path: path.to_owned(),
-                        got: *d,
-                        min: Some(*min),
-                        max: *max,
-                    });
-                }
-                if let Some(max) = max
-                    && d > max
-                {
-                    errors.push(ValidationError::ConfigFloatDefaultOutOfRange {
-                        path: path.to_owned(),
-                        got: *d,
-                        min: *min,
-                        max: Some(*max),
-                    });
-                }
-            }
+            validate_float_field(path, *default, *min, *max, errors);
         }
         ConfigFieldType::Enum { values, default } => {
-            if values.is_empty() {
-                errors.push(ValidationError::ConfigEnumEmpty {
-                    path: path.to_owned(),
-                });
-            }
-            if let Some(d) = default
-                && !values.is_empty()
-                && !values.contains(d)
-            {
-                errors.push(ValidationError::ConfigEnumDefaultOutOfRange {
-                    path: path.to_owned(),
-                    got: d.clone(),
-                    allowed: values.clone(),
-                });
-            }
+            validate_enum_field(path, values, default.as_deref(), errors);
         }
         ConfigFieldType::Nested { fields } => {
             for (sub_name, sub_field) in fields {
@@ -216,6 +177,143 @@ fn validate_config_field(path: &str, field: &ConfigField, errors: &mut Vec<Valid
                 validate_config_field(&sub_path, sub_field, errors);
             }
         }
+    }
+}
+
+fn validate_int_field(
+    path: &str,
+    default: Option<i64>,
+    min: Option<i64>,
+    max: Option<i64>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(min) = min
+        && let Some(max) = max
+        && min > max
+    {
+        errors.push(ValidationError::ConfigIntRangeInvalid {
+            path: path.to_owned(),
+            min,
+            max,
+        });
+    }
+    let Some(d) = default else { return };
+    if let Some(min) = min
+        && d < min
+    {
+        errors.push(ValidationError::ConfigIntDefaultOutOfRange {
+            path: path.to_owned(),
+            got: d,
+            min: Some(min),
+            max,
+        });
+    }
+    if let Some(max) = max
+        && d > max
+    {
+        errors.push(ValidationError::ConfigIntDefaultOutOfRange {
+            path: path.to_owned(),
+            got: d,
+            min,
+            max: Some(max),
+        });
+    }
+}
+
+fn validate_float_field(
+    path: &str,
+    default: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+    errors: &mut Vec<ValidationError>,
+) {
+    // NaN / ±inf bypass `<`/`>` comparisons silently — reject them up
+    // front so a malformed default doesn't fall through into runtime
+    // values.
+    check_float_finite(path, default, "default", errors);
+    check_float_finite(path, min, "min", errors);
+    check_float_finite(path, max, "max", errors);
+
+    if let Some(min) = min
+        && let Some(max) = max
+        && min.is_finite()
+        && max.is_finite()
+        && min > max
+    {
+        errors.push(ValidationError::ConfigFloatRangeInvalid {
+            path: path.to_owned(),
+            min,
+            max,
+        });
+    }
+    let Some(d) = default else { return };
+    if !d.is_finite() {
+        return;
+    }
+    if let Some(min) = min
+        && min.is_finite()
+        && d < min
+    {
+        errors.push(ValidationError::ConfigFloatDefaultOutOfRange {
+            path: path.to_owned(),
+            got: d,
+            min: Some(min),
+            max,
+        });
+    }
+    if let Some(max) = max
+        && max.is_finite()
+        && d > max
+    {
+        errors.push(ValidationError::ConfigFloatDefaultOutOfRange {
+            path: path.to_owned(),
+            got: d,
+            min,
+            max: Some(max),
+        });
+    }
+}
+
+fn validate_enum_field(
+    path: &str,
+    values: &[String],
+    default: Option<&str>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if values.is_empty() {
+        errors.push(ValidationError::ConfigEnumEmpty {
+            path: path.to_owned(),
+        });
+    }
+    if let Some(d) = default
+        && !values.is_empty()
+        && !values.iter().any(|v| v == d)
+    {
+        errors.push(ValidationError::ConfigEnumDefaultOutOfRange {
+            path: path.to_owned(),
+            got: d.to_owned(),
+            allowed: values.to_vec(),
+        });
+    }
+}
+
+/// Push a `ConfigFloatNotFinite` if `v` is `Some(NaN)` or `Some(±inf)`.
+/// The validator runs this for `default`, `min`, and `max` separately
+/// so the operator sees which field is malformed.
+fn check_float_finite(
+    path: &str,
+    v: Option<f64>,
+    role: &'static str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(v) = v
+        && !v.is_finite()
+    {
+        errors.push(ValidationError::ConfigFloatNotFinite {
+            path: path.to_owned(),
+            role,
+            got: v,
+        });
     }
 }
 
@@ -523,6 +621,118 @@ mod tests {
             },
         );
         validate(&m).expect("default in values should pass");
+    }
+
+    #[test]
+    fn manifest_version_zero_rejected() {
+        let mut m = ok_manifest();
+        m.manifest_version = 0;
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::UnsupportedManifestVersion { got: 0, .. }
+        )));
+    }
+
+    #[test]
+    fn flags_int_range_invalid() {
+        let mut m = ok_manifest();
+        m.config.insert(
+            "n".into(),
+            ConfigField {
+                ty: ConfigFieldType::Int {
+                    default: None,
+                    min: Some(100),
+                    max: Some(10),
+                },
+                description: None,
+            },
+        );
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::ConfigIntRangeInvalid {
+                min: 100,
+                max: 10,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn flags_float_range_invalid() {
+        let mut m = ok_manifest();
+        m.config.insert(
+            "f".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: None,
+                    min: Some(1.0),
+                    max: Some(0.5),
+                },
+                description: None,
+            },
+        );
+        let errs = validate(&m).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::ConfigFloatRangeInvalid { .. }))
+        );
+    }
+
+    #[test]
+    fn flags_non_finite_float_default() {
+        for (role, v) in [
+            ("default", f64::NAN),
+            ("default", f64::INFINITY),
+            ("default", f64::NEG_INFINITY),
+        ] {
+            let mut m = ok_manifest();
+            m.config.insert(
+                "f".into(),
+                ConfigField {
+                    ty: ConfigFieldType::Float {
+                        default: Some(v),
+                        min: None,
+                        max: None,
+                    },
+                    description: None,
+                },
+            );
+            let errs = validate(&m).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::ConfigFloatNotFinite { role: r, .. } if *r == role
+                )),
+                "expected NotFinite for {role} = {v}, got {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn flags_non_finite_float_min_and_max() {
+        let mut m = ok_manifest();
+        m.config.insert(
+            "f".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: Some(0.5),
+                    min: Some(f64::NAN),
+                    max: Some(f64::INFINITY),
+                },
+                description: None,
+            },
+        );
+        let errs = validate(&m).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::ConfigFloatNotFinite { role: "min", .. }))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::ConfigFloatNotFinite { role: "max", .. }))
+        );
     }
 
     #[test]

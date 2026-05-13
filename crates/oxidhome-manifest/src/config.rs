@@ -264,6 +264,17 @@ fn resolve_float(
         });
         None
     })?;
+    // NaN / ±inf comparisons against the declared bounds are always
+    // false, so reject non-finite overrides explicitly rather than
+    // letting them slip into `InstanceConfig`.
+    if !val.is_finite() {
+        errors.push(ValidationError::ConfigFloatNotFinite {
+            path: path.to_owned(),
+            role: "override",
+            got: val,
+        });
+        return None;
+    }
     check_range_f(path, val, min, max, errors);
     Some(ConfigValue::Float(val))
 }
@@ -857,6 +868,46 @@ mod tests {
         assert_eq!(type_name(&Value::Boolean(true)), "bool");
         assert_eq!(type_name(&Value::Array(vec![])), "array");
         assert_eq!(type_name(&Value::Table(toml::value::Table::new())), "table");
+    }
+
+    #[test]
+    fn merge_rejects_non_finite_float_override() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "r".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: Some(0.5),
+                    min: Some(0.0),
+                    max: Some(1.0),
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        // TOML can't directly express NaN/inf in its literal grammar,
+        // so we hand-build a `toml::Value`.
+        let mut t = toml::value::Table::new();
+        t.insert("r".into(), toml::Value::Float(f64::NAN));
+        let errs = merge(&m, &toml::Value::Table(t)).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::ConfigFloatNotFinite {
+                role: "override",
+                ..
+            }
+        )));
+
+        let mut t = toml::value::Table::new();
+        t.insert("r".into(), toml::Value::Float(f64::INFINITY));
+        let errs = merge(&m, &toml::Value::Table(t)).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::ConfigFloatNotFinite {
+                role: "override",
+                ..
+            }
+        )));
     }
 
     #[test]

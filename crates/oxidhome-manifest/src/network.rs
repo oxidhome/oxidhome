@@ -122,10 +122,14 @@ impl FromStr for NetworkRule {
             other => return Err(NetworkRuleParseError::UnknownProto(other.to_owned())),
         };
 
-        // Split host[:port]. CIDRs contain a `/` but no `:` (IPv4) or are
-        // bracketed (IPv6). For now we only support unbracketed forms;
-        // IPv6 CIDRs are written without a port — `:*` is required if a
-        // port match is desired.
+        // Split host[:port]. IPv4 CIDRs contain `/` but no `:`.
+        // IPv6 hosts/CIDRs aren't supported today: `split_host_port`
+        // treats any host containing `:` as "no port suffix", so an
+        // IPv6 rule has no way to express a port. Phase 8 will add
+        // bracketed IPv6 syntax (`[2001:db8::]/32:*`) when the
+        // streaming-plugin enforcer needs it. The
+        // `ipv6_cidr_currently_unsupported` test pins this so removing
+        // the limitation is a deliberate change.
         let (host_str, port_str_opt) = split_host_port(rest);
 
         let host = parse_host(host_str, raw)?;
