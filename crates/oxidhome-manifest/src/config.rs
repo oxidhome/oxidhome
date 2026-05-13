@@ -422,15 +422,24 @@ fn resolve_float(
     errors: &mut Vec<ValidationError>,
 ) -> Option<ConfigValue> {
     let val = if let Some(v) = override_val {
-        if let Some(n) = v.as_float() {
-            Some(n)
-        } else {
-            errors.push(ValidationError::ConfigTypeMismatch {
-                path: path.to_owned(),
-                expected: "float",
-                got: type_name(v),
-            });
-            None
+        // Accept TOML integer literals (`ratio = 1`) for float fields,
+        // matching the schema parser (`take_float`). Without this,
+        // `min = 1` works in the manifest but `ratio = 1` in a user
+        // override fails with a confusing type mismatch. Precision
+        // loss is theoretically possible for `|n| > 2^53` but the
+        // values we see in practice are small constants.
+        match v {
+            toml::Value::Float(n) => Some(*n),
+            #[allow(clippy::cast_precision_loss)]
+            toml::Value::Integer(n) => Some(*n as f64),
+            _ => {
+                errors.push(ValidationError::ConfigTypeMismatch {
+                    path: path.to_owned(),
+                    expected: "float",
+                    got: type_name(v),
+                });
+                None
+            }
         }
     } else {
         default
@@ -968,6 +977,66 @@ max = 1
                 .any(|e| matches!(e, ValidationError::ConfigOutOfRange { .. }))
         );
         // override with wrong type
+        let overrides: toml::Value = toml::from_str("ratio = \"oops\"").unwrap();
+        let errs = merge(&m, &overrides).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::ConfigTypeMismatch {
+                expected: "float",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn merge_float_override_accepts_integer_literal() {
+        // TOML distinguishes `0` and `0.0`; the manifest UX shouldn't —
+        // and `take_float` already accepts `min = 1` in the schema, so
+        // `ratio = 1` in an override must work too.
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "ratio".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: Some(0.5),
+                    min: Some(0.0),
+                    max: Some(2.0),
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+
+        let overrides: toml::Value = toml::from_str("ratio = 1").unwrap();
+        let cfg = merge(&m, &overrides).unwrap();
+        assert_eq!(cfg.get("ratio"), Some(&ConfigValue::Float(1.0)));
+
+        // Out-of-range integer literal still trips the range check.
+        let overrides: toml::Value = toml::from_str("ratio = 3").unwrap();
+        let errs = merge(&m, &overrides).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::ConfigOutOfRange { .. }))
+        );
+    }
+
+    #[test]
+    fn merge_float_override_still_rejects_non_numeric() {
+        // The integer-literal carve-out shouldn't accidentally let
+        // strings or bools through.
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "ratio".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: None,
+                    min: None,
+                    max: None,
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
         let overrides: toml::Value = toml::from_str("ratio = \"oops\"").unwrap();
         let errs = merge(&m, &overrides).unwrap_err();
         assert!(errs.iter().any(|e| matches!(
