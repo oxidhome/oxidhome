@@ -176,6 +176,23 @@ pub fn subscribe_device(device_id: DeviceId) -> Result<SubscriptionId, Error> {
     })
 }
 
+/// Subscribe to events by topic. Capability events
+/// (`state-changed`, `button`, `inference`) match exactly on the
+/// capability/topic name; custom events match by **prefix** — a
+/// subscription to `"camera."` receives every `camera.motion`,
+/// `camera.snapshot`, etc. Sugar for [`subscribe`] with `device =
+/// None` and `topic = Some(topic.into())`.
+///
+/// # Errors
+///
+/// Same as [`subscribe`].
+pub fn subscribe_topic(topic: impl Into<String>) -> Result<SubscriptionId, Error> {
+    subscribe(&EventFilter {
+        device: None,
+        topic: Some(topic.into()),
+    })
+}
+
 /// Drop a subscription previously returned by [`subscribe`].
 ///
 /// # Errors
