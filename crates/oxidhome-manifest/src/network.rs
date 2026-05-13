@@ -103,6 +103,10 @@ pub enum NetworkRuleParseError {
     InvalidPortRange(String),
     #[error("port required for proto `{0}` (use `:*` for any port)")]
     MissingPort(&'static str),
+    #[error("invalid host `{0}`: a host containing `:` must be a valid IPv6 literal or CIDR")]
+    InvalidHost(String),
+    #[error("invalid token `{0}` in rule `{1}`: whitespace not allowed")]
+    WhitespaceInToken(String, String),
 }
 
 impl FromStr for NetworkRule {
@@ -139,6 +143,15 @@ impl FromStr for NetworkRule {
         // change.
         let (host_str, port_str_opt) = split_host_port(rest);
 
+        // Reject any whitespace inside the split tokens. The full `raw`
+        // is `trim()`'d above; internal whitespace (e.g. `tcp:// host`
+        // or `tcp://host: 1883`) is a typo we want to surface, not
+        // silently absorb into a host string.
+        reject_whitespace(host_str, raw)?;
+        if let Some(p) = port_str_opt {
+            reject_whitespace(p, raw)?;
+        }
+
         let host = parse_host(host_str, raw)?;
         let port = match port_str_opt {
             Some(s) => parse_port(s, raw)?,
@@ -147,6 +160,16 @@ impl FromStr for NetworkRule {
 
         Ok(NetworkRule { proto, host, port })
     }
+}
+
+fn reject_whitespace(token: &str, raw: &str) -> Result<(), NetworkRuleParseError> {
+    if token.chars().any(char::is_whitespace) {
+        return Err(NetworkRuleParseError::WhitespaceInToken(
+            token.to_owned(),
+            raw.to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Split off an optional trailing `:port` token. Returns `(host, None)`
@@ -194,6 +217,13 @@ fn parse_host(host_str: &str, full: &str) -> Result<HostMatch, NetworkRuleParseE
     // form keeps the manifest readable.
     if let Ok(ip) = host_str.parse::<IpAddr>() {
         return Ok(HostMatch::Exact(ip.to_string()));
+    }
+    // A host that still contains `:` at this point isn't a wildcard,
+    // CIDR, or valid IP literal — that's a malformed rule like
+    // `https://example.com:80:90` (two ports) or a typo'd IPv6. Reject
+    // rather than absorbing the colons into a Exact host string.
+    if host_str.contains(':') {
+        return Err(NetworkRuleParseError::InvalidHost(host_str.to_owned()));
     }
     Ok(HostMatch::Exact(host_str.to_owned()))
 }
@@ -347,6 +377,52 @@ mod tests {
             matches!(err, NetworkRuleParseError::MissingPort(_)),
             "got {err:?}",
         );
+    }
+
+    #[test]
+    fn double_port_rejected() {
+        // The previously-too-lenient parser would silently turn
+        // `https://example.com:80:90` into host = "example.com:80:90",
+        // port = 443. Tighter `parse_host` now rejects it.
+        let err = "https://example.com:80:90"
+            .parse::<NetworkRule>()
+            .unwrap_err();
+        assert!(
+            matches!(err, NetworkRuleParseError::InvalidHost(_)),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_internal_whitespace() {
+        // Stray whitespace *inside* a token is almost certainly a typo;
+        // surfacing it as a parse error beats silently building a host
+        // string with embedded spaces. Whitespace at the *edges* of the
+        // whole rule is intentionally trimmed (see
+        // `outer_whitespace_is_trimmed`).
+        for bad in [
+            "tcp:// mqtt.example.com:1883", // leading space in host
+            "tcp://mqtt.example.com :1883", // trailing space in host
+            "tcp://mqtt.example.com: 1883", // leading space in port
+            "tcp://mqtt example.com:1883",  // embedded space in host
+        ] {
+            let err = bad.parse::<NetworkRule>().unwrap_err();
+            assert!(
+                matches!(err, NetworkRuleParseError::WhitespaceInToken(_, _)),
+                "expected WhitespaceInToken for `{bad}`, got {err:?}",
+            );
+        }
+    }
+
+    /// Whitespace at the *edges* of the whole rule string is intentionally
+    /// trimmed by `from_str` — a TOML author's stray leading/trailing
+    /// space shouldn't fail the install. Only whitespace *inside* a
+    /// token (host or port) is rejected.
+    #[test]
+    fn outer_whitespace_is_trimmed() {
+        let r = rule("  tcp://mqtt.example.com:1883  ");
+        assert_eq!(r.host, HostMatch::Exact("mqtt.example.com".into()));
+        assert_eq!(r.port, PortMatch::Exact(1883));
     }
 
     #[test]
