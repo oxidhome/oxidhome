@@ -11,9 +11,18 @@ use thiserror::Error;
 use crate::config::{ConfigField, ConfigFieldType};
 use crate::manifest::PluginManifest;
 
-/// One validator finding. Each variant carries the manifest *field
-/// path* (e.g. `"plugin.id"`, `"config.broker.host"`) plus enough
-/// context for the error message to point a human at what to fix.
+/// One validator finding. Variants carry the field-specific context
+/// needed for an error message to point at what to fix:
+///
+/// - Variants with a `path` field (`ConfigEnumEmpty`,
+///   `ConfigTypeMismatch`, …) name a config field *relative to
+///   `[config]`* — e.g. `"default_state"` for `[config.default_state]`,
+///   or `"broker.host"` for a nested `[config.broker.host]`. There is
+///   no `config.` prefix on these paths.
+/// - Variants without `path` carry the offending value directly —
+///   `InvalidPluginId { got }`, `UnknownDeclaredDeviceCapability { got }`,
+///   etc.
+///
 /// Source-line / column / span information from the TOML parser is
 /// not threaded through today — `toml` exposes spans via
 /// `serde_spanned`, and a future Phase-4 follow-up can wire them
