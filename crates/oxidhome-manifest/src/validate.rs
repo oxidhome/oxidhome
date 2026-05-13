@@ -11,9 +11,13 @@ use thiserror::Error;
 use crate::config::{ConfigField, ConfigFieldType};
 use crate::manifest::PluginManifest;
 
-/// One validator finding. Variants carry the original location and
-/// enough context for the error message to point a human at the line
-/// to fix.
+/// One validator finding. Each variant carries the manifest *field
+/// path* (e.g. `"plugin.id"`, `"config.broker.host"`) plus enough
+/// context for the error message to point a human at what to fix.
+/// Source-line / column / span information from the TOML parser is
+/// not threaded through today — `toml` exposes spans via
+/// `serde_spanned`, and a future Phase-4 follow-up can wire them
+/// into these variants when the install dialog needs them.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ValidationError {
     #[error("unsupported manifest_version {got}; this build supports only {supported:?}")]
