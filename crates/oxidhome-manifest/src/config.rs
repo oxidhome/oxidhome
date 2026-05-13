@@ -596,6 +596,22 @@ fn check_range(
     max: Option<i64>,
     errors: &mut Vec<ValidationError>,
 ) {
+    // `validate` flags `min > max` schemas ahead of time, but `merge`
+    // may be called without it (e.g. CLI test harnesses). Surface the
+    // schema error here too rather than letting the inverted bounds
+    // produce confusing `ConfigOutOfRange` pairs (`>= 100` *and*
+    // `<= 10`) for any value in the world.
+    if let Some(min) = min
+        && let Some(max) = max
+        && min > max
+    {
+        errors.push(ValidationError::ConfigIntRangeInvalid {
+            path: path.to_owned(),
+            min,
+            max,
+        });
+        return;
+    }
     if let Some(min) = min
         && val < min
     {
@@ -623,6 +639,23 @@ fn check_range_f(
     max: Option<f64>,
     errors: &mut Vec<ValidationError>,
 ) {
+    // See `check_range`. Float bounds add an extra wrinkle: NaN
+    // comparisons are always false, so we only treat the schema as
+    // invalid when both bounds are *finite*. Non-finite bounds are a
+    // separate finding the validator surfaces as `ConfigFloatNotFinite`.
+    if let Some(min) = min
+        && let Some(max) = max
+        && min.is_finite()
+        && max.is_finite()
+        && min > max
+    {
+        errors.push(ValidationError::ConfigFloatRangeInvalid {
+            path: path.to_owned(),
+            min,
+            max,
+        });
+        return;
+    }
     if let Some(min) = min
         && val < min
     {
@@ -1209,6 +1242,77 @@ e = 42
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn merge_int_invalid_range_emits_schema_error() {
+        // `merge` may be invoked without a prior `validate`; in that
+        // case an inverted bound (`min > max`) shouldn't manifest as
+        // a pair of confusing `ConfigOutOfRange` findings ("got X, must
+        // be >= 100 *and* <= 10") — it's a schema bug, surfaced via
+        // `ConfigIntRangeInvalid`.
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "n".into(),
+            ConfigField {
+                ty: ConfigFieldType::Int {
+                    default: None,
+                    min: Some(100),
+                    max: Some(10),
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        let overrides: toml::Value = toml::from_str("n = 50").unwrap();
+        let errs = merge(&m, &overrides).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::ConfigIntRangeInvalid {
+                    min: 100,
+                    max: 10,
+                    ..
+                }
+            )),
+            "expected ConfigIntRangeInvalid, got {errs:?}",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConfigOutOfRange { .. })),
+            "should not fall through to ConfigOutOfRange: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn merge_float_invalid_range_emits_schema_error() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "f".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: None,
+                    min: Some(1.0),
+                    max: Some(0.5),
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        let overrides: toml::Value = toml::from_str("f = 0.7").unwrap();
+        let errs = merge(&m, &overrides).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::ConfigFloatRangeInvalid { .. })),
+            "expected ConfigFloatRangeInvalid, got {errs:?}",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConfigOutOfRange { .. })),
+            "should not fall through to ConfigOutOfRange: {errs:?}",
+        );
     }
 
     #[test]
