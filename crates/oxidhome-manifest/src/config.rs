@@ -662,6 +662,7 @@ mod tests {
                 description: None,
                 source: None,
                 license: None,
+                keywords: vec![],
                 world: World::Plugin,
                 sdk_version: Version::new(0, 1, 0),
             },

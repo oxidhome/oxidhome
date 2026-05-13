@@ -33,6 +33,19 @@ pub enum ValidationError {
     UnknownDeclaredDeviceCapability { got: String },
 
     #[error(
+        "plugin.keywords has {count} entries; the cap is {max}. Trim the list — \
+         beyond that it's harder to skim than the plugin's name and description."
+    )]
+    TooManyKeywords { count: usize, max: usize },
+
+    #[error("plugin.keywords[{index}] `{got}` is invalid: {reason}")]
+    InvalidKeyword {
+        index: usize,
+        got: String,
+        reason: &'static str,
+    },
+
+    #[error(
         "config field `{path}`: enum `default` `{got}` is not in `values` (allowed: {allowed:?})"
     )]
     ConfigEnumDefaultOutOfRange {
@@ -119,6 +132,14 @@ pub enum ValidationError {
 /// plan).
 pub const SUPPORTED_MANIFEST_VERSIONS: &[u32] = &[1];
 
+/// Maximum number of entries allowed in `plugin.keywords`. Soft cap
+/// to keep the UI's filter chip list readable; beyond this a plugin
+/// author probably wants a `description` instead.
+pub const MAX_KEYWORDS: usize = 16;
+
+/// Maximum length of a single keyword in characters.
+pub const MAX_KEYWORD_LEN: usize = 50;
+
 /// Run every check against `m` and collect all findings.
 ///
 /// # Errors
@@ -147,6 +168,8 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
             errors.push(ValidationError::UnknownDeclaredDeviceCapability { got: cap.clone() });
         }
     }
+
+    validate_keywords(&m.plugin.keywords, &mut errors);
 
     for (path, field) in &m.config {
         validate_config_field(path, field, &mut errors);
@@ -297,6 +320,54 @@ fn validate_enum_field(
     }
 }
 
+/// Validate `plugin.keywords`. The UI uses these for filter/group
+/// facets, so they need a predictable shape:
+/// - lowercase kebab-case: first char `[a-z0-9]`, then `[a-z0-9-]*`
+/// - 1 to [`MAX_KEYWORD_LEN`] chars
+/// - at most [`MAX_KEYWORDS`] per plugin
+fn validate_keywords(keywords: &[String], errors: &mut Vec<ValidationError>) {
+    if keywords.len() > MAX_KEYWORDS {
+        errors.push(ValidationError::TooManyKeywords {
+            count: keywords.len(),
+            max: MAX_KEYWORDS,
+        });
+    }
+    for (index, kw) in keywords.iter().enumerate() {
+        let reason = keyword_problem(kw);
+        if let Some(reason) = reason {
+            errors.push(ValidationError::InvalidKeyword {
+                index,
+                got: kw.clone(),
+                reason,
+            });
+        }
+    }
+}
+
+fn keyword_problem(kw: &str) -> Option<&'static str> {
+    if kw.is_empty() {
+        return Some("empty");
+    }
+    if kw.len() > MAX_KEYWORD_LEN {
+        return Some("exceeds 50 characters");
+    }
+    if !is_valid_keyword(kw) {
+        return Some("must be lowercase kebab-case (`[a-z0-9][a-z0-9-]*`)");
+    }
+    None
+}
+
+fn is_valid_keyword(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// Push a `ConfigFloatNotFinite` if `v` is `Some(NaN)` or `Some(±inf)`.
 /// The validator runs this for `default`, `min`, and `max` separately
 /// so the operator sees which field is malformed.
@@ -380,6 +451,7 @@ mod tests {
                 description: None,
                 source: None,
                 license: None,
+                keywords: vec![],
                 world: World::Plugin,
                 sdk_version: Version::new(0, 1, 0),
             },
@@ -621,6 +693,80 @@ mod tests {
             },
         );
         validate(&m).expect("default in values should pass");
+    }
+
+    #[test]
+    fn keywords_accept_typical_shapes() {
+        let mut m = ok_manifest();
+        m.plugin.keywords = vec![
+            "switch".into(),
+            "matter".into(),
+            "home-assistant-compat".into(),
+            "zigbee2mqtt".into(),
+            "v2".into(), // digit-led labels are fine
+        ];
+        validate(&m).expect("typical keywords should pass");
+    }
+
+    #[test]
+    fn keywords_reject_too_many() {
+        let mut m = ok_manifest();
+        m.plugin.keywords = (0..=MAX_KEYWORDS).map(|i| format!("k{i}")).collect();
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::TooManyKeywords { count, max } if *max == MAX_KEYWORDS && *count == MAX_KEYWORDS + 1
+        )));
+    }
+
+    #[test]
+    fn keywords_reject_empty_string() {
+        let mut m = ok_manifest();
+        m.plugin.keywords = vec!["ok".into(), String::new()];
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidKeyword {
+                index: 1,
+                reason: "empty",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn keywords_reject_too_long() {
+        let mut m = ok_manifest();
+        let long = "a".repeat(MAX_KEYWORD_LEN + 1);
+        m.plugin.keywords = vec![long.clone()];
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidKeyword { reason: "exceeds 50 characters", got, .. } if got == &long
+        )));
+    }
+
+    #[test]
+    fn keywords_reject_bad_charset() {
+        let mut m = ok_manifest();
+        m.plugin.keywords = vec![
+            "UPPER".into(),      // uppercase
+            "with space".into(), // space
+            "trailing-".into(),  // valid (trailing dash is allowed by `[a-z0-9-]*`)
+            "-leading".into(),   // leading dash → invalid
+            "spe!cial".into(),   // punctuation
+        ];
+        let errs = validate(&m).unwrap_err();
+        let kebab_errs: Vec<_> = errs
+            .iter()
+            .filter(|e| matches!(
+                e,
+                ValidationError::InvalidKeyword { reason: r, .. } if r.starts_with("must be lowercase kebab-case")
+            ))
+            .collect();
+        // UPPER, "with space", "-leading", "spe!cial" — 4 invalid.
+        // "trailing-" is allowed because the grammar is `first [a-z0-9], rest [a-z0-9-]*`.
+        assert_eq!(kebab_errs.len(), 4, "got {errs:?}");
     }
 
     #[test]

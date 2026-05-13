@@ -75,6 +75,13 @@ pub struct PluginSection {
     pub source: Option<String>,
     #[serde(default)]
     pub license: Option<String>,
+    /// Free-form keywords the UI uses for filtering and grouping
+    /// (`camera`, `lighting`, `matter`, `home-assistant-compat`, …).
+    /// Each is lowercase kebab-case, 1–50 chars; up to
+    /// [`crate::validate::MAX_KEYWORDS`] per plugin. Mirrors Cargo's
+    /// `[package].keywords` convention.
+    #[serde(default)]
+    pub keywords: Vec<String>,
     /// Which plugin world this component was built against.
     pub world: World,
     /// `oxidhome-sdk` version the plugin was built against. The host
@@ -223,6 +230,7 @@ authors = ["The OxidHome Contributors"]
 description = "A switch with no real hardware backing it."
 source = "https://github.com/oxidhome/oxidhome/tree/main/examples/simulated-switch"
 license = "MIT OR Apache-2.0"
+keywords = ["switch", "example", "simulated"]
 world = "plugin"
 sdk_version = "0.1.0"
 
@@ -268,6 +276,14 @@ scripts = "none"
         assert_eq!(m.plugin.world, World::Plugin);
         assert_eq!(m.plugin.version, Version::new(0, 1, 0));
         assert_eq!(m.runtime.wasm, PathBuf::from("simulated-switch.wasm"));
+        assert_eq!(
+            m.plugin.keywords,
+            vec![
+                "switch".to_owned(),
+                "example".to_owned(),
+                "simulated".to_owned()
+            ],
+        );
         assert_eq!(m.runtime.tick_interval_ms, Some(1000));
         assert_eq!(m.runtime.fuel_per_call, Some(50_000_000));
         assert_eq!(m.capabilities.storage_quota_kb, 64);
