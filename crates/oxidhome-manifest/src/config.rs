@@ -15,7 +15,8 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::manifest::PluginManifest;
 use crate::validate::ValidationError;
@@ -34,16 +35,20 @@ use crate::validate::ValidationError;
 /// `type` discriminates the variant; the `default`/`values`/`fields`
 /// keys are interpreted per variant.
 //
-// `deny_unknown_fields` is *not* applied here: it interacts badly
-// with `#[serde(flatten)]` on internally-tagged enums (serde sees
-// fields routed via flatten as "unknown" at the outer struct). The
-// inner `ConfigFieldType` keeps `deny_unknown_fields` so per-variant
-// payloads are still strictly validated.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Strict deserialization is implemented by hand below rather than
+// derived: serde's `deny_unknown_fields` on internally-tagged enums
+// combined with `#[serde(flatten)]` doesn't reliably reject unknown
+// keys, so a typo'd `defualt` or a misplaced `min` on a `bool` would
+// silently disappear. The custom `Deserialize` impl below routes the
+// TOML table through a strict helper, then dispatches on `type` and
+// rejects any field that isn't part of the chosen variant. Serialize
+// remains derived since the typed enum naturally produces the right
+// on-disk shape.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConfigField {
     #[serde(flatten)]
     pub ty: ConfigFieldType,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
@@ -84,6 +89,178 @@ pub enum ConfigFieldType {
     Nested {
         fields: BTreeMap<String, ConfigField>,
     },
+}
+
+/// Strict-key helper used by [`ConfigField`]'s custom `Deserialize`.
+///
+/// Every possible per-variant key is listed once with `#[serde(default)]`
+/// so omission is OK. `deny_unknown_fields` then refuses anything
+/// outside this set, which catches typos like `defualt = true` at parse
+/// time. The dispatch in [`ConfigField::deserialize`] additionally
+/// rejects keys that *exist* in the helper but don't apply to the
+/// declared `type` — e.g. `min` on a `bool`, or `values` on an `int`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFieldHelper {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    default: Option<toml::Value>,
+    #[serde(default)]
+    min: Option<toml::Value>,
+    #[serde(default)]
+    max: Option<toml::Value>,
+    #[serde(default)]
+    values: Option<Vec<String>>,
+    #[serde(default)]
+    fields: Option<BTreeMap<String, ConfigField>>,
+}
+
+impl<'de> Deserialize<'de> for ConfigField {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let h = ConfigFieldHelper::deserialize(d)?;
+        let ty = match h.kind.as_str() {
+            "bool" => {
+                ensure_unset::<D>(&h, &["values", "fields", "min", "max"], "bool")?;
+                let default = match h.default {
+                    None => None,
+                    Some(toml::Value::Boolean(b)) => Some(b),
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "config field `type = \"bool\"`: `default` must be a boolean, got {}",
+                            type_name(&other),
+                        )));
+                    }
+                };
+                ConfigFieldType::Bool { default }
+            }
+            "int" => {
+                ensure_unset::<D>(&h, &["values", "fields"], "int")?;
+                let default = take_int::<D>(h.default, "default")?;
+                let min = take_int::<D>(h.min, "min")?;
+                let max = take_int::<D>(h.max, "max")?;
+                ConfigFieldType::Int { default, min, max }
+            }
+            "float" => {
+                ensure_unset::<D>(&h, &["values", "fields"], "float")?;
+                let default = take_float::<D>(h.default, "default")?;
+                let min = take_float::<D>(h.min, "min")?;
+                let max = take_float::<D>(h.max, "max")?;
+                ConfigFieldType::Float { default, min, max }
+            }
+            "string" => {
+                ensure_unset::<D>(&h, &["values", "fields", "min", "max"], "string")?;
+                let default = match h.default {
+                    None => None,
+                    Some(toml::Value::String(s)) => Some(s),
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "config field `type = \"string\"`: `default` must be a string, got {}",
+                            type_name(&other),
+                        )));
+                    }
+                };
+                ConfigFieldType::String { default }
+            }
+            "enum" => {
+                ensure_unset::<D>(&h, &["fields", "min", "max"], "enum")?;
+                let values = h.values.ok_or_else(|| {
+                    D::Error::custom("config field `type = \"enum\"` requires `values`")
+                })?;
+                let default = match h.default {
+                    None => None,
+                    Some(toml::Value::String(s)) => Some(s),
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "config field `type = \"enum\"`: `default` must be a string, got {}",
+                            type_name(&other),
+                        )));
+                    }
+                };
+                ConfigFieldType::Enum { values, default }
+            }
+            "nested" => {
+                ensure_unset::<D>(&h, &["default", "values", "min", "max"], "nested")?;
+                let fields = h.fields.ok_or_else(|| {
+                    D::Error::custom("config field `type = \"nested\"` requires `fields`")
+                })?;
+                ConfigFieldType::Nested { fields }
+            }
+            other => {
+                return Err(D::Error::custom(format!(
+                    "unknown config field `type` `{other}` \
+                     (expected bool/int/float/string/enum/nested)"
+                )));
+            }
+        };
+        Ok(ConfigField {
+            ty,
+            description: h.description,
+        })
+    }
+}
+
+/// Helper: return an error if any of the named helper fields is
+/// `Some(_)`. Used to reject category-mismatched keys like `min` on a
+/// `bool` field or `values` on an `int`.
+fn ensure_unset<'de, D: Deserializer<'de>>(
+    h: &ConfigFieldHelper,
+    disallowed: &[&str],
+    kind: &str,
+) -> Result<(), D::Error> {
+    for key in disallowed {
+        let present = match *key {
+            "default" => h.default.is_some(),
+            "min" => h.min.is_some(),
+            "max" => h.max.is_some(),
+            "values" => h.values.is_some(),
+            "fields" => h.fields.is_some(),
+            _ => false,
+        };
+        if present {
+            return Err(D::Error::custom(format!(
+                "config field `type = \"{kind}\"`: `{key}` is not valid for this type"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn take_int<'de, D: Deserializer<'de>>(
+    v: Option<toml::Value>,
+    key: &str,
+) -> Result<Option<i64>, D::Error> {
+    match v {
+        None => Ok(None),
+        Some(toml::Value::Integer(n)) => Ok(Some(n)),
+        Some(other) => Err(D::Error::custom(format!(
+            "config field `type = \"int\"`: `{key}` must be an integer, got {}",
+            type_name(&other),
+        ))),
+    }
+}
+
+fn take_float<'de, D: Deserializer<'de>>(
+    v: Option<toml::Value>,
+    key: &str,
+) -> Result<Option<f64>, D::Error> {
+    match v {
+        None => Ok(None),
+        Some(toml::Value::Float(n)) => Ok(Some(n)),
+        // Accept an integer literal where a float is expected so authors
+        // can write `min = 0` rather than `min = 0.0`. TOML treats them
+        // as distinct types but the manifest UX shouldn't. Precision
+        // loss is theoretically possible for `|n| > 2^53` but the
+        // manifest values we see in practice are small constants.
+        #[allow(clippy::cast_precision_loss)]
+        Some(toml::Value::Integer(n)) => Ok(Some(n as f64)),
+        Some(other) => Err(D::Error::custom(format!(
+            "config field `type = \"float\"`: `{key}` must be a float, got {}",
+            type_name(&other),
+        ))),
+    }
 }
 
 /// Resolved value for a single config field after defaults are
@@ -487,6 +664,105 @@ mod tests {
             ty: ConfigFieldType::Bool { default },
             description: Some(desc.into()),
         }
+    }
+
+    /// Typo'd key inside `[config.<name>]` must be caught at parse
+    /// time. Previously the inner enum had no `deny_unknown_fields`
+    /// (and serde's behavior with internally-tagged + flatten doesn't
+    /// reliably refuse extra keys), so `defualt = true` would land
+    /// silently as a bool field with no default.
+    #[test]
+    fn typo_in_default_key_rejected() {
+        let err = toml::from_str::<ConfigField>(
+            r#"
+type = "bool"
+defualt = true
+description = "x"
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") || msg.contains("defualt"),
+            "expected unknown-field error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn bool_rejects_int_keys() {
+        for bad in [
+            "type = \"bool\"\nmin = 1\n",
+            "type = \"bool\"\nmax = 10\n",
+            "type = \"bool\"\nvalues = [\"a\"]\n",
+            "type = \"bool\"\nfields = {}\n",
+        ] {
+            let err = toml::from_str::<ConfigField>(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("not valid for this type"),
+                "expected category-mismatch for `{bad}`, got {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn int_rejects_enum_or_nested_keys() {
+        let err =
+            toml::from_str::<ConfigField>("type = \"int\"\nvalues = [\"a\", \"b\"]\n").unwrap_err();
+        assert!(err.to_string().contains("not valid for this type"));
+
+        let err = toml::from_str::<ConfigField>("type = \"int\"\nfields = {}\n").unwrap_err();
+        assert!(err.to_string().contains("not valid for this type"));
+    }
+
+    #[test]
+    fn float_min_max_accept_integer_literal() {
+        // TOML distinguishes `0` and `0.0`; the manifest UX shouldn't.
+        let f: ConfigField = toml::from_str(
+            r#"
+type = "float"
+default = 0.5
+min = 0
+max = 1
+"#,
+        )
+        .unwrap();
+        let ConfigFieldType::Float { default, min, max } = f.ty else {
+            panic!("expected Float, got {:?}", f.ty)
+        };
+        assert_eq!(default, Some(0.5));
+        assert_eq!(min, Some(0.0));
+        assert_eq!(max, Some(1.0));
+    }
+
+    #[test]
+    fn int_default_must_be_integer() {
+        let err = toml::from_str::<ConfigField>("type = \"int\"\ndefault = 1.5\n").unwrap_err();
+        assert!(err.to_string().contains("must be an integer"));
+    }
+
+    #[test]
+    fn bool_default_must_be_bool() {
+        let err =
+            toml::from_str::<ConfigField>("type = \"bool\"\ndefault = \"yes\"\n").unwrap_err();
+        assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    #[test]
+    fn enum_requires_values() {
+        let err = toml::from_str::<ConfigField>("type = \"enum\"\ndefault = \"a\"\n").unwrap_err();
+        assert!(err.to_string().contains("requires `values`"));
+    }
+
+    #[test]
+    fn nested_requires_fields() {
+        let err = toml::from_str::<ConfigField>("type = \"nested\"\n").unwrap_err();
+        assert!(err.to_string().contains("requires `fields`"));
+    }
+
+    #[test]
+    fn unknown_type_rejected() {
+        let err = toml::from_str::<ConfigField>("type = \"datetime\"\n").unwrap_err();
+        assert!(err.to_string().contains("unknown config field `type`"));
     }
 
     #[test]
