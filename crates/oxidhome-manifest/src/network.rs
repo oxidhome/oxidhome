@@ -123,13 +123,20 @@ impl FromStr for NetworkRule {
         };
 
         // Split host[:port]. IPv4 CIDRs contain `/` but no `:`.
-        // IPv6 hosts/CIDRs aren't supported today: `split_host_port`
-        // treats any host containing `:` as "no port suffix", so an
-        // IPv6 rule has no way to express a port. Phase 8 will add
-        // bracketed IPv6 syntax (`[2001:db8::]/32:*`) when the
-        // streaming-plugin enforcer needs it. The
-        // `ipv6_cidr_currently_unsupported` test pins this so removing
-        // the limitation is a deliberate change.
+        //
+        // IPv6 support today is partial. `parse_host` handles both
+        // IPv6 literals (`IpAddr`) and IPv6 CIDRs (`IpNet`), so
+        // `https://2001:db8::/32` and `https://2001:db8::1` work
+        // (HTTPS supplies the default `:443`). What *doesn't* work is
+        // expressing an explicit port for IPv6 with tcp/udp/any:
+        // `split_host_port` treats any host containing `:` as "no
+        // port suffix", so `tcp://2001:db8::/32:*` parses as an
+        // invalid CIDR and the error message is misleading. Phase 8
+        // will add bracketed IPv6 syntax (`[2001:db8::]/32:*`) when
+        // the streaming-plugin enforcer needs explicit-port IPv6.
+        // The `ipv6_tcp_with_explicit_port_currently_unsupported`
+        // test pins this so removing the limitation is a deliberate
+        // change.
         let (host_str, port_str_opt) = split_host_port(rest);
 
         let host = parse_host(host_str, raw)?;
@@ -306,13 +313,35 @@ mod tests {
         assert_eq!(r.port, PortMatch::Range(8000, 9000));
     }
 
-    /// IPv6 CIDR currently errors because the unbracketed colon-split
-    /// can't see past IPv6 colons to find a `:port`. Phase 8 will
-    /// revisit with bracketed form (`[2001:db8::]/32:*`). Pinned as a
-    /// test so the limitation is explicit and removing it is a
-    /// deliberate change.
+    /// IPv6 works when the proto supplies a default port. HTTPS does,
+    /// so `https://2001:db8::/32` and `https://2001:db8::1` both parse
+    /// cleanly with port 443.
     #[test]
-    fn ipv6_cidr_currently_unsupported() {
+    fn ipv6_https_uses_default_port() {
+        let r = rule("https://2001:db8::/32");
+        let HostMatch::Cidr(net) = &r.host else {
+            panic!("expected Cidr, got {:?}", r.host)
+        };
+        assert!(net.to_string().starts_with("2001:db8::"));
+        assert_eq!(r.port, PortMatch::Exact(443));
+
+        let r = rule("https://2001:db8::1");
+        let HostMatch::Exact(s) = &r.host else {
+            panic!("expected Exact, got {:?}", r.host)
+        };
+        assert_eq!(s, "2001:db8::1");
+        assert_eq!(r.port, PortMatch::Exact(443));
+    }
+
+    /// Explicit-port IPv6 with tcp/udp/any is currently unsupported:
+    /// the unbracketed colon-split can't separate host from port when
+    /// the host already contains colons. Phase 8 will add bracketed
+    /// syntax (`[2001:db8::]/32:*`). Pinned as a test so removing the
+    /// limitation is a deliberate change.
+    #[test]
+    fn ipv6_tcp_with_explicit_port_currently_unsupported() {
+        // tcp requires a port; the parser bails with MissingPort because
+        // the trailing `:*` (or `:1883`) is shadowed by the IPv6 colons.
         let err = "tcp://2001:db8::/32".parse::<NetworkRule>().unwrap_err();
         assert!(
             matches!(err, NetworkRuleParseError::MissingPort(_)),

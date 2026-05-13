@@ -489,6 +489,17 @@ fn resolve_enum(
     override_val: Option<&toml::Value>,
     errors: &mut Vec<ValidationError>,
 ) -> Option<ConfigValue> {
+    // `validate` flags an empty-values enum schema, but `merge` may
+    // be called directly without a prior `validate` (e.g. CLI test
+    // harnesses), so emit the same specific error here rather than
+    // falling through to a confusing `ConfigEnumOutOfRange { allowed:
+    // [] }`.
+    if values.is_empty() {
+        errors.push(ValidationError::ConfigEnumEmpty {
+            path: path.to_owned(),
+        });
+        return None;
+    }
     let candidate: Option<String> = if let Some(v) = override_val {
         if let Some(s) = v.as_str() {
             Some(s.to_owned())
@@ -1052,6 +1063,39 @@ max = 1
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn merge_enum_empty_values_emits_specific_error() {
+        // `merge` may be called without `validate` (e.g. test harnesses);
+        // it must emit `ConfigEnumEmpty` rather than the confusing
+        // `ConfigEnumOutOfRange { allowed: [] }` that would otherwise
+        // fall through.
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "mode".into(),
+            ConfigField {
+                ty: ConfigFieldType::Enum {
+                    values: vec![],
+                    default: Some("anything".into()),
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        let errs = merge(&m, &toml::Value::Table(toml::value::Table::new())).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::ConfigEnumEmpty { .. })),
+            "expected ConfigEnumEmpty, got {errs:?}",
+        );
+        // And specifically not the wrong variant.
+        assert!(
+            !errs.iter().any(
+                |e| matches!(e, ValidationError::ConfigEnumOutOfRange { allowed, .. } if allowed.is_empty())
+            ),
+            "should not fall through to ConfigEnumOutOfRange",
+        );
     }
 
     #[test]
