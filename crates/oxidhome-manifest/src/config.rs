@@ -1489,7 +1489,9 @@ e = 42
     /// against the deserializer + the `merge()` consumer.
     #[test]
     fn nested_config_parses_from_toml_and_merges() {
-        // Schema on disk uses the `fields = { ... }` table for nested.
+        // Nested schema on disk: `type = "nested"` on the outer
+        // table, with each sub-field declared as a `[fields.<name>]`
+        // sub-table.
         let raw = r#"
 type = "nested"
 description = "MQTT broker settings"

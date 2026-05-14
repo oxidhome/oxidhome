@@ -289,12 +289,17 @@ fn parse_port(port_str: &str, full: &str) -> Result<PortMatch, NetworkRuleParseE
         return Ok(PortMatch::Any);
     }
     if let Some((lo, hi)) = port_str.split_once('-') {
+        // Pass the failing sub-token (`lo` or `hi`) into the error, not
+        // the full rule — the message reads "invalid port `<token>`:
+        // …" and the token should identify what couldn't be parsed.
+        // `InvalidPortRange` keeps `full` so the operator still sees
+        // the rule context for the range-shape error.
         let lo: u16 = lo
             .parse()
-            .map_err(|e| NetworkRuleParseError::InvalidPort(full.to_owned(), e))?;
+            .map_err(|e| NetworkRuleParseError::InvalidPort(lo.to_owned(), e))?;
         let hi: u16 = hi
             .parse()
-            .map_err(|e| NetworkRuleParseError::InvalidPort(full.to_owned(), e))?;
+            .map_err(|e| NetworkRuleParseError::InvalidPort(hi.to_owned(), e))?;
         if lo > hi {
             return Err(NetworkRuleParseError::InvalidPortRange(full.to_owned()));
         }
@@ -302,7 +307,7 @@ fn parse_port(port_str: &str, full: &str) -> Result<PortMatch, NetworkRuleParseE
     }
     let p: u16 = port_str
         .parse()
-        .map_err(|e| NetworkRuleParseError::InvalidPort(full.to_owned(), e))?;
+        .map_err(|e| NetworkRuleParseError::InvalidPort(port_str.to_owned(), e))?;
     Ok(PortMatch::Exact(p))
 }
 
@@ -597,15 +602,48 @@ mod tests {
     }
 
     #[test]
-    fn invalid_port() {
+    fn invalid_port_carries_just_the_token() {
+        // The `InvalidPort` variant's first field is the token that
+        // couldn't be parsed — not the entire rule. The rendered
+        // message reads "invalid port `notanumber`: …", not
+        // "invalid port `tcp://example.com:notanumber`: …".
         let err = "tcp://example.com:notanumber"
             .parse::<NetworkRule>()
             .unwrap_err();
-        assert!(matches!(err, NetworkRuleParseError::InvalidPort(_, _)));
+        let NetworkRuleParseError::InvalidPort(token, _) = &err else {
+            panic!("expected InvalidPort, got {err:?}");
+        };
+        assert_eq!(token, "notanumber");
     }
 
     #[test]
-    fn invalid_port_range() {
+    fn invalid_port_range_low_token() {
+        // For ranges, the failing side (`lo` or `hi`) is identified.
+        let err = "tcp://example.com:abc-9000"
+            .parse::<NetworkRule>()
+            .unwrap_err();
+        let NetworkRuleParseError::InvalidPort(token, _) = &err else {
+            panic!("expected InvalidPort, got {err:?}");
+        };
+        assert_eq!(token, "abc");
+    }
+
+    #[test]
+    fn invalid_port_range_high_token() {
+        let err = "tcp://example.com:8000-xyz"
+            .parse::<NetworkRule>()
+            .unwrap_err();
+        let NetworkRuleParseError::InvalidPort(token, _) = &err else {
+            panic!("expected InvalidPort, got {err:?}");
+        };
+        assert_eq!(token, "xyz");
+    }
+
+    #[test]
+    fn invalid_port_range_inverted() {
+        // The `lo > hi` case is a shape error about the whole range,
+        // not a single token — `InvalidPortRange` carries the full
+        // rule so the operator sees the context.
         let err = "tcp://example.com:9000-8000"
             .parse::<NetworkRule>()
             .unwrap_err();
