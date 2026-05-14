@@ -9,7 +9,7 @@
 //!   ([`Proto`], [`HostMatch`], [`PortMatch`]) parsed eagerly at
 //!   manifest load so a malformed rule fails install, not first
 //!   connect.
-//! - [`validate`] — collects every problem in one pass instead of
+//! - [`validate()`] — collects every problem in one pass instead of
 //!   bailing on the first.
 //! - [`merge`] — folds a manifest's `[config]` defaults with a
 //!   user-supplied override `toml::Value` into a typed

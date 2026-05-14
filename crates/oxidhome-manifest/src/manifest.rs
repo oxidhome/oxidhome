@@ -29,7 +29,7 @@ use crate::network::NetworkRule;
 
 /// Top-level `manifest.toml`.
 ///
-/// Use `toml::from_str` to deserialize, then run [`crate::validate`] to
+/// Use `toml::from_str` to deserialize, then run [`crate::validate()`] to
 /// surface every problem in one pass.
 //
 // `Eq` is omitted on purpose: `ConfigFieldType::Float` carries an

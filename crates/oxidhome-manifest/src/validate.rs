@@ -1,6 +1,6 @@
 //! Manifest validator — every problem in one pass.
 //!
-//! [`validate`] takes a parsed [`PluginManifest`] and returns
+//! [`validate()`] takes a parsed [`PluginManifest`] and returns
 //! `Ok(())` or `Err(Vec<ValidationError>)`. Errors are *collected*,
 //! never fail-fast: the CLI install dialog and the host loader both
 //! surface every issue to the operator at once so fixing the manifest
