@@ -405,13 +405,21 @@ fn keyword_problem(kw: &str) -> Option<InvalidKeywordReason> {
     if kw.is_empty() {
         return Some(InvalidKeywordReason::Empty);
     }
+    // Charset before length. The grammar is strict ASCII
+    // (`[a-z0-9][a-z0-9-]*`), so any keyword that passes the
+    // charset check is pure ASCII — at which point `len()` (bytes)
+    // equals `chars().count()` and the "exceeds N characters"
+    // message is accurate. Doing it the other way around could
+    // reject a 17-char UTF-8 keyword as "exceeds 50 characters"
+    // (because of multi-byte chars) before charset ever fires,
+    // which reads as a confusing length error.
+    if !is_valid_keyword(kw) {
+        return Some(InvalidKeywordReason::BadCharset);
+    }
     if kw.len() > MAX_KEYWORD_LEN {
         return Some(InvalidKeywordReason::TooLong {
             max: MAX_KEYWORD_LEN,
         });
-    }
-    if !is_valid_keyword(kw) {
-        return Some(InvalidKeywordReason::BadCharset);
     }
     None
 }
@@ -829,6 +837,45 @@ mod tests {
         assert!(
             rendered.contains(&format!("exceeds {MAX_KEYWORD_LEN}")),
             "expected rendered limit to come from MAX_KEYWORD_LEN, got {rendered}",
+        );
+    }
+
+    /// Pin the charset-before-length ordering: a long multi-byte
+    /// UTF-8 keyword (16 emojis = 64 bytes, but only 16 characters)
+    /// must report `BadCharset` rather than the misleading
+    /// "exceeds 50 characters". The grammar is strict ASCII so any
+    /// non-ASCII keyword fails charset; reporting `TooLong` instead
+    /// would confuse the operator.
+    #[test]
+    fn keywords_multi_byte_unicode_reports_bad_charset_not_too_long() {
+        let mut m = ok_manifest();
+        // 16 × 4-byte emoji = 64 bytes, well over MAX_KEYWORD_LEN (50)
+        // measured in bytes, but only 16 chars.
+        let unicode_kw: String = std::iter::repeat_n('🦀', 16).collect();
+        assert!(unicode_kw.len() > MAX_KEYWORD_LEN);
+        assert!(unicode_kw.chars().count() <= MAX_KEYWORD_LEN);
+        m.plugin.keywords = vec![unicode_kw.clone()];
+        let errs = validate(&m).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidKeyword {
+                    reason: InvalidKeywordReason::BadCharset,
+                    got,
+                    ..
+                } if got == &unicode_kw
+            )),
+            "expected BadCharset for multi-byte keyword, got {errs:?}",
+        );
+        assert!(
+            !errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidKeyword {
+                    reason: InvalidKeywordReason::TooLong { .. },
+                    ..
+                }
+            )),
+            "multi-byte keyword should not trip TooLong: got {errs:?}",
         );
     }
 
