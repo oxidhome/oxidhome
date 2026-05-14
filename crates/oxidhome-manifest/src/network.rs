@@ -13,14 +13,26 @@
 //! ## Grammar
 //!
 //! ```text
-//! rule    := proto "://" host [":" port]
-//! proto   := "tcp" | "udp" | "https" | "any"
-//! host    := exact-host | "*." suffix | cidr
-//! port    := digits | digits "-" digits | "*"
+//! rule        := proto "://" authority
+//! authority   := host-no-port | bracketed-ipv6 [":" port] | host-with-port
+//! host-no-port  := exact-host | "*." suffix | ipv4-cidr | ipv6-cidr | ipv6-literal
+//! bracketed-ipv6 := "[" (ipv6-literal | ipv6-cidr) "]"
+//! host-with-port := host-no-port ":" port    -- but only when host has no `:`
+//! proto       := "tcp" | "udp" | "https" | "any"
+//! port        := digits | digits "-" digits | "*"
 //! ```
 //!
 //! Defaults: omitting `:port` on an `https` rule means `:443`. Omitting
 //! `:port` on any other proto requires explicit `:*` for "any port".
+//!
+//! IPv6: hosts whose textual form contains `:` need bracket syntax when
+//! a port is supplied — `tcp://[2001:db8::1]:1883` (literal),
+//! `udp://[2001:db8::/32]:5353` (CIDR). The entire IP-literal goes
+//! inside the brackets; only `:port` follows the closing `]`.
+//! Bracket-less IPv6 is accepted only when no port is attached
+//! (e.g. `https://2001:db8::1` falls back on the HTTPS default
+//! `:443`). `Display` emits the bracketed form whenever it would be
+//! needed to round-trip cleanly.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -126,22 +138,33 @@ impl FromStr for NetworkRule {
             other => return Err(NetworkRuleParseError::UnknownProto(other.to_owned())),
         };
 
-        // Split host[:port]. IPv4 CIDRs contain `/` but no `:`.
-        //
-        // IPv6 support today is partial. `parse_host` handles both
-        // IPv6 literals (`IpAddr`) and IPv6 CIDRs (`IpNet`), so
-        // `https://2001:db8::/32` and `https://2001:db8::1` work
-        // (HTTPS supplies the default `:443`). What *doesn't* work is
-        // expressing an explicit port for IPv6 with tcp/udp/any:
-        // `split_host_port` treats any host containing `:` as "no
-        // port suffix", so `tcp://2001:db8::/32:*` parses as an
-        // invalid CIDR and the error message is misleading. Phase 8
-        // will add bracketed IPv6 syntax (`[2001:db8::]/32:*`) when
-        // the streaming-plugin enforcer needs explicit-port IPv6.
-        // The `ipv6_tcp_with_explicit_port_currently_unsupported`
-        // test pins this so removing the limitation is a deliberate
-        // change.
-        let (host_str, port_str_opt) = split_host_port(rest);
+        // Split host[:port]. Two forms:
+        //   - Bracketed `[host]:port` — required when host is IPv6
+        //     and a port is supplied (else the colon-split can't tell
+        //     the address from the port). Inside the brackets the
+        //     host must parse as an IPv6 literal or IPv6 CIDR.
+        //   - Unbracketed `host:port` — for DNS names, wildcards,
+        //     IPv4 (CIDR or literal), and IPv6 *without* an explicit
+        //     port (HTTPS supplies the default :443).
+        let (host_str, port_str_opt, bracketed) = if let Some(after_open) = rest.strip_prefix('[') {
+            let Some(close_idx) = after_open.find(']') else {
+                return Err(NetworkRuleParseError::InvalidHost(rest.to_owned()));
+            };
+            let host = &after_open[..close_idx];
+            let after_close = &after_open[close_idx + 1..];
+            let port = if after_close.is_empty() {
+                None
+            } else if let Some(p) = after_close.strip_prefix(':') {
+                Some(p)
+            } else {
+                // Stuff after `]` that isn't `:port` — e.g. `[host]junk`.
+                return Err(NetworkRuleParseError::InvalidHost(rest.to_owned()));
+            };
+            (host, port, true)
+        } else {
+            let (h, p) = split_host_port(rest);
+            (h, p, false)
+        };
 
         // Reject any whitespace inside the split tokens. The full `raw`
         // is `trim()`'d above; internal whitespace (e.g. `tcp:// host`
@@ -152,7 +175,7 @@ impl FromStr for NetworkRule {
             reject_whitespace(p, raw)?;
         }
 
-        let host = parse_host(host_str, raw)?;
+        let host = parse_host(host_str, raw, bracketed)?;
         let port = match port_str_opt {
             Some(s) => parse_port(s, raw)?,
             None => default_port(proto)?,
@@ -172,12 +195,17 @@ fn reject_whitespace(token: &str, raw: &str) -> Result<(), NetworkRuleParseError
     Ok(())
 }
 
-/// Split off an optional trailing `:port` token. Returns `(host, None)`
-/// when no `:` appears, `(host, Some(port_str))` otherwise. IPv6
-/// literals and CIDRs (e.g. `2001:db8::1`, `2001:db8::/32`) are
+/// Split off an optional trailing `:port` token from an unbracketed
+/// `host[:port]` string. Returns `(host, None)` when there's no port
+/// to extract, `(host, Some(port_str))` when there is.
+///
+/// IPv6 literals and CIDRs (e.g. `2001:db8::1`, `2001:db8::/32`) are
 /// detected as port-less here because their last colon sits inside
 /// the address — the host gets the whole string and `parse_host`
-/// hands it off to `IpAddr` / `IpNet`.
+/// hands it off to `IpAddr` / `IpNet`. To attach an explicit port
+/// to an IPv6 host, callers use the bracketed form
+/// (`[2001:db8::1]:1883`) which is parsed before this function is
+/// called.
 fn split_host_port(rest: &str) -> (&str, Option<&str>) {
     if let Some(idx) = rest.rfind(':') {
         let (host, after_colon) = rest.split_at(idx);
@@ -188,13 +216,6 @@ fn split_host_port(rest: &str) -> (&str, Option<&str>) {
         // `parse_host` validate it. Same if the candidate "port"
         // contains `/`: that's a CIDR mask sitting where we'd expect
         // a port number, so the whole `rest` is the host string.
-        //
-        // Limitation: this means tcp/udp/any rules can't carry an
-        // explicit port for IPv6 today (`tcp://2001:db8::/32:*` would
-        // need bracketed syntax). HTTPS works because the default
-        // port `:443` is supplied without parsing a `:port` suffix.
-        // Phase 8 will add `[…]/…:*` bracketed syntax when the
-        // streaming-plugin enforcer needs explicit-port IPv6.
         if host.contains(':') || port_str.contains('/') {
             return (rest, None);
         }
@@ -204,9 +225,36 @@ fn split_host_port(rest: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn parse_host(host_str: &str, full: &str) -> Result<HostMatch, NetworkRuleParseError> {
+/// Parse the host portion of a rule. `bracketed = true` means the
+/// host came out of `[…]` brackets and must be an IPv6 literal or
+/// IPv6 CIDR — DNS names, wildcards, and IPv4 forms are rejected
+/// (RFC-3986 only allows brackets around IP-literals).
+fn parse_host(
+    host_str: &str,
+    full: &str,
+    bracketed: bool,
+) -> Result<HostMatch, NetworkRuleParseError> {
     if host_str.is_empty() {
         return Err(NetworkRuleParseError::EmptyHost(full.to_owned()));
+    }
+    if bracketed {
+        // Inside brackets: IPv6 only.
+        if host_str.contains('/') {
+            let net = host_str
+                .parse::<IpNet>()
+                .map_err(|e| NetworkRuleParseError::InvalidCidr(host_str.to_owned(), e))?;
+            if !net.network().is_ipv6() {
+                return Err(NetworkRuleParseError::InvalidHost(host_str.to_owned()));
+            }
+            return Ok(HostMatch::Cidr(net));
+        }
+        let ip = host_str
+            .parse::<IpAddr>()
+            .map_err(|_| NetworkRuleParseError::InvalidHost(host_str.to_owned()))?;
+        if !ip.is_ipv6() {
+            return Err(NetworkRuleParseError::InvalidHost(host_str.to_owned()));
+        }
+        return Ok(HostMatch::Exact(ip.to_string()));
     }
     if let Some(suffix) = host_str.strip_prefix("*.") {
         if suffix.is_empty() || suffix.starts_with('.') {
@@ -269,13 +317,30 @@ const fn default_port(proto: Proto) -> Result<PortMatch, NetworkRuleParseError> 
 
 impl fmt::Display for NetworkRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let host = match &self.host {
+        let host_raw = match &self.host {
             HostMatch::Exact(s) => s.clone(),
             HostMatch::SuffixWildcard(suffix) => {
                 // suffix is stored leading-dot, e.g. ".example.com"
                 format!("*{suffix}")
             }
             HostMatch::Cidr(net) => net.to_string(),
+        };
+        // Whether we'll emit a `:port` suffix. The one no-port case is
+        // an HTTPS rule on the default port (443).
+        let emit_port = !matches!(
+            (self.proto, self.port),
+            (Proto::Https, PortMatch::Exact(443))
+        );
+        // Bracket the host whenever it serializes with `:` (IPv6) *and*
+        // we're attaching a port — otherwise the round-trip would
+        // fail (`FromStr` can't split `:port` past IPv6 colons). For
+        // the no-port HTTPS case, brackets are unnecessary and we
+        // keep the unbracketed form to match what the parser
+        // already accepts.
+        let host = if emit_port && host_raw.contains(':') {
+            format!("[{host_raw}]")
+        } else {
+            host_raw
         };
         match self.port {
             PortMatch::Any => write!(f, "{}://{}:*", self.proto.as_str(), host),
@@ -371,20 +436,90 @@ mod tests {
         assert_eq!(r.port, PortMatch::Exact(443));
     }
 
-    /// Explicit-port IPv6 with tcp/udp/any is currently unsupported:
-    /// the unbracketed colon-split can't separate host from port when
-    /// the host already contains colons. Phase 8 will add bracketed
-    /// syntax (`[2001:db8::]/32:*`). Pinned as a test so removing the
-    /// limitation is a deliberate change.
+    /// Unbracketed IPv6 with a proto that requires an explicit port
+    /// (tcp/udp/any) still fails — the colon-split can't separate the
+    /// address from the port without brackets. The fix is to use
+    /// `[…]:port`, exercised by `ipv6_tcp_with_bracketed_port_works`.
     #[test]
-    fn ipv6_tcp_with_explicit_port_currently_unsupported() {
-        // tcp requires a port; the parser bails with MissingPort because
-        // the trailing `:*` (or `:1883`) is shadowed by the IPv6 colons.
+    fn ipv6_tcp_without_brackets_still_rejected() {
         let err = "tcp://2001:db8::/32".parse::<NetworkRule>().unwrap_err();
         assert!(
             matches!(err, NetworkRuleParseError::MissingPort(_)),
             "got {err:?}",
         );
+    }
+
+    /// Bracketed IPv6 literals + CIDRs accept an explicit port. This
+    /// makes `Display` ↔ `FromStr` round-trip safe for any
+    /// programmatically-built rule. The grammar puts the *entire*
+    /// IP-literal (including any `/mask` for CIDRs) inside the
+    /// brackets; only `:port` follows the closing bracket.
+    #[test]
+    fn ipv6_tcp_with_bracketed_port_works() {
+        let r = rule("tcp://[2001:db8::1]:1883");
+        assert_eq!(r.proto, Proto::Tcp);
+        assert_eq!(r.host, HostMatch::Exact("2001:db8::1".into()));
+        assert_eq!(r.port, PortMatch::Exact(1883));
+
+        let r = rule("udp://[2001:db8::/32]:5353");
+        assert_eq!(r.proto, Proto::Udp);
+        let HostMatch::Cidr(net) = &r.host else {
+            panic!("expected Cidr, got {:?}", r.host)
+        };
+        assert!(net.network().is_ipv6());
+        assert_eq!(r.port, PortMatch::Exact(5353));
+
+        let r = rule("tcp://[2001:db8::1]:*");
+        assert_eq!(r.port, PortMatch::Any);
+    }
+
+    /// Brackets are only valid around IPv6 — DNS names, IPv4 literals,
+    /// and wildcards in brackets are rejected to match RFC 3986.
+    #[test]
+    fn brackets_reject_non_ipv6() {
+        for bad in [
+            "tcp://[example.com]:80",
+            "tcp://[10.0.0.1]:80",
+            "tcp://[*.example.com]:443",
+        ] {
+            let err = bad.parse::<NetworkRule>().unwrap_err();
+            assert!(
+                matches!(err, NetworkRuleParseError::InvalidHost(_)),
+                "expected InvalidHost for `{bad}`, got {err:?}",
+            );
+        }
+    }
+
+    /// Stuff trailing `]` other than `:port` is malformed.
+    #[test]
+    fn bracketed_trailing_junk_rejected() {
+        for bad in ["tcp://[2001:db8::1]junk:80", "tcp://[2001:db8::1junk"] {
+            let err = bad.parse::<NetworkRule>().unwrap_err();
+            assert!(
+                matches!(err, NetworkRuleParseError::InvalidHost(_)),
+                "expected InvalidHost for `{bad}`, got {err:?}",
+            );
+        }
+    }
+
+    /// `Display` emits the bracketed form whenever it would be needed
+    /// for round-trip. This pins the asymmetry-free behavior: a rule
+    /// built programmatically with an IPv6 host + explicit port
+    /// serializes to a string `FromStr` can read back.
+    #[test]
+    fn display_brackets_ipv6_when_port_present() {
+        let r: NetworkRule = "tcp://[2001:db8::1]:1883".parse().unwrap();
+        assert_eq!(r.to_string(), "tcp://[2001:db8::1]:1883");
+
+        let r: NetworkRule = "udp://[2001:db8::/32]:5353".parse().unwrap();
+        // ipnet may canonicalize the CIDR; just check the shape.
+        let s = r.to_string();
+        assert!(s.starts_with("udp://[") && s.ends_with("]:5353"), "got {s}");
+
+        // No-port HTTPS case stays unbracketed (matches what
+        // `ipv6_https_uses_default_port` asserts).
+        let r: NetworkRule = "https://2001:db8::1".parse().unwrap();
+        assert_eq!(r.to_string(), "https://2001:db8::1");
     }
 
     #[test]
