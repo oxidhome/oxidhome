@@ -223,6 +223,10 @@ fn validate_int_field(
     max: Option<i64>,
     errors: &mut Vec<ValidationError>,
 ) {
+    // Schema-level: `min > max` is a broken declaration. Surface it
+    // once and stop — running the default-in-range check on top of a
+    // broken bound declaration would layer noise on top of the root
+    // cause.
     if let Some(min) = min
         && let Some(max) = max
         && min > max
@@ -232,6 +236,7 @@ fn validate_int_field(
             min,
             max,
         });
+        return;
     }
     let Some(d) = default else { return };
     if let Some(min) = min
@@ -270,6 +275,11 @@ fn validate_float_field(
     check_float_finite(path, min, "min", errors);
     check_float_finite(path, max, "max", errors);
 
+    // Schema-level: `min > max` is a broken declaration. Surface it
+    // once and stop layering default-in-range errors on top of a
+    // broken bound declaration. Only fires when both bounds are
+    // finite — non-finite bounds are reported separately by
+    // `check_float_finite` above.
     if let Some(min) = min
         && let Some(max) = max
         && min.is_finite()
@@ -281,6 +291,7 @@ fn validate_float_field(
             min,
             max,
         });
+        return;
     }
     let Some(d) = default else { return };
     if !d.is_finite() {
@@ -791,6 +802,64 @@ mod tests {
             e,
             ValidationError::UnsupportedManifestVersion { got: 0, .. }
         )));
+    }
+
+    #[test]
+    fn int_range_invalid_does_not_cascade_to_default_out_of_range() {
+        // A schema with `min > max` AND a default that would be
+        // "out of range" against either bound should report the
+        // schema error only — the default-in-range check is
+        // meaningless when the bounds are broken.
+        let mut m = ok_manifest();
+        m.config.insert(
+            "n".into(),
+            ConfigField {
+                ty: ConfigFieldType::Int {
+                    default: Some(50),
+                    min: Some(100),
+                    max: Some(10),
+                },
+                description: None,
+            },
+        );
+        let errs = validate(&m).unwrap_err();
+        let range_invalids = errs
+            .iter()
+            .filter(|e| matches!(e, ValidationError::ConfigIntRangeInvalid { .. }))
+            .count();
+        let default_oor = errs
+            .iter()
+            .filter(|e| matches!(e, ValidationError::ConfigIntDefaultOutOfRange { .. }))
+            .count();
+        assert_eq!(range_invalids, 1, "got {errs:?}");
+        assert_eq!(default_oor, 0, "got {errs:?}");
+    }
+
+    #[test]
+    fn float_range_invalid_does_not_cascade_to_default_out_of_range() {
+        let mut m = ok_manifest();
+        m.config.insert(
+            "f".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: Some(0.7),
+                    min: Some(1.0),
+                    max: Some(0.5),
+                },
+                description: None,
+            },
+        );
+        let errs = validate(&m).unwrap_err();
+        let range_invalids = errs
+            .iter()
+            .filter(|e| matches!(e, ValidationError::ConfigFloatRangeInvalid { .. }))
+            .count();
+        let default_oor = errs
+            .iter()
+            .filter(|e| matches!(e, ValidationError::ConfigFloatDefaultOutOfRange { .. }))
+            .count();
+        assert_eq!(range_invalids, 1, "got {errs:?}");
+        assert_eq!(default_oor, 0, "got {errs:?}");
     }
 
     #[test]
