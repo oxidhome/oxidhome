@@ -448,9 +448,13 @@ const KNOWN_DEVICE_CAPABILITIES: &[&str] = &[
 ];
 
 fn is_known_device_capability(s: &str) -> bool {
-    // The `extension(...)` arm in the WIT is escape-hatch syntax
-    // plugin authors can use for capabilities outside the standard
-    // set. Accept it verbatim.
+    // The `extension(string)` variant of `capability-spec` in
+    // `wit/oxidhome.wit` is the escape hatch plugin authors use for
+    // capabilities outside the standard set. The WIT carries an
+    // opaque string payload; the manifest spells the same idea as
+    // `"extension(<name>)"`, e.g. `extension(window-shade)`. Accept
+    // anything matching that shape verbatim — we don't validate the
+    // payload itself today (that's a per-extension concern).
     if s.starts_with("extension(") && s.ends_with(')') {
         return true;
     }
