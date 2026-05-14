@@ -15,10 +15,15 @@ use crate::manifest::PluginManifest;
 /// needed for an error message to point at what to fix:
 ///
 /// - Variants with a `path` field (`ConfigEnumEmpty`,
-///   `ConfigTypeMismatch`, …) name a config field *relative to
-///   `[config]`* — e.g. `"default_state"` for `[config.default_state]`,
-///   or `"broker.host"` for a nested `[config.broker.host]`. There is
-///   no `config.` prefix on these paths.
+///   `ConfigTypeMismatch`, …) name a config field as the *dot-joined
+///   chain of field names* under `[config]`, with no `config.`
+///   prefix. For a flat field `[config.default_state]` that's just
+///   `"default_state"`; for a nested field declared via the
+///   `[config.<key>] type = "nested" fields.<subkey>` TOML shape,
+///   it's `"<key>.<subkey>"` — e.g. `"broker.host"` for a
+///   `[config.broker]` of type `"nested"` containing a `host` field.
+///   The error path is the lookup key the host uses; the on-disk
+///   TOML shape is documented separately in `config.rs`.
 /// - Variants without `path` carry the offending value directly —
 ///   `InvalidPluginId { got }`, `UnknownDeclaredDeviceCapability { got }`,
 ///   etc.
@@ -55,7 +60,7 @@ pub enum ValidationError {
     InvalidKeyword {
         index: usize,
         got: String,
-        reason: &'static str,
+        reason: InvalidKeywordReason,
     },
 
     #[error(
@@ -152,6 +157,34 @@ pub const MAX_KEYWORDS: usize = 16;
 
 /// Maximum length of a single keyword in characters.
 pub const MAX_KEYWORD_LEN: usize = 50;
+
+/// Why a `plugin.keywords` entry was rejected. Encoded as a typed
+/// enum (rather than a `&'static str` message) so the limit in
+/// `TooLong { max }` stays in sync with [`MAX_KEYWORD_LEN`] — change
+/// the constant and the formatted message follows automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidKeywordReason {
+    /// Empty string.
+    Empty,
+    /// Length exceeds `max` characters (always `MAX_KEYWORD_LEN`
+    /// today; carried in the variant so the message and constant
+    /// can't drift).
+    TooLong { max: usize },
+    /// Failed the lowercase-kebab-case shape check.
+    BadCharset,
+}
+
+impl std::fmt::Display for InvalidKeywordReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InvalidKeywordReason::Empty => f.write_str("empty"),
+            InvalidKeywordReason::TooLong { max } => write!(f, "exceeds {max} characters"),
+            InvalidKeywordReason::BadCharset => {
+                f.write_str("must be lowercase kebab-case (`[a-z0-9][a-z0-9-]*`)")
+            }
+        }
+    }
+}
 
 /// Run every check against `m` and collect all findings.
 ///
@@ -368,15 +401,17 @@ fn validate_keywords(keywords: &[String], errors: &mut Vec<ValidationError>) {
     }
 }
 
-fn keyword_problem(kw: &str) -> Option<&'static str> {
+fn keyword_problem(kw: &str) -> Option<InvalidKeywordReason> {
     if kw.is_empty() {
-        return Some("empty");
+        return Some(InvalidKeywordReason::Empty);
     }
     if kw.len() > MAX_KEYWORD_LEN {
-        return Some("exceeds 50 characters");
+        return Some(InvalidKeywordReason::TooLong {
+            max: MAX_KEYWORD_LEN,
+        });
     }
     if !is_valid_keyword(kw) {
-        return Some("must be lowercase kebab-case (`[a-z0-9][a-z0-9-]*`)");
+        return Some(InvalidKeywordReason::BadCharset);
     }
     None
 }
@@ -756,7 +791,7 @@ mod tests {
             e,
             ValidationError::InvalidKeyword {
                 index: 1,
-                reason: "empty",
+                reason: InvalidKeywordReason::Empty,
                 ..
             }
         )));
@@ -770,8 +805,31 @@ mod tests {
         let errs = validate(&m).unwrap_err();
         assert!(errs.iter().any(|e| matches!(
             e,
-            ValidationError::InvalidKeyword { reason: "exceeds 50 characters", got, .. } if got == &long
+            ValidationError::InvalidKeyword {
+                reason: InvalidKeywordReason::TooLong { max },
+                got,
+                ..
+            } if got == &long && *max == MAX_KEYWORD_LEN
         )));
+        // The formatted error message uses the live constant — if
+        // MAX_KEYWORD_LEN changes the displayed limit follows.
+        let too_long = errs
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    ValidationError::InvalidKeyword {
+                        reason: InvalidKeywordReason::TooLong { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("too-long error");
+        let rendered = too_long.to_string();
+        assert!(
+            rendered.contains(&format!("exceeds {MAX_KEYWORD_LEN}")),
+            "expected rendered limit to come from MAX_KEYWORD_LEN, got {rendered}",
+        );
     }
 
     #[test]
@@ -787,10 +845,15 @@ mod tests {
         let errs = validate(&m).unwrap_err();
         let kebab_errs: Vec<_> = errs
             .iter()
-            .filter(|e| matches!(
-                e,
-                ValidationError::InvalidKeyword { reason: r, .. } if r.starts_with("must be lowercase kebab-case")
-            ))
+            .filter(|e| {
+                matches!(
+                    e,
+                    ValidationError::InvalidKeyword {
+                        reason: InvalidKeywordReason::BadCharset,
+                        ..
+                    }
+                )
+            })
             .collect();
         // UPPER, "with space", "-leading", "spe!cial" — 4 invalid.
         // "trailing-" is allowed because the grammar is `first [a-z0-9], rest [a-z0-9-]*`.

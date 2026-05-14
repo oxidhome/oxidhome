@@ -1482,6 +1482,54 @@ e = 42
         )));
     }
 
+    /// End-to-end TOML round-trip for a nested config schema. The
+    /// previous tests only exercised programmatically-constructed
+    /// `ConfigFieldType::Nested`; this one pins the on-disk shape
+    /// (`[config.<key>] type = "nested" [config.<key>.fields.<subkey>]`)
+    /// against the deserializer + the `merge()` consumer.
+    #[test]
+    fn nested_config_parses_from_toml_and_merges() {
+        // Schema on disk uses the `fields = { ... }` table for nested.
+        let raw = r#"
+type = "nested"
+description = "MQTT broker settings"
+
+[fields.host]
+type = "string"
+default = "localhost"
+description = "Hostname"
+
+[fields.port]
+type = "int"
+default = 1883
+min = 1
+max = 65535
+"#;
+        let field: ConfigField = toml::from_str(raw).expect("nested field must parse");
+        let ConfigFieldType::Nested { fields } = &field.ty else {
+            panic!("expected Nested, got {:?}", field.ty);
+        };
+        assert!(fields.contains_key("host"));
+        assert!(fields.contains_key("port"));
+
+        // Plug it into a manifest and merge with an override that
+        // touches only one sub-field; the other resolves from default.
+        let mut top_fields = BTreeMap::new();
+        top_fields.insert("broker".into(), field);
+        let m = manifest_with(top_fields);
+
+        let overrides: toml::Value = toml::from_str("[broker]\nhost = \"mqtt.local\"\n").unwrap();
+        let cfg = merge(&m, &overrides).unwrap();
+        let ConfigValue::Nested(inner) = cfg.get("broker").unwrap() else {
+            panic!("expected Nested at broker");
+        };
+        assert_eq!(
+            inner.get("host"),
+            Some(&ConfigValue::String("mqtt.local".into())),
+        );
+        assert_eq!(inner.get("port"), Some(&ConfigValue::Int(1883)));
+    }
+
     #[test]
     fn merge_nested() {
         let mut inner = BTreeMap::new();
