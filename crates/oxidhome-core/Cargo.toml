@@ -36,6 +36,10 @@ path = "tests/simulated_switch.rs"
 name = "event_dispatch"
 path = "tests/event_dispatch.rs"
 
+[[test]]
+name = "manifest_loader"
+path = "tests/manifest_loader.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
@@ -56,6 +60,9 @@ wasmtime = { version = "=44.0.1", default-features = false, features = [
 ] }
 wasmtime-wasi = { version = "=44.0.1", default-features = false, features = ["p2"] }
 anyhow.workspace = true
+oxidhome-manifest.workspace = true
+semver.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs"] }
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "registry"] }

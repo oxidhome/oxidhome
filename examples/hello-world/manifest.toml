@@ -1,0 +1,21 @@
+manifest_version = 1
+
+[plugin]
+id = "example.hello-world"
+name = "Hello World"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Minimal plugin that logs on init/shutdown. Used by the Phase 2 integration test."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/hello-world"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "hello-world"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/hello_world.wasm"
+singleton = false
+
+[capabilities]
+# Hello-world registers no devices and uses no capabilities; the
+# defaults (empty lists, zero quotas) suffice.

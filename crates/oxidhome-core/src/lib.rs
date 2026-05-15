@@ -11,9 +11,26 @@
 // the API is settled.
 #![allow(clippy::missing_errors_doc)]
 
+pub mod auth;
 pub mod host_impl;
 pub mod runtime;
 pub mod state;
 
+pub use auth::{Actor, ActorKind};
 pub use runtime::{Engine, PluginInstance};
 pub use state::{DeviceMeta, DeviceRegistry, EventBus, EventSubscription};
+
+/// SDK version this host ships with. Plugins loaded by this build
+/// declare their own `sdk_version` in the manifest; the loader runs
+/// [`oxidhome_manifest::compatibility::check`] against this constant
+/// (and [`MIN_SUPPORTED_SDK_VERSION`]) before instantiating.
+///
+/// Bumped in lockstep with the `oxidhome-sdk` release for external
+/// plugin authors — see the WIT/SDK versioning note in
+/// `ARCHITECTURE.md`.
+pub const OXIDHOME_SDK_VERSION: &str = "0.1.0";
+
+/// Oldest `sdk_version` the host will accept from a plugin manifest.
+/// Below this, the load fails with a clear "rebuild your plugin
+/// against SDK ≥ X" error.
+pub const MIN_SUPPORTED_SDK_VERSION: &str = "0.1.0";

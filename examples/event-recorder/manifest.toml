@@ -1,0 +1,21 @@
+manifest_version = 1
+
+[plugin]
+id = "example.event-recorder"
+name = "Event Recorder"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Subscribes to the bus and remembers what it saw. Phase 3 event-dispatch fixture."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/event-recorder"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "event-recorder"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/event_recorder.wasm"
+singleton = false
+
+[capabilities]
+# Event-recorder doesn't register any devices; pub/sub is always
+# allowed in 0.1 (no event-related capability to declare).

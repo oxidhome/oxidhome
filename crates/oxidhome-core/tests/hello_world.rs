@@ -68,9 +68,12 @@ async fn hello_world_round_trip() {
 
     let wasm_path: PathBuf = support::build_example("hello-world", "hello_world.wasm");
     assert!(wasm_path.is_file(), "missing build artifact: {wasm_path:?}");
+    let plugin_dir = support::workspace_root()
+        .join("examples")
+        .join("hello-world");
 
     let engine = Engine::new().expect("engine");
-    let mut instance = PluginInstance::load(&engine, &wasm_path)
+    let mut instance = PluginInstance::load(&engine, &plugin_dir, "hello_world")
         .await
         .expect("loaded hello-world");
 

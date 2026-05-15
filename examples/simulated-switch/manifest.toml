@@ -1,0 +1,23 @@
+manifest_version = 1
+
+[plugin]
+id = "example.simulated-switch"
+name = "Simulated Switch"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "A switch with no real hardware backing it. Phase 3 integration-test fixture."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/simulated-switch"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "switch", "simulated"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/simulated_switch.wasm"
+singleton = false
+
+[capabilities]
+# The simulated switch registers one device with the `switch`
+# capability — declared here so the host's call-site gate allows
+# `register-device`.
+declares_devices = ["switch"]

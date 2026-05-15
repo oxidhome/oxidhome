@@ -1,10 +1,11 @@
-//! `oxidhome` host runtime, Phase 2 entrypoint.
+//! `oxidhome` host runtime entrypoint.
 //!
-//! Loads one `.wasm` plugin component, runs `init()` → `shutdown()`,
-//! prints the round-trip on stdout via `tracing-subscriber`. Phase 6+
-//! grows this into a real daemon with multi-instance lifecycle, the
-//! external API (Phase 12), the UI (Phase 13), and the MCP server
-//! (Phase 14).
+//! Loads one plugin from its install directory (containing
+//! `manifest.toml` + the `.wasm` it points at), runs `init()` →
+//! `shutdown()`, prints the round-trip on stdout via
+//! `tracing-subscriber`. Phase 6+ grows this into a real daemon with
+//! multi-instance lifecycle, the external API (Phase 12), the UI
+//! (Phase 13), and the MCP server (Phase 14).
 
 use std::path::PathBuf;
 
@@ -16,15 +17,28 @@ use tracing_subscriber::{EnvFilter, fmt};
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let wasm_path: PathBuf = std::env::args_os()
+    let plugin_dir: PathBuf = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("usage: {} <plugin.wasm>", env!("CARGO_BIN_NAME")))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: {} <plugin-dir>   (directory containing manifest.toml + the .wasm)",
+                env!("CARGO_BIN_NAME"),
+            )
+        })?;
 
     let engine = Engine::new()?;
-    let mut instance = PluginInstance::load(&engine, &wasm_path)
+    // Phase 4: the host accepts one plugin at a time and mints the
+    // instance id from the directory name. Phase 6's lifecycle layer
+    // will read multiple plugins from a host config file and mint
+    // per-config-row ids.
+    let instance_id = plugin_dir
+        .file_name()
+        .map_or_else(|| "plugin".to_owned(), |s| s.to_string_lossy().into_owned());
+    let mut instance = PluginInstance::load(&engine, &plugin_dir, &instance_id)
         .await
-        .with_context(|| format!("loading plugin from {}", wasm_path.display()))?;
+        .with_context(|| format!("loading plugin from {}", plugin_dir.display()))?;
+    tracing::info!(instance_id = %instance_id, "plugin loaded");
 
     instance.init().await?;
     instance.shutdown().await?;
