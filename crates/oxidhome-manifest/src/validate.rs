@@ -477,9 +477,11 @@ fn is_valid_label(label: &str) -> bool {
 }
 
 /// 0.1 capability names the WIT knows. Kept in sync with
-/// `wit/oxidhome.wit` `capability-spec`. The `extension(...)` form is
-/// open; manifests declaring a plain capability that isn't on this
-/// list fails validation.
+/// `wit/oxidhome.wit` `capability-spec`. The `extension(string)`
+/// variant of `capability-spec` is the escape hatch — manifests
+/// spell it as the string form `"extension(<name>)"`. A plain
+/// capability not on this list and not matching that shape fails
+/// validation.
 const KNOWN_DEVICE_CAPABILITIES: &[&str] = &[
     "switch",
     "dimmer",
@@ -496,10 +498,17 @@ fn is_known_device_capability(s: &str) -> bool {
     // capabilities outside the standard set. The WIT carries an
     // opaque string payload; the manifest spells the same idea as
     // `"extension(<name>)"`, e.g. `extension(window-shade)`. Accept
-    // anything matching that shape verbatim — we don't validate the
-    // payload itself today (that's a per-extension concern).
-    if s.starts_with("extension(") && s.ends_with(')') {
-        return true;
+    // anything matching that shape verbatim — but require a
+    // non-empty, non-whitespace payload between the parens.
+    // `extension()` or `extension(   )` is almost certainly a typo
+    // and silently letting it through would be hard to diagnose
+    // later. We don't validate the payload's *grammar* beyond
+    // "non-blank" (that's a per-extension concern).
+    if let Some(payload) = s
+        .strip_prefix("extension(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return !payload.trim().is_empty();
     }
     KNOWN_DEVICE_CAPABILITIES.contains(&s)
 }
@@ -584,7 +593,26 @@ mod tests {
     fn accepts_extension_capabilities() {
         let mut m = ok_manifest();
         m.capabilities.declares_devices = vec!["extension(window-shade)".into()];
-        validate(&m).expect("extension(...) is the escape hatch");
+        validate(&m).expect("extension(<name>) is the escape hatch");
+    }
+
+    /// `extension()` and `extension(   )` are almost certainly typos;
+    /// the validator should reject them rather than silently accept
+    /// an empty-name escape hatch.
+    #[test]
+    fn rejects_extension_with_blank_payload() {
+        for bad in ["extension()", "extension( )", "extension(   )"] {
+            let mut m = ok_manifest();
+            m.capabilities.declares_devices = vec![bad.into()];
+            let errs = validate(&m).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::UnknownDeclaredDeviceCapability { got } if got == bad
+                )),
+                "expected `{bad}` to be rejected, got {errs:?}",
+            );
+        }
     }
 
     #[test]
