@@ -280,6 +280,22 @@ pub enum ConfigValue {
 /// user overrides.
 pub type InstanceConfig = BTreeMap<String, ConfigValue>;
 
+/// Where a resolved value came from. Threaded through the per-type
+/// `resolve_*` helpers so that downstream range / finite / enum
+/// checks can attribute errors correctly: a default-sourced value
+/// that fails a check is a *schema* problem (the manifest author's
+/// fault), while an override-sourced value that fails is a *runtime
+/// override* problem (the deployment's fault). Without this
+/// distinction `merge()` called without a prior `validate()` would
+/// report schema bugs as override errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueSource {
+    /// Value came from the manifest's declared `default`.
+    Default,
+    /// Value came from the user-supplied override blob.
+    Override,
+}
+
 /// Fold the manifest's `[config]` defaults with a user-supplied
 /// override `toml::Value` (a TOML table keyed by config-field names)
 /// into a typed [`InstanceConfig`].
@@ -395,7 +411,7 @@ fn resolve_int(
     // `Required`. Without this split a single bad override produced
     // *two* errors (TypeMismatch + Required) which read as
     // contradictory.
-    let val = if let Some(v) = override_val {
+    let (val, source) = if let Some(v) = override_val {
         let Some(n) = v.as_integer() else {
             errors.push(ValidationError::ConfigTypeMismatch {
                 path: path.to_owned(),
@@ -404,7 +420,7 @@ fn resolve_int(
             });
             return None;
         };
-        n
+        (n, ValueSource::Override)
     } else {
         let Some(d) = default else {
             errors.push(ValidationError::ConfigRequired {
@@ -412,9 +428,9 @@ fn resolve_int(
             });
             return None;
         };
-        d
+        (d, ValueSource::Default)
     };
-    check_range(path, val, min, max, errors);
+    check_range(path, val, min, max, source, errors);
     Some(ConfigValue::Int(val))
 }
 
@@ -428,8 +444,8 @@ fn resolve_float(
 ) -> Option<ConfigValue> {
     // Same split as `resolve_int` — see the comment there for why
     // override-vs-default needs distinct error paths.
-    let val = if let Some(v) = override_val {
-        match v {
+    let (val, source) = if let Some(v) = override_val {
+        let parsed = match v {
             toml::Value::Float(n) => *n,
             // Accept TOML integer literals (`ratio = 1`) for float
             // fields, matching the schema parser (`take_float`).
@@ -448,7 +464,8 @@ fn resolve_float(
                 });
                 return None;
             }
-        }
+        };
+        (parsed, ValueSource::Override)
     } else {
         let Some(d) = default else {
             errors.push(ValidationError::ConfigRequired {
@@ -456,20 +473,27 @@ fn resolve_float(
             });
             return None;
         };
-        d
+        (d, ValueSource::Default)
     };
     // NaN / ±inf comparisons against the declared bounds are always
-    // false, so reject non-finite overrides explicitly rather than
-    // letting them slip into `InstanceConfig`.
+    // false, so reject non-finite values explicitly rather than
+    // letting them slip into `InstanceConfig`. The `role` field
+    // attributes the error to the right source — "default" when
+    // `merge()` is called without a prior `validate()` against a
+    // schema whose default is non-finite, "override" when a user
+    // override is non-finite.
     if !val.is_finite() {
         errors.push(ValidationError::ConfigFloatNotFinite {
             path: path.to_owned(),
-            role: "override",
+            role: match source {
+                ValueSource::Default => "default",
+                ValueSource::Override => "override",
+            },
             got: val,
         });
         return None;
     }
-    check_range_f(path, val, min, max, errors);
+    check_range_f(path, val, min, max, source, errors);
     Some(ConfigValue::Float(val))
 }
 
@@ -520,7 +544,7 @@ fn resolve_enum(
     // Same override-vs-default split as `resolve_int` — a wrong-type
     // override stops at `TypeMismatch` rather than also emitting
     // `Required`.
-    let val: String = if let Some(v) = override_val {
+    let (val, source): (String, ValueSource) = if let Some(v) = override_val {
         let Some(s) = v.as_str() else {
             errors.push(ValidationError::ConfigTypeMismatch {
                 path: path.to_owned(),
@@ -529,7 +553,7 @@ fn resolve_enum(
             });
             return None;
         };
-        s.to_owned()
+        (s.to_owned(), ValueSource::Override)
     } else {
         let Some(d) = default else {
             errors.push(ValidationError::ConfigRequired {
@@ -537,13 +561,25 @@ fn resolve_enum(
             });
             return None;
         };
-        d.to_owned()
+        (d.to_owned(), ValueSource::Default)
     };
     if !values.iter().any(|allowed| allowed == &val) {
-        errors.push(ValidationError::ConfigEnumOutOfRange {
-            path: path.to_owned(),
-            got: val.clone(),
-            allowed: values.to_vec(),
+        // Pick the variant by source: a default that's not in
+        // `values` is a schema bug; an override that's not in
+        // `values` is the deployment's problem. The two have the
+        // same field shape but distinct messages so the operator
+        // sees which side to fix.
+        errors.push(match source {
+            ValueSource::Default => ValidationError::ConfigEnumDefaultOutOfRange {
+                path: path.to_owned(),
+                got: val.clone(),
+                allowed: values.to_vec(),
+            },
+            ValueSource::Override => ValidationError::ConfigEnumOutOfRange {
+                path: path.to_owned(),
+                got: val.clone(),
+                allowed: values.to_vec(),
+            },
         });
         return None;
     }
@@ -594,6 +630,7 @@ fn check_range(
     val: i64,
     min: Option<i64>,
     max: Option<i64>,
+    source: ValueSource,
     errors: &mut Vec<ValidationError>,
 ) {
     // `validate` flags `min > max` schemas ahead of time, but `merge`
@@ -615,20 +652,56 @@ fn check_range(
     if let Some(min) = min
         && val < min
     {
-        errors.push(ValidationError::ConfigOutOfRange {
-            path: path.to_owned(),
-            bound: format!(">= {min}"),
-            got: val.to_string(),
-        });
+        errors.push(int_out_of_range(path, val, Some(min), max, source));
     }
     if let Some(max) = max
         && val > max
     {
-        errors.push(ValidationError::ConfigOutOfRange {
+        errors.push(int_out_of_range(path, val, min, Some(max), source));
+    }
+}
+
+fn int_out_of_range(
+    path: &str,
+    val: i64,
+    min: Option<i64>,
+    max: Option<i64>,
+    source: ValueSource,
+) -> ValidationError {
+    match source {
+        // A default value that falls outside the declared bounds is
+        // a schema bug — same finding the validator emits when it
+        // runs the schema-side check.
+        ValueSource::Default => ValidationError::ConfigIntDefaultOutOfRange {
             path: path.to_owned(),
-            bound: format!("<= {max}"),
-            got: val.to_string(),
-        });
+            got: val,
+            min,
+            max,
+        },
+        // An override outside the bounds is a runtime/deployment
+        // problem; the variant's message is phrased as a "config
+        // override" issue.
+        ValueSource::Override => {
+            // Preserve the existing single-bound format so the
+            // operator sees which side they tripped.
+            let bound = if let Some(min) = min
+                && val < min
+            {
+                format!(">= {min}")
+            } else if let Some(max) = max {
+                format!("<= {max}")
+            } else {
+                // Unreachable in practice — `check_range` calls this
+                // only when one bound failed — but emit something
+                // useful rather than panic.
+                "(unspecified)".to_owned()
+            };
+            ValidationError::ConfigOutOfRange {
+                path: path.to_owned(),
+                bound,
+                got: val.to_string(),
+            }
+        }
     }
 }
 
@@ -637,6 +710,7 @@ fn check_range_f(
     val: f64,
     min: Option<f64>,
     max: Option<f64>,
+    source: ValueSource,
     errors: &mut Vec<ValidationError>,
 ) {
     // See `check_range`. Float bounds add an extra wrinkle: NaN
@@ -659,20 +733,45 @@ fn check_range_f(
     if let Some(min) = min
         && val < min
     {
-        errors.push(ValidationError::ConfigOutOfRange {
-            path: path.to_owned(),
-            bound: format!(">= {min}"),
-            got: val.to_string(),
-        });
+        errors.push(float_out_of_range(path, val, Some(min), max, source));
     }
     if let Some(max) = max
         && val > max
     {
-        errors.push(ValidationError::ConfigOutOfRange {
+        errors.push(float_out_of_range(path, val, min, Some(max), source));
+    }
+}
+
+fn float_out_of_range(
+    path: &str,
+    val: f64,
+    min: Option<f64>,
+    max: Option<f64>,
+    source: ValueSource,
+) -> ValidationError {
+    match source {
+        ValueSource::Default => ValidationError::ConfigFloatDefaultOutOfRange {
             path: path.to_owned(),
-            bound: format!("<= {max}"),
-            got: val.to_string(),
-        });
+            got: val,
+            min,
+            max,
+        },
+        ValueSource::Override => {
+            let bound = if let Some(min) = min
+                && val < min
+            {
+                format!(">= {min}")
+            } else if let Some(max) = max {
+                format!("<= {max}")
+            } else {
+                "(unspecified)".to_owned()
+            };
+            ValidationError::ConfigOutOfRange {
+                path: path.to_owned(),
+                bound,
+                got: val.to_string(),
+            }
+        }
     }
 }
 
@@ -1312,6 +1411,138 @@ e = 42
                 .iter()
                 .any(|e| matches!(e, ValidationError::ConfigOutOfRange { .. })),
             "should not fall through to ConfigOutOfRange: {errs:?}",
+        );
+    }
+
+    /// When `merge()` is called without a prior `validate()`, an
+    /// out-of-bounds *default* should be attributed to the schema
+    /// (`ConfigIntDefaultOutOfRange`), not to a missing override
+    /// (`ConfigOutOfRange`, which reads as a runtime issue). This
+    /// pins the `ValueSource::Default` path through `check_range`.
+    #[test]
+    fn merge_int_default_out_of_range_uses_default_variant() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "n".into(),
+            ConfigField {
+                ty: ConfigFieldType::Int {
+                    default: Some(5),
+                    min: Some(10),
+                    max: Some(20),
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        // No override → resolved value is the default 5, which is
+        // below min 10.
+        let errs = merge(&m, &toml::Value::Table(toml::value::Table::new())).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::ConfigIntDefaultOutOfRange {
+                    got: 5,
+                    min: Some(10),
+                    ..
+                }
+            )),
+            "expected ConfigIntDefaultOutOfRange, got {errs:?}",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConfigOutOfRange { .. })),
+            "should not use the override-flavored ConfigOutOfRange for a default: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn merge_float_default_out_of_range_uses_default_variant() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "f".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: Some(0.1),
+                    min: Some(1.0),
+                    max: Some(2.0),
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        let errs = merge(&m, &toml::Value::Table(toml::value::Table::new())).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::ConfigFloatDefaultOutOfRange { .. })),
+            "expected ConfigFloatDefaultOutOfRange, got {errs:?}",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConfigOutOfRange { .. })),
+            "should not use ConfigOutOfRange for a default: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn merge_enum_default_not_in_values_uses_default_variant() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "mode".into(),
+            ConfigField {
+                ty: ConfigFieldType::Enum {
+                    values: vec!["off".into(), "on".into()],
+                    default: Some("oops".into()),
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        // No override → resolved value is the default "oops", which
+        // isn't in `values`. The default-specific variant should
+        // fire, not the runtime/override one.
+        let errs = merge(&m, &toml::Value::Table(toml::value::Table::new())).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::ConfigEnumDefaultOutOfRange { got, .. } if got == "oops"
+            )),
+            "expected ConfigEnumDefaultOutOfRange, got {errs:?}",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConfigEnumOutOfRange { .. })),
+            "should not use ConfigEnumOutOfRange for a default: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn merge_float_non_finite_default_role_is_default() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "f".into(),
+            ConfigField {
+                ty: ConfigFieldType::Float {
+                    default: Some(f64::NAN),
+                    min: None,
+                    max: None,
+                },
+                description: None,
+            },
+        );
+        let m = manifest_with(fields);
+        let errs = merge(&m, &toml::Value::Table(toml::value::Table::new())).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::ConfigFloatNotFinite {
+                    role: "default",
+                    ..
+                }
+            )),
+            "expected role=\"default\" for non-finite default, got {errs:?}",
         );
     }
 
