@@ -91,6 +91,22 @@ pub enum ValidationError {
     #[error("config field `{path}`: enum has no `values` declared")]
     ConfigEnumEmpty { path: String },
 
+    #[error(
+        "config field name `{name}` (under {parent}) contains `.`; \
+         the validator and host build dot-joined paths from these names \
+         (`broker.host` etc.), so a `.` in a key would make those paths \
+         ambiguous. Use bare keys (`[a-z0-9_-]`-style) for config field \
+         names."
+    )]
+    ConfigFieldNameContainsDot {
+        /// Where the offending key lives, formatted for the human:
+        /// `"[config]"` for top-level keys, `"[config.<parent>]"` for
+        /// nested ones.
+        parent: String,
+        /// The offending name, verbatim.
+        name: String,
+    },
+
     #[error("config field `{path}`: declared range is invalid (min={min:?} > max={max:?})")]
     ConfigIntRangeInvalid { path: String, min: i64, max: i64 },
 
@@ -217,8 +233,18 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
 
     validate_keywords(&m.plugin.keywords, &mut errors);
 
-    for (path, field) in &m.config {
-        validate_config_field(path, field, &mut errors);
+    for (name, field) in &m.config {
+        // A `.` in a config-field name breaks the dot-joined error
+        // paths and the host-config lookup keys (`broker.host` could
+        // mean a flat `"broker.host"` *or* nested `broker → host`).
+        // Reject before recursing, but keep checking other findings.
+        if name.contains('.') {
+            errors.push(ValidationError::ConfigFieldNameContainsDot {
+                parent: "[config]".to_owned(),
+                name: name.clone(),
+            });
+        }
+        validate_config_field(name, field, &mut errors);
     }
 
     if errors.is_empty() {
@@ -242,6 +268,12 @@ fn validate_config_field(path: &str, field: &ConfigField, errors: &mut Vec<Valid
         }
         ConfigFieldType::Nested { fields } => {
             for (sub_name, sub_field) in fields {
+                if sub_name.contains('.') {
+                    errors.push(ValidationError::ConfigFieldNameContainsDot {
+                        parent: format!("[config.{path}.fields]"),
+                        name: sub_name.clone(),
+                    });
+                }
                 let sub_path = format!("{path}.{sub_name}");
                 validate_config_field(&sub_path, sub_field, errors);
             }
@@ -933,6 +965,50 @@ mod tests {
         // UPPER, "with space", "-leading", "spe!cial" — 4 invalid.
         // "trailing-" is allowed because the grammar is `first [a-z0-9], rest [a-z0-9-]*`.
         assert_eq!(kebab_errs.len(), 4, "got {errs:?}");
+    }
+
+    #[test]
+    fn rejects_top_level_config_field_name_with_dot() {
+        let mut m = ok_manifest();
+        m.config.insert(
+            "broker.host".into(),
+            ConfigField {
+                ty: ConfigFieldType::String { default: None },
+                description: None,
+            },
+        );
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::ConfigFieldNameContainsDot { parent, name }
+                if parent == "[config]" && name == "broker.host"
+        )));
+    }
+
+    #[test]
+    fn rejects_nested_config_field_name_with_dot() {
+        let mut inner = BTreeMap::new();
+        inner.insert(
+            "a.b".into(),
+            ConfigField {
+                ty: ConfigFieldType::String { default: None },
+                description: None,
+            },
+        );
+        let mut m = ok_manifest();
+        m.config.insert(
+            "broker".into(),
+            ConfigField {
+                ty: ConfigFieldType::Nested { fields: inner },
+                description: None,
+            },
+        );
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::ConfigFieldNameContainsDot { parent, name }
+                if parent == "[config.broker.fields]" && name == "a.b"
+        )));
     }
 
     #[test]

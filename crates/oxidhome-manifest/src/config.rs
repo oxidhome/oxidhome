@@ -713,14 +713,46 @@ fn check_range_f(
     source: ValueSource,
     errors: &mut Vec<ValidationError>,
 ) {
+    // `validate()` already reports non-finite bounds at the schema
+    // level via `check_float_finite`, but `merge()` may be called
+    // standalone — without that pre-check a `min = NaN` or
+    // `max = +inf` would slip past the range check (NaN comparisons
+    // are always false) and let any value through. Mirror the
+    // finiteness check here so a malformed schema fails merge too.
+    let mut schema_broken = false;
+    if let Some(m) = min
+        && !m.is_finite()
+    {
+        errors.push(ValidationError::ConfigFloatNotFinite {
+            path: path.to_owned(),
+            role: "min",
+            got: m,
+        });
+        schema_broken = true;
+    }
+    if let Some(m) = max
+        && !m.is_finite()
+    {
+        errors.push(ValidationError::ConfigFloatNotFinite {
+            path: path.to_owned(),
+            role: "max",
+            got: m,
+        });
+        schema_broken = true;
+    }
+    if schema_broken {
+        // Don't run range comparisons against a non-finite bound; the
+        // result would be garbage and would layer noise on top of the
+        // schema error.
+        return;
+    }
+
     // See `check_range`. Float bounds add an extra wrinkle: NaN
     // comparisons are always false, so we only treat the schema as
-    // invalid when both bounds are *finite*. Non-finite bounds are a
-    // separate finding the validator surfaces as `ConfigFloatNotFinite`.
+    // invalid when both bounds are *finite*. The non-finite case is
+    // already handled above.
     if let Some(min) = min
         && let Some(max) = max
-        && min.is_finite()
-        && max.is_finite()
         && min > max
     {
         errors.push(ValidationError::ConfigFloatRangeInvalid {
@@ -1516,6 +1548,44 @@ e = 42
                 .any(|e| matches!(e, ValidationError::ConfigEnumOutOfRange { .. })),
             "should not use ConfigEnumOutOfRange for a default: {errs:?}",
         );
+    }
+
+    /// `validate()` reports non-finite `min`/`max` bounds at the
+    /// schema level, but `merge()` may be called standalone — and a
+    /// `NaN` bound silently disables the range check (NaN
+    /// comparisons are always false). Mirror the finiteness check
+    /// in `check_range_f` so a malformed schema can't slip past
+    /// merge without an error.
+    #[test]
+    fn merge_float_non_finite_bound_reported() {
+        for (min, max, role) in [
+            (Some(f64::NAN), None, "min"),
+            (Some(f64::INFINITY), None, "min"),
+            (None, Some(f64::NAN), "max"),
+            (None, Some(f64::NEG_INFINITY), "max"),
+        ] {
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "f".into(),
+                ConfigField {
+                    ty: ConfigFieldType::Float {
+                        default: Some(0.5),
+                        min,
+                        max,
+                    },
+                    description: None,
+                },
+            );
+            let m = manifest_with(fields);
+            let errs = merge(&m, &toml::Value::Table(toml::value::Table::new())).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::ConfigFloatNotFinite { role: r, .. } if *r == role
+                )),
+                "expected ConfigFloatNotFinite with role={role}, got {errs:?}",
+            );
+        }
     }
 
     #[test]
