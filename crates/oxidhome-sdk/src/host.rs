@@ -31,6 +31,11 @@ use crate::bindings::oxidhome::plugin::events::{
 use crate::bindings::oxidhome::plugin::types::{DeviceId, Error, KeyValue, SubscriptionId};
 use crate::bindings::oxidhome::plugin::{host_devices, host_events};
 
+/// Per-instance config reads (Phase 4C). Plugin authors call
+/// `oxidhome_sdk::host::config::get_typed::<T>("...")` etc. — see
+/// the [`config`] module for the surface.
+pub mod config;
+
 // ── Devices ──────────────────────────────────────────────────────────
 
 /// Register a device with the host. Accepts either a

@@ -970,6 +970,9 @@ name = "oxidhome-sdk"
 version = "0.1.0"
 dependencies = [
  "oxidhome-wit",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tracing",
 ]
 

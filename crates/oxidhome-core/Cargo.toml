@@ -40,6 +40,10 @@ path = "tests/event_dispatch.rs"
 name = "manifest_loader"
 path = "tests/manifest_loader.rs"
 
+[[test]]
+name = "config_overrides"
+path = "tests/config_overrides.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
