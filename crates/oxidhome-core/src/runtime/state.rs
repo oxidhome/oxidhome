@@ -167,26 +167,78 @@ fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
     }
 }
 
+/// Capability name for an `initial_state` variant. The
+/// `capability-state` WIT variant only covers the stateful
+/// capabilities (button / video-stream / audio-stream / extension
+/// have no entry), so this returns the matching capability-spec name
+/// for each. Used by the device-registration gate to confirm a
+/// plugin isn't smuggling state for a capability it didn't declare.
+fn capability_state_name(state: &capabilities::CapabilityState) -> &'static str {
+    match state {
+        capabilities::CapabilityState::Switch(_) => "switch",
+        capabilities::CapabilityState::Dimmer(_) => "dimmer",
+        capabilities::CapabilityState::ColorLight(_) => "color-light",
+        capabilities::CapabilityState::Sensor(_) => "sensor",
+    }
+}
+
+/// Run both gates for a `register-device` / `update-device` call:
+///
+/// 1. Every `initial_state` entry must have a matching
+///    `capability-spec` in `info.capabilities`. A state-without-spec
+///    `DeviceInfo` is malformed — the WIT contract is "one entry per
+///    stateful capability the plugin can already report."
+/// 2. Every `capability-spec` in `info.capabilities` (which, after
+///    step 1, transitively covers every state variant) must appear
+///    in the manifest's `declares_devices` list.
+///
+/// Both surface as `PermissionDenied` with a specific message. The
+/// state-without-spec case is technically "invalid argument" more
+/// than "permission denied," but the WIT only carries
+/// `permission-denied` / `not-found` / `unavailable` etc.; we use
+/// the most useful existing variant rather than reaching for a new
+/// WIT error today.
+fn authorize_device_info(declared: &[String], info: &DeviceInfo) -> Result<(), WitError> {
+    for state in &info.initial_state {
+        let name = capability_state_name(state);
+        if !info
+            .capabilities
+            .iter()
+            .any(|spec| capability_name(spec) == name)
+        {
+            return Err(WitError::PermissionDenied(format!(
+                "initial_state contains `{name}` but the device doesn't declare \
+                 a matching `{name}` capability"
+            )));
+        }
+    }
+    for spec in &info.capabilities {
+        let name = capability_name(spec);
+        if !declared.contains(&name) {
+            return Err(WitError::PermissionDenied(format!(
+                "capability `{name}` is not declared in this plugin's manifest \
+                 (capabilities.declares_devices)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl host_devices::Host for PluginState {
     async fn register_device(&mut self, info: DeviceInfo) -> Result<DeviceId, WitError> {
-        // Capability gate: every declared capability must appear in
-        // the manifest's `declares_devices` list. Refuse rather than
-        // partially registering — the operator should fix the manifest
-        // or the plugin code.
-        let declared = &self.manifest.capabilities.declares_devices;
-        for spec in &info.capabilities {
-            let name = capability_name(spec);
-            if !declared.contains(&name) {
-                tracing::warn!(
-                    instance_id = %self.instance_id,
-                    capability = %name,
-                    "register-device denied: capability not in manifest declares_devices",
-                );
-                return Err(WitError::PermissionDenied(format!(
-                    "capability `{name}` is not declared in this plugin's manifest \
-                     (capabilities.declares_devices)"
-                )));
-            }
+        // Authorize the full DeviceInfo: gate `capabilities` against
+        // the manifest's `declares_devices`, *and* refuse any
+        // `initial_state` entry that doesn't have a matching spec on
+        // the same device (otherwise a plugin could smuggle in state
+        // for an undeclared sensor / switch / etc. via the state list).
+        if let Err(err) = authorize_device_info(&self.manifest.capabilities.declares_devices, &info)
+        {
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                error = %err,
+                "register-device denied",
+            );
+            return Err(err);
         }
 
         let id = self.devices.register(self.instance_id.clone(), info).await;
@@ -201,17 +253,9 @@ impl host_devices::Host for PluginState {
     async fn update_device(&mut self, id: DeviceId, info: DeviceInfo) -> Result<(), WitError> {
         // Same gate as register-device — a plugin that wasn't allowed
         // to register a switch shouldn't be able to update one into a
-        // switch either.
-        let declared = &self.manifest.capabilities.declares_devices;
-        for spec in &info.capabilities {
-            let name = capability_name(spec);
-            if !declared.contains(&name) {
-                return Err(WitError::PermissionDenied(format!(
-                    "capability `{name}` is not declared in this plugin's manifest \
-                     (capabilities.declares_devices)"
-                )));
-            }
-        }
+        // switch either, and the initial_state cross-check still
+        // applies.
+        authorize_device_info(&self.manifest.capabilities.declares_devices, &info)?;
         self.devices.update(&self.instance_id, &id, info).await
     }
 
@@ -791,6 +835,99 @@ mod tests {
         host_devices::Host::register_device(&mut state, info)
             .await
             .expect("declared extension should pass");
+    }
+
+    /// `initial_state` for a capability the device's `capabilities`
+    /// list doesn't declare is malformed: the WIT contract says
+    /// "one entry per stateful capability the plugin can already
+    /// report." Reject before it lands in the registry, otherwise an
+    /// undeclared sensor / switch state could slip in via the state
+    /// list even when `capabilities` looks clean.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_register_denied_when_state_lacks_matching_capability() {
+        let mut state = fresh_state("alpha");
+        let mut info = empty_device("d-stateful");
+        // Device claims it's a switch, but the plugin tries to ship
+        // sensor state alongside — sensor isn't in `capabilities`.
+        info.capabilities = vec![capabilities::CapabilitySpec::Switch];
+        info.initial_state = vec![
+            capabilities::CapabilityState::Switch(capabilities::Switchable { state: true }),
+            capabilities::CapabilityState::Sensor(capabilities::Measurement {
+                value: 21.5,
+                unit: "celsius".into(),
+            }),
+        ];
+        let err = host_devices::Host::register_device(&mut state, info)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("sensor")),
+            "expected PermissionDenied naming `sensor`, got {err:?}",
+        );
+    }
+
+    /// Even when `capabilities` is the empty list (no declared spec),
+    /// the plugin can't smuggle state in. The state-without-spec
+    /// check fires first, before the manifest gate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_register_denied_when_state_present_without_any_spec() {
+        let mut state = fresh_state("alpha");
+        let mut info = empty_device("d-bare");
+        info.initial_state = vec![capabilities::CapabilityState::Switch(
+            capabilities::Switchable { state: false },
+        )];
+        let err = host_devices::Host::register_device(&mut state, info)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("switch")),
+            "got {err:?}",
+        );
+    }
+
+    /// Update path runs the same gate. A previously-clean device's
+    /// `update_device` call that adds state for an undeclared
+    /// capability must be refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_update_denied_when_state_lacks_matching_capability() {
+        use oxidhome_manifest::CapabilitiesSection;
+
+        let mut manifest = (*fixture_manifest("test.switch-only")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            declares_devices: vec!["switch".into()],
+            ..CapabilitiesSection::default()
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+        );
+
+        let mut info = empty_device("d-up");
+        info.capabilities = vec![capabilities::CapabilitySpec::Switch];
+        let id = host_devices::Host::register_device(&mut state, info)
+            .await
+            .expect("initial register");
+
+        // Now try to update with sensor state attached.
+        let mut bad = empty_device("d-up");
+        bad.capabilities = vec![capabilities::CapabilitySpec::Switch];
+        bad.initial_state = vec![capabilities::CapabilityState::Sensor(
+            capabilities::Measurement {
+                value: 21.5,
+                unit: "celsius".into(),
+            },
+        )];
+        let err = host_devices::Host::update_device(&mut state, id, bad)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("sensor")),
+            "got {err:?}",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

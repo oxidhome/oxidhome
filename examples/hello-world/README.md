@@ -21,14 +21,22 @@ The resulting component is at
 
 ## Run via the host
 
+From Phase 4 on, the host loader takes the plugin's **install
+directory**, not a bare `.wasm` path: it reads `manifest.toml`,
+validates it, and resolves `[runtime].wasm` relative to that
+directory. This example ships its `manifest.toml` alongside its
+`Cargo.toml`, and the manifest's `wasm` key points at
+`target/wasm32-wasip2/debug/hello_world.wasm`. So a `cargo build` is
+all you need before launching:
+
 From the **OxidHome workspace root**:
 
 ```shell
-cargo run -p oxidhome-core -- \
-    examples/hello-world/target/wasm32-wasip2/debug/hello_world.wasm
+cargo run -p oxidhome-core -- examples/hello-world
 ```
 
-The host loads the component, calls its exported `init` then
+The host reads `examples/hello-world/manifest.toml`, loads the
+`.wasm` the manifest points at, calls its exported `init` then
 `shutdown`, and exits.
 
 ## Verify

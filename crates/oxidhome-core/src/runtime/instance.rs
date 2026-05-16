@@ -146,7 +146,7 @@ impl PluginInstance {
                 )
             })?;
 
-            let wasm_path = plugin_dir.join(&manifest.runtime.wasm);
+            let wasm_path = resolve_wasm_path(&plugin_dir, &manifest.runtime.wasm)?;
             let manifest = Arc::new(manifest);
             Self::instantiate(engine, &wasm_path, instance_id, manifest, config).await
         }
@@ -374,4 +374,33 @@ impl PluginInstance {
     pub fn instance_id(&self) -> &str {
         &self.store.data().instance_id
     }
+}
+
+/// Join `plugin_dir + manifest.runtime.wasm`, canonicalize both, and
+/// confirm the resolved `.wasm` lives under the canonical plugin
+/// directory. Catches anything the manifest validator's shape check
+/// can't see: symlinks pointing outside the plugin dir, races where
+/// `plugin_dir` itself is a symlink, etc.
+///
+/// The validator's `WasmPathProblem` check already rejects absolute
+/// paths and `..` components at parse time, so this is defense in
+/// depth — but the canonicalize hop catches symlinks, which the
+/// purely-syntactic validator can't.
+fn resolve_wasm_path(plugin_dir: &Path, rel_wasm: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let joined = plugin_dir.join(rel_wasm);
+    let canonical_wasm = joined
+        .canonicalize()
+        .with_context(|| format!("canonicalizing wasm path {}", joined.display()))?;
+    let canonical_dir = plugin_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing plugin dir {}", plugin_dir.display()))?;
+    if !canonical_wasm.starts_with(&canonical_dir) {
+        return Err(anyhow!(
+            "runtime.wasm resolves to {}, which is outside the plugin directory {} \
+             (symlink? `..`-traversal that snuck past validation?)",
+            canonical_wasm.display(),
+            canonical_dir.display(),
+        ));
+    }
+    Ok(canonical_wasm)
 }
