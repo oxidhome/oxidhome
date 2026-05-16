@@ -42,13 +42,16 @@ impl Plugin for SimulatedSwitch {
 
         // Manifest `[config.default_state]` declares a `bool` with
         // `default = false`. A user override in the host's
-        // per-instance config flips the initial value; absence falls
-        // back on the manifest default, so a config read failure or
-        // a missing key both resolve to `false` and the plugin still
-        // boots.
+        // per-instance config flips the initial value. Only the
+        // "host returned no entry" arm falls back on `false` — a
+        // type mismatch or a host-side error surfaces from `init`
+        // rather than getting silently swallowed, otherwise
+        // manifest/plugin drift (someone renamed the field to
+        // `default_value`, switched its type to `int`, …) and host
+        // bugs would all look like a clean default and be invisible
+        // in the operator's logs.
         self.state = host::config::get_typed::<bool>("default_state")
-            .ok()
-            .flatten()
+            .map_err(|e| format!("reading default_state config: {e}"))?
             .unwrap_or(false);
 
         let id = host::register_device(
