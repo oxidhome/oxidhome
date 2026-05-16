@@ -21,3 +21,11 @@ singleton = false
 # capability — declared here so the host's call-site gate allows
 # `register-device`.
 declares_devices = ["switch"]
+
+[config.default_state]
+# Initial value the plugin reports on `init` (and registers as the
+# device's `initial_state`). Operators can override this in their
+# per-instance config to start the switch on instead of off.
+type = "bool"
+default = false
+description = "Initial state for the simulated switch on plugin init."

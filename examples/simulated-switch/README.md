@@ -6,8 +6,10 @@ event bus.
 
 What it does:
 
-- On `init`: registers one device (`switch-1`) with the `switch`
-  capability and reports an initial `state = false`.
+- On `init`: reads `default_state: bool` from per-instance config
+  (manifest default: `false`; operators can override per instance),
+  then registers one device (`switch-1`) with the `switch` capability
+  and that value as its initial state.
 - On `execute_command`:
   - `switch::set { state: bool }` — sets the switch to the requested
     state.

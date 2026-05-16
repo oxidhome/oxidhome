@@ -23,3 +23,10 @@ oxidhome-wit.workspace = true
 # Re-exported so plugin authors can use `oxidhome_sdk::tracing::info!` etc.
 # without adding tracing as a direct dep. Pinned at workspace level.
 tracing.workspace = true
+# `host::config::get_typed::<T: DeserializeOwned>` deserializes whatever
+# the host returned from `host-config::get-config` into the plugin's own
+# type. The WIT `value` variant is mapped through `serde_json::Value` so
+# both primitives and `json-val`-encoded structured payloads work.
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -40,6 +40,20 @@ impl Plugin for SimulatedSwitch {
         // `info!` calls below show up in operator output.
         let _ = oxidhome_sdk::logging::init();
 
+        // Manifest `[config.default_state]` declares a `bool` with
+        // `default = false`. A user override in the host's
+        // per-instance config flips the initial value. Only the
+        // "host returned no entry" arm falls back on `false` — a
+        // type mismatch or a host-side error surfaces from `init`
+        // rather than getting silently swallowed, otherwise
+        // manifest/plugin drift (someone renamed the field to
+        // `default_value`, switched its type to `int`, …) and host
+        // bugs would all look like a clean default and be invisible
+        // in the operator's logs.
+        self.state = host::config::get_typed::<bool>("default_state")
+            .map_err(|e| format!("reading default_state config: {e}"))?
+            .unwrap_or(false);
+
         let id = host::register_device(
             Device::new("switch-1", "Simulated Switch")
                 .manufacturer("OxidHome Example")
@@ -49,7 +63,10 @@ impl Plugin for SimulatedSwitch {
         )
         .map_err(|e| format!("register-device failed: {e:?}"))?;
         self.device_id = Some(id);
-        oxidhome_sdk::tracing::info!("simulated-switch ready");
+        oxidhome_sdk::tracing::info!(
+            initial_state = self.state,
+            "simulated-switch ready",
+        );
         Ok(())
     }
 
