@@ -58,15 +58,21 @@ async fn drain_events_dispatches_to_plugin_on_event() {
     );
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let switch_wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
-    let recorder_wasm = support::build_example("event-recorder", "event_recorder.wasm");
+    let _switch_wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let _recorder_wasm = support::build_example("event-recorder", "event_recorder.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let recorder_dir = support::workspace_root()
+        .join("examples")
+        .join("event-recorder");
 
     let engine = Engine::new().expect("engine");
 
-    let mut switch = PluginInstance::load(&engine, &switch_wasm)
+    let mut switch = PluginInstance::load(&engine, &switch_dir, "simulated_switch")
         .await
         .expect("load simulated-switch");
-    let mut recorder = PluginInstance::load(&engine, &recorder_wasm)
+    let mut recorder = PluginInstance::load(&engine, &recorder_dir, "event_recorder")
         .await
         .expect("load event-recorder");
 

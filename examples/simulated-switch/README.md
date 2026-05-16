@@ -33,16 +33,19 @@ The component is at
 
 ## Run via the host
 
-The Phase 2 host binary loads the plugin, calls `init`, then
-`shutdown` — it has no command-line surface for sending commands or
-subscribing to events yet (Phase 12 lands the CLI). Useful as a smoke
-check that the plugin loads and registers cleanly:
+From Phase 4 on, the host loader takes the plugin's **install
+directory** (containing `manifest.toml`), not a bare `.wasm` path:
 
 ```shell
 # from the OxidHome workspace root
-cargo run -p oxidhome-core -- \
-    examples/simulated-switch/target/wasm32-wasip2/debug/simulated_switch.wasm
+cargo run -p oxidhome-core -- examples/simulated-switch
 ```
+
+The host reads `examples/simulated-switch/manifest.toml`, loads the
+component the manifest points at, calls `init`, then `shutdown` — it
+has no command-line surface for sending commands or subscribing to
+events yet (Phase 12 lands the CLI). Useful as a smoke check that
+the plugin loads and registers cleanly.
 
 ## Verify
 

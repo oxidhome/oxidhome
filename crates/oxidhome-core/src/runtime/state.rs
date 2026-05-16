@@ -3,16 +3,29 @@
 //!
 //! Every host import the plugin world declares (`host-devices`,
 //! `host-events`, `host-config`, `storage`, `logging`) is implemented
-//! against this struct. Phase 3 makes `host-devices`, `host-events`,
-//! and `logging` fully functional; `host-config` returns empty until
-//! Phase 4 wires the manifest, and `storage` returns
-//! [`Error::Unavailable`] until Phase 5a's SQLite-backed KV.
+//! against this struct. As of Phase 4B:
+//!
+//! - `host-devices::register-device` and `update-device` are gated by
+//!   the manifest's `capabilities.declares_devices` (plus an
+//!   `initial-state`-must-have-matching-spec cross-check).
+//!   `remove-device` and `get-device` are always-allow — they can't
+//!   smuggle new capabilities in.
+//! - `host-events`, `host-config`, and `logging` are functional but
+//!   not manifest-gated. There's no per-call authorization for
+//!   publishing or subscribing yet; capability gating beyond device
+//!   registration (network rules for streaming plugins, services,
+//!   blob/log quotas) lives in later phases.
+//! - `storage` returns [`Error::Unavailable`] until Phase 5a's
+//!   SQLite-backed KV — the call-site framework is wired so 5a only
+//!   fills in the impl.
 
 use std::sync::Arc;
 
+use oxidhome_manifest::{ConfigValue, InstanceConfig, PluginManifest};
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::{
     capabilities, devices,
     devices::DeviceInfo,
@@ -35,10 +48,13 @@ pub type InstanceId = String;
 /// Held mutably by every host-import callback. The registry + event
 /// bus are shared with the [`Engine`](crate::Engine) via `Arc`; the
 /// per-instance subscription bookkeeping (`subscriptions`) lives here
-/// alongside the WASI context.
+/// alongside the WASI context, the parsed manifest, the [`Actor`]
+/// identity for this instance, and the resolved per-instance config.
 pub struct PluginState {
-    /// Stable id for the plugin instance — currently the plugin's
-    /// filename stem; Phase 6 swaps for the manifest-declared id.
+    /// Stable id for the plugin instance. Phase 4 derives it from
+    /// the manifest's `plugin.id` plus a per-instance suffix chosen
+    /// by the loader caller; Phase 6 wraps the lifecycle that mints
+    /// them.
     pub instance_id: InstanceId,
     /// Resource handles owned by this store. Required by Wasmtime's
     /// component model; populated when Phase 5 introduces blob/model
@@ -60,13 +76,33 @@ pub struct PluginState {
     /// data in a per-instance tokio task so delivery is automatic
     /// without an explicit driver.
     pub subscriptions: Vec<EventSubscription>,
+    /// The plugin's manifest. Capability decisions (`declares_devices`
+    /// gating, future Phase 7's `declares_services`, Phase 5's
+    /// storage quotas) consult this directly. `Arc` so cloning a
+    /// `PluginState` for tests is cheap.
+    pub manifest: Arc<PluginManifest>,
+    /// Who's making host calls *from this instance*. For Phase 4 always
+    /// the in-process plugin actor; Phase 12 routes external HTTP/WS
+    /// callers through the same struct so the audit-log shape is
+    /// consistent.
+    pub actor: Actor,
+    /// Per-instance config — manifest `[config]` schema folded with
+    /// any user override blob. Returned to the plugin via
+    /// `host-config::get-config` / `list-config`. Empty when the
+    /// manifest has no `[config]` block.
+    pub config: InstanceConfig,
 }
 
 impl PluginState {
     /// Build a fresh state for one plugin instance. `devices` /
-    /// `events` come from the parent [`Engine`](crate::Engine).
+    /// `events` come from the parent [`Engine`](crate::Engine); the
+    /// manifest, actor, and resolved config come from the loader
+    /// (real or test).
     pub fn new(
         instance_id: impl Into<InstanceId>,
+        manifest: Arc<PluginManifest>,
+        actor: Actor,
+        config: InstanceConfig,
         devices: Arc<DeviceRegistry>,
         events: Arc<EventBus>,
     ) -> Self {
@@ -79,6 +115,9 @@ impl PluginState {
             devices,
             events,
             subscriptions: Vec::new(),
+            manifest,
+            actor,
+            config,
         }
     }
 }
@@ -114,15 +153,104 @@ fn unavailable() -> WitError {
 
 // ── Devices ──────────────────────────────────────────────────────────
 //
-// Phase 3 makes the device registry calls fully functional. Ownership
-// is tracked so commands can be routed back to the registering
-// instance. Phase 4 layers in the manifest's `declares_devices`
-// capability gate (so a plugin that didn't declare a capability gets
-// `permission-denied` on register-device); Phase 6 adds multi-
+// Phase 3 makes the device registry calls functional. Ownership is
+// tracked so commands can be routed back to the registering instance.
+// Phase 4 layers in the manifest's `declares_devices` capability
+// gate: each capability the device declares must be in the manifest's
+// declared list (or the `extension(<name>)` escape hatch), otherwise
+// `register-device` returns `permission-denied`. Phase 6 adds multi-
 // instance lifecycle and crash-isolated re-registration.
+
+/// Stable string name for a `capability-spec` variant — what
+/// `manifest.capabilities.declares_devices` lists. Mirrors
+/// `capability-spec` in `wit/oxidhome.wit`.
+fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
+    match spec {
+        capabilities::CapabilitySpec::Switch => "switch".into(),
+        capabilities::CapabilitySpec::Dimmer => "dimmer".into(),
+        capabilities::CapabilitySpec::ColorLight(_) => "color-light".into(),
+        capabilities::CapabilitySpec::Sensor(_) => "sensor".into(),
+        capabilities::CapabilitySpec::Button => "button".into(),
+        capabilities::CapabilitySpec::VideoStream => "video-stream".into(),
+        capabilities::CapabilitySpec::AudioStream => "audio-stream".into(),
+        capabilities::CapabilitySpec::Extension(name) => format!("extension({name})"),
+    }
+}
+
+/// Capability name for an `initial_state` variant. The
+/// `capability-state` WIT variant only covers the stateful
+/// capabilities (button / video-stream / audio-stream / extension
+/// have no entry), so this returns the matching capability-spec name
+/// for each. Used by the device-registration gate to confirm a
+/// plugin isn't smuggling state for a capability it didn't declare.
+fn capability_state_name(state: &capabilities::CapabilityState) -> &'static str {
+    match state {
+        capabilities::CapabilityState::Switch(_) => "switch",
+        capabilities::CapabilityState::Dimmer(_) => "dimmer",
+        capabilities::CapabilityState::ColorLight(_) => "color-light",
+        capabilities::CapabilityState::Sensor(_) => "sensor",
+    }
+}
+
+/// Run both gates for a `register-device` / `update-device` call:
+///
+/// 1. Every `initial_state` entry must have a matching
+///    `capability-spec` in `info.capabilities`. A state-without-spec
+///    `DeviceInfo` is malformed — the WIT contract is "one entry per
+///    stateful capability the plugin can already report."
+/// 2. Every `capability-spec` in `info.capabilities` (which, after
+///    step 1, transitively covers every state variant) must appear
+///    in the manifest's `declares_devices` list.
+///
+/// Both surface as `PermissionDenied` with a specific message. The
+/// state-without-spec case is technically "invalid argument" more
+/// than "permission denied," but the WIT only carries
+/// `permission-denied` / `not-found` / `unavailable` etc.; we use
+/// the most useful existing variant rather than reaching for a new
+/// WIT error today.
+fn authorize_device_info(declared: &[String], info: &DeviceInfo) -> Result<(), WitError> {
+    for state in &info.initial_state {
+        let name = capability_state_name(state);
+        if !info
+            .capabilities
+            .iter()
+            .any(|spec| capability_name(spec) == name)
+        {
+            return Err(WitError::PermissionDenied(format!(
+                "initial_state contains `{name}` but the device doesn't declare \
+                 a matching `{name}` capability"
+            )));
+        }
+    }
+    for spec in &info.capabilities {
+        let name = capability_name(spec);
+        if !declared.contains(&name) {
+            return Err(WitError::PermissionDenied(format!(
+                "capability `{name}` is not declared in this plugin's manifest \
+                 (capabilities.declares_devices)"
+            )));
+        }
+    }
+    Ok(())
+}
 
 impl host_devices::Host for PluginState {
     async fn register_device(&mut self, info: DeviceInfo) -> Result<DeviceId, WitError> {
+        // Authorize the full DeviceInfo: gate `capabilities` against
+        // the manifest's `declares_devices`, *and* refuse any
+        // `initial_state` entry that doesn't have a matching spec on
+        // the same device (otherwise a plugin could smuggle in state
+        // for an undeclared sensor / switch / etc. via the state list).
+        if let Err(err) = authorize_device_info(&self.manifest.capabilities.declares_devices, &info)
+        {
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                error = %err,
+                "register-device denied",
+            );
+            return Err(err);
+        }
+
         let id = self.devices.register(self.instance_id.clone(), info).await;
         tracing::debug!(
             instance_id = %self.instance_id,
@@ -133,6 +261,22 @@ impl host_devices::Host for PluginState {
     }
 
     async fn update_device(&mut self, id: DeviceId, info: DeviceInfo) -> Result<(), WitError> {
+        // Same gate as register-device — a plugin that wasn't allowed
+        // to register a switch shouldn't be able to update one into a
+        // switch either, and the initial_state cross-check still
+        // applies. Log denials symmetrically with register-device so
+        // the Phase-5c log/trace store captures both paths through the
+        // same `warn`.
+        if let Err(err) = authorize_device_info(&self.manifest.capabilities.declares_devices, &info)
+        {
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                device_id = %id,
+                error = %err,
+                "update-device denied",
+            );
+            return Err(err);
+        }
         self.devices.update(&self.instance_id, &id, info).await
     }
 
@@ -191,11 +335,78 @@ impl host_events::Host for PluginState {
 // ── Config / storage / logging — see header. ─────────────────────────
 
 impl host_config::Host for PluginState {
-    async fn get_config(&mut self, _key: String) -> Result<Option<WitValue>, WitError> {
-        Ok(None)
+    /// Look up a config field by its dot-joined path (`broker.host`
+    /// for a nested field, `default_state` for a flat one). Returns
+    /// `Ok(None)` when the key is absent from the resolved
+    /// [`InstanceConfig`]; bare-string nested lookups (`broker`,
+    /// which would map to a nested table) also return `Ok(None)` —
+    /// plugins access *leaves*, the host doesn't JSON-encode nested
+    /// subtrees today.
+    async fn get_config(&mut self, key: String) -> Result<Option<WitValue>, WitError> {
+        Ok(lookup_leaf(&self.config, key.split('.')).and_then(config_value_to_wit))
     }
+
+    /// Flatten the resolved config into dot-joined `KeyValue` pairs,
+    /// one per leaf. Nested fields appear as `parent.child` keys.
+    /// Order is the iteration order of the underlying `BTreeMap`
+    /// (lexicographic).
     async fn list_config(&mut self) -> Result<Vec<KeyValue>, WitError> {
-        Ok(Vec::new())
+        let mut out = Vec::new();
+        flatten_config(&self.config, "", &mut out);
+        Ok(out)
+    }
+}
+
+/// Walk the resolved config along the `.`-separated path, returning
+/// the leaf (or `None` if the path doesn't lead to one).
+fn lookup_leaf<'a>(
+    cfg: &'a InstanceConfig,
+    mut parts: std::str::Split<'_, char>,
+) -> Option<&'a ConfigValue> {
+    let first = parts.next()?;
+    let mut current = cfg.get(first)?;
+    for next in parts {
+        match current {
+            ConfigValue::Nested(inner) => current = inner.get(next)?,
+            _ => return None, // path keeps going but we hit a leaf — no such field
+        }
+    }
+    Some(current)
+}
+
+/// Recursively flatten the resolved config into `(dot-joined-key,
+/// WitValue)` pairs, skipping anything that doesn't have a WIT
+/// representation (today: nested-themselves; `ConfigValue` itself
+/// only has leaf variants the WIT understands, so this is just the
+/// recursion).
+fn flatten_config(cfg: &InstanceConfig, prefix: &str, out: &mut Vec<KeyValue>) {
+    for (k, v) in cfg {
+        let key = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            ConfigValue::Nested(inner) => flatten_config(inner, &key, out),
+            leaf => {
+                if let Some(value) = config_value_to_wit(leaf) {
+                    out.push(KeyValue { key, value });
+                }
+            }
+        }
+    }
+}
+
+/// Map a leaf [`ConfigValue`] to its [`WitValue`] representation.
+/// Nested values (which the path-lookup code already filters out)
+/// return `None`.
+fn config_value_to_wit(v: &ConfigValue) -> Option<WitValue> {
+    match v {
+        ConfigValue::Bool(b) => Some(WitValue::BoolVal(*b)),
+        ConfigValue::Int(n) => Some(WitValue::IntVal(*n)),
+        ConfigValue::Float(n) => Some(WitValue::FloatVal(*n)),
+        ConfigValue::String(s) => Some(WitValue::StringVal(s.clone())),
+        ConfigValue::Nested(_) => None,
     }
 }
 
@@ -261,9 +472,62 @@ mod tests {
         }
     }
 
+    /// A bare-minimum manifest just complete enough for `PluginState`
+    /// to be constructed. The trait-impl unit tests below don't
+    /// exercise any of these fields beyond their existence; they
+    /// poke individual host calls directly, not through the loader.
+    fn fixture_manifest(plugin_id: &str) -> Arc<PluginManifest> {
+        use oxidhome_manifest::{CapabilitiesSection, PluginSection, RuntimeSection, World};
+        use semver::Version;
+        Arc::new(PluginManifest {
+            manifest_version: 1,
+            plugin: PluginSection {
+                id: plugin_id.to_owned(),
+                name: plugin_id.to_owned(),
+                version: Version::new(0, 1, 0),
+                authors: Vec::new(),
+                description: None,
+                source: None,
+                license: None,
+                keywords: Vec::new(),
+                world: World::Plugin,
+                sdk_version: Version::new(0, 1, 0),
+            },
+            runtime: RuntimeSection {
+                wasm: std::path::PathBuf::from("plugin.wasm"),
+                singleton: false,
+                tick_interval_ms: None,
+                fuel_per_call: None,
+                memory_max_mb: None,
+                call_timeout_ms: None,
+            },
+            // Devices declared so the in-module gating tests for
+            // *non-device* paths (events, logging) don't trip the
+            // gate. Per-test overrides can replace this manifest
+            // via `with_caps` below.
+            capabilities: CapabilitiesSection {
+                declares_devices: vec![
+                    "switch".into(),
+                    "dimmer".into(),
+                    "color-light".into(),
+                    "sensor".into(),
+                    "button".into(),
+                    "video-stream".into(),
+                    "audio-stream".into(),
+                ],
+                ..CapabilitiesSection::default()
+            },
+            config: std::collections::BTreeMap::new(),
+            ui: None,
+        })
+    }
+
     fn fresh_state(instance_id: &str) -> PluginState {
         PluginState::new(
             instance_id,
+            fixture_manifest("test.fixture"),
+            Actor::plugin(instance_id),
+            InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
         )
@@ -274,7 +538,14 @@ mod tests {
         registry: Arc<DeviceRegistry>,
         bus: Arc<EventBus>,
     ) -> PluginState {
-        PluginState::new(instance_id, registry, bus)
+        PluginState::new(
+            instance_id,
+            fixture_manifest("test.fixture"),
+            Actor::plugin(instance_id),
+            InstanceConfig::new(),
+            registry,
+            bus,
+        )
     }
 
     // ── host-devices ──────────────────────────────────────────────
@@ -458,6 +729,225 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Inject a hand-built `InstanceConfig` so the host-config trait
+    /// impl can be exercised without spinning up the full loader.
+    /// The flatten + leaf-lookup behavior is what we want pinned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_config_returns_resolved_leaves() {
+        let mut state = fresh_state("alpha");
+        let mut nested = std::collections::BTreeMap::new();
+        nested.insert("host".into(), ConfigValue::String("mqtt.local".into()));
+        nested.insert("port".into(), ConfigValue::Int(1883));
+        state
+            .config
+            .insert("default_state".into(), ConfigValue::Bool(true));
+        state
+            .config
+            .insert("broker".into(), ConfigValue::Nested(nested));
+
+        // Flat leaf.
+        let v = host_config::Host::get_config(&mut state, "default_state".into())
+            .await
+            .unwrap()
+            .expect("default_state must resolve");
+        assert!(matches!(v, WitValue::BoolVal(true)));
+
+        // Nested leaf.
+        let v = host_config::Host::get_config(&mut state, "broker.host".into())
+            .await
+            .unwrap()
+            .expect("broker.host must resolve");
+        match v {
+            WitValue::StringVal(s) => assert_eq!(s, "mqtt.local"),
+            other => panic!("expected StringVal, got {other:?}"),
+        }
+
+        // Asking for the nested *node* (not a leaf) returns None.
+        assert!(
+            host_config::Host::get_config(&mut state, "broker".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "bare-string nested lookups return None — leaves only"
+        );
+
+        // list_config flattens to dot-joined keys.
+        let listed = host_config::Host::list_config(&mut state).await.unwrap();
+        let keys: Vec<_> = listed.iter().map(|kv| kv.key.as_str()).collect();
+        assert!(keys.contains(&"default_state"));
+        assert!(keys.contains(&"broker.host"));
+        assert!(keys.contains(&"broker.port"));
+        // No bare "broker" entry — nested intermediate nodes don't
+        // appear in the flattened list.
+        assert!(!keys.contains(&"broker"));
+    }
+
+    /// register-device for an undeclared capability returns
+    /// `PermissionDenied` — Phase 4's call-site gating in action.
+    /// `fresh_state("alpha")` uses a fixture manifest that declares
+    /// every standard capability; build one that declares *only*
+    /// `switch` and watch a `dimmer` registration get refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_register_denied_when_capability_not_declared() {
+        use oxidhome_manifest::CapabilitiesSection;
+
+        // Construct a manifest where the plugin only declared `switch`.
+        let mut manifest = (*fixture_manifest("test.switch-only")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            declares_devices: vec!["switch".into()],
+            ..CapabilitiesSection::default()
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+        );
+
+        // A device that claims `dimmer` should be refused.
+        let mut info = empty_device("d-1");
+        info.capabilities = vec![capabilities::CapabilitySpec::Dimmer];
+        let err = host_devices::Host::register_device(&mut state, info)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("dimmer")),
+            "got {err:?}",
+        );
+
+        // A device that claims only `switch` goes through.
+        let mut info = empty_device("d-2");
+        info.capabilities = vec![capabilities::CapabilitySpec::Switch];
+        host_devices::Host::register_device(&mut state, info)
+            .await
+            .expect("switch is declared, register should succeed");
+    }
+
+    /// The `extension(<name>)` escape hatch must round-trip through
+    /// the gate: a manifest declaring `extension(window-shade)`
+    /// accepts a device with that capability.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_register_allows_declared_extension() {
+        use oxidhome_manifest::CapabilitiesSection;
+
+        let mut manifest = (*fixture_manifest("test.window-shade")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            declares_devices: vec!["extension(window-shade)".into()],
+            ..CapabilitiesSection::default()
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+        );
+
+        let mut info = empty_device("d-shade");
+        info.capabilities = vec![capabilities::CapabilitySpec::Extension(
+            "window-shade".into(),
+        )];
+        host_devices::Host::register_device(&mut state, info)
+            .await
+            .expect("declared extension should pass");
+    }
+
+    /// `initial_state` for a capability the device's `capabilities`
+    /// list doesn't declare is malformed: the WIT contract says
+    /// "one entry per stateful capability the plugin can already
+    /// report." Reject before it lands in the registry, otherwise an
+    /// undeclared sensor / switch state could slip in via the state
+    /// list even when `capabilities` looks clean.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_register_denied_when_state_lacks_matching_capability() {
+        let mut state = fresh_state("alpha");
+        let mut info = empty_device("d-stateful");
+        // Device claims it's a switch, but the plugin tries to ship
+        // sensor state alongside — sensor isn't in `capabilities`.
+        info.capabilities = vec![capabilities::CapabilitySpec::Switch];
+        info.initial_state = vec![
+            capabilities::CapabilityState::Switch(capabilities::Switchable { state: true }),
+            capabilities::CapabilityState::Sensor(capabilities::Measurement {
+                value: 21.5,
+                unit: "celsius".into(),
+            }),
+        ];
+        let err = host_devices::Host::register_device(&mut state, info)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("sensor")),
+            "expected PermissionDenied naming `sensor`, got {err:?}",
+        );
+    }
+
+    /// Even when `capabilities` is the empty list (no declared spec),
+    /// the plugin can't smuggle state in. The state-without-spec
+    /// check fires first, before the manifest gate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_register_denied_when_state_present_without_any_spec() {
+        let mut state = fresh_state("alpha");
+        let mut info = empty_device("d-bare");
+        info.initial_state = vec![capabilities::CapabilityState::Switch(
+            capabilities::Switchable { state: false },
+        )];
+        let err = host_devices::Host::register_device(&mut state, info)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("switch")),
+            "got {err:?}",
+        );
+    }
+
+    /// Update path runs the same gate. A previously-clean device's
+    /// `update_device` call that adds state for an undeclared
+    /// capability must be refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_update_denied_when_state_lacks_matching_capability() {
+        use oxidhome_manifest::CapabilitiesSection;
+
+        let mut manifest = (*fixture_manifest("test.switch-only")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            declares_devices: vec!["switch".into()],
+            ..CapabilitiesSection::default()
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+        );
+
+        let mut info = empty_device("d-up");
+        info.capabilities = vec![capabilities::CapabilitySpec::Switch];
+        let id = host_devices::Host::register_device(&mut state, info)
+            .await
+            .expect("initial register");
+
+        // Now try to update with sensor state attached.
+        let mut bad = empty_device("d-up");
+        bad.capabilities = vec![capabilities::CapabilitySpec::Switch];
+        bad.initial_state = vec![capabilities::CapabilityState::Sensor(
+            capabilities::Measurement {
+                value: 21.5,
+                unit: "celsius".into(),
+            },
+        )];
+        let err = host_devices::Host::update_device(&mut state, id, bad)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("sensor")),
+            "got {err:?}",
         );
     }
 

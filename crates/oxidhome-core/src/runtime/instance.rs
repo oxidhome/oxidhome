@@ -1,19 +1,27 @@
 //! [`PluginInstance`] — host handle to one running `plugin`-world
-//! component. Phase 2 implements the load → init → shutdown cycle.
+//! component. Phase 2 implements the load → init → shutdown cycle;
+//! Phase 4 wraps it in the manifest loader so every loaded plugin
+//! carries its declared identity, capabilities, and resolved
+//! per-instance config.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
+use oxidhome_manifest::{InstanceConfig, PluginManifest, merge};
+use semver::Version;
 use tracing::{Instrument, info_span};
 use wasmtime::Store;
 use wasmtime::component::{Component, HasSelf, Linker};
 
 use tokio::sync::broadcast::error::TryRecvError;
 
+use crate::auth::Actor;
 use crate::host_impl::plugin::Plugin as PluginBindings;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
 use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
+use crate::{MIN_SUPPORTED_SDK_VERSION, OXIDHOME_SDK_VERSION};
 
 use super::Engine;
 use super::state::PluginState;
@@ -30,56 +38,217 @@ pub struct PluginInstance {
 }
 
 impl PluginInstance {
-    /// Read a `.wasm` component from disk, build a Linker that satisfies
-    /// every import in the `plugin` world (oxidhome host-* + WASI), and
-    /// instantiate. Does **not** call [`Self::init`] — callers run that
-    /// next.
-    pub async fn load(engine: &Engine, wasm_path: &Path) -> anyhow::Result<Self> {
-        let span = info_span!("plugin.load", path = %wasm_path.display());
+    /// Load a plugin from its install directory.
+    ///
+    /// The directory must contain `manifest.toml` (parsed via
+    /// `oxidhome-manifest`) and the `.wasm` component the manifest
+    /// points at via `[runtime].wasm` (relative to the manifest dir).
+    ///
+    /// Steps:
+    ///
+    /// 1. Read + parse `manifest.toml`.
+    /// 2. Validate the manifest (`oxidhome_manifest::validate`).
+    /// 3. Compatibility-check the plugin's declared `sdk_version`
+    ///    against this host's [`OXIDHOME_SDK_VERSION`] and
+    ///    [`MIN_SUPPORTED_SDK_VERSION`].
+    /// 4. Resolve the per-instance config (`merge` with the
+    ///    optional override blob).
+    /// 5. Instantiate the wasm component.
+    ///
+    /// Does **not** call [`Self::init`] — callers run that next.
+    pub async fn load(
+        engine: &Engine,
+        plugin_dir: &Path,
+        instance_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_overrides(engine, plugin_dir, instance_id, None).await
+    }
+
+    /// Same as [`Self::load`], but the caller supplies the user
+    /// config-override blob. The host's per-instance config layer
+    /// uses this; tests pass `None` to take all defaults.
+    ///
+    /// # Panics
+    /// Panics only if the host's `OXIDHOME_SDK_VERSION` /
+    /// `MIN_SUPPORTED_SDK_VERSION` constants fail to parse as
+    /// semver — those are compile-time string literals and the
+    /// `parse` is essentially a debug assertion on the constants.
+    pub async fn load_with_overrides(
+        engine: &Engine,
+        plugin_dir: &Path,
+        instance_id: impl Into<String>,
+        overrides: Option<&toml::Value>,
+    ) -> anyhow::Result<Self> {
+        let plugin_dir = plugin_dir.to_path_buf();
+        let instance_id = instance_id.into();
+        let span = info_span!(
+            "plugin.load",
+            plugin_dir = %plugin_dir.display(),
+            instance_id = %instance_id,
+        );
         async move {
-            let component = Component::from_file(engine.raw(), wasm_path)
-                .map_err(anyhow::Error::from)
-                .with_context(|| format!("loading component from {}", wasm_path.display()))?;
-
-            let mut linker: Linker<PluginState> = Linker::new(engine.raw());
-
-            // WASI p2 satisfies the `wasi:cli`, `wasi:io`, `wasi:clocks`
-            // etc. imports the plugin's libstd pulls in. Plugin world
-            // doesn't expose WASI to the plugin author yet (Phase 8
-            // does, via the streaming-plugin world), but the
-            // libstd-driven imports still need a real implementation.
-            wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-                .map_err(anyhow::Error::from)
-                .context("adding wasi:p2 to linker")?;
-
-            // Host imports declared by the `plugin` world: host-devices,
-            // host-events, host-config, storage, logging. All wired
-            // through the bindgen-generated `add_to_linker` against
-            // `PluginState`. As of Phase 3, logging + host-devices +
-            // host-events are functional; `storage::*` still returns
-            // `Error::Unavailable` (Phase 5a wires the real KV);
-            // `host-config::*` returns empty `Ok` values (`Ok(None)` /
-            // empty list) until Phase 4 wires the real config source.
-            PluginBindings::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(anyhow::Error::from)
-                .context("adding plugin world host imports to linker")?;
-
-            let instance_id = wasm_path.file_stem().map_or_else(
-                || "plugin".to_string(),
-                |s| s.to_string_lossy().into_owned(),
-            );
-            let state = PluginState::new(instance_id, engine.devices(), engine.events());
-            let mut store = Store::new(engine.raw(), state);
-
-            let bindings = PluginBindings::instantiate_async(&mut store, &component, &linker)
+            let manifest_path = plugin_dir.join("manifest.toml");
+            let manifest_text = tokio::fs::read_to_string(&manifest_path)
                 .await
-                .map_err(anyhow::Error::from)
-                .context("instantiating plugin component")?;
+                .with_context(|| {
+                    format!(
+                        "reading manifest from {} (does the plugin dir contain manifest.toml?)",
+                        manifest_path.display(),
+                    )
+                })?;
+            let manifest: PluginManifest = toml::from_str(&manifest_text)
+                .with_context(|| format!("parsing {}", manifest_path.display()))?;
+            if let Err(errors) = oxidhome_manifest::validate(&manifest) {
+                return Err(anyhow!(
+                    "manifest {} is invalid:\n  - {}",
+                    manifest_path.display(),
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n  - "),
+                ));
+            }
 
-            Ok(Self { bindings, store })
+            // SDK compatibility preflight.
+            let core_sdk = OXIDHOME_SDK_VERSION
+                .parse::<Version>()
+                .expect("OXIDHOME_SDK_VERSION is a valid semver string");
+            let min_sdk = MIN_SUPPORTED_SDK_VERSION
+                .parse::<Version>()
+                .expect("MIN_SUPPORTED_SDK_VERSION is a valid semver string");
+            oxidhome_manifest::check_compatibility(
+                &manifest.plugin.sdk_version,
+                &core_sdk,
+                &min_sdk,
+            )
+            .with_context(|| {
+                format!(
+                    "rejecting plugin {} (instance {})",
+                    manifest.plugin.id, instance_id,
+                )
+            })?;
+
+            // Resolve per-instance config. An absent override blob is
+            // the same as an empty TOML table for merge() — every
+            // field falls back on its declared default. Required
+            // fields with no default and no override fail loudly.
+            let empty_overrides = toml::Value::Table(toml::value::Table::new());
+            let overrides_ref = overrides.unwrap_or(&empty_overrides);
+            let config = merge(&manifest, overrides_ref).map_err(|errors| {
+                anyhow!(
+                    "config merge for instance {instance_id} failed:\n  - {}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n  - "),
+                )
+            })?;
+
+            let wasm_path = resolve_wasm_path(&plugin_dir, &manifest.runtime.wasm)?;
+            let manifest = Arc::new(manifest);
+            Self::instantiate(engine, &wasm_path, instance_id, manifest, config).await
         }
         .instrument(span)
         .await
+    }
+
+    /// Test-only constructor: skip the manifest-on-disk hop and
+    /// supply the parsed `PluginManifest` directly. Useful for unit
+    /// tests that want to vary capabilities without writing TOML
+    /// fixtures to a tmpdir per scenario. Still runs the SDK-version
+    /// compatibility preflight and `merge()` (so the assertions
+    /// match the real load path).
+    ///
+    /// # Panics
+    /// See [`Self::load_with_overrides`].
+    #[doc(hidden)]
+    pub async fn load_with_manifest(
+        engine: &Engine,
+        wasm_path: &Path,
+        instance_id: impl Into<String>,
+        manifest: PluginManifest,
+        overrides: Option<&toml::Value>,
+    ) -> anyhow::Result<Self> {
+        let core_sdk = OXIDHOME_SDK_VERSION
+            .parse::<Version>()
+            .expect("OXIDHOME_SDK_VERSION is a valid semver string");
+        let min_sdk = MIN_SUPPORTED_SDK_VERSION
+            .parse::<Version>()
+            .expect("MIN_SUPPORTED_SDK_VERSION is a valid semver string");
+        oxidhome_manifest::check_compatibility(&manifest.plugin.sdk_version, &core_sdk, &min_sdk)
+            .context("rejecting test plugin")?;
+
+        let empty_overrides = toml::Value::Table(toml::value::Table::new());
+        let overrides_ref = overrides.unwrap_or(&empty_overrides);
+        let config = merge(&manifest, overrides_ref).map_err(|errors| {
+            anyhow!(
+                "test config merge failed:\n  - {}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n  - "),
+            )
+        })?;
+
+        Self::instantiate(engine, wasm_path, instance_id, Arc::new(manifest), config).await
+    }
+
+    /// Shared tail: build the Linker, construct `PluginState`, load
+    /// the component, instantiate.
+    async fn instantiate(
+        engine: &Engine,
+        wasm_path: &Path,
+        instance_id: impl Into<String>,
+        manifest: Arc<PluginManifest>,
+        config: InstanceConfig,
+    ) -> anyhow::Result<Self> {
+        let component = Component::from_file(engine.raw(), wasm_path)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("loading component from {}", wasm_path.display()))?;
+
+        let mut linker: Linker<PluginState> = Linker::new(engine.raw());
+
+        // WASI p2 satisfies the `wasi:cli`, `wasi:io`, `wasi:clocks`
+        // etc. imports the plugin's libstd pulls in. Plugin world
+        // doesn't expose WASI to the plugin author yet (Phase 8
+        // does, via the streaming-plugin world), but the
+        // libstd-driven imports still need a real implementation.
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+            .map_err(anyhow::Error::from)
+            .context("adding wasi:p2 to linker")?;
+
+        // Host imports declared by the `plugin` world: host-devices,
+        // host-events, host-config, storage, logging. All wired
+        // through the bindgen-generated `add_to_linker` against
+        // `PluginState`. As of Phase 4, host-devices is gated by the
+        // manifest's `declares_devices`; host-config returns the
+        // resolved `InstanceConfig`. `storage::*` still stubs
+        // `Error::Unavailable` (Phase 5a wires the SQLite-backed KV).
+        PluginBindings::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+            .map_err(anyhow::Error::from)
+            .context("adding plugin world host imports to linker")?;
+
+        let instance_id = instance_id.into();
+        let actor = Actor::plugin(instance_id.clone());
+        let state = PluginState::new(
+            instance_id,
+            manifest,
+            actor,
+            config,
+            engine.devices(),
+            engine.events(),
+        );
+        let mut store = Store::new(engine.raw(), state);
+
+        let bindings = PluginBindings::instantiate_async(&mut store, &component, &linker)
+            .await
+            .map_err(anyhow::Error::from)
+            .context("instantiating plugin component")?;
+
+        Ok(Self { bindings, store })
     }
 
     /// Call the plugin's exported `init`. The plugin returns
@@ -205,4 +374,33 @@ impl PluginInstance {
     pub fn instance_id(&self) -> &str {
         &self.store.data().instance_id
     }
+}
+
+/// Join `plugin_dir + manifest.runtime.wasm`, canonicalize both, and
+/// confirm the resolved `.wasm` lives under the canonical plugin
+/// directory. Catches anything the manifest validator's shape check
+/// can't see: symlinks pointing outside the plugin dir, races where
+/// `plugin_dir` itself is a symlink, etc.
+///
+/// The validator's `WasmPathProblem` check already rejects absolute
+/// paths and `..` components at parse time, so this is defense in
+/// depth — but the canonicalize hop catches symlinks, which the
+/// purely-syntactic validator can't.
+fn resolve_wasm_path(plugin_dir: &Path, rel_wasm: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let joined = plugin_dir.join(rel_wasm);
+    let canonical_wasm = joined
+        .canonicalize()
+        .with_context(|| format!("canonicalizing wasm path {}", joined.display()))?;
+    let canonical_dir = plugin_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing plugin dir {}", plugin_dir.display()))?;
+    if !canonical_wasm.starts_with(&canonical_dir) {
+        return Err(anyhow!(
+            "runtime.wasm resolves to {}, which is outside the plugin directory {} \
+             (symlink? `..`-traversal that snuck past validation?)",
+            canonical_wasm.display(),
+            canonical_dir.display(),
+        ));
+    }
+    Ok(canonical_wasm)
 }

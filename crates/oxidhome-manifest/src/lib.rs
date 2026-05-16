@@ -36,4 +36,4 @@ pub use manifest::{
     World,
 };
 pub use network::{HostMatch, NetworkRule, NetworkRuleParseError, PortMatch, Proto};
-pub use validate::{ValidationError, validate};
+pub use validate::{ValidationError, WasmPathProblem, validate};

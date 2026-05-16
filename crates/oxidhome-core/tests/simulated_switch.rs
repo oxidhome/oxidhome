@@ -36,6 +36,9 @@ async fn simulated_switch_round_trip() {
 
     let wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
     assert!(wasm.is_file(), "missing build artifact: {wasm:?}");
+    let plugin_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
 
     let engine = Engine::new().expect("engine");
     let registry = engine.devices();
@@ -47,7 +50,7 @@ async fn simulated_switch_round_trip() {
     // subscribe call.
     let mut subscription = bus.subscribe_all();
 
-    let mut instance = PluginInstance::load(&engine, &wasm)
+    let mut instance = PluginInstance::load(&engine, &plugin_dir, "simulated_switch")
         .await
         .expect("load simulated-switch");
     instance.init().await.expect("init");

@@ -158,6 +158,49 @@ pub enum ValidationError {
 
     #[error("config overrides root `{path}` must be a TOML table")]
     ConfigOverrideShape { path: String },
+
+    /// `runtime.wasm` is interpreted relative to the manifest's
+    /// directory. An absolute path, or one with `..` / `.` components,
+    /// could escape the plugin's install directory and point the host
+    /// loader at an arbitrary `.wasm` elsewhere on disk. Reject those
+    /// shapes at parse time so the install path never sees them.
+    #[error(
+        "runtime.wasm `{got}` must be a relative path under the manifest's directory \
+         (no leading `/`, no `..` or `.` components): {reason}"
+    )]
+    RuntimeWasmPathEscapes {
+        got: String,
+        reason: WasmPathProblem,
+    },
+}
+
+/// Why a `runtime.wasm` path was rejected. Carried in
+/// [`ValidationError::RuntimeWasmPathEscapes`] so the operator sees
+/// the specific shape problem (absolute, parent-traversal, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmPathProblem {
+    /// The path is empty.
+    Empty,
+    /// Starts with `/` (Unix) or a drive/UNC root (Windows).
+    Absolute,
+    /// Contains a `..` component.
+    ParentTraversal,
+    /// Contains a `.` component.
+    CurrentDir,
+    /// Contains a Windows-style prefix (`C:`, `\\?\…`).
+    HasPrefix,
+}
+
+impl std::fmt::Display for WasmPathProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WasmPathProblem::Empty => f.write_str("path is empty"),
+            WasmPathProblem::Absolute => f.write_str("path is absolute"),
+            WasmPathProblem::ParentTraversal => f.write_str("contains a `..` component"),
+            WasmPathProblem::CurrentDir => f.write_str("contains a `.` component"),
+            WasmPathProblem::HasPrefix => f.write_str("contains a path prefix"),
+        }
+    }
 }
 
 /// Every `manifest_version` this build accepts. Add to this list when
@@ -222,6 +265,13 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
     if !is_reverse_dns(&m.plugin.id) {
         errors.push(ValidationError::InvalidPluginId {
             got: m.plugin.id.clone(),
+        });
+    }
+
+    if let Some(reason) = wasm_path_problem(&m.runtime.wasm) {
+        errors.push(ValidationError::RuntimeWasmPathEscapes {
+            got: m.runtime.wasm.display().to_string(),
+            reason,
         });
     }
 
@@ -485,6 +535,36 @@ fn check_float_finite(
             got: v,
         });
     }
+}
+
+/// Vet `runtime.wasm`. The host loader joins it to the manifest's
+/// directory; on Unix `Path::join` short-circuits to the RHS when the
+/// RHS is absolute, and a `..` component would walk above the plugin
+/// dir. Either shape lets a manifest point the host at any `.wasm`
+/// on disk. Reject both at parse time. Returns `None` when the path
+/// is safe to join.
+fn wasm_path_problem(p: &std::path::Path) -> Option<WasmPathProblem> {
+    use std::path::Component;
+    if p.as_os_str().is_empty() {
+        return Some(WasmPathProblem::Empty);
+    }
+    if p.is_absolute() {
+        return Some(WasmPathProblem::Absolute);
+    }
+    for c in p.components() {
+        match c {
+            Component::Normal(_) => {}
+            Component::Prefix(_) | Component::RootDir => {
+                // `RootDir` alone is caught by `is_absolute()` above,
+                // but a Windows `Prefix` (e.g. `C:`) isn't always —
+                // belt-and-suspenders.
+                return Some(WasmPathProblem::HasPrefix);
+            }
+            Component::ParentDir => return Some(WasmPathProblem::ParentTraversal),
+            Component::CurDir => return Some(WasmPathProblem::CurrentDir),
+        }
+    }
+    None
 }
 
 /// Reverse-DNS: at least two dot-separated labels, each label is
@@ -1179,6 +1259,83 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, ValidationError::ConfigFloatNotFinite { role: "max", .. }))
         );
+    }
+
+    #[test]
+    fn flags_absolute_runtime_wasm_path() {
+        let mut m = ok_manifest();
+        m.runtime.wasm = "/etc/passwd".into();
+        let errs = validate(&m).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::RuntimeWasmPathEscapes {
+                    reason: WasmPathProblem::Absolute,
+                    ..
+                }
+            )),
+            "got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn flags_parent_traversal_runtime_wasm_path() {
+        for bad in ["../escape.wasm", "subdir/../../etc/passwd"] {
+            let mut m = ok_manifest();
+            m.runtime.wasm = bad.into();
+            let errs = validate(&m).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::RuntimeWasmPathEscapes {
+                        reason: WasmPathProblem::ParentTraversal,
+                        ..
+                    }
+                )),
+                "expected ParentTraversal for `{bad}`, got {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn flags_current_dir_runtime_wasm_path() {
+        let mut m = ok_manifest();
+        m.runtime.wasm = "./x.wasm".into();
+        let errs = validate(&m).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::RuntimeWasmPathEscapes {
+                    reason: WasmPathProblem::CurrentDir,
+                    ..
+                }
+            )),
+            "got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn flags_empty_runtime_wasm_path() {
+        let mut m = ok_manifest();
+        m.runtime.wasm = "".into();
+        let errs = validate(&m).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::RuntimeWasmPathEscapes {
+                    reason: WasmPathProblem::Empty,
+                    ..
+                }
+            )),
+            "got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn accepts_nested_relative_runtime_wasm_path() {
+        let mut m = ok_manifest();
+        m.runtime.wasm = "build/plugin.wasm".into();
+        validate(&m).expect("nested relative path is fine");
     }
 
     #[test]
