@@ -2,20 +2,18 @@
 //!
 //! Cover the bits the per-plugin round-trip tests don't: loading
 //! refuses cleanly when the manifest is missing or invalid, and the
-//! call-site capability gate prevents an undeclared device
-//! registration from going through. The simulated-switch wasm is
-//! reused so we don't rebuild a wasm fixture per scenario.
+//! call-site capability gate refuses a *real* guest-side
+//! `register-device` call when the manifest doesn't declare it. The
+//! simulated-switch wasm is reused as the guest fixture — its `init`
+//! propagates the host's error through `map_err(...)?`, so the
+//! permission-denied surfaces as the `init()` Result.
 
 #[path = "support.rs"]
 mod support;
 
 use std::path::PathBuf;
 
-use oxidhome_core::host_impl::plugin::oxidhome::plugin::capabilities::CapabilitySpec;
-use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::DeviceInfo;
-use oxidhome_core::host_impl::plugin::oxidhome::plugin::host_devices;
-use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
-use oxidhome_core::{Actor, ActorKind, DeviceRegistry, Engine, EventBus, PluginInstance};
+use oxidhome_core::{Engine, PluginInstance};
 
 /// Plugin directory with no manifest → load errors loudly.
 #[tokio::test(flavor = "current_thread")]
@@ -99,81 +97,78 @@ wasm = "irrelevant.wasm"
     );
 }
 
-/// End-to-end gating check via the loader path. Loads
-/// `simulated-switch` with a *swapped* manifest that doesn't
-/// declare `switch`; calling `register_device` with a switch
-/// capability through the WIT trait surface must return
-/// `permission-denied`. Bypasses the wasm `init` so we don't need a
-/// different .wasm built — we exercise the gate on `PluginState`
-/// directly, simulating what a guest would see if the plugin tried
-/// to register a capability the manifest didn't authorize.
+/// **Definition-of-done end-to-end gating check.**
+///
+/// Per `07_manifest.md`: *"a plugin instantiates fine, then tries to
+/// call `register-device` without `declares_devices` set, and
+/// observes `permission-denied`."* This is the literal version of
+/// that — no `PluginState`-direct shortcuts.
+///
+/// The simulated-switch wasm is reused as the guest fixture. Its
+/// `init` calls `host::register_device(...)` for a `switch`-capability
+/// device and propagates any host error via `map_err(...)?`, so a
+/// `permission-denied` from the host surfaces directly through the
+/// returned `init()` Result. The test builds the wasm, copies it into
+/// a tempdir, writes a manifest with `declares_devices = []`
+/// alongside it, loads through `PluginInstance::load` (which proves
+/// instantiation succeeds — the gate fires at the call site, not at
+/// load time), and asserts `init()` fails with a message naming
+/// `permission-denied` and `switch`.
 #[tokio::test(flavor = "current_thread")]
-async fn register_device_for_undeclared_capability_denied() {
-    use oxidhome_manifest::{
-        CapabilitiesSection, PluginManifest, PluginSection, RuntimeSection, World,
-    };
-    use semver::Version;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
+async fn loader_path_register_device_for_undeclared_capability_denied() {
+    let wasm_src = support::build_example("simulated-switch", "simulated_switch.wasm");
+    assert!(wasm_src.is_file(), "missing build artifact: {wasm_src:?}");
 
-    // Manifest that declares *no* device capabilities.
-    let manifest = PluginManifest {
-        manifest_version: 1,
-        plugin: PluginSection {
-            id: "example.bare".into(),
-            name: "Bare".into(),
-            version: Version::new(0, 1, 0),
-            authors: Vec::new(),
-            description: None,
-            source: None,
-            license: None,
-            keywords: Vec::new(),
-            world: World::Plugin,
-            sdk_version: Version::new(0, 1, 0),
-        },
-        runtime: RuntimeSection {
-            wasm: PathBuf::from("none.wasm"),
-            singleton: false,
-            tick_interval_ms: None,
-            fuel_per_call: None,
-            memory_max_mb: None,
-            call_timeout_ms: None,
-        },
-        capabilities: CapabilitiesSection::default(),
-        config: BTreeMap::new(),
-        ui: None,
-    };
+    // Tempdir laid out as a real plugin install dir: `manifest.toml`
+    // alongside the wasm. The manifest's `wasm` key is relative
+    // (absolute paths trip `RuntimeWasmPathEscapes`), so the wasm
+    // file is *copied* into the tempdir rather than referenced via a
+    // symlink (which the loader's canonicalize check would refuse
+    // for landing outside the plugin dir).
+    let dir = tempdir();
+    let wasm_dst = dir.path().join("simulated_switch.wasm");
+    std::fs::copy(&wasm_src, &wasm_dst).expect("copy wasm");
+    std::fs::write(
+        dir.path().join("manifest.toml"),
+        // declares_devices is intentionally absent → empty → the
+        // simulated-switch's `register_device(.. CapabilitySpec::Switch ..)`
+        // call inside `init` must come back denied.
+        r#"manifest_version = 1
+[plugin]
+id = "example.bare-switch"
+name = "Bare Switch"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "simulated_switch.wasm"
+[capabilities]
+"#,
+    )
+    .expect("write manifest");
 
-    // Build a PluginState directly via oxidhome-core's library
-    // surface. This bypasses Wasmtime entirely — we're exercising
-    // the host trait impl, which is what the WIT linker call would
-    // route into.
-    let mut state = oxidhome_core::runtime::PluginState::new(
-        "bare-0",
-        Arc::new(manifest),
-        Actor::plugin("bare-0"),
-        oxidhome_manifest::InstanceConfig::new(),
-        Arc::new(DeviceRegistry::new()),
-        Arc::new(EventBus::new()),
-    );
-    assert_eq!(state.actor.kind(), ActorKind::Plugin);
+    let engine = Engine::new().expect("engine");
 
-    let info = DeviceInfo {
-        local_id: "d-1".into(),
-        name: "d-1".into(),
-        manufacturer: None,
-        model: None,
-        firmware: None,
-        capabilities: vec![CapabilitySpec::Switch],
-        initial_state: Vec::new(),
-        metadata: Vec::new(),
-    };
-    let err = host_devices::Host::register_device(&mut state, info)
+    // Load must succeed — gating is at the call site, not at
+    // instantiation. The Wasmtime linker provides every host import
+    // unconditionally; the manifest only filters at call time.
+    let mut instance = PluginInstance::load(&engine, dir.path(), "bare_switch")
         .await
-        .expect_err("undeclared capability must be denied");
+        .expect("plugin should instantiate even with empty declares_devices");
+
+    // `init` runs guest code that calls host::register_device for a
+    // switch. The host's gate returns permission-denied; the guest's
+    // `map_err(...)?` propagates the error back through `init`'s
+    // Result, which surfaces here as an anyhow::Error.
+    let err = match instance.init().await {
+        Ok(()) => panic!("expected init to fail for undeclared `switch` capability"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
     assert!(
-        matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("switch")),
-        "expected PermissionDenied with `switch`, got {err:?}",
+        msg.to_ascii_lowercase().contains("permission")
+            && msg.to_ascii_lowercase().contains("switch"),
+        "expected error mentioning permission + switch, got: {msg}",
     );
 }
 

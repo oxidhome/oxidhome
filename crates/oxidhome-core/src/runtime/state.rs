@@ -3,11 +3,21 @@
 //!
 //! Every host import the plugin world declares (`host-devices`,
 //! `host-events`, `host-config`, `storage`, `logging`) is implemented
-//! against this struct. As of Phase 4: `host-devices`, `host-events`,
-//! `host-config`, and `logging` are functional and gated by the
-//! plugin's manifest; `storage` returns [`Error::Unavailable`] until
-//! Phase 5a's SQLite-backed KV (the call-site framework is wired so
-//! Phase 5a only fills in the impl).
+//! against this struct. As of Phase 4B:
+//!
+//! - `host-devices::register-device` and `update-device` are gated by
+//!   the manifest's `capabilities.declares_devices` (plus an
+//!   `initial-state`-must-have-matching-spec cross-check).
+//!   `remove-device` and `get-device` are always-allow — they can't
+//!   smuggle new capabilities in.
+//! - `host-events`, `host-config`, and `logging` are functional but
+//!   not manifest-gated. There's no per-call authorization for
+//!   publishing or subscribing yet; capability gating beyond device
+//!   registration (network rules for streaming plugins, services,
+//!   blob/log quotas) lives in later phases.
+//! - `storage` returns [`Error::Unavailable`] until Phase 5a's
+//!   SQLite-backed KV — the call-site framework is wired so 5a only
+//!   fills in the impl.
 
 use std::sync::Arc;
 
