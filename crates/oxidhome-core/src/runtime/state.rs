@@ -254,8 +254,19 @@ impl host_devices::Host for PluginState {
         // Same gate as register-device — a plugin that wasn't allowed
         // to register a switch shouldn't be able to update one into a
         // switch either, and the initial_state cross-check still
-        // applies.
-        authorize_device_info(&self.manifest.capabilities.declares_devices, &info)?;
+        // applies. Log denials symmetrically with register-device so
+        // the Phase-5c log/trace store captures both paths through the
+        // same `warn`.
+        if let Err(err) = authorize_device_info(&self.manifest.capabilities.declares_devices, &info)
+        {
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                device_id = %id,
+                error = %err,
+                "update-device denied",
+            );
+            return Err(err);
+        }
         self.devices.update(&self.instance_id, &id, info).await
     }
 

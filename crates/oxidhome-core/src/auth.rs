@@ -2,12 +2,18 @@
 //!
 //! Every command, tool invocation, and state-changing call that
 //! crosses an internal boundary should carry an [`Actor`]: *who* is
-//! making this call? Phase 4 introduces the type and threads it
-//! through the plugin-instance dispatch path. Phase 12's external
-//! HTTP/WS API populates it for inbound requests; Phase 14's MCP
-//! server reuses the same shape. For 0.1 (Phase 4), only
-//! [`Actor::plugin`] is constructed — the other variants exist so
-//! the future API surface has a slot waiting, not a refactor.
+//! making this call?
+//!
+//! **Phase 4 scope.** Introduce the type and give every
+//! [`PluginState`](crate::runtime::PluginState) an
+//! [`Actor::plugin(instance_id)`]. Host-call entry points (e.g.
+//! `execute_command`, `on_event`) do **not** take an `Actor` parameter
+//! yet — every host call from a `PluginState` is by construction a
+//! plugin actor with the state's `instance_id`, so a separate field
+//! would only duplicate the existing `instance_id` span data. Phase 12
+//! threads `Actor` through host-call sites once non-plugin actor
+//! kinds (Api / Cli / Mcp / Automation) have real callers; the other
+//! variants exist now so that work doesn't need a refactor.
 //!
 //! Beyond identity, [`Actor`] carries the scopes the caller is
 //! authorized for. The Phase-12 token table is the source of truth;
