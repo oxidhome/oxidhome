@@ -257,6 +257,7 @@ impl PluginInstance {
             engine.devices(),
             engine.events(),
             kv,
+            engine.event_log(),
         );
         let mut store = Store::new(engine.raw(), state);
 

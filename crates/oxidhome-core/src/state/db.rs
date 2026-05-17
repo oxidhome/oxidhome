@@ -138,6 +138,44 @@ const MIGRATIONS: &[&str] = &[
          WHERE kv.instance_id = kv_usage.instance_id
     ), 0);
     ",
+    // 3 — Phase 5d: event history store.
+    //
+    // Durable mirror of the live `EventBus` (`state/events.rs`). The
+    // host writes every plugin-published event here, the CLI/API
+    // reads back history. Trust separation on timestamps: `received_ms`
+    // is the host's wall-clock at receive time (used for ordering,
+    // retention, query bounds); `payload_ms` is the plugin's
+    // self-reported `events::event.timestamp` (informational only, so
+    // a buggy plugin can't backdate history).
+    //
+    // `actor_kind` / `actor_id` columns from the per-crate plan are
+    // **not** here — Phase 4B only constructs `Actor::plugin(instance_id)`
+    // so they'd always echo `(plugin, instance_id)` and add no info.
+    // Phase 12 (external API) adds them as a follow-up migration when
+    // non-plugin actors become real callers.
+    //
+    // `payload_blob` is the WIT event-payload variant encoded as
+    // tagged JSON via `serde_json`. Postcard (smaller wire) is an
+    // optimization for later; the store reads opaque BLOBs so a
+    // future migration can re-encode in place.
+    "
+    CREATE TABLE event_log (
+        id            INTEGER PRIMARY KEY,
+        received_ms   INTEGER NOT NULL,
+        payload_ms    INTEGER NOT NULL,
+        device_id     TEXT,
+        instance_id   TEXT NOT NULL,
+        plugin_id     TEXT NOT NULL,
+        topic         TEXT NOT NULL,
+        payload_blob  BLOB NOT NULL
+    );
+
+    CREATE INDEX evt_received      ON event_log(received_ms);
+    CREATE INDEX evt_device        ON event_log(device_id, received_ms) WHERE device_id IS NOT NULL;
+    CREATE INDEX evt_topic         ON event_log(topic, received_ms);
+    CREATE INDEX evt_instance      ON event_log(instance_id, received_ms);
+    CREATE INDEX evt_plugin        ON event_log(plugin_id, received_ms);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.
