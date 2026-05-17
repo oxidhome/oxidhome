@@ -84,9 +84,11 @@ pub struct HistoricalEvent {
 ///
 /// - `Some((s, TopicMatch::Exact))` → `topic = s`. Use for
 ///   capability events (`"switch"`, `"button"`, `"inference"`).
-/// - `Some((s, TopicMatch::Prefix))` → `topic LIKE 's%'`. Use for
-///   custom-event topic prefixes (`"automation."` → every
-///   `automation.morning`, `automation.evening`, …).
+/// - `Some((s, TopicMatch::Prefix))` → `substr(topic, 1, length(s)) = s`.
+///   Use for custom-event topic prefixes (`"automation."` → every
+///   `automation.morning`, `automation.evening`, …). Same shape
+///   `kv::list_keys` settled on post-5a — correct on TEXT, no `LIKE`
+///   wildcard-escaping hazards.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventQuery {
     pub since_ms: Option<i64>,
