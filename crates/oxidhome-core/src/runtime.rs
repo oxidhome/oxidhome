@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
-use crate::state::{Db, DeviceRegistry, EventBus, KvStore};
+use crate::state::{Db, DeviceRegistry, EventBus, EventLog, KvStore};
 
 /// Process-wide Wasmtime engine. Components are compiled once per engine
 /// and instantiated cheaply across many [`PluginInstance`]s — wrap this
@@ -42,6 +42,7 @@ pub struct Engine {
     devices: Arc<DeviceRegistry>,
     events: Arc<EventBus>,
     kv: Arc<KvStore>,
+    event_log: Arc<EventLog>,
 }
 
 impl Engine {
@@ -91,7 +92,8 @@ impl Engine {
             inner,
             devices: Arc::new(DeviceRegistry::new()),
             events: Arc::new(EventBus::new()),
-            kv: Arc::new(KvStore::new(db)),
+            kv: Arc::new(KvStore::new(Arc::clone(&db))),
+            event_log: Arc::new(EventLog::new(db)),
         })
     }
 
@@ -119,5 +121,15 @@ impl Engine {
     #[must_use]
     pub fn kv(&self) -> Arc<KvStore> {
         Arc::clone(&self.kv)
+    }
+
+    /// Shared durable event log. Mirrors every `publish-event` call
+    /// into `<state_dir>/oxidhome.db`'s `event_log` table — Phase 5d.
+    /// Host-side consumers (tests, the future CLI/API query layer)
+    /// can query it directly; plugins still go through `host-events`
+    /// for live delivery only.
+    #[must_use]
+    pub fn event_log(&self) -> Arc<EventLog> {
+        Arc::clone(&self.event_log)
     }
 }

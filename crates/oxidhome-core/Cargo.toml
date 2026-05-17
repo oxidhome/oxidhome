@@ -48,6 +48,10 @@ path = "tests/config_overrides.rs"
 name = "storage_persistence"
 path = "tests/storage_persistence.rs"
 
+[[test]]
+name = "event_history"
+path = "tests/event_history.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors

@@ -98,6 +98,11 @@ pub struct PluginState {
     /// bookkeeping live in the store itself; this is just the handle.
     /// `host-storage::*` calls go through here.
     pub kv: Arc<crate::state::KvStore>,
+    /// Shared durable event log — Phase 5d. Every `host-events::publish-event`
+    /// is mirrored here before the live broadcast. The handle is
+    /// per-`Engine`, cloned into each `PluginState` so the trait impl
+    /// can reach the store without going through the engine.
+    pub event_log: Arc<crate::state::EventLog>,
 }
 
 impl PluginState {
@@ -114,6 +119,7 @@ impl PluginState {
         devices: Arc<DeviceRegistry>,
         events: Arc<EventBus>,
         kv: Arc<crate::state::KvStore>,
+        event_log: Arc<crate::state::EventLog>,
     ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
@@ -124,6 +130,7 @@ impl PluginState {
             devices,
             events,
             kv,
+            event_log,
             subscriptions: Vec::new(),
             manifest,
             actor,
@@ -315,6 +322,39 @@ impl host_devices::Host for PluginState {
 
 impl host_events::Host for PluginState {
     async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
+        // Durable mirror first (Phase 5d): if the write fails — disk
+        // full, sqlite corruption, etc. — we'd rather refuse the
+        // publish than silently lose history. Live broadcast comes
+        // second.
+        let event_log = Arc::clone(&self.event_log);
+        let instance_id = self.instance_id.clone();
+        let plugin_id = self.manifest.plugin.id.clone();
+        let to_record = ev.clone();
+        // rusqlite is sync — hop to a blocking thread for the write
+        // so we don't park the tokio worker on disk I/O. Panics in
+        // the spawn_blocking body surface as `Error::Internal`,
+        // matching the storage-side error mapping.
+        let recorded = tokio::task::spawn_blocking(move || {
+            event_log.record(
+                crate::state::event_log::now_unix_ms(),
+                &to_record,
+                &instance_id,
+                &plugin_id,
+            )
+        })
+        .await;
+        match recorded {
+            Ok(Ok(_id)) => {}
+            Ok(Err(e)) => {
+                return Err(WitError::Internal(format!("event_log: write failed: {e}")));
+            }
+            Err(join) => {
+                return Err(WitError::Internal(format!(
+                    "event_log: blocking task panicked: {join}",
+                )));
+            }
+        }
+
         let _delivered = self.events.publish(ev);
         Ok(())
     }
@@ -622,6 +662,16 @@ mod tests {
         kv
     }
 
+    /// Build a throw-away [`EventLog`] backed by its own in-memory
+    /// [`Db`]. Lib unit tests don't share a DB between the KV and the
+    /// event log (each test makes its own); the persistence
+    /// integration test in `tests/event_history.rs` exercises the
+    /// shared-file shape that matters for production.
+    fn fresh_event_log() -> Arc<crate::state::EventLog> {
+        let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
+        Arc::new(crate::state::EventLog::new(db))
+    }
+
     fn fresh_state(instance_id: &str) -> PluginState {
         let manifest = fixture_manifest("test.fixture");
         PluginState::new(
@@ -632,6 +682,7 @@ mod tests {
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
             fresh_kv(instance_id, 0),
+            fresh_event_log(),
         )
     }
 
@@ -653,6 +704,7 @@ mod tests {
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
             fresh_kv(instance_id, quota_kb),
+            fresh_event_log(),
         )
     }
 
@@ -669,6 +721,7 @@ mod tests {
             registry,
             bus,
             fresh_kv(instance_id, 0),
+            fresh_event_log(),
         )
     }
 
@@ -932,6 +985,7 @@ mod tests {
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
+            fresh_event_log(),
         );
 
         // A device that claims `dimmer` should be refused.
@@ -973,6 +1027,7 @@ mod tests {
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
+            fresh_event_log(),
         );
 
         let mut info = empty_device("d-shade");
@@ -1052,6 +1107,7 @@ mod tests {
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
+            fresh_event_log(),
         );
 
         let mut info = empty_device("d-up");
