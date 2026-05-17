@@ -191,9 +191,15 @@ impl KvStore {
                 });
             };
 
+            // `length(key)` on a TEXT column counts characters, not
+            // bytes — cast to BLOB so we get the same byte total the
+            // Rust-side `key.len()` math used to project
+            // `new_entry_bytes`. The triggers (migration 2) use the
+            // same shape so the persisted `kv_usage.bytes_used` stays
+            // in sync.
             let old_size: Option<i64> = tx
                 .query_row(
-                    "SELECT length(key) + length(value) FROM kv \
+                    "SELECT length(CAST(key AS BLOB)) + length(value) FROM kv \
                      WHERE instance_id = ?1 AND key = ?2",
                     params![instance_id_owned, key_owned],
                     |row| row.get(0),
@@ -431,6 +437,62 @@ mod tests {
         // First write must still be readable.
         let got = kv.get("alpha", "k").expect("get").expect("present");
         assert!(values_match(&got, &WitValue::IntVal(1)));
+    }
+
+    /// Regression for the byte-vs-character mismatch between the
+    /// Rust-side projection (`key.len()` in bytes) and the trigger's
+    /// `length(key)` on TEXT (characters). A non-ASCII key like
+    /// `"αβγ"` is 6 UTF-8 bytes but 3 characters; under the
+    /// pre-migration-2 triggers a 100-byte quota would accept many
+    /// more `"αβγ"`-keyed writes than the byte budget allowed.
+    /// Migration 2's `length(CAST(key AS BLOB))` brings both sides
+    /// onto bytes.
+    #[test]
+    fn quota_uses_byte_count_for_non_ascii_keys() {
+        let kv = store();
+        kv.register_instance("alpha", 64).expect("register");
+        // "αβγ" = 3 chars / 6 bytes. The empty-tagged
+        // StoredValue::Int(0) payload is ~10 bytes of JSON.
+        // First write: 6 + 10 ≈ 16 bytes ≤ 64 quota.
+        kv.set("alpha", "αβγ", WitValue::IntVal(0))
+            .expect("first non-ascii write");
+        let (used_1, _) = kv.usage("alpha").expect("usage").expect("present");
+        // `bytes_used` must reflect the 6-byte key, not 3.
+        assert!(
+            used_1 > 6,
+            "bytes_used should count UTF-8 bytes (key alone is 6); got {used_1} for a 6-byte key + payload",
+        );
+
+        // Add three more non-ASCII keys. Each adds ~16 bytes. The
+        // pre-fix accounting would land bytes_used at ~13 per row
+        // and let a fifth row in; the byte-correct accounting refuses
+        // anything past the 64-byte quota.
+        let mut over = false;
+        for i in 1..10 {
+            let k = format!("αβγ-{i}");
+            match kv.set("alpha", &k, WitValue::IntVal(0)) {
+                Ok(()) => {}
+                Err(KvError::QuotaExceeded { .. }) => {
+                    over = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert!(
+            over,
+            "quota should refuse a non-ASCII write once byte total exceeds 64",
+        );
+
+        // Final `bytes_used` must stay under the byte quota — the
+        // pre-fix accounting could have let it pass while the
+        // triggers undercounted.
+        let (used_final, quota) = kv.usage("alpha").expect("usage").expect("present");
+        assert_eq!(quota, 64);
+        assert!(
+            used_final <= quota,
+            "bytes_used ({used_final}) must stay within quota ({quota})",
+        );
     }
 
     #[test]

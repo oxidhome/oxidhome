@@ -91,6 +91,53 @@ const MIGRATIONS: &[&str] = &[
          WHERE instance_id = NEW.instance_id;
     END;
     ",
+    // 2 — Phase 5a follow-up: count key length in **bytes**, not
+    // characters. SQLite's `length()` on TEXT returns the character
+    // count; on BLOB it returns the byte count. Migration 1 used the
+    // bare `length(key)` so a non-ASCII key was undercounted against
+    // the byte quota the Rust side projects in `state::kv::set`.
+    // Drop the triggers and recreate with `length(CAST(... AS BLOB))`,
+    // then re-baseline `kv_usage.bytes_used` for any rows that already
+    // drifted under migration 1's accounting.
+    //
+    // `value` is already declared `BLOB NOT NULL` so `length(value)`
+    // is byte-correct without a cast.
+    "
+    DROP TRIGGER kv_usage_insert;
+    DROP TRIGGER kv_usage_delete;
+    DROP TRIGGER kv_usage_update;
+
+    CREATE TRIGGER kv_usage_insert AFTER INSERT ON kv
+    BEGIN
+        UPDATE kv_usage
+           SET bytes_used = bytes_used + length(CAST(NEW.key AS BLOB)) + length(NEW.value)
+         WHERE instance_id = NEW.instance_id;
+    END;
+
+    CREATE TRIGGER kv_usage_delete AFTER DELETE ON kv
+    BEGIN
+        UPDATE kv_usage
+           SET bytes_used = bytes_used - length(CAST(OLD.key AS BLOB)) - length(OLD.value)
+         WHERE instance_id = OLD.instance_id;
+    END;
+
+    CREATE TRIGGER kv_usage_update AFTER UPDATE OF value ON kv
+    BEGIN
+        UPDATE kv_usage
+           SET bytes_used = bytes_used + length(NEW.value) - length(OLD.value)
+         WHERE instance_id = NEW.instance_id;
+    END;
+
+    -- Re-baseline existing rows so already-drifted instances start
+    -- from the correct byte total. Sum over each instance's `kv` rows;
+    -- COALESCE handles instances with a `kv_usage` row but no `kv`
+    -- rows yet (registered + never wrote).
+    UPDATE kv_usage SET bytes_used = COALESCE((
+        SELECT SUM(length(CAST(key AS BLOB)) + length(value))
+          FROM kv
+         WHERE kv.instance_id = kv_usage.instance_id
+    ), 0);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.
@@ -306,6 +353,79 @@ mod tests {
         // CREATE TABLE without IF NOT EXISTS) — proves user_version
         // gating works.
         let _db2 = Db::open_file(dir.path()).expect("open 2");
+    }
+
+    /// Migration 2 has to fix up `kv_usage.bytes_used` for any
+    /// instances that already accumulated character-counted totals
+    /// under migration 1. Simulate that by:
+    ///
+    /// 1. Open a fresh file DB (runs both migrations on empty tables
+    ///    — nothing to re-baseline).
+    /// 2. Hand-craft a drifted row: insert a non-ASCII key and
+    ///    manually overwrite `bytes_used` with the character count
+    ///    migration 1's triggers would have produced.
+    /// 3. Run the migration-2 body again as a one-shot UPDATE and
+    ///    confirm `bytes_used` jumps to the byte total.
+    ///
+    /// Step 3 is the same SQL the actual migration runs; this gives
+    /// us a deterministic check without needing to roll back
+    /// `user_version` and replay the upgrade.
+    #[test]
+    fn migration_2_rebaseline_corrects_drifted_bytes_used() {
+        let dir = tempdir_for_test();
+        let db = Db::open_file(dir.path()).expect("open");
+        db.write(|conn| -> rusqlite::Result<()> {
+            conn.execute(
+                "INSERT INTO kv_usage(instance_id, bytes_used, bytes_quota) VALUES (?1, 0, ?2)",
+                rusqlite::params!["alpha", 4096_i64],
+            )?;
+            // The triggers (now migration-2-shape) account this
+            // correctly on insert, so explicitly set `bytes_used` to
+            // the character total a migration-1 trigger would have
+            // produced: "αβγ" = 3 chars, value JSON = ~10 bytes.
+            conn.execute(
+                "INSERT INTO kv(instance_id, key, value, updated_ms) VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params!["alpha", "αβγ", &b"{\"t\":\"Int\",\"v\":0}"[..]],
+            )?;
+            // Force the drift: pretend the row was inserted under
+            // migration 1's character-counting triggers. 3 (chars) +
+            // 17 (payload bytes) = 20, where the byte-correct total
+            // is 6 + 17 = 23.
+            conn.execute(
+                "UPDATE kv_usage SET bytes_used = 20 WHERE instance_id = 'alpha'",
+                (),
+            )?;
+            Ok(())
+        })
+        .expect("seed drift");
+
+        // Re-run migration 2's rebaseline body. Same SQL as in
+        // `MIGRATIONS[1]`.
+        db.write(|conn| -> rusqlite::Result<()> {
+            conn.execute_batch(
+                "UPDATE kv_usage SET bytes_used = COALESCE((
+                    SELECT SUM(length(CAST(key AS BLOB)) + length(value))
+                      FROM kv
+                     WHERE kv.instance_id = kv_usage.instance_id
+                ), 0);",
+            )?;
+            Ok(())
+        })
+        .expect("rebaseline");
+
+        let used: i64 = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT bytes_used FROM kv_usage WHERE instance_id = 'alpha'",
+                    (),
+                    |row| row.get(0),
+                )
+            })
+            .expect("read");
+        assert_eq!(
+            used, 23,
+            "rebaseline should produce 6 byte key + 17 byte value = 23",
+        );
     }
 
     /// Tiny tempdir helper — same shape as the one in the
