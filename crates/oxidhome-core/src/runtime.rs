@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
-use crate::state::{Db, DeviceRegistry, EventBus, EventLog, KvStore};
+use crate::state::{Db, DeviceRegistry, EventBus, EventLog, KvStore, LogStore};
 
 /// Process-wide Wasmtime engine. Components are compiled once per engine
 /// and instantiated cheaply across many [`PluginInstance`]s — wrap this
@@ -43,6 +43,7 @@ pub struct Engine {
     events: Arc<EventBus>,
     kv: Arc<KvStore>,
     event_log: Arc<EventLog>,
+    log_store: Arc<LogStore>,
 }
 
 impl Engine {
@@ -93,7 +94,8 @@ impl Engine {
             devices: Arc::new(DeviceRegistry::new()),
             events: Arc::new(EventBus::new()),
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
-            event_log: Arc::new(EventLog::new(db)),
+            event_log: Arc::new(EventLog::new(Arc::clone(&db))),
+            log_store: Arc::new(LogStore::new(db)),
         })
     }
 
@@ -131,5 +133,17 @@ impl Engine {
     #[must_use]
     pub fn event_log(&self) -> Arc<EventLog> {
         Arc::clone(&self.event_log)
+    }
+
+    /// Shared log/trace store — Phase 5c. The `tracing_subscriber`
+    /// layer accessor lives on the store itself
+    /// ([`LogStore::layer`]); call sites that want to capture host
+    /// tracing into `<state_dir>/oxidhome.db`'s `log_event` table
+    /// compose that layer into their `Registry`. The host binary
+    /// does that in `main.rs`; tests opt in per-test so they don't
+    /// have to share the global default subscriber.
+    #[must_use]
+    pub fn log_store(&self) -> Arc<LogStore> {
+        Arc::clone(&self.log_store)
     }
 }

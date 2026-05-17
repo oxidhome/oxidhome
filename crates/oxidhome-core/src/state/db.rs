@@ -176,6 +176,49 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX evt_instance      ON event_log(instance_id, received_ms);
     CREATE INDEX evt_plugin        ON event_log(plugin_id, received_ms);
     ",
+    // 4 — Phase 5c: log/trace store.
+    //
+    // Host-owned diagnostic stream. Every `tracing::{trace,debug,info,
+    // warn,error}!` macro the host emits — including Phase-4 capability
+    // denials, Phase-5d publish_event writes, plugin-side log lines
+    // forwarded through the `logging` import — captures into this
+    // table via a `tracing_subscriber::Layer` (`state::log_store`).
+    // CLI / API query is Phase 12.
+    //
+    // Schema mirrors `03_core.md` §5c with one shape decision: the
+    // structured-field map is encoded as tagged JSON (same format as
+    // `event_log.payload_blob`) rather than postcard. JSON keeps the
+    // store self-debuggable via `sqlite3 oxidhome.db` and matches the
+    // pattern the rest of Phase 5 settled on; postcard is a possible
+    // smaller-on-disk follow-up.
+    //
+    // Indexes match the CLI's expected query shapes: time-range scans
+    // (`log_ts`), level-filter (`log_level_ts`), per-instance /
+    // per-plugin / per-device drill-down, and per-target filtering.
+    // Partial indexes (`WHERE … IS NOT NULL`) skip rows that don't
+    // carry that column — host-only events without an `instance_id`
+    // shouldn't bloat the per-instance index.
+    "
+    CREATE TABLE log_event (
+        id            INTEGER PRIMARY KEY,
+        ts_unix_ms    INTEGER NOT NULL,
+        level         INTEGER NOT NULL,
+        instance_id   TEXT,
+        plugin_id     TEXT,
+        device_id     TEXT,
+        target        TEXT NOT NULL,
+        span_path     TEXT,
+        message       TEXT NOT NULL,
+        fields_blob   BLOB
+    );
+
+    CREATE INDEX log_ts          ON log_event(ts_unix_ms);
+    CREATE INDEX log_level_ts    ON log_event(level, ts_unix_ms);
+    CREATE INDEX log_instance_ts ON log_event(instance_id, ts_unix_ms) WHERE instance_id IS NOT NULL;
+    CREATE INDEX log_plugin_ts   ON log_event(plugin_id, ts_unix_ms)   WHERE plugin_id   IS NOT NULL;
+    CREATE INDEX log_device_ts   ON log_event(device_id, ts_unix_ms)   WHERE device_id   IS NOT NULL;
+    CREATE INDEX log_target_ts   ON log_event(target, ts_unix_ms);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

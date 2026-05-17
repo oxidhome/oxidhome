@@ -20,9 +20,13 @@ pub mod devices;
 pub mod event_log;
 pub mod events;
 pub mod kv;
+pub mod log_store;
 
 pub use db::Db;
 pub use devices::{DeviceMeta, DeviceRegistry};
 pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicMatch};
 pub use events::{EventBus, EventSubscription};
 pub use kv::{KvError, KvStore};
+pub use log_store::{
+    HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogStoreError, LogValue, SqliteLayer,
+};
