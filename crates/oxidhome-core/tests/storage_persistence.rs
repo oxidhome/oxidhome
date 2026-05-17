@@ -13,10 +13,16 @@
 //! tempdir → `init` (reads the persisted value back) → `counter::read`
 //! → assert the returned `count` is 3.
 //!
-//! A separate test (`quota_exceeded_returns_permission_denied`)
-//! reuses the simulated-switch fixture against a 1-KiB-quota
-//! manifest to confirm a write that would push past the quota lands
-//! as `permission-denied` from the guest's perspective.
+//! The second test (`storage_off_surfaces_through_init`) loads the
+//! same `kv-counter` wasm against a tempdir manifest with an empty
+//! `[capabilities]` block — storage gated off — and confirms the
+//! `permission-denied` from `host::storage::get` lands as the guest's
+//! `init` Result.
+//!
+//! Quota-exceeded shape is covered in the lib unit tests on the
+//! `storage::Host` impl (`storage_quota_exceeded_returns_permission_denied`)
+//! — exercising the same WIT mapping that this end-to-end test
+//! validates structurally.
 
 #[path = "support.rs"]
 mod support;

@@ -241,35 +241,33 @@ impl KvStore {
     }
 
     /// List keys beginning with `prefix`. Ordering is lexicographic,
-    /// matching `SQLite`'s default for `WHERE key LIKE ? ORDER BY key`.
+    /// matching `SQLite`'s default for `ORDER BY key`.
     ///
     /// # Errors
     ///
     /// Forwards any SQL error.
     pub fn list_keys(&self, instance_id: &str, prefix: &str) -> Result<Vec<String>, KvError> {
-        // `LIKE` is the natural fit, but it needs the `%` glob and
-        // `prefix` could itself contain `%` / `_`. Use the raw `>=` /
-        // `<` range trick instead: keys in `[prefix, prefix.next())`
-        // are exactly the ones starting with `prefix`, without any
-        // wildcard escaping.
-        let upper = prefix_upper_bound(prefix);
+        // `substr(key, 1, length(?2)) = ?2` is the simplest correct
+        // shape: SQLite's `length` and `substr` both work in *bytes*
+        // for TEXT/BLOB, so this is a literal prefix-byte equality
+        // test that handles any UTF-8 key (and any prefix that's a
+        // valid prefix-byte-sequence — i.e. any `&str`) without the
+        // escaping hazards of `LIKE` or the codepoint-bound
+        // arithmetic an open-coded range would need.
+        //
+        // The trade-off is loss of the `(instance_id, key)` primary
+        // key as a range index: the planner walks every row in the
+        // instance's slice and applies the substr filter. For
+        // Phase-5a quotas (KiB-scale per-instance keyspaces) that's
+        // fine; if a future plugin pushes into the MiB / 100k-key
+        // regime we'd revisit with a codepoint-correct upper bound.
         self.db.read(|conn| -> Result<Vec<String>, KvError> {
-            let mut stmt = match upper.as_deref() {
-                Some(_) => conn.prepare(
-                    "SELECT key FROM kv \
-                     WHERE instance_id = ?1 AND key >= ?2 AND key < ?3 \
-                     ORDER BY key",
-                )?,
-                None => conn.prepare(
-                    "SELECT key FROM kv \
-                     WHERE instance_id = ?1 AND key >= ?2 \
-                     ORDER BY key",
-                )?,
-            };
-            let mut rows = match upper.as_deref() {
-                Some(upper) => stmt.query(params![instance_id, prefix, upper])?,
-                None => stmt.query(params![instance_id, prefix])?,
-            };
+            let mut stmt = conn.prepare(
+                "SELECT key FROM kv \
+                 WHERE instance_id = ?1 AND substr(key, 1, length(?2)) = ?2 \
+                 ORDER BY key",
+            )?;
+            let mut rows = stmt.query(params![instance_id, prefix])?;
             let mut keys = Vec::new();
             while let Some(row) = rows.next()? {
                 keys.push(row.get::<_, String>(0)?);
@@ -296,32 +294,6 @@ impl KvStore {
         })?;
         Ok(row.map(|(used, quota)| (used.try_into().unwrap_or(0), quota.try_into().unwrap_or(0))))
     }
-}
-
-/// Compute the lexicographic upper bound for `prefix`: the smallest
-/// string that does *not* start with `prefix`. Returns `None` when no
-/// such bound exists (e.g. `prefix = "\u{10FFFF}\u{10FFFF}..."`),
-/// which falls back to an unbounded range scan.
-fn prefix_upper_bound(prefix: &str) -> Option<String> {
-    if prefix.is_empty() {
-        return None;
-    }
-    let bytes = prefix.as_bytes();
-    // Walk from the back. Find the first byte we can increment. If
-    // every byte is 0xFF, there's no upper bound — fall back to
-    // unbounded scan and let the WHERE pin down the lower end.
-    for i in (0..bytes.len()).rev() {
-        if bytes[i] < 0xff {
-            let mut upper = bytes[..=i].to_vec();
-            upper[i] += 1;
-            // `SQLite` stores TEXT as UTF-8; this *should* round-trip
-            // for any prefix the host actually sees (plugin-author
-            // keys are ASCII-ish), but a malformed multi-byte
-            // sequence at the boundary would fall back to `lossy`.
-            return Some(String::from_utf8_lossy(&upper).into_owned());
-        }
-    }
-    None
 }
 
 fn now_unix_ms() -> i64 {
@@ -475,6 +447,38 @@ mod tests {
         assert_eq!(bs, vec!["ba".to_string(), "bb".to_string()]);
         let none = kv.list_keys("alpha", "z").expect("list");
         assert!(none.is_empty());
+    }
+
+    /// Regression for the byte-level `prefix_upper_bound` shape we
+    /// replaced with `substr(key, 1, length(?2)) = ?2`. The old
+    /// implementation incremented the last byte of `"ÿ"` (`0xC3 0xBF`)
+    /// to `0xC3 0xC0`, decoded that with `from_utf8_lossy` to
+    /// something like `"Ã�"`, and ran a `key < ?upper` range that
+    /// included keys *past* `"ÿ"` in the codepoint order — e.g. `"Ā"`
+    /// at U+0100, which a `"ÿ"`-prefix list must not match. The
+    /// `substr` filter handles every UTF-8 key exactly.
+    #[test]
+    fn list_keys_non_ascii_prefix_does_not_overmatch() {
+        let kv = store();
+        kv.register_instance("alpha", 4096).expect("register");
+        // `"ÿ-keep"` is the one key that genuinely starts with `"ÿ"`.
+        // The other keys span the byte boundary cases that an
+        // incorrect upper-bound calculation would mis-match.
+        for k in [
+            "ÿ-keep",    // U+00FF, must match
+            "Ā-drop",    // U+0100, the codepoint right after "ÿ"
+            "z-drop",    // ASCII below "ÿ"
+            "ÿabc-keep", // longer prefix
+        ] {
+            kv.set("alpha", k, WitValue::BoolVal(true)).expect("set");
+        }
+        let mut keys = kv.list_keys("alpha", "ÿ").expect("list");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["ÿ-keep".to_string(), "ÿabc-keep".to_string()],
+            "prefix `ÿ` should match only keys that literally start with U+00FF",
+        );
     }
 
     #[test]
