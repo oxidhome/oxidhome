@@ -203,9 +203,9 @@ impl EventLog {
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
 
         let push = |binds: &mut Vec<rusqlite::types::Value>,
-                        sql: &mut String,
-                        clause: &str,
-                        v: rusqlite::types::Value| {
+                    sql: &mut String,
+                    clause: &str,
+                    v: rusqlite::types::Value| {
             binds.push(v);
             // `?N` requires N to match the bind count — splice the
             // index in as we go so the SQL stays in sync with the
@@ -242,10 +242,7 @@ impl EventLog {
                     let n_left = binds.len();
                     binds.push(rusqlite::types::Value::Text(t.clone()));
                     let n_right = binds.len();
-                    let _ = write!(
-                        sql,
-                        " AND substr(topic, 1, length(?{n_left})) = ?{n_right}",
-                    );
+                    let _ = write!(sql, " AND substr(topic, 1, length(?{n_left})) = ?{n_right}");
                 }
             }
         }
@@ -253,7 +250,11 @@ impl EventLog {
         binds.push(rusqlite::types::Value::Integer(
             i64::try_from(limit).unwrap_or(i64::MAX),
         ));
-        let _ = write!(sql, " ORDER BY received_ms DESC, id DESC LIMIT ?{}", binds.len());
+        let _ = write!(
+            sql,
+            " ORDER BY received_ms DESC, id DESC LIMIT ?{}",
+            binds.len()
+        );
 
         self.db.read(|conn| -> Result<_, EventLogError> {
             let mut stmt = conn.prepare(&sql)?;
