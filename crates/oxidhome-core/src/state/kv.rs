@@ -254,12 +254,20 @@ impl KvStore {
     /// Forwards any SQL error.
     pub fn list_keys(&self, instance_id: &str, prefix: &str) -> Result<Vec<String>, KvError> {
         // `substr(key, 1, length(?2)) = ?2` is the simplest correct
-        // shape: SQLite's `length` and `substr` both work in *bytes*
-        // for TEXT/BLOB, so this is a literal prefix-byte equality
-        // test that handles any UTF-8 key (and any prefix that's a
-        // valid prefix-byte-sequence — i.e. any `&str`) without the
+        // shape: on TEXT, SQLite's `length`/`substr` both work in
+        // *characters* (UTF-8 codepoints), so this is a literal
+        // character-prefix equality test. Both `key` and `?2` are
+        // TEXT, so the units match on both sides of the `=` — any
+        // `&str` prefix matches keys whose first `chars().count()`
+        // characters equal the prefix's characters, without the
         // escaping hazards of `LIKE` or the codepoint-bound
         // arithmetic an open-coded range would need.
+        //
+        // (Quota accounting is the *byte* count, computed separately
+        // via `length(CAST(key AS BLOB))` in migration 2's triggers
+        // — that's correctness for "bytes used"; the listing here
+        // is character-level prefix matching, which is what callers
+        // want.)
         //
         // The trade-off is loss of the `(instance_id, key)` primary
         // key as a range index: the planner walks every row in the
