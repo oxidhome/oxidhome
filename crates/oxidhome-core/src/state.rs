@@ -15,8 +15,12 @@
 //! takes another at load time, and host-import callbacks reach them
 //! through `PluginState`.
 
+pub mod db;
 pub mod devices;
 pub mod events;
+pub mod kv;
 
+pub use db::Db;
 pub use devices::{DeviceMeta, DeviceRegistry};
 pub use events::{EventBus, EventSubscription};
+pub use kv::{KvError, KvStore};

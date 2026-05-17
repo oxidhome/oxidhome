@@ -223,16 +223,32 @@ impl PluginInstance {
         // Host imports declared by the `plugin` world: host-devices,
         // host-events, host-config, storage, logging. All wired
         // through the bindgen-generated `add_to_linker` against
-        // `PluginState`. As of Phase 4, host-devices is gated by the
+        // `PluginState`. As of Phase 5a, host-devices is gated by the
         // manifest's `declares_devices`; host-config returns the
-        // resolved `InstanceConfig`. `storage::*` still stubs
-        // `Error::Unavailable` (Phase 5a wires the SQLite-backed KV).
+        // resolved `InstanceConfig`; storage is backed by the shared
+        // SQLite KV with per-instance quotas from
+        // `capabilities.storage_quota_kb`.
         PluginBindings::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(anyhow::Error::from)
             .context("adding plugin world host imports to linker")?;
 
         let instance_id = instance_id.into();
         let actor = Actor::plugin(instance_id.clone());
+
+        // Reserve a `kv_usage` row for this instance with the quota
+        // declared in the manifest. `register_instance` is idempotent
+        // — repeat loads of the same instance id preserve `bytes_used`
+        // and only refresh the quota, so a manifest edit + reload
+        // picks up the new value without wiping data.
+        let quota_bytes = manifest.capabilities.storage_quota_kb.saturating_mul(1024);
+        let kv = engine.kv();
+        kv.register_instance(&instance_id, quota_bytes)
+            .with_context(|| {
+                format!(
+                    "registering KV usage row for instance {instance_id} (quota {quota_bytes} bytes)",
+                )
+            })?;
+
         let state = PluginState::new(
             instance_id,
             manifest,
@@ -240,6 +256,7 @@ impl PluginInstance {
             config,
             engine.devices(),
             engine.events(),
+            kv,
         );
         let mut store = Store::new(engine.raw(), state);
 

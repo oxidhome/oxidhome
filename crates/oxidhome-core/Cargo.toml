@@ -44,6 +44,10 @@ path = "tests/manifest_loader.rs"
 name = "config_overrides"
 path = "tests/config_overrides.rs"
 
+[[test]]
+name = "storage_persistence"
+path = "tests/storage_persistence.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
@@ -65,7 +69,15 @@ wasmtime = { version = "=44.0.1", default-features = false, features = [
 wasmtime-wasi = { version = "=44.0.1", default-features = false, features = ["p2"] }
 anyhow.workspace = true
 oxidhome-manifest.workspace = true
+rusqlite.workspace = true
 semver.workspace = true
+# `serde` + `serde_json` carry the on-disk KV encoding (tagged enum →
+# JSON BLOB) — see `state::kv::StoredValue`. Postcard-style compact
+# encoding can drop in later without a schema migration: the store
+# treats values as opaque bytes.
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs"] }
 toml.workspace = true
 tracing.workspace = true

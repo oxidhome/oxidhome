@@ -36,6 +36,14 @@ use crate::bindings::oxidhome::plugin::{host_devices, host_events};
 /// the [`config`] module for the surface.
 pub mod config;
 
+/// Per-instance KV storage (Phase 5a). Plugin authors call
+/// `oxidhome_sdk::host::storage::get` / `set` / `delete` /
+/// `list_keys`, plus the typed `get_typed::<T>` / `set_typed::<T>`
+/// helpers. Quota lives in `manifest.toml` under
+/// `[capabilities] storage_quota_kb`; a quota of `0` (default) keeps
+/// every call gated off behind `permission-denied`.
+pub mod storage;
+
 // ── Devices ──────────────────────────────────────────────────────────
 
 /// Register a device with the host. Accepts either a
