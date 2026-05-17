@@ -3,7 +3,7 @@
 //!
 //! Every host import the plugin world declares (`host-devices`,
 //! `host-events`, `host-config`, `storage`, `logging`) is implemented
-//! against this struct. As of Phase 4B:
+//! against this struct. As of Phase 5a:
 //!
 //! - `host-devices::register-device` and `update-device` are gated by
 //!   the manifest's `capabilities.declares_devices` (plus an
@@ -14,10 +14,13 @@
 //!   not manifest-gated. There's no per-call authorization for
 //!   publishing or subscribing yet; capability gating beyond device
 //!   registration (network rules for streaming plugins, services,
-//!   blob/log quotas) lives in later phases.
-//! - `storage` returns [`Error::Unavailable`] until Phase 5a's
-//!   SQLite-backed KV — the call-site framework is wired so 5a only
-//!   fills in the impl.
+//!   blob quotas) lives in later phases.
+//! - `storage` is backed by the shared `SQLite` [`KvStore`] with
+//!   per-instance quotas from `capabilities.storage_quota_kb`. A
+//!   manifest quota of `0` keeps storage gated off
+//!   (`permission-denied`); a positive quota lets calls through, with
+//!   the KV's own transactional quota check refusing writes that
+//!   would push past the cap.
 
 use std::sync::Arc;
 
@@ -91,13 +94,18 @@ pub struct PluginState {
     /// `host-config::get-config` / `list-config`. Empty when the
     /// manifest has no `[config]` block.
     pub config: InstanceConfig,
+    /// Shared SQLite-backed KV store — Phase 5a. Per-instance quota +
+    /// bookkeeping live in the store itself; this is just the handle.
+    /// `host-storage::*` calls go through here.
+    pub kv: Arc<crate::state::KvStore>,
 }
 
 impl PluginState {
     /// Build a fresh state for one plugin instance. `devices` /
-    /// `events` come from the parent [`Engine`](crate::Engine); the
-    /// manifest, actor, and resolved config come from the loader
+    /// `events` / `kv` come from the parent [`Engine`](crate::Engine);
+    /// the manifest, actor, and resolved config come from the loader
     /// (real or test).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instance_id: impl Into<InstanceId>,
         manifest: Arc<PluginManifest>,
@@ -105,6 +113,7 @@ impl PluginState {
         config: InstanceConfig,
         devices: Arc<DeviceRegistry>,
         events: Arc<EventBus>,
+        kv: Arc<crate::state::KvStore>,
     ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
@@ -114,6 +123,7 @@ impl PluginState {
             wasi: wasi.build(),
             devices,
             events,
+            kv,
             subscriptions: Vec::new(),
             manifest,
             actor,
@@ -144,12 +154,6 @@ impl types::Host for PluginState {}
 impl capabilities::Host for PluginState {}
 impl devices::Host for PluginState {}
 impl events::Host for PluginState {}
-
-const NOT_IMPL: &str = "not implemented in Phase 3";
-
-fn unavailable() -> WitError {
-    WitError::Unavailable(NOT_IMPL.into())
-}
 
 // ── Devices ──────────────────────────────────────────────────────────
 //
@@ -410,18 +414,102 @@ fn config_value_to_wit(v: &ConfigValue) -> Option<WitValue> {
     }
 }
 
+// ── Storage ─────────────────────────────────────────────────────────
+//
+// Phase 5a backs the WIT `storage` interface with the SQLite-based
+// `KvStore`. Gating semantics are inherited from the manifest:
+// `capabilities.storage_quota_kb = 0` (or absent) is the "storage off"
+// signal — every call returns `permission-denied` before it ever hits
+// the KV. A positive quota lets calls through; the KV's transactional
+// quota check then refuses writes that would exceed it (also
+// `permission-denied`, mirroring the `register_device` shape).
+//
+// All four methods hop to `tokio::task::spawn_blocking` because
+// rusqlite is synchronous. Anything that goes wrong on the blocking
+// thread surfaces as `Error::Internal` — the task should not panic in
+// practice, but the WIT contract requires *something* if it does.
+
+/// Refuse the call with a clear message when the manifest didn't
+/// grant any KV quota. Returns `Ok(())` when storage is enabled.
+fn require_storage_enabled(state: &PluginState) -> Result<(), WitError> {
+    if state.manifest.capabilities.storage_quota_kb == 0 {
+        return Err(WitError::PermissionDenied(
+            "storage disabled: capabilities.storage_quota_kb is 0 (set a positive value in manifest.toml)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Map [`crate::state::KvError`] to the WIT [`WitError`]. `QuotaExceeded`
+/// surfaces as `permission-denied` (consistent with the
+/// `declares_devices` gate's shape); the unregistered-instance case
+/// can only happen on a host bug (loader didn't register), so that
+/// lands as `internal`.
+fn kv_error_to_wit(err: crate::state::KvError) -> WitError {
+    use crate::state::KvError;
+    match err {
+        KvError::QuotaExceeded {
+            instance_id: _,
+            would_use,
+            allowed,
+        } => WitError::PermissionDenied(format!(
+            "quota exceeded: {would_use} bytes used / {allowed} allowed",
+        )),
+        KvError::UnregisteredInstance { ref instance_id } => WitError::Internal(format!(
+            "kv: instance `{instance_id}` not registered (host bug)",
+        )),
+        KvError::Encode { key, source } => {
+            WitError::Internal(format!("kv: encoding `{key}`: {source}"))
+        }
+        KvError::Sql(e) => WitError::Internal(format!("kv: sqlite error: {e}")),
+    }
+}
+
+/// Lift a `KvStore` operation into the WIT result shape via
+/// `spawn_blocking`. The op runs on a dedicated blocking thread (the
+/// store itself is sync), and panics inside it bubble out as
+/// `Error::Internal`.
+async fn kv_op<R, F>(f: F) -> Result<R, WitError>
+where
+    R: Send + 'static,
+    F: FnOnce() -> Result<R, crate::state::KvError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(kv_error_to_wit(e)),
+        Err(join) => Err(WitError::Internal(format!(
+            "kv: blocking task panicked: {join}",
+        ))),
+    }
+}
+
 impl storage::Host for PluginState {
-    async fn get(&mut self, _key: String) -> Result<Option<WitValue>, WitError> {
-        Err(unavailable())
+    async fn get(&mut self, key: String) -> Result<Option<WitValue>, WitError> {
+        require_storage_enabled(self)?;
+        let kv = Arc::clone(&self.kv);
+        let instance_id = self.instance_id.clone();
+        kv_op(move || kv.get(&instance_id, &key)).await
     }
-    async fn set(&mut self, _key: String, _val: WitValue) -> Result<(), WitError> {
-        Err(unavailable())
+
+    async fn set(&mut self, key: String, val: WitValue) -> Result<(), WitError> {
+        require_storage_enabled(self)?;
+        let kv = Arc::clone(&self.kv);
+        let instance_id = self.instance_id.clone();
+        kv_op(move || kv.set(&instance_id, &key, val)).await
     }
-    async fn delete(&mut self, _key: String) -> Result<(), WitError> {
-        Err(unavailable())
+
+    async fn delete(&mut self, key: String) -> Result<(), WitError> {
+        require_storage_enabled(self)?;
+        let kv = Arc::clone(&self.kv);
+        let instance_id = self.instance_id.clone();
+        kv_op(move || kv.delete(&instance_id, &key)).await
     }
-    async fn list_keys(&mut self, _prefix: String) -> Result<Vec<String>, WitError> {
-        Err(unavailable())
+
+    async fn list_keys(&mut self, prefix: String) -> Result<Vec<String>, WitError> {
+        require_storage_enabled(self)?;
+        let kv = Arc::clone(&self.kv);
+        let instance_id = self.instance_id.clone();
+        kv_op(move || kv.list_keys(&instance_id, &prefix)).await
     }
 }
 
@@ -522,14 +610,49 @@ mod tests {
         })
     }
 
+    /// Build a fresh KV store backed by an in-memory database and
+    /// register the instance with `quota_kb` KiB of quota. Returns
+    /// the `Arc<KvStore>` so individual tests can vary the quota
+    /// without re-typing the wiring.
+    fn fresh_kv(instance_id: &str, quota_kb: u64) -> Arc<crate::state::KvStore> {
+        let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
+        let kv = Arc::new(crate::state::KvStore::new(db));
+        kv.register_instance(instance_id, quota_kb * 1024)
+            .expect("register kv");
+        kv
+    }
+
     fn fresh_state(instance_id: &str) -> PluginState {
+        let manifest = fixture_manifest("test.fixture");
         PluginState::new(
             instance_id,
-            fixture_manifest("test.fixture"),
+            manifest,
             Actor::plugin(instance_id),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
+            fresh_kv(instance_id, 0),
+        )
+    }
+
+    /// Same as [`fresh_state`] but the fixture manifest grants `kb`
+    /// KiB of storage quota — the host's `require_storage_enabled`
+    /// gate then lets storage calls through.
+    fn fresh_state_with_storage(instance_id: &str, quota_kb: u64) -> PluginState {
+        use oxidhome_manifest::CapabilitiesSection;
+        let mut manifest = (*fixture_manifest("test.fixture")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            storage_quota_kb: quota_kb,
+            ..manifest.capabilities
+        };
+        PluginState::new(
+            instance_id,
+            Arc::new(manifest),
+            Actor::plugin(instance_id),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+            fresh_kv(instance_id, quota_kb),
         )
     }
 
@@ -545,6 +668,7 @@ mod tests {
             InstanceConfig::new(),
             registry,
             bus,
+            fresh_kv(instance_id, 0),
         )
     }
 
@@ -807,6 +931,7 @@ mod tests {
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
         );
 
         // A device that claims `dimmer` should be refused.
@@ -847,6 +972,7 @@ mod tests {
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
         );
 
         let mut info = empty_device("d-shade");
@@ -925,6 +1051,7 @@ mod tests {
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
             Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
         );
 
         let mut info = empty_device("d-up");
@@ -951,8 +1078,13 @@ mod tests {
         );
     }
 
+    /// `capabilities.storage_quota_kb = 0` (the manifest default)
+    /// keeps storage gated off — every call returns `permission-denied`
+    /// before it reaches the KV. The 0-vs-positive split is the
+    /// host's gate; the KV's own quota check is the second line of
+    /// defense once storage is enabled.
     #[tokio::test(flavor = "current_thread")]
-    async fn storage_methods_all_unavailable() {
+    async fn storage_methods_denied_when_quota_zero() {
         let mut state = fresh_state("alpha");
         for outcome in [
             storage::Host::get(&mut state, "k".into()).await,
@@ -967,8 +1099,58 @@ mod tests {
                 .map(|_| None),
         ] {
             let err = outcome.unwrap_err();
-            assert!(matches!(err, WitError::Unavailable(_)), "got {err:?}");
+            assert!(
+                matches!(err, WitError::PermissionDenied(_)),
+                "expected PermissionDenied, got {err:?}",
+            );
         }
+    }
+
+    /// With a positive quota the KV-backed methods round-trip.
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_round_trip_when_quota_enabled() {
+        let mut state = fresh_state_with_storage("alpha", 4);
+        storage::Host::set(&mut state, "k".into(), WitValue::IntVal(42))
+            .await
+            .expect("set");
+        let got = storage::Host::get(&mut state, "k".into())
+            .await
+            .expect("get")
+            .expect("present");
+        assert!(matches!(got, WitValue::IntVal(42)), "got {got:?}");
+        let keys = storage::Host::list_keys(&mut state, String::new())
+            .await
+            .expect("list");
+        assert_eq!(keys, vec!["k".to_string()]);
+        storage::Host::delete(&mut state, "k".into())
+            .await
+            .expect("delete");
+        let after = storage::Host::get(&mut state, "k".into())
+            .await
+            .expect("get");
+        assert!(after.is_none(), "key should be gone after delete");
+    }
+
+    /// A KV write that would push past the manifest-declared quota
+    /// surfaces as `permission-denied` from the WIT side — same
+    /// shape as the "storage off" gate so plugins handle both
+    /// arms in one branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_quota_exceeded_returns_permission_denied() {
+        // 1 KiB quota — small enough that one big string blows past
+        // it after JSON overhead.
+        let mut state = fresh_state_with_storage("alpha", 1);
+        let err = storage::Host::set(
+            &mut state,
+            "big".into(),
+            WitValue::StringVal("x".repeat(4096)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("quota exceeded")),
+            "got {err:?}",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

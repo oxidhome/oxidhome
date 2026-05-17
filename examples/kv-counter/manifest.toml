@@ -1,0 +1,24 @@
+manifest_version = 1
+
+[plugin]
+id = "example.kv-counter"
+name = "KV Counter"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Persistent counter — reads from storage on init, increments on each tick. Phase 5a integration-test fixture."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/kv-counter"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "storage", "kv", "counter"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/kv_counter.wasm"
+singleton = false
+
+[capabilities]
+# Phase 5a's KV store is per-instance and quota-bounded. 4 KiB is
+# tiny but plenty for a single integer counter; setting it to a
+# positive value flips the host's `storage_quota_kb = 0` gate from
+# "off" to "on", so the storage calls below land in the KV.
+storage_quota_kb = 4
