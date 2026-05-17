@@ -273,7 +273,12 @@ impl PluginInstance {
     /// `Result<(), String>` per the WIT — we propagate the error
     /// message through `anyhow`.
     pub async fn init(&mut self) -> anyhow::Result<()> {
-        let span = info_span!("plugin.init", instance_id = %self.store.data().instance_id);
+        let data = self.store.data();
+        let span = info_span!(
+            "plugin.init",
+            instance_id = %data.instance_id,
+            plugin_id = %data.manifest.plugin.id,
+        );
         async {
             self.bindings
                 .call_init(&mut self.store)
@@ -289,7 +294,12 @@ impl PluginInstance {
     /// Call the plugin's exported `shutdown`. The plugin can't fail this
     /// call by contract; trapping bubbles up as an error.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
-        let span = info_span!("plugin.shutdown", instance_id = %self.store.data().instance_id);
+        let data = self.store.data();
+        let span = info_span!(
+            "plugin.shutdown",
+            instance_id = %data.instance_id,
+            plugin_id = %data.manifest.plugin.id,
+        );
         async {
             self.bindings
                 .call_shutdown(&mut self.store)
@@ -311,9 +321,11 @@ impl PluginInstance {
         device: DeviceId,
         cmd: Command,
     ) -> anyhow::Result<CommandResult> {
+        let data = self.store.data();
         let span = info_span!(
             "plugin.execute_command",
-            instance_id = %self.store.data().instance_id,
+            instance_id = %data.instance_id,
+            plugin_id = %data.manifest.plugin.id,
             device_id = %device,
             capability = %cmd.capability,
             action = %cmd.action,

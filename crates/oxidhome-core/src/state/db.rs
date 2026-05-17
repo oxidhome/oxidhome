@@ -219,6 +219,15 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX log_device_ts   ON log_event(device_id, ts_unix_ms)   WHERE device_id   IS NOT NULL;
     CREATE INDEX log_target_ts   ON log_event(target, ts_unix_ms);
     ",
+    // 5 — Phase 5c follow-up: add the `log_span_ts` index that the
+    // per-crate plan listed but migration 4 forgot. `LogQuery::span_path_prefix`
+    // does a `substr(span_path, 1, length(?)) = ?` scan; without an
+    // index the planner walks the full instance slice. Partial index
+    // (`WHERE span_path IS NOT NULL`) skips host-only events that
+    // fired outside any span.
+    "
+    CREATE INDEX log_span_ts ON log_event(span_path, ts_unix_ms) WHERE span_path IS NOT NULL;
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

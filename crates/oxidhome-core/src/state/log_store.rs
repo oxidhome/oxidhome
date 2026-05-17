@@ -161,6 +161,17 @@ pub enum LogValue {
 /// AND-combined; `None` everywhere returns the most recent `limit`
 /// rows. Time bounds (`since_ms` / `until_ms`) are inclusive on both
 /// ends. `min_level` is inclusive: `Info` matches info/warn/error.
+///
+/// Prefix filters (`target_prefix`, `span_path_prefix`) use the
+/// same `substr(col, 1, length(?)) = ?` shape `kv::list_keys` and
+/// `event_log` settled on — correct on TEXT, no `LIKE` escaping
+/// hazards. The `log_target_ts` / `log_span_ts` indexes cover the
+/// scans.
+///
+/// Message-substring search, structured-field equality, and a live
+/// tail are deferred to the Phase 12 query API; the on-disk shape
+/// (`fields_blob` as tagged JSON, message as TEXT) is forward-
+/// compatible with both.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LogQuery {
     pub since_ms: Option<i64>,
@@ -169,7 +180,20 @@ pub struct LogQuery {
     pub instance_id: Option<String>,
     pub plugin_id: Option<String>,
     pub device_id: Option<String>,
+    /// Exact target match. Use [`target_prefix`] for module-tree
+    /// scans (e.g. `oxidhome_core::runtime`).
+    ///
+    /// [`target_prefix`]: Self::target_prefix
     pub target: Option<String>,
+    /// Match every event whose `target` starts with this prefix —
+    /// e.g. `oxidhome_core::runtime` catches both
+    /// `oxidhome_core::runtime::state` and
+    /// `oxidhome_core::runtime::instance`.
+    pub target_prefix: Option<String>,
+    /// Match every event whose `span_path` starts with this prefix —
+    /// e.g. `plugin.` catches `plugin.init`, `plugin.shutdown`,
+    /// `plugin.execute_command`, etc.
+    pub span_path_prefix: Option<String>,
 }
 
 // ── Internal channel record ─────────────────────────────────────────
@@ -302,30 +326,62 @@ impl LogStore {
         self.counters.write_errors.load(Ordering::Relaxed)
     }
 
-    /// Spin-wait until the writer thread has committed every event
-    /// the Layer has enqueued so far. Returns immediately if the
-    /// queue is already empty. Used by tests; **don't** call from
-    /// production code — there's no timeout, and live producers can
-    /// keep the gap open indefinitely.
-    pub fn wait_drained_for_test(&self) {
+    /// Wait until the writer thread has accounted for every event
+    /// the Layer has enqueued so far (committed *or* dropped), with
+    /// a bound on how long we'll spin.
+    ///
+    /// Returns `true` if the queue drained inside `budget`, `false`
+    /// if the timeout elapsed first. Callers that want the
+    /// "definitely drained, no time limit" shape should pass
+    /// `Duration::MAX` (or [`Self::wait_drained_for_test`], which
+    /// is the same thing under the hood and exists so tests read
+    /// intent-clearly).
+    ///
+    /// Concurrency note: this method racks the `sent` counter once
+    /// up front, then waits for `written + dropped` to reach that
+    /// snapshot. Concurrent producers can keep emitting after the
+    /// snapshot — that's fine, those events will land on the *next*
+    /// flush. For program shutdown, ensure no plugin is still
+    /// firing events when you call this (the natural shape after
+    /// `instance.shutdown()`).
+    #[must_use]
+    pub fn flush(&self, budget: std::time::Duration) -> bool {
+        let target = self.sent();
+        let deadline = std::time::Instant::now().checked_add(budget);
         loop {
-            let sent = self.sent();
             let written = self.written();
             let dropped = self.dropped();
-            if written + dropped >= sent {
-                return;
+            if written + dropped >= target {
+                return true;
+            }
+            if let Some(deadline) = deadline
+                && std::time::Instant::now() >= deadline
+            {
+                return false;
             }
             std::thread::yield_now();
         }
+    }
+
+    /// Convenience wrapper around [`Self::flush`] for tests: spin
+    /// without a timeout. Don't use from production code — a slow or
+    /// hung writer would hang the caller forever.
+    pub fn wait_drained_for_test(&self) {
+        let _ = self.flush(std::time::Duration::MAX);
     }
 
     /// Query the store. Returns at most `limit` rows newest-first.
     ///
     /// # Errors
     ///
-    /// - [`LogStoreError::Sql`] for any underlying ``SQLite`` error.
+    /// - [`LogStoreError::Sql`] for any underlying `SQLite` error.
     /// - [`LogStoreError::Decode`] if a stored row's `fields_blob`
     ///   doesn't parse as the expected tagged-JSON map.
+    // SQL builder + row decode is naturally linear and reads top-to-
+    // bottom; splitting for the `too_many_lines` lint would shuffle
+    // the parameterized-WHERE logic across helpers without making
+    // anything clearer.
+    #[allow(clippy::too_many_lines)]
     pub fn query(
         &self,
         filter: &LogQuery,
@@ -367,6 +423,29 @@ impl LogStore {
         }
         if let Some(t) = &filter.target {
             push(&mut binds, &mut sql, "target =", t.clone().into());
+        }
+        // Prefix filters: `substr(col, 1, length(?)) = ?` matches the
+        // shape kv::list_keys / event_log topic prefix use — correct
+        // on TEXT, no `LIKE` wildcard hazards.
+        if let Some(t) = &filter.target_prefix {
+            binds.push(rusqlite::types::Value::Text(t.clone()));
+            let n_left = binds.len();
+            binds.push(rusqlite::types::Value::Text(t.clone()));
+            let n_right = binds.len();
+            let _ = write!(
+                sql,
+                " AND substr(target, 1, length(?{n_left})) = ?{n_right}"
+            );
+        }
+        if let Some(s) = &filter.span_path_prefix {
+            binds.push(rusqlite::types::Value::Text(s.clone()));
+            let n_left = binds.len();
+            binds.push(rusqlite::types::Value::Text(s.clone()));
+            let n_right = binds.len();
+            let _ = write!(
+                sql,
+                " AND span_path IS NOT NULL AND substr(span_path, 1, length(?{n_left})) = ?{n_right}"
+            );
         }
 
         binds.push(rusqlite::types::Value::Integer(
@@ -449,6 +528,27 @@ impl LogStore {
         })?;
         #[allow(clippy::cast_sign_loss)]
         Ok(n as u64)
+    }
+}
+
+impl Drop for LogStore {
+    /// Best-effort drain on drop. Bounded at 5 s so unexpected
+    /// teardown (panic unwind, error path bailing early) doesn't
+    /// hang the caller. The explicit `flush(...)` call in
+    /// `oxidhome` main covers the happy path with a tunable budget;
+    /// this is the fall-back for everything else (tests that drop
+    /// the engine instead of cleanly shutting down, library
+    /// embedders that don't call flush themselves).
+    ///
+    /// **The writer thread isn't joined**, only flushed. Cloned
+    /// `SqliteLayer` handles can outlive the `LogStore` (they live
+    /// inside whichever subscriber holds them); the writer keeps
+    /// serving those until every sender — including each Layer
+    /// clone — drops. That's what we want: a `LogStore` dropping
+    /// mid-program shouldn't abort tracing capture, and at process
+    /// exit the OS reaps the detached thread regardless.
+    fn drop(&mut self) {
+        let _ = self.flush(std::time::Duration::from_secs(5));
     }
 }
 
@@ -934,6 +1034,91 @@ mod tests {
             .expect("query");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].target, "alpha");
+    }
+
+    /// `target_prefix` narrows to every event whose target starts
+    /// with the given module path — catches a whole module tree
+    /// without enumerating each leaf.
+    #[test]
+    fn target_prefix_filter_narrows() {
+        let store = store();
+        with_log_subscriber(&store, || {
+            tracing::info!(target: "oxidhome_core::runtime::state", "rt-state");
+            tracing::info!(target: "oxidhome_core::runtime::instance", "rt-instance");
+            tracing::info!(target: "oxidhome_sdk::plugin", "sdk-plugin");
+        });
+        store.wait_drained_for_test();
+
+        let rows = store
+            .query(
+                &LogQuery {
+                    target_prefix: Some("oxidhome_core::runtime".into()),
+                    ..LogQuery::default()
+                },
+                16,
+            )
+            .expect("query");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|r| r.target.starts_with("oxidhome_core::runtime"))
+        );
+    }
+
+    /// `span_path_prefix` narrows to every event under a span subtree
+    /// (e.g. `plugin.` catches `plugin.init`, `plugin.execute_command`,
+    /// `plugin.shutdown` without naming each).
+    #[test]
+    fn span_path_prefix_filter_narrows() {
+        let store = store();
+        with_log_subscriber(&store, || {
+            let init = tracing::info_span!("plugin.init", instance_id = "alpha");
+            init.in_scope(|| tracing::info!(target: "t", "in-init"));
+            let cmd = tracing::info_span!("plugin.execute_command", instance_id = "alpha");
+            cmd.in_scope(|| tracing::info!(target: "t", "in-cmd"));
+            let unrelated = tracing::info_span!("other.span");
+            unrelated.in_scope(|| tracing::info!(target: "t", "in-other"));
+            // Top-level (no span).
+            tracing::info!(target: "t", "no-span");
+        });
+        store.wait_drained_for_test();
+
+        let rows = store
+            .query(
+                &LogQuery {
+                    span_path_prefix: Some("plugin.".into()),
+                    ..LogQuery::default()
+                },
+                16,
+            )
+            .expect("query");
+        // Two events live under `plugin.*` spans.
+        assert_eq!(rows.len(), 2, "got {rows:?}");
+        assert!(
+            rows.iter().all(|r| r
+                .span_path
+                .as_deref()
+                .is_some_and(|s| s.starts_with("plugin."))),
+            "every row should have a plugin.* span_path",
+        );
+    }
+
+    /// `flush(timeout)` returns `false` when the writer hasn't
+    /// drained within the budget. We can't reliably create that
+    /// state without racing the writer thread, so the test confirms
+    /// the *opposite*: `flush(MAX)` always drains and returns `true`
+    /// once events are committed.
+    #[test]
+    fn flush_returns_true_when_drained() {
+        let store = store();
+        with_log_subscriber(&store, || {
+            tracing::info!(target: "t", "flush-target");
+        });
+        assert!(
+            store.flush(std::time::Duration::from_secs(5)),
+            "flush should drain within 5 s for a single in-memory write",
+        );
+        assert_eq!(store.written(), 1);
     }
 
     /// `trim_older_than(cutoff)` removes rows strictly older than the
