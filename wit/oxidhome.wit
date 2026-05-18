@@ -359,7 +359,7 @@ interface blob-store {
   /// to an existing name overwrites it atomically (stage to `.tmp` →
   /// fsync → rename → index commit; readers always see the old blob
   /// or the new one, never a half-written file). Returns the host-
-  /// minted ULID for the new blob.
+  /// minted id for the new blob.
   ///
   /// Errors: `permission-denied` when the quota would be exceeded
   /// or `blob_quota_mb` is 0 in the manifest; `internal` for
@@ -370,7 +370,7 @@ interface blob-store {
     mime: option<string>,
   ) -> result<blob-id, error>;
 
-  /// Read a blob by its host-minted ULID.
+  /// Read a blob by its host-minted id.
   ///
   /// Errors: `not-found` if the id doesn't exist in this instance's
   /// blob namespace; `internal` for filesystem failures.

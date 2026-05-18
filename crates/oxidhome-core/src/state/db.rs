@@ -238,7 +238,7 @@ const MIGRATIONS: &[&str] = &[
     //
     // Blob *bytes* live on the filesystem (`<state_dir>/blobs/<instance_id>/<id>`);
     // these tables are the index + quota accounting. `blob` maps the
-    // plugin-chosen `name` to the host-minted ULID + metadata; `blob_usage`
+    // plugin-chosen `name` to the host-minted id + metadata; `blob_usage`
     // tracks `bytes_used` per instance for the manifest-declared
     // `blob_quota_mb` cap. Triggers maintain `bytes_used` from
     // `size_bytes` deltas so the quota check on write is a single
@@ -279,12 +279,35 @@ const MIGRATIONS: &[&str] = &[
          WHERE instance_id = OLD.instance_id;
     END;
 
+    -- `blob_usage_update` fires on `UPDATE OF size_bytes` only — today
+    -- `state::blobs::write` does DELETE+INSERT for replacements, so
+    -- this trigger never runs in the shipped write path. Kept for any
+    -- future path that mutates `size_bytes` in place (e.g. a streaming
+    -- resource-handle resize) so the accounting stays consistent
+    -- without a Phase-N code change.
     CREATE TRIGGER blob_usage_update AFTER UPDATE OF size_bytes ON blob
     BEGIN
         UPDATE blob_usage
            SET bytes_used = bytes_used + NEW.size_bytes - OLD.size_bytes
          WHERE instance_id = NEW.instance_id;
     END;
+    ",
+    // 7 — Phase 5b follow-up: tighten blob id uniqueness.
+    //
+    // Migration 6's `blob_by_id` index was non-unique. `mint_id` is
+    // per-`BlobStore` (per-process) — two processes opening the same
+    // DB and minting an id in the same millisecond + counter slot
+    // would silently collide, producing two `blob` rows with the
+    // same `id` and overwriting each other's FS file. Replacing the
+    // index with a UNIQUE one on `(instance_id, id)` makes a
+    // collision fail the writing transaction loudly instead.
+    //
+    // Cross-instance collisions are fine (the id namespace is
+    // per-instance — `read(id)` already filters by `instance_id`),
+    // so the constraint is `(instance_id, id)` rather than `id`.
+    "
+    DROP INDEX blob_by_id;
+    CREATE UNIQUE INDEX blob_by_id ON blob(instance_id, id);
     ",
 ];
 
