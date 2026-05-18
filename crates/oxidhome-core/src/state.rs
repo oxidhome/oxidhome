@@ -15,6 +15,7 @@
 //! takes another at load time, and host-import callbacks reach them
 //! through `PluginState`.
 
+pub mod blobs;
 pub mod db;
 pub mod devices;
 pub mod event_log;
@@ -22,6 +23,7 @@ pub mod events;
 pub mod kv;
 pub mod log_store;
 
+pub use blobs::{BlobError, BlobInfo, BlobStore};
 pub use db::Db;
 pub use devices::{DeviceMeta, DeviceRegistry};
 pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicMatch};

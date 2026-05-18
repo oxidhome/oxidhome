@@ -56,6 +56,10 @@ path = "tests/event_history.rs"
 name = "log_trace"
 path = "tests/log_trace.rs"
 
+[[test]]
+name = "blob_persistence"
+path = "tests/blob_persistence.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors

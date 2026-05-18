@@ -264,6 +264,23 @@ impl PluginInstance {
                 )
             })?;
 
+        // Phase 5b: reserve a `blob_usage` row for this instance
+        // with the manifest's `blob_quota_mb`. Idempotent like the
+        // KV register; positive quota lets calls through, zero
+        // gates them off at the host call site.
+        let blob_quota_bytes = manifest
+            .capabilities
+            .blob_quota_mb
+            .saturating_mul(1024 * 1024);
+        let blobs = engine.blobs();
+        blobs
+            .register_instance(&instance_id, blob_quota_bytes)
+            .with_context(|| {
+                format!(
+                    "registering blob usage row for instance {instance_id} (quota {blob_quota_bytes} bytes)",
+                )
+            })?;
+
         let state = PluginState::new(
             instance_id,
             manifest,
@@ -273,6 +290,7 @@ impl PluginInstance {
             engine.events(),
             kv,
             engine.event_log(),
+            blobs,
         );
         let mut store = Store::new(engine.raw(), state);
 

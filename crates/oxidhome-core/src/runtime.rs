@@ -15,13 +15,13 @@ mod state;
 pub use instance::PluginInstance;
 pub use state::PluginState;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
-use crate::state::{Db, DeviceRegistry, EventBus, EventLog, KvStore, LogStore};
+use crate::state::{BlobStore, Db, DeviceRegistry, EventBus, EventLog, KvStore, LogStore};
 
 /// Process-wide Wasmtime engine. Components are compiled once per engine
 /// and instantiated cheaply across many [`PluginInstance`]s — wrap this
@@ -44,6 +44,7 @@ pub struct Engine {
     kv: Arc<KvStore>,
     event_log: Arc<EventLog>,
     log_store: Arc<LogStore>,
+    blobs: Arc<BlobStore>,
 }
 
 impl Engine {
@@ -60,7 +61,10 @@ impl Engine {
     /// Forwards Wasmtime engine-construction failures and `SQLite`
     /// open / migration errors.
     pub fn new() -> anyhow::Result<Self> {
-        Self::with_db(Db::open_in_memory()?)
+        // No FS root → in-memory engine — blob writes return
+        // `BlobError::Unavailable`. Tests that need to exercise the
+        // blob store construct `Engine::with_state_dir(...)`.
+        Self::with_db(Db::open_in_memory()?, None)
     }
 
     /// Build the engine with a file-backed `SQLite` database at
@@ -73,10 +77,11 @@ impl Engine {
     /// Forwards Wasmtime engine-construction failures and `SQLite`
     /// open / migration errors.
     pub fn with_state_dir(state_dir: &Path) -> anyhow::Result<Self> {
-        Self::with_db(Db::open_file(state_dir)?)
+        let blobs_root = state_dir.join("blobs");
+        Self::with_db(Db::open_file(state_dir)?, Some(blobs_root))
     }
 
-    fn with_db(db: Db) -> anyhow::Result<Self> {
+    fn with_db(db: Db, blobs_root: Option<PathBuf>) -> anyhow::Result<Self> {
         let mut cfg = Config::new();
         cfg.wasm_component_model(true);
         // `async_support(true)` is the default in wasmtime 44 (and was
@@ -95,7 +100,8 @@ impl Engine {
             events: Arc::new(EventBus::new()),
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
-            log_store: Arc::new(LogStore::new(db)),
+            log_store: Arc::new(LogStore::new(Arc::clone(&db))),
+            blobs: Arc::new(BlobStore::new(db, blobs_root)),
         })
     }
 
@@ -145,5 +151,16 @@ impl Engine {
     #[must_use]
     pub fn log_store(&self) -> Arc<LogStore> {
         Arc::clone(&self.log_store)
+    }
+
+    /// Shared blob store — Phase 5b. Bytes live on the filesystem
+    /// at `<state_dir>/blobs/<instance_id>/<id>`; the `SQLite` index
+    /// keeps `(name → id)` lookups + quota accounting. In-memory
+    /// engines (`Engine::new()`) carry a store with no FS root —
+    /// every write returns `BlobError::Unavailable`. Use
+    /// `Engine::with_state_dir` to enable blob writes.
+    #[must_use]
+    pub fn blobs(&self) -> Arc<BlobStore> {
+        Arc::clone(&self.blobs)
     }
 }

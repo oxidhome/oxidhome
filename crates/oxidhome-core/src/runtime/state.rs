@@ -30,6 +30,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::{
+    blob_store::{self, BlobInfo as WitBlobInfo},
     capabilities, devices,
     devices::DeviceInfo,
     events,
@@ -103,13 +104,18 @@ pub struct PluginState {
     /// per-`Engine`, cloned into each `PluginState` so the trait impl
     /// can reach the store without going through the engine.
     pub event_log: Arc<crate::state::EventLog>,
+    /// Shared blob store — Phase 5b. Bytes live on the filesystem
+    /// at `<state_dir>/blobs/<instance_id>/<id>`; the `SQLite` index
+    /// keeps `(name → id)` lookup + quota accounting. `blob-store`
+    /// host calls go through here.
+    pub blobs: Arc<crate::state::BlobStore>,
 }
 
 impl PluginState {
     /// Build a fresh state for one plugin instance. `devices` /
-    /// `events` / `kv` come from the parent [`Engine`](crate::Engine);
-    /// the manifest, actor, and resolved config come from the loader
-    /// (real or test).
+    /// `events` / `kv` / `event_log` / `blobs` come from the parent
+    /// [`Engine`](crate::Engine); the manifest, actor, and resolved
+    /// config come from the loader (real or test).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         instance_id: impl Into<InstanceId>,
@@ -120,6 +126,7 @@ impl PluginState {
         events: Arc<EventBus>,
         kv: Arc<crate::state::KvStore>,
         event_log: Arc<crate::state::EventLog>,
+        blobs: Arc<crate::state::BlobStore>,
     ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
@@ -131,6 +138,7 @@ impl PluginState {
             events,
             kv,
             event_log,
+            blobs,
             subscriptions: Vec::new(),
             manifest,
             actor,
@@ -553,6 +561,128 @@ impl storage::Host for PluginState {
     }
 }
 
+// ── Blob store ──────────────────────────────────────────────────────
+//
+// Phase 5b. Same shape as `storage`: a manifest-side gate
+// (`blob_quota_mb = 0` ⇒ `permission-denied` before the store is
+// touched), then `spawn_blocking` to keep the sync FS + SQLite work
+// off the tokio worker.
+
+fn require_blobs_enabled(state: &PluginState) -> Result<(), WitError> {
+    if state.manifest.capabilities.blob_quota_mb == 0 {
+        return Err(WitError::PermissionDenied(
+            "blob store disabled: capabilities.blob_quota_mb is 0 (set a positive value in manifest.toml)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Map [`crate::state::BlobError`] to a WIT [`WitError`]. Quota and
+/// "store unavailable" surface as `permission-denied`; missing
+/// blobs as `not-found`; everything else as `internal`.
+fn blob_error_to_wit(err: crate::state::BlobError) -> WitError {
+    use crate::state::BlobError;
+    match err {
+        BlobError::Unavailable => WitError::PermissionDenied(
+            "blob store unavailable: engine has no state directory configured".into(),
+        ),
+        BlobError::UnregisteredInstance { ref instance_id } => WitError::Internal(format!(
+            "blob_store: instance `{instance_id}` not registered (host bug)"
+        )),
+        BlobError::QuotaExceeded {
+            would_use, allowed, ..
+        } => WitError::PermissionDenied(format!(
+            "blob quota exceeded: {would_use} bytes used / {allowed} allowed"
+        )),
+        BlobError::NotFound { what } => WitError::NotFound(format!("blob {what}")),
+        BlobError::Io { path, source } => WitError::Internal(format!(
+            "blob_store: filesystem error at {}: {source}",
+            path.display()
+        )),
+        BlobError::Sql(e) => WitError::Internal(format!("blob_store: sqlite error: {e}")),
+    }
+}
+
+async fn blob_op<R, F>(f: F) -> Result<R, WitError>
+where
+    R: Send + 'static,
+    F: FnOnce() -> Result<R, crate::state::BlobError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(blob_error_to_wit(e)),
+        Err(join) => Err(WitError::Internal(format!(
+            "blob_store: blocking task panicked: {join}"
+        ))),
+    }
+}
+
+/// Convert host-side [`crate::state::BlobInfo`] into the wit-bindgen
+/// `BlobInfo` record. The two have the same shape — this is a
+/// trivial field-by-field move kept inline so the host's blob impl
+/// doesn't have to depend on the wit-bindgen types.
+fn blob_info_to_wit(info: crate::state::BlobInfo) -> WitBlobInfo {
+    WitBlobInfo {
+        name: info.name,
+        id: info.id,
+        size_bytes: info.size_bytes,
+        created_ms: info.created_ms,
+        mime: info.mime,
+    }
+}
+
+impl blob_store::Host for PluginState {
+    async fn write(
+        &mut self,
+        name: String,
+        data: Vec<u8>,
+        mime: Option<String>,
+    ) -> Result<String, WitError> {
+        require_blobs_enabled(self)?;
+        let blobs = Arc::clone(&self.blobs);
+        let instance_id = self.instance_id.clone();
+        blob_op(move || blobs.write(&instance_id, &name, &data, mime.as_deref())).await
+    }
+
+    async fn read(&mut self, id: String) -> Result<Vec<u8>, WitError> {
+        require_blobs_enabled(self)?;
+        let blobs = Arc::clone(&self.blobs);
+        let instance_id = self.instance_id.clone();
+        blob_op(move || blobs.read(&instance_id, &id)).await
+    }
+
+    async fn read_by_name(&mut self, name: String) -> Result<Vec<u8>, WitError> {
+        require_blobs_enabled(self)?;
+        let blobs = Arc::clone(&self.blobs);
+        let instance_id = self.instance_id.clone();
+        blob_op(move || blobs.read_by_name(&instance_id, &name)).await
+    }
+
+    async fn get_info(&mut self, name: String) -> Result<WitBlobInfo, WitError> {
+        require_blobs_enabled(self)?;
+        let blobs = Arc::clone(&self.blobs);
+        let instance_id = self.instance_id.clone();
+        blob_op(move || blobs.get_info(&instance_id, &name))
+            .await
+            .map(blob_info_to_wit)
+    }
+
+    async fn delete(&mut self, name: String) -> Result<(), WitError> {
+        require_blobs_enabled(self)?;
+        let blobs = Arc::clone(&self.blobs);
+        let instance_id = self.instance_id.clone();
+        blob_op(move || blobs.delete(&instance_id, &name)).await
+    }
+
+    async fn list_blobs(&mut self, prefix: String) -> Result<Vec<WitBlobInfo>, WitError> {
+        require_blobs_enabled(self)?;
+        let blobs = Arc::clone(&self.blobs);
+        let instance_id = self.instance_id.clone();
+        let rows = blob_op(move || blobs.list_blobs(&instance_id, &prefix)).await?;
+        Ok(rows.into_iter().map(blob_info_to_wit).collect())
+    }
+}
+
 impl logging::Host for PluginState {
     async fn log(&mut self, level: WitLevel, message: String) {
         let instance_id = self.instance_id.as_str();
@@ -672,6 +802,16 @@ mod tests {
         Arc::new(crate::state::EventLog::new(db))
     }
 
+    /// Build a throw-away [`BlobStore`] backed by its own in-memory
+    /// `Db` and no FS root — every mutating call will return
+    /// `BlobError::Unavailable`. Tests that exercise actual blob
+    /// writes go through `tests/blob_persistence.rs` against
+    /// `Engine::with_state_dir`.
+    fn fresh_blobs() -> Arc<crate::state::BlobStore> {
+        let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
+        Arc::new(crate::state::BlobStore::new(db, None))
+    }
+
     fn fresh_state(instance_id: &str) -> PluginState {
         let manifest = fixture_manifest("test.fixture");
         PluginState::new(
@@ -683,6 +823,7 @@ mod tests {
             Arc::new(EventBus::new()),
             fresh_kv(instance_id, 0),
             fresh_event_log(),
+            fresh_blobs(),
         )
     }
 
@@ -705,6 +846,7 @@ mod tests {
             Arc::new(EventBus::new()),
             fresh_kv(instance_id, quota_kb),
             fresh_event_log(),
+            fresh_blobs(),
         )
     }
 
@@ -722,6 +864,7 @@ mod tests {
             bus,
             fresh_kv(instance_id, 0),
             fresh_event_log(),
+            fresh_blobs(),
         )
     }
 
@@ -986,6 +1129,7 @@ mod tests {
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
+            fresh_blobs(),
         );
 
         // A device that claims `dimmer` should be refused.
@@ -1028,6 +1172,7 @@ mod tests {
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
+            fresh_blobs(),
         );
 
         let mut info = empty_device("d-shade");
@@ -1108,6 +1253,7 @@ mod tests {
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
+            fresh_blobs(),
         );
 
         let mut info = empty_device("d-up");

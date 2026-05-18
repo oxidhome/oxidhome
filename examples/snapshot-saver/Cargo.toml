@@ -1,0 +1,24 @@
+# Standalone workspace so the example builds for `wasm32-wasip2`
+# without pulling the host (`oxidhome-core`) into the wasm build
+# graph. Mirrors every other example.
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "snapshot-saver"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "OxidHome example plugin: writes snapshot blobs via host::blobs (Phase 5b)."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oxidhome-sdk = { path = "../../crates/oxidhome-sdk" }
+
+[lints.rust]
+unsafe_code = "deny"

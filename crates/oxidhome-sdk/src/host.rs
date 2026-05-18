@@ -44,6 +44,18 @@ pub mod config;
 /// every call gated off behind `permission-denied`.
 pub mod storage;
 
+/// Per-instance blob store (Phase 5b). Plugin authors call
+/// `oxidhome_sdk::host::blobs::write(name, &bytes, Some("image/jpeg"))`
+/// to store a blob (camera snapshot, recording, oversized config),
+/// then `read_by_name` / `read` / `list_blobs` / `delete` for the
+/// usual lifecycle. Quota lives under
+/// `[capabilities] blob_quota_mb`; `0` (default) gates every call
+/// off behind `permission-denied`. Phase 5b v1 buffers through
+/// `list<u8>` at the WIT boundary; a streaming resource-handle
+/// follow-up is planned for plugins that need to write recordings
+/// without buffering end-to-end.
+pub mod blobs;
+
 // ── Devices ──────────────────────────────────────────────────────────
 
 /// Register a device with the host. Accepts either a
