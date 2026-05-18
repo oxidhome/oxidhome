@@ -107,8 +107,8 @@ async fn blobs_survive_host_restart() {
     // accounting is the load-bearing-for-overwrites bit, and the
     // restart proved the triggers ran on insert.
     let (used, quota) = blobs.usage(&instance_id).expect("usage").expect("present");
-    let total_payload = u64::try_from(INIT_PAYLOAD.len() + RUNTIME_PAYLOAD.len())
-        .expect("payload sums fit in u64");
+    let total_payload =
+        u64::try_from(INIT_PAYLOAD.len() + RUNTIME_PAYLOAD.len()).expect("payload sums fit in u64");
     assert_eq!(
         used, total_payload,
         "bytes_used should equal the sum of the two payloads",
