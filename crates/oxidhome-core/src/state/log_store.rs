@@ -32,14 +32,17 @@
 //!
 //! ## Span-carried context
 //!
-//! The Layer extracts `instance_id`, `plugin_id`, and `device_id`
-//! from the *innermost-to-root* span chain so every host call's
-//! emissions are attributed correctly without each callsite having
-//! to type the field at the macro. Phase 4B's `plugin.load` span
-//! adds `instance_id`; the device/event/storage host impls add
-//! `plugin_id` / `device_id` as they apply. The `span_path` column
-//! is the slash-joined span name chain — useful for "everything
-//! that happened inside `plugin.execute_command`."
+//! The Layer walks the span chain **root → leaf** for each event;
+//! the innermost span's `instance_id` / `plugin_id` / `device_id`
+//! field wins because it's recorded last. Event-level fields on
+//! the `info!` / `warn!` / etc. call itself override the inherited
+//! span value. Plugin authors and host callers don't have to type
+//! the field at every callsite — Phase 4B's `plugin.load` span
+//! adds `instance_id` (and records `plugin_id` once the manifest
+//! parses); the device/event/storage host impls add `plugin_id` /
+//! `device_id` as they apply. The `span_path` column is the
+//! slash-joined span name chain in root→leaf order — useful for
+//! "everything that happened inside `plugin.execute_command`."
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -328,17 +331,22 @@ impl LogStore {
         }
     }
 
-    /// Number of events the Layer tried to enqueue. Mostly useful in
-    /// tests that want to wait for the writer to catch up.
+    /// Total number of events the Layer observed — every call to
+    /// `on_event`, whether the row eventually committed, errored,
+    /// or was dropped. Monotonic; never decremented. The flush
+    /// invariant `written + write_errors + dropped >= sent` holds
+    /// because every increment here matches exactly one increment
+    /// in those terminal counters.
     #[must_use]
     pub fn sent(&self) -> u64 {
         self.counters.sent.load(Ordering::Relaxed)
     }
 
-    /// Number of events dropped because the channel was full. Bumped
-    /// by the Layer on `TrySendError::Full`; the writer thread emits
-    /// no `tracing::warn!` itself (would loop). The host's periodic
-    /// status endpoint (Phase 12) surfaces this counter.
+    /// Number of events dropped because the channel was full *or*
+    /// the writer thread was gone (every `TrySendError`). Bumped by
+    /// the Layer; the writer thread emits no `tracing::warn!`
+    /// itself (would loop). The host's periodic status endpoint
+    /// (Phase 12) surfaces this counter.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.counters.dropped.load(Ordering::Relaxed)
@@ -371,14 +379,14 @@ impl LogStore {
     /// is the same thing under the hood and exists so tests read
     /// intent-clearly).
     ///
-    /// The condition is `written + write_errors >= sent_snapshot`.
-    /// We deliberately **don't** add `dropped` into the comparison
-    /// even though dropped rows are "done" — `dropped` accumulates
-    /// independently of `sent`, so including it would let the
-    /// condition pass trivially after a burst that dropped many
-    /// rows while enqueued ones were still pending in the channel
-    /// (`sent_snapshot = 5`, `dropped = 95` → `0 + 95 >= 5` would
-    /// fire before any of the 5 enqueued rows actually wrote).
+    /// The condition is `written + write_errors + dropped >= sent_snapshot`.
+    /// `sent` is monotonic ("every event the Layer observed") and
+    /// every observation deposits in exactly one terminal counter,
+    /// so the sum is monotonically non-decreasing and self-correcting.
+    /// (Earlier revisions decremented `sent` on `TrySendError`; the
+    /// fix dropped the decrement so a flush snapshot taken between
+    /// the layer's `fetch_add` and a subsequent `fetch_sub` can't
+    /// outrun what the writer can ever process.)
     ///
     /// Concurrency note: snapshots `sent` once up front. Concurrent
     /// producers can keep emitting after the snapshot — those events
@@ -397,7 +405,12 @@ impl LogStore {
         // expensive (not incorrect) and `flush` is rare on the hot
         // path (called once per process exit, once per LogStore drop).
         loop {
-            let processed = self.written() + self.write_errors();
+            // Every `sent` deposits in exactly one of the three:
+            // `written` (writer committed), `write_errors` (writer
+            // failed), `dropped` (try_send Full / Disconnected, never
+            // reached the writer). Sum is monotonically non-decreasing
+            // and catches up to any prior `sent` snapshot.
+            let processed = self.written() + self.write_errors() + self.dropped();
             if processed >= target {
                 return true;
             }
@@ -705,34 +718,44 @@ where
             fields_blob,
         };
 
-        // Bump `sent` **before** `try_send`. The store's flush
-        // contract is "every enqueued row has been processed when
-        // `written + write_errors >= sent`." If we incremented
-        // `sent` after `try_send`, a concurrent `flush` could
-        // snapshot `sent` *between* the channel insert and the
-        // counter bump — the row is in the writer's queue but flush
-        // doesn't see it, and returns true prematurely. Pre-bumping
-        // closes that window: by the time the row reaches the
-        // channel it's already accounted for in `sent`, and any
-        // flush snapshot taken after the bump waits for that row.
+        // Bump `sent` **before** `try_send`, and never decrement.
+        // `sent` counts every event the Layer observed — equivalent
+        // to "Layer invocations." Each invocation deposits the row
+        // in exactly one of three terminal counters:
         //
-        // On `Full` / `Disconnected` we'd over-count, so dec `sent`
-        // and route to the right counter. Race-free because
-        // `fetch_sub` is atomic and `flush`'s relaxed-load semantics
-        // tolerate brief over-counting (it would just wait a beat
-        // longer than needed).
+        // - `try_send` Ok → writer eventually bumps `written` or
+        //   `write_errors`.
+        // - `try_send` Full → bump `dropped` here.
+        // - `try_send` Disconnected → bump `dropped` here too. The
+        //   row is lost (writer thread gone), but from flush's
+        //   perspective it's "done" — count it as dropped so the
+        //   invariant `written + write_errors + dropped == sent`
+        //   holds eventually.
+        //
+        // Pre-bumping closes the original race (a concurrent flush
+        // snapshot between channel insert and counter bump would
+        // miss the row); never decrementing closes the *second*
+        // race (a flush snapshot caught the over-counted state,
+        // and a later fetch_sub on `Full` would let the target
+        // outrun what the writer can ever process). With
+        // sent-monotonic, every snapshot has a matching invariant:
+        // `written + write_errors + dropped` is monotonically
+        // non-decreasing and will catch up to any prior `sent`
+        // snapshot.
         self.counters.sent.fetch_add(1, Ordering::Relaxed);
         match self.tx.try_send(record) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.counters.sent.fetch_sub(1, Ordering::Relaxed);
+            // `Full`: channel saturated.
+            // `Disconnected`: writer thread gone (very rare — only
+            // happens if LogStore drops while a Layer clone is still
+            // emitting, or in pathological subscriber teardown).
+            // Both lose the row from the writer's perspective, so
+            // bucket both as `dropped` from flush's perspective.
+            // (A separate `disconnected` counter would only help
+            // diagnostics; Phase-12's status endpoint can split if
+            // useful.)
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.counters.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            // The writer thread has gone away (LogStore dropped, all
-            // senders closed). Lose the record silently — tracing
-            // must never panic on the calling thread.
-            Err(TrySendError::Disconnected(_)) => {
-                self.counters.sent.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
@@ -740,11 +763,18 @@ where
 
 // ── Field visitors ──────────────────────────────────────────────────
 //
-// `SpanFields` watches for `instance_id` / `plugin_id` / `device_id`
-// by name and keeps them in dedicated slots; everything else lands in
-// `extra` for the row's `fields_blob`. `EventFields` is the same
-// shape with one extra slot for `message` (the `tracing` macro
-// stores the format string under the magic field name `"message"`).
+// `SpanFields` watches a span's recorded fields for the three
+// attribution columns (`instance_id` / `plugin_id` / `device_id`) and
+// stores them in dedicated slots. Everything *else* on a span is
+// **discarded** — the store doesn't persist arbitrary span fields
+// because no current query consumer reads them and the cost of
+// encoding+writing them would scale with span depth. (If a future
+// caller needs them, add an `extra: Vec<(String, LogValue)>` slot
+// here and merge into `fields_blob` at `on_event` time.) `EventFields`
+// is the parallel shape for *event*-level fields: same three
+// attribution slots, plus a `message` slot for the `tracing` macro's
+// format string, plus an `extra` vec for everything else (which
+// **is** persisted in `fields_blob`).
 
 // The `*_id` postfix is intentional — these mirror the SQLite
 // columns of the same name. Lint relaxed for that reason.
@@ -1309,19 +1339,23 @@ mod tests {
                 tracing::info!(target: "t", i, "burst");
             }
         });
-        // Don't sleep here — go straight to flush. The old condition
-        // (`written + dropped >= sent`) would have returned `true`
-        // immediately because `dropped >> sent`. The new condition
-        // forces us to actually wait for the writer.
+        // Don't sleep here — go straight to flush. The pre-fix
+        // formula `written + dropped >= sent` (where `sent` was
+        // decremented on drop) would have returned `true`
+        // immediately because `dropped >> sent`. The current
+        // formula treats `sent` as monotonic and sums all three
+        // terminal counters, so flush has to wait for every
+        // observed event to land in one bucket.
         assert!(
             store.flush(std::time::Duration::from_secs(5)),
             "flush should still drain within budget",
         );
-        // After flush returns true, every successfully-enqueued event
-        // has been processed by the writer.
+        // Invariant after flush returns true: every event the
+        // Layer observed has been processed (committed, errored,
+        // or dropped).
         assert!(
-            store.written() + store.write_errors() >= store.sent(),
-            "post-flush invariant: written + write_errors >= sent (\
+            store.written() + store.write_errors() + store.dropped() >= store.sent(),
+            "post-flush invariant: written + write_errors + dropped >= sent (\
              written={}, write_errors={}, sent={}, dropped={})",
             store.written(),
             store.write_errors(),
@@ -1402,13 +1436,14 @@ mod tests {
         let sent = store.sent();
         let dropped = store.dropped();
         let written = store.written();
-        // Sanity: every emit reached the Layer (either sent or
-        // dropped). 64 emits → sent + dropped should be 64. (The
-        // `sent` counter is bumped before try_send and unwound on
-        // Full/Disconnected, so this invariant holds even mid-burst.)
-        assert!(
-            sent + dropped >= 1,
-            "Layer should have observed all events: sent={sent} dropped={dropped} written={written}",
+        // `sent` is bumped on every Layer invocation and never
+        // decremented, so we know the Layer saw all 64 emits — a
+        // tighter check than the old `sent + dropped >= 1`. Would
+        // also catch a filter / EnvFilter regression that swallowed
+        // events before the Layer ran.
+        assert_eq!(
+            sent, 64,
+            "Layer should have observed every emit: sent={sent} dropped={dropped} written={written}",
         );
         // Capacity-0 + 64 rapid emits → every try_send that
         // doesn't catch the writer mid-recv drops. The writer

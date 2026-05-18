@@ -49,11 +49,17 @@ async fn main() -> anyhow::Result<()> {
 
     let state_dir = resolve_state_dir()?;
     // Engine first — its `log_store` provides the SQLite tracing
-    // layer that the global subscriber composes below. Setting the
-    // subscriber up before the engine would lose every event the
-    // engine emits during construction; setting it up after the
-    // plugin loads loses every event during `PluginInstance::load`.
-    // So: build engine → install subscriber → load plugin.
+    // layer that the global subscriber composes below.
+    //
+    // **Bootstrap gap:** events emitted *during* `Engine::with_state_dir`
+    // itself (the SQLite migrations, WAL setup, KvStore /
+    // EventLog / LogStore construction) land before the subscriber
+    // is installed — they're visible on stdout's default-ish
+    // tracing target but not persisted. There's no way around that
+    // ordering without an in-memory buffer the layer flushes after
+    // installation, and engine construction is operator-observed
+    // anyway. The plugin lifecycle (load / init / shutdown) and
+    // every subsequent host event are captured.
     let engine = Engine::with_state_dir(&state_dir).with_context(|| {
         format!(
             "opening engine state at {} — set $OXIDHOME_STATE_DIR to override",

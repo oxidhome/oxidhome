@@ -220,11 +220,17 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX log_target_ts   ON log_event(target, ts_unix_ms);
     ",
     // 5 — Phase 5c follow-up: add the `log_span_ts` index that the
-    // per-crate plan listed but migration 4 forgot. `LogQuery::span_path_prefix`
-    // does a `substr(span_path, 1, length(?)) = ?` scan; without an
-    // index the planner walks the full instance slice. Partial index
-    // (`WHERE span_path IS NOT NULL`) skips host-only events that
-    // fired outside any span.
+    // per-crate plan listed but migration 4 forgot. Note this index
+    // helps `span_path = ?` (and `span_path` time-range scans on
+    // events that carry one); it does **not** seek the
+    // `LogQuery::span_path_prefix` predicate, which uses
+    // `substr(span_path, 1, length(?)) = ?` — SQLite can't seek a
+    // B-tree with `substr(...)`. The partial-index `WHERE span_path
+    // IS NOT NULL` still narrows the scan because the planner can
+    // restrict to non-null span_path rows. A codepoint-range
+    // rewrite (`span_path >= ? AND span_path < ?`) would let
+    // prefix queries seek the index; Phase 12 picks that up when
+    // there's a workload that wants it.
     "
     CREATE INDEX log_span_ts ON log_event(span_path, ts_unix_ms) WHERE span_path IS NOT NULL;
     ",

@@ -87,11 +87,16 @@ async fn plugin_logs_survive_host_restart() {
 
         instance.shutdown().await.expect("shutdown");
 
-        // Drain the writer thread before we drop the subscriber — any
-        // events still in the channel after `_guard` falls out of
-        // scope still land (the layer's senders are owned by the
-        // running writer), but draining here makes the assertions
-        // below deterministic without polling.
+        // Drain the writer thread before we drop the subscriber.
+        // Ownership: the writer owns the channel *receiver*; the
+        // senders live on `LogStore` + every `SqliteLayer` clone the
+        // subscriber holds. When `_guard` falls out of scope the
+        // subscriber drops, dropping its Layer (and thus that
+        // sender). Rows already in the channel still land on
+        // `<state_dir>/oxidhome.db` because the writer drains them
+        // out before its `recv` returns `Err` — draining here just
+        // makes the assertions below deterministic without
+        // additional polling.
         engine.log_store().wait_drained_for_test();
     }
 
