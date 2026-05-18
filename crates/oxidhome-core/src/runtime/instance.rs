@@ -81,10 +81,20 @@ impl PluginInstance {
     ) -> anyhow::Result<Self> {
         let plugin_dir = plugin_dir.to_path_buf();
         let instance_id = instance_id.into();
+        // `plugin_id = Empty` declares the field up-front so it
+        // appears in the span's metadata; we fill it in below once
+        // the manifest parses. The Phase-5c log layer's `on_record`
+        // handler picks up the deferred value, so events emitted
+        // anywhere inside this span (after the parse) attribute to
+        // the right plugin. Events between span entry and the
+        // parse step — the manifest read itself, the read-error
+        // path — still land with `plugin_id` null, which is the
+        // honest answer: we don't know the plugin id yet.
         let span = info_span!(
             "plugin.load",
             plugin_dir = %plugin_dir.display(),
             instance_id = %instance_id,
+            plugin_id = tracing::field::Empty,
         );
         async move {
             let manifest_path = plugin_dir.join("manifest.toml");
@@ -98,6 +108,11 @@ impl PluginInstance {
                 })?;
             let manifest: PluginManifest = toml::from_str(&manifest_text)
                 .with_context(|| format!("parsing {}", manifest_path.display()))?;
+            // Record the plugin id onto the active span as soon as
+            // it's known. Validation, compatibility-check, and
+            // instantiate-time events below will all attribute to
+            // it via the Layer's `on_record` hook.
+            tracing::Span::current().record("plugin_id", manifest.plugin.id.as_str());
             if let Err(errors) = oxidhome_manifest::validate(&manifest) {
                 return Err(anyhow!(
                     "manifest {} is invalid:\n  - {}",
@@ -273,7 +288,12 @@ impl PluginInstance {
     /// `Result<(), String>` per the WIT — we propagate the error
     /// message through `anyhow`.
     pub async fn init(&mut self) -> anyhow::Result<()> {
-        let span = info_span!("plugin.init", instance_id = %self.store.data().instance_id);
+        let data = self.store.data();
+        let span = info_span!(
+            "plugin.init",
+            instance_id = %data.instance_id,
+            plugin_id = %data.manifest.plugin.id,
+        );
         async {
             self.bindings
                 .call_init(&mut self.store)
@@ -289,7 +309,12 @@ impl PluginInstance {
     /// Call the plugin's exported `shutdown`. The plugin can't fail this
     /// call by contract; trapping bubbles up as an error.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
-        let span = info_span!("plugin.shutdown", instance_id = %self.store.data().instance_id);
+        let data = self.store.data();
+        let span = info_span!(
+            "plugin.shutdown",
+            instance_id = %data.instance_id,
+            plugin_id = %data.manifest.plugin.id,
+        );
         async {
             self.bindings
                 .call_shutdown(&mut self.store)
@@ -311,9 +336,11 @@ impl PluginInstance {
         device: DeviceId,
         cmd: Command,
     ) -> anyhow::Result<CommandResult> {
+        let data = self.store.data();
         let span = info_span!(
             "plugin.execute_command",
-            instance_id = %self.store.data().instance_id,
+            instance_id = %data.instance_id,
+            plugin_id = %data.manifest.plugin.id,
             device_id = %device,
             capability = %cmd.capability,
             action = %cmd.action,
@@ -345,13 +372,30 @@ impl PluginInstance {
         // `subscriptions` mutably borrows `self.store.data_mut()`,
         // but `call_on_event` needs `&mut self.store` exclusively.
         let pending = self.collect_pending_events();
+        // Snapshot the identity fields once before the call loop —
+        // building the span per iteration is what matters (each
+        // `on_event` call is its own host span, so plugin log lines
+        // emitted from inside `on_event` attribute under
+        // `plugin.on_event` with both `instance_id` and `plugin_id`).
+        // Reading from `self.store.data()` per iteration is fine —
+        // these strings don't change for the lifetime of the instance.
         let mut delivered = 0;
         for ev in pending {
-            self.bindings
-                .call_on_event(&mut self.store, &ev)
-                .await
-                .map_err(anyhow::Error::from)
-                .context("invoking plugin on-event")?;
+            let data = self.store.data();
+            let span = info_span!(
+                "plugin.on_event",
+                instance_id = %data.instance_id,
+                plugin_id = %data.manifest.plugin.id,
+            );
+            async {
+                self.bindings
+                    .call_on_event(&mut self.store, &ev)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .context("invoking plugin on-event")
+            }
+            .instrument(span)
+            .await?;
             delivered += 1;
         }
         Ok(delivered)
