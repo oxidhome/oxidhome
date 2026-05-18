@@ -83,9 +83,10 @@ pub enum LogStoreError {
 }
 
 /// Log levels mapped to integers for the `log_event.level` column.
-/// Matches the doc: TRACE=0, DEBUG=1, INFO=2, WARN=3, ERROR=4.
-/// Lower-is-louder is intentional — operators usually filter
-/// `level >= 2` to see info+ — and matches tracing's own ordering.
+/// TRACE=0 through ERROR=4 — bigger numbers are *louder*, so the
+/// natural "show me INFO and above" filter is `level >= 2`. Matches
+/// `tracing::Level`'s own ordering and lets `min_level` queries do
+/// a single index range scan.
 const LEVEL_TRACE: i64 = 0;
 const LEVEL_DEBUG: i64 = 1;
 const LEVEL_INFO: i64 = 2;
@@ -151,9 +152,15 @@ pub enum LogValue {
     UInt(u64),
     Float(f64),
     String(String),
-    /// Captured from `?` formatter — what `tracing` calls
-    /// `record_debug`. Stored verbatim as the Debug-formatted
-    /// string.
+    /// Captured from the `?` formatter — what `tracing` calls
+    /// `record_debug` — plus non-finite floats that
+    /// [`Visit::record_f64`](tracing::field::Visit::record_f64)
+    /// can't otherwise round-trip through JSON. The field visitor
+    /// trims a single pair of surrounding `"` quotes when the
+    /// `Debug` output is a quoted string literal so
+    /// `device_id = %"d-1"` and `device_id = "d-1"` look the same
+    /// to the store; everything else lands verbatim as the
+    /// Debug-formatted form.
     Debug(String),
 }
 
@@ -165,8 +172,14 @@ pub enum LogValue {
 /// Prefix filters (`target_prefix`, `span_path_prefix`) use the
 /// same `substr(col, 1, length(?)) = ?` shape `kv::list_keys` and
 /// `event_log` settled on — correct on TEXT, no `LIKE` escaping
-/// hazards. The `log_target_ts` / `log_span_ts` indexes cover the
-/// scans.
+/// hazards. The `log_target_ts` / `log_span_ts` partial indexes
+/// help **range** queries (`target = ?` / `span_path = ?`), not
+/// these prefix predicates — `substr(...)` doesn't seek a B-tree.
+/// Phase-5c workloads are small (per-host log volume measured in
+/// thousands of events / hour), so the planner-chosen `(target, ts)`
+/// index keeps the post-filter cheap. A range-rewrite with
+/// codepoint-correct upper bounds (`target >= ? AND target < ?`)
+/// lands when there's a workload that pushes past that envelope.
 ///
 /// Message-substring search, structured-field equality, and a live
 /// tail are deferred to the Phase 12 query API; the on-disk shape
@@ -232,19 +245,40 @@ struct Counters {
     write_errors: AtomicU64,
 }
 
-/// Per-host log/trace store. Cheap to clone — holds an `Arc<Inner>`.
+/// Per-host log/trace store.
+///
+/// `LogStore` itself is *not* `Clone` — share it as `Arc<LogStore>`
+/// (which is what `Engine::log_store()` hands out). The bits inside
+/// (`SyncSender`, `Arc<Counters>`, `Arc<Db>`) are all individually
+/// cheap to clone; the type doesn't derive `Clone` because the
+/// `JoinHandle` slot for the writer thread is single-owner — we
+/// keep it on `LogStore` so future shutdown paths can join the
+/// writer (today it's stored and never joined — see below).
 ///
 /// Drop semantics: dropping the `LogStore` doesn't kill the writer
 /// thread, because [`LogStore::layer`] clones hand out fresh
-/// senders. When every sender (`LogStore` + every `Layer` instance)
-/// drops, the receiver in the writer thread sees `Err`, exits the
-/// loop, and joins.
+/// senders. When every sender (`LogStore` + every `SqliteLayer`
+/// clone the subscriber holds) drops, the receiver in the writer
+/// thread sees `Err`, exits the loop, and the thread returns. The
+/// `JoinHandle` is held in `_writer` but **not joined** — the
+/// `Drop` impl below explicitly detaches it. Detaching is the
+/// right shape: `LogStore` dropping mid-program (because the host
+/// is restarting an engine) shouldn't block on a writer that's
+/// still serving Layer clones held by the global subscriber, and
+/// at process exit the OS reaps the thread regardless.
+///
+/// What does run at `LogStore::drop` is a bounded `flush(5s)` so
+/// rows already in the channel land before the store goes away.
 pub struct LogStore {
     tx: SyncSender<LogRecord>,
     counters: Arc<Counters>,
     db: Arc<Db>,
-    /// `Some` while the writer thread is alive — the handle moves
-    /// out on `wait_drained_for_test`-style joins.
+    /// Held but never joined — see the type-level doc. The slot
+    /// stays so a future explicit `LogStore::shutdown(self)` can
+    /// drop the sender, then join the writer, when there's a
+    /// caller pattern that wants that. Today's callers all live in
+    /// `Arc<LogStore>` so a `&mut self`-taking shutdown would need
+    /// interior mutability that doesn't pull its weight yet.
     _writer: Option<JoinHandle<()>>,
 }
 
@@ -355,6 +389,13 @@ impl LogStore {
     pub fn flush(&self, budget: std::time::Duration) -> bool {
         let target = self.sent();
         let deadline = std::time::Instant::now().checked_add(budget);
+        // Naive `yield_now` polling. A disk-stalled writer makes this
+        // pin one CPU until the budget expires. The actual fix —
+        // a condvar bumped by the writer thread after each commit /
+        // failure, or an ack-channel — is filed for Phase 12's
+        // shutdown-coordination work since it's only operationally
+        // expensive (not incorrect) and `flush` is rare on the hot
+        // path (called once per process exit, once per LogStore drop).
         loop {
             let processed = self.written() + self.write_errors();
             if processed >= target {
@@ -664,17 +705,35 @@ where
             fields_blob,
         };
 
+        // Bump `sent` **before** `try_send`. The store's flush
+        // contract is "every enqueued row has been processed when
+        // `written + write_errors >= sent`." If we incremented
+        // `sent` after `try_send`, a concurrent `flush` could
+        // snapshot `sent` *between* the channel insert and the
+        // counter bump — the row is in the writer's queue but flush
+        // doesn't see it, and returns true prematurely. Pre-bumping
+        // closes that window: by the time the row reaches the
+        // channel it's already accounted for in `sent`, and any
+        // flush snapshot taken after the bump waits for that row.
+        //
+        // On `Full` / `Disconnected` we'd over-count, so dec `sent`
+        // and route to the right counter. Race-free because
+        // `fetch_sub` is atomic and `flush`'s relaxed-load semantics
+        // tolerate brief over-counting (it would just wait a beat
+        // longer than needed).
+        self.counters.sent.fetch_add(1, Ordering::Relaxed);
         match self.tx.try_send(record) {
-            Ok(()) => {
-                self.counters.sent.fetch_add(1, Ordering::Relaxed);
-            }
+            Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                self.counters.sent.fetch_sub(1, Ordering::Relaxed);
                 self.counters.dropped.fetch_add(1, Ordering::Relaxed);
             }
             // The writer thread has gone away (LogStore dropped, all
             // senders closed). Lose the record silently — tracing
             // must never panic on the calling thread.
-            Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters.sent.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -798,7 +857,22 @@ impl Visit for EventFields {
         self.record(field, LogValue::UInt(value));
     }
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.record(field, LogValue::Float(value));
+        // `serde_json` serializes non-finite floats (NaN, ±inf) as
+        // `null`. A round-trip through `from_slice` back into
+        // `LogValue::Float(f64)` would then fail with
+        // `LogStoreError::Decode`, taking the whole row's
+        // `fields_blob` with it. Stash non-finite values as
+        // `Debug(String)` so they round-trip losslessly and don't
+        // poison the row. (Same trade-off `kv.rs`/`event_log.rs`
+        // make for floats; the host's tracing macros use this path
+        // when an operator emits, say, `tracing::warn!(ratio = f, …)`
+        // with `f = f64::NAN` from a failed calculation.)
+        let v = if value.is_finite() {
+            LogValue::Float(value)
+        } else {
+            LogValue::Debug(format!("{value}"))
+        };
+        self.record(field, v);
     }
     fn record_str(&mut self, field: &Field, value: &str) {
         self.record(field, LogValue::String(value.to_owned()));
@@ -1041,6 +1115,47 @@ mod tests {
         assert!(matches!(by_name["ok"], LogValue::Bool(true)));
     }
 
+    /// Non-finite floats (`NaN`, `±inf`) round-trip as
+    /// `LogValue::Debug(String)` rather than `LogValue::Float`,
+    /// because `serde_json` serializes non-finite floats as `null`
+    /// and the decode would fail. The row stays readable; the
+    /// payload survives as the float's Display string.
+    #[test]
+    fn non_finite_floats_survive_round_trip() {
+        let store = store();
+        with_log_subscriber(&store, || {
+            tracing::info!(
+                target: "test",
+                ratio_nan = f64::NAN,
+                ratio_pos_inf = f64::INFINITY,
+                ratio_neg_inf = f64::NEG_INFINITY,
+                "non-finite floats",
+            );
+        });
+        store.wait_drained_for_test();
+
+        let rows = store.query(&LogQuery::default(), 16).expect("query");
+        assert_eq!(rows.len(), 1, "row should be present, not failed-decode");
+        let fields = &rows[0].fields;
+        let by_name: std::collections::HashMap<&str, &LogValue> =
+            fields.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        // Each non-finite value lands as a Debug string whose body
+        // is the float's Display form.
+        for (key, expected) in &[
+            ("ratio_nan", "NaN"),
+            ("ratio_pos_inf", "inf"),
+            ("ratio_neg_inf", "-inf"),
+        ] {
+            let v = by_name
+                .get(*key)
+                .unwrap_or_else(|| panic!("field {key} missing in {fields:?}"));
+            match v {
+                LogValue::Debug(s) => assert_eq!(s, expected, "field {key}"),
+                other => panic!("expected Debug for non-finite {key}, got {other:?}"),
+            }
+        }
+    }
+
     /// `min_level = Warn` narrows to warn+error rows.
     #[test]
     fn min_level_filter_narrows() {
@@ -1224,9 +1339,32 @@ mod tests {
             tracing::info!(target: "test", "first");
         });
         store.wait_drained_for_test();
-        let cutoff = now_unix_ms() + 1;
-        // Sleep one ms so the next event lands strictly after cutoff.
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Use the first row's stored `ts_unix_ms` + 1 as the cutoff
+        // instead of `now_unix_ms() + 1` plus a sleep. The
+        // `SystemTime::now()` call inside the layer might land on
+        // the same millisecond as our outside call; the safe move
+        // is to read what actually landed and bump by 1.
+        let first_ts = store
+            .query(&LogQuery::default(), 1)
+            .expect("query first")
+            .first()
+            .expect("first row")
+            .ts_unix_ms;
+        let cutoff = first_ts + 1;
+        // Spin until `SystemTime::now()` is strictly past `cutoff`
+        // before emitting the second event. Coarse-clock platforms
+        // (Windows historically, some CI VMs) would otherwise stamp
+        // the second event with the same millisecond as the first
+        // and trim it too. Bounded so the loop can't run away on a
+        // broken clock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while now_unix_ms() <= cutoff {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "clock never advanced past cutoff = {cutoff}",
+            );
+            std::thread::yield_now();
+        }
         with_log_subscriber(&store, || {
             tracing::info!(target: "test", "second");
         });
@@ -1241,36 +1379,44 @@ mod tests {
     }
 
     /// A bounded channel + a high-rate burst trips the drop counter.
-    /// Tiny capacity (1) makes the test fast and deterministic.
+    /// Capacity 0 (`sync_channel(0)` = rendezvous) deterministically
+    /// drops everything `try_send` can't hand off synchronously to
+    /// the writer thread.
+    ///
+    /// Previously this test used capacity 1 + a 2 ms sleep, betting
+    /// the writer was slow enough to leave most emits dropped. On a
+    /// fast or quietly-scheduled CI worker the writer can drain
+    /// between sends and leave `dropped == 0`, making the test
+    /// flaky. With a rendezvous channel + no sleep, every emit that
+    /// arrives while the writer is busy committing a `SQLite` hit takes the
+    /// drop path — and out of 64 back-to-back tries, at least one
+    /// is going to find the writer busy.
     #[test]
     fn channel_overflow_increments_dropped_counter() {
-        let store = LogStore::new_with_capacity(Arc::new(Db::open_in_memory().expect("db")), 1);
-        // Fill + try to overflow without draining. `with_default`
-        // pulls in the layer; the writer thread is still slow because
-        // each `SQLite` insert takes ~hundreds of µs.
+        let store = LogStore::new_with_capacity(Arc::new(Db::open_in_memory().expect("db")), 0);
         with_log_subscriber(&store, || {
             for i in 0..64 {
                 tracing::info!(target: "test", i, "burst");
             }
         });
-        // Don't wait for drain — we want to inspect the in-flight
-        // dropped counter. Give the writer a moment to land at least
-        // one row but not all 64.
-        std::thread::sleep(std::time::Duration::from_millis(2));
         let sent = store.sent();
         let dropped = store.dropped();
         let written = store.written();
-        // Sanity: every emit was accounted for (sent + dropped == 64,
-        // possibly minus any in-flight write).
+        // Sanity: every emit reached the Layer (either sent or
+        // dropped). 64 emits → sent + dropped should be 64. (The
+        // `sent` counter is bumped before try_send and unwound on
+        // Full/Disconnected, so this invariant holds even mid-burst.)
         assert!(
             sent + dropped >= 1,
             "Layer should have observed all events: sent={sent} dropped={dropped} written={written}",
         );
-        // Capacity 1 + 64 emits guarantees the drop path fires at
-        // least once.
+        // Capacity-0 + 64 rapid emits → every try_send that
+        // doesn't catch the writer mid-recv drops. The writer
+        // committing a single SQLite insert takes long enough that
+        // at least a few of 64 emits will arrive while it's busy.
         assert!(
             dropped > 0,
-            "drop counter should fire under capacity=1 burst, got sent={sent} dropped={dropped} written={written}",
+            "drop counter should fire under capacity=0 burst, got sent={sent} dropped={dropped} written={written}",
         );
         // Drain so the writer thread exits cleanly on test teardown.
         store.wait_drained_for_test();

@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use oxidhome_core::{Engine, PluginInstance};
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -110,16 +111,26 @@ fn resolve_state_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn init_tracing(engine: &Engine) {
-    // Order in the registry: filter first (cheapest rejection),
-    // then fmt for stdout, then the sqlite layer. `try_init`
-    // returns Err if another subscriber is already global — e.g.
-    // an integration test in the same process already called
-    // `set_global_default`. Treat that as "tracing is already wired
-    // up; we're done" rather than aborting the binary.
+    // `EnvFilter` wraps the fmt layer **only**, not the whole
+    // registry. A registry-level filter would gate *both* layers —
+    // the SQLite store would silently miss everything below the
+    // env-configured threshold (default `info`), so `trace!` and
+    // `debug!` would never reach the persistent log even though the
+    // store and schema have first-class slots for them. Phase 5c's
+    // contract is "capture every host tracing event"; operators
+    // tune stdout verbosity via `RUST_LOG` independently of what
+    // we persist. The Phase-12 retention/level config will grow a
+    // separate per-host filter for the SQLite layer when there's a
+    // workload that needs it.
+    //
+    // `try_init` returns Err if another subscriber is already
+    // global — e.g. an integration test in the same process
+    // already called `set_global_default`. Treat that as "tracing
+    // is already wired up; we're done" rather than aborting the
+    // binary.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer())
+        .with(fmt::layer().with_filter(filter))
         .with(engine.log_store().layer())
         .try_init();
 }
