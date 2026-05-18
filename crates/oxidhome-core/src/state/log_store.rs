@@ -326,9 +326,9 @@ impl LogStore {
         self.counters.write_errors.load(Ordering::Relaxed)
     }
 
-    /// Wait until the writer thread has accounted for every event
-    /// the Layer has enqueued so far (committed *or* dropped), with
-    /// a bound on how long we'll spin.
+    /// Wait until the writer thread has processed every event the
+    /// Layer has successfully enqueued so far (committed *or*
+    /// failed-with-Sql-error), with a bound on how long we'll spin.
     ///
     /// Returns `true` if the queue drained inside `budget`, `false`
     /// if the timeout elapsed first. Callers that want the
@@ -337,21 +337,27 @@ impl LogStore {
     /// is the same thing under the hood and exists so tests read
     /// intent-clearly).
     ///
-    /// Concurrency note: this method racks the `sent` counter once
-    /// up front, then waits for `written + dropped` to reach that
-    /// snapshot. Concurrent producers can keep emitting after the
-    /// snapshot — that's fine, those events will land on the *next*
-    /// flush. For program shutdown, ensure no plugin is still
-    /// firing events when you call this (the natural shape after
-    /// `instance.shutdown()`).
+    /// The condition is `written + write_errors >= sent_snapshot`.
+    /// We deliberately **don't** add `dropped` into the comparison
+    /// even though dropped rows are "done" — `dropped` accumulates
+    /// independently of `sent`, so including it would let the
+    /// condition pass trivially after a burst that dropped many
+    /// rows while enqueued ones were still pending in the channel
+    /// (`sent_snapshot = 5`, `dropped = 95` → `0 + 95 >= 5` would
+    /// fire before any of the 5 enqueued rows actually wrote).
+    ///
+    /// Concurrency note: snapshots `sent` once up front. Concurrent
+    /// producers can keep emitting after the snapshot — those events
+    /// land on the *next* flush. For program shutdown, ensure no
+    /// plugin is still firing events when you call this (the natural
+    /// shape after `instance.shutdown()`).
     #[must_use]
     pub fn flush(&self, budget: std::time::Duration) -> bool {
         let target = self.sent();
         let deadline = std::time::Instant::now().checked_add(budget);
         loop {
-            let written = self.written();
-            let dropped = self.dropped();
-            if written + dropped >= target {
+            let processed = self.written() + self.write_errors();
+            if processed >= target {
                 return true;
             }
             if let Some(deadline) = deadline
@@ -920,6 +926,55 @@ mod tests {
         assert!(rows[0].fields.is_empty(), "no extras expected");
     }
 
+    /// Phase 5c-review follow-up: `plugin.load`'s span declares
+    /// `plugin_id = tracing::field::Empty` and records the manifest's
+    /// id once parsed. The Layer's `on_record` handler must pick up
+    /// that deferred value so events fired afterwards attribute to
+    /// the plugin.
+    #[test]
+    fn span_record_attributes_subsequent_events() {
+        let store = store();
+        with_log_subscriber(&store, || {
+            let span = tracing::info_span!(
+                "plugin.load",
+                instance_id = "alpha",
+                plugin_id = tracing::field::Empty,
+            );
+            let _enter = span.enter();
+            // Pre-record event lands without plugin_id — honest about
+            // not knowing yet.
+            tracing::info!(target: "test", "pre-record");
+            span.record("plugin_id", "example.alpha");
+            // Post-record event picks up the field via on_record.
+            tracing::info!(target: "test", "post-record");
+        });
+        store.wait_drained_for_test();
+
+        let rows = store
+            .query(
+                &LogQuery {
+                    instance_id: Some("alpha".into()),
+                    ..LogQuery::default()
+                },
+                16,
+            )
+            .expect("query");
+        let pre = rows
+            .iter()
+            .find(|r| r.message == "pre-record")
+            .expect("pre-record row");
+        let post = rows
+            .iter()
+            .find(|r| r.message == "post-record")
+            .expect("post-record row");
+        assert!(
+            pre.plugin_id.is_none(),
+            "pre-record event should have no plugin_id; got {:?}",
+            pre.plugin_id,
+        );
+        assert_eq!(post.plugin_id.as_deref(), Some("example.alpha"));
+    }
+
     /// A span carrying `instance_id` attributes child events without
     /// each callsite repeating the field. Mirrors how Phase 4B's
     /// `plugin.load` span flows through.
@@ -1119,6 +1174,45 @@ mod tests {
             "flush should drain within 5 s for a single in-memory write",
         );
         assert_eq!(store.written(), 1);
+    }
+
+    /// Regression for the earlier `written + dropped >= sent` formula:
+    /// a burst that dropped many rows while a small number of
+    /// enqueued rows are still pending would have let `flush`
+    /// trivially return `true` because `dropped` already exceeded
+    /// `sent`. The corrected `written + write_errors >= sent` waits
+    /// for the actually-enqueued rows to commit regardless of how
+    /// many were dropped in transit.
+    #[test]
+    fn flush_waits_for_enqueued_rows_after_drops() {
+        let store = LogStore::new_with_capacity(Arc::new(Db::open_in_memory().expect("db")), 1);
+        // Capacity 1 + 32 emits → most drop, a handful (≥1) enqueue.
+        // After the burst returns we expect `sent >= 1`, `dropped` may
+        // be very large, and `written` may still be 0.
+        with_log_subscriber(&store, || {
+            for i in 0..32 {
+                tracing::info!(target: "t", i, "burst");
+            }
+        });
+        // Don't sleep here — go straight to flush. The old condition
+        // (`written + dropped >= sent`) would have returned `true`
+        // immediately because `dropped >> sent`. The new condition
+        // forces us to actually wait for the writer.
+        assert!(
+            store.flush(std::time::Duration::from_secs(5)),
+            "flush should still drain within budget",
+        );
+        // After flush returns true, every successfully-enqueued event
+        // has been processed by the writer.
+        assert!(
+            store.written() + store.write_errors() >= store.sent(),
+            "post-flush invariant: written + write_errors >= sent (\
+             written={}, write_errors={}, sent={}, dropped={})",
+            store.written(),
+            store.write_errors(),
+            store.sent(),
+            store.dropped(),
+        );
     }
 
     /// `trim_older_than(cutoff)` removes rows strictly older than the

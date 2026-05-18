@@ -81,10 +81,20 @@ impl PluginInstance {
     ) -> anyhow::Result<Self> {
         let plugin_dir = plugin_dir.to_path_buf();
         let instance_id = instance_id.into();
+        // `plugin_id = Empty` declares the field up-front so it
+        // appears in the span's metadata; we fill it in below once
+        // the manifest parses. The Phase-5c log layer's `on_record`
+        // handler picks up the deferred value, so events emitted
+        // anywhere inside this span (after the parse) attribute to
+        // the right plugin. Events between span entry and the
+        // parse step — the manifest read itself, the read-error
+        // path — still land with `plugin_id` null, which is the
+        // honest answer: we don't know the plugin id yet.
         let span = info_span!(
             "plugin.load",
             plugin_dir = %plugin_dir.display(),
             instance_id = %instance_id,
+            plugin_id = tracing::field::Empty,
         );
         async move {
             let manifest_path = plugin_dir.join("manifest.toml");
@@ -98,6 +108,11 @@ impl PluginInstance {
                 })?;
             let manifest: PluginManifest = toml::from_str(&manifest_text)
                 .with_context(|| format!("parsing {}", manifest_path.display()))?;
+            // Record the plugin id onto the active span as soon as
+            // it's known. Validation, compatibility-check, and
+            // instantiate-time events below will all attribute to
+            // it via the Layer's `on_record` hook.
+            tracing::Span::current().record("plugin_id", manifest.plugin.id.as_str());
             if let Err(errors) = oxidhome_manifest::validate(&manifest) {
                 return Err(anyhow!(
                     "manifest {} is invalid:\n  - {}",
