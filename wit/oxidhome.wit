@@ -309,6 +309,94 @@ interface storage {
 
 
 // ─────────────────────────────────────────────────────────────────────────
+// Blob store — larger byte payloads (camera snapshots, recordings, oversized
+// config). Filesystem-backed on the host; this WIT is the plugin-facing
+// surface.
+//
+// Capability-gated by the manifest's `blob_quota_mb`: 0 (or absent) means
+// blob-store calls return `permission-denied` at the call site. A positive
+// quota lets calls through; the host enforces total bytes used per
+// instance transactionally with the index.
+//
+// **Phase 5b v1 ships a buffered API**: `write` takes `list<u8>` and
+// `read` returns `list<u8>`. Both ends marshal the bytes through the WIT
+// boundary in one shot. Fine for blobs measured in single-digit MB — the
+// expected workload (per-frame snapshots, short recordings, oversized
+// state). Streaming resource handles (`resource blob-writer` /
+// `resource blob-reader` with `write`/`finish`/`abort` and chunked
+// `read`) are the planned follow-up for plugins that want to stream
+// large recordings without buffering end-to-end. The on-disk format
+// doesn't change between v1 and the streaming variant — the writer
+// already stages to `.tmp/<ulid>` and atomically renames on `finish`.
+// ─────────────────────────────────────────────────────────────────────────
+
+interface blob-store {
+  use types.{error};
+
+  /// Opaque host-side identifier for one stored blob. The host returns
+  /// this from `write`; plugins can keep it for direct `read`s, or use
+  /// the human-readable `name` they chose at write time via
+  /// `read-by-name` / `delete`.
+  type blob-id = string;
+
+  /// Metadata for one stored blob. The byte payload itself is fetched
+  /// via `read` / `read-by-name`; `list` returns these records so a
+  /// plugin can enumerate without pulling every blob's bytes through
+  /// the WIT boundary.
+  record blob-info {
+    name: string,
+    id: blob-id,
+    size-bytes: u64,
+    /// Host's wall-clock at write time (`finish`), unix-ms.
+    created-ms: u64,
+    /// Optional MIME hint from the writer. Informational only — the
+    /// host doesn't validate or use it for anything.
+    mime: option<string>,
+  }
+
+  /// Write a blob in one shot. `name` is the human-readable key the
+  /// plugin chose (e.g. `"snapshot-2026-05-08T10-15-00.jpg"`). Writing
+  /// to an existing name overwrites it atomically (stage to `.tmp` →
+  /// fsync → rename → index commit; readers always see the old blob
+  /// or the new one, never a half-written file). Returns the host-
+  /// minted ULID for the new blob.
+  ///
+  /// Errors: `permission-denied` when the quota would be exceeded
+  /// or `blob_quota_mb` is 0 in the manifest; `internal` for
+  /// filesystem / index failures.
+  write: func(
+    name: string,
+    data: list<u8>,
+    mime: option<string>,
+  ) -> result<blob-id, error>;
+
+  /// Read a blob by its host-minted ULID.
+  ///
+  /// Errors: `not-found` if the id doesn't exist in this instance's
+  /// blob namespace; `internal` for filesystem failures.
+  read: func(id: blob-id) -> result<list<u8>, error>;
+
+  /// Read a blob by the user-chosen name.
+  ///
+  /// Errors: `not-found` if no blob with that name exists for this
+  /// instance.
+  read-by-name: func(name: string) -> result<list<u8>, error>;
+
+  /// Look up metadata without fetching the byte payload.
+  get-info: func(name: string) -> result<blob-info, error>;
+
+  /// Delete a blob by name. Returns `Ok(())` whether the blob existed
+  /// or not — the WIT delete contract makes no distinction.
+  delete: func(name: string) -> result<_, error>;
+
+  /// List blobs whose name starts with `prefix`. Empty prefix
+  /// enumerates every blob in the instance. Named `list-blobs`
+  /// because `list` is a WIT keyword.
+  list-blobs: func(prefix: string) -> result<list<blob-info>, error>;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
 // Logging
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -598,6 +686,7 @@ world plugin {
   import host-events;
   import host-config;
   import storage;
+  import blob-store;
   import logging;
 
   use types.{device-id};

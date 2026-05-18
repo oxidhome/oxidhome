@@ -1,0 +1,23 @@
+manifest_version = 1
+
+[plugin]
+id = "example.snapshot-saver"
+name = "Snapshot Saver"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Periodically saves a blob via host::blobs. Phase 5b integration-test fixture."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/snapshot-saver"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "blob", "snapshot"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/snapshot_saver.wasm"
+singleton = false
+
+[capabilities]
+# Phase 5b's blob store is per-instance and quota-bounded.
+# 4 MiB is plenty for the test fixture; manifests for real
+# camera plugins would go higher.
+blob_quota_mb = 4

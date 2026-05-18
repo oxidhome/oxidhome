@@ -234,6 +234,58 @@ const MIGRATIONS: &[&str] = &[
     "
     CREATE INDEX log_span_ts ON log_event(span_path, ts_unix_ms) WHERE span_path IS NOT NULL;
     ",
+    // 6 — Phase 5b: blob store index + usage tracking.
+    //
+    // Blob *bytes* live on the filesystem (`<state_dir>/blobs/<instance_id>/<id>`);
+    // these tables are the index + quota accounting. `blob` maps the
+    // plugin-chosen `name` to the host-minted ULID + metadata; `blob_usage`
+    // tracks `bytes_used` per instance for the manifest-declared
+    // `blob_quota_mb` cap. Triggers maintain `bytes_used` from
+    // `size_bytes` deltas so the quota check on write is a single
+    // transactional `SELECT bytes_used + new_size > bytes_quota` rather
+    // than a `SUM` over the table. Quota enforcement happens in the
+    // writing transaction in `state::blobs::write` — the triggers only
+    // update accounting; they don't refuse.
+    "
+    CREATE TABLE blob (
+        instance_id  TEXT NOT NULL,
+        name         TEXT NOT NULL,
+        id           TEXT NOT NULL,
+        size_bytes   INTEGER NOT NULL,
+        created_ms   INTEGER NOT NULL,
+        mime         TEXT,
+        PRIMARY KEY (instance_id, name)
+    ) WITHOUT ROWID;
+
+    CREATE INDEX blob_by_id ON blob(id);
+
+    CREATE TABLE blob_usage (
+        instance_id  TEXT PRIMARY KEY,
+        bytes_used   INTEGER NOT NULL DEFAULT 0,
+        bytes_quota  INTEGER NOT NULL
+    ) WITHOUT ROWID;
+
+    CREATE TRIGGER blob_usage_insert AFTER INSERT ON blob
+    BEGIN
+        UPDATE blob_usage
+           SET bytes_used = bytes_used + NEW.size_bytes
+         WHERE instance_id = NEW.instance_id;
+    END;
+
+    CREATE TRIGGER blob_usage_delete AFTER DELETE ON blob
+    BEGIN
+        UPDATE blob_usage
+           SET bytes_used = bytes_used - OLD.size_bytes
+         WHERE instance_id = OLD.instance_id;
+    END;
+
+    CREATE TRIGGER blob_usage_update AFTER UPDATE OF size_bytes ON blob
+    BEGIN
+        UPDATE blob_usage
+           SET bytes_used = bytes_used + NEW.size_bytes - OLD.size_bytes
+         WHERE instance_id = NEW.instance_id;
+    END;
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.
