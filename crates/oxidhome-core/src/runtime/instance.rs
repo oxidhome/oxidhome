@@ -372,13 +372,30 @@ impl PluginInstance {
         // `subscriptions` mutably borrows `self.store.data_mut()`,
         // but `call_on_event` needs `&mut self.store` exclusively.
         let pending = self.collect_pending_events();
+        // Snapshot the identity fields once before the call loop —
+        // building the span per iteration is what matters (each
+        // `on_event` call is its own host span, so plugin log lines
+        // emitted from inside `on_event` attribute under
+        // `plugin.on_event` with both `instance_id` and `plugin_id`).
+        // Reading from `self.store.data()` per iteration is fine —
+        // these strings don't change for the lifetime of the instance.
         let mut delivered = 0;
         for ev in pending {
-            self.bindings
-                .call_on_event(&mut self.store, &ev)
-                .await
-                .map_err(anyhow::Error::from)
-                .context("invoking plugin on-event")?;
+            let data = self.store.data();
+            let span = info_span!(
+                "plugin.on_event",
+                instance_id = %data.instance_id,
+                plugin_id = %data.manifest.plugin.id,
+            );
+            async {
+                self.bindings
+                    .call_on_event(&mut self.store, &ev)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .context("invoking plugin on-event")
+            }
+            .instrument(span)
+            .await?;
             delivered += 1;
         }
         Ok(delivered)

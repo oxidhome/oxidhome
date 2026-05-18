@@ -153,11 +153,24 @@ async fn plugin_logs_survive_host_restart() {
         Some("plugin.init"),
         "ready message should be attributed to the plugin.init span",
     );
+    // The host's `logging::Host::log` impl emits the event with an
+    // explicit `instance_id` field, so the layer's
+    // "event-overrides-span" rule means a non-null `instance_id` on
+    // the row only proves the *event* carried it — it doesn't prove
+    // anything about span-chain attribution. `plugin_id` is the
+    // load-bearing check: nothing in the host's logging impl emits
+    // it, so the only way it can land on the row is via the
+    // `plugin.init` span's recorded field. If that pipe is broken
+    // (e.g. `instance.rs` stops adding `plugin_id` to the span), the
+    // row would land with `plugin_id: None` and this assertion fires.
     assert_eq!(
-        ready.instance_id.as_deref(),
-        Some(instance_id.as_str()),
-        "ready message should carry the instance_id from its span chain",
+        ready.plugin_id.as_deref(),
+        Some("example.simulated-switch"),
+        "ready message should pick up `plugin_id` from the plugin.init span chain",
     );
+    // Belt-and-suspenders: `instance_id` matches the host's emit, but
+    // doesn't *prove* the span-chain pipe works on its own.
+    assert_eq!(ready.instance_id.as_deref(), Some(instance_id.as_str()));
 }
 
 // ── tempdir helper ──────────────────────────────────────────────────

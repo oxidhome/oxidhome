@@ -246,6 +246,12 @@ struct Counters {
     dropped: AtomicU64,
     written: AtomicU64,
     write_errors: AtomicU64,
+    /// `true` iff the most recent `flush()` call hit its budget
+    /// without draining. Used by `LogStore::drop` to avoid a
+    /// second 5-second wait when an explicit shutdown flush has
+    /// already given up — re-waiting won't catch up a writer
+    /// that's stuck.
+    last_flush_timed_out: std::sync::atomic::AtomicBool,
 }
 
 /// Per-host log/trace store.
@@ -412,11 +418,17 @@ impl LogStore {
             // and catches up to any prior `sent` snapshot.
             let processed = self.written() + self.write_errors() + self.dropped();
             if processed >= target {
+                self.counters
+                    .last_flush_timed_out
+                    .store(false, Ordering::Relaxed);
                 return true;
             }
             if let Some(deadline) = deadline
                 && std::time::Instant::now() >= deadline
             {
+                self.counters
+                    .last_flush_timed_out
+                    .store(true, Ordering::Relaxed);
                 return false;
             }
             std::thread::yield_now();
@@ -565,10 +577,30 @@ impl LogStore {
     /// number of rows removed. Used by the future retention
     /// scheduler.
     ///
+    /// Flushes the writer thread first (5 s budget) so any rows in
+    /// the channel with `ts_unix_ms < cutoff_ms` actually commit
+    /// before the `DELETE` runs — otherwise the retention contract
+    /// is violated by writer-side races: a row already in the
+    /// channel keeps its original timestamp, the trim DELETE
+    /// doesn't see it, and the writer inserts it *after* the
+    /// trim, leaving a row older than `cutoff_ms` behind. If the
+    /// flush budget exceeds, a `tracing::warn!` fires and the trim
+    /// proceeds — better to under-trim than to block the retention
+    /// scheduler on a wedged writer.
+    ///
     /// # Errors
     ///
     /// Forwards any SQL error.
     pub fn trim_older_than(&self, cutoff_ms: i64) -> Result<usize, LogStoreError> {
+        if !self.flush(std::time::Duration::from_secs(5)) {
+            // No `tracing::error!` here — would loop into the layer
+            // we're trying to drain. Stderr is the same backstop the
+            // writer-side error path uses.
+            eprintln!(
+                "oxidhome log_store: trim_older_than: flush budget exceeded; \
+                 retention may miss in-flight rows on this pass",
+            );
+        }
         self.db.write(|conn| -> Result<_, LogStoreError> {
             Ok(conn.execute(
                 "DELETE FROM log_event WHERE ts_unix_ms < ?1",
@@ -600,6 +632,19 @@ impl Drop for LogStore {
     /// the engine instead of cleanly shutting down, library
     /// embedders that don't call flush themselves).
     ///
+    /// If the most recent `flush()` call **already timed out**, skip
+    /// the re-flush. The writer is stuck (disk hiccup, sqlite hang,
+    /// etc.); another 5-second wait won't catch it up, and would
+    /// double the worst-case shutdown latency to 10 s. Callers
+    /// observe that case via `flush()` returning `false`; the
+    /// flag is internal so Drop can avoid the duplicate wait
+    /// without an extra API.
+    ///
+    /// If everything's already drained — common: an explicit
+    /// `flush()` succeeded just before drop and no new events were
+    /// emitted — the inner flush loop returns immediately because
+    /// `processed >= sent` holds on entry, so this Drop is cheap.
+    ///
     /// **The writer thread isn't joined**, only flushed. Cloned
     /// `SqliteLayer` handles can outlive the `LogStore` (they live
     /// inside whichever subscriber holds them); the writer keeps
@@ -608,6 +653,9 @@ impl Drop for LogStore {
     /// mid-program shouldn't abort tracing capture, and at process
     /// exit the OS reaps the detached thread regardless.
     fn drop(&mut self) {
+        if self.counters.last_flush_timed_out.load(Ordering::Relaxed) {
+            return;
+        }
         let _ = self.flush(std::time::Duration::from_secs(5));
     }
 }
