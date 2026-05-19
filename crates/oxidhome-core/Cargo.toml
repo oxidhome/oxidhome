@@ -64,6 +64,10 @@ path = "tests/blob_persistence.rs"
 name = "instance_tick"
 path = "tests/instance_tick.rs"
 
+[[test]]
+name = "instance_lifecycle"
+path = "tests/instance_lifecycle.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
@@ -94,7 +98,7 @@ semver.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "registry"] }

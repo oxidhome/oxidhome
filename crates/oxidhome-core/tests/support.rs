@@ -103,6 +103,19 @@ pub fn tempdir(prefix: &str) -> TempDir {
     TempDir { path }
 }
 
+/// Stage a plugin install dir in a fresh tempdir: copy `wasm_src` in
+/// as `wasm_name` and write `manifest` as `manifest.toml`. The
+/// manifest's `runtime.wasm` should be the bare `wasm_name`. Lets a
+/// test vary `[runtime]` knobs (e.g. `tick_interval_ms`) without a
+/// committed fixture per scenario.
+#[must_use]
+pub fn stage_plugin(prefix: &str, wasm_src: &Path, wasm_name: &str, manifest: &str) -> TempDir {
+    let dir = tempdir(prefix);
+    std::fs::copy(wasm_src, dir.path().join(wasm_name)).expect("copy staged wasm");
+    std::fs::write(dir.path().join("manifest.toml"), manifest).expect("write staged manifest");
+    dir
+}
+
 /// Build a wasm32-wasip2 example through [`spawn_clean_cargo`] and
 /// return the path to its `.wasm` artifact. Asserts the build
 /// succeeded.
