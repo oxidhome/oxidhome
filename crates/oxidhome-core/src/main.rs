@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
-use oxidhome_core::{Engine, PluginInstance};
+use oxidhome_core::Engine;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -75,20 +75,25 @@ async fn main() -> anyhow::Result<()> {
         "host starting",
     );
 
-    // Phase 4: the host accepts one plugin at a time and mints the
-    // instance id from the directory name. Phase 6's lifecycle layer
-    // will read multiple plugins from a host config file and mint
-    // per-config-row ids.
+    // Phase 6 lifecycle: hand the plugin to `Engine::start_instance`
+    // and let the supervisor task run the load → init → serve cycle.
+    // The host accepts one plugin at a time and mints the instance id
+    // from the directory name; Phase 12's CLI will read multiple
+    // plugins from a host config file and mint per-config-row ids.
     let instance_id = plugin_dir
         .file_name()
         .map_or_else(|| "plugin".to_owned(), |s| s.to_string_lossy().into_owned());
-    let mut instance = PluginInstance::load(&engine, &plugin_dir, &instance_id)
+    let handle = engine
+        .start_instance(plugin_dir.clone(), &instance_id, None)
         .await
-        .with_context(|| format!("loading plugin from {}", plugin_dir.display()))?;
-    tracing::info!(instance_id = %instance_id, "plugin loaded");
+        .with_context(|| format!("starting plugin from {}", plugin_dir.display()))?;
+    tracing::info!(instance_id = %instance_id, "plugin started");
 
-    instance.init().await?;
-    instance.shutdown().await?;
+    // Demo flow: wait for the instance to come up, then ask it to
+    // shut down cleanly. The daemon model (run until SIGTERM, supervise
+    // multiple instances) lands with Phase 12.
+    handle.wait_for_running().await?;
+    handle.stop().await?;
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s

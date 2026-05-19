@@ -26,6 +26,41 @@ use crate::{MIN_SUPPORTED_SDK_VERSION, OXIDHOME_SDK_VERSION};
 use super::Engine;
 use super::state::PluginState;
 
+/// Read + validate the manifest at `<plugin_dir>/manifest.toml`
+/// without instantiating the wasm component. Used by the Phase-6
+/// registry's pre-flight singleton check; the full load path
+/// re-reads + re-validates inside [`PluginInstance::load`].
+///
+/// # Errors
+///
+/// Returns the underlying I/O / parse error wrapped with the file
+/// path, or an aggregated message listing every validation finding.
+pub async fn read_manifest(plugin_dir: &Path) -> anyhow::Result<PluginManifest> {
+    let manifest_path = plugin_dir.join("manifest.toml");
+    let text = tokio::fs::read_to_string(&manifest_path)
+        .await
+        .with_context(|| {
+            format!(
+                "reading manifest from {} (does the plugin dir contain manifest.toml?)",
+                manifest_path.display(),
+            )
+        })?;
+    let manifest: PluginManifest =
+        toml::from_str(&text).with_context(|| format!("parsing {}", manifest_path.display()))?;
+    if let Err(errors) = oxidhome_manifest::validate(&manifest) {
+        return Err(anyhow!(
+            "manifest {} is invalid:\n  - {}",
+            manifest_path.display(),
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n  - "),
+        ));
+    }
+    Ok(manifest)
+}
+
 /// One loaded `plugin`-world component, ready to drive through its
 /// lifecycle.
 ///

@@ -8,8 +8,9 @@
 // stabilizes only at Phase 12 (external API). Until then, every public
 // fn returning `Result` would need a `# Errors` section that's almost
 // always restating "the operation failed" — defer the doc churn until
-// the API is settled.
-#![allow(clippy::missing_errors_doc)]
+// the API is settled. Same applies to `# Panics` sections for mutex
+// `.expect("poisoned")` lines and similar host-internal assertions.
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 pub mod auth;
 pub mod host_impl;
@@ -18,8 +19,8 @@ pub mod state;
 
 pub use auth::{Actor, ActorKind};
 pub use runtime::{
-    Engine, InitError, InstanceHandle, InstanceState, PluginInstance, SupervisorTuning, supervise,
-    supervise_with_tuning,
+    Engine, InitError, InstanceHandle, InstanceRegistry, InstanceState, PluginInstance,
+    RegistryError, SupervisorTuning, read_manifest, supervise, supervise_with_tuning,
 };
 pub use state::{DeviceMeta, DeviceRegistry, EventBus, EventSubscription};
 

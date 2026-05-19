@@ -11,12 +11,14 @@
 
 mod instance;
 mod lifecycle;
+mod registry;
 mod state;
 
-pub use instance::{InitError, PluginInstance};
+pub use instance::{InitError, PluginInstance, read_manifest};
 pub use lifecycle::{
     InstanceHandle, InstanceState, SupervisorTuning, supervise, supervise_with_tuning,
 };
+pub use registry::{InstanceRegistry, RegistryError};
 pub use state::PluginState;
 
 use std::path::{Path, PathBuf};
@@ -49,6 +51,7 @@ pub struct Engine {
     event_log: Arc<EventLog>,
     log_store: Arc<LogStore>,
     blobs: Arc<BlobStore>,
+    instances: Arc<InstanceRegistry>,
 }
 
 impl Engine {
@@ -106,6 +109,7 @@ impl Engine {
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
             blobs: Arc::new(BlobStore::new(db, blobs_root)),
+            instances: Arc::new(InstanceRegistry::new()),
         })
     }
 
@@ -166,5 +170,98 @@ impl Engine {
     #[must_use]
     pub fn blobs(&self) -> Arc<BlobStore> {
         Arc::clone(&self.blobs)
+    }
+
+    /// Per-engine registry of supervised plugin instances — Phase 6d.
+    /// The handle this returns is the same `Arc` the engine itself
+    /// holds, so host-side callers (tests, the future API layer) can
+    /// look running instances up without going through `start_instance`.
+    #[must_use]
+    pub fn instances(&self) -> Arc<InstanceRegistry> {
+        Arc::clone(&self.instances)
+    }
+
+    /// Start a supervised plugin instance under this engine. Reads
+    /// the manifest at `<plugin_dir>/manifest.toml` first to enforce
+    /// the singleton and duplicate-id checks, then spawns a
+    /// [`supervise`] task and registers its handle. A reaper task
+    /// removes the entry once the supervisor reaches a terminal
+    /// state, so the slot frees up for a fresh start.
+    ///
+    /// # Errors
+    ///
+    /// Forwards a manifest read / parse / validation error, or
+    /// returns a [`RegistryError`] (mapped to `anyhow::Error`) when
+    /// the singleton slot or `instance_id` is taken.
+    pub async fn start_instance(
+        &self,
+        plugin_dir: PathBuf,
+        instance_id: impl Into<String>,
+        overrides: Option<toml::Value>,
+    ) -> anyhow::Result<InstanceHandle> {
+        self.start_instance_with_tuning(
+            plugin_dir,
+            instance_id,
+            overrides,
+            SupervisorTuning::default(),
+        )
+        .await
+    }
+
+    /// Like [`Engine::start_instance`], but with an explicit
+    /// [`SupervisorTuning`] for tests that need a fast backoff or low
+    /// restart cap. The daemon always uses [`Engine::start_instance`].
+    #[doc(hidden)]
+    pub async fn start_instance_with_tuning(
+        &self,
+        plugin_dir: PathBuf,
+        instance_id: impl Into<String>,
+        overrides: Option<toml::Value>,
+        tuning: SupervisorTuning,
+    ) -> anyhow::Result<InstanceHandle> {
+        let instance_id = instance_id.into();
+        // Pre-flight: parse + validate the manifest so we know the
+        // plugin id + singleton flag before spawning. The supervisor's
+        // load path re-reads + re-validates — small redundancy, but it
+        // keeps the supervisor self-contained for the test_host crate.
+        let manifest = read_manifest(&plugin_dir).await?;
+        let plugin_id = manifest.plugin.id.clone();
+        let singleton = manifest.runtime.singleton;
+
+        // Atomic check + spawn + insert: `register` only calls the
+        // factory after the singleton / duplicate-id checks pass, so
+        // a rejected start_instance never spawns a supervisor task.
+        let engine = self.clone();
+        let plugin_dir_for_spawn = plugin_dir;
+        let instance_id_for_spawn = instance_id.clone();
+        let handle =
+            self.instances
+                .register(instance_id.clone(), plugin_id.clone(), singleton, || {
+                    supervise_with_tuning(
+                        engine,
+                        plugin_dir_for_spawn,
+                        instance_id_for_spawn,
+                        overrides,
+                        tuning,
+                    )
+                })?;
+
+        // Reaper: free the slot when the supervisor reaches terminal.
+        let registry = Arc::clone(&self.instances);
+        let reaper_handle = handle.clone();
+        tokio::spawn(async move {
+            let _ = reaper_handle.wait_terminal().await;
+            registry.unregister(&instance_id, &plugin_id);
+        });
+
+        Ok(handle)
+    }
+
+    /// Look up a running instance by id. `None` if no such
+    /// instance is registered (or it already reached a terminal state
+    /// and the reaper removed it).
+    #[must_use]
+    pub fn instance(&self, instance_id: &str) -> Option<InstanceHandle> {
+        self.instances.get(instance_id)
     }
 }

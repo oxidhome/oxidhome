@@ -134,6 +134,7 @@ impl std::fmt::Display for TrapReason {
 }
 
 /// A message the [`InstanceHandle`] sends to the supervisor task.
+#[derive(Debug)]
 enum ControlCommand {
     /// Run the plugin's `execute-command` for a device it owns.
     Execute {
@@ -149,7 +150,7 @@ enum ControlCommand {
 /// `Send + Sync`, so the future registry / API layers can hold it.
 /// Dropping every clone closes the control channel, which the
 /// supervisor treats as a shutdown request.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct InstanceHandle {
     instance_id: Arc<str>,
     control: mpsc::Sender<ControlCommand>,
