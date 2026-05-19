@@ -17,7 +17,7 @@ pub mod runtime;
 pub mod state;
 
 pub use auth::{Actor, ActorKind};
-pub use runtime::{Engine, InstanceHandle, InstanceState, PluginInstance, supervise};
+pub use runtime::{Engine, InitError, InstanceHandle, InstanceState, PluginInstance, supervise};
 pub use state::{DeviceMeta, DeviceRegistry, EventBus, EventSubscription};
 
 /// SDK version this host ships with. Plugins loaded by this build

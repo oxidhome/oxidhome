@@ -13,7 +13,7 @@ mod instance;
 mod lifecycle;
 mod state;
 
-pub use instance::PluginInstance;
+pub use instance::{InitError, PluginInstance};
 pub use lifecycle::{InstanceHandle, InstanceState, supervise};
 pub use state::PluginState;
 
