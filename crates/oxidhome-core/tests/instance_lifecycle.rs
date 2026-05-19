@@ -126,6 +126,34 @@ async fn supervisor_delivers_bus_events() {
     assert_eq!(handle.wait_terminal().await, InstanceState::Stopped);
 }
 
+/// A load failure (here: a missing plugin directory) drives the
+/// supervisor straight to `Failed` — `wait_for_running` surfaces the
+/// error instead of hanging, and `wait_terminal` reports `Failed`.
+/// The trap-during-`execute-command` crash path needs a trapping
+/// plugin and is covered in 6c alongside the restart logic.
+#[tokio::test(flavor = "multi_thread")]
+async fn supervisor_load_failure_lands_in_failed() {
+    let engine = Engine::new().expect("engine");
+    let missing = support::workspace_root()
+        .join("examples")
+        .join("does-not-exist");
+
+    let handle = supervise(engine, missing, "ghost", None);
+
+    let err = handle
+        .wait_for_running()
+        .await
+        .expect_err("a missing plugin dir must fail the load");
+    assert!(err.to_string().contains("failed"), "got: {err}");
+
+    match handle.wait_terminal().await {
+        InstanceState::Failed { error } => {
+            assert!(error.contains("load failed"), "got: {error}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
 /// Run a command through the handle and pull its `count` field.
 async fn read_count(handle: &InstanceHandle, capability: &str, action: &str) -> i64 {
     let result = handle

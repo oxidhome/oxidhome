@@ -117,10 +117,11 @@ impl InstanceHandle {
                     return Err(anyhow!("instance `{}` failed: {error}", self.instance_id));
                 }
                 InstanceState::Stopped => {
-                    return Err(anyhow!(
-                        "instance `{}` stopped before reaching Running",
-                        self.instance_id,
-                    ));
+                    // `watch` keeps only the latest value, so a fast
+                    // Running→Stopped instance lands here too — don't
+                    // claim it never reached Running, only that it's
+                    // terminal now.
+                    return Err(anyhow!("instance `{}` is Stopped", self.instance_id));
                 }
                 InstanceState::Loading | InstanceState::Inited | InstanceState::Stopping => {}
             }
@@ -325,7 +326,11 @@ async fn run_supervisor(
     // Build the tick interval if the manifest declares a cadence. The
     // floor (`MIN_TICK_INTERVAL_MS`) is enforced at manifest validation.
     let mut tick: Option<Interval> = instance.manifest().runtime.tick_interval_ms.map(|ms| {
-        let mut interval = tokio::time::interval(Duration::from_millis(ms));
+        let period = Duration::from_millis(ms);
+        // `interval_at(now + period, ..)` so the *first* tick lands
+        // one cadence after Running, not immediately — `tick_interval_ms`
+        // is the gap between ticks, the first one included.
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         // A slow tick body must not make the loop "catch up" with a
         // burst of back-to-back ticks; delay the schedule instead.
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
