@@ -6,6 +6,7 @@
 //! manifest_version = 1
 //! [plugin] id = "..." version = "..." world = "plugin" sdk_version = "0.1.0"
 //! [runtime] wasm = "..." singleton = false tick_interval_ms = 1000
+//!           restart = "on-trap"
 //!           # Phase 7 amendments: fuel_per_call, memory_max_mb, call_timeout_ms
 //! [capabilities] network = [...] storage_quota_kb = 64 ...
 //!                # Phase 7 amendment: declares_services = [...]
@@ -99,9 +100,14 @@ pub struct RuntimeSection {
     /// `true` ⇒ only one instance of the plugin may run at a time.
     #[serde(default)]
     pub singleton: bool,
-    /// `tick()` cadence in ms. `None` ⇒ no ticks.
+    /// `tick()` cadence in ms. `None` ⇒ no ticks. The host rejects a
+    /// value below [`crate::validate::MIN_TICK_INTERVAL_MS`].
     #[serde(default)]
     pub tick_interval_ms: Option<u64>,
+    /// What the Phase-6 supervisor does when this instance crashes.
+    /// Absent ⇒ [`RestartPolicy::OnTrap`].
+    #[serde(default)]
+    pub restart: RestartPolicy,
 
     // --- Phase 7 amendments (sandbox limits — see 08_services.md §7.8). ---
     // Accepted in 0.1 so plugin authors can adopt the keys, but the
@@ -146,6 +152,36 @@ pub struct CapabilitiesSection {
     /// ⇒ `register-service` returns `permission-denied`.
     #[serde(default)]
     pub declares_services: Vec<String>,
+}
+
+/// What the Phase-6 instance supervisor does after a crash. A "crash"
+/// is the instance's tokio supervisor catching either a Wasmtime trap
+/// or a plugin entry point returning `Err`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Restart on any crash, including a clean `init` failure.
+    Always,
+    /// Restart only on a Wasmtime trap (and, from Phase 7, on a
+    /// fuel/memory exhaustion trap). A plugin `init` that returns
+    /// `Err` is treated as a permanent misconfiguration and is *not*
+    /// retried. This is the default.
+    #[default]
+    OnTrap,
+    /// Never restart — the first crash is terminal.
+    Never,
+}
+
+impl RestartPolicy {
+    /// Stable name as it appears in the manifest TOML (kebab-case).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RestartPolicy::Always => "always",
+            RestartPolicy::OnTrap => "on-trap",
+            RestartPolicy::Never => "never",
+        }
+    }
 }
 
 /// Which plugin world the component was built against. Drives which
@@ -238,6 +274,7 @@ sdk_version = "0.1.0"
 wasm = "simulated-switch.wasm"
 singleton = false
 tick_interval_ms = 1000
+restart = "on-trap"
 fuel_per_call = 50_000_000
 memory_max_mb = 64
 call_timeout_ms = 5_000
@@ -285,6 +322,7 @@ scripts = "none"
             ],
         );
         assert_eq!(m.runtime.tick_interval_ms, Some(1000));
+        assert_eq!(m.runtime.restart, RestartPolicy::OnTrap);
         assert_eq!(m.runtime.fuel_per_call, Some(50_000_000));
         assert_eq!(m.capabilities.storage_quota_kb, 64);
         assert_eq!(m.capabilities.declares_devices, vec!["switch".to_string()]);
@@ -342,5 +380,50 @@ wasm = "x.wasm"
     #[derive(Deserialize)]
     struct TestWorld {
         v: World,
+    }
+
+    #[test]
+    fn restart_policy_defaults_to_on_trap_when_absent() {
+        let m: PluginManifest = toml::from_str(
+            r#"
+manifest_version = 1
+[plugin]
+id = "x"
+name = "x"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "x.wasm"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(m.runtime.restart, RestartPolicy::OnTrap);
+    }
+
+    #[test]
+    fn restart_policy_strings_round_trip() {
+        for (p, s) in [
+            (RestartPolicy::Always, "always"),
+            (RestartPolicy::OnTrap, "on-trap"),
+            (RestartPolicy::Never, "never"),
+        ] {
+            assert_eq!(p.as_str(), s);
+            let parsed: RestartPolicy = toml::from_str(&format!("v = \"{s}\"\n"))
+                .map(|v: TestRestart| v.v)
+                .unwrap();
+            assert_eq!(parsed, p);
+        }
+    }
+
+    #[test]
+    fn unknown_restart_policy_is_rejected() {
+        let err = toml::from_str::<TestRestart>("v = \"reboot\"\n").unwrap_err();
+        assert!(err.to_string().contains("reboot"), "got {err}");
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TestRestart {
+        v: RestartPolicy,
     }
 }

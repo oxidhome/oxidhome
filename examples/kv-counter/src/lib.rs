@@ -2,10 +2,11 @@
 //!
 //! On `init` the plugin reads its `count` key out of the host's KV
 //! store. If the key is absent the counter starts at zero — covers
-//! the "first boot" path. Each `execute_command` for the
-//! `counter::tick` action increments the counter and writes it back
-//! through `host::storage::set`. Restarting the host with the same
-//! `<state_dir>` loads the persisted value.
+//! the "first boot" path. Both the lifecycle `tick()` hook (driven by
+//! the Phase-6 supervisor off `runtime.tick_interval_ms`) and the
+//! `counter::tick` command action increment the counter and write it
+//! back through `host::storage::set`. Restarting the host with the
+//! same `<state_dir>` loads the persisted value.
 //!
 //! The example deliberately does *not* register a device — Phase 3's
 //! device-registration gate is independent of Phase 5a's storage
@@ -53,6 +54,16 @@ impl Plugin for KvCounter {
         Ok(())
     }
 
+    fn tick(&mut self) {
+        // The lifecycle tick is the scheduled counterpart of the
+        // `counter::tick` command. WIT `tick` returns `()`, so a
+        // storage failure can only be logged here, not surfaced.
+        match self.increment() {
+            Ok(count) => oxidhome_sdk::tracing::info!(count, "kv-counter ticked"),
+            Err(e) => oxidhome_sdk::tracing::error!(error = %e, "kv-counter tick failed"),
+        }
+    }
+
     fn shutdown(&mut self) {
         oxidhome_sdk::tracing::info!(count = self.count, "kv-counter stopped");
     }
@@ -65,22 +76,17 @@ impl Plugin for KvCounter {
             )));
         }
         match cmd.action.as_str() {
-            "tick" => {
-                self.count += 1;
-                if let Err(e) = host::storage::set(COUNT_KEY, &Value::IntVal(self.count)) {
-                    // Surface as InvalidArgument since CommandResult
-                    // doesn't carry a richer error variant — the
-                    // string includes the underlying KV error so the
-                    // operator can tell quota / sqlite / etc. apart.
-                    return CommandResult::Err(Error::InvalidArgument(format!(
-                        "writing counter to storage: {e:?}",
-                    )));
-                }
-                CommandResult::OkWithState(vec![KeyValue {
+            "tick" => match self.increment() {
+                Ok(count) => CommandResult::OkWithState(vec![KeyValue {
                     key: "count".into(),
-                    value: Value::IntVal(self.count),
-                }])
-            }
+                    value: Value::IntVal(count),
+                }]),
+                // Surface as InvalidArgument since CommandResult
+                // doesn't carry a richer error variant — the string
+                // includes the underlying KV error so the operator
+                // can tell quota / sqlite / etc. apart.
+                Err(e) => CommandResult::Err(Error::InvalidArgument(e)),
+            },
             "read" => CommandResult::OkWithState(vec![KeyValue {
                 key: "count".into(),
                 value: Value::IntVal(self.count),
@@ -89,6 +95,18 @@ impl Plugin for KvCounter {
                 "unsupported action counter::{other}",
             ))),
         }
+    }
+}
+
+impl KvCounter {
+    /// Bump the in-memory counter and persist it. Shared by the
+    /// lifecycle `tick()` hook and the `counter::tick` command.
+    /// Returns the new count, or a storage-error message.
+    fn increment(&mut self) -> Result<i64, String> {
+        self.count += 1;
+        host::storage::set(COUNT_KEY, &Value::IntVal(self.count))
+            .map_err(|e| format!("writing counter to storage: {e:?}"))?;
+        Ok(self.count)
     }
 }
 

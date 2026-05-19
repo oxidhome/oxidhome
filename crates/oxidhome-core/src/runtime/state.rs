@@ -744,7 +744,9 @@ mod tests {
     /// exercise any of these fields beyond their existence; they
     /// poke individual host calls directly, not through the loader.
     fn fixture_manifest(plugin_id: &str) -> Arc<PluginManifest> {
-        use oxidhome_manifest::{CapabilitiesSection, PluginSection, RuntimeSection, World};
+        use oxidhome_manifest::{
+            CapabilitiesSection, PluginSection, RestartPolicy, RuntimeSection, World,
+        };
         use semver::Version;
         Arc::new(PluginManifest {
             manifest_version: 1,
@@ -764,6 +766,7 @@ mod tests {
                 wasm: std::path::PathBuf::from("plugin.wasm"),
                 singleton: false,
                 tick_interval_ms: None,
+                restart: RestartPolicy::default(),
                 fuel_per_call: None,
                 memory_max_mb: None,
                 call_timeout_ms: None,

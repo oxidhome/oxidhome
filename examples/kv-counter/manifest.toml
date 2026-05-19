@@ -15,6 +15,9 @@ sdk_version = "0.1.0"
 [runtime]
 wasm = "target/wasm32-wasip2/debug/kv_counter.wasm"
 singleton = false
+# The lifecycle `tick()` hook increments the counter; the Phase-6
+# supervisor drives it at this cadence.
+tick_interval_ms = 1000
 
 [capabilities]
 # Phase 5a's KV store is per-instance and quota-bounded. 4 KiB is

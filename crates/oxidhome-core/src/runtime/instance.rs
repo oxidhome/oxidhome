@@ -324,6 +324,32 @@ impl PluginInstance {
         .await
     }
 
+    /// Call the plugin's exported `tick` — the optional periodic poll
+    /// hook. The plugin can't fail this call by contract (WIT `tick`
+    /// returns `()`); a trap bubbles up as an error.
+    ///
+    /// Phase 6's per-instance supervisor drives this off a
+    /// `tokio::time::interval` whose cadence is the manifest's
+    /// `runtime.tick_interval_ms`. Plugins that declare no interval
+    /// are never ticked.
+    pub async fn tick(&mut self) -> anyhow::Result<()> {
+        let data = self.store.data();
+        let span = info_span!(
+            "plugin.tick",
+            instance_id = %data.instance_id,
+            plugin_id = %data.manifest.plugin.id,
+        );
+        async {
+            self.bindings
+                .call_tick(&mut self.store)
+                .await
+                .map_err(anyhow::Error::from)
+                .context("invoking plugin tick")
+        }
+        .instrument(span)
+        .await
+    }
+
     /// Call the plugin's exported `shutdown`. The plugin can't fail this
     /// call by contract; trapping bubbles up as an error.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
@@ -453,6 +479,15 @@ impl PluginInstance {
     #[must_use]
     pub fn instance_id(&self) -> &str {
         &self.store.data().instance_id
+    }
+
+    /// The resolved manifest this instance was loaded from. The
+    /// Phase-6 supervisor reads `runtime.tick_interval_ms` and
+    /// `runtime.restart` off this to decide its tick cadence and
+    /// crash-recovery behaviour.
+    #[must_use]
+    pub fn manifest(&self) -> &PluginManifest {
+        &self.store.data().manifest
     }
 }
 
