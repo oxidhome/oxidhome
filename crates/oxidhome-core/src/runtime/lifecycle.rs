@@ -17,24 +17,62 @@
 //!   `select!` arm on the bus is what makes its events arrive.
 //!
 //! The state machine is `Loading → Inited → Running`, with
-//! `Stopping → Stopped` on a clean shutdown and `Failed` on any crash.
-//! Crash *recovery* (restart policy + backoff) lands in Phase 6c — for
-//! now a crash is terminal.
+//! `Stopping → Stopped` on a clean shutdown. A crash goes
+//! `Running → Crashed`; the manifest's `restart` policy then decides
+//! between `Restarting → Loading` (a fresh `Store`, after an
+//! exponential-backoff wait) and the terminal `Failed`. A `load`
+//! failure is always terminal — there's no manifest to read a policy
+//! from. The consecutive-restart counter is capped at [`MAX_RESTARTS`]
+//! and resets once an instance stays `Running` for [`HEALTHY_RESET`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use oxidhome_manifest::RestartPolicy;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{Interval, MissedTickBehavior};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use crate::Engine;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::events::Event;
 use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
 
-use super::instance::PluginInstance;
+use super::instance::{InitError, PluginInstance};
+
+/// Tunable supervisor timing — restart backoff plus the consecutive-
+/// restart cap and its healthy-reset window. Production code uses
+/// [`SupervisorTuning::default`] (the values in the Phase-6 plan);
+/// tests inject a fast variant through [`supervise_with_tuning`] so a
+/// restart suite runs in milliseconds rather than minutes.
+#[derive(Debug, Clone)]
+pub struct SupervisorTuning {
+    /// Backoff ceiling for the first restart (doubles each attempt).
+    pub backoff_base: Duration,
+    /// Upper bound the doubling backoff saturates against.
+    pub backoff_max: Duration,
+    /// Consecutive restarts attempted before the supervisor gives up
+    /// and goes `Failed`.
+    pub max_restarts: u32,
+    /// How long an instance must stay `Running` before its
+    /// consecutive-restart counter resets to zero — so a plugin that
+    /// crashes rarely keeps being restarted, only a tight crash-loop
+    /// is capped.
+    pub healthy_reset: Duration,
+}
+
+impl Default for SupervisorTuning {
+    fn default() -> Self {
+        Self {
+            backoff_base: Duration::from_secs(1),
+            backoff_max: Duration::from_mins(1),
+            max_restarts: 10,
+            healthy_reset: Duration::from_mins(5),
+        }
+    }
+}
 
 /// Observable lifecycle state of a supervised instance. Published
 /// through the [`InstanceHandle`]'s `watch` channel.
@@ -46,13 +84,19 @@ pub enum InstanceState {
     Inited,
     /// Steady state — serving ticks, commands, and event drains.
     Running,
+    /// The instance just crashed; the supervisor is applying the
+    /// restart policy. `restarts` is the consecutive-restart count
+    /// *so far* (0 on the first crash).
+    Crashed { reason: String, restarts: u32 },
+    /// Crashed and waiting out the backoff delay before restart
+    /// attempt `attempt`.
+    Restarting { attempt: u32 },
     /// A clean `shutdown` is in flight.
     Stopping,
     /// Clean terminal state — `shutdown` completed.
     Stopped,
-    /// Unrecoverable terminal state. Carries the failure message.
-    /// Phase 6c turns the crash paths that land here into restarts
-    /// where the manifest's `restart` policy permits.
+    /// Unrecoverable terminal state — a `load` failure, a crash the
+    /// `restart` policy doesn't cover, or the restart cap hit.
     Failed { error: String },
 }
 
@@ -62,6 +106,30 @@ impl InstanceState {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, InstanceState::Stopped | InstanceState::Failed { .. })
+    }
+}
+
+/// Why a supervised instance crashed. The supervisor's `on-trap`
+/// restart policy keys off this: a [`TrapReason::Trap`] is
+/// restartable, a [`TrapReason::InitFailed`] is not. Phase 7 adds
+/// fuel- / memory-exhaustion variants here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrapReason {
+    /// A Wasmtime trap — guest panic, `unreachable`, an out-of-bounds
+    /// access, or a host-call error surfacing from an entry point
+    /// other than `init`.
+    Trap(String),
+    /// The plugin's `init` export returned `Err` — a clean,
+    /// deterministic startup failure that retrying won't fix.
+    InitFailed(String),
+}
+
+impl std::fmt::Display for TrapReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrapReason::Trap(m) => write!(f, "trap: {m}"),
+            TrapReason::InitFailed(m) => write!(f, "init failed: {m}"),
+        }
     }
 }
 
@@ -123,7 +191,13 @@ impl InstanceHandle {
                     // terminal now.
                     return Err(anyhow!("instance `{}` is Stopped", self.instance_id));
                 }
-                InstanceState::Loading | InstanceState::Inited | InstanceState::Stopping => {}
+                // A crash mid-restart isn't terminal — a later
+                // attempt may still reach Running, so keep waiting.
+                InstanceState::Loading
+                | InstanceState::Inited
+                | InstanceState::Crashed { .. }
+                | InstanceState::Restarting { .. }
+                | InstanceState::Stopping => {}
             }
             if rx.changed().await.is_err() {
                 return Err(anyhow!(
@@ -222,6 +296,27 @@ pub fn supervise(
     instance_id: impl Into<String>,
     overrides: Option<toml::Value>,
 ) -> InstanceHandle {
+    supervise_with_tuning(
+        engine,
+        plugin_dir,
+        instance_id,
+        overrides,
+        SupervisorTuning::default(),
+    )
+}
+
+/// Like [`supervise`], but with an explicit [`SupervisorTuning`].
+/// Intended for tests that need a fast backoff / low restart cap; the
+/// daemon always uses [`supervise`].
+#[doc(hidden)]
+#[must_use]
+pub fn supervise_with_tuning(
+    engine: Engine,
+    plugin_dir: PathBuf,
+    instance_id: impl Into<String>,
+    overrides: Option<toml::Value>,
+    tuning: SupervisorTuning,
+) -> InstanceHandle {
     let instance_id: Arc<str> = Arc::from(instance_id.into());
     let (control_tx, control_rx) = mpsc::channel(16);
     let (state_tx, state_rx) = watch::channel(InstanceState::Loading);
@@ -235,6 +330,7 @@ pub fn supervise(
         plugin_dir,
         instance_id,
         overrides,
+        tuning,
         control_rx,
         state_tx,
     ));
@@ -264,86 +360,319 @@ fn transition(state_tx: &watch::Sender<InstanceState>, instance_id: &str, next: 
     let _ = state_tx.send(next);
 }
 
-/// The supervisor task body — see the module docs.
+/// Exponential-backoff-with-full-jitter delay policy for restarts.
+struct BackoffPolicy {
+    base: Duration,
+    max: Duration,
+}
+
+impl BackoffPolicy {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self { base, max }
+    }
+
+    /// Pre-jitter delay ceiling for restart `attempt` (1-based):
+    /// `min(base * 2^(attempt-1), max)`.
+    fn ceiling(&self, attempt: u32) -> Duration {
+        // Cap the shift so `1 << shift` can't overflow `u32`; any
+        // shift past ~6 already saturates against `max` anyway.
+        let shift = attempt.saturating_sub(1).min(31);
+        self.base.saturating_mul(1u32 << shift).min(self.max)
+    }
+
+    /// Backoff delay for restart `attempt` — the [`Self::ceiling`]
+    /// scaled by a full-jitter factor in `[0.5, 1.0)`, so a fleet of
+    /// instances that crash together don't all restart in lockstep.
+    fn next_delay(&self, attempt: u32) -> Duration {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ceiling = self.ceiling(attempt);
+        // Cheap entropy — avoids a `rand` dependency for jitter.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let frac = 0.5 + 0.5 * (f64::from(nanos) / 1_000_000_000.0);
+        ceiling.mul_f64(frac)
+    }
+}
+
+/// Outcome of the restart decision for one crash.
+#[derive(Debug, PartialEq, Eq)]
+enum RestartDecision {
+    /// Restart the instance after a backoff wait.
+    Restart,
+    /// Stop trying — transition to `Failed`.
+    GiveUp,
+}
+
+/// Decide whether to restart, given the manifest policy, the crash
+/// reason, how many consecutive restarts have happened already, and
+/// the restart cap.
+fn restart_decision(
+    policy: RestartPolicy,
+    reason: &TrapReason,
+    restarts_done: u32,
+    max_restarts: u32,
+) -> RestartDecision {
+    let policy_allows = match policy {
+        RestartPolicy::Never => false,
+        RestartPolicy::Always => true,
+        // `on-trap` restarts real traps but not a clean `init` failure
+        // — retrying a deterministic config error won't fix it.
+        RestartPolicy::OnTrap => matches!(reason, TrapReason::Trap(_)),
+    };
+    if policy_allows && restarts_done < max_restarts {
+        RestartDecision::Restart
+    } else {
+        RestartDecision::GiveUp
+    }
+}
+
+/// Outcome of one full load → init → run-loop attempt.
+enum LifecycleOutcome {
+    /// A clean `shutdown` ran — the supervisor should exit.
+    Stopped,
+    /// `load` itself failed; there's no manifest, so no policy — the
+    /// supervisor must treat this as terminal.
+    LoadFailed(String),
+    /// The instance loaded then crashed. Carries everything the
+    /// restart decision needs.
+    Crashed {
+        policy: RestartPolicy,
+        reason: TrapReason,
+        /// The instance stayed `Running` at least the tuning's
+        /// `healthy_reset` window — long enough to reset the
+        /// consecutive-restart counter.
+        ran_healthy: bool,
+    },
+}
+
+/// Outcome of the steady-state `select!` loop.
+enum ServeOutcome {
+    /// A clean `shutdown` ran.
+    Stopped,
+    /// The instance trapped.
+    Crashed(TrapReason),
+}
+
+/// Outcome of waiting out a restart backoff delay.
+enum BackoffOutcome {
+    /// The delay elapsed — go ahead and restart.
+    Elapsed,
+    /// A shutdown was requested mid-backoff.
+    Shutdown,
+}
+
+/// The supervisor task body: run the instance, and on a crash apply
+/// the manifest's `restart` policy with exponential backoff until a
+/// clean stop, an unrecoverable failure, or the restart cap.
 async fn run_supervisor(
     engine: Engine,
     plugin_dir: PathBuf,
     instance_id: Arc<str>,
     overrides: Option<toml::Value>,
+    tuning: SupervisorTuning,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     state_tx: watch::Sender<InstanceState>,
 ) {
     // Subscribe the wakeup receiver *before* loading so no publish
     // between now and the run loop is missed: the broadcast channel
-    // buffers wakeups until the loop's first `recv`.
+    // buffers wakeups until the loop's first `recv`. Reused across
+    // restarts — a fresh instance re-subscribes its own receivers.
     let mut wakeup = engine.events().subscribe_all().receiver;
+    let backoff = BackoffPolicy::new(tuning.backoff_base, tuning.backoff_max);
+    // Consecutive restarts; reset once an instance runs healthily.
+    let mut restarts: u32 = 0;
+
+    loop {
+        let outcome = run_one_lifecycle(
+            &engine,
+            &plugin_dir,
+            &instance_id,
+            overrides.as_ref(),
+            tuning.healthy_reset,
+            &mut control_rx,
+            &mut wakeup,
+            &state_tx,
+        )
+        .await;
+
+        match outcome {
+            LifecycleOutcome::Stopped => return,
+            LifecycleOutcome::LoadFailed(msg) => {
+                transition(
+                    &state_tx,
+                    &instance_id,
+                    InstanceState::Failed {
+                        error: format!("load failed: {msg}"),
+                    },
+                );
+                return;
+            }
+            LifecycleOutcome::Crashed {
+                policy,
+                reason,
+                ran_healthy,
+            } => {
+                if ran_healthy {
+                    restarts = 0;
+                }
+                if restart_decision(policy, &reason, restarts, tuning.max_restarts)
+                    == RestartDecision::GiveUp
+                {
+                    let error = if restarts >= tuning.max_restarts {
+                        format!(
+                            "gave up after {} consecutive restarts; last crash: {reason}",
+                            tuning.max_restarts,
+                        )
+                    } else {
+                        format!(
+                            "not restarting under `{}` policy: {reason}",
+                            policy.as_str()
+                        )
+                    };
+                    transition(&state_tx, &instance_id, InstanceState::Failed { error });
+                    return;
+                }
+                transition(
+                    &state_tx,
+                    &instance_id,
+                    InstanceState::Crashed {
+                        reason: reason.to_string(),
+                        restarts,
+                    },
+                );
+                restarts += 1;
+                let delay = backoff.next_delay(restarts);
+                transition(
+                    &state_tx,
+                    &instance_id,
+                    InstanceState::Restarting { attempt: restarts },
+                );
+                if let BackoffOutcome::Shutdown =
+                    backoff_wait(delay, &mut control_rx, &instance_id).await
+                {
+                    transition(&state_tx, &instance_id, InstanceState::Stopped);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Run one load → init → serve attempt. State transitions up to
+/// `Running` (and the clean `Stopped`) are emitted here; the
+/// supervisor owns `Crashed` / `Restarting` / `Failed`.
+//
+// The argument list is wide because the supervisor lends this helper
+// every borrow it needs for one attempt; bundling them into a struct
+// purely for the lint would only move the noise.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_lifecycle(
+    engine: &Engine,
+    plugin_dir: &Path,
+    instance_id: &str,
+    overrides: Option<&toml::Value>,
+    healthy_reset: Duration,
+    control_rx: &mut mpsc::Receiver<ControlCommand>,
+    wakeup: &mut broadcast::Receiver<Event>,
+    state_tx: &watch::Sender<InstanceState>,
+) -> LifecycleOutcome {
+    transition(state_tx, instance_id, InstanceState::Loading);
 
     let mut instance = match PluginInstance::load_with_overrides(
-        &engine,
-        &plugin_dir,
+        engine,
+        plugin_dir,
         instance_id.to_string(),
-        overrides.as_ref(),
+        overrides,
     )
     .await
     {
         Ok(instance) => instance,
-        Err(e) => {
-            transition(
-                &state_tx,
-                &instance_id,
-                InstanceState::Failed {
-                    error: format!("load failed: {e:#}"),
-                },
-            );
-            return;
-        }
+        Err(e) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
     };
+    let policy = instance.manifest().runtime.restart;
 
-    if let Err(e) = instance.init().await {
-        transition(
-            &state_tx,
-            &instance_id,
-            InstanceState::Failed {
-                error: format!("init failed: {e:#}"),
-            },
-        );
-        return;
+    match instance.init().await {
+        Ok(()) => {}
+        Err(InitError::Plugin(msg)) => {
+            return LifecycleOutcome::Crashed {
+                policy,
+                reason: TrapReason::InitFailed(msg),
+                ran_healthy: false,
+            };
+        }
+        Err(InitError::Trap(msg)) => {
+            return LifecycleOutcome::Crashed {
+                policy,
+                reason: TrapReason::Trap(msg),
+                ran_healthy: false,
+            };
+        }
     }
-    transition(&state_tx, &instance_id, InstanceState::Inited);
+    transition(state_tx, instance_id, InstanceState::Inited);
 
     // Deliver anything the plugin's subscriptions buffered during init.
     if let Err(e) = instance.drain_events().await {
-        transition(
-            &state_tx,
-            &instance_id,
-            InstanceState::Failed {
-                error: format!("event drain failed: {e:#}"),
-            },
-        );
-        return;
+        return LifecycleOutcome::Crashed {
+            policy,
+            reason: TrapReason::Trap(format!("event drain failed: {e:#}")),
+            ran_healthy: false,
+        };
     }
 
-    // Build the tick interval if the manifest declares a cadence. The
-    // floor (`MIN_TICK_INTERVAL_MS`) is enforced at manifest validation.
-    let mut tick: Option<Interval> = instance.manifest().runtime.tick_interval_ms.map(|ms| {
+    let tick = build_tick_interval(&instance);
+    let running_since = Instant::now();
+    transition(state_tx, instance_id, InstanceState::Running);
+
+    match serve_loop(
+        &mut instance,
+        control_rx,
+        wakeup,
+        state_tx,
+        instance_id,
+        tick,
+    )
+    .await
+    {
+        ServeOutcome::Stopped => LifecycleOutcome::Stopped,
+        ServeOutcome::Crashed(reason) => LifecycleOutcome::Crashed {
+            policy,
+            reason,
+            ran_healthy: running_since.elapsed() >= healthy_reset,
+        },
+    }
+}
+
+/// Build the tick interval if the manifest declares a cadence. The
+/// floor (`MIN_TICK_INTERVAL_MS`) is enforced at manifest validation.
+fn build_tick_interval(instance: &PluginInstance) -> Option<Interval> {
+    instance.manifest().runtime.tick_interval_ms.map(|ms| {
         let period = Duration::from_millis(ms);
-        // `interval_at(now + period, ..)` so the *first* tick lands
-        // one cadence after Running, not immediately — `tick_interval_ms`
+        // `interval_at(now + period, ..)` so the *first* tick lands one
+        // cadence after Running, not immediately — `tick_interval_ms`
         // is the gap between ticks, the first one included.
-        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
         // A slow tick body must not make the loop "catch up" with a
         // burst of back-to-back ticks; delay the schedule instead.
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         interval
-    });
+    })
+}
 
-    transition(&state_tx, &instance_id, InstanceState::Running);
-
+/// The steady-state `select!` loop — see the module docs.
+async fn serve_loop(
+    instance: &mut PluginInstance,
+    control_rx: &mut mpsc::Receiver<ControlCommand>,
+    wakeup: &mut broadcast::Receiver<Event>,
+    state_tx: &watch::Sender<InstanceState>,
+    instance_id: &str,
+    mut tick: Option<Interval>,
+) -> ServeOutcome {
     let mut bus_open = true;
     loop {
         let outcome: anyhow::Result<LoopAction> = tokio::select! {
             ctrl = control_rx.recv() => {
-                handle_control(&mut instance, &state_tx, &instance_id, ctrl).await
+                handle_control(instance, state_tx, instance_id, ctrl).await
             }
             // `if tick.is_some()` gates the `unwrap` — the arm is only
             // polled when an interval exists.
@@ -369,29 +698,45 @@ async fn run_supervisor(
         match outcome {
             Ok(LoopAction::Continue) => {
                 if let Err(e) = instance.drain_events().await {
-                    transition(
-                        &state_tx,
-                        &instance_id,
-                        InstanceState::Failed {
-                            error: format!("event drain failed: {e:#}"),
-                        },
-                    );
-                    return;
+                    return ServeOutcome::Crashed(TrapReason::Trap(format!(
+                        "event drain failed: {e:#}"
+                    )));
                 }
             }
             Ok(LoopAction::Stop) => {
-                transition(&state_tx, &instance_id, InstanceState::Stopped);
-                return;
+                transition(state_tx, instance_id, InstanceState::Stopped);
+                return ServeOutcome::Stopped;
             }
-            Err(e) => {
-                transition(
-                    &state_tx,
-                    &instance_id,
-                    InstanceState::Failed {
-                        error: format!("{e:#}"),
-                    },
-                );
-                return;
+            Err(e) => return ServeOutcome::Crashed(TrapReason::Trap(format!("{e:#}"))),
+        }
+    }
+}
+
+/// Wait out a restart backoff delay. Returns early if a shutdown is
+/// requested mid-backoff; an `execute-command` arriving during the
+/// wait is answered with an error (the instance isn't running).
+async fn backoff_wait(
+    delay: Duration,
+    control_rx: &mut mpsc::Receiver<ControlCommand>,
+    instance_id: &str,
+) -> BackoffOutcome {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            () = &mut sleep => return BackoffOutcome::Elapsed,
+            ctrl = control_rx.recv() => match ctrl {
+                // Every handle dropped, or an explicit shutdown.
+                None => return BackoffOutcome::Shutdown,
+                Some(ControlCommand::Shutdown { reply }) => {
+                    let _ = reply.send(());
+                    return BackoffOutcome::Shutdown;
+                }
+                Some(ControlCommand::Execute { reply, .. }) => {
+                    let _ = reply.send(Err(anyhow!(
+                        "instance `{instance_id}` is restarting after a crash",
+                    )));
+                }
             }
         }
     }
@@ -438,5 +783,107 @@ async fn handle_control(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The restart cap used across the decision-matrix tests.
+    const CAP: u32 = 10;
+
+    #[test]
+    fn default_tuning_matches_the_phase6_plan() {
+        let t = SupervisorTuning::default();
+        assert_eq!(t.backoff_base, Duration::from_secs(1));
+        assert_eq!(t.backoff_max, Duration::from_mins(1));
+        assert_eq!(t.max_restarts, 10);
+        assert_eq!(t.healthy_reset, Duration::from_mins(5));
+    }
+
+    #[test]
+    fn backoff_ceiling_doubles_then_caps_at_max() {
+        let policy = BackoffPolicy::new(Duration::from_secs(1), Duration::from_mins(1));
+        assert_eq!(policy.ceiling(1), Duration::from_secs(1));
+        assert_eq!(policy.ceiling(2), Duration::from_secs(2));
+        assert_eq!(policy.ceiling(4), Duration::from_secs(8));
+        // 1 * 2^6 = 64s, capped to the 60s max.
+        assert_eq!(policy.ceiling(7), Duration::from_mins(1));
+        // A huge attempt must saturate, not overflow the shift.
+        assert_eq!(policy.ceiling(100), Duration::from_mins(1));
+        assert_eq!(policy.ceiling(u32::MAX), Duration::from_mins(1));
+    }
+
+    #[test]
+    fn backoff_next_delay_stays_within_full_jitter_band() {
+        let policy = BackoffPolicy::new(Duration::from_secs(1), Duration::from_mins(1));
+        for attempt in 1..=10 {
+            let ceiling = policy.ceiling(attempt);
+            let delay = policy.next_delay(attempt);
+            // Full jitter: delay ∈ [0.5 * ceiling, ceiling).
+            assert!(delay >= ceiling / 2, "attempt {attempt}: {delay:?} < half");
+            assert!(delay <= ceiling, "attempt {attempt}: {delay:?} > ceiling");
+        }
+    }
+
+    #[test]
+    fn never_policy_always_gives_up() {
+        for reason in [
+            TrapReason::Trap("x".into()),
+            TrapReason::InitFailed("x".into()),
+        ] {
+            assert_eq!(
+                restart_decision(RestartPolicy::Never, &reason, 0, CAP),
+                RestartDecision::GiveUp,
+            );
+        }
+    }
+
+    #[test]
+    fn always_policy_restarts_either_reason_under_the_cap() {
+        for reason in [
+            TrapReason::Trap("x".into()),
+            TrapReason::InitFailed("x".into()),
+        ] {
+            assert_eq!(
+                restart_decision(RestartPolicy::Always, &reason, 0, CAP),
+                RestartDecision::Restart,
+            );
+            assert_eq!(
+                restart_decision(RestartPolicy::Always, &reason, CAP - 1, CAP),
+                RestartDecision::Restart,
+            );
+        }
+    }
+
+    #[test]
+    fn on_trap_policy_restarts_traps_but_not_init_failures() {
+        assert_eq!(
+            restart_decision(RestartPolicy::OnTrap, &TrapReason::Trap("x".into()), 0, CAP),
+            RestartDecision::Restart,
+        );
+        assert_eq!(
+            restart_decision(
+                RestartPolicy::OnTrap,
+                &TrapReason::InitFailed("x".into()),
+                0,
+                CAP,
+            ),
+            RestartDecision::GiveUp,
+        );
+    }
+
+    #[test]
+    fn restart_cap_gives_up_even_for_an_always_policy() {
+        let reason = TrapReason::Trap("x".into());
+        assert_eq!(
+            restart_decision(RestartPolicy::Always, &reason, CAP, CAP),
+            RestartDecision::GiveUp,
+        );
+        assert_eq!(
+            restart_decision(RestartPolicy::Always, &reason, CAP + 1, CAP),
+            RestartDecision::GiveUp,
+        );
     }
 }

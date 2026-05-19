@@ -37,6 +37,24 @@ pub struct PluginInstance {
     store: Store<PluginState>,
 }
 
+/// Why a [`PluginInstance::init`] call failed. The two cases are kept
+/// apart because the Phase-6 supervisor's `on-trap` restart policy
+/// treats them differently: a [`InitError::Trap`] is restartable, a
+/// [`InitError::Plugin`] (a deterministic config / capability failure)
+/// is not.
+#[derive(Debug, thiserror::Error)]
+pub enum InitError {
+    /// The plugin's `init` export returned `Err(message)` — a clean,
+    /// deterministic startup failure (bad config, a host call denied
+    /// by a missing capability, …).
+    #[error("plugin init returned error: {0}")]
+    Plugin(String),
+    /// A Wasmtime trap (or host-call error) while invoking `init` —
+    /// e.g. the guest panicked or hit `unreachable`.
+    #[error("plugin init trapped: {0}")]
+    Trap(String),
+}
+
 impl PluginInstance {
     /// Load a plugin from its install directory.
     ///
@@ -303,9 +321,14 @@ impl PluginInstance {
     }
 
     /// Call the plugin's exported `init`. The plugin returns
-    /// `Result<(), String>` per the WIT — we propagate the error
-    /// message through `anyhow`.
-    pub async fn init(&mut self) -> anyhow::Result<()> {
+    /// `Result<(), String>` per the WIT.
+    ///
+    /// # Errors
+    ///
+    /// [`InitError::Plugin`] when the plugin's `init` returns `Err`;
+    /// [`InitError::Trap`] when the call traps. The split lets the
+    /// Phase-6 supervisor apply its `on-trap` restart policy.
+    pub async fn init(&mut self) -> Result<(), InitError> {
         let data = self.store.data();
         let span = info_span!(
             "plugin.init",
@@ -313,12 +336,11 @@ impl PluginInstance {
             plugin_id = %data.manifest.plugin.id,
         );
         async {
-            self.bindings
-                .call_init(&mut self.store)
-                .await
-                .map_err(anyhow::Error::from)
-                .context("invoking plugin init")?
-                .map_err(|msg| anyhow::anyhow!("plugin init returned error: {msg}"))
+            match self.bindings.call_init(&mut self.store).await {
+                Err(trap) => Err(InitError::Trap(format!("{trap:#}"))),
+                Ok(Err(msg)) => Err(InitError::Plugin(msg)),
+                Ok(Ok(())) => Ok(()),
+            }
         }
         .instrument(span)
         .await
