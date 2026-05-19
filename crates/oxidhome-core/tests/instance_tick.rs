@@ -9,8 +9,6 @@
 #[path = "support.rs"]
 mod support;
 
-use std::path::PathBuf;
-
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::Value;
 use oxidhome_core::{Engine, PluginInstance};
@@ -25,7 +23,7 @@ async fn lifecycle_tick_increments_persistent_counter() {
         .join("examples")
         .join("kv-counter");
 
-    let state_dir = tempdir();
+    let state_dir = support::tempdir("tick-test");
 
     // Round 1 — tick three times through the lifecycle hook.
     {
@@ -78,36 +76,4 @@ async fn lifecycle_tick_increments_persistent_counter() {
     );
 
     instance.shutdown().await.expect("shutdown 2");
-}
-
-// ── tempdir helper (same shape as the other test crates) ───────────
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-fn tempdir() -> TempDir {
-    let base = std::env::temp_dir();
-    let name = format!(
-        "oxidhome-tick-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos()),
-    );
-    let path = base.join(name);
-    std::fs::create_dir_all(&path).expect("mk tempdir");
-    TempDir { path }
 }

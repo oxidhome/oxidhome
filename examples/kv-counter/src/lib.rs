@@ -99,14 +99,19 @@ impl Plugin for KvCounter {
 }
 
 impl KvCounter {
-    /// Bump the in-memory counter and persist it. Shared by the
-    /// lifecycle `tick()` hook and the `counter::tick` command.
-    /// Returns the new count, or a storage-error message.
+    /// Bump the counter and persist it. Shared by the lifecycle
+    /// `tick()` hook and the `counter::tick` command. Persists *before*
+    /// committing the new value to `self.count`, so a storage failure
+    /// leaves the in-memory counter in sync with what's on disk —
+    /// otherwise a transient failure (which `tick()` only logs) would
+    /// desync the two permanently. Returns the new count, or a
+    /// storage-error message.
     fn increment(&mut self) -> Result<i64, String> {
-        self.count += 1;
-        host::storage::set(COUNT_KEY, &Value::IntVal(self.count))
+        let next = self.count + 1;
+        host::storage::set(COUNT_KEY, &Value::IntVal(next))
             .map_err(|e| format!("writing counter to storage: {e:?}"))?;
-        Ok(self.count)
+        self.count = next;
+        Ok(next)
     }
 }
 
