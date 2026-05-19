@@ -10,9 +10,11 @@
 //! Lifecycle, multi-instance, and crash isolation land in Phase 6.
 
 mod instance;
+mod lifecycle;
 mod state;
 
 pub use instance::PluginInstance;
+pub use lifecycle::{InstanceHandle, InstanceState, supervise};
 pub use state::PluginState;
 
 use std::path::{Path, PathBuf};
