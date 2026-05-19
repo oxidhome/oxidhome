@@ -538,14 +538,14 @@ impl BlobStore {
     }
 }
 
-/// Per-`BlobStore` counter seed: `pid ^ construction-time nanos`,
-/// masked to 32 bits so `mint_id`'s `{counter:08x}` format stays
-/// width-stable. Two processes opening the same DB in the same
-/// wall-clock millisecond won't both start at 0 — pid differs, and
-/// even if pid repeated, the construction nanos almost never align.
-/// Migration 7's `UNIQUE` index is the load-bearing collision check;
-/// the seed is just an optimization that drops the collision rate to
-/// effectively zero in practice.
+/// Per-`BlobStore` counter seed: `pid ^ construction-time subsec
+/// nanos`, masked to 32 bits so `mint_id`'s `{counter:08x}` format
+/// stays width-stable. `subsec_nanos()` only varies within a single
+/// second — two processes starting in the same wall-clock second
+/// share that range and only `pid` differentiates them (container
+/// pid recycling shrinks that further). That's fine: migration 7's
+/// `UNIQUE (instance_id, id)` index is the load-bearing collision
+/// check; the seed just keeps the practical collision rate at zero.
 fn id_counter_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let pid = std::process::id();
@@ -581,7 +581,10 @@ fn finalize_write_outcome(
         }) => {
             // Bytes already at `final_path`, but the DB doesn't know
             // about them. Clean the orphan deterministically so we
-            // don't have to wait for a Phase-12 sweep.
+            // don't have to wait for a Phase-12 sweep. The unlink
+            // itself is best-effort — if it fails (permissions, FS
+            // gone), the orphan persists and Phase-12 reclaims it,
+            // same as the pre-fix behaviour.
             let _ = std::fs::remove_file(&orphan);
             Err(BlobError::Sql(source))
         }
