@@ -65,6 +65,44 @@ pub fn spawn_clean_cargo(example_dir: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// A self-deleting temp directory for integration tests. Each
+/// `tests/*.rs` is its own crate, so this lives here instead of being
+/// copy-pasted per test file.
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    /// Absolute path of the directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Create a fresh temp directory under the system temp dir, named
+/// `oxidhome-<prefix>-<pid>-<nanos>` so concurrent test binaries
+/// don't collide. Removed on drop.
+#[must_use]
+pub fn tempdir(prefix: &str) -> TempDir {
+    let name = format!(
+        "oxidhome-{prefix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    let path = std::env::temp_dir().join(name);
+    std::fs::create_dir_all(&path).expect("mk tempdir");
+    TempDir { path }
+}
+
 /// Build a wasm32-wasip2 example through [`spawn_clean_cargo`] and
 /// return the path to its `.wasm` artifact. Asserts the build
 /// succeeded.

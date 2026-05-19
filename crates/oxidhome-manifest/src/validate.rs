@@ -172,6 +172,16 @@ pub enum ValidationError {
         got: String,
         reason: WasmPathProblem,
     },
+
+    /// `runtime.tick_interval_ms` is below [`MIN_TICK_INTERVAL_MS`]. A
+    /// sub-floor cadence (including `0`) is a runaway, not a useful
+    /// schedule — the Phase-6 supervisor would spin a tokio interval
+    /// faster than the plugin can do real work.
+    #[error(
+        "runtime.tick_interval_ms is {got}; the minimum is {min} ms \
+         (a sub-{min}ms tick is a runaway, not a schedule)"
+    )]
+    RuntimeTickIntervalTooSmall { got: u64, min: u64 },
 }
 
 /// Why a `runtime.wasm` path was rejected. Carried in
@@ -216,6 +226,12 @@ pub const MAX_KEYWORDS: usize = 16;
 
 /// Maximum length of a single keyword in characters.
 pub const MAX_KEYWORD_LEN: usize = 50;
+
+/// Smallest accepted `runtime.tick_interval_ms`. The Phase-6
+/// supervisor drives ticks off a `tokio::time::interval`; a cadence
+/// below this floor (or `0`) busy-loops the instance instead of
+/// scheduling useful work.
+pub const MIN_TICK_INTERVAL_MS: u64 = 10;
 
 /// Why a `plugin.keywords` entry was rejected. Encoded as a typed
 /// enum (rather than a `&'static str` message) so the limit in
@@ -272,6 +288,15 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
         errors.push(ValidationError::RuntimeWasmPathEscapes {
             got: m.runtime.wasm.display().to_string(),
             reason,
+        });
+    }
+
+    if let Some(interval) = m.runtime.tick_interval_ms
+        && interval < MIN_TICK_INTERVAL_MS
+    {
+        errors.push(ValidationError::RuntimeTickIntervalTooSmall {
+            got: interval,
+            min: MIN_TICK_INTERVAL_MS,
         });
     }
 
@@ -628,7 +653,9 @@ fn is_known_device_capability(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{CapabilitiesSection, PluginSection, RuntimeSection, World};
+    use crate::manifest::{
+        CapabilitiesSection, PluginSection, RestartPolicy, RuntimeSection, World,
+    };
     use semver::Version;
     use std::collections::BTreeMap;
 
@@ -651,6 +678,7 @@ mod tests {
                 wasm: "x.wasm".into(),
                 singleton: false,
                 tick_interval_ms: None,
+                restart: RestartPolicy::default(),
                 fuel_per_call: None,
                 memory_max_mb: None,
                 call_timeout_ms: None,
@@ -723,6 +751,32 @@ mod tests {
                     ValidationError::UnknownDeclaredDeviceCapability { got } if got == bad
                 )),
                 "expected `{bad}` to be rejected, got {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_tick_interval_at_and_above_floor() {
+        for ok in [MIN_TICK_INTERVAL_MS, MIN_TICK_INTERVAL_MS + 1, 1000] {
+            let mut m = ok_manifest();
+            m.runtime.tick_interval_ms = Some(ok);
+            validate(&m).unwrap_or_else(|e| panic!("{ok} ms should pass, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn flags_tick_interval_below_floor() {
+        for bad in [0, 1, MIN_TICK_INTERVAL_MS - 1] {
+            let mut m = ok_manifest();
+            m.runtime.tick_interval_ms = Some(bad);
+            let errs = validate(&m).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::RuntimeTickIntervalTooSmall { got, min }
+                        if *got == bad && *min == MIN_TICK_INTERVAL_MS
+                )),
+                "expected RuntimeTickIntervalTooSmall for {bad} ms, got {errs:?}",
             );
         }
     }

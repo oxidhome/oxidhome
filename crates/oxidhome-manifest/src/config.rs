@@ -825,7 +825,9 @@ mod tests {
     use semver::Version;
 
     fn manifest_with(fields: BTreeMap<String, ConfigField>) -> PluginManifest {
-        use crate::manifest::{CapabilitiesSection, PluginSection, RuntimeSection, World};
+        use crate::manifest::{
+            CapabilitiesSection, PluginSection, RestartPolicy, RuntimeSection, World,
+        };
         PluginManifest {
             manifest_version: 1,
             plugin: PluginSection {
@@ -844,6 +846,7 @@ mod tests {
                 wasm: "x.wasm".into(),
                 singleton: false,
                 tick_interval_ms: None,
+                restart: RestartPolicy::default(),
                 fuel_per_call: None,
                 memory_max_mb: None,
                 call_timeout_ms: None,
