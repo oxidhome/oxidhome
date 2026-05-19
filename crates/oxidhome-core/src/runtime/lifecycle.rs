@@ -42,15 +42,37 @@ use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
 
 use super::instance::{InitError, PluginInstance};
 
-/// How many consecutive restarts the supervisor will attempt before
-/// giving up and going `Failed`. The counter resets after an instance
-/// stays `Running` for [`HEALTHY_RESET`], so a plugin that crashes
-/// rarely keeps being restarted — only a tight crash-loop is capped.
-const MAX_RESTARTS: u32 = 10;
+/// Tunable supervisor timing — restart backoff plus the consecutive-
+/// restart cap and its healthy-reset window. Production code uses
+/// [`SupervisorTuning::default`] (the values in the Phase-6 plan);
+/// tests inject a fast variant through [`supervise_with_tuning`] so a
+/// restart suite runs in milliseconds rather than minutes.
+#[derive(Debug, Clone)]
+pub struct SupervisorTuning {
+    /// Backoff ceiling for the first restart (doubles each attempt).
+    pub backoff_base: Duration,
+    /// Upper bound the doubling backoff saturates against.
+    pub backoff_max: Duration,
+    /// Consecutive restarts attempted before the supervisor gives up
+    /// and goes `Failed`.
+    pub max_restarts: u32,
+    /// How long an instance must stay `Running` before its
+    /// consecutive-restart counter resets to zero — so a plugin that
+    /// crashes rarely keeps being restarted, only a tight crash-loop
+    /// is capped.
+    pub healthy_reset: Duration,
+}
 
-/// How long an instance must stay `Running` before its consecutive-
-/// restart counter resets to zero.
-const HEALTHY_RESET: Duration = Duration::from_mins(5);
+impl Default for SupervisorTuning {
+    fn default() -> Self {
+        Self {
+            backoff_base: Duration::from_secs(1),
+            backoff_max: Duration::from_mins(1),
+            max_restarts: 10,
+            healthy_reset: Duration::from_mins(5),
+        }
+    }
+}
 
 /// Observable lifecycle state of a supervised instance. Published
 /// through the [`InstanceHandle`]'s `watch` channel.
@@ -274,6 +296,27 @@ pub fn supervise(
     instance_id: impl Into<String>,
     overrides: Option<toml::Value>,
 ) -> InstanceHandle {
+    supervise_with_tuning(
+        engine,
+        plugin_dir,
+        instance_id,
+        overrides,
+        SupervisorTuning::default(),
+    )
+}
+
+/// Like [`supervise`], but with an explicit [`SupervisorTuning`].
+/// Intended for tests that need a fast backoff / low restart cap; the
+/// daemon always uses [`supervise`].
+#[doc(hidden)]
+#[must_use]
+pub fn supervise_with_tuning(
+    engine: Engine,
+    plugin_dir: PathBuf,
+    instance_id: impl Into<String>,
+    overrides: Option<toml::Value>,
+    tuning: SupervisorTuning,
+) -> InstanceHandle {
     let instance_id: Arc<str> = Arc::from(instance_id.into());
     let (control_tx, control_rx) = mpsc::channel(16);
     let (state_tx, state_rx) = watch::channel(InstanceState::Loading);
@@ -287,6 +330,7 @@ pub fn supervise(
         plugin_dir,
         instance_id,
         overrides,
+        tuning,
         control_rx,
         state_tx,
     ));
@@ -317,19 +361,14 @@ fn transition(state_tx: &watch::Sender<InstanceState>, instance_id: &str, next: 
 }
 
 /// Exponential-backoff-with-full-jitter delay policy for restarts.
-/// Held as fixed host constants rather than manifest knobs — see the
-/// Phase-6 plan; revisit if a real plugin needs per-plugin tuning.
 struct BackoffPolicy {
     base: Duration,
     max: Duration,
 }
 
 impl BackoffPolicy {
-    fn new() -> Self {
-        Self {
-            base: Duration::from_secs(1),
-            max: Duration::from_mins(1),
-        }
+    fn new(base: Duration, max: Duration) -> Self {
+        Self { base, max }
     }
 
     /// Pre-jitter delay ceiling for restart `attempt` (1-based):
@@ -366,11 +405,13 @@ enum RestartDecision {
 }
 
 /// Decide whether to restart, given the manifest policy, the crash
-/// reason, and how many consecutive restarts have happened already.
+/// reason, how many consecutive restarts have happened already, and
+/// the restart cap.
 fn restart_decision(
     policy: RestartPolicy,
     reason: &TrapReason,
     restarts_done: u32,
+    max_restarts: u32,
 ) -> RestartDecision {
     let policy_allows = match policy {
         RestartPolicy::Never => false,
@@ -379,7 +420,7 @@ fn restart_decision(
         // — retrying a deterministic config error won't fix it.
         RestartPolicy::OnTrap => matches!(reason, TrapReason::Trap(_)),
     };
-    if policy_allows && restarts_done < MAX_RESTARTS {
+    if policy_allows && restarts_done < max_restarts {
         RestartDecision::Restart
     } else {
         RestartDecision::GiveUp
@@ -398,8 +439,9 @@ enum LifecycleOutcome {
     Crashed {
         policy: RestartPolicy,
         reason: TrapReason,
-        /// The instance stayed `Running` at least [`HEALTHY_RESET`]
-        /// — long enough to reset the consecutive-restart counter.
+        /// The instance stayed `Running` at least the tuning's
+        /// `healthy_reset` window — long enough to reset the
+        /// consecutive-restart counter.
         ran_healthy: bool,
     },
 }
@@ -428,6 +470,7 @@ async fn run_supervisor(
     plugin_dir: PathBuf,
     instance_id: Arc<str>,
     overrides: Option<toml::Value>,
+    tuning: SupervisorTuning,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     state_tx: watch::Sender<InstanceState>,
 ) {
@@ -436,7 +479,7 @@ async fn run_supervisor(
     // buffers wakeups until the loop's first `recv`. Reused across
     // restarts — a fresh instance re-subscribes its own receivers.
     let mut wakeup = engine.events().subscribe_all().receiver;
-    let backoff = BackoffPolicy::new();
+    let backoff = BackoffPolicy::new(tuning.backoff_base, tuning.backoff_max);
     // Consecutive restarts; reset once an instance runs healthily.
     let mut restarts: u32 = 0;
 
@@ -446,6 +489,7 @@ async fn run_supervisor(
             &plugin_dir,
             &instance_id,
             overrides.as_ref(),
+            tuning.healthy_reset,
             &mut control_rx,
             &mut wakeup,
             &state_tx,
@@ -472,10 +516,13 @@ async fn run_supervisor(
                 if ran_healthy {
                     restarts = 0;
                 }
-                if restart_decision(policy, &reason, restarts) == RestartDecision::GiveUp {
-                    let error = if restarts >= MAX_RESTARTS {
+                if restart_decision(policy, &reason, restarts, tuning.max_restarts)
+                    == RestartDecision::GiveUp
+                {
+                    let error = if restarts >= tuning.max_restarts {
                         format!(
-                            "gave up after {MAX_RESTARTS} consecutive restarts; last crash: {reason}",
+                            "gave up after {} consecutive restarts; last crash: {reason}",
+                            tuning.max_restarts,
                         )
                     } else {
                         format!(
@@ -515,11 +562,17 @@ async fn run_supervisor(
 /// Run one load → init → serve attempt. State transitions up to
 /// `Running` (and the clean `Stopped`) are emitted here; the
 /// supervisor owns `Crashed` / `Restarting` / `Failed`.
+//
+// The argument list is wide because the supervisor lends this helper
+// every borrow it needs for one attempt; bundling them into a struct
+// purely for the lint would only move the noise.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_lifecycle(
     engine: &Engine,
     plugin_dir: &Path,
     instance_id: &str,
     overrides: Option<&toml::Value>,
+    healthy_reset: Duration,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     wakeup: &mut broadcast::Receiver<Event>,
     state_tx: &watch::Sender<InstanceState>,
@@ -585,7 +638,7 @@ async fn run_one_lifecycle(
         ServeOutcome::Crashed(reason) => LifecycleOutcome::Crashed {
             policy,
             reason,
-            ran_healthy: running_since.elapsed() >= HEALTHY_RESET,
+            ran_healthy: running_since.elapsed() >= healthy_reset,
         },
     }
 }
@@ -737,9 +790,21 @@ async fn handle_control(
 mod tests {
     use super::*;
 
+    /// The restart cap used across the decision-matrix tests.
+    const CAP: u32 = 10;
+
+    #[test]
+    fn default_tuning_matches_the_phase6_plan() {
+        let t = SupervisorTuning::default();
+        assert_eq!(t.backoff_base, Duration::from_secs(1));
+        assert_eq!(t.backoff_max, Duration::from_mins(1));
+        assert_eq!(t.max_restarts, 10);
+        assert_eq!(t.healthy_reset, Duration::from_mins(5));
+    }
+
     #[test]
     fn backoff_ceiling_doubles_then_caps_at_max() {
-        let policy = BackoffPolicy::new();
+        let policy = BackoffPolicy::new(Duration::from_secs(1), Duration::from_mins(1));
         assert_eq!(policy.ceiling(1), Duration::from_secs(1));
         assert_eq!(policy.ceiling(2), Duration::from_secs(2));
         assert_eq!(policy.ceiling(4), Duration::from_secs(8));
@@ -752,7 +817,7 @@ mod tests {
 
     #[test]
     fn backoff_next_delay_stays_within_full_jitter_band() {
-        let policy = BackoffPolicy::new();
+        let policy = BackoffPolicy::new(Duration::from_secs(1), Duration::from_mins(1));
         for attempt in 1..=10 {
             let ceiling = policy.ceiling(attempt);
             let delay = policy.next_delay(attempt);
@@ -769,7 +834,7 @@ mod tests {
             TrapReason::InitFailed("x".into()),
         ] {
             assert_eq!(
-                restart_decision(RestartPolicy::Never, &reason, 0),
+                restart_decision(RestartPolicy::Never, &reason, 0, CAP),
                 RestartDecision::GiveUp,
             );
         }
@@ -782,11 +847,11 @@ mod tests {
             TrapReason::InitFailed("x".into()),
         ] {
             assert_eq!(
-                restart_decision(RestartPolicy::Always, &reason, 0),
+                restart_decision(RestartPolicy::Always, &reason, 0, CAP),
                 RestartDecision::Restart,
             );
             assert_eq!(
-                restart_decision(RestartPolicy::Always, &reason, MAX_RESTARTS - 1),
+                restart_decision(RestartPolicy::Always, &reason, CAP - 1, CAP),
                 RestartDecision::Restart,
             );
         }
@@ -795,7 +860,7 @@ mod tests {
     #[test]
     fn on_trap_policy_restarts_traps_but_not_init_failures() {
         assert_eq!(
-            restart_decision(RestartPolicy::OnTrap, &TrapReason::Trap("x".into()), 0),
+            restart_decision(RestartPolicy::OnTrap, &TrapReason::Trap("x".into()), 0, CAP),
             RestartDecision::Restart,
         );
         assert_eq!(
@@ -803,6 +868,7 @@ mod tests {
                 RestartPolicy::OnTrap,
                 &TrapReason::InitFailed("x".into()),
                 0,
+                CAP,
             ),
             RestartDecision::GiveUp,
         );
@@ -812,11 +878,11 @@ mod tests {
     fn restart_cap_gives_up_even_for_an_always_policy() {
         let reason = TrapReason::Trap("x".into());
         assert_eq!(
-            restart_decision(RestartPolicy::Always, &reason, MAX_RESTARTS),
+            restart_decision(RestartPolicy::Always, &reason, CAP, CAP),
             RestartDecision::GiveUp,
         );
         assert_eq!(
-            restart_decision(RestartPolicy::Always, &reason, MAX_RESTARTS + 1),
+            restart_decision(RestartPolicy::Always, &reason, CAP + 1, CAP),
             RestartDecision::GiveUp,
         );
     }

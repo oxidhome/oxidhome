@@ -2,15 +2,35 @@
 //!
 //! Drives the `crasher` example (panics in `tick`, or fails `init`)
 //! through the supervisor's restart machinery: `never` is terminal on
-//! the first crash, `on-trap` restarts a real trap with backoff, and
-//! `on-trap` treats a clean `init` failure as terminal.
+//! the first crash, `on-trap` restarts a real trap with backoff until
+//! the cap, and `on-trap` treats a clean `init` failure as terminal.
+//!
+//! Each test injects a fast [`SupervisorTuning`] so the restart suite
+//! runs in milliseconds — the production constants would make a cap
+//! test take minutes of cumulative backoff.
 
 #[path = "support.rs"]
 mod support;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use oxidhome_core::{Engine, InstanceHandle, InstanceState, supervise};
+use oxidhome_core::{Engine, InstanceState, SupervisorTuning, supervise_with_tuning};
+
+/// Fast backoff + a low restart cap so a full crash-loop completes
+/// near-instantly.
+fn fast_tuning() -> SupervisorTuning {
+    SupervisorTuning {
+        backoff_base: Duration::from_millis(10),
+        backoff_max: Duration::from_millis(40),
+        // Low cap: each restart reloads + recompiles the component,
+        // which is the slow part under coverage instrumentation. Two
+        // restarts still exercises the loop and the cap.
+        max_restarts: 2,
+        // Large enough that an always-crashing fixture never looks
+        // "healthy" and resets the counter.
+        healthy_reset: Duration::from_mins(1),
+    }
+}
 
 /// crasher manifest staged with a chosen `restart` policy and a fast
 /// tick so the trap fires quickly.
@@ -44,7 +64,13 @@ async fn never_policy_fails_after_one_crash() {
     );
     let engine = Engine::new().expect("engine");
 
-    let handle = supervise(engine, plugin.path().to_path_buf(), "crasher", None);
+    let handle = supervise_with_tuning(
+        engine,
+        plugin.path().to_path_buf(),
+        "crasher",
+        None,
+        fast_tuning(),
+    );
 
     match handle.wait_terminal().await {
         InstanceState::Failed { error } => {
@@ -59,10 +85,10 @@ async fn never_policy_fails_after_one_crash() {
 }
 
 /// Under `restart = "on-trap"`, a tick trap is restarted with backoff.
-/// The crasher traps every run, so the supervisor keeps restarting —
-/// observe it reach a second restart attempt, then stop it cleanly.
+/// The crasher traps every run, so the supervisor restarts until the
+/// `max_restarts` cap, then goes `Failed` naming the cap.
 #[tokio::test(flavor = "multi_thread")]
-async fn on_trap_restarts_a_tick_trap() {
+async fn on_trap_restarts_a_tick_trap_until_the_cap() {
     let wasm = support::build_example("crasher", "crasher.wasm");
     let plugin = support::stage_plugin(
         "crash-ontrap",
@@ -71,17 +97,21 @@ async fn on_trap_restarts_a_tick_trap() {
         &crasher_manifest("on-trap"),
     );
     let engine = Engine::new().expect("engine");
+    let tuning = fast_tuning();
+    let cap = tuning.max_restarts;
 
-    let handle = supervise(engine, plugin.path().to_path_buf(), "crasher", None);
+    let handle =
+        supervise_with_tuning(engine, plugin.path().to_path_buf(), "crasher", None, tuning);
 
-    let attempts = wait_for_restart_attempt(&handle, 2).await;
-    assert!(
-        attempts >= 2,
-        "expected >=2 restart attempts, saw {attempts}"
-    );
-
-    handle.stop().await.expect("stop");
-    assert_eq!(handle.wait_terminal().await, InstanceState::Stopped);
+    match handle.wait_terminal().await {
+        InstanceState::Failed { error } => {
+            assert!(
+                error.contains(&format!("gave up after {cap}")),
+                "expected the cap ({cap}) named: {error}",
+            );
+        }
+        other => panic!("expected Failed after the restart cap, got {other:?}"),
+    }
 }
 
 /// Under `restart = "on-trap"`, a clean `init` failure is *not* a trap
@@ -95,7 +125,13 @@ async fn on_trap_init_failure_is_terminal() {
 
     let overrides: toml::Value =
         toml::from_str("crash_on = \"init\"\n").expect("override blob parses");
-    let handle = supervise(engine, crasher_dir, "crasher", Some(overrides));
+    let handle = supervise_with_tuning(
+        engine,
+        crasher_dir,
+        "crasher",
+        Some(overrides),
+        fast_tuning(),
+    );
 
     match handle.wait_terminal().await {
         InstanceState::Failed { error } => {
@@ -105,29 +141,9 @@ async fn on_trap_init_failure_is_terminal() {
             );
             assert!(
                 error.contains("init failed"),
-                "expected an init-failure reason: {error}"
+                "expected an init-failure reason: {error}",
             );
         }
         other => panic!("expected Failed, got {other:?}"),
-    }
-}
-
-/// Poll the handle until it reports a restart attempt `>= want` (or a
-/// terminal state, or a 20s deadline). Returns the highest attempt
-/// count observed across `Restarting` / `Crashed` states.
-async fn wait_for_restart_attempt(handle: &InstanceHandle, want: u32) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut max_seen = 0;
-    loop {
-        match handle.state() {
-            InstanceState::Restarting { attempt } => max_seen = max_seen.max(attempt),
-            InstanceState::Crashed { restarts, .. } => max_seen = max_seen.max(restarts),
-            state if state.is_terminal() => return max_seen,
-            _ => {}
-        }
-        if max_seen >= want || Instant::now() >= deadline {
-            return max_seen;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }

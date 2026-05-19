@@ -14,7 +14,9 @@ mod lifecycle;
 mod state;
 
 pub use instance::{InitError, PluginInstance};
-pub use lifecycle::{InstanceHandle, InstanceState, supervise};
+pub use lifecycle::{
+    InstanceHandle, InstanceState, SupervisorTuning, supervise, supervise_with_tuning,
+};
 pub use state::PluginState;
 
 use std::path::{Path, PathBuf};
