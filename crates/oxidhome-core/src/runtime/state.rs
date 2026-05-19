@@ -577,13 +577,15 @@ fn require_blobs_enabled(state: &PluginState) -> Result<(), WitError> {
     Ok(())
 }
 
-/// Map [`crate::state::BlobError`] to a WIT [`WitError`]. Quota and
-/// "store unavailable" surface as `permission-denied`; missing
-/// blobs as `not-found`; everything else as `internal`.
+/// Map [`crate::state::BlobError`] to a WIT [`WitError`]. Quota
+/// surfaces as `permission-denied`; missing blobs as `not-found`;
+/// "store unavailable" (no state dir) as `unavailable` — it isn't a
+/// permission problem, the store is just not configured for the
+/// engine. Everything else lands as `internal`.
 fn blob_error_to_wit(err: crate::state::BlobError) -> WitError {
     use crate::state::BlobError;
     match err {
-        BlobError::Unavailable => WitError::PermissionDenied(
+        BlobError::Unavailable => WitError::Unavailable(
             "blob store unavailable: engine has no state directory configured".into(),
         ),
         BlobError::UnregisteredInstance { ref instance_id } => WitError::Internal(format!(
@@ -600,6 +602,13 @@ fn blob_error_to_wit(err: crate::state::BlobError) -> WitError {
             path.display()
         )),
         BlobError::Sql(e) => WitError::Internal(format!("blob_store: sqlite error: {e}")),
+        // Should never escape `state::blobs::write` — the matcher
+        // downconverts to `BlobError::Sql` after cleaning the orphan
+        // file. Treat any leakage as a host bug.
+        BlobError::CommitFailedAfterRename { final_path, source } => WitError::Internal(format!(
+            "blob_store: commit-after-rename leaked to WIT layer at {}: {source}",
+            final_path.display(),
+        )),
     }
 }
 

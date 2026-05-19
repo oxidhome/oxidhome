@@ -92,6 +92,27 @@ pub enum BlobError {
     /// ``SQLite`` returned an error during the operation.
     #[error("sqlite error: {0}")]
     Sql(#[from] rusqlite::Error),
+
+    /// `tx.commit()` failed *after* the in-transaction `rename`
+    /// already moved bytes into place. Internal-only variant so the
+    /// outer `write` matcher can remove `final_path` deterministically
+    /// instead of leaving an FS orphan for the Phase-12 sweep to
+    /// catch. Never surfaces outside `write` — the matcher
+    /// downconverts it to `BlobError::Sql(source)` before returning
+    /// to the caller.
+    #[error("blob commit failed after rename at {final_path}: {source}")]
+    CommitFailedAfterRename {
+        final_path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+}
+
+/// Outcome from a successful `write` transaction. Carries the path
+/// to the *previous* file when an overwrite ran, so the outer
+/// matcher can `remove_file` it post-commit.
+struct WriteOutcome {
+    old_file: Option<PathBuf>,
 }
 
 /// Decoded metadata for one stored blob — mirrors the WIT
@@ -121,10 +142,17 @@ pub struct BlobStore {
 impl BlobStore {
     #[must_use]
     pub fn new(db: Arc<Db>, blobs_root: Option<PathBuf>) -> Self {
+        // Seed the counter from pid + the construction-instant nanos
+        // so two processes opening the same DB in the same wall-clock
+        // millisecond don't both start at 0 and collide on `mint_id`.
+        // The new `(instance_id, id)` UNIQUE constraint (migration 7)
+        // catches any residual collision loudly inside the writing
+        // transaction, but seeding makes the collision rate vanish
+        // in practice.
         Self {
             db,
             blobs_root,
-            id_counter: AtomicU64::new(0),
+            id_counter: AtomicU64::new(id_counter_seed()),
         }
     }
 
@@ -203,11 +231,19 @@ impl BlobStore {
         let tmp_path = tmp_dir.join(&id);
         let final_path = instance_dir.join(&id);
 
-        // 1. Make directories.
+        // 1. Make directories. Track whether `instance_dir` is new so
+        // we can fsync `blobs_root` and make the new dir entry durable
+        // — without that, a crash during the first write to a fresh
+        // instance can lose the instance dir itself (and the file
+        // inside it) even after the SQLite commit is durable.
+        let instance_dir_is_new = !instance_dir.exists();
         std::fs::create_dir_all(&tmp_dir).map_err(|source| BlobError::Io {
             path: tmp_dir.clone(),
             source,
         })?;
+        if instance_dir_is_new {
+            fsync_dir(blobs_root)?;
+        }
 
         // 2. Stage write + fsync.
         write_and_fsync(&tmp_path, data)?;
@@ -220,17 +256,23 @@ impl BlobStore {
         let id_owned = id.clone();
         let final_path_clone = final_path.clone();
         let tmp_path_clone = tmp_path.clone();
+        let instance_dir_clone = instance_dir.clone();
         let blobs_root_owned = blobs_root.to_path_buf();
 
-        // 3-5. Transaction: quota check + UPSERT + rename. The
-        // rename happens *inside* the transaction so a commit
-        // failure leaves the file in place without a row pointing
-        // at it (Phase-12 sweep recoverable) rather than a row
-        // pointing at a missing file (read error visible to
+        // 3-5. Transaction: quota check + UPSERT + rename + dir
+        // fsync. The rename happens *inside* the transaction so a
+        // commit failure leaves the file in place without a row
+        // pointing at it (Phase-12 sweep recoverable) rather than a
+        // row pointing at a missing file (read error visible to
         // plugins).
+        //
+        // Closure returns `Outcome` so the outer error handler can
+        // tell whether the rename ran — that determines which path
+        // (tmp or final) needs to be cleaned up on a failure between
+        // rename and commit.
         let outcome = self
             .db
-            .write(move |conn| -> Result<Option<PathBuf>, BlobError> {
+            .write(move |conn| -> Result<WriteOutcome, BlobError> {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
@@ -272,7 +314,10 @@ impl BlobStore {
                 // INSERT-OR-REPLACE via DELETE+INSERT so the triggers
                 // fire on both legs and `bytes_used` stays correct
                 // (the UPDATE trigger only handles `size_bytes`
-                // changes, not `id` / `name` changes).
+                // changes, not `id` / `name` changes). Migration 7's
+                // UNIQUE `(instance_id, id)` index makes a residual
+                // id collision fail the transaction loudly here
+                // rather than silently overwriting the FS file.
                 tx.execute(
                     "DELETE FROM blob WHERE instance_id = ?1 AND name = ?2",
                     params![instance_id_owned, name_owned],
@@ -290,40 +335,41 @@ impl BlobStore {
                     ],
                 )?;
 
-                // Rename inside the tx so failure here aborts the
-                // commit (and we clean tmp below).
+                // Rename + fsync the *parent directory*. Without the
+                // directory fsync the rename can be undone after a
+                // crash while the SQLite WAL commit is durable —
+                // exactly the "DB row pointing at a missing file"
+                // shape the module doc said we avoid. From this point
+                // on the file lives at `final_path` durably; track
+                // that so the outer error handler cleans the right
+                // path if `tx.commit()` fails below.
                 std::fs::rename(&tmp_path_clone, &final_path_clone).map_err(|source| {
                     BlobError::Io {
                         path: final_path_clone.clone(),
                         source,
                     }
                 })?;
+                fsync_dir(&instance_dir_clone)?;
 
-                tx.commit()?;
-                // Old file path to clean up after the tx — only
-                // returned if we actually overwrote. The old file
-                // lives in the same instance dir.
-                Ok(old.map(|(old_id, _)| blobs_root_owned.join(&instance_id_owned).join(old_id)))
+                if let Err(e) = tx.commit() {
+                    // Commit failure after a successful rename leaves
+                    // bytes at `final_path` with no DB row. Surface
+                    // that path so the outer match can clean it.
+                    return Err(BlobError::CommitFailedAfterRename {
+                        final_path: final_path_clone.clone(),
+                        source: e,
+                    });
+                }
+                Ok(WriteOutcome {
+                    old_file: old
+                        .map(|(old_id, _)| blobs_root_owned.join(&instance_id_owned).join(old_id)),
+                })
             });
 
-        match outcome {
-            Ok(None) => Ok(id),
-            Ok(Some(old_path)) => {
-                // Best-effort cleanup; ignore failure (operator-
-                // visible if `usage` reports drift, which it won't
-                // — the trigger already accounted for the delete).
-                let _ = std::fs::remove_file(&old_path);
-                Ok(id)
-            }
-            Err(e) => {
-                // Roll back the staged file so we don't leak it.
-                let _ = std::fs::remove_file(&tmp_path);
-                Err(e)
-            }
-        }
+        finalize_write_outcome(outcome, id, &tmp_path)
     }
 
-    /// Read bytes by ULID.
+    /// Read bytes by id.
     ///
     /// # Errors
     ///
@@ -437,10 +483,15 @@ impl BlobStore {
             Ok(id)
         })?;
         if let Some(id) = id {
-            let path = blobs_root.join(instance_id).join(&id);
+            let instance_dir = blobs_root.join(instance_id);
+            let path = instance_dir.join(&id);
             // Best-effort: row already gone, FS orphan would be
-            // cleaned by Phase-12 sweep.
+            // cleaned by Phase-12 sweep. `fsync_dir` after the
+            // unlink so the directory entry's removal is durable —
+            // without it a crash could resurrect the file at the
+            // path the DB no longer references.
             let _ = std::fs::remove_file(&path);
+            let _ = fsync_dir(&instance_dir);
         }
         Ok(())
     }
@@ -466,11 +517,12 @@ impl BlobStore {
         })
     }
 
-    /// Mint a new blob ID. Format: `<unix_ms_13hex>-<counter_8hex>-<nanos_8hex>`.
-    /// Not a "real" ULID (no Crockford base32, no crypto RNG) but
-    /// provides every property the store actually needs: unique
-    /// within and across processes (timestamp+counter+nanos
-    /// disambiguates), filesystem-safe, sortable by creation time.
+    /// Mint a new blob id. Format:
+    /// `<unix_ms_13hex>-<counter_8hex>-<nanos_8hex>` — host-minted,
+    /// filesystem-safe, sortable by creation time. The counter is
+    /// seeded per-`BlobStore` (see [`Self::new`]) so two processes
+    /// don't both start at 0; migration 7's `UNIQUE (instance_id,
+    /// id)` index is the load-bearing collision check.
     fn mint_id(&self) -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -483,6 +535,65 @@ impl BlobStore {
         let nanos = now.subsec_nanos();
         let counter = self.id_counter.fetch_add(1, Ordering::Relaxed);
         format!("{ms:013x}-{counter:08x}-{nanos:08x}")
+    }
+}
+
+/// Per-`BlobStore` counter seed: `pid ^ construction-time subsec
+/// nanos`, masked to 32 bits so `mint_id`'s `{counter:08x}` format
+/// stays width-stable. `subsec_nanos()` only varies within a single
+/// second — two processes starting in the same wall-clock second
+/// share that range and only `pid` differentiates them (container
+/// pid recycling shrinks that further). That's fine: migration 7's
+/// `UNIQUE (instance_id, id)` index is the load-bearing collision
+/// check; the seed just keeps the practical collision rate at zero.
+fn id_counter_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    u64::from(pid ^ nanos)
+}
+
+/// Map the transaction outcome to the public `write` result, doing
+/// the best-effort filesystem cleanup that depends on *where* the
+/// write got to (post-commit overwrite, commit-after-rename failure,
+/// or pre-rename failure).
+fn finalize_write_outcome(
+    outcome: Result<WriteOutcome, BlobError>,
+    id: String,
+    tmp_path: &Path,
+) -> Result<String, BlobError> {
+    match outcome {
+        Ok(WriteOutcome { old_file: None }) => Ok(id),
+        Ok(WriteOutcome {
+            old_file: Some(old_path),
+        }) => {
+            // Best-effort cleanup; ignore failure (operator-visible
+            // if `usage` reports drift, which it won't — the trigger
+            // already accounted for the delete).
+            let _ = std::fs::remove_file(&old_path);
+            Ok(id)
+        }
+        Err(BlobError::CommitFailedAfterRename {
+            final_path: orphan,
+            source,
+        }) => {
+            // Bytes already at `final_path`, but the DB doesn't know
+            // about them. Clean the orphan deterministically so we
+            // don't have to wait for a Phase-12 sweep. The unlink
+            // itself is best-effort — if it fails (permissions, FS
+            // gone), the orphan persists and Phase-12 reclaims it,
+            // same as the pre-fix behaviour.
+            let _ = std::fs::remove_file(&orphan);
+            Err(BlobError::Sql(source))
+        }
+        Err(e) => {
+            // Rename hadn't happened yet — `final_path` is empty, the
+            // staged file is still at `tmp_path`.
+            let _ = std::fs::remove_file(tmp_path);
+            Err(e)
+        }
     }
 }
 
@@ -500,6 +611,37 @@ fn write_and_fsync(path: &Path, data: &[u8]) -> Result<(), BlobError> {
         path: path.to_path_buf(),
         source,
     })?;
+    Ok(())
+}
+
+/// fsync the directory entry. `fsync` on the file alone (in
+/// `write_and_fsync`) doesn't make the rename durable — POSIX
+/// requires fsyncing the parent directory after a rename so the
+/// new entry survives a crash. Without this, a crash between
+/// `rename` and the next checkpoint can leave the file at its
+/// pre-rename location while the `SQLite` WAL commit is durable, and
+/// the next `read_by_name` fails with `Io { not found }`.
+///
+/// Unix-only — `std::fs::File::open` on a directory path fails on
+/// Windows without `FILE_FLAG_BACKUP_SEMANTICS`, and `OxidHome` only
+/// ships POSIX targets (Linux/macOS hub-class machines). The non-
+/// unix arm is a deliberate no-op so the call sites stay uniform;
+/// if Windows support is added later this needs a `BackupSemantics`
+/// `OpenOptionsExt` path before re-enabling.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> Result<(), BlobError> {
+    let dir_file = std::fs::File::open(dir).map_err(|source| BlobError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    dir_file.sync_all().map_err(|source| BlobError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> Result<(), BlobError> {
     Ok(())
 }
 
@@ -559,24 +701,92 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_replaces_in_place_and_accounts_correctly() {
-        let (store, _dir) = store_with_root();
+    fn overwrite_replaces_blob_and_accounts_correctly() {
+        let (store, dir) = store_with_root();
         store
             .register_instance("alpha", 64 * 1024)
             .expect("register");
-        store
+        let first_id = store
             .write("alpha", "k", b"original-bytes", None)
             .expect("first");
+        let first_path = dir.path.join("alpha").join(&first_id);
+        assert!(first_path.is_file(), "first write should land on disk");
         let (used1, _) = store.usage("alpha").expect("usage").expect("present");
-        store
+        let second_id = store
             .write("alpha", "k", b"replaced-with-longer-bytes", None)
             .expect("second");
+        assert_ne!(first_id, second_id, "overwrite should mint a fresh id");
         let (used2, _) = store.usage("alpha").expect("usage").expect("present");
         assert_eq!(used2, "replaced-with-longer-bytes".len() as u64);
         assert!(used2 > used1);
 
         let payload = store.read_by_name("alpha", "k").expect("read");
         assert_eq!(payload, b"replaced-with-longer-bytes");
+        assert!(
+            !first_path.exists(),
+            "previous blob's FS file should be unlinked after overwrite",
+        );
+    }
+
+    #[test]
+    fn concurrent_writes_to_same_name_serialize() {
+        // Assumes `Db::write` serializes via the single mutexed
+        // connection (see `state::db::Db`). If `Db` ever moves to a
+        // pool, `BEGIN IMMEDIATE` can return `SQLITE_BUSY` here and
+        // the `.expect("concurrent write")` below would panic — that
+        // change needs to teach this test to retry, not relax the
+        // invariant (one row, no orphans).
+        let (store, dir) = store_with_root();
+        store
+            .register_instance("alpha", 64 * 1024)
+            .expect("register");
+
+        let store = Arc::new(store);
+        let mut handles = Vec::new();
+        for n in 0..8u32 {
+            let s = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let payload = format!("payload-from-{n}");
+                s.write("alpha", "k", payload.as_bytes(), None)
+                    .expect("concurrent write")
+            }));
+        }
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect();
+        // Every minted id is distinct — the UNIQUE index would have
+        // failed the transaction otherwise.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "id collision: {ids:?}");
+
+        // Index has exactly one row for name "k".
+        let rows = store.list_blobs("alpha", "k").expect("list");
+        assert_eq!(rows.len(), 1, "expected single row, got {rows:?}");
+        let winner_id = rows[0].id.clone();
+
+        // On disk: only the winner's file remains; every other staged
+        // id is gone (no orphans).
+        let instance_dir = dir.path.join("alpha");
+        let mut files: Vec<String> = std::fs::read_dir(&instance_dir)
+            .expect("read instance dir")
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name == ".tmp" {
+                    return None;
+                }
+                Some(name)
+            })
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![winner_id],
+            "orphan files left behind: {files:?}"
+        );
     }
 
     #[test]
