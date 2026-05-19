@@ -231,11 +231,19 @@ impl BlobStore {
         let tmp_path = tmp_dir.join(&id);
         let final_path = instance_dir.join(&id);
 
-        // 1. Make directories.
+        // 1. Make directories. Track whether `instance_dir` is new so
+        // we can fsync `blobs_root` and make the new dir entry durable
+        // — without that, a crash during the first write to a fresh
+        // instance can lose the instance dir itself (and the file
+        // inside it) even after the SQLite commit is durable.
+        let instance_dir_is_new = !instance_dir.exists();
         std::fs::create_dir_all(&tmp_dir).map_err(|source| BlobError::Io {
             path: tmp_dir.clone(),
             source,
         })?;
+        if instance_dir_is_new {
+            fsync_dir(blobs_root)?;
+        }
 
         // 2. Stage write + fsync.
         write_and_fsync(&tmp_path, data)?;
@@ -530,18 +538,21 @@ impl BlobStore {
     }
 }
 
-/// Per-`BlobStore` counter seed: pid << 32 | construction-time nanos.
-/// Two processes opening the same DB in the same wall-clock
-/// millisecond won't both start at 0 — pid differs, and even if pid
-/// repeated, the construction nanos almost never align. Migration
-/// 7's `UNIQUE` index catches any residual collision loudly.
+/// Per-`BlobStore` counter seed: `pid ^ construction-time nanos`,
+/// masked to 32 bits so `mint_id`'s `{counter:08x}` format stays
+/// width-stable. Two processes opening the same DB in the same
+/// wall-clock millisecond won't both start at 0 — pid differs, and
+/// even if pid repeated, the construction nanos almost never align.
+/// Migration 7's `UNIQUE` index is the load-bearing collision check;
+/// the seed is just an optimization that drops the collision rate to
+/// effectively zero in practice.
 fn id_counter_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let pid = u64::from(std::process::id());
+    let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()));
-    (pid << 32) ^ nanos
+        .map_or(0, |d| d.subsec_nanos());
+    u64::from(pid ^ nanos)
 }
 
 /// Map the transaction outcome to the public `write` result, doing
@@ -606,10 +617,15 @@ fn write_and_fsync(path: &Path, data: &[u8]) -> Result<(), BlobError> {
 /// new entry survives a crash. Without this, a crash between
 /// `rename` and the next checkpoint can leave the file at its
 /// pre-rename location while the `SQLite` WAL commit is durable, and
-/// the next `read_by_name` fails with `Io { not found }`. On
-/// Windows `sync_all` on a directory handle is a no-op (renames are
-/// metadata-journaled by NTFS); the call is still cheap and the
-/// code stays uniform.
+/// the next `read_by_name` fails with `Io { not found }`.
+///
+/// Unix-only — `std::fs::File::open` on a directory path fails on
+/// Windows without `FILE_FLAG_BACKUP_SEMANTICS`, and `OxidHome` only
+/// ships POSIX targets (Linux/macOS hub-class machines). The non-
+/// unix arm is a deliberate no-op so the call sites stay uniform;
+/// if Windows support is added later this needs a `BackupSemantics`
+/// `OpenOptionsExt` path before re-enabling.
+#[cfg(unix)]
 fn fsync_dir(dir: &Path) -> Result<(), BlobError> {
     let dir_file = std::fs::File::open(dir).map_err(|source| BlobError::Io {
         path: dir.to_path_buf(),
@@ -619,6 +635,11 @@ fn fsync_dir(dir: &Path) -> Result<(), BlobError> {
         path: dir.to_path_buf(),
         source,
     })
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> Result<(), BlobError> {
+    Ok(())
 }
 
 fn decode_blob_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<BlobInfo> {
@@ -706,6 +727,12 @@ mod tests {
 
     #[test]
     fn concurrent_writes_to_same_name_serialize() {
+        // Assumes `Db::write` serializes via the single mutexed
+        // connection (see `state::db::Db`). If `Db` ever moves to a
+        // pool, `BEGIN IMMEDIATE` can return `SQLITE_BUSY` here and
+        // the `.expect("concurrent write")` below would panic — that
+        // change needs to teach this test to retry, not relax the
+        // invariant (one row, no orphans).
         let (store, dir) = store_with_root();
         store
             .register_instance("alpha", 64 * 1024)

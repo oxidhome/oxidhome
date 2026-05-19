@@ -305,7 +305,27 @@ const MIGRATIONS: &[&str] = &[
     // Cross-instance collisions are fine (the id namespace is
     // per-instance — `read(id)` already filters by `instance_id`),
     // so the constraint is `(instance_id, id)` rather than `id`.
+    //
+    // Defensive: collapse any duplicate `(instance_id, id)` rows
+    // before the UNIQUE index goes on. Two host processes that briefly
+    // shared a DB between #19 (5b ship) and #20 (this index) could
+    // have written colliding ids; without the dedupe, the index
+    // creation would fail and brick the upgrade. `blob` is `WITHOUT
+    // ROWID` (PK is `(instance_id, name)`) so we partition by
+    // `(instance_id, id)`, keep the most-recently-created row, and
+    // tiebreak by `name` for determinism. The dropped row's FS bytes
+    // become an orphan that the Phase-12 sweep will reclaim.
     "
+    DELETE FROM blob WHERE (instance_id, name) IN (
+      SELECT instance_id, name FROM (
+        SELECT instance_id, name,
+               ROW_NUMBER() OVER (
+                 PARTITION BY instance_id, id
+                 ORDER BY created_ms DESC, name DESC
+               ) AS rn
+        FROM blob
+      ) WHERE rn > 1
+    );
     DROP INDEX blob_by_id;
     CREATE UNIQUE INDEX blob_by_id ON blob(instance_id, id);
     ",
