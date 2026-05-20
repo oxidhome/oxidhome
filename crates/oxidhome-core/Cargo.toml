@@ -72,6 +72,10 @@ path = "tests/instance_lifecycle.rs"
 name = "instance_restart"
 path = "tests/instance_restart.rs"
 
+[[test]]
+name = "instance_registry"
+path = "tests/instance_registry.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
