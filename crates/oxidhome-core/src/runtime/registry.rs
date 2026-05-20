@@ -87,9 +87,7 @@ impl InstanceRegistry {
         if guard.instances.contains_key(&instance_id) {
             return Err(RegistryError::DuplicateInstanceId { instance_id });
         }
-        if singleton
-            && let Some(existing) = guard.singletons.get(&plugin_id)
-        {
+        if singleton && let Some(existing) = guard.singletons.get(&plugin_id) {
             return Err(RegistryError::SingletonInUse {
                 plugin_id,
                 existing_instance_id: existing.clone(),
