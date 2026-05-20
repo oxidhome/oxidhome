@@ -31,11 +31,11 @@ use super::state::PluginState;
 /// registry's pre-flight singleton check; the full load path
 /// re-reads + re-validates inside [`PluginInstance::load`].
 ///
-/// # Errors
-///
-/// Returns the underlying I/O / parse error wrapped with the file
-/// path, or an aggregated message listing every validation finding.
-pub async fn read_manifest(plugin_dir: &Path) -> anyhow::Result<PluginManifest> {
+/// `pub(crate)` for now — only [`crate::Engine::start_instance`]
+/// needs the pre-flight parse. The Phase-12 CLI's manifest-validation
+/// command will likely want a public variant; that can lift the
+/// visibility when it lands.
+pub(crate) async fn read_manifest(plugin_dir: &Path) -> anyhow::Result<PluginManifest> {
     let manifest_path = plugin_dir.join("manifest.toml");
     let text = tokio::fs::read_to_string(&manifest_path)
         .await

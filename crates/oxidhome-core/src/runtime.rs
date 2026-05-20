@@ -14,7 +14,7 @@ mod lifecycle;
 mod registry;
 mod state;
 
-pub use instance::{InitError, PluginInstance, read_manifest};
+pub use instance::{InitError, PluginInstance};
 pub use lifecycle::{
     InstanceHandle, InstanceState, SupervisorTuning, supervise, supervise_with_tuning,
 };
@@ -188,6 +188,14 @@ impl Engine {
     /// removes the entry once the supervisor reaches a terminal
     /// state, so the slot frees up for a fresh start.
     ///
+    /// **Manifest immutability assumption.** This call reads the
+    /// manifest once for the singleton / `plugin_id` check, then the
+    /// supervisor's load path reads it again to instantiate. The two
+    /// reads are *not* atomic against an on-disk edit between them; a
+    /// manifest swap mid-call could let a singleton coexist with a
+    /// non-singleton or unregister the wrong slot on terminal. Live-
+    /// reload (Phase 7+) needs a re-register through this method.
+    ///
     /// # Errors
     ///
     /// Forwards a manifest read / parse / validation error, or
@@ -195,7 +203,7 @@ impl Engine {
     /// the singleton slot or `instance_id` is taken.
     pub async fn start_instance(
         &self,
-        plugin_dir: PathBuf,
+        plugin_dir: impl Into<PathBuf>,
         instance_id: impl Into<String>,
         overrides: Option<toml::Value>,
     ) -> anyhow::Result<InstanceHandle> {
@@ -214,47 +222,51 @@ impl Engine {
     #[doc(hidden)]
     pub async fn start_instance_with_tuning(
         &self,
-        plugin_dir: PathBuf,
+        plugin_dir: impl Into<PathBuf>,
         instance_id: impl Into<String>,
         overrides: Option<toml::Value>,
         tuning: SupervisorTuning,
     ) -> anyhow::Result<InstanceHandle> {
+        let plugin_dir = plugin_dir.into();
         let instance_id = instance_id.into();
         // Pre-flight: parse + validate the manifest so we know the
         // plugin id + singleton flag before spawning. The supervisor's
         // load path re-reads + re-validates — small redundancy, but it
         // keeps the supervisor self-contained for the test_host crate.
-        let manifest = read_manifest(&plugin_dir).await?;
+        // See the immutability note on `start_instance`.
+        let manifest = instance::read_manifest(&plugin_dir).await?;
         let plugin_id = manifest.plugin.id.clone();
         let singleton = manifest.runtime.singleton;
 
-        // Atomic check + spawn + insert: `register` only calls the
-        // factory after the singleton / duplicate-id checks pass, so
-        // a rejected start_instance never spawns a supervisor task.
+        // Atomic check + spawn-supervisor + spawn-reaper + insert.
+        // `register` only calls the factory after the singleton /
+        // duplicate-id checks pass, so a rejected start_instance never
+        // spawns a supervisor task. Spawning the reaper *inside* the
+        // factory keeps it strictly ordered after the supervisor
+        // spawn, so the reaper can't miss the first `watch` notify.
         let engine = self.clone();
+        let registry = Arc::clone(&self.instances);
         let plugin_dir_for_spawn = plugin_dir;
         let instance_id_for_spawn = instance_id.clone();
-        let handle =
-            self.instances
-                .register(instance_id.clone(), plugin_id.clone(), singleton, || {
-                    supervise_with_tuning(
-                        engine,
-                        plugin_dir_for_spawn,
-                        instance_id_for_spawn,
-                        overrides,
-                        tuning,
-                    )
-                })?;
-
-        // Reaper: free the slot when the supervisor reaches terminal.
-        let registry = Arc::clone(&self.instances);
-        let reaper_handle = handle.clone();
-        tokio::spawn(async move {
-            let _ = reaper_handle.wait_terminal().await;
-            registry.unregister(&instance_id, &plugin_id);
-        });
-
-        Ok(handle)
+        let plugin_id_for_reaper = plugin_id.clone();
+        let instance_id_for_reaper = instance_id.clone();
+        self.instances
+            .register(instance_id, plugin_id, singleton, || {
+                let handle = supervise_with_tuning(
+                    engine,
+                    plugin_dir_for_spawn,
+                    instance_id_for_spawn,
+                    overrides,
+                    tuning,
+                );
+                let reaper_handle = handle.clone();
+                tokio::spawn(async move {
+                    let _ = reaper_handle.wait_terminal().await;
+                    registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
+                });
+                handle
+            })
+            .map_err(anyhow::Error::from)
     }
 
     /// Look up a running instance by id. `None` if no such

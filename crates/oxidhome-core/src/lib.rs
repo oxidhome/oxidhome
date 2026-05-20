@@ -20,7 +20,7 @@ pub mod state;
 pub use auth::{Actor, ActorKind};
 pub use runtime::{
     Engine, InitError, InstanceHandle, InstanceRegistry, InstanceState, PluginInstance,
-    RegistryError, SupervisorTuning, read_manifest, supervise, supervise_with_tuning,
+    RegistryError, SupervisorTuning, supervise, supervise_with_tuning,
 };
 pub use state::{DeviceMeta, DeviceRegistry, EventBus, EventSubscription};
 

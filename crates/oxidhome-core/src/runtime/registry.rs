@@ -69,11 +69,25 @@ impl InstanceRegistry {
     /// can't both succeed *and* we don't spawn a supervisor task
     /// whose slot turns out to be taken.
     ///
+    /// `factory` runs while a `std::sync::Mutex` is held, so it must
+    /// not `.await`. Today's caller only calls `tokio::spawn` +
+    /// `supervise_with_tuning` (both synchronous); a future supervisor
+    /// pre-flight that needs to await — e.g. a host-DB row insert —
+    /// would force a redesign to a `tokio::sync::Mutex` or a two-phase
+    /// reserve / commit shape.
+    ///
+    /// `pub(crate)` because the singleton-enforcement invariants only
+    /// hold when the caller went through [`Engine::start_instance`]
+    /// (which reads the manifest); the read-side accessors below stay
+    /// public.
+    ///
     /// # Errors
     ///
     /// Returns [`RegistryError`] when the slot is taken; `factory`
     /// is not called in that case.
-    pub fn register<F>(
+    ///
+    /// [`Engine::start_instance`]: crate::Engine::start_instance
+    pub(crate) fn register<F>(
         &self,
         instance_id: String,
         plugin_id: String,
@@ -87,6 +101,13 @@ impl InstanceRegistry {
         if guard.instances.contains_key(&instance_id) {
             return Err(RegistryError::DuplicateInstanceId { instance_id });
         }
+        // TODO(phase 7+): `singleton` is read from the *caller's*
+        // manifest, but a different install dir with the same
+        // `plugin_id` could carry `singleton = false`. That would let
+        // a non-singleton instance coexist with a singleton one. The
+        // host-side plugin ledger Phase 7+ adds is where the canonical
+        // per-`plugin_id` singleton flag belongs; for now Phase 6
+        // accepts the per-instance reading.
         if singleton && let Some(existing) = guard.singletons.get(&plugin_id) {
             return Err(RegistryError::SingletonInUse {
                 plugin_id,
@@ -105,7 +126,14 @@ impl InstanceRegistry {
     /// Frees the singleton slot iff *this* instance still owns it
     /// (paranoia against a future race where the slot was already
     /// taken back by something else).
-    pub fn unregister(&self, instance_id: &str, plugin_id: &str) {
+    ///
+    /// `pub(crate)`: only the reaper task spawned by
+    /// [`Engine::start_instance`] is supposed to call this. An
+    /// external caller could otherwise free a singleton slot while
+    /// the supervisor task is still running.
+    ///
+    /// [`Engine::start_instance`]: crate::Engine::start_instance
+    pub(crate) fn unregister(&self, instance_id: &str, plugin_id: &str) {
         let mut guard = self.inner.lock().expect("instance registry mutex poisoned");
         guard.instances.remove(instance_id);
         if guard.singletons.get(plugin_id).map(String::as_str) == Some(instance_id) {
