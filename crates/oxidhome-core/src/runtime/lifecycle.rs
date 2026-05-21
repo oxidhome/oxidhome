@@ -110,9 +110,9 @@ impl InstanceState {
 }
 
 /// Why a supervised instance crashed. The supervisor's `on-trap`
-/// restart policy keys off this: a [`TrapReason::Trap`] is
-/// restartable, a [`TrapReason::InitFailed`] is not. Phase 7 adds
-/// fuel- / memory-exhaustion variants here.
+/// restart policy keys off this: every variant *except*
+/// [`TrapReason::InitFailed`] is restartable; the deterministic init
+/// failure isn't, since retrying a bad config won't fix it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrapReason {
     /// A Wasmtime trap — guest panic, `unreachable`, an out-of-bounds
@@ -122,6 +122,14 @@ pub enum TrapReason {
     /// The plugin's `init` export returned `Err` — a clean,
     /// deterministic startup failure that retrying won't fix.
     InitFailed(String),
+    /// `Store::set_fuel` budget exhausted (Phase 7a sandbox limits).
+    OutOfFuel(String),
+    /// `ResourceLimiter::memory_growing` refused a `memory.grow` past
+    /// the manifest's `memory_max_mb` (Phase 7a sandbox limits).
+    OutOfMemory(String),
+    /// Per-call epoch deadline fired past `call_timeout_ms` (Phase
+    /// 7a sandbox limits).
+    OutOfTimeBudget(String),
 }
 
 impl std::fmt::Display for TrapReason {
@@ -129,7 +137,24 @@ impl std::fmt::Display for TrapReason {
         match self {
             TrapReason::Trap(m) => write!(f, "trap: {m}"),
             TrapReason::InitFailed(m) => write!(f, "init failed: {m}"),
+            TrapReason::OutOfFuel(m) => write!(f, "out of fuel: {m}"),
+            TrapReason::OutOfMemory(m) => write!(f, "out of memory: {m}"),
+            TrapReason::OutOfTimeBudget(m) => write!(f, "out of time budget: {m}"),
         }
+    }
+}
+
+/// Classify an `anyhow::Error` from a post-init entry-point call
+/// (`tick`, `execute_command`, `drain_events`, `shutdown`) into the
+/// matching [`TrapReason`] variant. Used by the supervisor to surface
+/// fuel / memory / timeout exhaustion separately from a generic trap.
+fn classify_post_init_trap(err: &anyhow::Error) -> TrapReason {
+    let msg = format!("{err:#}");
+    match super::sandbox::classify_trap(err) {
+        super::sandbox::ClassifiedTrap::OutOfFuel => TrapReason::OutOfFuel(msg),
+        super::sandbox::ClassifiedTrap::OutOfMemory => TrapReason::OutOfMemory(msg),
+        super::sandbox::ClassifiedTrap::OutOfTimeBudget => TrapReason::OutOfTimeBudget(msg),
+        super::sandbox::ClassifiedTrap::Other(other) => TrapReason::Trap(other),
     }
 }
 
@@ -417,9 +442,17 @@ fn restart_decision(
     let policy_allows = match policy {
         RestartPolicy::Never => false,
         RestartPolicy::Always => true,
-        // `on-trap` restarts real traps but not a clean `init` failure
-        // — retrying a deterministic config error won't fix it.
-        RestartPolicy::OnTrap => matches!(reason, TrapReason::Trap(_)),
+        // `on-trap` restarts every "trap-shaped" crash (real wasmtime
+        // trap, or one of the Phase-7a sandbox-budget exhaustions)
+        // but not a clean `init` failure — retrying a deterministic
+        // config error won't fix it.
+        RestartPolicy::OnTrap => matches!(
+            reason,
+            TrapReason::Trap(_)
+                | TrapReason::OutOfFuel(_)
+                | TrapReason::OutOfMemory(_)
+                | TrapReason::OutOfTimeBudget(_),
+        ),
     };
     if policy_allows && restarts_done < max_restarts {
         RestartDecision::Restart
@@ -595,17 +628,17 @@ async fn run_one_lifecycle(
 
     match instance.init().await {
         Ok(()) => {}
-        Err(InitError::Plugin(msg)) => {
-            return LifecycleOutcome::Crashed {
-                policy,
-                reason: TrapReason::InitFailed(msg),
-                ran_healthy: false,
+        Err(e) => {
+            let reason = match e {
+                InitError::Plugin(msg) => TrapReason::InitFailed(msg),
+                InitError::Trap(msg) => TrapReason::Trap(msg),
+                InitError::OutOfFuel(msg) => TrapReason::OutOfFuel(msg),
+                InitError::OutOfMemory(msg) => TrapReason::OutOfMemory(msg),
+                InitError::OutOfTimeBudget(msg) => TrapReason::OutOfTimeBudget(msg),
             };
-        }
-        Err(InitError::Trap(msg)) => {
             return LifecycleOutcome::Crashed {
                 policy,
-                reason: TrapReason::Trap(msg),
+                reason,
                 ran_healthy: false,
             };
         }
@@ -616,7 +649,7 @@ async fn run_one_lifecycle(
     if let Err(e) = instance.drain_events().await {
         return LifecycleOutcome::Crashed {
             policy,
-            reason: TrapReason::Trap(format!("event drain failed: {e:#}")),
+            reason: classify_post_init_trap(&e),
             ran_healthy: false,
         };
     }
@@ -699,16 +732,14 @@ async fn serve_loop(
         match outcome {
             Ok(LoopAction::Continue) => {
                 if let Err(e) = instance.drain_events().await {
-                    return ServeOutcome::Crashed(TrapReason::Trap(format!(
-                        "event drain failed: {e:#}"
-                    )));
+                    return ServeOutcome::Crashed(classify_post_init_trap(&e));
                 }
             }
             Ok(LoopAction::Stop) => {
                 transition(state_tx, instance_id, InstanceState::Stopped);
                 return ServeOutcome::Stopped;
             }
-            Err(e) => return ServeOutcome::Crashed(TrapReason::Trap(format!("{e:#}"))),
+            Err(e) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),
         }
     }
 }

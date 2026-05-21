@@ -109,6 +109,11 @@ pub struct PluginState {
     /// keeps `(name → id)` lookup + quota accounting. `blob-store`
     /// host calls go through here.
     pub blobs: Arc<crate::state::BlobStore>,
+    /// Per-store memory ceiling — Phase 7a. Plumbed into the wasmtime
+    /// `Store` via `Store::limiter` at instantiation; refused growth
+    /// surfaces as a typed `MemoryLimitExceeded` that the supervisor
+    /// classifies as `TrapReason::OutOfMemory`.
+    pub limiter: super::sandbox::PluginResourceLimiter,
 }
 
 impl PluginState {
@@ -130,6 +135,10 @@ impl PluginState {
     ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
+        let memory_max_mb = manifest
+            .runtime
+            .memory_max_mb
+            .unwrap_or(super::sandbox::DEFAULT_MEMORY_MAX_MB);
         Self {
             instance_id: instance_id.into(),
             table: ResourceTable::new(),
@@ -143,6 +152,7 @@ impl PluginState {
             manifest,
             actor,
             config,
+            limiter: super::sandbox::PluginResourceLimiter::new(memory_max_mb),
         }
     }
 }

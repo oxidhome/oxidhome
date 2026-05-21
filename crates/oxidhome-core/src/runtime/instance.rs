@@ -24,6 +24,7 @@ use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
 use crate::{MIN_SUPPORTED_SDK_VERSION, OXIDHOME_SDK_VERSION};
 
 use super::Engine;
+use super::sandbox::{self, ClassifiedTrap};
 use super::state::PluginState;
 
 /// Read + validate the manifest at `<plugin_dir>/manifest.toml`
@@ -72,11 +73,10 @@ pub struct PluginInstance {
     store: Store<PluginState>,
 }
 
-/// Why a [`PluginInstance::init`] call failed. The two cases are kept
-/// apart because the Phase-6 supervisor's `on-trap` restart policy
-/// treats them differently: a [`InitError::Trap`] is restartable, a
-/// [`InitError::Plugin`] (a deterministic config / capability failure)
-/// is not.
+/// Why a [`PluginInstance::init`] call failed. Variants other than
+/// [`InitError::Plugin`] are restartable under the `on-trap` policy
+/// — a clean plugin-`Err` is treated as a deterministic config /
+/// capability failure that retrying won't fix.
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
     /// The plugin's `init` export returned `Err(message)` — a clean,
@@ -84,10 +84,19 @@ pub enum InitError {
     /// by a missing capability, …).
     #[error("plugin init returned error: {0}")]
     Plugin(String),
-    /// A Wasmtime trap (or host-call error) while invoking `init` —
-    /// e.g. the guest panicked or hit `unreachable`.
+    /// A Wasmtime trap during `init` that doesn't match a more specific
+    /// sandbox-budget variant — guest panic, `unreachable`, OOB, etc.
     #[error("plugin init trapped: {0}")]
     Trap(String),
+    /// `init` exhausted its `fuel_per_call` budget.
+    #[error("plugin init exhausted its fuel budget: {0}")]
+    OutOfFuel(String),
+    /// `init` exceeded its memory budget (`memory_max_mb`).
+    #[error("plugin init exceeded its memory budget: {0}")]
+    OutOfMemory(String),
+    /// `init` exceeded its wall-clock budget (`call_timeout_ms`).
+    #[error("plugin init exceeded its time budget: {0}")]
+    OutOfTimeBudget(String),
 }
 
 impl PluginInstance {
@@ -346,6 +355,19 @@ impl PluginInstance {
             blobs,
         );
         let mut store = Store::new(engine.raw(), state);
+        // Phase 7a — wire the per-store memory cap through wasmtime's
+        // `ResourceLimiter` hook so `memory.grow` past `memory_max_mb`
+        // surfaces as a typed `MemoryLimitExceeded` via the limiter.
+        store.limiter(|state| &mut state.limiter);
+        // With `epoch_interruption(true)` the default deadline is 0
+        // (already elapsed) — any wasm the component instantiator
+        // runs would trap before reaching `init`. Set a generous
+        // instantiation window (a few minutes' worth of epoch ticks);
+        // `apply_sandbox_limits` resets per-call before each
+        // subsequent entry point. The cap stops short of u64::MAX so
+        // wasmtime's internal `current_epoch + delta` arithmetic
+        // can't overflow.
+        store.set_epoch_deadline(u64::MAX / 2);
 
         let bindings = PluginBindings::instantiate_async(&mut store, &component, &linker)
             .await
@@ -371,8 +393,24 @@ impl PluginInstance {
             plugin_id = %data.manifest.plugin.id,
         );
         async {
+            // Phase 7a — apply per-call fuel + epoch deadline. If
+            // applying the limits itself fails the engine is
+            // misconfigured (`consume_fuel` off); that's a host bug,
+            // not a plugin one, so it lands as a `Trap` InitError.
+            if let Err(e) = self.apply_sandbox_limits() {
+                return Err(InitError::Trap(format!("applying sandbox limits: {e:#}")));
+            }
             match self.bindings.call_init(&mut self.store).await {
-                Err(trap) => Err(InitError::Trap(format!("{trap:#}"))),
+                Err(trap) => {
+                    let err: anyhow::Error = trap.into();
+                    let msg = format!("{err:#}");
+                    Err(match sandbox::classify_trap(&err) {
+                        ClassifiedTrap::OutOfFuel => InitError::OutOfFuel(msg),
+                        ClassifiedTrap::OutOfMemory => InitError::OutOfMemory(msg),
+                        ClassifiedTrap::OutOfTimeBudget => InitError::OutOfTimeBudget(msg),
+                        ClassifiedTrap::Other(other) => InitError::Trap(other),
+                    })
+                }
                 Ok(Err(msg)) => Err(InitError::Plugin(msg)),
                 Ok(Ok(())) => Ok(()),
             }
@@ -397,6 +435,7 @@ impl PluginInstance {
             plugin_id = %data.manifest.plugin.id,
         );
         async {
+            self.apply_sandbox_limits()?;
             self.bindings
                 .call_tick(&mut self.store)
                 .await
@@ -417,6 +456,7 @@ impl PluginInstance {
             plugin_id = %data.manifest.plugin.id,
         );
         async {
+            self.apply_sandbox_limits()?;
             self.bindings
                 .call_shutdown(&mut self.store)
                 .await
@@ -447,6 +487,7 @@ impl PluginInstance {
             action = %cmd.action,
         );
         async {
+            self.apply_sandbox_limits()?;
             self.bindings
                 .call_execute_command(&mut self.store, &device, &cmd)
                 .await
@@ -489,6 +530,7 @@ impl PluginInstance {
                 plugin_id = %data.manifest.plugin.id,
             );
             async {
+                self.apply_sandbox_limits()?;
                 self.bindings
                     .call_on_event(&mut self.store, &ev)
                     .await
@@ -529,6 +571,36 @@ impl PluginInstance {
             }
         }
         events
+    }
+
+    /// Apply the per-call sandbox budgets to the store: reset fuel
+    /// from the manifest's `fuel_per_call`, and set the per-call epoch
+    /// deadline from `call_timeout_ms`. Called at the top of every
+    /// host-driven entry point (`init`, `tick`, `shutdown`,
+    /// `execute_command`, `on_event` drain) so a slow call can't burn
+    /// through a neighbour call's budget. Defaults from
+    /// `super::sandbox` apply when the manifest omits a field.
+    fn apply_sandbox_limits(&mut self) -> anyhow::Result<()> {
+        let (fuel, timeout_ms) = {
+            let runtime = &self.store.data().manifest.runtime;
+            (
+                runtime
+                    .fuel_per_call
+                    .unwrap_or(sandbox::DEFAULT_FUEL_PER_CALL),
+                runtime
+                    .call_timeout_ms
+                    .unwrap_or(sandbox::DEFAULT_CALL_TIMEOUT_MS),
+            )
+        };
+        self.store
+            .set_fuel(fuel)
+            .map_err(anyhow::Error::from)
+            .context("setting per-call fuel (consume_fuel must be enabled)")?;
+        // One extra tick of headroom so a budget that's a clean
+        // multiple of EPOCH_TICK_MS doesn't trip at the boundary.
+        let ticks = (timeout_ms / sandbox::EPOCH_TICK_MS).max(1) + 1;
+        self.store.set_epoch_deadline(ticks);
+        Ok(())
     }
 
     /// The instance id this state was built with. Currently the plugin's

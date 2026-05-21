@@ -12,6 +12,7 @@
 mod instance;
 mod lifecycle;
 mod registry;
+pub(crate) mod sandbox;
 mod state;
 
 pub use instance::{InitError, PluginInstance};
@@ -94,12 +95,22 @@ impl Engine {
         // `async_support(true)` is the default in wasmtime 44 (and was
         // deprecated as a no-op). We just need the `async` feature on
         // the dep — which the workspace pin enables.
-        cfg.epoch_interruption(false);
+        //
+        // Phase 7a turns on the two sandbox knobs:
+        // - `consume_fuel` so `Store::set_fuel` traps a runaway loop.
+        // - `epoch_interruption` so a per-call `set_epoch_deadline`
+        //   can interrupt a wasm tight-loop that never yields to
+        //   tokio. `tokio::time::timeout` alone can't preempt that
+        //   loop (the fiber doesn't yield) — see the module docs on
+        //   `sandbox` for the OS-thread ticker that drives it.
+        cfg.consume_fuel(true);
+        cfg.epoch_interruption(true);
         let inner = Arc::new(
             WasmtimeEngine::new(&cfg)
                 .map_err(anyhow::Error::from)
                 .context("constructing wasmtime engine")?,
         );
+        sandbox::EpochTicker::spawn(&inner);
         let db = Arc::new(db);
         Ok(Self {
             inner,

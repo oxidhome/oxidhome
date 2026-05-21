@@ -1,0 +1,35 @@
+manifest_version = 1
+
+[plugin]
+id = "example.fuel-hog"
+name = "Fuel Hog"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Burns wasm fuel / memory on demand — Phase 7a sandbox-limits test fixture."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/fuel-hog"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "test-fixture", "sandbox"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/fuel_hog.wasm"
+# Tight budgets so the fixture trips on the first call. Tests stage
+# their own manifests with the specific budget shape they exercise.
+tick_interval_ms = 10
+restart = "never"
+fuel_per_call = 1_000_000
+memory_max_mb = 16
+call_timeout_ms = 1_000
+
+[config.mode]
+type = "enum"
+values = ["fuel", "memory"]
+default = "fuel"
+description = "Which sandbox budget to burn."
+
+[config.phase]
+type = "enum"
+values = ["init", "tick"]
+default = "tick"
+description = "Which lifecycle hook burns the budget."
