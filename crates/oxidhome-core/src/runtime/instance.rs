@@ -448,6 +448,13 @@ impl PluginInstance {
 
     /// Call the plugin's exported `shutdown`. The plugin can't fail this
     /// call by contract; trapping bubbles up as an error.
+    ///
+    /// Like every other entry point, `shutdown` runs under the
+    /// per-call sandbox budget — a cleanup that exhausts `fuel_per_call`
+    /// or `call_timeout_ms` traps and the supervisor records `Failed`
+    /// rather than `Stopped`. That's deliberate: a runaway shutdown
+    /// shouldn't be able to wedge host teardown. The default 5 s / 10M
+    /// budget is generous for ordinary cleanup.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         let data = self.store.data();
         let span = info_span!(

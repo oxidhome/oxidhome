@@ -182,6 +182,17 @@ pub enum ValidationError {
          (a sub-{min}ms tick is a runaway, not a schedule)"
     )]
     RuntimeTickIntervalTooSmall { got: u64, min: u64 },
+
+    /// `runtime.call_timeout_ms` is below [`MIN_CALL_TIMEOUT_MS`]. The
+    /// host's Phase-7a wall-clock enforcement is epoch-based at a
+    /// ~100 ms granularity, so a smaller value would be silently
+    /// rounded up — reject it at validation rather than surprise the
+    /// author with a coarser timeout than they asked for.
+    #[error(
+        "runtime.call_timeout_ms is {got}; the minimum is {min} ms \
+         (the host enforces call timeouts at ~{min}ms epoch granularity)"
+    )]
+    RuntimeCallTimeoutTooSmall { got: u64, min: u64 },
 }
 
 /// Why a `runtime.wasm` path was rejected. Carried in
@@ -232,6 +243,12 @@ pub const MAX_KEYWORD_LEN: usize = 50;
 /// below this floor (or `0`) busy-loops the instance instead of
 /// scheduling useful work.
 pub const MIN_TICK_INTERVAL_MS: u64 = 10;
+
+/// Smallest accepted `runtime.call_timeout_ms`. The Phase-7a host
+/// enforces per-call wall-clock budgets via Wasmtime epoch
+/// interruption ticked at ~100 ms; a smaller timeout can't be
+/// honoured precisely and would be rounded up, so reject it instead.
+pub const MIN_CALL_TIMEOUT_MS: u64 = 100;
 
 /// Why a `plugin.keywords` entry was rejected. Encoded as a typed
 /// enum (rather than a `&'static str` message) so the limit in
@@ -297,6 +314,15 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
         errors.push(ValidationError::RuntimeTickIntervalTooSmall {
             got: interval,
             min: MIN_TICK_INTERVAL_MS,
+        });
+    }
+
+    if let Some(timeout) = m.runtime.call_timeout_ms
+        && timeout < MIN_CALL_TIMEOUT_MS
+    {
+        errors.push(ValidationError::RuntimeCallTimeoutTooSmall {
+            got: timeout,
+            min: MIN_CALL_TIMEOUT_MS,
         });
     }
 
@@ -777,6 +803,32 @@ mod tests {
                         if *got == bad && *min == MIN_TICK_INTERVAL_MS
                 )),
                 "expected RuntimeTickIntervalTooSmall for {bad} ms, got {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_call_timeout_at_and_above_floor() {
+        for ok in [MIN_CALL_TIMEOUT_MS, MIN_CALL_TIMEOUT_MS + 1, 5000] {
+            let mut m = ok_manifest();
+            m.runtime.call_timeout_ms = Some(ok);
+            validate(&m).unwrap_or_else(|e| panic!("{ok} ms should pass, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn flags_call_timeout_below_floor() {
+        for bad in [0, 1, MIN_CALL_TIMEOUT_MS - 1] {
+            let mut m = ok_manifest();
+            m.runtime.call_timeout_ms = Some(bad);
+            let errs = validate(&m).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::RuntimeCallTimeoutTooSmall { got, min }
+                        if *got == bad && *min == MIN_CALL_TIMEOUT_MS
+                )),
+                "expected RuntimeCallTimeoutTooSmall for {bad} ms, got {errs:?}",
             );
         }
     }
