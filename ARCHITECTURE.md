@@ -43,7 +43,7 @@ The `oxidhome.wit` file is the *real product* in a sense. Once plugins exist in 
 - A **plugin** is a `.wasm` component package — the code (e.g. "onvif-camera", "zigbee2mqtt-bridge")
 - A **plugin instance** is a configured, running copy of that plugin (one per camera, one per Zigbee bridge, etc.)
 
-A user installs the "ONVIF camera" plugin once. They configure three cameras through the UI. The host spins up three component instances of that plugin, each with its own config, capabilities, and lifecycle. Crash isolation, per-instance resource limits, and independent updates fall out naturally.
+A user installs the "ONVIF camera" plugin once. They configure three cameras through the UI. The host spins up three component instances of that plugin, each with its own config, capabilities, and lifecycle. Crash isolation, per-instance supervision, and independent updates fall out naturally.
 
 Plugin manifests declare whether the plugin is **singleton** (Zigbee coordinator owns the radio — only one instance makes sense) or **multi-instance** (cameras, MQTT brokers).
 
@@ -229,7 +229,8 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 > - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
 > - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API.
 > - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode).
-> - **Inter-plugin communication beyond the event bus** — *now in scope* as Phase 7. Services + a synchronous cross-plugin `call-service` host import + per-instance Wasmtime sandbox limits ship together; the motivation comes from the embedded scripting-plugin design (Rhai/Lua hosts where automation instances expose commands and call each other).
+> - **Inter-plugin communication beyond the event bus** — *now in scope* as Phase 7. Services + a synchronous cross-plugin `call-service` host import; the motivation comes from the embedded scripting-plugin design (Rhai/Lua hosts where automation instances expose commands and call each other).
+> - **Plugin resource usage** — *not limited by design*. OxidHome does not cap a plugin's CPU/memory; on an admin-curated home hub, catching a greedy or buggy plugin is the operator's job, and the host's role is to surface metrics rather than enforce compute quotas. The host keeps exactly one guarantee — a per-call **liveness watchdog** (Wasmtime epoch interruption) so the supervisor can always reclaim a wedged/infinite-loop instance. (Storage and blob *byte* quotas remain — they guard finite disk, not compute.)
 
 The remaining items below are still deferred:
 
