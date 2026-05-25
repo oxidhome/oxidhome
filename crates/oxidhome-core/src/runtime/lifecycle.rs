@@ -61,6 +61,10 @@ pub struct SupervisorTuning {
     /// crashes rarely keeps being restarted, only a tight crash-loop
     /// is capped.
     pub healthy_reset: Duration,
+    /// Per-call liveness watchdog deadline applied to every host entry
+    /// point. Production uses [`watchdog::WATCHDOG_DEFAULT`]; tests
+    /// lower it so a hung-plugin case trips in milliseconds.
+    pub watchdog: Duration,
 }
 
 impl Default for SupervisorTuning {
@@ -70,6 +74,7 @@ impl Default for SupervisorTuning {
             backoff_max: Duration::from_mins(1),
             max_restarts: 10,
             healthy_reset: Duration::from_mins(5),
+            watchdog: super::watchdog::WATCHDOG_DEFAULT,
         }
     }
 }
@@ -110,9 +115,9 @@ impl InstanceState {
 }
 
 /// Why a supervised instance crashed. The supervisor's `on-trap`
-/// restart policy keys off this: a [`TrapReason::Trap`] is
-/// restartable, a [`TrapReason::InitFailed`] is not. Phase 7 adds
-/// fuel- / memory-exhaustion variants here.
+/// restart policy keys off this: every variant *except*
+/// [`TrapReason::InitFailed`] is restartable; the deterministic init
+/// failure isn't, since retrying a bad config won't fix it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrapReason {
     /// A Wasmtime trap — guest panic, `unreachable`, an out-of-bounds
@@ -122,6 +127,9 @@ pub enum TrapReason {
     /// The plugin's `init` export returned `Err` — a clean,
     /// deterministic startup failure that retrying won't fix.
     InitFailed(String),
+    /// The liveness watchdog interrupted a call that ran past the
+    /// deadline (Phase 7a). Restartable — a stuck call may not recur.
+    Unresponsive(String),
 }
 
 impl std::fmt::Display for TrapReason {
@@ -129,7 +137,20 @@ impl std::fmt::Display for TrapReason {
         match self {
             TrapReason::Trap(m) => write!(f, "trap: {m}"),
             TrapReason::InitFailed(m) => write!(f, "init failed: {m}"),
+            TrapReason::Unresponsive(m) => write!(f, "unresponsive (watchdog): {m}"),
         }
+    }
+}
+
+/// Classify an `anyhow::Error` from a post-init entry-point call
+/// (`tick`, `execute_command`, `drain_events`, `shutdown`) into the
+/// matching [`TrapReason`] — the watchdog interrupt vs a generic trap.
+fn classify_post_init_trap(err: &anyhow::Error) -> TrapReason {
+    let msg = format!("{err:#}");
+    if super::watchdog::is_watchdog_trap(err) {
+        TrapReason::Unresponsive(msg)
+    } else {
+        TrapReason::Trap(msg)
     }
 }
 
@@ -417,9 +438,12 @@ fn restart_decision(
     let policy_allows = match policy {
         RestartPolicy::Never => false,
         RestartPolicy::Always => true,
-        // `on-trap` restarts real traps but not a clean `init` failure
-        // — retrying a deterministic config error won't fix it.
-        RestartPolicy::OnTrap => matches!(reason, TrapReason::Trap(_)),
+        // `on-trap` restarts a real trap or a watchdog interrupt, but
+        // not a clean `init` failure — retrying a deterministic config
+        // error won't fix it.
+        RestartPolicy::OnTrap => {
+            matches!(reason, TrapReason::Trap(_) | TrapReason::Unresponsive(_))
+        }
     };
     if policy_allows && restarts_done < max_restarts {
         RestartDecision::Restart
@@ -491,6 +515,7 @@ async fn run_supervisor(
             &instance_id,
             overrides.as_ref(),
             tuning.healthy_reset,
+            tuning.watchdog,
             &mut control_rx,
             &mut wakeup,
             &state_tx,
@@ -574,6 +599,7 @@ async fn run_one_lifecycle(
     instance_id: &str,
     overrides: Option<&toml::Value>,
     healthy_reset: Duration,
+    watchdog: Duration,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     wakeup: &mut broadcast::Receiver<Event>,
     state_tx: &watch::Sender<InstanceState>,
@@ -591,21 +617,20 @@ async fn run_one_lifecycle(
         Ok(instance) => instance,
         Err(e) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
     };
+    instance.set_watchdog(watchdog);
     let policy = instance.manifest().runtime.restart;
 
     match instance.init().await {
         Ok(()) => {}
-        Err(InitError::Plugin(msg)) => {
-            return LifecycleOutcome::Crashed {
-                policy,
-                reason: TrapReason::InitFailed(msg),
-                ran_healthy: false,
+        Err(e) => {
+            let reason = match e {
+                InitError::Plugin(msg) => TrapReason::InitFailed(msg),
+                InitError::Trap(msg) => TrapReason::Trap(msg),
+                InitError::Unresponsive(msg) => TrapReason::Unresponsive(msg),
             };
-        }
-        Err(InitError::Trap(msg)) => {
             return LifecycleOutcome::Crashed {
                 policy,
-                reason: TrapReason::Trap(msg),
+                reason,
                 ran_healthy: false,
             };
         }
@@ -616,7 +641,7 @@ async fn run_one_lifecycle(
     if let Err(e) = instance.drain_events().await {
         return LifecycleOutcome::Crashed {
             policy,
-            reason: TrapReason::Trap(format!("event drain failed: {e:#}")),
+            reason: classify_post_init_trap(&e),
             ran_healthy: false,
         };
     }
@@ -699,16 +724,14 @@ async fn serve_loop(
         match outcome {
             Ok(LoopAction::Continue) => {
                 if let Err(e) = instance.drain_events().await {
-                    return ServeOutcome::Crashed(TrapReason::Trap(format!(
-                        "event drain failed: {e:#}"
-                    )));
+                    return ServeOutcome::Crashed(classify_post_init_trap(&e));
                 }
             }
             Ok(LoopAction::Stop) => {
                 transition(state_tx, instance_id, InstanceState::Stopped);
                 return ServeOutcome::Stopped;
             }
-            Err(e) => return ServeOutcome::Crashed(TrapReason::Trap(format!("{e:#}"))),
+            Err(e) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),
         }
     }
 }

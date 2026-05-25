@@ -29,6 +29,7 @@ fn fast_tuning() -> SupervisorTuning {
         // Large enough that an always-crashing fixture never looks
         // "healthy" and resets the counter.
         healthy_reset: Duration::from_mins(1),
+        ..SupervisorTuning::default()
     }
 }
 

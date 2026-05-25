@@ -1,0 +1,24 @@
+manifest_version = 1
+
+[plugin]
+id = "example.hang"
+name = "Hang"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Never returns from a chosen hook — Phase 7a liveness-watchdog test fixture."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/hang"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "test-fixture", "watchdog"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/hang.wasm"
+tick_interval_ms = 10
+restart = "never"
+
+[config.phase]
+type = "enum"
+values = ["init", "tick"]
+default = "tick"
+description = "Which lifecycle hook spins forever."
