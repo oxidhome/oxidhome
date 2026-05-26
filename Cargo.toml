@@ -48,7 +48,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 # then deserializes. `default-features = false` strips the std dep paths
 # we don't use here; the `std` feature is on so plugin authors get the
 # normal `serde_json` API.
-serde_json = { version = "1.0.128", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "sync", "fs"] }
 toml = { version = "1.1.2", default-features = false, features = ["display", "parse", "serde", "std"] }

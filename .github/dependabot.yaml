@@ -12,3 +12,7 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    groups:
+      wasmtime:
+        patterns:
+          - "wasmtime*"
