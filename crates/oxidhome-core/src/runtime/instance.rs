@@ -355,11 +355,16 @@ impl PluginInstance {
         let mut store = Store::new(engine.raw(), state);
         // Phase 7a — `epoch_interruption(true)` starts every store at
         // deadline 0 (already elapsed), which would trap any wasm the
-        // component instantiator runs. Set a generous instantiation
-        // window; `arm_watchdog` resets it per host call afterwards.
-        // Cap below `u64::MAX` so wasmtime's `current_epoch + delta`
-        // can't overflow.
-        store.set_epoch_deadline(u64::MAX / 2);
+        // component instantiator runs (core-module `start` / component
+        // initializers). Arm the *same* watchdog window over
+        // instantiation rather than an effectively-infinite one: a
+        // `start` function with an infinite loop must be reclaimable
+        // too, otherwise it pins the supervisor's worker — exactly the
+        // wedge the watchdog exists to prevent. `arm_watchdog` re-arms
+        // per host call afterwards. `WATCHDOG_DEFAULT` (not the
+        // post-load `set_watchdog` override) is the right ceiling here:
+        // legitimate instantiation is near-instant, 30 s is plenty.
+        store.set_epoch_deadline(watchdog::deadline_ticks(watchdog::WATCHDOG_DEFAULT));
 
         let bindings = PluginBindings::instantiate_async(&mut store, &component, &linker)
             .await

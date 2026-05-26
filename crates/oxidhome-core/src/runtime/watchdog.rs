@@ -26,6 +26,15 @@
 //!   classifies as [`TrapReason::Unresponsive`] and restarts under the
 //!   `on-trap` policy.
 //!
+//! **Cost.** `epoch_interruption` is a *global* engine setting:
+//! Wasmtime inserts an epoch check at every loop back-edge / function
+//! entry across all compiled guest code, for the engine's whole life
+//! — the cost is per-guest-instruction-stream, not "only while a call
+//! is armed". `arm_watchdog` itself is just a `u64` store. This is
+//! still markedly cheaper than fuel metering (why we dropped fuel),
+//! but it isn't free, and it's why the watchdog is the *only*
+//! interruption mechanism we keep.
+//!
 //! [`TrapReason::Unresponsive`]: super::lifecycle::TrapReason::Unresponsive
 
 use std::sync::{Arc, Weak};
@@ -44,9 +53,23 @@ pub const EPOCH_TICK_MS: u64 = 100;
 /// world (Phase 8) with its own model, not a plugin-tunable knob here.
 pub const WATCHDOG_DEFAULT: Duration = Duration::from_secs(30);
 
+/// Stack size for the ticker thread. The closure only sleeps +
+/// increments an atomic, so the platform-default (~2 MiB on most
+/// targets) is wasteful — one engine spawns one ticker, and the
+/// integration suite builds many engines. 64 KiB is ample.
+const TICKER_STACK_BYTES: usize = 64 * 1024;
+
 /// Dedicated OS thread that bumps the engine's epoch counter every
-/// [`EPOCH_TICK_MS`]. Held by a [`Weak`] so it exits cleanly once the
-/// engine drops — integration tests build many engines.
+/// [`EPOCH_TICK_MS`]. Held by a [`Weak`] so it exits once the engine
+/// drops — integration tests build many engines.
+///
+/// The ticker runs unconditionally at 10 Hz for the engine's whole
+/// life, even when no call is in flight (negligible CPU, but it does
+/// keep a timer warm — a conscious trade against the coordination a
+/// "tick only while a deadline is armed" scheme would need). It
+/// checks the `Weak` *before* sleeping so the epoch starts moving
+/// immediately after spawn; exit still lags up to one `EPOCH_TICK_MS`
+/// after the engine drops, which is fine (bounded, not a leak).
 pub(crate) struct EpochTicker;
 
 impl EpochTicker {
@@ -54,13 +77,20 @@ impl EpochTicker {
         let weak: Weak<WasmtimeEngine> = Arc::downgrade(engine);
         std::thread::Builder::new()
             .name("oxidhome-epoch-ticker".into())
+            .stack_size(TICKER_STACK_BYTES)
             .spawn(move || {
                 loop {
-                    std::thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
+                    // Upgrade in a tight scope so the strong `Arc`
+                    // doesn't outlive the increment; if the engine has
+                    // dropped, exit. (When the ticker holds the last
+                    // ref, `WasmtimeEngine::drop` runs here — harmless,
+                    // just teardown landing on this thread.)
                     let Some(engine) = weak.upgrade() else {
                         return;
                     };
                     engine.increment_epoch();
+                    drop(engine);
+                    std::thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
                 }
             })
             .expect("spawning epoch ticker thread");
