@@ -679,9 +679,6 @@ mod tests {
                 singleton: false,
                 tick_interval_ms: None,
                 restart: RestartPolicy::default(),
-                fuel_per_call: None,
-                memory_max_mb: None,
-                call_timeout_ms: None,
             },
             capabilities: CapabilitiesSection {
                 declares_devices: vec!["switch".into()],

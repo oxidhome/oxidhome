@@ -767,9 +767,6 @@ mod tests {
                 singleton: false,
                 tick_interval_ms: None,
                 restart: RestartPolicy::default(),
-                fuel_per_call: None,
-                memory_max_mb: None,
-                call_timeout_ms: None,
             },
             // Devices declared so the in-module gating tests for
             // *non-device* paths (events, logging) don't trip the

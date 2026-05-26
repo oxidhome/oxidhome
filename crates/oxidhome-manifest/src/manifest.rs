@@ -7,7 +7,6 @@
 //! [plugin] id = "..." version = "..." world = "plugin" sdk_version = "0.1.0"
 //! [runtime] wasm = "..." singleton = false tick_interval_ms = 1000
 //!           restart = "on-trap"
-//!           # Phase 7 amendments: fuel_per_call, memory_max_mb, call_timeout_ms
 //! [capabilities] network = [...] storage_quota_kb = 64 ...
 //!                # Phase 7 amendment: declares_services = [...]
 //! [config.<key>] type = "bool" default = false description = "..."
@@ -108,19 +107,6 @@ pub struct RuntimeSection {
     /// Absent ⇒ [`RestartPolicy::OnTrap`].
     #[serde(default)]
     pub restart: RestartPolicy,
-
-    // --- Phase 7 amendments (sandbox limits — see 08_services.md §7.8). ---
-    // Accepted in 0.1 so plugin authors can adopt the keys, but the
-    // host enforcer for them ships with Phase 7.
-    /// Wasmtime fuel budget per host-call entry. `None` ⇒ engine default.
-    #[serde(default)]
-    pub fuel_per_call: Option<u64>,
-    /// Wasmtime memory cap (per-`Store`) in MiB.
-    #[serde(default)]
-    pub memory_max_mb: Option<u64>,
-    /// Cooperative interruption deadline per host-call in ms.
-    #[serde(default)]
-    pub call_timeout_ms: Option<u64>,
 }
 
 /// `[capabilities]` block — every host import the plugin wants to use
@@ -275,9 +261,6 @@ wasm = "simulated-switch.wasm"
 singleton = false
 tick_interval_ms = 1000
 restart = "on-trap"
-fuel_per_call = 50_000_000
-memory_max_mb = 64
-call_timeout_ms = 5_000
 
 [capabilities]
 network = []
@@ -323,7 +306,6 @@ scripts = "none"
         );
         assert_eq!(m.runtime.tick_interval_ms, Some(1000));
         assert_eq!(m.runtime.restart, RestartPolicy::OnTrap);
-        assert_eq!(m.runtime.fuel_per_call, Some(50_000_000));
         assert_eq!(m.capabilities.storage_quota_kb, 64);
         assert_eq!(m.capabilities.declares_devices, vec!["switch".to_string()]);
         assert!(m.config.contains_key("default_state"));

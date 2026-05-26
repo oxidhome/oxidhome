@@ -13,6 +13,7 @@ mod instance;
 mod lifecycle;
 mod registry;
 mod state;
+pub(crate) mod watchdog;
 
 pub use instance::{InitError, PluginInstance};
 pub use lifecycle::{
@@ -94,12 +95,20 @@ impl Engine {
         // `async_support(true)` is the default in wasmtime 44 (and was
         // deprecated as a no-op). We just need the `async` feature on
         // the dep — which the workspace pin enables.
-        cfg.epoch_interruption(false);
+        //
+        // Phase 7a turns on `epoch_interruption` purely as a liveness
+        // watchdog: it lets the host trap a wasm call that never
+        // returns so the supervisor can always reclaim a wedged
+        // instance. The `EpochTicker` below drives the epoch counter.
+        // We deliberately don't enable `consume_fuel` — OxidHome
+        // doesn't cap plugin resource usage (see `watchdog` docs).
+        cfg.epoch_interruption(true);
         let inner = Arc::new(
             WasmtimeEngine::new(&cfg)
                 .map_err(anyhow::Error::from)
                 .context("constructing wasmtime engine")?,
         );
+        watchdog::EpochTicker::spawn(&inner);
         let db = Arc::new(db);
         Ok(Self {
             inner,

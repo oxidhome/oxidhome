@@ -25,6 +25,7 @@ use crate::{MIN_SUPPORTED_SDK_VERSION, OXIDHOME_SDK_VERSION};
 
 use super::Engine;
 use super::state::PluginState;
+use super::watchdog;
 
 /// Read + validate the manifest at `<plugin_dir>/manifest.toml`
 /// without instantiating the wasm component. Used by the Phase-6
@@ -70,13 +71,16 @@ pub(crate) async fn read_manifest(plugin_dir: &Path) -> anyhow::Result<PluginMan
 pub struct PluginInstance {
     bindings: PluginBindings,
     store: Store<PluginState>,
+    /// Per-call liveness deadline armed before every host entry point.
+    /// Fixed [`watchdog::WATCHDOG_DEFAULT`] in production; the
+    /// supervisor lowers it for tests via [`Self::set_watchdog`].
+    watchdog: std::time::Duration,
 }
 
-/// Why a [`PluginInstance::init`] call failed. The two cases are kept
-/// apart because the Phase-6 supervisor's `on-trap` restart policy
-/// treats them differently: a [`InitError::Trap`] is restartable, a
-/// [`InitError::Plugin`] (a deterministic config / capability failure)
-/// is not.
+/// Why a [`PluginInstance::init`] call failed. The supervisor's
+/// `on-trap` restart policy restarts every variant *except*
+/// [`InitError::Plugin`] — a clean plugin-`Err` is a deterministic
+/// config / capability failure that retrying won't fix.
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
     /// The plugin's `init` export returned `Err(message)` — a clean,
@@ -84,10 +88,13 @@ pub enum InitError {
     /// by a missing capability, …).
     #[error("plugin init returned error: {0}")]
     Plugin(String),
-    /// A Wasmtime trap (or host-call error) while invoking `init` —
-    /// e.g. the guest panicked or hit `unreachable`.
+    /// A Wasmtime trap while invoking `init` — guest panic,
+    /// `unreachable`, OOB, etc.
     #[error("plugin init trapped: {0}")]
     Trap(String),
+    /// `init` ran past the liveness watchdog and was interrupted.
+    #[error("plugin init was unresponsive (watchdog): {0}")]
+    Unresponsive(String),
 }
 
 impl PluginInstance {
@@ -346,13 +353,46 @@ impl PluginInstance {
             blobs,
         );
         let mut store = Store::new(engine.raw(), state);
+        // Phase 7a — `epoch_interruption(true)` starts every store at
+        // deadline 0 (already elapsed), which would trap any wasm the
+        // component instantiator runs (core-module `start` / component
+        // initializers). Arm the *same* watchdog window over
+        // instantiation rather than an effectively-infinite one: a
+        // `start` function with an infinite loop must be reclaimable
+        // too, otherwise it pins the supervisor's worker — exactly the
+        // wedge the watchdog exists to prevent. `arm_watchdog` re-arms
+        // per host call afterwards. `WATCHDOG_DEFAULT` (not the
+        // post-load `set_watchdog` override) is the right ceiling here:
+        // legitimate instantiation is near-instant, 30 s is plenty.
+        store.set_epoch_deadline(watchdog::deadline_ticks(watchdog::WATCHDOG_DEFAULT));
 
         let bindings = PluginBindings::instantiate_async(&mut store, &component, &linker)
             .await
             .map_err(anyhow::Error::from)
             .context("instantiating plugin component")?;
 
-        Ok(Self { bindings, store })
+        Ok(Self {
+            bindings,
+            store,
+            watchdog: watchdog::WATCHDOG_DEFAULT,
+        })
+    }
+
+    /// Override the per-call liveness deadline. Production uses the
+    /// fixed [`watchdog::WATCHDOG_DEFAULT`]; the Phase-6 supervisor
+    /// lowers it from its `SupervisorTuning` so a watchdog test trips
+    /// in milliseconds instead of the 30 s default.
+    pub(crate) fn set_watchdog(&mut self, timeout: std::time::Duration) {
+        self.watchdog = timeout;
+    }
+
+    /// Arm the per-call epoch deadline before a host-driven entry
+    /// point so a call that never returns is interrupted and the
+    /// supervisor regains control. Infallible — `set_epoch_deadline`
+    /// can't fail once `epoch_interruption` is on at the engine.
+    fn arm_watchdog(&mut self) {
+        self.store
+            .set_epoch_deadline(watchdog::deadline_ticks(self.watchdog));
     }
 
     /// Call the plugin's exported `init`. The plugin returns
@@ -361,8 +401,9 @@ impl PluginInstance {
     /// # Errors
     ///
     /// [`InitError::Plugin`] when the plugin's `init` returns `Err`;
-    /// [`InitError::Trap`] when the call traps. The split lets the
-    /// Phase-6 supervisor apply its `on-trap` restart policy.
+    /// [`InitError::Unresponsive`] when the liveness watchdog
+    /// interrupts it; [`InitError::Trap`] for any other trap. The
+    /// split lets the Phase-6 supervisor apply its `on-trap` policy.
     pub async fn init(&mut self) -> Result<(), InitError> {
         let data = self.store.data();
         let span = info_span!(
@@ -371,8 +412,17 @@ impl PluginInstance {
             plugin_id = %data.manifest.plugin.id,
         );
         async {
+            self.arm_watchdog();
             match self.bindings.call_init(&mut self.store).await {
-                Err(trap) => Err(InitError::Trap(format!("{trap:#}"))),
+                Err(trap) => {
+                    let err: anyhow::Error = trap.into();
+                    let msg = format!("{err:#}");
+                    if watchdog::is_watchdog_trap(&err) {
+                        Err(InitError::Unresponsive(msg))
+                    } else {
+                        Err(InitError::Trap(msg))
+                    }
+                }
                 Ok(Err(msg)) => Err(InitError::Plugin(msg)),
                 Ok(Ok(())) => Ok(()),
             }
@@ -397,6 +447,7 @@ impl PluginInstance {
             plugin_id = %data.manifest.plugin.id,
         );
         async {
+            self.arm_watchdog();
             self.bindings
                 .call_tick(&mut self.store)
                 .await
@@ -417,6 +468,7 @@ impl PluginInstance {
             plugin_id = %data.manifest.plugin.id,
         );
         async {
+            self.arm_watchdog();
             self.bindings
                 .call_shutdown(&mut self.store)
                 .await
@@ -447,6 +499,7 @@ impl PluginInstance {
             action = %cmd.action,
         );
         async {
+            self.arm_watchdog();
             self.bindings
                 .call_execute_command(&mut self.store, &device, &cmd)
                 .await
@@ -489,6 +542,7 @@ impl PluginInstance {
                 plugin_id = %data.manifest.plugin.id,
             );
             async {
+                self.arm_watchdog();
                 self.bindings
                     .call_on_event(&mut self.store, &ev)
                     .await
