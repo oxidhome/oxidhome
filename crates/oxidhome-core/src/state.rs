@@ -22,6 +22,7 @@ pub mod event_log;
 pub mod events;
 pub mod kv;
 pub mod log_store;
+pub mod services;
 
 pub use blobs::{BlobError, BlobInfo, BlobStore};
 pub use db::Db;
@@ -32,3 +33,4 @@ pub use kv::{KvError, KvStore};
 pub use log_store::{
     HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogStoreError, LogValue, SqliteLayer,
 };
+pub use services::{ServiceMeta, ServiceRegistry};

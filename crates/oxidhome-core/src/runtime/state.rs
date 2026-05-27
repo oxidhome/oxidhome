@@ -31,16 +31,17 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::{
     blob_store::{self, BlobInfo as WitBlobInfo},
-    capabilities, devices,
-    devices::DeviceInfo,
+    capabilities,
+    devices::{self, CommandResult, DeviceInfo},
     events,
     events::{Event, EventFilter},
-    host_config, host_devices, host_events,
+    host_config, host_devices, host_events, host_services,
     logging::{self, Level as WitLevel},
+    services::{self, ServiceInfo},
     storage, types,
-    types::{DeviceId, Error as WitError, KeyValue, SubscriptionId, Value as WitValue},
+    types::{DeviceId, Error as WitError, KeyValue, ServiceId, SubscriptionId, Value as WitValue},
 };
-use crate::state::{DeviceRegistry, EventBus, EventSubscription};
+use crate::state::{DeviceRegistry, EventBus, EventSubscription, ServiceRegistry};
 
 /// Identifier the host assigns to a plugin instance — Phase 6 fleshes
 /// this out (manifest-driven IDs, multi-instance dedup). Phase 2 uses
@@ -109,6 +110,9 @@ pub struct PluginState {
     /// keeps `(name → id)` lookup + quota accounting. `blob-store`
     /// host calls go through here.
     pub blobs: Arc<crate::state::BlobStore>,
+    /// Shared service registry — Phase 7. `host-services` calls go
+    /// through here; owner-scoped to this instance's `instance_id`.
+    pub services: Arc<ServiceRegistry>,
 }
 
 impl PluginState {
@@ -127,6 +131,7 @@ impl PluginState {
         kv: Arc<crate::state::KvStore>,
         event_log: Arc<crate::state::EventLog>,
         blobs: Arc<crate::state::BlobStore>,
+        services: Arc<ServiceRegistry>,
     ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
@@ -139,6 +144,7 @@ impl PluginState {
             kv,
             event_log,
             blobs,
+            services,
             subscriptions: Vec::new(),
             manifest,
             actor,
@@ -169,6 +175,7 @@ impl types::Host for PluginState {}
 impl capabilities::Host for PluginState {}
 impl devices::Host for PluginState {}
 impl events::Host for PluginState {}
+impl services::Host for PluginState {}
 
 // ── Devices ──────────────────────────────────────────────────────────
 //
@@ -316,6 +323,103 @@ impl host_devices::Host for PluginState {
             .get(&self.instance_id, &id)
             .await
             .map(|meta| meta.info)
+    }
+}
+
+// ── Services (Phase 7) ─────────────────────────────────────────────────
+//
+// `register-service` is gated by the manifest's `declares_services`
+// (matching `host-devices`'s `declares_devices` shape). `update` /
+// `remove` / `get` are owner-scoped through the registry. `call-service`
+// is the synchronous cross-plugin dispatch — its routing dispatcher
+// lands in Phase 7c; the 7b impl is a deliberate `Unavailable` stub so
+// the WIT compiles end-to-end and plugins can register/look-up services
+// today.
+
+/// Whether `name` appears in the manifest's `declares_services`. The
+/// service's `name` field is the capability key (the human-readable
+/// name), mirroring how `declares_devices` gates by capability.
+fn service_name_declared(declared: &[String], name: &str) -> bool {
+    declared.iter().any(|d| d == name)
+}
+
+impl host_services::Host for PluginState {
+    async fn register_service(&mut self, info: ServiceInfo) -> Result<ServiceId, WitError> {
+        if !service_name_declared(&self.manifest.capabilities.declares_services, &info.name) {
+            let err = WitError::PermissionDenied(format!(
+                "service name `{}` is not declared in this plugin's manifest \
+                 (capabilities.declares_services)",
+                info.name,
+            ));
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                service_name = %info.name,
+                error = %err,
+                "register-service denied",
+            );
+            return Err(err);
+        }
+        let id = self.services.register(self.instance_id.clone(), info).await;
+        tracing::debug!(
+            instance_id = %self.instance_id,
+            service_id = %id,
+            "registered service"
+        );
+        Ok(id)
+    }
+
+    async fn update_service(&mut self, id: ServiceId, info: ServiceInfo) -> Result<(), WitError> {
+        // Same capability gate as register — a plugin can't update a
+        // service into a name it wasn't allowed to declare.
+        if !service_name_declared(&self.manifest.capabilities.declares_services, &info.name) {
+            let err = WitError::PermissionDenied(format!(
+                "service name `{}` is not declared in this plugin's manifest \
+                 (capabilities.declares_services)",
+                info.name,
+            ));
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                service_id = %id,
+                error = %err,
+                "update-service denied",
+            );
+            return Err(err);
+        }
+        self.services.update(&self.instance_id, &id, info).await
+    }
+
+    async fn remove_service(&mut self, id: ServiceId) -> Result<(), WitError> {
+        let outcome = self.services.remove(&self.instance_id, &id).await;
+        if outcome.is_ok() {
+            tracing::debug!(
+                instance_id = %self.instance_id,
+                service_id = %id,
+                "removed service"
+            );
+        }
+        outcome
+    }
+
+    async fn get_service(&mut self, id: ServiceId) -> Result<ServiceInfo, WitError> {
+        self.services
+            .get(&self.instance_id, &id)
+            .await
+            .map(|meta| meta.info)
+    }
+
+    async fn call_service(
+        &mut self,
+        target: ServiceId,
+        _command: String,
+        _args: Vec<KeyValue>,
+    ) -> Result<CommandResult, WitError> {
+        // Phase 7b stub: the routing dispatcher (recursion stack,
+        // timeout, cross-instance `execute-service-command`) lands in
+        // 7c. Until then, surface `Unavailable` so callers get a clear
+        // signal rather than a silent failure.
+        Err(WitError::Unavailable(format!(
+            "call-service to `{target}` is not available yet (dispatcher lands in Phase 7c)"
+        )))
     }
 }
 
@@ -833,6 +937,7 @@ mod tests {
             fresh_kv(instance_id, 0),
             fresh_event_log(),
             fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
         )
     }
 
@@ -856,6 +961,7 @@ mod tests {
             fresh_kv(instance_id, quota_kb),
             fresh_event_log(),
             fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
         )
     }
 
@@ -874,6 +980,7 @@ mod tests {
             fresh_kv(instance_id, 0),
             fresh_event_log(),
             fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
         )
     }
 
@@ -1139,6 +1246,7 @@ mod tests {
             fresh_kv("alpha", 0),
             fresh_event_log(),
             fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
         );
 
         // A device that claims `dimmer` should be refused.
@@ -1182,6 +1290,7 @@ mod tests {
             fresh_kv("alpha", 0),
             fresh_event_log(),
             fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
         );
 
         let mut info = empty_device("d-shade");
@@ -1263,6 +1372,7 @@ mod tests {
             fresh_kv("alpha", 0),
             fresh_event_log(),
             fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
         );
 
         let mut info = empty_device("d-up");
