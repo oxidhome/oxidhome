@@ -351,6 +351,7 @@ impl PluginInstance {
             kv,
             engine.event_log(),
             blobs,
+            engine.services(),
         );
         let mut store = Store::new(engine.raw(), state);
         // Phase 7a — `epoch_interruption(true)` starts every store at

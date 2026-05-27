@@ -3,7 +3,7 @@
 use crate::bindings::oxidhome::plugin::{
     devices::{Command, CommandResult},
     events::Event,
-    types::Error,
+    types::{Error, KeyValue},
 };
 
 /// Lifecycle and event entry points for a standard-world plugin.
@@ -41,6 +41,22 @@ pub trait Plugin: Default + 'static {
     fn execute_command(&mut self, _device: String, _cmd: Command) -> CommandResult {
         CommandResult::Err(Error::Unavailable(
             "execute-command not implemented by this plugin".into(),
+        ))
+    }
+
+    /// Invoked when the host dispatches a `call-service` to a service
+    /// this plugin registered (Phase 7). `service` is the host-assigned
+    /// `service-id`, `command` the command name, `args` its arguments.
+    /// Default returns [`Error::Unavailable`] — plugins that expose
+    /// services override it.
+    fn execute_service_command(
+        &mut self,
+        _service: String,
+        _command: String,
+        _args: Vec<KeyValue>,
+    ) -> CommandResult {
+        CommandResult::Err(Error::Unavailable(
+            "execute-service-command not implemented by this plugin".into(),
         ))
     }
 

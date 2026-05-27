@@ -28,7 +28,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
-use crate::state::{BlobStore, Db, DeviceRegistry, EventBus, EventLog, KvStore, LogStore};
+use crate::state::{
+    BlobStore, Db, DeviceRegistry, EventBus, EventLog, KvStore, LogStore, ServiceRegistry,
+};
 
 /// Process-wide Wasmtime engine. Components are compiled once per engine
 /// and instantiated cheaply across many [`PluginInstance`]s — wrap this
@@ -52,6 +54,7 @@ pub struct Engine {
     event_log: Arc<EventLog>,
     log_store: Arc<LogStore>,
     blobs: Arc<BlobStore>,
+    services: Arc<ServiceRegistry>,
     instances: Arc<InstanceRegistry>,
 }
 
@@ -118,6 +121,7 @@ impl Engine {
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
             blobs: Arc::new(BlobStore::new(db, blobs_root)),
+            services: Arc::new(ServiceRegistry::new()),
             instances: Arc::new(InstanceRegistry::new()),
         })
     }
@@ -179,6 +183,15 @@ impl Engine {
     #[must_use]
     pub fn blobs(&self) -> Arc<BlobStore> {
         Arc::clone(&self.blobs)
+    }
+
+    /// Shared service registry — Phase 7. Parallel to [`Self::devices`];
+    /// host-side callers (tests, the future API / dispatcher) look up or
+    /// list services through this without going through the WIT
+    /// host-import path.
+    #[must_use]
+    pub fn services(&self) -> Arc<ServiceRegistry> {
+        Arc::clone(&self.services)
     }
 
     /// Per-engine registry of supervised plugin instances — Phase 6d.

@@ -46,6 +46,9 @@ pub use oxidhome_wit::plugin as bindings;
 mod device;
 pub use device::Device;
 
+mod service;
+pub use service::{CommandSpec, Service};
+
 pub mod host;
 
 mod plugin;

@@ -80,6 +80,10 @@ path = "tests/instance_registry.rs"
 name = "watchdog"
 path = "tests/watchdog.rs"
 
+[[test]]
+name = "service_registry"
+path = "tests/service_registry.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors

@@ -48,6 +48,11 @@ interface types {
   /// devices before/after registration.
   type local-id = string;
 
+  /// Stable identifier for a service within the host's service registry
+  /// (Phase 7). Assigned by the host when the plugin registers a service.
+  /// Distinct id-space from `device-id` (the host mints `svc-N`).
+  type service-id = string;
+
   type subscription-id = u64;
 
   variant value {
@@ -220,6 +225,45 @@ interface devices {
     /// Device returned new state inline alongside the OK.
     ok-with-state(list<key-value>),
     err(error),
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Services — non-device peers (automation scripts, virtual integrations)
+//
+// Mirror of the device shape: a plugin instance registers services it
+// owns; commands and results reuse the `devices` `command` /
+// `command-result` types so the SDK can share helpers. The driving
+// use-case is the embedded scripting plugin where each user script is a
+// service that exposes commands and calls into other scripts' commands.
+// ─────────────────────────────────────────────────────────────────────────
+
+interface services {
+  use types.{local-id, key-value};
+
+  /// Metadata for one command a service exposes. Argument / return
+  /// shapes stay textual in 0.1 (no structured-type-in-WIT); plugin
+  /// authors match on `name` from `execute-service-command`.
+  record command-spec {
+    name: string,
+    description: option<string>,
+    /// Free-form hints like `"mode: string — one of occupied/vacant"`.
+    arg-hints: list<string>,
+  }
+
+  record service-info {
+    /// Plugin-instance-local id, echoed back so the plugin can map the
+    /// host-assigned `service-id` to its own bookkeeping.
+    local-id: local-id,
+    /// Human-readable name. Also the capability key gated by the
+    /// manifest's `[capabilities] declares_services`.
+    name: string,
+    /// Free-form metadata persisted with the service.
+    metadata: list<key-value>,
+    /// Commands the service accepts. Empty ⇒ an event-only service with
+    /// no callable surface.
+    commands: list<command-spec>,
   }
 }
 
@@ -633,6 +677,41 @@ interface host-devices {
   get-device:      func(id: device-id) -> result<device-info, error>;
 }
 
+/// Service lifecycle + synchronous cross-plugin dispatch (Phase 7).
+/// Owner-scoped read/write mirrors `host-devices`: a plugin can only
+/// manage services it registered. `register-service` is gated by the
+/// manifest's `[capabilities] declares_services`.
+interface host-services {
+  use types.{service-id, key-value, error};
+  use services.{service-info};
+  use devices.{command-result};
+
+  register-service: func(info: service-info) -> result<service-id, error>;
+  update-service:   func(id: service-id, info: service-info) -> result<_, error>;
+  remove-service:   func(id: service-id) -> result<_, error>;
+  /// Look up a service the plugin previously registered. Returns
+  /// `error::not-found(...)` if the id is unknown to this plugin.
+  get-service:      func(id: service-id) -> result<service-info, error>;
+
+  /// Synchronously call another plugin's (or this plugin's own) service
+  /// command. The host routes `target` → owning instance, races its
+  /// `execute-service-command` export against a timeout, and returns the
+  /// result.
+  ///
+  /// Errors: `not-found` (no such service); `permission-denied`
+  /// (call not allowed); `invalid-argument` (recursion `A→…→A`, or the
+  /// command/args were rejected); `unavailable` (owner not running, or
+  /// the call timed out).
+  ///
+  /// NOTE: Phase 7b ships this signature with a stub host impl that
+  /// returns `unavailable`; the routing dispatcher lands in 7c.
+  call-service: func(
+    target: service-id,
+    command: string,
+    args: list<key-value>,
+  ) -> result<command-result, error>;
+}
+
 /// Event bus pub/sub. Subscribed events are delivered via the plugin's
 /// exported `on-event(...)`.
 interface host-events {
@@ -685,11 +764,12 @@ world plugin {
   import host-devices;
   import host-events;
   import host-config;
+  import host-services;
   import storage;
   import blob-store;
   import logging;
 
-  use types.{device-id};
+  use types.{device-id, service-id, key-value};
   use devices.{command, command-result};
   use events.{event};
 
@@ -704,6 +784,16 @@ world plugin {
   export execute-command: func(
     device: device-id,
     cmd: command,
+  ) -> command-result;
+
+  // Commands targeting services the plugin owns (Phase 7). Invoked by
+  // the host dispatcher when another plugin (or this one) calls
+  // `host-services::call-service` against one of this plugin's services.
+  // Plugins that expose no services return `command-result::err(...)`.
+  export execute-service-command: func(
+    service: service-id,
+    command: string,
+    args: list<key-value>,
   ) -> command-result;
 
   // Optional periodic tick for plugins that poll. Host calls based on the
