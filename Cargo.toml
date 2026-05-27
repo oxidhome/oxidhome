@@ -39,7 +39,7 @@ ipnet = { version = "2.12.0", default-features = false, features = ["serde", "st
 # (consistent build/cross-compile story for the Pi / ARM-NAS targets the
 # OS supports). The Phase-5a KV store + the Phase-5b/c/d additions all
 # go through this one dep. WAL mode is enabled in `state::db`.
-rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40.0", default-features = false, features = ["bundled"] }
 semver = { version = "1.0.28", default-features = false, features = ["serde", "std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # `serde_json` is the bridge between the WIT `value` variant and arbitrary
