@@ -12,6 +12,7 @@ pub use core::option::Option;
 pub use core::result::Result;
 pub use std::string::String;
 pub use std::thread_local;
+pub use std::vec::Vec;
 
 pub use crate::bindings;
 
@@ -79,6 +80,20 @@ pub fn run_execute_command<P: crate::Plugin>(
     })
 }
 
+pub fn run_execute_service_command<P: crate::Plugin>(
+    cell: &'static std::thread::LocalKey<RefCell<Option<P>>>,
+    service: String,
+    command: String,
+    args: Vec<bindings::oxidhome::plugin::types::KeyValue>,
+) -> bindings::oxidhome::plugin::devices::CommandResult {
+    cell.with(|cell| match cell.borrow_mut().as_mut() {
+        Option::Some(p) => crate::Plugin::execute_service_command(p, service, command, args),
+        Option::None => bindings::oxidhome::plugin::devices::CommandResult::Err(
+            bindings::oxidhome::plugin::types::Error::Unavailable("plugin not initialized".into()),
+        ),
+    })
+}
+
 pub fn run_tick<P: crate::Plugin>(cell: &'static std::thread::LocalKey<RefCell<Option<P>>>) {
     cell.with(|cell| {
         if let Option::Some(p) = cell.borrow_mut().as_mut() {
@@ -132,6 +147,21 @@ macro_rules! __plugin_impl {
                     cmd: $crate::__private::bindings::oxidhome::plugin::devices::Command,
                 ) -> $crate::__private::bindings::oxidhome::plugin::devices::CommandResult {
                     $crate::__private::run_execute_command::<$ty>(&__OXIDHOME_PLUGIN, device, cmd)
+                }
+
+                fn execute_service_command(
+                    service: $crate::__private::String,
+                    command: $crate::__private::String,
+                    args: $crate::__private::Vec<
+                        $crate::__private::bindings::oxidhome::plugin::types::KeyValue,
+                    >,
+                ) -> $crate::__private::bindings::oxidhome::plugin::devices::CommandResult {
+                    $crate::__private::run_execute_service_command::<$ty>(
+                        &__OXIDHOME_PLUGIN,
+                        service,
+                        command,
+                        args,
+                    )
                 }
 
                 fn tick() {

@@ -28,7 +28,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
-use crate::state::{BlobStore, Db, DeviceRegistry, EventBus, EventLog, KvStore, LogStore};
+use crate::state::{
+    BlobStore, Db, DeviceRegistry, EventBus, EventLog, KvStore, LogStore, ServiceRegistry,
+};
 
 /// Process-wide Wasmtime engine. Components are compiled once per engine
 /// and instantiated cheaply across many [`PluginInstance`]s — wrap this
@@ -52,6 +54,7 @@ pub struct Engine {
     event_log: Arc<EventLog>,
     log_store: Arc<LogStore>,
     blobs: Arc<BlobStore>,
+    services: Arc<ServiceRegistry>,
     instances: Arc<InstanceRegistry>,
 }
 
@@ -118,6 +121,7 @@ impl Engine {
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
             blobs: Arc::new(BlobStore::new(db, blobs_root)),
+            services: Arc::new(ServiceRegistry::new()),
             instances: Arc::new(InstanceRegistry::new()),
         })
     }
@@ -179,6 +183,15 @@ impl Engine {
     #[must_use]
     pub fn blobs(&self) -> Arc<BlobStore> {
         Arc::clone(&self.blobs)
+    }
+
+    /// Shared service registry — Phase 7. Parallel to [`Self::devices`];
+    /// host-side callers (tests, the future API / dispatcher) look up or
+    /// list services through this without going through the WIT
+    /// host-import path.
+    #[must_use]
+    pub fn services(&self) -> Arc<ServiceRegistry> {
+        Arc::clone(&self.services)
     }
 
     /// Per-engine registry of supervised plugin instances — Phase 6d.
@@ -253,7 +266,8 @@ impl Engine {
         // spawns a supervisor task. Spawning the reaper *inside* the
         // factory keeps it strictly ordered after the supervisor
         // spawn, so the reaper can't miss the first `watch` notify.
-        let engine = self.clone();
+        let engine_for_spawn = self.clone();
+        let engine_for_reaper = self.clone();
         let registry = Arc::clone(&self.instances);
         let plugin_dir_for_spawn = plugin_dir;
         let instance_id_for_spawn = instance_id.clone();
@@ -262,7 +276,7 @@ impl Engine {
         self.instances
             .register(instance_id, plugin_id, singleton, || {
                 let handle = supervise_with_tuning(
-                    engine,
+                    engine_for_spawn,
                     plugin_dir_for_spawn,
                     instance_id_for_spawn,
                     overrides,
@@ -271,6 +285,19 @@ impl Engine {
                 let reaper_handle = handle.clone();
                 tokio::spawn(async move {
                     let _ = reaper_handle.wait_terminal().await;
+                    // Drop any device/service registry entries the
+                    // instance left behind. The supervisor sweeps at
+                    // the top of every load attempt; this is the
+                    // final post-terminal cleanup so a Stopped /
+                    // Failed instance leaves nothing behind.
+                    engine_for_reaper
+                        .devices()
+                        .remove_by_owner(&instance_id_for_reaper)
+                        .await;
+                    engine_for_reaper
+                        .services()
+                        .remove_by_owner(&instance_id_for_reaper)
+                        .await;
                     registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
                 });
                 handle

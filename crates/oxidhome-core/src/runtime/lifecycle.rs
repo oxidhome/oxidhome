@@ -604,6 +604,14 @@ async fn run_one_lifecycle(
     wakeup: &mut broadcast::Receiver<Event>,
     state_tx: &watch::Sender<InstanceState>,
 ) -> LifecycleOutcome {
+    // Sweep any device/service registry entries this instance left
+    // behind on a previous life. First load is a no-op; on a restart
+    // it prevents stacking duplicates as `init` re-registers, and
+    // keeps the registries from growing unboundedly across crash
+    // loops. Idempotent + cheap (one HashMap retain each).
+    engine.devices().remove_by_owner(instance_id).await;
+    engine.services().remove_by_owner(instance_id).await;
+
     transition(state_tx, instance_id, InstanceState::Loading);
 
     let mut instance = match PluginInstance::load_with_overrides(

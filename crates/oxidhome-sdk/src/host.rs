@@ -24,12 +24,16 @@
 //! Wasmtime. This is the "boilerplate / hard-to-mock IO" exemption
 //! category from the project-wide coverage policy.
 
+use crate::bindings::oxidhome::plugin::devices::CommandResult;
 use crate::bindings::oxidhome::plugin::devices::DeviceInfo;
 use crate::bindings::oxidhome::plugin::events::{
     CustomEvent, Event, EventFilter, EventPayload, StateChange,
 };
-use crate::bindings::oxidhome::plugin::types::{DeviceId, Error, KeyValue, SubscriptionId};
-use crate::bindings::oxidhome::plugin::{host_devices, host_events};
+use crate::bindings::oxidhome::plugin::services::ServiceInfo;
+use crate::bindings::oxidhome::plugin::types::{
+    DeviceId, Error, KeyValue, ServiceId, SubscriptionId,
+};
+use crate::bindings::oxidhome::plugin::{host_devices, host_events, host_services};
 
 /// Per-instance config reads (Phase 4C). Plugin authors call
 /// `oxidhome_sdk::host::config::get_typed::<T>("...")` etc. — see
@@ -99,6 +103,69 @@ pub fn remove_device(id: &DeviceId) -> Result<(), Error> {
 /// [`Error::NotFound`] if the id isn't registered.
 pub fn get_device(id: &DeviceId) -> Result<DeviceInfo, Error> {
     host_devices::get_device(id)
+}
+
+// ── Services (Phase 7) ───────────────────────────────────────────────
+
+/// Register a service with the host. Accepts either a [`Service`]
+/// builder (recommended) or a raw [`ServiceInfo`]. Returns the
+/// host-assigned `service-id`.
+///
+/// # Errors
+///
+/// [`Error::PermissionDenied`] when the manifest's
+/// `[capabilities] declares_services` didn't authorize the service's
+/// `name`.
+pub fn register_service(service: impl Into<ServiceInfo>) -> Result<ServiceId, Error> {
+    host_services::register_service(&service.into())
+}
+
+/// Update an already-registered service's metadata / commands.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the id isn't registered to this instance.
+pub fn update_service(id: &ServiceId, info: &ServiceInfo) -> Result<(), Error> {
+    host_services::update_service(id, info)
+}
+
+/// Remove a service from the registry.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the id isn't registered; [`Error::Unavailable`]
+/// if a `call-service` to it is still in flight.
+pub fn remove_service(id: &ServiceId) -> Result<(), Error> {
+    host_services::remove_service(id)
+}
+
+/// Look up a service the plugin previously registered.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the id isn't registered.
+pub fn get_service(id: &ServiceId) -> Result<ServiceInfo, Error> {
+    host_services::get_service(id)
+}
+
+/// Synchronously call a service command — on another plugin or on this
+/// one. The host routes `target` to its owning instance and returns the
+/// result.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] (no such service), [`Error::PermissionDenied`]
+/// (call not allowed), [`Error::InvalidArgument`] (recursion, or bad
+/// command/args), [`Error::Unavailable`] (owner down or timed out).
+///
+/// NOTE: Phase 7b's host impl is a stub that returns
+/// [`Error::Unavailable`]; the routing dispatcher lands in 7c.
+pub fn call_service(
+    target: &ServiceId,
+    command: &str,
+    args: &[KeyValue],
+) -> Result<CommandResult, Error> {
+    host_services::call_service(target, command, args)
 }
 
 // ── Events ───────────────────────────────────────────────────────────
