@@ -136,6 +136,20 @@ impl DeviceRegistry {
     pub async fn list(&self) -> Vec<DeviceMeta> {
         self.inner.read().await.values().cloned().collect()
     }
+
+    /// Drop every device owned by `instance_id`. Called by the
+    /// Phase-6 supervisor when an instance reaches a terminal state
+    /// *and* at the top of every restart attempt — without it, a
+    /// plugin that `register-device`s in `init` and then crash-loops
+    /// would stack a fresh entry per restart life, and even on clean
+    /// stop its devices would outlive the instance. Returns the
+    /// number of entries removed.
+    pub async fn remove_by_owner(&self, instance_id: &str) -> usize {
+        let mut guard = self.inner.write().await;
+        let before = guard.len();
+        guard.retain(|_, m| m.owner_instance != instance_id);
+        before - guard.len()
+    }
 }
 
 /// Bundle the registry into a shared `Arc` for [`Engine`] /

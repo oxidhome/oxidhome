@@ -114,6 +114,20 @@ impl ServiceRegistry {
     pub async fn list(&self) -> Vec<ServiceMeta> {
         self.inner.read().await.values().cloned().collect()
     }
+
+    /// Drop every service owned by `instance_id`. Called by the
+    /// supervisor when an instance reaches a terminal state, *and* at
+    /// the top of every restart attempt — without it, a plugin that
+    /// `register-service`s in `init` and then crash-loops would stack
+    /// a fresh entry per restart life, and even on clean stop its
+    /// services would outlive the instance. Returns the number of
+    /// entries removed (for tracing).
+    pub async fn remove_by_owner(&self, instance_id: &str) -> usize {
+        let mut guard = self.inner.write().await;
+        let before = guard.len();
+        guard.retain(|_, m| m.owner_instance != instance_id);
+        before - guard.len()
+    }
 }
 
 /// Shared `Arc` alias, parallel to `SharedDeviceRegistry`.

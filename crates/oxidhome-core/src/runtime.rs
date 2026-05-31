@@ -266,7 +266,8 @@ impl Engine {
         // spawns a supervisor task. Spawning the reaper *inside* the
         // factory keeps it strictly ordered after the supervisor
         // spawn, so the reaper can't miss the first `watch` notify.
-        let engine = self.clone();
+        let engine_for_spawn = self.clone();
+        let engine_for_reaper = self.clone();
         let registry = Arc::clone(&self.instances);
         let plugin_dir_for_spawn = plugin_dir;
         let instance_id_for_spawn = instance_id.clone();
@@ -275,7 +276,7 @@ impl Engine {
         self.instances
             .register(instance_id, plugin_id, singleton, || {
                 let handle = supervise_with_tuning(
-                    engine,
+                    engine_for_spawn,
                     plugin_dir_for_spawn,
                     instance_id_for_spawn,
                     overrides,
@@ -284,6 +285,19 @@ impl Engine {
                 let reaper_handle = handle.clone();
                 tokio::spawn(async move {
                     let _ = reaper_handle.wait_terminal().await;
+                    // Drop any device/service registry entries the
+                    // instance left behind. The supervisor sweeps at
+                    // the top of every load attempt; this is the
+                    // final post-terminal cleanup so a Stopped /
+                    // Failed instance leaves nothing behind.
+                    engine_for_reaper
+                        .devices()
+                        .remove_by_owner(&instance_id_for_reaper)
+                        .await;
+                    engine_for_reaper
+                        .services()
+                        .remove_by_owner(&instance_id_for_reaper)
+                        .await;
                     registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
                 });
                 handle
