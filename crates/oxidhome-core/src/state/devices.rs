@@ -23,9 +23,8 @@
 //! for a `SQLite`-backed store; that work happens later.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::host_impl::plugin::oxidhome::plugin::devices::DeviceInfo;
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, Error as WitError};
@@ -69,6 +68,17 @@ impl DeviceRegistry {
         format!("dev-{n}")
     }
 
+    // Poison-tolerant accessors — see the matching note on
+    // `ServiceRegistry::services_read`. The critical sections are
+    // atomic `HashMap` ops + Arc / String clones, so recovering the
+    // inner guard after a panic-under-lock is consistent.
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<DeviceId, Arc<DeviceMeta>>> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<DeviceId, Arc<DeviceMeta>>> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Register a device on behalf of `owner_instance`. Returns the
     /// fresh host-assigned id.
     pub fn register(&self, owner_instance: String, info: DeviceInfo) -> DeviceId {
@@ -78,10 +88,7 @@ impl DeviceRegistry {
             owner_instance,
             info,
         });
-        self.inner
-            .write()
-            .expect("devices lock poisoned")
-            .insert(id.clone(), meta);
+        self.write().insert(id.clone(), meta);
         id
     }
 
@@ -101,7 +108,7 @@ impl DeviceRegistry {
         id: &DeviceId,
         info: DeviceInfo,
     ) -> Result<(), WitError> {
-        let mut guard = self.inner.write().expect("devices lock poisoned");
+        let mut guard = self.write();
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
                 let new = Arc::new(DeviceMeta {
@@ -119,7 +126,7 @@ impl DeviceRegistry {
     /// Drop a device from the registry, scoped to the caller's
     /// plugin instance (see [`Self::update`] for rationale).
     pub fn remove(&self, owner_instance: &str, id: &DeviceId) -> Result<(), WitError> {
-        let mut guard = self.inner.write().expect("devices lock poisoned");
+        let mut guard = self.write();
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
                 guard.remove(id);
@@ -132,7 +139,7 @@ impl DeviceRegistry {
     /// Look up a device by id, scoped to the caller's instance.
     /// Returns a cheap `Arc<DeviceMeta>` (atomic bump, no deep copy).
     pub fn get(&self, owner_instance: &str, id: &DeviceId) -> Result<Arc<DeviceMeta>, WitError> {
-        let guard = self.inner.read().expect("devices lock poisoned");
+        let guard = self.read();
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => Ok(Arc::clone(meta)),
             _ => Err(WitError::NotFound(format!("device {id} not registered"))),
@@ -143,12 +150,7 @@ impl DeviceRegistry {
     /// per entry, no deep copies).
     #[must_use]
     pub fn list(&self) -> Vec<Arc<DeviceMeta>> {
-        self.inner
-            .read()
-            .expect("devices lock poisoned")
-            .values()
-            .map(Arc::clone)
-            .collect()
+        self.read().values().map(Arc::clone).collect()
     }
 
     /// Drop every device owned by `instance_id`. Called by the
@@ -158,7 +160,7 @@ impl DeviceRegistry {
     /// would stack a fresh entry per restart life. Returns the
     /// number of entries removed.
     pub fn remove_by_owner(&self, instance_id: &str) -> usize {
-        let mut guard = self.inner.write().expect("devices lock poisoned");
+        let mut guard = self.write();
         let before = guard.len();
         guard.retain(|_, m| m.owner_instance != instance_id);
         before - guard.len()

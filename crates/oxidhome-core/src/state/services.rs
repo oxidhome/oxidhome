@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::host_impl::plugin::oxidhome::plugin::services::ServiceInfo;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, ServiceId};
@@ -79,6 +79,25 @@ impl ServiceRegistry {
         format!("svc-{n}")
     }
 
+    // Poison-tolerant lock accessors. `std::sync::*` poisons on a
+    // panic-under-lock, after which every `.unwrap()` / `.expect()` on
+    // the lock panics too — a single hiccup would brick the registry
+    // for the engine's lifetime. None of our critical sections can
+    // leave the map invariant-violated (atomic `HashMap` ops + Arc /
+    // String clones + integer math), so recovering the inner guard is
+    // both correct and far less alarming than a cascading panic.
+    fn services_read(&self) -> RwLockReadGuard<'_, HashMap<ServiceId, Arc<ServiceMeta>>> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn services_write(&self) -> RwLockWriteGuard<'_, HashMap<ServiceId, Arc<ServiceMeta>>> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn calls_lock(&self) -> MutexGuard<'_, ActiveCalls> {
+        self.active_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Register a service on behalf of `owner_instance`. Returns the
     /// fresh host-assigned id.
     pub fn register(&self, owner_instance: String, info: ServiceInfo) -> ServiceId {
@@ -88,10 +107,7 @@ impl ServiceRegistry {
             owner_instance,
             info,
         });
-        self.inner
-            .write()
-            .expect("services lock poisoned")
-            .insert(id.clone(), meta);
+        self.services_write().insert(id.clone(), meta);
         id
     }
 
@@ -104,7 +120,7 @@ impl ServiceRegistry {
         id: &ServiceId,
         info: ServiceInfo,
     ) -> Result<(), WitError> {
-        let mut guard = self.inner.write().expect("services lock poisoned");
+        let mut guard = self.services_write();
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
                 // Rebuild the Arc rather than mutating in place —
@@ -130,8 +146,8 @@ impl ServiceRegistry {
     /// refcount). Lock order (`inner` → `active_calls`) matches
     /// [`Self::acquire_call`] to keep the two linearizable.
     pub fn remove(&self, owner_instance: &str, id: &ServiceId) -> Result<(), WitError> {
-        let mut guard = self.inner.write().expect("services lock poisoned");
-        let mut calls = self.active_calls.lock().expect("active_calls poisoned");
+        let mut guard = self.services_write();
+        let mut calls = self.calls_lock();
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
                 let in_flight = calls.get(id).copied().unwrap_or(0);
@@ -151,7 +167,7 @@ impl ServiceRegistry {
     /// Look up a service by id, scoped to the caller's instance.
     /// Returns a cheap `Arc<ServiceMeta>` (atomic bump, no deep copy).
     pub fn get(&self, owner_instance: &str, id: &ServiceId) -> Result<Arc<ServiceMeta>, WitError> {
-        let guard = self.inner.read().expect("services lock poisoned");
+        let guard = self.services_read();
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => Ok(Arc::clone(meta)),
             _ => Err(WitError::NotFound(format!("service {id} not registered"))),
@@ -163,9 +179,7 @@ impl ServiceRegistry {
     /// API/MCP read paths). Not owner-scoped. Plugin-facing reads
     /// go through [`Self::get`].
     pub fn get_any(&self, id: &ServiceId) -> Result<Arc<ServiceMeta>, WitError> {
-        self.inner
-            .read()
-            .expect("services lock poisoned")
+        self.services_read()
             .get(id)
             .map(Arc::clone)
             .ok_or_else(|| WitError::NotFound(format!("service {id} not registered")))
@@ -177,9 +191,7 @@ impl ServiceRegistry {
     /// caller only needs to route the call to its owner.
     #[must_use]
     pub fn get_owner(&self, id: &ServiceId) -> Option<String> {
-        self.inner
-            .read()
-            .expect("services lock poisoned")
+        self.services_read()
             .get(id)
             .map(|m| m.owner_instance.clone())
     }
@@ -192,11 +204,11 @@ impl ServiceRegistry {
     /// services read lock as the counter increment so an in-flight
     /// removal can't race the bump).
     pub fn acquire_call(self: &Arc<Self>, id: &ServiceId) -> Result<CallGuard, WitError> {
-        let services = self.inner.read().expect("services lock poisoned");
+        let services = self.services_read();
         if !services.contains_key(id) {
             return Err(WitError::NotFound(format!("service {id} not registered")));
         }
-        let mut calls = self.active_calls.lock().expect("active_calls poisoned");
+        let mut calls = self.calls_lock();
         *calls.entry(id.clone()).or_insert(0) += 1;
         Ok(CallGuard {
             registry: Arc::clone(self),
@@ -207,7 +219,7 @@ impl ServiceRegistry {
     /// Internal: decrement the in-flight refcount for `id`. Called
     /// from [`CallGuard::drop`]. Tolerant of an over-release.
     fn release_call(&self, id: &ServiceId) {
-        let mut calls = self.active_calls.lock().expect("active_calls poisoned");
+        let mut calls = self.calls_lock();
         if let Some(n) = calls.get_mut(id) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -220,12 +232,7 @@ impl ServiceRegistry {
     #[doc(hidden)]
     #[must_use]
     pub fn active_call_count(&self, id: &ServiceId) -> u32 {
-        self.active_calls
-            .lock()
-            .expect("active_calls poisoned")
-            .get(id)
-            .copied()
-            .unwrap_or(0)
+        self.calls_lock().get(id).copied().unwrap_or(0)
     }
 
     /// Snapshot of every registered service — cheap (one `Arc::clone`
@@ -233,24 +240,41 @@ impl ServiceRegistry {
     /// fine for the API/MCP read paths, avoid in hot loops.
     #[must_use]
     pub fn list(&self) -> Vec<Arc<ServiceMeta>> {
-        self.inner
-            .read()
-            .expect("services lock poisoned")
-            .values()
-            .map(Arc::clone)
-            .collect()
+        self.services_read().values().map(Arc::clone).collect()
     }
 
     /// Drop every service owned by `instance_id`. Called by the
     /// supervisor when an instance reaches a terminal state *and* at
     /// the top of every restart attempt — without it, a plugin that
     /// `register-service`s in `init` and crash-loops stacks a fresh
-    /// entry per restart life. Returns the number of entries removed.
+    /// entry per restart life.
+    ///
+    /// Sweeps `active_calls` for the same ids. In the expected flow
+    /// the supervisor's task drop runs every owned `CallGuard::Drop`
+    /// before `wait_terminal()` returns, so the refcounts are
+    /// already 0 by the time the reaper calls us — but matching
+    /// [`Self::remove`]'s contract (clean both maps) means stale
+    /// state from any unexpected path can't leak.
+    ///
+    /// Returns the number of `inner` entries removed (the public
+    /// "what got swept" figure; the parallel `active_calls` cleanup
+    /// is bookkeeping).
     pub fn remove_by_owner(&self, instance_id: &str) -> usize {
-        let mut guard = self.inner.write().expect("services lock poisoned");
-        let before = guard.len();
-        guard.retain(|_, m| m.owner_instance != instance_id);
-        before - guard.len()
+        let mut guard = self.services_write();
+        let mut calls = self.calls_lock();
+        let mut removed_ids: Vec<ServiceId> = Vec::new();
+        guard.retain(|id, m| {
+            if m.owner_instance == instance_id {
+                removed_ids.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for id in &removed_ids {
+            calls.remove(id);
+        }
+        removed_ids.len()
     }
 }
 
@@ -409,5 +433,36 @@ mod tests {
         assert_eq!(reg.active_call_count(&id), 1);
         drop(guard);
         assert_eq!(reg.active_call_count(&id), 0);
+    }
+
+    /// `remove_by_owner` cleans `active_calls` alongside `inner`. In
+    /// the supervised flow `CallGuard::Drop` already takes the count
+    /// to 0 before the reaper runs, but this defends against any
+    /// stale state from an unexpected path (and matches `remove`'s
+    /// contract of clearing both maps).
+    #[test]
+    fn remove_by_owner_clears_active_calls_for_owner() {
+        let reg = Arc::new(ServiceRegistry::new());
+        let a1 = reg.register("alpha".into(), info("svc1"));
+        let _a2 = reg.register("alpha".into(), info("svc2"));
+        let b1 = reg.register("beta".into(), info("ring"));
+
+        // Force a stale `active_calls` entry for an alpha service by
+        // forgetting the guard (simulating a worst-case where the
+        // refcount didn't drop cleanly).
+        let alpha_guard = reg.acquire_call(&a1).expect("acquire alpha");
+        let beta_guard = reg.acquire_call(&b1).expect("acquire beta");
+        std::mem::forget(alpha_guard);
+        assert_eq!(reg.active_call_count(&a1), 1);
+        assert_eq!(reg.active_call_count(&b1), 1);
+
+        let removed = reg.remove_by_owner("alpha");
+        assert_eq!(removed, 2);
+        // Alpha's stale active-call entry is gone — defense in depth.
+        assert_eq!(reg.active_call_count(&a1), 0);
+        // Beta's untouched (different owner).
+        assert_eq!(reg.active_call_count(&b1), 1);
+        drop(beta_guard);
+        assert_eq!(reg.active_call_count(&b1), 0);
     }
 }
