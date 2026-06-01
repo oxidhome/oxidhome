@@ -1,10 +1,40 @@
 //! Plugin SDK for `OxidHome`.
 //!
-//! Phase 2 surface: a [`Plugin`] trait, a [`plugin!`](crate::plugin)
-//! macro that wires the trait to the wit-bindgen-generated guest exports
-//! for the standard `plugin` world, and a [`logging::init`] bridge that
-//! forwards `tracing` events to the host's `logging` import. Streaming /
-//! AI worlds + structured fields + storage helpers land in later phases.
+//! A [`Plugin`] trait + a [`plugin!`](crate::plugin) macro that wires
+//! it to the wit-bindgen-generated guest exports for the standard
+//! `plugin` world, plus thin host-import wrappers and ergonomic
+//! builders.
+//!
+//! What's available today, by category:
+//!
+//! - **Lifecycle & events** — `init` / `shutdown` / `on_event` /
+//!   `tick` / `execute_command` / `execute_service_command` on
+//!   [`Plugin`]; [`plugin!`] generates the canonical-ABI glue.
+//! - **Devices** — [`Device`] builder; [`host::register_device`] /
+//!   `update_device` / `remove_device` / `get_device`; gated by
+//!   `[capabilities] declares_devices`.
+//! - **Services** (Phase 7) — [`Service`] + [`CommandSpec`] builders;
+//!   [`host::register_service`] / `update_service` / `remove_service`
+//!   / `get_service`; gated by `[capabilities] declares_services`.
+//!   [`host::call_service`] dispatches synchronously to another
+//!   plugin's (or this plugin's) service; the host rejects A→…→A
+//!   cycles at instance granularity. Cross-plugin example pair:
+//!   `examples/service-counter` + `examples/service-caller`.
+//! - **Events** — [`host::publish_event`] / `publish_state_change` /
+//!   `publish_custom_event` / `subscribe` / `unsubscribe`.
+//! - **Storage** ([`host::storage`]) — per-instance KV; manifest
+//!   `[capabilities] storage_quota_kb` (default 0 = denied).
+//! - **Blobs** ([`host::blobs`]) — filesystem-backed bytes + a
+//!   `SQLite` name index; `[capabilities] blob_quota_mb`.
+//! - **Config** ([`host::config`]) — `get` / `get_typed::<T>` /
+//!   `list` against the manifest's `[config]` schema folded with
+//!   per-instance overrides.
+//! - **Logging** ([`logging::init`]) — installs a `tracing` ↔ host
+//!   `logging` bridge so [`tracing`] macros from plugin code reach
+//!   the host's log store.
+//!
+//! Streaming / AI worlds land in later phases; everything above is
+//! the standard `plugin` world.
 //!
 //! # Hello world
 //!

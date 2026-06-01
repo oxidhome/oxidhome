@@ -63,7 +63,8 @@ pub mod blobs;
 // ── Devices ──────────────────────────────────────────────────────────
 
 /// Register a device with the host. Accepts either a
-/// [`Device`] builder (recommended) or a raw [`DeviceInfo`].
+/// [`Device`](crate::Device) builder (recommended) or a raw
+/// [`DeviceInfo`].
 /// Returns the host-assigned `device-id`, which is what later
 /// `update_device` / `remove_device` / `publish_state_change` calls
 /// reference.
@@ -107,9 +108,9 @@ pub fn get_device(id: &DeviceId) -> Result<DeviceInfo, Error> {
 
 // ── Services (Phase 7) ───────────────────────────────────────────────
 
-/// Register a service with the host. Accepts either a [`Service`]
-/// builder (recommended) or a raw [`ServiceInfo`]. Returns the
-/// host-assigned `service-id`.
+/// Register a service with the host. Accepts either a
+/// [`Service`](crate::Service) builder (recommended) or a raw
+/// [`ServiceInfo`]. Returns the host-assigned `service-id`.
 ///
 /// # Errors
 ///

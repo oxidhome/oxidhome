@@ -202,17 +202,24 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 
 - **Lifecycle** — `init()`, `shutdown()`
 - **Event delivery** — the host buffers matching events on the subscriber's per-instance queue. A host-side helper (`PluginInstance::drain_events()`) walks that queue and invokes the plugin's `on-event` export once per buffered event. There is no separate `drain-events` export on the plugin world. Phase 3 ships the helper; *when* to call it is the caller's choice today — integration tests invoke it explicitly after each host-driven step. The intended future driver is a per-instance tokio task that owns the `Store` and `select!`s between control commands and bus events, draining automatically after each entry point (`init`, `execute-command`, `tick`); that scheduler lands with Phase 6's per-instance lifecycle. The polling-drain shape preserves the single-threaded per-`Store` WASM contract — no host call ever re-enters the plugin from a separate task — and avoids needing a streaming export on the plugin world.
-- **Commands** — `execute-command(device, cmd)` for actions targeting plugin's devices
+- **Commands** — `execute-command(device, cmd)` for actions targeting plugin's devices; `execute-service-command(service, command, args)` for actions targeting the plugin's services (Phase 7), routed from the host dispatcher
 - **Periodic** — `tick()` for plugins that genuinely need a heartbeat (most should be event-driven)
 
 ### Plugin → Host (imports)
 
-- **Device lifecycle** — `register-device`, `update-device`, `remove-device`
+- **Device lifecycle** — `register-device`, `update-device`, `remove-device`, `get-device`
+- **Service lifecycle** (Phase 7) — `register-service`, `update-service`, `remove-service`, `get-service`; gated by `[capabilities] declares_services`
 - **Event bus** — `publish-event`, `subscribe`, `unsubscribe`
-- **Storage** — `get`, `set`, `delete`, `list-keys` (small KV, per instance)
+- **Storage** — `get`, `set`, `delete`, `list-keys` (small KV, per instance); blob bytes via `host-blobs`
 - **Configuration** — `get-config`, `list-config`
 - **Inference** (AI plugins only) — `load-model`, model handles with `infer()`
 - **Logging** — at standard levels
+
+### Plugin → Plugin (Phase 7)
+
+- **Service dispatch** — `host-services::call-service(target, command, args)` is a synchronous host-mediated call. The host resolves `target` (a `service-id` minted by `register-service`) to its owning instance, looks the instance up in the engine's registry, and hops to that instance's Phase-6 supervisor task to invoke its `execute-service-command` export. The single-`Store` contract holds: a callee's wasm only ever runs on its own supervisor task.
+- **Recursion / cycles** — the dispatcher carries the in-flight call chain across the task hop (in `ControlCommand::ExecuteService`); the callee's supervisor re-scopes a `tokio::task_local` on its task before driving the wasm so any nested `call-service` sees the full chain. Cycle detection is at instance granularity — a same-instance peer service must use the plugin's internal dispatch — and rejects with `Error::InvalidArgument` rather than deadlocking.
+- **Back-pressure** — a registry refcount makes `remove-service` refuse with `Error::Unavailable` while a call is in flight; the refcount travels with the work (in the control-channel message), not with the caller's wait future, so a dispatch-side timeout can't release it mid-handler.
 
 ### Long-running work
 
@@ -229,7 +236,7 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 > - **Host-side blob storage** — *now in scope*, planned for Phase 5b (filesystem bytes + SQLite index).
 > - **Authentication / actor identity in commands** — *pulled forward*; an actor model lands by Phase 4 and is required before Phase 12's external API.
 > - **Storage backend** — *settled* (SQLite via `rusqlite` + `bundled`, WAL mode).
-> - **Inter-plugin communication beyond the event bus** — *now in scope* as Phase 7. Services + a synchronous cross-plugin `call-service` host import; the motivation comes from the embedded scripting-plugin design (Rhai/Lua hosts where automation instances expose commands and call each other).
+> - **Inter-plugin communication beyond the event bus** — *shipped in Phase 7*. A plugin instance can register **services** (non-device peers — automation scripts, virtual integrations) gated by `[capabilities] declares_services`; another plugin (or the same plugin) can drive them through `host-services::call-service`, a synchronous host import. The host's dispatcher routes the call to the owner instance's supervisor task (preserving the single-`Store` contract), rejects A→…→A cycles at instance granularity, and bounds the round-trip with a dispatch timeout *and* the per-call liveness watchdog.
 > - **Plugin resource usage** — *not limited by design*. OxidHome does not cap a plugin's CPU/memory; on an admin-curated home hub, catching a greedy or buggy plugin is the operator's job, and the host's role is to surface metrics rather than enforce compute quotas. The host keeps exactly one guarantee — a per-call **liveness watchdog** (Wasmtime epoch interruption) so the supervisor can always reclaim a wedged/infinite-loop instance. (Storage and blob *byte* quotas remain — they guard finite disk, not compute.)
 
 The remaining items below are still deferred:
