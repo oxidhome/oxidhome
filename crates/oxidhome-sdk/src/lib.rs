@@ -16,10 +16,13 @@
 //! - **Services** (Phase 7) — [`Service`] + [`CommandSpec`] builders;
 //!   [`host::register_service`] / `update_service` / `remove_service`
 //!   / `get_service`; gated by `[capabilities] declares_services`.
-//!   [`host::call_service`] dispatches synchronously to another
-//!   plugin's (or this plugin's) service; the host rejects A→…→A
-//!   cycles at instance granularity. Cross-plugin example pair:
-//!   `examples/service-counter` + `examples/service-caller`.
+//!   [`host::call_service`] dispatches synchronously to a service
+//!   owned by **another** plugin instance; the host rejects cycles
+//!   at instance granularity, including the first-hop A→A self-call
+//!   (same-instance peer services must use the plugin's *internal*
+//!   dispatch, not `call_service`, to avoid deadlocking the single
+//!   `Store`). Cross-plugin example pair: `examples/service-counter`
+//!   + `examples/service-caller`.
 //! - **Events** — [`host::publish_event`] / `publish_state_change` /
 //!   `publish_custom_event` / `subscribe` / `unsubscribe`.
 //! - **Storage** ([`host::storage`]) — per-instance KV; manifest

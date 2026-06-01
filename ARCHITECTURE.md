@@ -210,7 +210,7 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 - **Device lifecycle** — `register-device`, `update-device`, `remove-device`, `get-device`
 - **Service lifecycle** (Phase 7) — `register-service`, `update-service`, `remove-service`, `get-service`; gated by `[capabilities] declares_services`
 - **Event bus** — `publish-event`, `subscribe`, `unsubscribe`
-- **Storage** — `get`, `set`, `delete`, `list-keys` (small KV, per instance); blob bytes via `host-blobs`
+- **Storage** — `get`, `set`, `delete`, `list-keys` (small KV, per instance); blob bytes via the `blob-store` interface
 - **Configuration** — `get-config`, `list-config`
 - **Inference** (AI plugins only) — `load-model`, model handles with `infer()`
 - **Logging** — at standard levels
