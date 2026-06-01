@@ -33,4 +33,4 @@ pub use kv::{KvError, KvStore};
 pub use log_store::{
     HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogStoreError, LogValue, SqliteLayer,
 };
-pub use services::{ServiceMeta, ServiceRegistry};
+pub use services::{CallGuard, ServiceMeta, ServiceRegistry};

@@ -38,7 +38,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use crate::Engine;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
-use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
+use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
 
 use super::instance::{InitError, PluginInstance};
 
@@ -163,6 +163,15 @@ enum ControlCommand {
         cmd: Command,
         reply: oneshot::Sender<anyhow::Result<CommandResult>>,
     },
+    /// Run the plugin's `execute-service-command` on a service it owns
+    /// — the dispatcher hops to this on the owner's supervisor task so
+    /// the single-`Store` contract holds.
+    ExecuteService {
+        service: ServiceId,
+        command: String,
+        args: Vec<KeyValue>,
+        reply: oneshot::Sender<anyhow::Result<CommandResult>>,
+    },
     /// Run `shutdown` and end the supervisor task.
     Shutdown { reply: oneshot::Sender<()> },
 }
@@ -275,6 +284,46 @@ impl InstanceHandle {
         rx.await.map_err(|_| {
             anyhow!(
                 "instance `{}` supervisor dropped the command reply",
+                self.instance_id,
+            )
+        })?
+    }
+
+    /// Run the plugin's `execute-service-command` on `service`. Used
+    /// by [`crate::runtime::dispatcher`]'s cross-instance routing —
+    /// always hops to the *owner*'s supervisor task so the
+    /// single-`Store` contract holds.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if the supervisor is gone, the supervisor dropped the
+    /// reply, or the call trapped (a trap also crashes the instance).
+    /// A plugin returning a normal error result surfaces as
+    /// `Ok(CommandResult::Err(..))`.
+    pub async fn execute_service_command(
+        &self,
+        service: ServiceId,
+        command: String,
+        args: Vec<KeyValue>,
+    ) -> anyhow::Result<CommandResult> {
+        let (reply, rx) = oneshot::channel();
+        self.control
+            .send(ControlCommand::ExecuteService {
+                service,
+                command,
+                args,
+                reply,
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "instance `{}` supervisor is no longer running",
+                    self.instance_id,
+                )
+            })?;
+        rx.await.map_err(|_| {
+            anyhow!(
+                "instance `{}` supervisor dropped the service-command reply",
                 self.instance_id,
             )
         })?
@@ -764,7 +813,20 @@ async fn backoff_wait(
                     let _ = reply.send(());
                     return BackoffOutcome::Shutdown;
                 }
+                // The two `Execute*` arms hand the caller the same
+                // "instance is restarting" Err, but the typed reply
+                // channels are distinct so the arms can't share a
+                // single block. The arms may diverge later (e.g.
+                // returning a typed `CommandResult::Err` for service
+                // calls); keep them separate now rather than merging.
+                #[allow(clippy::match_same_arms)]
                 Some(ControlCommand::Execute { reply, .. }) => {
+                    let _ = reply.send(Err(anyhow!(
+                        "instance `{instance_id}` is restarting after a crash",
+                    )));
+                }
+                #[allow(clippy::match_same_arms)]
+                Some(ControlCommand::ExecuteService { reply, .. }) => {
                     let _ = reply.send(Err(anyhow!(
                         "instance `{instance_id}` is restarting after a crash",
                     )));
@@ -810,6 +872,28 @@ async fn handle_control(
                     // instance — an `execute-command` trap is a crash.
                     let _ = reply.send(Err(anyhow!(
                         "instance `{instance_id}` crashed during execute-command: {trap:#}",
+                    )));
+                    Err(trap)
+                }
+            }
+        }
+        Some(ControlCommand::ExecuteService {
+            service,
+            command,
+            args,
+            reply,
+        }) => {
+            match instance
+                .execute_service_command(service, command, args)
+                .await
+            {
+                Ok(result) => {
+                    let _ = reply.send(Ok(result));
+                    Ok(LoopAction::Continue)
+                }
+                Err(trap) => {
+                    let _ = reply.send(Err(anyhow!(
+                        "instance `{instance_id}` crashed during execute-service-command: {trap:#}",
                     )));
                     Err(trap)
                 }

@@ -9,6 +9,7 @@
 //!
 //! Lifecycle, multi-instance, and crash isolation land in Phase 6.
 
+mod dispatcher;
 mod instance;
 mod lifecycle;
 mod registry;

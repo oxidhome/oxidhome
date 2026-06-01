@@ -1,0 +1,27 @@
+manifest_version = 1
+
+[plugin]
+id = "example.service-caller"
+name = "Service Caller"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Drives another plugin's `counter` service — Phase 7c dispatch fixture."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/service-caller"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "service", "caller"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/service_caller.wasm"
+
+[capabilities]
+# The caller only *invokes* services; it doesn't register any of its
+# own, so `declares_services` stays empty. (`call-service` isn't gated
+# by a manifest allowlist in Phase 7 — gating by target existence +
+# recursion check; see the Phase-7 plan.)
+storage_quota_kb = 4
+
+[config.target_service_id]
+type = "string"
+description = "Host-minted service id of the target counter (e.g. `svc-0`)."
