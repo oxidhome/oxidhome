@@ -2,37 +2,50 @@
 //!
 //! [`call_service`] is the host-side entry point for the WIT
 //! `host-services::call-service` import. It resolves the target
-//! service to its owning instance, rejects recursion (A→…→A) at
-//! *instance* granularity, races the owning instance's
-//! `execute-service-command` against a deadline, and returns the
-//! result.
+//! service to its owning instance, rejects cycles at *instance*
+//! granularity, races the owning instance's `execute-service-command`
+//! against a deadline, and returns the result.
 //!
-//! ## Recursion-stack design
+//! ## Recursion-stack design (cross-task)
 //!
-//! The chain of in-flight `call-service` invocations on the *current
-//! tokio task* lives in a [`tokio::task_local`]. The dispatcher:
+//! Each supervisor task has its own `tokio::task_local` [`CALL_STACK`]
+//! holding the chain of in-flight `call-service` invocations *that
+//! led to whatever wasm it is currently driving*. The dispatcher:
 //!
 //! 1. Resolves `target_service` → `target_instance` via the engine's
-//!    `ServiceRegistry`.
-//! 2. Walks the task-local stack; if any frame's target instance is
-//!    the same as `target_instance`, returns `Error::InvalidArgument`
-//!    naming the cycle. **Instance granularity, not service**: a
-//!    scripting plugin's same-instance peer scripts must use the
-//!    plugin's *internal* dispatch — going through the host's
-//!    `call-service` would deadlock the single `Store`.
-//! 3. Pushes a frame with `(caller_instance, target_instance,
-//!    target_service)`, bumps the registry's [`CallGuard`] refcount
-//!    so `remove-service` refuses while this call is alive, sends an
-//!    `ExecuteService` mpsc to the owner's supervisor task — the
-//!    supervisor rebuilds the stack in `CALL_STACK::scope` on its own
-//!    task before driving the wasm — races the result against the
-//!    dispatcher timeout, then pops + releases.
+//!    [`ServiceRegistry`].
+//! 2. Reads the *parent* chain from `CALL_STACK` (unset on outermost
+//!    calls — treated as empty) and runs the cycle check:
+//!    **reject if `target_instance` would dispatch to a supervisor
+//!    that is already parked awaiting a reply.** A supervisor is
+//!    parked exactly while it is the `caller_instance` in some
+//!    in-flight frame on the chain — that's the set we look up
+//!    against, plus the current call's own caller (we're about to
+//!    park them too). This is what catches both A→A self-calls
+//!    (empty chain, caller == target) and A→B→A cycles (B's wasm
+//!    calling back into A — A is `caller_instance` of the parent
+//!    frame).
+//! 3. Looks up the target's [`InstanceHandle`](crate::InstanceHandle)
+//!    via `instances`; refuses with `Unavailable` if the owner isn't
+//!    running.
+//! 4. Acquires a [`crate::state::CallGuard`] (refcount on the target's
+//!    `active_calls` map) so `remove-service` refuses while the call
+//!    is in flight.
+//! 5. Builds `chain = parent_chain ++ [(caller, target_instance,
+//!    target_service)]` and hands it through `ControlCommand::ExecuteService`
+//!    to the owner's supervisor. The owner's supervisor **scopes
+//!    `CALL_STACK` to that chain on its own task** before invoking
+//!    `instance.execute_service_command(...)`, so any nested
+//!    `host::call_service` from inside the callee's wasm reads the
+//!    full chain and the cycle check works across the task hop.
+//! 6. Races the reply against [`DISPATCH_TIMEOUT`], releases the
+//!    guard regardless of outcome, returns the result.
 //!
-//! Cycle detection works across tasks: the caller's task-local frame
-//! is *copied* into the `ExecuteService` message, and the callee's
-//! supervisor enters a `CALL_STACK::scope(parent_frames, ...)` before
-//! dispatching, so a deeper recursive `call-service` from inside the
-//! callee sees the full chain.
+//! **Instance granularity, not service**: same-instance peer services
+//! (e.g. two scripts inside a scripting plugin) must use the plugin's
+//! *internal* dispatch — going through the host's `call-service`
+//! would queue an `ExecuteService` to the supervisor that's already
+//! parked on us, i.e. deadlock-by-construction.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,17 +56,17 @@ use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, ServiceId};
 use crate::state::ServiceRegistry;
 
-use super::lifecycle::InstanceHandle;
 use super::registry::InstanceRegistry;
 
-/// One frame on the recursion stack. `target_instance` is the unit of
-/// cycle detection; the other fields are kept for diagnostics and for
-/// the Phase-12+ structured trace surface (audit-log per `call-service`
-/// hop) that consumes them.
+/// One frame on the recursion stack. `caller_instance` is the unit
+/// of cycle detection (a parked-supervisor identifier — see
+/// [`call_service`]); the other fields are kept for diagnostics and
+/// for the Phase-12+ structured trace surface (audit-log per
+/// `call-service` hop) that will consume them.
 #[derive(Debug, Clone)]
 pub(crate) struct CallFrame {
-    #[allow(dead_code)] // diagnostic / future audit-log field
     pub caller_instance: String,
+    #[allow(dead_code)] // diagnostic / future audit-log field
     pub target_instance: String,
     #[allow(dead_code)] // diagnostic / future audit-log field
     pub target_service: ServiceId,
@@ -61,11 +74,14 @@ pub(crate) struct CallFrame {
 
 task_local! {
     /// Chain of in-flight `call-service` invocations on the current
-    /// tokio task. Outermost first; the current call is the last
-    /// entry. Unset / empty ⇒ no service call in progress (the normal
-    /// case for `init`, `tick`, `execute-command`, `on-event` entry
-    /// points).
-    static CALL_STACK: Vec<CallFrame>;
+    /// tokio task. Outermost first. Unset / empty ⇒ no service call
+    /// in progress (the normal case for `init`, `tick`,
+    /// `execute-command`, `on-event` entry points).
+    ///
+    /// `pub(crate)` so the supervisor (in [`super::lifecycle`]) can
+    /// re-scope it when receiving a `ControlCommand::ExecuteService`
+    /// — that's how the chain rides across the task boundary.
+    pub(crate) static CALL_STACK: Vec<CallFrame>;
 }
 
 /// Per-dispatcher-call wall-clock timeout. Independent of the
@@ -73,7 +89,45 @@ task_local! {
 /// and traps wasm that doesn't yield) — this one bounds how long the
 /// caller waits for a reply on the dispatch channel. Generous on
 /// purpose; a legitimate cross-plugin call shouldn't be slow.
+///
+/// The watchdog default and the dispatch timeout are deliberately
+/// the same (30 s). The two bound *different* things: the watchdog
+/// traps the wasm call site (via `Trap::Interrupt`), the dispatch
+/// timeout unblocks the caller's supervisor. Either firing first is
+/// fine — the wasm-side trap also resolves the oneshot the caller is
+/// awaiting, and a dispatch timeout drops the future, which releases
+/// the [`CallGuard`] regardless.
 pub(crate) const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Public test-only entry point. The `host-services::call-service`
+/// path runs from inside a wasm `execute-service-command`; an
+/// integration test that wants to drive the dispatcher from the
+/// outside (e.g. to set up a cross-instance call chain) goes
+/// through here.
+///
+/// **Not** a stable API — the `dispatcher` module is otherwise
+/// `pub(crate)`. Keep this thin so the regular `call_service` path
+/// is the single source of truth.
+#[doc(hidden)]
+pub async fn call_service_from_host(
+    engine: &crate::Engine,
+    caller_instance: impl Into<String>,
+    target: ServiceId,
+    command: impl Into<String>,
+    args: Vec<KeyValue>,
+) -> Result<CommandResult, WitError> {
+    let services = engine.services();
+    let instances = engine.instances();
+    call_service(
+        &services,
+        &instances,
+        caller_instance.into(),
+        target,
+        command.into(),
+        args,
+    )
+    .await
+}
 
 /// Entry point for the `host-services::call-service` host impl.
 ///
@@ -90,21 +144,36 @@ pub(crate) async fn call_service(
     args: Vec<KeyValue>,
 ) -> Result<CommandResult, WitError> {
     // 1. Resolve the target service to its owning instance. Cross-
-    //    instance lookup — the caller is allowed to see *this one*
+    //    instance lookup — the caller is allowed to see the one
     //    service it's about to call.
     let meta = services.get_any(&target).await?;
     let target_instance = meta.owner_instance.clone();
 
-    // 2. Cycle detection at instance granularity. CALL_STACK isn't
-    //    set on the outermost call (`try_with` returns Err); treat
-    //    that as "empty chain, no cycle".
-    let already_on_chain = CALL_STACK
-        .try_with(|stack| stack.iter().any(|f| f.target_instance == target_instance))
-        .unwrap_or(false);
-    if already_on_chain {
+    // 2. Cycle detection at instance granularity.
+    //
+    //    The deadlock condition is: dispatching to a supervisor that
+    //    is *currently parked* awaiting a reply from an upstream
+    //    `call-service`. A supervisor is parked exactly while it is
+    //    the **caller** in an in-flight frame — its `handle_control`
+    //    is blocked on the oneshot. So the "blocked" set is the
+    //    `caller_instance` of every frame on the chain *plus* this
+    //    very call's caller (we're about to park them on the oneshot
+    //    below). If `target_instance` is in that set, the dispatch
+    //    would queue an `ExecuteService` to a supervisor that can't
+    //    process it ⇒ 30s timeout deadlock. Reject up-front instead.
+    //
+    //    This also catches the first-hop self-call A→A (empty chain
+    //    + caller == target).
+    let parent_chain: Vec<CallFrame> = CALL_STACK.try_with(Clone::clone).unwrap_or_default();
+    let blocked = caller_instance == target_instance
+        || parent_chain
+            .iter()
+            .any(|f| f.caller_instance == target_instance);
+    if blocked {
         return Err(WitError::InvalidArgument(format!(
-            "recursion detected: instance `{target_instance}` is already on the call chain \
-             (target service `{target}`)"
+            "recursion detected: instance `{target_instance}` is already on the \
+             call chain (target service `{target}`); same-instance peer services \
+             must use the plugin's internal dispatch, not host-services::call-service"
         )));
     }
 
@@ -117,30 +186,29 @@ pub(crate) async fn call_service(
 
     // 4. Bump the active-call refcount so `remove-service` refuses
     //    while we're dispatching. Held across the whole call; the
-    //    `release().await` below covers both Ok and Err paths.
+    //    `release().await` below covers Ok / Err / timeout paths.
     let guard = services.acquire_call(&target).await?;
 
-    // 5. Build the next stack frame and dispatch under it. Inherit
-    //    the parent stack (if any) so a deeper `call-service` from
-    //    inside the callee's handler sees the full chain.
-    let next_frame = CallFrame {
+    // 5. Build the chain we'll *hand to the callee*: parent + the
+    //    frame for this call. The callee's supervisor wraps its
+    //    `execute_service_command` in `CALL_STACK::scope(chain, ...)`
+    //    on its own task, so any nested `call-service` from inside
+    //    the callee's wasm sees the full chain (this is how cycle
+    //    detection works across the task hop).
+    let mut chain = parent_chain;
+    chain.push(CallFrame {
         caller_instance,
         target_instance,
         target_service: target.clone(),
-    };
-    let parent_stack: Vec<CallFrame> = CALL_STACK
-        .try_with(Clone::clone)
-        .unwrap_or_else(|_| Vec::new());
-    let mut full_stack = parent_stack;
-    full_stack.push(next_frame);
+    });
 
-    let dispatch_future = CALL_STACK.scope(
-        full_stack,
-        dispatch_one(&target_handle, target, command, args),
-    );
-
+    let dispatch_future =
+        target_handle.execute_service_command(chain, target.clone(), command, args);
     let outcome = match tokio::time::timeout(DISPATCH_TIMEOUT, dispatch_future).await {
-        Ok(result) => result,
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(trap)) => Err(WitError::Unavailable(format!(
+            "call-service to `{target}` failed: {trap:#}"
+        ))),
         Err(_) => Err(WitError::Unavailable(format!(
             "call-service dispatch timed out after {} ms",
             DISPATCH_TIMEOUT.as_millis(),
@@ -149,25 +217,6 @@ pub(crate) async fn call_service(
 
     guard.release().await;
     outcome
-}
-
-/// Drive the actual handle call. Separated so [`call_service`] can
-/// wrap it in `CALL_STACK::scope` cleanly.
-async fn dispatch_one(
-    target_handle: &InstanceHandle,
-    target: ServiceId,
-    command: String,
-    args: Vec<KeyValue>,
-) -> Result<CommandResult, WitError> {
-    match target_handle
-        .execute_service_command(target.clone(), command, args)
-        .await
-    {
-        Ok(result) => Ok(result),
-        Err(trap) => Err(WitError::Unavailable(format!(
-            "call-service to `{target}` failed: {trap:#}"
-        ))),
-    }
 }
 
 #[cfg(test)]
@@ -196,58 +245,147 @@ mod tests {
             .await;
     }
 
-    /// Cycle detection fires *before* `instances.get(...)` so an
-    /// in-process test (no wasm, no `InstanceHandle`) can prove the
-    /// policy. Owner-instance "alpha" already on the stack ⇒
-    /// `call_service(target: svc-0 owned by alpha)` → `InvalidArgument`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn rejects_self_call_with_invalid_argument() {
-        let services = Arc::new(ServiceRegistry::new());
-        let svc_id = services
-            .register(
-                "alpha".into(),
-                ServiceInfo {
-                    local_id: "counter".into(),
-                    name: "counter".into(),
-                    metadata: Vec::new(),
-                    commands: Vec::new(),
-                },
-            )
-            .await;
-        let instances = Arc::new(InstanceRegistry::new());
+    fn fixture_info(name: &str) -> ServiceInfo {
+        ServiceInfo {
+            local_id: name.into(),
+            name: name.into(),
+            metadata: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
 
-        // Pre-seed the task-local with a frame whose `target_instance`
-        // matches what the dispatcher will resolve from `svc_id`'s
-        // owner, simulating an in-flight outer call.
-        let outer = vec![CallFrame {
-            caller_instance: "outer".into(),
-            target_instance: "alpha".into(),
-            target_service: "outer-svc".into(),
-        }];
-        let outcome = CALL_STACK
-            .scope(
-                outer,
-                call_service(
-                    &services,
-                    &instances,
-                    "alpha".into(),
-                    svc_id.clone(),
-                    "increment".into(),
-                    Vec::new(),
-                ),
-            )
-            .await;
-
-        let err = outcome.expect_err("self-call must be rejected");
+    fn assert_recursion(err: &WitError) {
         assert!(
             matches!(err, WitError::InvalidArgument(_)),
             "expected InvalidArgument, got {err:?}",
         );
         let msg = format!("{err:?}").to_ascii_lowercase();
         assert!(msg.contains("recursion"), "expected `recursion` in: {msg}");
+    }
 
-        // Active-call refcount stays 0 — the bail happens before
-        // `acquire_call`.
-        assert_eq!(services.active_call_count(&svc_id).await, 0);
+    /// Outermost (empty chain) A→A self-call is rejected — the
+    /// predicate compares `caller_instance == target_instance` for
+    /// the *current* call before consulting the chain.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_outermost_self_call() {
+        let services = Arc::new(ServiceRegistry::new());
+        let svc = services
+            .register("alpha".into(), fixture_info("ring"))
+            .await;
+        let instances = Arc::new(InstanceRegistry::new());
+
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            svc.clone(),
+            "kick".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("self-call must be rejected");
+
+        assert_recursion(&err);
+        // Refcount stays 0 — the bail happens before `acquire_call`.
+        assert_eq!(services.active_call_count(&svc).await, 0);
+    }
+
+    /// Cross-task cycle: A's supervisor is already parked awaiting
+    /// B's reply (frame `{caller:A, target:B}` on the stack). B's
+    /// wasm now tries to call back into A. The dispatcher must
+    /// reject because A is on the *blocked-callers* set — without
+    /// the fix, this would have queued an `ExecuteService` to A's
+    /// already-parked supervisor and deadlocked for 30 s.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_blocked_caller_cycle() {
+        let services = Arc::new(ServiceRegistry::new());
+        let a_svc = services
+            .register("alpha".into(), fixture_info("ring"))
+            .await;
+        let _b_svc = services.register("beta".into(), fixture_info("ring")).await;
+        let instances = Arc::new(InstanceRegistry::new());
+
+        let chain = vec![CallFrame {
+            caller_instance: "alpha".into(),
+            target_instance: "beta".into(),
+            target_service: "irrelevant".into(),
+        }];
+
+        // B's wasm calls A's service. `CALL_STACK` is scoped — exactly
+        // what the callee's supervisor does in `handle_control`'s
+        // `ExecuteService` arm.
+        let err = CALL_STACK
+            .scope(
+                chain,
+                call_service(
+                    &services,
+                    &instances,
+                    "beta".into(),
+                    a_svc.clone(),
+                    "kick".into(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect_err("cycle must be rejected");
+
+        assert_recursion(&err);
+        assert_eq!(services.active_call_count(&a_svc).await, 0);
+    }
+
+    /// Sanity: a non-cyclic deeper hop (A→B→C, never returning to A
+    /// or B) is *not* rejected at the cycle check — it should reach
+    /// `instances.get(...)` and fail there with `Unavailable` because
+    /// C's instance handle isn't registered in this in-process test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn permits_non_cyclic_chain() {
+        let services = Arc::new(ServiceRegistry::new());
+        let _c_svc = services
+            .register("gamma".into(), fixture_info("ring"))
+            .await;
+        let instances = Arc::new(InstanceRegistry::new());
+
+        let chain = vec![
+            CallFrame {
+                caller_instance: "alpha".into(),
+                target_instance: "beta".into(),
+                target_service: "irrelevant".into(),
+            },
+            CallFrame {
+                caller_instance: "beta".into(),
+                target_instance: "gamma".into(),
+                target_service: "irrelevant".into(),
+            },
+        ];
+
+        // Caller is gamma (the current task is gamma's supervisor),
+        // target's owner is gamma's service... wait, that'd be a
+        // self-call. Use a distinct owner "delta" and verify the
+        // dispatcher gets past the cycle check.
+        let delta_svc = services
+            .register("delta".into(), fixture_info("ring"))
+            .await;
+        let err = CALL_STACK
+            .scope(
+                chain,
+                call_service(
+                    &services,
+                    &instances,
+                    "gamma".into(),
+                    delta_svc.clone(),
+                    "kick".into(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect_err("delta isn't a real instance, so we get Unavailable");
+
+        // Reached the `instances.get(...)` step — proves the cycle
+        // check let it through.
+        assert!(
+            matches!(err, WitError::Unavailable(_)),
+            "expected Unavailable (delta not running), got {err:?}",
+        );
+        assert_eq!(services.active_call_count(&delta_svc).await, 0);
     }
 }

@@ -39,6 +39,7 @@ use crate::Engine;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
+use crate::runtime::dispatcher::{CALL_STACK, CallFrame};
 
 use super::instance::{InitError, PluginInstance};
 
@@ -165,8 +166,13 @@ enum ControlCommand {
     },
     /// Run the plugin's `execute-service-command` on a service it owns
     /// — the dispatcher hops to this on the owner's supervisor task so
-    /// the single-`Store` contract holds.
+    /// the single-`Store` contract holds. `chain` is the full
+    /// in-flight `call-service` chain (caller's parent chain + the
+    /// frame for this call); the supervisor scopes it on its task
+    /// before driving the wasm so nested `call-service`s from inside
+    /// `execute-service-command` see the full chain for cycle checks.
     ExecuteService {
+        chain: Vec<CallFrame>,
         service: ServiceId,
         command: String,
         args: Vec<KeyValue>,
@@ -294,14 +300,26 @@ impl InstanceHandle {
     /// always hops to the *owner*'s supervisor task so the
     /// single-`Store` contract holds.
     ///
+    /// `chain` is the full in-flight `call-service` chain leading to
+    /// this call; the callee's supervisor scopes it on its own task
+    /// before invoking the wasm, so cycle detection works across the
+    /// task hop.
+    ///
+    /// **Caller blocking note.** The caller's supervisor task is
+    /// parked on the oneshot until this returns, so any other control
+    /// message (including `stop`) queued on the caller's mpsc waits
+    /// up to [`crate::runtime::dispatcher::DISPATCH_TIMEOUT`] for the
+    /// service call to complete.
+    ///
     /// # Errors
     ///
     /// `Err` if the supervisor is gone, the supervisor dropped the
     /// reply, or the call trapped (a trap also crashes the instance).
     /// A plugin returning a normal error result surfaces as
     /// `Ok(CommandResult::Err(..))`.
-    pub async fn execute_service_command(
+    pub(crate) async fn execute_service_command(
         &self,
+        chain: Vec<CallFrame>,
         service: ServiceId,
         command: String,
         args: Vec<KeyValue>,
@@ -309,6 +327,7 @@ impl InstanceHandle {
         let (reply, rx) = oneshot::channel();
         self.control
             .send(ControlCommand::ExecuteService {
+                chain,
                 service,
                 command,
                 args,
@@ -878,15 +897,25 @@ async fn handle_control(
             }
         }
         Some(ControlCommand::ExecuteService {
+            chain,
             service,
             command,
             args,
             reply,
         }) => {
-            match instance
-                .execute_service_command(service, command, args)
-                .await
-            {
+            // Scope `CALL_STACK` to the chain handed to us by the
+            // caller's dispatcher *on this supervisor's task*. That's
+            // how cycle detection survives the task hop: any nested
+            // `host::call_service` from inside the wasm we're about
+            // to drive runs on this task, reads `CALL_STACK`, and
+            // sees the full chain leading to it.
+            let outcome = CALL_STACK
+                .scope(
+                    chain,
+                    instance.execute_service_command(service, command, args),
+                )
+                .await;
+            match outcome {
                 Ok(result) => {
                     let _ = reply.send(Ok(result));
                     Ok(LoopAction::Continue)

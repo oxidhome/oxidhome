@@ -124,8 +124,106 @@ async fn call_service_to_unknown_target_is_not_found() {
     }
 }
 
-// Cycle detection (instance granularity) is covered as a focused
-// unit test in `runtime::dispatcher::tests` against the `CALL_STACK`
-// task-local directly. End-to-end cycle exercise via wasm would need
-// a self-registering caller plugin and adds little over the unit
-// test — the policy lives in one place.
+/// Cross-task A→B→A cycle, end-to-end through wasm. Two `service-bouncer`
+/// instances are configured to bounce to each other; calling A.kick
+/// runs A's wasm, which calls B.kick (A's supervisor parks),
+/// which runs B's wasm, which calls A.kick — the dispatcher must
+/// reject *that* with `InvalidArgument` rather than letting it
+/// deadlock A's supervisor for the full 30s `DISPATCH_TIMEOUT`. The
+/// error rides back through B's wasm into A's wasm, surfaces as a
+/// `CommandResult::Err`, and the test asserts it landed promptly.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_task_cycle_is_rejected_promptly() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, Value};
+    use oxidhome_core::runtime::dispatcher;
+
+    let _wasm = support::build_example("service-bouncer", "service_bouncer.wasm");
+    let bouncer_dir = support::workspace_root()
+        .join("examples")
+        .join("service-bouncer");
+    let state_dir = support::tempdir("dispatch-cycle-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+
+    // Two bouncer instances, alpha and beta.
+    let alpha = engine
+        .start_instance(bouncer_dir.clone(), "alpha", None)
+        .await
+        .expect("start alpha");
+    alpha.wait_for_running().await.expect("alpha Running");
+    let beta = engine
+        .start_instance(bouncer_dir, "beta", None)
+        .await
+        .expect("start beta");
+    beta.wait_for_running().await.expect("beta Running");
+
+    // Find the svc-N each instance registered.
+    let services = engine.services().list().await;
+    let svc_a = services
+        .iter()
+        .find(|m| m.owner_instance == "alpha")
+        .expect("alpha registered a service")
+        .id
+        .clone();
+    let svc_b = services
+        .iter()
+        .find(|m| m.owner_instance == "beta")
+        .expect("beta registered a service")
+        .id
+        .clone();
+
+    // Wire the cycle through each plugin's per-instance KV. The
+    // bouncer reads `bounce_to` on every kick.
+    let kv = engine.kv();
+    kv.set("alpha", "bounce_to", Value::StringVal(svc_b.clone()))
+        .expect("set alpha.bounce_to");
+    kv.set("beta", "bounce_to", Value::StringVal(svc_a.clone()))
+        .expect("set beta.bounce_to");
+
+    // Drive A.kick from the host. Should round-trip *quickly* —
+    // before the 30s DISPATCH_TIMEOUT — with the cycle error
+    // surfaced via B's wasm to A's CommandResult::Err.
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        dispatcher::call_service_from_host(
+            &engine,
+            "test-driver",
+            svc_a.clone(),
+            "kick",
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("call must not exceed the test timeout");
+    let elapsed = started.elapsed();
+
+    // The dispatcher returned (didn't deadlock).
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cycle rejection should be near-instant; took {elapsed:?}",
+    );
+
+    // The shape: A's wasm propagated B's result, which propagated the
+    // dispatcher's `InvalidArgument` from the cycle check. So the
+    // outermost call returns `Ok(CommandResult::Err(InvalidArgument))`
+    // — the dispatcher itself sees A's wasm finishing normally.
+    match outcome {
+        Ok(CommandResult::Err(WitError::InvalidArgument(msg))) => {
+            assert!(
+                msg.to_ascii_lowercase().contains("recursion"),
+                "expected `recursion` in: {msg}",
+            );
+        }
+        other => panic!(
+            "expected the cycle to surface as Ok(CommandResult::Err(InvalidArgument(\"recursion ...\"))), got {other:?}",
+        ),
+    }
+
+    // Refcounts back to 0 — both guards released.
+    assert_eq!(engine.services().active_call_count(&svc_a).await, 0);
+    assert_eq!(engine.services().active_call_count(&svc_b).await, 0);
+
+    alpha.stop().await.expect("stop alpha");
+    beta.stop().await.expect("stop beta");
+}
