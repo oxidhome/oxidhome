@@ -3,9 +3,8 @@
 //!
 //! On `init` it registers service `bouncer` with one command `kick`.
 //! `kick` reads `bounce_to` from KV: if set, it calls
-//! `bounce_to.kick` and returns that result; otherwise it returns
-//! `Ok` with the configured `name` so the caller can confirm the hop
-//! landed.
+//! `bounce_to.kick` and returns that result verbatim; otherwise it
+//! returns an empty `CommandResult::Ok` to signal the leaf hop landed.
 //!
 //! Two instances configured to bounce to each other exercise the
 //! Phase-7c cross-task cycle detection: A.kick → B.kick → A.kick must

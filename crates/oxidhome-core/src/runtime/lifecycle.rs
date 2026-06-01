@@ -40,6 +40,7 @@ use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
 use crate::runtime::dispatcher::{CALL_STACK, CallFrame};
+use crate::state::CallGuard;
 
 use super::instance::{InitError, PluginInstance};
 
@@ -171,8 +172,17 @@ enum ControlCommand {
     /// frame for this call); the supervisor scopes it on its task
     /// before driving the wasm so nested `call-service`s from inside
     /// `execute-service-command` see the full chain for cycle checks.
+    ///
+    /// `guard` is the [`CallGuard`] the dispatcher acquired before
+    /// sending the message. It rides with the work so the in-flight
+    /// refcount tracks *real* execution: dropped when the supervisor
+    /// finishes the wasm call (`handle_control` holds it across the
+    /// scoped invocation), or dropped with the message if the
+    /// channel closes before the supervisor consumes it. Nothing
+    /// *reads* it — `Drop` does the decrement.
     ExecuteService {
         chain: Vec<CallFrame>,
+        guard: CallGuard,
         service: ServiceId,
         command: String,
         args: Vec<KeyValue>,
@@ -320,14 +330,21 @@ impl InstanceHandle {
     pub(crate) async fn execute_service_command(
         &self,
         chain: Vec<CallFrame>,
+        guard: CallGuard,
         service: ServiceId,
         command: String,
         args: Vec<KeyValue>,
     ) -> anyhow::Result<CommandResult> {
         let (reply, rx) = oneshot::channel();
+        // If the send fails (control channel closed), the
+        // `SendError` carries the message back; `map_err` discards
+        // it, which drops the `ControlCommand::ExecuteService` and
+        // with it the `CallGuard` → refcount decrements cleanly even
+        // on the supervisor-gone path.
         self.control
             .send(ControlCommand::ExecuteService {
                 chain,
+                guard,
                 service,
                 command,
                 args,
@@ -898,11 +915,17 @@ async fn handle_control(
         }
         Some(ControlCommand::ExecuteService {
             chain,
+            guard,
             service,
             command,
             args,
             reply,
         }) => {
+            // Hold the dispatcher's in-flight refcount across the
+            // wasm call. `_call_guard` lives until end-of-arm, so
+            // `remove-service` can only succeed once we've truly
+            // finished — no early release on a caller-side timeout.
+            let _call_guard = guard;
             // Scope `CALL_STACK` to the chain handed to us by the
             // caller's dispatcher *on this supervisor's task*. That's
             // how cycle detection survives the task hop: any nested

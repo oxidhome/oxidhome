@@ -93,7 +93,7 @@ async fn cross_plugin_call_service_round_trips() {
 
     // Active-call refcount should be 0 after the round-trip — the
     // dispatcher's `CallGuard::release` ran on each hop.
-    assert_eq!(engine.services().active_call_count(&target_id).await, 0);
+    assert_eq!(engine.services().active_call_count(&target_id), 0);
 
     caller.stop().await.expect("stop caller");
     counter.stop().await.expect("stop counter");
@@ -221,8 +221,8 @@ async fn cross_task_cycle_is_rejected_promptly() {
     }
 
     // Refcounts back to 0 — both guards released.
-    assert_eq!(engine.services().active_call_count(&svc_a).await, 0);
-    assert_eq!(engine.services().active_call_count(&svc_b).await, 0);
+    assert_eq!(engine.services().active_call_count(&svc_a), 0);
+    assert_eq!(engine.services().active_call_count(&svc_b), 0);
 
     alpha.stop().await.expect("stop alpha");
     beta.stop().await.expect("stop beta");

@@ -30,7 +30,12 @@
 //!    running.
 //! 4. Acquires a [`crate::state::CallGuard`] (refcount on the target's
 //!    `active_calls` map) so `remove-service` refuses while the call
-//!    is in flight.
+//!    is in flight. The guard travels in the `ExecuteService`
+//!    message and is dropped by the callee's supervisor when the
+//!    wasm call actually finishes — *not* on the caller's wait
+//!    future — so a dispatcher-side timeout can't release the
+//!    refcount while the supervisor is still about to run the
+//!    handler.
 //! 5. Builds `chain = parent_chain ++ [(caller, target_instance,
 //!    target_service)]` and hands it through `ControlCommand::ExecuteService`
 //!    to the owner's supervisor. The owner's supervisor **scopes
@@ -38,8 +43,11 @@
 //!    `instance.execute_service_command(...)`, so any nested
 //!    `host::call_service` from inside the callee's wasm reads the
 //!    full chain and the cycle check works across the task hop.
-//! 6. Races the reply against [`DISPATCH_TIMEOUT`], releases the
-//!    guard regardless of outcome, returns the result.
+//! 6. Races the reply against [`DISPATCH_TIMEOUT`] and returns the
+//!    result. The guard is owned by the supervisor's match arm at
+//!    this point and drops there when the wasm call returns (or when
+//!    the message is dropped without being processed — e.g. on
+//!    channel close).
 //!
 //! **Instance granularity, not service**: same-instance peer services
 //! (e.g. two scripts inside a scripting plugin) must use the plugin's
@@ -94,9 +102,11 @@ task_local! {
 /// the same (30 s). The two bound *different* things: the watchdog
 /// traps the wasm call site (via `Trap::Interrupt`), the dispatch
 /// timeout unblocks the caller's supervisor. Either firing first is
-/// fine — the wasm-side trap also resolves the oneshot the caller is
-/// awaiting, and a dispatch timeout drops the future, which releases
-/// the [`CallGuard`] regardless.
+/// fine. When the dispatch timeout fires, the caller's wait future
+/// is dropped, but the [`CallGuard`] lives with the callee's
+/// supervisor (inside `ControlCommand::ExecuteService`), so the
+/// refcount only drops once the supervisor finishes the wasm —
+/// `remove-service` can't succeed mid-handler.
 pub(crate) const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Public test-only entry point. The `host-services::call-service`
@@ -184,9 +194,16 @@ pub(crate) async fn call_service(
         ))
     })?;
 
-    // 4. Bump the active-call refcount so `remove-service` refuses
-    //    while we're dispatching. Held across the whole call; the
-    //    `release().await` below covers Ok / Err / timeout paths.
+    // 4. Acquire the in-flight refcount. The guard travels in the
+    //    `ExecuteService` message — the callee's supervisor holds it
+    //    across the wasm call and `Drop` decrements when the work
+    //    actually finishes. This is what makes the refcount track
+    //    real execution rather than the caller's wait future: if we
+    //    time out below, dropping the wait future doesn't release
+    //    the refcount while the supervisor is still about to run the
+    //    handler. If the supervisor's mpsc is closed (send fails),
+    //    the `SendError` carries the message back and the guard
+    //    drops with it.
     let guard = services.acquire_call(&target).await?;
 
     // 5. Build the chain we'll *hand to the callee*: parent + the
@@ -198,25 +215,22 @@ pub(crate) async fn call_service(
     let mut chain = parent_chain;
     chain.push(CallFrame {
         caller_instance,
-        target_instance,
+        target_instance: target_instance.clone(),
         target_service: target.clone(),
     });
 
     let dispatch_future =
-        target_handle.execute_service_command(chain, target.clone(), command, args);
-    let outcome = match tokio::time::timeout(DISPATCH_TIMEOUT, dispatch_future).await {
+        target_handle.execute_service_command(chain, guard, target.clone(), command, args);
+    match tokio::time::timeout(DISPATCH_TIMEOUT, dispatch_future).await {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(trap)) => Err(WitError::Unavailable(format!(
-            "call-service to `{target}` failed: {trap:#}"
+            "call-service to `{target}` (owner `{target_instance}`) failed: {trap:#}"
         ))),
         Err(_) => Err(WitError::Unavailable(format!(
-            "call-service dispatch timed out after {} ms",
+            "call-service to `{target}` (owner `{target_instance}`) timed out after {} ms",
             DISPATCH_TIMEOUT.as_millis(),
         ))),
-    };
-
-    guard.release().await;
-    outcome
+    }
 }
 
 #[cfg(test)]
@@ -227,7 +241,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn task_local_default_to_empty_when_unset() {
         // Outside a scope, `try_with` is an Err — covered by the
-        // `unwrap_or(false)` cycle check.
+        // dispatcher's `try_with(...).unwrap_or_default()` (empty
+        // chain ⇒ no cycle check fires).
         assert!(CALL_STACK.try_with(Vec::is_empty).is_err());
         // Inside a scope, the stack is visible.
         let frame = CallFrame {
@@ -287,7 +302,7 @@ mod tests {
 
         assert_recursion(&err);
         // Refcount stays 0 — the bail happens before `acquire_call`.
-        assert_eq!(services.active_call_count(&svc).await, 0);
+        assert_eq!(services.active_call_count(&svc), 0);
     }
 
     /// Cross-task cycle: A's supervisor is already parked awaiting
@@ -330,7 +345,7 @@ mod tests {
             .expect_err("cycle must be rejected");
 
         assert_recursion(&err);
-        assert_eq!(services.active_call_count(&a_svc).await, 0);
+        assert_eq!(services.active_call_count(&a_svc), 0);
     }
 
     /// Sanity: a linear, non-cyclic chain A→B→C→D — where D's owner
@@ -382,6 +397,6 @@ mod tests {
             matches!(err, WitError::Unavailable(_)),
             "expected Unavailable (delta not running), got {err:?}",
         );
-        assert_eq!(services.active_call_count(&delta_svc).await, 0);
+        assert_eq!(services.active_call_count(&delta_svc), 0);
     }
 }
