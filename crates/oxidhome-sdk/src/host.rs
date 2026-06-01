@@ -4,8 +4,8 @@
 //! Plugin authors call these from inside [`Plugin::init`](crate::Plugin::init),
 //! `on_event`, `execute_command`, or `tick`. Each function is a thin
 //! wrapper over the corresponding wit-bindgen-generated import; the
-//! point is type ergonomics (e.g. accepting [`Device`] instead of
-//! [`DeviceInfo`]) and a single import path
+//! point is type ergonomics (e.g. accepting [`Device`](crate::Device)
+//! instead of [`DeviceInfo`]) and a single import path
 //! (`oxidhome_sdk::host::register_device`) instead of the deep
 //! `bindings::oxidhome::plugin::host_devices::register_device`.
 //!
@@ -63,7 +63,8 @@ pub mod blobs;
 // ── Devices ──────────────────────────────────────────────────────────
 
 /// Register a device with the host. Accepts either a
-/// [`Device`] builder (recommended) or a raw [`DeviceInfo`].
+/// [`Device`](crate::Device) builder (recommended) or a raw
+/// [`DeviceInfo`].
 /// Returns the host-assigned `device-id`, which is what later
 /// `update_device` / `remove_device` / `publish_state_change` calls
 /// reference.
@@ -107,9 +108,9 @@ pub fn get_device(id: &DeviceId) -> Result<DeviceInfo, Error> {
 
 // ── Services (Phase 7) ───────────────────────────────────────────────
 
-/// Register a service with the host. Accepts either a [`Service`]
-/// builder (recommended) or a raw [`ServiceInfo`]. Returns the
-/// host-assigned `service-id`.
+/// Register a service with the host. Accepts either a
+/// [`Service`](crate::Service) builder (recommended) or a raw
+/// [`ServiceInfo`]. Returns the host-assigned `service-id`.
 ///
 /// # Errors
 ///
@@ -152,14 +153,18 @@ pub fn get_service(id: &ServiceId) -> Result<ServiceInfo, Error> {
 /// one. The host routes `target` to its owning instance and returns the
 /// result.
 ///
+/// **Same-instance peer services must use the plugin's internal
+/// dispatch** — going through `call_service` to a service the
+/// calling instance also owns is rejected up-front with
+/// [`Error::InvalidArgument`] (the host would otherwise have to
+/// re-enter the calling instance's single `Store` and deadlock).
+///
 /// # Errors
 ///
 /// [`Error::NotFound`] (no such service), [`Error::PermissionDenied`]
-/// (call not allowed), [`Error::InvalidArgument`] (recursion, or bad
-/// command/args), [`Error::Unavailable`] (owner down or timed out).
-///
-/// NOTE: Phase 7b's host impl is a stub that returns
-/// [`Error::Unavailable`]; the routing dispatcher lands in 7c.
+/// (call not allowed), [`Error::InvalidArgument`] (cycle / same-
+/// instance call / bad args), [`Error::Unavailable`] (owner down or
+/// dispatch timed out).
 pub fn call_service(
     target: &ServiceId,
     command: &str,
