@@ -153,11 +153,13 @@ pub(crate) async fn call_service(
     command: String,
     args: Vec<KeyValue>,
 ) -> Result<CommandResult, WitError> {
-    // 1. Resolve the target service to its owning instance. Cross-
-    //    instance lookup — the caller is allowed to see the one
-    //    service it's about to call.
-    let meta = services.get_any(&target).await?;
-    let target_instance = meta.owner_instance.clone();
+    // 1. Resolve the target service to its owning instance. The
+    //    dispatcher only needs the owner string to route, not the
+    //    full meta (its `Vec<CommandSpec>` etc.) — `get_owner` is
+    //    the cross-instance owner-only lookup.
+    let target_instance = services
+        .get_owner(&target)
+        .ok_or_else(|| WitError::NotFound(format!("service {target} not registered")))?;
 
     // 2. Cycle detection at instance granularity.
     //
@@ -204,7 +206,7 @@ pub(crate) async fn call_service(
     //    handler. If the supervisor's mpsc is closed (send fails),
     //    the `SendError` carries the message back and the guard
     //    drops with it.
-    let guard = services.acquire_call(&target).await?;
+    let guard = services.acquire_call(&target)?;
 
     // 5. Build the chain we'll *hand to the callee*: parent + the
     //    frame for this call. The callee's supervisor wraps its
@@ -284,9 +286,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_outermost_self_call() {
         let services = Arc::new(ServiceRegistry::new());
-        let svc = services
-            .register("alpha".into(), fixture_info("ring"))
-            .await;
+        let svc = services.register("alpha".into(), fixture_info("ring"));
         let instances = Arc::new(InstanceRegistry::new());
 
         let err = call_service(
@@ -314,10 +314,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_blocked_caller_cycle() {
         let services = Arc::new(ServiceRegistry::new());
-        let a_svc = services
-            .register("alpha".into(), fixture_info("ring"))
-            .await;
-        let _b_svc = services.register("beta".into(), fixture_info("ring")).await;
+        let a_svc = services.register("alpha".into(), fixture_info("ring"));
+        let _b_svc = services.register("beta".into(), fixture_info("ring"));
         let instances = Arc::new(InstanceRegistry::new());
 
         let chain = vec![CallFrame {
@@ -357,9 +355,7 @@ mod tests {
     async fn permits_non_cyclic_chain() {
         let services = Arc::new(ServiceRegistry::new());
         let instances = Arc::new(InstanceRegistry::new());
-        let delta_svc = services
-            .register("delta".into(), fixture_info("ring"))
-            .await;
+        let delta_svc = services.register("delta".into(), fixture_info("ring"));
 
         // Chain represents A→B→C in flight on gamma's task — gamma is
         // the current caller. The new target is delta, which is not

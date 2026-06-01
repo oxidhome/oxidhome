@@ -86,11 +86,11 @@ async fn drain_events_dispatches_to_plugin_on_event() {
     let registry = engine.devices();
     let device_id = registry
         .list()
-        .await
         .into_iter()
         .find(|m| m.owner_instance == switch.instance_id())
         .expect("switch registered a device")
-        .id;
+        .id
+        .clone();
 
     // Toggle the switch — fires a state-changed event on the bus.
     switch

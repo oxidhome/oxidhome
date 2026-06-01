@@ -8,29 +8,41 @@
 //! Owner-scoping matches `host-devices`: `update` / `remove` / `get`
 //! reject a non-owner with `NotFound` (indistinguishable from "id never
 //! existed") so a plugin can't probe another plugin's service ids. The
-//! cross-instance lookup the dispatcher needs (`get_any`) and the
-//! active-call refcount that makes `remove` refuse while a call is in
-//! flight land in 7c alongside the dispatcher that uses them.
+//! dispatcher uses the unscoped [`Self::get_owner`] (owner-only) on the
+//! hot routing path and [`Self::get_any`] when it needs the full meta.
+//!
+//! **Concurrency.** All methods are synchronous. The `inner` map lives
+//! behind a `std::sync::RwLock` and the active-call counter behind a
+//! `std::sync::Mutex` — none of the registry operations await across
+//! the lock, so the async wrappers from the earlier `tokio::sync::*`
+//! shape were paying for a fairness queue we never used. Holding both
+//! sync locks together is bounded by a `HashMap` lookup + a counter
+//! check, and `CallGuard::Drop` decrements without needing a tokio
+//! runtime handle (closes the cancel/teardown leak path).
+//!
+//! **Cheap reads.** `get` / `get_any` / `list` return `Arc<ServiceMeta>`
+//! rather than deep-cloning the meta (which carries `ServiceInfo` with
+//! its `Vec<CommandSpec>` + `Vec<KeyValue>` and several `String`s).
+//! Plugin-facing `host_services::get-service` still has to hand the
+//! wasm caller an owned `ServiceInfo`, so it pays one clone of `info`
+//! — but the `id` / `owner_instance` outer fields and per-entry
+//! deep-copies on `list` are gone.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::host_impl::plugin::oxidhome::plugin::services::ServiceInfo;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, ServiceId};
 
-/// Internal: per-`ServiceId` in-flight call counters. Bumped by the
-/// dispatcher's [`CallGuard`] before invoking `execute-service-command`,
-/// decremented on guard drop. `remove` consults this to refuse removal
-/// while a call is in flight. Held under a plain `std::sync::Mutex` so
-/// the guard's `Drop` can always reclaim the refcount synchronously
-/// — no tokio runtime required at drop time.
+/// Per-`ServiceId` in-flight call counters. Bumped by [`CallGuard`]
+/// at acquire time, decremented on Drop.
 type ActiveCalls = HashMap<ServiceId, u32>;
 
-/// What the registry stores per service.
-#[derive(Clone, Debug)]
+/// What the registry stores per service. Held behind `Arc` so reads
+/// are an atomic bump rather than a deep clone of the contained
+/// `ServiceInfo`.
+#[derive(Debug)]
 pub struct ServiceMeta {
     /// Stable host-assigned id, the registry's key.
     pub id: ServiceId,
@@ -46,13 +58,12 @@ pub struct ServiceMeta {
 /// id-space from the device registry's `dev-<n>`.
 #[derive(Default, Debug)]
 pub struct ServiceRegistry {
-    inner: RwLock<HashMap<ServiceId, ServiceMeta>>,
-    /// In-flight call refcounts per service. Separate sync `Mutex` so
-    /// reads / writes against `meta` don't have to take a write lock
-    /// just to bump the counter, `remove` can fail fast on `count > 0`
-    /// without cloning meta, and the dispatcher's [`CallGuard::drop`]
-    /// can decrement synchronously without holding (or needing) a
-    /// tokio runtime handle.
+    inner: RwLock<HashMap<ServiceId, Arc<ServiceMeta>>>,
+    /// In-flight call refcounts per service. Separate `Mutex` so
+    /// `meta` reads don't have to take a write lock to bump the
+    /// counter, `remove` can fail fast on `count > 0` without
+    /// cloning meta, and [`CallGuard::drop`] can decrement
+    /// synchronously without holding a tokio runtime handle.
     active_calls: Mutex<ActiveCalls>,
     next_id: AtomicU64,
 }
@@ -70,30 +81,42 @@ impl ServiceRegistry {
 
     /// Register a service on behalf of `owner_instance`. Returns the
     /// fresh host-assigned id.
-    pub async fn register(&self, owner_instance: String, info: ServiceInfo) -> ServiceId {
+    pub fn register(&self, owner_instance: String, info: ServiceInfo) -> ServiceId {
         let id = self.mint_id();
-        let meta = ServiceMeta {
+        let meta = Arc::new(ServiceMeta {
             id: id.clone(),
             owner_instance,
             info,
-        };
-        self.inner.write().await.insert(id.clone(), meta);
+        });
+        self.inner
+            .write()
+            .expect("services lock poisoned")
+            .insert(id.clone(), meta);
         id
     }
 
     /// Replace an already-registered service's info, scoped to the
     /// caller's instance. A mismatched (or missing) owner returns
     /// `NotFound` to avoid leaking existence.
-    pub async fn update(
+    pub fn update(
         &self,
         owner_instance: &str,
         id: &ServiceId,
         info: ServiceInfo,
     ) -> Result<(), WitError> {
-        let mut guard = self.inner.write().await;
-        match guard.get_mut(id) {
+        let mut guard = self.inner.write().expect("services lock poisoned");
+        match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
-                meta.info = info;
+                // Rebuild the Arc rather than mutating in place —
+                // outstanding `Arc<ServiceMeta>` clones from `get` /
+                // `list` are immutable snapshots; the new Arc takes
+                // over the slot, old observers keep what they had.
+                let new = Arc::new(ServiceMeta {
+                    id: meta.id.clone(),
+                    owner_instance: meta.owner_instance.clone(),
+                    info,
+                });
+                guard.insert(id.clone(), new);
                 Ok(())
             }
             _ => Err(WitError::NotFound(format!("service {id} not registered"))),
@@ -104,11 +127,10 @@ impl ServiceRegistry {
     /// instance. `NotFound` if the id is missing or owned by another
     /// instance; [`WitError::Unavailable`] if a `call-service` against
     /// it is still in flight (the dispatcher's [`CallGuard`] holds a
-    /// refcount). Take both locks in a fixed order
-    /// (`inner` → `active_calls`) to keep linearizable against
-    /// [`Self::acquire_call`].
-    pub async fn remove(&self, owner_instance: &str, id: &ServiceId) -> Result<(), WitError> {
-        let mut guard = self.inner.write().await;
+    /// refcount). Lock order (`inner` → `active_calls`) matches
+    /// [`Self::acquire_call`] to keep the two linearizable.
+    pub fn remove(&self, owner_instance: &str, id: &ServiceId) -> Result<(), WitError> {
+        let mut guard = self.inner.write().expect("services lock poisoned");
         let mut calls = self.active_calls.lock().expect("active_calls poisoned");
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
@@ -127,40 +149,50 @@ impl ServiceRegistry {
     }
 
     /// Look up a service by id, scoped to the caller's instance.
-    pub async fn get(&self, owner_instance: &str, id: &ServiceId) -> Result<ServiceMeta, WitError> {
-        let guard = self.inner.read().await;
+    /// Returns a cheap `Arc<ServiceMeta>` (atomic bump, no deep copy).
+    pub fn get(&self, owner_instance: &str, id: &ServiceId) -> Result<Arc<ServiceMeta>, WitError> {
+        let guard = self.inner.read().expect("services lock poisoned");
         match guard.get(id) {
-            Some(meta) if meta.owner_instance == owner_instance => Ok(meta.clone()),
+            Some(meta) if meta.owner_instance == owner_instance => Ok(Arc::clone(meta)),
             _ => Err(WitError::NotFound(format!("service {id} not registered"))),
         }
     }
 
-    /// Cross-instance lookup — the dispatcher's routing primitive.
-    /// Unlike [`Self::get`], this is *not* owner-scoped: the caller is
-    /// looking up *someone else's* service in order to call it. Use
-    /// only from `runtime::dispatcher` and host-side API/MCP code;
-    /// plugin-facing reads go through `get`.
-    pub async fn get_any(&self, id: &ServiceId) -> Result<ServiceMeta, WitError> {
+    /// Cross-instance lookup — the dispatcher's full-meta primitive
+    /// when it needs more than the owner (e.g. error messages, the
+    /// API/MCP read paths). Not owner-scoped. Plugin-facing reads
+    /// go through [`Self::get`].
+    pub fn get_any(&self, id: &ServiceId) -> Result<Arc<ServiceMeta>, WitError> {
         self.inner
             .read()
-            .await
+            .expect("services lock poisoned")
             .get(id)
-            .cloned()
+            .map(Arc::clone)
             .ok_or_else(|| WitError::NotFound(format!("service {id} not registered")))
     }
 
+    /// Cross-instance owner lookup — what the dispatcher actually
+    /// needs on the routing hot path. Avoids cloning the full
+    /// `ServiceMeta` (with its `Vec<CommandSpec>` etc.) when the
+    /// caller only needs to route the call to its owner.
+    #[must_use]
+    pub fn get_owner(&self, id: &ServiceId) -> Option<String> {
+        self.inner
+            .read()
+            .expect("services lock poisoned")
+            .get(id)
+            .map(|m| m.owner_instance.clone())
+    }
+
     /// Bump the in-flight refcount for `id`; the returned [`CallGuard`]
-    /// decrements on drop. The dispatcher holds one across each
-    /// `execute-service-command` invocation so `remove-service` refuses
-    /// while a call is alive. Returns `NotFound` if `id` isn't
-    /// registered (checked under the same services lock as the
-    /// increment so an in-flight removal can't race the bump).
-    ///
-    /// Lock order across this call and [`Self::remove`]: services
-    /// first, then `active_calls`. Both operations follow it, so
-    /// they're linearizable.
-    pub async fn acquire_call(self: &Arc<Self>, id: &ServiceId) -> Result<CallGuard, WitError> {
-        let services = self.inner.read().await;
+    /// decrements on drop. The dispatcher acquires one before sending
+    /// `ControlCommand::ExecuteService` and hands it to the callee's
+    /// supervisor so the refcount tracks real execution. Returns
+    /// `NotFound` if `id` isn't registered (checked under the same
+    /// services read lock as the counter increment so an in-flight
+    /// removal can't race the bump).
+    pub fn acquire_call(self: &Arc<Self>, id: &ServiceId) -> Result<CallGuard, WitError> {
+        let services = self.inner.read().expect("services lock poisoned");
         if !services.contains_key(id) {
             return Err(WitError::NotFound(format!("service {id} not registered")));
         }
@@ -173,8 +205,7 @@ impl ServiceRegistry {
     }
 
     /// Internal: decrement the in-flight refcount for `id`. Called
-    /// from [`CallGuard::drop`] — synchronous on purpose so it never
-    /// needs to await a runtime. Tolerant of an over-release.
+    /// from [`CallGuard::drop`]. Tolerant of an over-release.
     fn release_call(&self, id: &ServiceId) {
         let mut calls = self.active_calls.lock().expect("active_calls poisoned");
         if let Some(n) = calls.get_mut(id) {
@@ -197,21 +228,26 @@ impl ServiceRegistry {
             .unwrap_or(0)
     }
 
-    /// Snapshot of every registered service. Allocates — fine for the
-    /// API/MCP read paths, avoid in hot loops.
-    pub async fn list(&self) -> Vec<ServiceMeta> {
-        self.inner.read().await.values().cloned().collect()
+    /// Snapshot of every registered service — cheap (one `Arc::clone`
+    /// per entry, no deep copies). Allocate-and-collect on purpose;
+    /// fine for the API/MCP read paths, avoid in hot loops.
+    #[must_use]
+    pub fn list(&self) -> Vec<Arc<ServiceMeta>> {
+        self.inner
+            .read()
+            .expect("services lock poisoned")
+            .values()
+            .map(Arc::clone)
+            .collect()
     }
 
     /// Drop every service owned by `instance_id`. Called by the
-    /// supervisor when an instance reaches a terminal state, *and* at
+    /// supervisor when an instance reaches a terminal state *and* at
     /// the top of every restart attempt — without it, a plugin that
-    /// `register-service`s in `init` and then crash-loops would stack
-    /// a fresh entry per restart life, and even on clean stop its
-    /// services would outlive the instance. Returns the number of
-    /// entries removed (for tracing).
-    pub async fn remove_by_owner(&self, instance_id: &str) -> usize {
-        let mut guard = self.inner.write().await;
+    /// `register-service`s in `init` and crash-loops stacks a fresh
+    /// entry per restart life. Returns the number of entries removed.
+    pub fn remove_by_owner(&self, instance_id: &str) -> usize {
+        let mut guard = self.inner.write().expect("services lock poisoned");
         let before = guard.len();
         guard.retain(|_, m| m.owner_instance != instance_id);
         before - guard.len()
@@ -265,62 +301,87 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn register_mints_distinct_svc_ids() {
+    #[test]
+    fn register_mints_distinct_svc_ids() {
         let reg = ServiceRegistry::new();
-        let a = reg.register("alpha".into(), info("house-mode")).await;
-        let b = reg.register("alpha".into(), info("evening")).await;
+        let a = reg.register("alpha".into(), info("house-mode"));
+        let b = reg.register("alpha".into(), info("evening"));
         assert!(a.starts_with("svc-"));
         assert_ne!(a, b);
-        assert_eq!(reg.list().await.len(), 2);
+        assert_eq!(reg.list().len(), 2);
     }
 
     /// `update`/`remove`/`get` reject a non-owner with `NotFound`,
     /// indistinguishable from "id never existed".
-    #[tokio::test(flavor = "current_thread")]
-    async fn cross_instance_access_is_rejected() {
+    #[test]
+    fn cross_instance_access_is_rejected() {
         let reg = ServiceRegistry::new();
-        let id = reg.register("alpha".into(), info("house-mode")).await;
+        let id = reg.register("alpha".into(), info("house-mode"));
 
-        reg.get("alpha", &id).await.expect("owner can get");
+        reg.get("alpha", &id).expect("owner can get");
         reg.update("alpha", &id, info("house-mode"))
-            .await
             .expect("owner can update");
 
         for bad in ["beta", "gamma"] {
             assert!(matches!(
-                reg.get(bad, &id).await.unwrap_err(),
+                reg.get(bad, &id).unwrap_err(),
                 WitError::NotFound(_)
             ));
             assert!(matches!(
-                reg.update(bad, &id, info("x")).await.unwrap_err(),
+                reg.update(bad, &id, info("x")).unwrap_err(),
                 WitError::NotFound(_)
             ));
             assert!(matches!(
-                reg.remove(bad, &id).await.unwrap_err(),
+                reg.remove(bad, &id).unwrap_err(),
                 WitError::NotFound(_)
             ));
         }
 
-        // Still owned by alpha after the failed non-owner removes.
-        reg.get("alpha", &id).await.expect("still alpha's");
-        reg.remove("alpha", &id).await.expect("owner can remove");
-        reg.get("alpha", &id).await.expect_err("gone after remove");
+        reg.get("alpha", &id).expect("still alpha's");
+        reg.remove("alpha", &id).expect("owner can remove");
+        reg.get("alpha", &id).expect_err("gone after remove");
+    }
+
+    /// `get_owner` lets the dispatcher route without pulling the
+    /// full `ServiceMeta` (and its `Vec<CommandSpec>`) through the
+    /// lock.
+    #[test]
+    fn get_owner_returns_just_the_owner() {
+        let reg = ServiceRegistry::new();
+        let id = reg.register("alpha".into(), info("house-mode"));
+        assert_eq!(reg.get_owner(&id).as_deref(), Some("alpha"));
+        assert_eq!(reg.get_owner(&"svc-nonexistent".to_string()), None);
+    }
+
+    /// `update` rebuilds the Arc — outstanding `get` snapshots see
+    /// the *old* info, the new snapshot sees the update. Guarantees
+    /// reads-while-update don't observe a partially-written meta.
+    #[test]
+    fn update_swaps_arc_without_disturbing_outstanding_snapshots() {
+        let reg = ServiceRegistry::new();
+        let id = reg.register("alpha".into(), info("v1"));
+        let before = reg.get("alpha", &id).expect("get");
+        assert_eq!(before.info.name, "v1");
+
+        reg.update("alpha", &id, info("v2")).expect("update");
+        let after = reg.get("alpha", &id).expect("get");
+        assert_eq!(after.info.name, "v2");
+        // The pre-update snapshot still observes the original name.
+        assert_eq!(before.info.name, "v1");
     }
 
     /// `acquire_call` bumps the refcount; `remove` then refuses with
     /// `Unavailable`. The guard's `Drop` synchronously decrements
-    /// (no tokio runtime required) — so dropping it lets the next
-    /// `remove` succeed.
-    #[tokio::test(flavor = "current_thread")]
-    async fn remove_refuses_while_call_in_flight() {
+    /// — so dropping it lets the next `remove` succeed.
+    #[test]
+    fn remove_refuses_while_call_in_flight() {
         let reg = Arc::new(ServiceRegistry::new());
-        let id = reg.register("alpha".into(), info("house-mode")).await;
+        let id = reg.register("alpha".into(), info("house-mode"));
 
-        let guard = reg.acquire_call(&id).await.expect("acquire");
+        let guard = reg.acquire_call(&id).expect("acquire");
         assert_eq!(reg.active_call_count(&id), 1);
 
-        match reg.remove("alpha", &id).await {
+        match reg.remove("alpha", &id) {
             Err(WitError::Unavailable(msg)) => {
                 assert!(
                     msg.contains("active call") && msg.contains(&id),
@@ -330,33 +391,22 @@ mod tests {
             other => panic!("expected Unavailable while in flight, got {other:?}"),
         }
 
-        // Dropping the guard releases the refcount synchronously.
         drop(guard);
         assert_eq!(reg.active_call_count(&id), 0);
-        reg.remove("alpha", &id).await.expect("now removable");
+        reg.remove("alpha", &id).expect("now removable");
     }
 
     /// `CallGuard::Drop` runs synchronously through a plain `Mutex`
-    /// — no `tokio::runtime::Handle` lookup, no detached spawn. A
-    /// fresh `Runtime::block_on` builds, acquires, drops, and the
-    /// next `block_on` still sees the count back to 0.
+    /// — no `tokio::runtime::Handle` lookup. A fresh `block_on`
+    /// builds, acquires, drops, and the next `block_on` still sees
+    /// the count back to 0.
     #[test]
     fn call_guard_drop_works_without_active_runtime() {
-        use tokio::runtime::Builder;
-
         let reg = Arc::new(ServiceRegistry::new());
-        let rt = Builder::new_current_thread().build().expect("rt");
-        let id = rt.block_on(reg.register("alpha".into(), info("ring")));
+        let id = reg.register("alpha".into(), info("ring"));
 
-        let guard = rt
-            .block_on(reg.acquire_call(&id))
-            .expect("acquire under runtime");
+        let guard = reg.acquire_call(&id).expect("acquire");
         assert_eq!(reg.active_call_count(&id), 1);
-
-        // Tear the runtime down *first*, then drop the guard. With
-        // the old `tokio::sync::RwLock` + `Handle::try_current()`
-        // design this would have silently leaked the refcount.
-        drop(rt);
         drop(guard);
         assert_eq!(reg.active_call_count(&id), 0);
     }

@@ -694,8 +694,8 @@ async fn run_one_lifecycle(
     // it prevents stacking duplicates as `init` re-registers, and
     // keeps the registries from growing unboundedly across crash
     // loops. Idempotent + cheap (one HashMap retain each).
-    engine.devices().remove_by_owner(instance_id).await;
-    engine.services().remove_by_owner(instance_id).await;
+    engine.devices().remove_by_owner(instance_id);
+    engine.services().remove_by_owner(instance_id);
 
     transition(state_tx, instance_id, InstanceState::Loading);
 

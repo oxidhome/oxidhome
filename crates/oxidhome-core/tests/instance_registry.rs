@@ -99,7 +99,7 @@ async fn multi_instance_runs_two_with_distinct_overrides() {
     inst_off.wait_for_running().await.expect("off Running");
     inst_on.wait_for_running().await.expect("on Running");
 
-    let devices = engine.devices().list().await;
+    let devices = engine.devices().list();
     assert_eq!(devices.len(), 2, "expected two devices, got {devices:?}");
     let mut owners: Vec<&str> = devices.iter().map(|d| d.owner_instance.as_str()).collect();
     owners.sort_unstable();

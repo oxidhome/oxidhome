@@ -65,7 +65,6 @@ async fn plugin_logs_survive_host_restart() {
         let meta = engine
             .devices()
             .list()
-            .await
             .into_iter()
             .find(|m| m.owner_instance == instance_id)
             .expect("switch registered one device");

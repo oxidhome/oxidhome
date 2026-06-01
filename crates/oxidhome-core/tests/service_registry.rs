@@ -26,7 +26,7 @@ async fn registered_service_is_visible_in_registry() {
         .expect("load");
     instance.init().await.expect("init registers the service");
 
-    let services = engine.services().list().await;
+    let services = engine.services().list();
     assert_eq!(services.len(), 1, "expected one service, got {services:?}");
     let svc = &services[0];
     assert_eq!(svc.owner_instance, "service_counter");
@@ -78,7 +78,7 @@ wasm = "service_counter.wasm"
         "expected a permission-denied mentioning the service, got: {msg}",
     );
     // Nothing landed in the registry.
-    assert!(engine.services().list().await.is_empty());
+    assert!(engine.services().list().is_empty());
 }
 
 /// A supervised instance's services are reaped when it reaches a
@@ -99,7 +99,7 @@ async fn services_are_reaped_on_terminal_state() {
         .expect("start_instance");
     handle.wait_for_running().await.expect("reach Running");
     assert_eq!(
-        engine.services().list().await.len(),
+        engine.services().list().len(),
         1,
         "service is registered while the instance is Running",
     );
@@ -112,7 +112,7 @@ async fn services_are_reaped_on_terminal_state() {
     // Phase-6 `wait_until_unregistered` helper.)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if engine.services().list().await.is_empty() {
+        if engine.services().list().is_empty() {
             break;
         }
         assert!(
@@ -138,22 +138,21 @@ async fn remove_by_owner_scopes_to_one_instance() {
         metadata: Vec::new(),
         commands: Vec::new(),
     };
-    let _a1 = reg.register("alpha".into(), info("counter-a1")).await;
-    let _a2 = reg.register("alpha".into(), info("counter-a2")).await;
-    let _b1 = reg.register("beta".into(), info("counter-b1")).await;
-    assert_eq!(reg.list().await.len(), 3);
+    let _a1 = reg.register("alpha".into(), info("counter-a1"));
+    let _a2 = reg.register("alpha".into(), info("counter-a2"));
+    let _b1 = reg.register("beta".into(), info("counter-b1"));
+    assert_eq!(reg.list().len(), 3);
 
-    let removed = reg.remove_by_owner("alpha").await;
+    let removed = reg.remove_by_owner("alpha");
     assert_eq!(removed, 2, "expected two alpha services dropped");
 
     let remaining: Vec<String> = reg
         .list()
-        .await
         .into_iter()
-        .map(|m| m.owner_instance)
+        .map(|m| m.owner_instance.clone())
         .collect();
     assert_eq!(remaining, vec!["beta".to_string()]);
 
     // Idempotent — a second sweep finds nothing.
-    assert_eq!(reg.remove_by_owner("alpha").await, 0);
+    assert_eq!(reg.remove_by_owner("alpha"), 0);
 }
