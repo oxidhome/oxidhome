@@ -13,13 +13,21 @@
 //! flight land in 7c alongside the dispatcher that uses them.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
 
 use crate::host_impl::plugin::oxidhome::plugin::services::ServiceInfo;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, ServiceId};
+
+/// Internal: per-`ServiceId` in-flight call counters. Bumped by the
+/// dispatcher's [`CallGuard`] before invoking `execute-service-command`,
+/// decremented on guard drop. `remove` consults this to refuse removal
+/// while a call is in flight. Held under a plain `std::sync::Mutex` so
+/// the guard's `Drop` can always reclaim the refcount synchronously
+/// — no tokio runtime required at drop time.
+type ActiveCalls = HashMap<ServiceId, u32>;
 
 /// What the registry stores per service.
 #[derive(Clone, Debug)]
@@ -39,6 +47,13 @@ pub struct ServiceMeta {
 #[derive(Default, Debug)]
 pub struct ServiceRegistry {
     inner: RwLock<HashMap<ServiceId, ServiceMeta>>,
+    /// In-flight call refcounts per service. Separate sync `Mutex` so
+    /// reads / writes against `meta` don't have to take a write lock
+    /// just to bump the counter, `remove` can fail fast on `count > 0`
+    /// without cloning meta, and the dispatcher's [`CallGuard::drop`]
+    /// can decrement synchronously without holding (or needing) a
+    /// tokio runtime handle.
+    active_calls: Mutex<ActiveCalls>,
     next_id: AtomicU64,
 }
 
@@ -87,13 +102,24 @@ impl ServiceRegistry {
 
     /// Drop a service from the registry, scoped to the caller's
     /// instance. `NotFound` if the id is missing or owned by another
-    /// instance. (7c adds an active-call check that refuses removal
-    /// while a `call-service` is in flight.)
+    /// instance; [`WitError::Unavailable`] if a `call-service` against
+    /// it is still in flight (the dispatcher's [`CallGuard`] holds a
+    /// refcount). Take both locks in a fixed order
+    /// (`inner` → `active_calls`) to keep linearizable against
+    /// [`Self::acquire_call`].
     pub async fn remove(&self, owner_instance: &str, id: &ServiceId) -> Result<(), WitError> {
         let mut guard = self.inner.write().await;
+        let mut calls = self.active_calls.lock().expect("active_calls poisoned");
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
+                let in_flight = calls.get(id).copied().unwrap_or(0);
+                if in_flight > 0 {
+                    return Err(WitError::Unavailable(format!(
+                        "service {id} has {in_flight} active call(s); retry after they complete"
+                    )));
+                }
                 guard.remove(id);
+                calls.remove(id);
                 Ok(())
             }
             _ => Err(WitError::NotFound(format!("service {id} not registered"))),
@@ -107,6 +133,68 @@ impl ServiceRegistry {
             Some(meta) if meta.owner_instance == owner_instance => Ok(meta.clone()),
             _ => Err(WitError::NotFound(format!("service {id} not registered"))),
         }
+    }
+
+    /// Cross-instance lookup — the dispatcher's routing primitive.
+    /// Unlike [`Self::get`], this is *not* owner-scoped: the caller is
+    /// looking up *someone else's* service in order to call it. Use
+    /// only from `runtime::dispatcher` and host-side API/MCP code;
+    /// plugin-facing reads go through `get`.
+    pub async fn get_any(&self, id: &ServiceId) -> Result<ServiceMeta, WitError> {
+        self.inner
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| WitError::NotFound(format!("service {id} not registered")))
+    }
+
+    /// Bump the in-flight refcount for `id`; the returned [`CallGuard`]
+    /// decrements on drop. The dispatcher holds one across each
+    /// `execute-service-command` invocation so `remove-service` refuses
+    /// while a call is alive. Returns `NotFound` if `id` isn't
+    /// registered (checked under the same services lock as the
+    /// increment so an in-flight removal can't race the bump).
+    ///
+    /// Lock order across this call and [`Self::remove`]: services
+    /// first, then `active_calls`. Both operations follow it, so
+    /// they're linearizable.
+    pub async fn acquire_call(self: &Arc<Self>, id: &ServiceId) -> Result<CallGuard, WitError> {
+        let services = self.inner.read().await;
+        if !services.contains_key(id) {
+            return Err(WitError::NotFound(format!("service {id} not registered")));
+        }
+        let mut calls = self.active_calls.lock().expect("active_calls poisoned");
+        *calls.entry(id.clone()).or_insert(0) += 1;
+        Ok(CallGuard {
+            registry: Arc::clone(self),
+            id: id.clone(),
+        })
+    }
+
+    /// Internal: decrement the in-flight refcount for `id`. Called
+    /// from [`CallGuard::drop`] — synchronous on purpose so it never
+    /// needs to await a runtime. Tolerant of an over-release.
+    fn release_call(&self, id: &ServiceId) {
+        let mut calls = self.active_calls.lock().expect("active_calls poisoned");
+        if let Some(n) = calls.get_mut(id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                calls.remove(id);
+            }
+        }
+    }
+
+    /// Snapshot of the in-flight refcount for `id`. Test helper.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn active_call_count(&self, id: &ServiceId) -> u32 {
+        self.active_calls
+            .lock()
+            .expect("active_calls poisoned")
+            .get(id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Snapshot of every registered service. Allocates — fine for the
@@ -132,6 +220,37 @@ impl ServiceRegistry {
 
 /// Shared `Arc` alias, parallel to `SharedDeviceRegistry`.
 pub type SharedServiceRegistry = Arc<ServiceRegistry>;
+
+/// RAII handle on an in-flight call refcount. The dispatcher takes
+/// one with [`ServiceRegistry::acquire_call`] before dispatching and
+/// hands it to the *callee's* supervisor inside the
+/// `ControlCommand::ExecuteService` message; the supervisor holds it
+/// across the wasm call and `Drop` decrements when the supervisor
+/// finishes (or when the message is dropped without being processed
+/// — e.g. control channel closed).
+///
+/// `Drop` is synchronous (the underlying counter is a
+/// `std::sync::Mutex`) and reliable — no tokio runtime needed at
+/// drop time, no detached spawn, no leak path on cancellation or
+/// runtime teardown.
+pub struct CallGuard {
+    registry: Arc<ServiceRegistry>,
+    id: ServiceId,
+}
+
+impl std::fmt::Debug for CallGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallGuard")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.registry.release_call(&self.id);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -187,5 +306,58 @@ mod tests {
         reg.get("alpha", &id).await.expect("still alpha's");
         reg.remove("alpha", &id).await.expect("owner can remove");
         reg.get("alpha", &id).await.expect_err("gone after remove");
+    }
+
+    /// `acquire_call` bumps the refcount; `remove` then refuses with
+    /// `Unavailable`. The guard's `Drop` synchronously decrements
+    /// (no tokio runtime required) — so dropping it lets the next
+    /// `remove` succeed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_refuses_while_call_in_flight() {
+        let reg = Arc::new(ServiceRegistry::new());
+        let id = reg.register("alpha".into(), info("house-mode")).await;
+
+        let guard = reg.acquire_call(&id).await.expect("acquire");
+        assert_eq!(reg.active_call_count(&id), 1);
+
+        match reg.remove("alpha", &id).await {
+            Err(WitError::Unavailable(msg)) => {
+                assert!(
+                    msg.contains("active call") && msg.contains(&id),
+                    "expected the Unavailable message to name the active call + id, got: {msg}",
+                );
+            }
+            other => panic!("expected Unavailable while in flight, got {other:?}"),
+        }
+
+        // Dropping the guard releases the refcount synchronously.
+        drop(guard);
+        assert_eq!(reg.active_call_count(&id), 0);
+        reg.remove("alpha", &id).await.expect("now removable");
+    }
+
+    /// `CallGuard::Drop` runs synchronously through a plain `Mutex`
+    /// — no `tokio::runtime::Handle` lookup, no detached spawn. A
+    /// fresh `Runtime::block_on` builds, acquires, drops, and the
+    /// next `block_on` still sees the count back to 0.
+    #[test]
+    fn call_guard_drop_works_without_active_runtime() {
+        use tokio::runtime::Builder;
+
+        let reg = Arc::new(ServiceRegistry::new());
+        let rt = Builder::new_current_thread().build().expect("rt");
+        let id = rt.block_on(reg.register("alpha".into(), info("ring")));
+
+        let guard = rt
+            .block_on(reg.acquire_call(&id))
+            .expect("acquire under runtime");
+        assert_eq!(reg.active_call_count(&id), 1);
+
+        // Tear the runtime down *first*, then drop the guard. With
+        // the old `tokio::sync::RwLock` + `Handle::try_current()`
+        // design this would have silently leaked the refcount.
+        drop(rt);
+        drop(guard);
+        assert_eq!(reg.active_call_count(&id), 0);
     }
 }

@@ -9,6 +9,11 @@
 //!
 //! Lifecycle, multi-instance, and crash isolation land in Phase 6.
 
+// `dispatcher` is `pub` only so integration tests can reach the
+// `#[doc(hidden)]` `call_service_from_host` helper; the regular
+// surface is everything else accessed via `pub(crate)` inside the
+// module.
+pub mod dispatcher;
 mod instance;
 mod lifecycle;
 mod registry;

@@ -20,7 +20,7 @@ use crate::auth::Actor;
 use crate::host_impl::plugin::Plugin as PluginBindings;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
-use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
+use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
 use crate::{MIN_SUPPORTED_SDK_VERSION, OXIDHOME_SDK_VERSION};
 
 use super::Engine;
@@ -352,6 +352,7 @@ impl PluginInstance {
             engine.event_log(),
             blobs,
             engine.services(),
+            engine.instances(),
         );
         let mut store = Store::new(engine.raw(), state);
         // Phase 7a — `epoch_interruption(true)` starts every store at
@@ -506,6 +507,37 @@ impl PluginInstance {
                 .await
                 .map_err(anyhow::Error::from)
                 .context("invoking plugin execute-command")
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Call the plugin's exported `execute-service-command` for a
+    /// service this instance owns. Phase 7c's `runtime::dispatcher`
+    /// routes `host-services::call-service` here on the *owner*
+    /// instance's supervisor task — never directly on the caller's,
+    /// so the single-`Store` contract is preserved.
+    pub async fn execute_service_command(
+        &mut self,
+        service: ServiceId,
+        command: String,
+        args: Vec<KeyValue>,
+    ) -> anyhow::Result<CommandResult> {
+        let data = self.store.data();
+        let span = info_span!(
+            "plugin.execute_service_command",
+            instance_id = %data.instance_id,
+            plugin_id = %data.manifest.plugin.id,
+            service_id = %service,
+            command = %command,
+        );
+        async {
+            self.arm_watchdog();
+            self.bindings
+                .call_execute_service_command(&mut self.store, &service, &command, &args)
+                .await
+                .map_err(anyhow::Error::from)
+                .context("invoking plugin execute-service-command")
         }
         .instrument(span)
         .await

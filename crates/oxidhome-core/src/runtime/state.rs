@@ -41,6 +41,7 @@ use crate::host_impl::plugin::oxidhome::plugin::{
     storage, types,
     types::{DeviceId, Error as WitError, KeyValue, ServiceId, SubscriptionId, Value as WitValue},
 };
+use crate::runtime::registry::InstanceRegistry;
 use crate::state::{DeviceRegistry, EventBus, EventSubscription, ServiceRegistry};
 
 /// Identifier the host assigns to a plugin instance — Phase 6 fleshes
@@ -113,6 +114,10 @@ pub struct PluginState {
     /// Shared service registry — Phase 7. `host-services` calls go
     /// through here; owner-scoped to this instance's `instance_id`.
     pub services: Arc<ServiceRegistry>,
+    /// Shared instance registry — Phase 7c. `call_service` resolves
+    /// the target's owner through `services.get_any(...)` and then
+    /// looks up that owner's handle here to dispatch.
+    pub instances: Arc<InstanceRegistry>,
 }
 
 impl PluginState {
@@ -132,6 +137,7 @@ impl PluginState {
         event_log: Arc<crate::state::EventLog>,
         blobs: Arc<crate::state::BlobStore>,
         services: Arc<ServiceRegistry>,
+        instances: Arc<InstanceRegistry>,
     ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
@@ -145,6 +151,7 @@ impl PluginState {
             event_log,
             blobs,
             services,
+            instances,
             subscriptions: Vec::new(),
             manifest,
             actor,
@@ -410,16 +417,23 @@ impl host_services::Host for PluginState {
     async fn call_service(
         &mut self,
         target: ServiceId,
-        _command: String,
-        _args: Vec<KeyValue>,
+        command: String,
+        args: Vec<KeyValue>,
     ) -> Result<CommandResult, WitError> {
-        // Phase 7b stub: the routing dispatcher (recursion stack,
-        // timeout, cross-instance `execute-service-command`) lands in
-        // 7c. Until then, surface `Unavailable` so callers get a clear
-        // signal rather than a silent failure.
-        Err(WitError::Unavailable(format!(
-            "call-service to `{target}` is not available yet (dispatcher lands in Phase 7c)"
-        )))
+        // Phase 7c: route through the dispatcher. Resolves target →
+        // owner, rejects A→…→A cycles, races
+        // `execute-service-command` against the dispatcher timeout,
+        // and holds a `CallGuard` so `remove-service` refuses while
+        // the call is alive.
+        crate::runtime::dispatcher::call_service(
+            &self.services,
+            &self.instances,
+            self.instance_id.clone(),
+            target,
+            command,
+            args,
+        )
+        .await
     }
 }
 
@@ -938,6 +952,7 @@ mod tests {
             fresh_event_log(),
             fresh_blobs(),
             Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
         )
     }
 
@@ -962,6 +977,7 @@ mod tests {
             fresh_event_log(),
             fresh_blobs(),
             Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
         )
     }
 
@@ -981,6 +997,7 @@ mod tests {
             fresh_event_log(),
             fresh_blobs(),
             Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
         )
     }
 
@@ -1247,6 +1264,7 @@ mod tests {
             fresh_event_log(),
             fresh_blobs(),
             Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
         );
 
         // A device that claims `dimmer` should be refused.
@@ -1291,6 +1309,7 @@ mod tests {
             fresh_event_log(),
             fresh_blobs(),
             Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
         );
 
         let mut info = empty_device("d-shade");
@@ -1373,6 +1392,7 @@ mod tests {
             fresh_event_log(),
             fresh_blobs(),
             Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
         );
 
         let mut info = empty_device("d-up");

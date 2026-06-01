@@ -38,7 +38,9 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use crate::Engine;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
-use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
+use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
+use crate::runtime::dispatcher::{CALL_STACK, CallFrame};
+use crate::state::CallGuard;
 
 use super::instance::{InitError, PluginInstance};
 
@@ -163,6 +165,29 @@ enum ControlCommand {
         cmd: Command,
         reply: oneshot::Sender<anyhow::Result<CommandResult>>,
     },
+    /// Run the plugin's `execute-service-command` on a service it owns
+    /// — the dispatcher hops to this on the owner's supervisor task so
+    /// the single-`Store` contract holds. `chain` is the full
+    /// in-flight `call-service` chain (caller's parent chain + the
+    /// frame for this call); the supervisor scopes it on its task
+    /// before driving the wasm so nested `call-service`s from inside
+    /// `execute-service-command` see the full chain for cycle checks.
+    ///
+    /// `guard` is the [`CallGuard`] the dispatcher acquired before
+    /// sending the message. It rides with the work so the in-flight
+    /// refcount tracks *real* execution: dropped when the supervisor
+    /// finishes the wasm call (`handle_control` holds it across the
+    /// scoped invocation), or dropped with the message if the
+    /// channel closes before the supervisor consumes it. Nothing
+    /// *reads* it — `Drop` does the decrement.
+    ExecuteService {
+        chain: Vec<CallFrame>,
+        guard: CallGuard,
+        service: ServiceId,
+        command: String,
+        args: Vec<KeyValue>,
+        reply: oneshot::Sender<anyhow::Result<CommandResult>>,
+    },
     /// Run `shutdown` and end the supervisor task.
     Shutdown { reply: oneshot::Sender<()> },
 }
@@ -275,6 +300,66 @@ impl InstanceHandle {
         rx.await.map_err(|_| {
             anyhow!(
                 "instance `{}` supervisor dropped the command reply",
+                self.instance_id,
+            )
+        })?
+    }
+
+    /// Run the plugin's `execute-service-command` on `service`. Used
+    /// by [`crate::runtime::dispatcher`]'s cross-instance routing —
+    /// always hops to the *owner*'s supervisor task so the
+    /// single-`Store` contract holds.
+    ///
+    /// `chain` is the full in-flight `call-service` chain leading to
+    /// this call; the callee's supervisor scopes it on its own task
+    /// before invoking the wasm, so cycle detection works across the
+    /// task hop.
+    ///
+    /// **Caller blocking note.** The caller's supervisor task is
+    /// parked on the oneshot until this returns, so any other control
+    /// message (including `stop`) queued on the caller's mpsc waits
+    /// up to [`crate::runtime::dispatcher::DISPATCH_TIMEOUT`] for the
+    /// service call to complete.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if the supervisor is gone, the supervisor dropped the
+    /// reply, or the call trapped (a trap also crashes the instance).
+    /// A plugin returning a normal error result surfaces as
+    /// `Ok(CommandResult::Err(..))`.
+    pub(crate) async fn execute_service_command(
+        &self,
+        chain: Vec<CallFrame>,
+        guard: CallGuard,
+        service: ServiceId,
+        command: String,
+        args: Vec<KeyValue>,
+    ) -> anyhow::Result<CommandResult> {
+        let (reply, rx) = oneshot::channel();
+        // If the send fails (control channel closed), the
+        // `SendError` carries the message back; `map_err` discards
+        // it, which drops the `ControlCommand::ExecuteService` and
+        // with it the `CallGuard` → refcount decrements cleanly even
+        // on the supervisor-gone path.
+        self.control
+            .send(ControlCommand::ExecuteService {
+                chain,
+                guard,
+                service,
+                command,
+                args,
+                reply,
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "instance `{}` supervisor is no longer running",
+                    self.instance_id,
+                )
+            })?;
+        rx.await.map_err(|_| {
+            anyhow!(
+                "instance `{}` supervisor dropped the service-command reply",
                 self.instance_id,
             )
         })?
@@ -764,7 +849,20 @@ async fn backoff_wait(
                     let _ = reply.send(());
                     return BackoffOutcome::Shutdown;
                 }
+                // The two `Execute*` arms hand the caller the same
+                // "instance is restarting" Err, but the typed reply
+                // channels are distinct so the arms can't share a
+                // single block. The arms may diverge later (e.g.
+                // returning a typed `CommandResult::Err` for service
+                // calls); keep them separate now rather than merging.
+                #[allow(clippy::match_same_arms)]
                 Some(ControlCommand::Execute { reply, .. }) => {
+                    let _ = reply.send(Err(anyhow!(
+                        "instance `{instance_id}` is restarting after a crash",
+                    )));
+                }
+                #[allow(clippy::match_same_arms)]
+                Some(ControlCommand::ExecuteService { reply, .. }) => {
                     let _ = reply.send(Err(anyhow!(
                         "instance `{instance_id}` is restarting after a crash",
                     )));
@@ -810,6 +908,44 @@ async fn handle_control(
                     // instance — an `execute-command` trap is a crash.
                     let _ = reply.send(Err(anyhow!(
                         "instance `{instance_id}` crashed during execute-command: {trap:#}",
+                    )));
+                    Err(trap)
+                }
+            }
+        }
+        Some(ControlCommand::ExecuteService {
+            chain,
+            guard,
+            service,
+            command,
+            args,
+            reply,
+        }) => {
+            // Hold the dispatcher's in-flight refcount across the
+            // wasm call. `_call_guard` lives until end-of-arm, so
+            // `remove-service` can only succeed once we've truly
+            // finished — no early release on a caller-side timeout.
+            let _call_guard = guard;
+            // Scope `CALL_STACK` to the chain handed to us by the
+            // caller's dispatcher *on this supervisor's task*. That's
+            // how cycle detection survives the task hop: any nested
+            // `host::call_service` from inside the wasm we're about
+            // to drive runs on this task, reads `CALL_STACK`, and
+            // sees the full chain leading to it.
+            let outcome = CALL_STACK
+                .scope(
+                    chain,
+                    instance.execute_service_command(service, command, args),
+                )
+                .await;
+            match outcome {
+                Ok(result) => {
+                    let _ = reply.send(Ok(result));
+                    Ok(LoopAction::Continue)
+                }
+                Err(trap) => {
+                    let _ = reply.send(Err(anyhow!(
+                        "instance `{instance_id}` crashed during execute-service-command: {trap:#}",
                     )));
                     Err(trap)
                 }
