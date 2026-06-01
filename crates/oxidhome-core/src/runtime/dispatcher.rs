@@ -333,18 +333,22 @@ mod tests {
         assert_eq!(services.active_call_count(&a_svc).await, 0);
     }
 
-    /// Sanity: a non-cyclic deeper hop (A→B→C, never returning to A
-    /// or B) is *not* rejected at the cycle check — it should reach
-    /// `instances.get(...)` and fail there with `Unavailable` because
-    /// C's instance handle isn't registered in this in-process test.
+    /// Sanity: a linear, non-cyclic chain A→B→C→D — where D's owner
+    /// is *not* on the existing caller-set {A,B,C} — passes the cycle
+    /// check. The call then reaches `instances.get(...)` and fails
+    /// there with `Unavailable` (delta has no real handle in this
+    /// in-process test), which is the proof the check let it through.
     #[tokio::test(flavor = "current_thread")]
     async fn permits_non_cyclic_chain() {
         let services = Arc::new(ServiceRegistry::new());
-        let _c_svc = services
-            .register("gamma".into(), fixture_info("ring"))
-            .await;
         let instances = Arc::new(InstanceRegistry::new());
+        let delta_svc = services
+            .register("delta".into(), fixture_info("ring"))
+            .await;
 
+        // Chain represents A→B→C in flight on gamma's task — gamma is
+        // the current caller. The new target is delta, which is not
+        // on the caller-set {alpha, beta, gamma}.
         let chain = vec![
             CallFrame {
                 caller_instance: "alpha".into(),
@@ -357,14 +361,6 @@ mod tests {
                 target_service: "irrelevant".into(),
             },
         ];
-
-        // Caller is gamma (the current task is gamma's supervisor),
-        // target's owner is gamma's service... wait, that'd be a
-        // self-call. Use a distinct owner "delta" and verify the
-        // dispatcher gets past the cycle check.
-        let delta_svc = services
-            .register("delta".into(), fixture_info("ring"))
-            .await;
         let err = CALL_STACK
             .scope(
                 chain,
