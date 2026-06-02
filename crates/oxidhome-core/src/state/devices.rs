@@ -147,10 +147,14 @@ impl DeviceRegistry {
     }
 
     /// Snapshot of every registered device — cheap (one `Arc::clone`
-    /// per entry, no deep copies).
+    /// per entry, no deep copies). The `Vec` is pre-sized so the
+    /// `Arc::clone` loop doesn't realloc-grow under the read lock.
     #[must_use]
     pub fn list(&self) -> Vec<Arc<DeviceMeta>> {
-        self.read().values().map(Arc::clone).collect()
+        let guard = self.read();
+        let mut out = Vec::with_capacity(guard.len());
+        out.extend(guard.values().map(Arc::clone));
+        out
     }
 
     /// Drop every device owned by `instance_id`. Called by the

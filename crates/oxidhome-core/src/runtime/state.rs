@@ -339,11 +339,14 @@ impl host_devices::Host for PluginState {
 //
 // `register-service` is gated by the manifest's `declares_services`
 // (matching `host-devices`'s `declares_devices` shape). `update` /
-// `remove` / `get` are owner-scoped through the registry. `call-service`
-// is the synchronous cross-plugin dispatch — its routing dispatcher
-// lands in Phase 7c; the 7b impl is a deliberate `Unavailable` stub so
-// the WIT compiles end-to-end and plugins can register/look-up services
-// today.
+// `remove` / `get` are owner-scoped through the registry.
+// `call-service` is the synchronous cross-plugin dispatch — it
+// routes through `runtime::dispatcher::call_service`, which resolves
+// the target's owner, rejects cycles at instance granularity, and
+// hops to the owner's supervisor task via
+// `ControlCommand::ExecuteService`. The in-flight refcount
+// (`CallGuard`) travels with the message so `remove-service` refuses
+// while a call is alive.
 
 /// Whether `name` appears in the manifest's `declares_services`. The
 /// service's `name` field is the capability key (the human-readable

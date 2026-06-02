@@ -237,10 +237,15 @@ impl ServiceRegistry {
 
     /// Snapshot of every registered service — cheap (one `Arc::clone`
     /// per entry, no deep copies). Allocate-and-collect on purpose;
-    /// fine for the API/MCP read paths, avoid in hot loops.
+    /// fine for the API/MCP read paths, avoid in hot loops. The
+    /// `Vec` is pre-sized to the registry length so the `Arc::clone`
+    /// loop doesn't realloc-grow under the read lock.
     #[must_use]
     pub fn list(&self) -> Vec<Arc<ServiceMeta>> {
-        self.services_read().values().map(Arc::clone).collect()
+        let guard = self.services_read();
+        let mut out = Vec::with_capacity(guard.len());
+        out.extend(guard.values().map(Arc::clone));
+        out
     }
 
     /// Drop every service owned by `instance_id`. Called by the
