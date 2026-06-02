@@ -284,7 +284,7 @@ impl host_devices::Host for PluginState {
             return Err(err);
         }
 
-        let id = self.devices.register(self.instance_id.clone(), info).await;
+        let id = self.devices.register(self.instance_id.clone(), info);
         tracing::debug!(
             instance_id = %self.instance_id,
             device_id = %id,
@@ -310,11 +310,11 @@ impl host_devices::Host for PluginState {
             );
             return Err(err);
         }
-        self.devices.update(&self.instance_id, &id, info).await
+        self.devices.update(&self.instance_id, &id, info)
     }
 
     async fn remove_device(&mut self, id: DeviceId) -> Result<(), WitError> {
-        let outcome = self.devices.remove(&self.instance_id, &id).await;
+        let outcome = self.devices.remove(&self.instance_id, &id);
         if outcome.is_ok() {
             tracing::debug!(
                 instance_id = %self.instance_id,
@@ -326,10 +326,12 @@ impl host_devices::Host for PluginState {
     }
 
     async fn get_device(&mut self, id: DeviceId) -> Result<DeviceInfo, WitError> {
+        // The Arc holds the canonical meta; the WIT surface returns
+        // `DeviceInfo` by value so we clone `info` once at the
+        // boundary. `id` and `owner_instance` aren't cloned.
         self.devices
             .get(&self.instance_id, &id)
-            .await
-            .map(|meta| meta.info)
+            .map(|meta| meta.info.clone())
     }
 }
 
@@ -337,11 +339,14 @@ impl host_devices::Host for PluginState {
 //
 // `register-service` is gated by the manifest's `declares_services`
 // (matching `host-devices`'s `declares_devices` shape). `update` /
-// `remove` / `get` are owner-scoped through the registry. `call-service`
-// is the synchronous cross-plugin dispatch — its routing dispatcher
-// lands in Phase 7c; the 7b impl is a deliberate `Unavailable` stub so
-// the WIT compiles end-to-end and plugins can register/look-up services
-// today.
+// `remove` / `get` are owner-scoped through the registry.
+// `call-service` is the synchronous cross-plugin dispatch — it
+// routes through `runtime::dispatcher::call_service`, which resolves
+// the target's owner, rejects cycles at instance granularity, and
+// hops to the owner's supervisor task via
+// `ControlCommand::ExecuteService`. The in-flight refcount
+// (`CallGuard`) travels with the message so `remove-service` refuses
+// while a call is alive.
 
 /// Whether `name` appears in the manifest's `declares_services`. The
 /// service's `name` field is the capability key (the human-readable
@@ -366,7 +371,7 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
-        let id = self.services.register(self.instance_id.clone(), info).await;
+        let id = self.services.register(self.instance_id.clone(), info);
         tracing::debug!(
             instance_id = %self.instance_id,
             service_id = %id,
@@ -392,11 +397,11 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
-        self.services.update(&self.instance_id, &id, info).await
+        self.services.update(&self.instance_id, &id, info)
     }
 
     async fn remove_service(&mut self, id: ServiceId) -> Result<(), WitError> {
-        let outcome = self.services.remove(&self.instance_id, &id).await;
+        let outcome = self.services.remove(&self.instance_id, &id);
         if outcome.is_ok() {
             tracing::debug!(
                 instance_id = %self.instance_id,
@@ -408,10 +413,11 @@ impl host_services::Host for PluginState {
     }
 
     async fn get_service(&mut self, id: ServiceId) -> Result<ServiceInfo, WitError> {
+        // Clone `info` once at the WIT boundary; `id` and
+        // `owner_instance` are kept behind the Arc.
         self.services
             .get(&self.instance_id, &id)
-            .await
-            .map(|meta| meta.info)
+            .map(|meta| meta.info.clone())
     }
 
     async fn call_service(

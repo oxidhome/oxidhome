@@ -57,7 +57,7 @@ async fn simulated_switch_round_trip() {
 
     // Plugin should have registered exactly one device, owned by
     // this instance, supporting the `switch` capability.
-    let devices = registry.list().await;
+    let devices = registry.list();
     assert_eq!(
         devices.len(),
         1,
@@ -122,7 +122,7 @@ async fn simulated_switch_round_trip() {
 
     // After shutdown, the plugin's best-effort `remove_device`
     // should have cleared the registry.
-    let devices_after = registry.list().await;
+    let devices_after = registry.list();
     assert!(
         devices_after.is_empty(),
         "expected registry empty after shutdown, got {devices_after:?}"

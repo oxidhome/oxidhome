@@ -694,8 +694,8 @@ async fn run_one_lifecycle(
     // it prevents stacking duplicates as `init` re-registers, and
     // keeps the registries from growing unboundedly across crash
     // loops. Idempotent + cheap (one HashMap retain each).
-    engine.devices().remove_by_owner(instance_id).await;
-    engine.services().remove_by_owner(instance_id).await;
+    engine.devices().remove_by_owner(instance_id);
+    engine.services().remove_by_owner(instance_id);
 
     transition(state_tx, instance_id, InstanceState::Loading);
 
@@ -921,23 +921,28 @@ async fn handle_control(
             args,
             reply,
         }) => {
-            // Hold the dispatcher's in-flight refcount across the
-            // wasm call. `_call_guard` lives until end-of-arm, so
-            // `remove-service` can only succeed once we've truly
-            // finished — no early release on a caller-side timeout.
-            let _call_guard = guard;
             // Scope `CALL_STACK` to the chain handed to us by the
             // caller's dispatcher *on this supervisor's task*. That's
             // how cycle detection survives the task hop: any nested
             // `host::call_service` from inside the wasm we're about
             // to drive runs on this task, reads `CALL_STACK`, and
             // sees the full chain leading to it.
+            //
+            // `guard` is bound only into this match arm — held across
+            // the wasm call below, dropped *before* `reply.send` so
+            // the caller can never observe `active_call_count > 0`
+            // after its await resumes. (The codex/GPT-5 invariant —
+            // refcount > 0 *while wasm is running* — still holds:
+            // wasm finishes inside the `scope(...).await` above the
+            // drop, so the drop happens strictly after the work is
+            // done.)
             let outcome = CALL_STACK
                 .scope(
                     chain,
                     instance.execute_service_command(service, command, args),
                 )
                 .await;
+            drop(guard);
             match outcome {
                 Ok(result) => {
                     let _ = reply.send(Ok(result));

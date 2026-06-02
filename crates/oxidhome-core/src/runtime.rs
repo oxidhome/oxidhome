@@ -297,12 +297,10 @@ impl Engine {
                     // Failed instance leaves nothing behind.
                     engine_for_reaper
                         .devices()
-                        .remove_by_owner(&instance_id_for_reaper)
-                        .await;
+                        .remove_by_owner(&instance_id_for_reaper);
                     engine_for_reaper
                         .services()
-                        .remove_by_owner(&instance_id_for_reaper)
-                        .await;
+                        .remove_by_owner(&instance_id_for_reaper);
                     registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
                 });
                 handle

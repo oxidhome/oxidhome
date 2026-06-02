@@ -43,7 +43,7 @@ async fn no_override_uses_manifest_default() {
         .expect("load");
     instance.init().await.expect("init");
 
-    let state = registered_switch_state(&engine, instance.instance_id()).await;
+    let state = registered_switch_state(&engine, instance.instance_id());
     assert!(
         !state,
         "manifest default is `false`; expected initial state false, got {state}",
@@ -78,7 +78,7 @@ async fn override_flips_default_state() {
     .expect("load with override");
     instance.init().await.expect("init");
 
-    let state = registered_switch_state(&engine, instance.instance_id()).await;
+    let state = registered_switch_state(&engine, instance.instance_id());
     assert!(
         state,
         "override sets `default_state = true`; expected initial state true, got {state}",
@@ -91,17 +91,17 @@ async fn override_flips_default_state() {
 /// `Switch(state)` from its `initial_state`. Panics if anything
 /// doesn't match — these are integration assertions about the
 /// shape the plugin should have produced.
-async fn registered_switch_state(engine: &Engine, instance_id: &str) -> bool {
-    let devices = engine.devices().list().await;
+fn registered_switch_state(engine: &Engine, instance_id: &str) -> bool {
+    let devices = engine.devices().list();
     let meta = devices
         .into_iter()
         .find(|m| m.owner_instance == instance_id)
         .expect("plugin registered exactly one device");
     meta.info
         .initial_state
-        .into_iter()
+        .iter()
         .find_map(|s| match s {
-            CapabilityState::Switch(Switchable { state }) => Some(state),
+            CapabilityState::Switch(Switchable { state }) => Some(*state),
             _ => None,
         })
         .expect("device has a Switch capability state")

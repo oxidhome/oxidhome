@@ -54,7 +54,6 @@ async fn state_changed_event_survives_host_restart() {
         let dev_meta = engine
             .devices()
             .list()
-            .await
             .into_iter()
             .find(|m| m.owner_instance == instance_id)
             .expect("switch registered one device");

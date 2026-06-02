@@ -44,7 +44,7 @@ fn setup() -> (
 async fn await_service_id(engine: &Engine) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let services = engine.services().list().await;
+        let services = engine.services().list();
         if let Some(meta) = services.first() {
             return meta.id.clone();
         }
@@ -158,7 +158,7 @@ async fn cross_task_cycle_is_rejected_promptly() {
     beta.wait_for_running().await.expect("beta Running");
 
     // Find the svc-N each instance registered.
-    let services = engine.services().list().await;
+    let services = engine.services().list();
     let svc_a = services
         .iter()
         .find(|m| m.owner_instance == "alpha")
