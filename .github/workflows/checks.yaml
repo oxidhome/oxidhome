@@ -28,7 +28,7 @@ jobs:
       matrix: ${{ steps.rustmeta.outputs.matrix }}
       publish: ${{ steps.rustmeta.outputs.publish }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: sv-tools/rust-metadata-action@4e7375355154e9cc49ebb10805dbcf2ce4860669 # v1.2.0
         id: rustmeta
   BuildJob:
@@ -39,14 +39,14 @@ jobs:
         args: ${{ fromJSON(needs.RustMeta.outputs.matrix) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo build ${{ matrix.args }} --all-targets --verbose
   WasmBuildJob:
     name: Build SDK for wasm32-wasip2
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo build --package oxidhome-sdk --target wasm32-wasip2 --all-targets --verbose
   ExamplesBuildJob:
@@ -56,7 +56,7 @@ jobs:
       matrix:
         example: [hello-world, simulated-switch, event-recorder]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - name: Build examples/${{ matrix.example }}
         # `--locked` so a drifted lockfile fails CI loudly instead of
@@ -79,14 +79,14 @@ jobs:
     name: Check Rust code formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo fmt --all --check --verbose
   Wit:
     name: Validate WIT
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo install-tools
       - name: Verify wit/deps is populated
@@ -109,7 +109,7 @@ jobs:
     name: Check Rust code with Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo install-tools
       - run: cargo clippy --all-features --all-targets --verbose -- --deny warnings
@@ -119,7 +119,7 @@ jobs:
     name: Check SDK with Clippy for wasm32-wasip2
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo install-tools
       - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --all-features --all-targets --verbose -- --deny warnings
@@ -133,7 +133,7 @@ jobs:
         args: ${{ fromJSON(needs.RustMeta.outputs.matrix) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo install-tools
       - name: Pre-build hello-world example for wasm32-wasip2
@@ -191,7 +191,7 @@ jobs:
     name: Check dependencies
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - run: cargo install-tools
       - name: Machete
@@ -206,7 +206,7 @@ jobs:
         package: ${{ fromJSON(needs.RustMeta.outputs.publish) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       - name: Dry run publish
         run: cargo publish --all-features --package ${{ matrix.package }} --dry-run --verbose
