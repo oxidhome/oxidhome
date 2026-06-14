@@ -88,6 +88,10 @@ path = "tests/service_registry.rs"
 name = "service_dispatch"
 path = "tests/service_dispatch.rs"
 
+[[test]]
+name = "api_skeleton"
+path = "tests/api_skeleton.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
@@ -118,7 +122,13 @@ semver.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "net", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "registry"] }
+
+# Phase 12 — external HTTP/WS API.
+axum.workspace = true
+rand.workspace = true
+sha2.workspace = true
+tower.workspace = true

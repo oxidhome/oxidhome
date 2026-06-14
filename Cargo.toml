@@ -54,3 +54,14 @@ tokio = { version = "1.52.3", default-features = false, features = ["macros", "r
 toml = { version = "1.1.2", default-features = false, features = ["display", "parse", "serde", "std"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "registry"] }
+
+# Phase 12 — external HTTP/WS API. axum on top of tokio + tower; only
+# the host (`oxidhome-core`) depends on it. `tower` is pulled in for
+# the auth middleware. `sha2` hashes the high-entropy random tokens
+# at rest (argon2 would be overengineering for 256-bit random secrets
+# — argon2's slow KDF is for low-entropy passwords). `rand` generates
+# the secrets themselves.
+axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "tokio", "ws"] }
+rand = { version = "0.9.2", default-features = false, features = ["os_rng", "std", "std_rng"] }
+sha2 = { version = "0.11.0", default-features = false }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
