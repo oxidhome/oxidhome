@@ -25,3 +25,6 @@ mod server;
 
 pub use bootstrap::ensure_admin_token;
 pub use server::{ApiConfig, build_router, serve};
+
+#[cfg(test)]
+pub(crate) use auth::parse_scopes;

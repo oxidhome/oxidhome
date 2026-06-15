@@ -18,16 +18,27 @@ use anyhow::Context;
 
 use crate::state::{IssuedToken, TokenStore};
 
-/// Default scope blob for the bootstrap token — the JSON `"*"`
-/// sentinel that future scope-policy enforcement will treat as
-/// "all scopes". The shape is intentionally trivial in this PR;
-/// 12-API-b lands the full scope-policy parser.
-const ADMIN_SCOPE_JSON: &[u8] = b"\"*\"";
+/// Default scope blob for the bootstrap token: a JSON array
+/// containing the single wildcard `"*"` element. The array shape
+/// is what [`crate::api::parse_scopes`](crate::api) (and 12-API-b's
+/// scope-policy enforcer that builds on it) expects — a bare
+/// `"\"*\""` string would silently degrade to deny-all on the
+/// fail-closed parser path and silently lock the break-glass token
+/// out of every scoped route. The wildcard contract: 12-API-b's
+/// enforcer treats a scope entry equal to `"*"` as "any scope".
+/// `bootstrap_blob_parses_as_wildcard_scope` pins this so the two
+/// halves can't drift.
+pub(crate) const ADMIN_SCOPE_JSON: &[u8] = br#"["*"]"#;
 
 /// If `tokens` is empty, mint an `admin` token and write its
-/// plaintext to `<state_dir>/admin-token`. Returns `Some(token)` if
-/// a new admin was issued, `None` if the store already had tokens
-/// (so the caller can log the right one-liner).
+/// plaintext to `<state_dir>/admin-token`. Returns `Some(token)`
+/// if this call minted the admin, `None` if the store already had
+/// tokens (including the case where a second daemon raced to mint
+/// the same one — exactly one winner; the loser gets `None`).
+///
+/// The count + insert run inside one `BEGIN IMMEDIATE` write
+/// transaction via [`TokenStore::create_if_empty`], so two daemons
+/// starting against the same `SQLite` file can't both mint an admin.
 ///
 /// **Filesystem permissions.** The token file is created with mode
 /// `0o600` on Unix so a misconfigured state dir doesn't leak the
@@ -36,7 +47,7 @@ const ADMIN_SCOPE_JSON: &[u8] = b"\"*\"";
 ///
 /// # Errors
 ///
-/// - DB errors from [`TokenStore::count`] / [`TokenStore::create`].
+/// - DB errors from [`TokenStore::create_if_empty`].
 /// - I/O errors creating or writing the file. The token row stays
 ///   in the DB on file-write failure; the caller can log the id
 ///   and rotate manually rather than re-mint.
@@ -44,14 +55,12 @@ pub fn ensure_admin_token(
     tokens: &Arc<TokenStore>,
     state_dir: &Path,
 ) -> anyhow::Result<Option<IssuedToken>> {
-    let count = tokens.count().context("counting tokens")?;
-    if count > 0 {
+    let Some(issued) = tokens
+        .create_if_empty("admin", ADMIN_SCOPE_JSON)
+        .context("minting admin token")?
+    else {
         return Ok(None);
-    }
-
-    let issued = tokens
-        .create("admin", ADMIN_SCOPE_JSON)
-        .context("minting admin token")?;
+    };
 
     let path = state_dir.join("admin-token");
     write_secret(&path, &issued.plaintext)
@@ -88,7 +97,27 @@ fn write_secret(path: &Path, secret: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::parse_scopes;
     use crate::state::Db;
+
+    /// Pins the wildcard contract: `ADMIN_SCOPE_JSON` must parse
+    /// through `parse_scopes` to a non-empty scope list containing
+    /// the wildcard sentinel `"*"`. Pre-fix this PR shipped the
+    /// blob as `b"\"*\""` (a JSON string, not an array), which
+    /// silently failed parsing → empty scopes → 12-API-b would
+    /// have locked the break-glass admin token out of every scoped
+    /// route. This test makes the bootstrap blob and the parser
+    /// impossible to drift independently.
+    #[test]
+    fn bootstrap_blob_parses_as_wildcard_scope() {
+        let scopes = parse_scopes(ADMIN_SCOPE_JSON)
+            .expect("ADMIN_SCOPE_JSON must parse through the scope parser");
+        assert_eq!(
+            scopes,
+            vec!["*".to_string()],
+            "bootstrap blob must surface the wildcard sentinel verbatim",
+        );
+    }
 
     #[test]
     fn bootstrap_mints_when_store_empty() {

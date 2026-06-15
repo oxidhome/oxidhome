@@ -5,7 +5,8 @@
 //! middleware:
 //!
 //! 1. Reads `Authorization: Bearer <token>` (case-insensitive on
-//!    `Bearer`, single space).
+//!    the scheme per RFC 6750 §1.1; one or more SP between scheme
+//!    and credential).
 //! 2. Calls [`TokenStore::verify`] — the store hashes the presented
 //!    secret with SHA-256 and looks the row up by hash.
 //! 3. On success, builds an [`Actor::api(token_id, scopes)`] from
@@ -97,8 +98,11 @@ fn actor_from_record(rec: &TokenRecord) -> Actor {
 }
 
 /// Parse `scope_json` as a JSON array of strings. Returns `None` on
-/// any parse failure.
-fn parse_scopes(blob: &[u8]) -> Option<Vec<String>> {
+/// any parse failure. The wildcard contract: an element equal to
+/// `"*"` means "any scope" — 12-API-b's scope-policy enforcer
+/// recognizes it. `pub(crate)` so the bootstrap test can pin the
+/// admin-blob round trip (see [`crate::api`]).
+pub(crate) fn parse_scopes(blob: &[u8]) -> Option<Vec<String>> {
     let value: serde_json::Value = serde_json::from_slice(blob).ok()?;
     let arr = value.as_array()?;
     arr.iter()
@@ -106,16 +110,25 @@ fn parse_scopes(blob: &[u8]) -> Option<Vec<String>> {
         .collect::<Option<Vec<_>>>()
 }
 
-/// Pull the bearer secret out of an `Authorization: Bearer …`
-/// header. `None` if the header is missing, has a non-`Bearer`
-/// scheme, or is empty after the scheme.
+/// Pull the bearer secret out of an `Authorization: <scheme> …`
+/// header. RFC 6750 §1.1 says the scheme name is case-insensitive
+/// (`Bearer` / `bearer` / `BEARER` / mixed all parse). One or more
+/// SP between the scheme and the credential are tolerated. `None`
+/// if the header is missing, the scheme isn't `Bearer`, or the
+/// credential is empty.
 fn extract_bearer(req: &Request) -> Option<&str> {
     let h = req.headers().get(header::AUTHORIZATION)?;
     let s = h.to_str().ok()?;
-    let rest = s
-        .strip_prefix("Bearer ")
-        .or_else(|| s.strip_prefix("bearer "))?;
-    if rest.is_empty() { None } else { Some(rest) }
+    let (scheme, rest) = s.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let trimmed = rest.trim_start_matches(' ');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// 401 with `WWW-Authenticate: Bearer`.
@@ -152,9 +165,16 @@ mod tests {
                 .body(axum::body::Body::empty())
                 .unwrap()
         };
+        // Case-insensitive scheme (RFC 6750 §1.1).
         assert_eq!(extract_bearer(&req_with("Bearer abc")), Some("abc"));
         assert_eq!(extract_bearer(&req_with("bearer xyz")), Some("xyz"));
+        assert_eq!(extract_bearer(&req_with("BEARER tok")), Some("tok"));
+        assert_eq!(extract_bearer(&req_with("BeArEr tok")), Some("tok"));
+        // Extra whitespace between scheme and credential is tolerated.
+        assert_eq!(extract_bearer(&req_with("Bearer   tok")), Some("tok"));
+        // Empty credential / wrong scheme / no SP rejected.
         assert!(extract_bearer(&req_with("Bearer ")).is_none());
+        assert!(extract_bearer(&req_with("Bearer")).is_none());
         assert!(extract_bearer(&req_with("Basic foo")).is_none());
     }
 }

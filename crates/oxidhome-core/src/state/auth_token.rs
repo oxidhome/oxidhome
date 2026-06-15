@@ -172,6 +172,17 @@ impl TokenStore {
     /// the API rejects with are intentionally indistinguishable from
     /// the outside (all map to 401) so an attacker can't probe id
     /// shape, validity, or revocation state.
+    ///
+    /// **Locking.** The lookup runs under `db.read()` and only the
+    /// `last_used_ms` bump takes the write lock — so on the
+    /// happy-path the auth check competes for the shared `SQLite`
+    /// connection mutex only briefly for the timestamp update,
+    /// instead of holding the write lock across the SELECT. The
+    /// gap between read and write is benign: at worst two concurrent
+    /// verifies of the same token write `last_used_ms` to nearly
+    /// identical values, and a `revoke` interleaved between the
+    /// two bumps a now-revoked token's "last used" by a few
+    /// milliseconds — neither leaks privilege.
     pub fn verify(&self, presented: &str) -> Result<TokenRecord, TokenError> {
         let secret = parse_token(presented).ok_or(TokenError::Malformed)?;
         let hash = sha256(&secret);
@@ -180,7 +191,7 @@ impl TokenStore {
         let hash_for_db = hash.to_vec();
         let rec = self
             .db
-            .write(move |conn| -> Result<TokenRecord, TokenError> {
+            .read(move |conn| -> Result<TokenRecord, TokenError> {
                 let mut stmt = conn.prepare(
                     "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
                  FROM auth_token WHERE hash = ?1",
@@ -194,15 +205,32 @@ impl TokenStore {
                 if row.revoked_ms.is_some() {
                     return Err(TokenError::Revoked);
                 }
-                conn.execute(
-                    "UPDATE auth_token SET last_used_ms = ?1 WHERE id = ?2",
-                    params![now, row.id],
-                )?;
-                Ok(TokenRecord {
-                    last_used_ms: Some(now),
-                    ..row
-                })
+                Ok(row)
             })?;
+
+        // Best-effort `last_used_ms` bump. Lock-contention failures
+        // here are deliberately swallowed: the token is already
+        // verified, and missing a timestamp update is strictly less
+        // bad than rejecting the request.
+        let id_for_db = rec.id.clone();
+        if let Err(err) = self.db.write(move |conn| -> Result<(), TokenError> {
+            conn.execute(
+                "UPDATE auth_token SET last_used_ms = ?1 WHERE id = ?2",
+                params![now, id_for_db],
+            )?;
+            Ok(())
+        }) {
+            tracing::warn!(
+                target: "auth.token",
+                token_id = %rec.id,
+                error = %err,
+                "failed to bump last_used_ms; verify itself succeeded",
+            );
+        }
+        let rec = TokenRecord {
+            last_used_ms: Some(now),
+            ..rec
+        };
         Ok(rec)
     }
 
@@ -224,8 +252,9 @@ impl TokenStore {
         Ok(changed)
     }
 
-    /// Row count. Used by the bootstrap path to detect a
-    /// first-run / empty store (so it can mint the admin token).
+    /// Row count. Used by tests + the CLI's future `token list`.
+    /// (Bootstrap goes through [`Self::create_if_empty`] so the
+    /// check-then-insert race doesn't matter.)
     pub fn count(&self) -> Result<u64, TokenError> {
         let n = self.db.read(|conn| -> Result<i64, TokenError> {
             let n: i64 = conn.query_row("SELECT COUNT(*) FROM auth_token", [], |r| r.get(0))?;
@@ -233,6 +262,55 @@ impl TokenStore {
         })?;
         #[allow(clippy::cast_sign_loss)]
         Ok(n as u64)
+    }
+
+    /// Atomic "mint exactly one token iff the table is empty".
+    /// Runs the count + insert inside one `BEGIN IMMEDIATE` write
+    /// transaction, so two daemons racing against the same `SQLite`
+    /// file see exactly one winner (the loser observes `count > 0`
+    /// inside the transaction and rolls back).
+    ///
+    /// Returns `Ok(Some(issued))` when a token is minted, `Ok(None)`
+    /// when the table already had at least one row.
+    pub fn create_if_empty(
+        &self,
+        label: &str,
+        scope_json: &[u8],
+    ) -> Result<Option<IssuedToken>, TokenError> {
+        let secret = generate_secret();
+        let plaintext = format_token(&secret);
+        let hash = sha256(&secret);
+        let id = derive_id(&hash);
+        let now = now_ms();
+
+        let label_owned = label.to_string();
+        let scope_owned = scope_json.to_vec();
+        let id_for_db = id.clone();
+        let hash_for_db = hash.to_vec();
+
+        let inserted = self.db.write(move |conn| -> Result<bool, TokenError> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let existing: i64 =
+                tx.query_row("SELECT COUNT(*) FROM auth_token", [], |r| r.get(0))?;
+            if existing > 0 {
+                // Implicit rollback on drop; no row was written.
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO auth_token \
+                   (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+                params![id_for_db, label_owned, hash_for_db, scope_owned, now],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })?;
+
+        Ok(if inserted {
+            Some(IssuedToken { id, plaintext })
+        } else {
+            None
+        })
     }
 }
 
@@ -436,5 +514,45 @@ mod tests {
             let dec = base64url_no_pad_decode(&enc).expect("decode");
             assert_eq!(dec, input);
         }
+    }
+
+    /// `create_if_empty` mints on an empty store, becomes a no-op
+    /// once any token exists, and (most importantly) does both in
+    /// the same `BEGIN IMMEDIATE` write so two concurrent calls
+    /// can't both mint. Hard to drive a real two-process race in
+    /// a unit test; the next-best signal is "first call mints,
+    /// second call sees the row and returns None even with the
+    /// same `db` handle".
+    #[test]
+    fn create_if_empty_mints_once_then_is_noop() {
+        let store = TokenStore::new(fresh());
+        let first = store
+            .create_if_empty("admin", b"[\"*\"]")
+            .expect("first call");
+        assert!(first.is_some(), "first call should mint");
+        assert_eq!(store.count().unwrap(), 1);
+
+        let second = store
+            .create_if_empty("admin", b"[\"*\"]")
+            .expect("second call");
+        assert!(second.is_none(), "second call must see the row and bail");
+        assert_eq!(store.count().unwrap(), 1, "still exactly one row");
+    }
+
+    /// Verify still bumps `last_used_ms` after the split into
+    /// `db.read` + `db.write`. Pins the contract so future
+    /// optimizations (e.g. coalescing the write to a 30-60s
+    /// window) can't drop the bump entirely.
+    #[test]
+    fn verify_bumps_last_used_ms_via_separate_write() {
+        let store = TokenStore::new(fresh());
+        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let pre = store.get(&issued.id).unwrap().unwrap();
+        assert!(pre.last_used_ms.is_none());
+        let rec = store.verify(&issued.plaintext).expect("verify");
+        assert!(rec.last_used_ms.is_some());
+        let post = store.get(&issued.id).unwrap().unwrap();
+        assert!(post.last_used_ms.is_some());
+        assert_eq!(rec.last_used_ms, post.last_used_ms);
     }
 }
