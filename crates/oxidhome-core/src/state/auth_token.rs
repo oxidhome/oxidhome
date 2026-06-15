@@ -408,9 +408,24 @@ fn base64url_no_pad(input: &[u8]) -> String {
     out
 }
 
+/// Canonical-only base64url-no-pad decoder. The trailing
+/// partial-group bits MUST be zero — otherwise multiple distinct
+/// input strings would decode to the same output, and a token
+/// wouldn't have a single canonical text form. Today the only
+/// caller is [`parse_token`] and the only operator-facing path
+/// produces tokens via our own `base64url_no_pad` encoder (which
+/// is canonical), so non-canonical input is already a "couldn't
+/// come from us" signal; rejecting it keeps the property explicit.
 fn base64url_no_pad_decode(input: &str) -> Option<Vec<u8>> {
     if input.is_empty() {
         return Some(Vec::new());
+    }
+    // A canonical encoding has length ≡ 0, 2, or 3 mod 4.
+    // (Length ≡ 1 mod 4 is impossible — it would need ≥4 trailing
+    // bits, but only 0/2/4 bits of slop are possible after the
+    // 8-bit boundary.)
+    if input.len() % 4 == 1 {
+        return None;
     }
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
@@ -436,6 +451,15 @@ fn base64url_no_pad_decode(input: &str) -> Option<Vec<u8>> {
             let byte = u8::try_from((buf >> bits) & 0xFF).expect("masked to one byte");
             out.push(byte);
         }
+    }
+    // Trailing 2- or 4-bit remainder MUST be zero for a canonical
+    // encoding. With `bits` left at 0/2/4 after the loop and the
+    // input length mod-4 already constrained to 0/2/3 above, the
+    // last char contributes only 2 or 4 unconsumed low bits — those
+    // must all be zero, else multiple distinct inputs would round-
+    // trip to the same bytes.
+    if buf & ((1 << bits) - 1) != 0 {
+        return None;
     }
     Some(out)
 }
@@ -518,6 +542,26 @@ mod tests {
             let dec = base64url_no_pad_decode(&enc).expect("decode");
             assert_eq!(dec, input);
         }
+    }
+
+    /// Canonicality check: trailing partial-group bits must be zero.
+    /// `AA` (canonical) decodes to `[0]`; `AB`, `AC`, `AD` all have
+    /// non-zero trailing bits and would all round-trip to `[0]` if
+    /// we accepted them — so we reject. Same logic for the 32-byte
+    /// 43-char case the token format uses (last char must come from
+    /// the 4-bit-aligned subset).
+    #[test]
+    fn base64url_rejects_non_canonical_trailing_bits() {
+        // 2-char form: canonical only when the low 4 bits of the
+        // second char are zero. Encoded body == decoded one byte.
+        assert_eq!(base64url_no_pad_decode("AA").as_deref(), Some(&[0u8][..]));
+        assert!(base64url_no_pad_decode("AB").is_none());
+        assert!(base64url_no_pad_decode("AC").is_none());
+        // Length ≡ 1 mod 4 is structurally impossible.
+        assert!(base64url_no_pad_decode("A").is_none());
+        // Wrong charset.
+        assert!(base64url_no_pad_decode("A+").is_none());
+        assert!(base64url_no_pad_decode("A/").is_none());
     }
 
     /// `create_if_empty` mints on an empty store, becomes a no-op
