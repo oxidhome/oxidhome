@@ -400,7 +400,7 @@ async fn wildcard_token_satisfies_every_scoped_route() {
     let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
     let router = build_router(engine);
 
-    for path in ["/api/v1/instances", "/api/v1/devices"] {
+    for path in ["/api/v1/instances", "/api/v1/devices", "/api/v1/logs"] {
         let response = router
             .clone()
             .oneshot(
@@ -419,4 +419,192 @@ async fn wildcard_token_satisfies_every_scoped_route() {
             response.status(),
         );
     }
+}
+
+// ── Events tail (WebSocket) — Phase 12-API-c ─────────────────────
+//
+// **WS coverage note.** axum's `WebSocketUpgrade` extractor pulls a
+// `hyper::upgrade::OnUpgrade` value out of the request extensions
+// — populated only by hyper when a real TCP connection is upgraded.
+// `tower::ServiceExt::oneshot` can't synthesize one, so even a
+// syntactically-perfect handshake bounces with 426 at the
+// extractor. Full WS round-trip coverage (real handshake, the
+// streaming loop, the `Lagged` notice) lives in a follow-up
+// integration test that spawns `serve(...)` on `127.0.0.1:0` and
+// drives a real WS client. The oneshot test below verifies the
+// route is wired and the auth middleware sits in front of it; the
+// scope-check pattern itself is exhaustively covered by
+// `instances_list_returns_403_without_scope` and
+// `devices_list_enforces_scope`.
+
+/// A non-WS probe hits axum's `WebSocketUpgrade` rejection at the
+/// extractor *before* the scope check runs in the handler body.
+/// That's intentional: a caller without a real handshake gets the
+/// same "wrong shape" response regardless of scope, so the probing
+/// signal "scope missing vs scope OK" only leaks through a real
+/// WS handshake — which the caller has to commit to anyway.
+#[tokio::test(flavor = "current_thread")]
+async fn events_tail_non_websocket_probe_is_wrong_shape_not_403() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("limited", b"[\"devices:list\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events/tail")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status.is_client_error() && status != StatusCode::FORBIDDEN,
+        "expected non-403 client error from axum's not-a-WS-request rejection, got {status}",
+    );
+}
+
+// ── Logs query — Phase 12-API-c ──────────────────────────────────
+
+/// A token without `logs:read` returns 403; an empty store + valid
+/// scope returns 200 + `{"logs":[]}`.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_enforces_scope_and_returns_empty_array() {
+    let engine = Engine::new().expect("engine");
+    let denied = engine
+        .auth_tokens()
+        .create("no-logs", b"[\"devices:list\"]")
+        .unwrap();
+    let allowed = engine
+        .auth_tokens()
+        .create("reader", b"[\"logs:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    let denied_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/logs")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", denied.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied_resp.status(), StatusCode::FORBIDDEN);
+
+    let ok_resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/logs")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", allowed.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+    let body = body_to_json(ok_resp.into_body()).await;
+    assert!(body["logs"].is_array(), "got {body:?}");
+    assert!(body["logs"].as_array().unwrap().is_empty());
+}
+
+/// Logs emitted via `tracing::info!` while the `LogStore` layer is
+/// installed land in the `SQLite` table and are returned by
+/// `GET /api/v1/logs`. Filters (`target_prefix`, `limit`) round-trip
+/// through query-string params. Mirrors the audit-log test shape:
+/// installs the `SqliteLayer`, drives a request through the layer's
+/// scope, drains, queries.
+#[test]
+fn logs_query_returns_emitted_events_through_layer() {
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"logs:read\"]")
+        .unwrap();
+
+    let log_store = engine.log_store();
+    let subscriber = Registry::default().with(log_store.layer());
+
+    with_default(subscriber, || {
+        // Emit a recognisable log row through the layer.
+        tracing::info!(
+            target: "test.api_logs_query",
+            kind = "manual-emit",
+            "hello from the test",
+        );
+    });
+    log_store.wait_drained_for_test();
+
+    let response = rt.block_on(async {
+        build_router(engine.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/logs?target_prefix=test.api_logs_query&limit=10")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", reader.plaintext),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = rt.block_on(body_to_json(response.into_body()));
+    let logs = body["logs"].as_array().expect("logs array");
+    assert!(!logs.is_empty(), "expected ≥1 log row, got {body:?}");
+    assert_eq!(logs[0]["target"], "test.api_logs_query");
+    assert_eq!(logs[0]["message"], "hello from the test");
+}
+
+/// `limit` is clamped to `LOGS_QUERY_MAX_LIMIT` (`1_000`). Passing
+/// a higher value doesn't 400; it silently caps. Pins the contract
+/// so a CLI that nudges the parameter up doesn't suddenly break.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_accepts_overlarge_limit_without_400() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"logs:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/logs?limit=999999")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

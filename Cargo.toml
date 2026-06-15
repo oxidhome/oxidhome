@@ -61,10 +61,10 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 # at rest (argon2 would be overengineering for 256-bit random secrets
 # — argon2's slow KDF is for low-entropy passwords). `rand` generates
 # the secrets themselves.
-# `axum` features kept minimal. `ws` joins the list when 12-API-b
-# lands `events tail` (pulls `tokio-tungstenite` + `tungstenite` +
-# `sha1`).
-axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "tokio"] }
+# `axum` features kept minimal. `ws` re-enabled in 12-API-c with
+# the `events/tail` WebSocket endpoint (pulls in
+# `tokio-tungstenite` + `tungstenite` + `sha1`).
+axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 # `rand` and `sha2` versions match what wasmtime / wasmtime-wasi
 # pull in transitively so the dep graph contains exactly one copy
 # of each. Bumping our pin past wasmtime's would double-count both
