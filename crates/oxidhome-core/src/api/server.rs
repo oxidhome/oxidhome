@@ -18,6 +18,7 @@ use crate::Engine;
 use crate::auth::Actor;
 
 use super::auth::{AuthState, require_token};
+use super::scopes::{DEVICES_LIST, INSTANCES_LIST, ScopeDenied, require_scope};
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
 /// loopback port — what tests use). Daemon callers set `bind` to
@@ -44,6 +45,7 @@ pub fn build_router(engine: Engine) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/instances", get(list_instances))
+        .route("/api/v1/devices", get(list_devices))
         .layer(from_fn_with_state(auth_state.clone(), require_token))
         .with_state(ApiState { engine })
 }
@@ -114,13 +116,14 @@ struct InstanceSummary {
 }
 
 /// Authenticated `GET /api/v1/instances`. Returns every supervised
-/// instance under the engine with its current lifecycle state. The
-/// scope-policy enforcement layer (12-API-b) will gate this on a
-/// `instances:list` scope; this slice authenticates only.
+/// instance under the engine with its current lifecycle state. Gated
+/// on the `instances:list` scope; the admin / wildcard token
+/// satisfies it via [`crate::api::scopes::WILDCARD`].
 async fn list_instances(
-    Extension(_actor): Extension<Actor>,
+    Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
-) -> Json<InstancesBody> {
+) -> Result<Json<InstancesBody>, ScopeDenied> {
+    require_scope(&actor, INSTANCES_LIST)?;
     let mut instances = Vec::new();
     for handle in state.engine.instances().list() {
         instances.push(InstanceSummary {
@@ -128,5 +131,47 @@ async fn list_instances(
             state: format!("{:?}", handle.state()),
         });
     }
-    Json(InstancesBody { instances })
+    Ok(Json(InstancesBody { instances }))
+}
+
+#[derive(Serialize)]
+struct DevicesBody {
+    devices: Vec<DeviceSummary>,
+}
+
+#[derive(Serialize)]
+struct DeviceSummary {
+    device_id: String,
+    /// Owning plugin instance id (the host's routing key for
+    /// `execute-command`).
+    owner_instance: String,
+    /// Human-readable name from the registration `DeviceInfo`.
+    name: String,
+}
+
+/// Authenticated `GET /api/v1/devices`. Lists every device any
+/// supervised instance has registered with the host. Gated on the
+/// `devices:list` scope.
+///
+/// Returns a flat snapshot suitable for the CLI's `device list`
+/// table — `device_id`, `owner_instance`, `name`. Capability /
+/// state-vector projection lands in a later slice once we have a
+/// concrete UI/CLI consumer.
+async fn list_devices(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+) -> Result<Json<DevicesBody>, ScopeDenied> {
+    require_scope(&actor, DEVICES_LIST)?;
+    let devices = state
+        .engine
+        .devices()
+        .list()
+        .into_iter()
+        .map(|meta| DeviceSummary {
+            device_id: meta.id.clone(),
+            owner_instance: meta.owner_instance.clone(),
+            name: meta.info.name.clone(),
+        })
+        .collect();
+    Ok(Json(DevicesBody { devices }))
 }

@@ -21,6 +21,7 @@
 
 mod auth;
 mod bootstrap;
+mod scopes;
 mod server;
 
 pub use bootstrap::ensure_admin_token;

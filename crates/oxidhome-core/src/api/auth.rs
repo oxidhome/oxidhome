@@ -52,6 +52,24 @@ pub(crate) struct AuthState {
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
 /// in `server::router`.
+///
+/// After the inner handler runs, emits **one** audit event per
+/// authenticated request — `target = "api.<path>"`, structured
+/// fields `{token_id, actor_kind, status, decision}` — through the
+/// existing `tracing` layer so `oxidhome logs query --target api.*`
+/// surfaces every request. The `decision` field is:
+///
+/// - `"allow"` on 2xx
+/// - `"deny"` on 4xx (includes scope-denial 403; 401 here means a
+///   `Sqlite` error tripped the verify path — the
+///   `missing-credentials` case returns 401 before this branch is
+///   ever reached and is **not** audited, matching the design's
+///   "audit authenticated requests")
+/// - `"error"` on 5xx
+///
+/// Anonymous (`PUBLIC_PATHS`) requests skip the audit emission
+/// — there's no token id to attribute them to, and the events
+/// would be uninformative noise on the liveness probe.
 pub(crate) async fn require_token(
     State(state): State<AuthState>,
     mut req: Request,
@@ -65,18 +83,58 @@ pub(crate) async fn require_token(
         return unauthorized();
     };
 
-    match state.tokens.verify(bearer) {
+    let (actor, http_path, method) = match state.tokens.verify(bearer) {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
-            req.extensions_mut().insert(actor);
-            next.run(req).await
+            let path = req.uri().path().to_string();
+            let method = req.method().to_string();
+            req.extensions_mut().insert(actor.clone());
+            (actor, path, method)
         }
-        Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => unauthorized(),
+        Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
+            return unauthorized();
+        }
         Err(TokenError::Sqlite(err)) => {
             tracing::error!(target: "api.auth", error = %err, "token verify failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
-    }
+    };
+
+    let response = next.run(req).await;
+    emit_audit(&actor, &method, &http_path, response.status());
+    response
+}
+
+/// One audit event per authenticated request. Routed through
+/// `tracing::info!` with `target = "api.<path>"` — the existing
+/// `LogStore` layer in `main.rs` captures it. Fields are flat
+/// strings so a CLI / API query (`--field decision=deny`) is a
+/// simple substring/equality post-filter on `fields_blob`.
+fn emit_audit(actor: &Actor, method: &str, path: &str, status: StatusCode) {
+    let decision = if status.is_success() {
+        "allow"
+    } else if status.is_server_error() {
+        "error"
+    } else {
+        "deny"
+    };
+    // Target encodes the path so the query surface (`logs query
+    // --target api.GET-/api/v1/instances`) can pivot on it. The
+    // `method-path` pair is one token because `tracing` targets
+    // are slash-separated namespaces and the path itself is
+    // slash-heavy.
+    let target = format!("api.{method}-{path}");
+    tracing::info!(
+        target: "api.audit",
+        audit_target = %target,
+        token_id = %actor.id(),
+        actor_kind = %actor.kind().as_str(),
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        decision = %decision,
+        "api request",
+    );
 }
 
 /// Build an [`Actor`] from a verified record. Scopes are parsed
