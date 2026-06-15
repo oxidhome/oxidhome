@@ -61,6 +61,7 @@ pub struct Engine {
     blobs: Arc<BlobStore>,
     services: Arc<ServiceRegistry>,
     instances: Arc<InstanceRegistry>,
+    auth_tokens: Arc<crate::state::TokenStore>,
 }
 
 impl Engine {
@@ -125,6 +126,7 @@ impl Engine {
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
+            auth_tokens: Arc::new(crate::state::TokenStore::new(Arc::clone(&db))),
             blobs: Arc::new(BlobStore::new(db, blobs_root)),
             services: Arc::new(ServiceRegistry::new()),
             instances: Arc::new(InstanceRegistry::new()),
@@ -206,6 +208,16 @@ impl Engine {
     #[must_use]
     pub fn instances(&self) -> Arc<InstanceRegistry> {
         Arc::clone(&self.instances)
+    }
+
+    /// Phase-12 token store. The API's auth middleware verifies
+    /// inbound bearer tokens against this; the CLI's `token`
+    /// subcommands mint / rotate / revoke through it. Both share the
+    /// same `Arc<TokenStore>` so a CLI-issued token is visible to the
+    /// API immediately (and a revoke is, too).
+    #[must_use]
+    pub fn auth_tokens(&self) -> Arc<crate::state::TokenStore> {
+        Arc::clone(&self.auth_tokens)
     }
 
     /// Start a supervised plugin instance under this engine. Reads

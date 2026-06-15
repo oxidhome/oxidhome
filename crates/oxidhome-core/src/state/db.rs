@@ -329,6 +329,34 @@ const MIGRATIONS: &[&str] = &[
     DROP INDEX blob_by_id;
     CREATE UNIQUE INDEX blob_by_id ON blob(instance_id, id);
     ",
+    // Migration 8 — Phase 12 external API token store.
+    //
+    // High-entropy random tokens (256 bits from a CSPRNG) hashed at
+    // rest with plain SHA-256. Argon2/bcrypt would be overengineering
+    // — those KDFs are tuned to slow down brute-force on
+    // low-entropy passwords; against a uniformly random 256-bit
+    // secret, brute force is infeasible regardless of hash speed.
+    // SHA-256 is constant-time on the relevant inputs and keeps the
+    // verify path cheap.
+    //
+    // `scope_json` is the scope policy blob the API consults before
+    // dispatch (shape lives in `state::auth_token`; the API enforces
+    // it). `last_used_ms` is bumped on every successful verify so
+    // operators can tell a token is in use. `revoked_ms` is the
+    // tombstone — non-null means the token is dead; rows aren't
+    // deleted so audit trails stay intact.
+    "
+    CREATE TABLE auth_token (
+      id            TEXT PRIMARY KEY,
+      label         TEXT NOT NULL,
+      hash          BLOB NOT NULL,
+      scope_json    BLOB NOT NULL,
+      created_ms    INTEGER NOT NULL,
+      last_used_ms  INTEGER,
+      revoked_ms    INTEGER
+    ) STRICT;
+    CREATE UNIQUE INDEX auth_token_hash ON auth_token(hash);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

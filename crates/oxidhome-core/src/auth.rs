@@ -95,6 +95,23 @@ impl Actor {
         }
     }
 
+    /// Construct an `Actor` for a Phase-12 external HTTP/WS request.
+    /// `token_id` is the persisted token id (not the secret); the
+    /// secret only exists in the inbound `Authorization: Bearer …`
+    /// header and is hashed for comparison against the store. `scopes`
+    /// is the verbatim scope list from the token record — the
+    /// dispatch layer checks individual entries before executing.
+    #[must_use]
+    pub fn api(token_id: impl Into<String>, scopes: Vec<String>) -> Self {
+        Self {
+            inner: Arc::new(ActorInner {
+                kind: ActorKind::Api,
+                id: token_id.into(),
+                scopes,
+            }),
+        }
+    }
+
     /// What kind of caller this is.
     #[must_use]
     pub fn kind(&self) -> ActorKind {

@@ -12,6 +12,7 @@
 // `.expect("poisoned")` lines and similar host-internal assertions.
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
+pub mod api;
 pub mod auth;
 pub mod host_impl;
 pub mod runtime;

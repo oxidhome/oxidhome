@@ -1,0 +1,606 @@
+//! Phase 12 token store — the `auth_token` `SQLite` table.
+//!
+//! Tokens are 256-bit values minted from a CSPRNG, displayed to the
+//! operator **once** at issuance, and stored only as a SHA-256 hash
+//! on the host. Argon2/bcrypt would be overengineering for a
+//! uniformly-random 256-bit secret (those slow KDFs defend against
+//! brute-force on low-entropy passwords; against ~2^256 candidates,
+//! brute force is infeasible regardless of hash cost).
+//!
+//! Token administration is host-only — the CLI is the only path that
+//! mints, rotates, or revokes tokens. The API consults the store
+//! during request authentication; it never issues tokens itself.
+//!
+//! ## Wire shape
+//!
+//! Plaintext tokens are presented as a base64url-no-pad encoding of
+//! the 32-byte secret prefixed with `oxh_` so they're easy to spot
+//! in logs and config files (and so we can refuse to load anything
+//! that doesn't have the prefix as a quick sanity gate). The id and
+//! the hash are derived from the secret itself, so the same secret
+//! never produces two different rows.
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rand::TryRng;
+use rusqlite::params;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use super::db::Db;
+
+/// Plaintext-token prefix. Helps operators spot a token in logs +
+/// config dumps, and lets [`TokenStore::verify`] reject any input
+/// that obviously isn't an `OxidHome` token without doing a DB lookup.
+const TOKEN_PREFIX: &str = "oxh_";
+
+/// Raw secret length, in bytes. 256 bits of CSPRNG output.
+const TOKEN_BYTES: usize = 32;
+
+/// Errors the token store surfaces. All variants are
+/// host-only — the API maps them to opaque 401/403 responses so the
+/// client can't distinguish "no such token" from "wrong shape".
+#[derive(Debug, Error)]
+pub enum TokenError {
+    /// Underlying `SQLite` error from `rusqlite`.
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    /// The presented secret didn't match the expected shape: an
+    /// `oxh_` prefix followed by base64url-encoded 32 bytes. The
+    /// API rejects it without hashing or DB lookup.
+    #[error("malformed token")]
+    Malformed,
+    /// The secret hash didn't match any row.
+    #[error("unknown token")]
+    Unknown,
+    /// The matching row has a non-null `revoked_ms`.
+    #[error("token revoked")]
+    Revoked,
+}
+
+/// What the store hands back on a successful verify. `Clone` is
+/// cheap; callers stash it on the request extension.
+#[derive(Debug, Clone)]
+pub struct TokenRecord {
+    pub id: String,
+    pub label: String,
+    /// Scope policy bytes verbatim. The auth layer parses this on
+    /// each verify; if parse fails the token is treated as deny-all
+    /// rather than panicked on (the store doesn't enforce shape on
+    /// insert beyond "valid UTF-8 JSON").
+    pub scope_json: Vec<u8>,
+    pub created_ms: i64,
+    pub last_used_ms: Option<i64>,
+    pub revoked_ms: Option<i64>,
+}
+
+/// Newly-minted token. The plaintext field is the **only** copy of
+/// the secret; once dropped, the operator must rotate to get a new
+/// one.
+#[derive(Debug)]
+pub struct IssuedToken {
+    pub id: String,
+    pub plaintext: String,
+}
+
+/// In-memory + SQLite-backed token registry. One per [`Engine`](crate::Engine).
+#[derive(Debug)]
+pub struct TokenStore {
+    db: Arc<Db>,
+}
+
+impl TokenStore {
+    #[must_use]
+    pub fn new(db: Arc<Db>) -> Self {
+        Self { db }
+    }
+
+    /// Mint a fresh token with `label` and the given `scope_json`
+    /// blob. Returns the id + plaintext (the only copy — caller
+    /// must surface it to the operator immediately).
+    pub fn create(&self, label: &str, scope_json: &[u8]) -> Result<IssuedToken, TokenError> {
+        let secret = generate_secret();
+        let plaintext = format_token(&secret);
+        let hash = sha256(&secret);
+        let id = derive_id(&hash);
+        let now = now_ms();
+
+        let label_owned = label.to_string();
+        let scope_owned = scope_json.to_vec();
+        let id_for_db = id.clone();
+        let hash_for_db = hash.to_vec();
+        self.db.write(move |conn| -> Result<(), TokenError> {
+            conn.execute(
+                "INSERT INTO auth_token \
+                   (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+                params![id_for_db, label_owned, hash_for_db, scope_owned, now],
+            )?;
+            Ok(())
+        })?;
+
+        Ok(IssuedToken { id, plaintext })
+    }
+
+    /// Look up a token by id. Used by [`Self::revoke`] / the CLI's
+    /// `token show`. Returns `Ok(None)` if no such row exists.
+    pub fn get(&self, token_id: &str) -> Result<Option<TokenRecord>, TokenError> {
+        let id_owned = token_id.to_string();
+        let rec = self
+            .db
+            .read(move |conn| -> Result<Option<TokenRecord>, TokenError> {
+                let mut stmt = conn.prepare(
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                 FROM auth_token WHERE id = ?1",
+                )?;
+                let row = stmt
+                    .query_row(params![id_owned], row_to_record)
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(TokenError::from(other)),
+                    })?;
+                Ok(row)
+            })?;
+        Ok(rec)
+    }
+
+    /// Snapshot of every token. Pre-sized; the lock-hold time scales
+    /// with the row count, which is small (operators don't mint
+    /// thousands of tokens). Used by the CLI's `token list`.
+    pub fn list(&self) -> Result<Vec<TokenRecord>, TokenError> {
+        let rows = self
+            .db
+            .read(|conn| -> Result<Vec<TokenRecord>, TokenError> {
+                let mut stmt = conn.prepare(
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                 FROM auth_token ORDER BY created_ms ASC",
+                )?;
+                let iter = stmt.query_map([], row_to_record)?;
+                let mut out = Vec::new();
+                for r in iter {
+                    out.push(r?);
+                }
+                Ok(out)
+            })?;
+        Ok(rows)
+    }
+
+    /// Verify a plaintext bearer secret and return the matching
+    /// record. On success, bumps `last_used_ms`. The error variants
+    /// the API rejects with are intentionally indistinguishable from
+    /// the outside (all map to 401) so an attacker can't probe id
+    /// shape, validity, or revocation state.
+    ///
+    /// **Locking.** The lookup runs under `db.read()` and only the
+    /// `last_used_ms` bump takes the write lock — so on the
+    /// happy-path the auth check competes for the shared `SQLite`
+    /// connection mutex only briefly for the timestamp update,
+    /// instead of holding the write lock across the SELECT. The
+    /// gap between read and write is benign: at worst two concurrent
+    /// verifies of the same token write `last_used_ms` to nearly
+    /// identical values, and a `revoke` interleaved between the
+    /// two bumps a now-revoked token's "last used" by a few
+    /// milliseconds — neither leaks privilege.
+    pub fn verify(&self, presented: &str) -> Result<TokenRecord, TokenError> {
+        let secret = parse_token(presented).ok_or(TokenError::Malformed)?;
+        let hash = sha256(&secret);
+        let now = now_ms();
+
+        let hash_for_db = hash.to_vec();
+        let rec = self
+            .db
+            .read(move |conn| -> Result<TokenRecord, TokenError> {
+                let mut stmt = conn.prepare(
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                 FROM auth_token WHERE hash = ?1",
+                )?;
+                let row = stmt
+                    .query_row(params![hash_for_db], row_to_record)
+                    .map_err(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => TokenError::Unknown,
+                        other => TokenError::from(other),
+                    })?;
+                if row.revoked_ms.is_some() {
+                    return Err(TokenError::Revoked);
+                }
+                Ok(row)
+            })?;
+
+        // Best-effort `last_used_ms` bump. Lock-contention failures
+        // here are deliberately swallowed: the token is already
+        // verified, and missing a timestamp update is strictly less
+        // bad than rejecting the request.
+        let id_for_db = rec.id.clone();
+        if let Err(err) = self.db.write(move |conn| -> Result<(), TokenError> {
+            conn.execute(
+                "UPDATE auth_token SET last_used_ms = ?1 WHERE id = ?2",
+                params![now, id_for_db],
+            )?;
+            Ok(())
+        }) {
+            tracing::warn!(
+                target: "auth.token",
+                token_id = %rec.id,
+                error = %err,
+                "failed to bump last_used_ms; verify itself succeeded",
+            );
+        }
+        let rec = TokenRecord {
+            last_used_ms: Some(now),
+            ..rec
+        };
+        Ok(rec)
+    }
+
+    /// Mark a token revoked. Idempotent — calling on an already-
+    /// revoked token leaves the original `revoked_ms`. Returns
+    /// `true` if a row was newly revoked, `false` otherwise (the
+    /// token didn't exist or was already revoked).
+    pub fn revoke(&self, token_id: &str) -> Result<bool, TokenError> {
+        let id_owned = token_id.to_string();
+        let now = now_ms();
+        let changed = self.db.write(move |conn| -> Result<bool, TokenError> {
+            let n = conn.execute(
+                "UPDATE auth_token SET revoked_ms = ?1 \
+                 WHERE id = ?2 AND revoked_ms IS NULL",
+                params![now, id_owned],
+            )?;
+            Ok(n > 0)
+        })?;
+        Ok(changed)
+    }
+
+    /// Row count. Used by tests + the CLI's future `token list`.
+    /// (Bootstrap goes through [`Self::create_if_empty`] so the
+    /// check-then-insert race doesn't matter.)
+    pub fn count(&self) -> Result<u64, TokenError> {
+        let n = self.db.read(|conn| -> Result<i64, TokenError> {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM auth_token", [], |r| r.get(0))?;
+            Ok(n)
+        })?;
+        #[allow(clippy::cast_sign_loss)]
+        Ok(n as u64)
+    }
+
+    /// Atomic "mint exactly one token iff the table is empty".
+    /// Runs the count + insert inside one `BEGIN IMMEDIATE` write
+    /// transaction, so two daemons racing against the same `SQLite`
+    /// file see exactly one winner (the loser observes `count > 0`
+    /// inside the transaction and rolls back).
+    ///
+    /// Returns `Ok(Some(issued))` when a token is minted, `Ok(None)`
+    /// when the table already had at least one row.
+    pub fn create_if_empty(
+        &self,
+        label: &str,
+        scope_json: &[u8],
+    ) -> Result<Option<IssuedToken>, TokenError> {
+        let secret = generate_secret();
+        let plaintext = format_token(&secret);
+        let hash = sha256(&secret);
+        let id = derive_id(&hash);
+        let now = now_ms();
+
+        let label_owned = label.to_string();
+        let scope_owned = scope_json.to_vec();
+        let id_for_db = id.clone();
+        let hash_for_db = hash.to_vec();
+
+        let inserted = self.db.write(move |conn| -> Result<bool, TokenError> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let existing: i64 =
+                tx.query_row("SELECT COUNT(*) FROM auth_token", [], |r| r.get(0))?;
+            if existing > 0 {
+                // Implicit rollback on drop; no row was written.
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO auth_token \
+                   (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+                params![id_for_db, label_owned, hash_for_db, scope_owned, now],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })?;
+
+        Ok(if inserted {
+            Some(IssuedToken { id, plaintext })
+        } else {
+            None
+        })
+    }
+}
+
+fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRecord> {
+    Ok(TokenRecord {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        scope_json: row.get(2)?,
+        created_ms: row.get(3)?,
+        last_used_ms: row.get(4)?,
+        revoked_ms: row.get(5)?,
+    })
+}
+
+fn generate_secret() -> [u8; TOKEN_BYTES] {
+    let mut buf = [0u8; TOKEN_BYTES];
+    // `SysRng` is rand 0.10's stateless OS-CSPRNG interface
+    // (the renamed-from-0.9 `OsRng`). Token minting is rare; we
+    // pull bytes straight from the OS rather than threading a
+    // seeded PRNG.
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut buf)
+        .expect("OS CSPRNG must be available for token generation");
+    buf
+}
+
+fn sha256(input: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(input);
+    h.finalize().into()
+}
+
+/// Format `secret` as `oxh_<base64url-no-pad>`.
+fn format_token(secret: &[u8; TOKEN_BYTES]) -> String {
+    let body = base64url_no_pad(secret);
+    format!("{TOKEN_PREFIX}{body}")
+}
+
+/// Parse a presented bearer string back into the 32-byte secret.
+/// Returns `None` for anything that doesn't have the prefix or
+/// doesn't decode to exactly [`TOKEN_BYTES`] bytes.
+fn parse_token(presented: &str) -> Option<[u8; TOKEN_BYTES]> {
+    let body = presented.strip_prefix(TOKEN_PREFIX)?;
+    let bytes = base64url_no_pad_decode(body)?;
+    bytes.as_slice().try_into().ok()
+}
+
+/// Derive a stable token id from the hash. First 12 bytes of the
+/// hash, encoded base64url-no-pad — 16 chars, ~96 bits, plenty for
+/// uniqueness across a hub's token table (operators mint a handful).
+fn derive_id(hash: &[u8; 32]) -> String {
+    base64url_no_pad(&hash[..12])
+}
+
+fn now_ms() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(now).unwrap_or(i64::MAX)
+}
+
+const B64URL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Tiny base64url encoder (no padding). Avoids pulling `base64` in
+/// just for these two helpers; the bytes-in shapes are always
+/// fixed-size (32 secret bytes, 12 id bytes) so there's no risk of
+/// a pathological input.
+fn base64url_no_pad(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= input.len() {
+        let n =
+            (u32::from(input[i]) << 16) | (u32::from(input[i + 1]) << 8) | u32::from(input[i + 2]);
+        out.push(B64URL[((n >> 18) & 0x3F) as usize] as char);
+        out.push(B64URL[((n >> 12) & 0x3F) as usize] as char);
+        out.push(B64URL[((n >> 6) & 0x3F) as usize] as char);
+        out.push(B64URL[(n & 0x3F) as usize] as char);
+        i += 3;
+    }
+    match input.len() - i {
+        1 => {
+            let n = u32::from(input[i]) << 16;
+            out.push(B64URL[((n >> 18) & 0x3F) as usize] as char);
+            out.push(B64URL[((n >> 12) & 0x3F) as usize] as char);
+        }
+        2 => {
+            let n = (u32::from(input[i]) << 16) | (u32::from(input[i + 1]) << 8);
+            out.push(B64URL[((n >> 18) & 0x3F) as usize] as char);
+            out.push(B64URL[((n >> 12) & 0x3F) as usize] as char);
+            out.push(B64URL[((n >> 6) & 0x3F) as usize] as char);
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Canonical-only base64url-no-pad decoder. The trailing
+/// partial-group bits MUST be zero — otherwise multiple distinct
+/// input strings would decode to the same output, and a token
+/// wouldn't have a single canonical text form. Today the only
+/// caller is [`parse_token`] and the only operator-facing path
+/// produces tokens via our own `base64url_no_pad` encoder (which
+/// is canonical), so non-canonical input is already a "couldn't
+/// come from us" signal; rejecting it keeps the property explicit.
+fn base64url_no_pad_decode(input: &str) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+    // A canonical encoding has length ≡ 0, 2, or 3 mod 4.
+    // (Length ≡ 1 mod 4 is impossible — it would need ≥4 trailing
+    // bits, but only 0/2/4 bits of slop are possible after the
+    // 8-bit boundary.)
+    if input.len() % 4 == 1 {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in bytes {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            // Mask to the low byte first, then truncate to u8.
+            // Equivalent in value to `(buf >> bits) as u8 & 0xFF`,
+            // but the explicit mask + `try_from` keeps clippy's
+            // `cast_possible_truncation` happy.
+            let byte = u8::try_from((buf >> bits) & 0xFF).expect("masked to one byte");
+            out.push(byte);
+        }
+    }
+    // Trailing 2- or 4-bit remainder MUST be zero for a canonical
+    // encoding. With `bits` left at 0/2/4 after the loop and the
+    // input length mod-4 already constrained to 0/2/3 above, the
+    // last char contributes only 2 or 4 unconsumed low bits — those
+    // must all be zero, else multiple distinct inputs would round-
+    // trip to the same bytes.
+    if buf & ((1 << bits) - 1) != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> Arc<Db> {
+        let db = Db::open_in_memory().expect("db");
+        Arc::new(db)
+    }
+
+    #[test]
+    fn create_and_verify_roundtrip() {
+        let store = TokenStore::new(fresh());
+        let issued = store.create("admin", b"{}").expect("create");
+        assert!(issued.plaintext.starts_with("oxh_"));
+        assert_eq!(store.count().unwrap(), 1);
+
+        let rec = store.verify(&issued.plaintext).expect("verify");
+        assert_eq!(rec.id, issued.id);
+        assert_eq!(rec.label, "admin");
+        assert!(rec.last_used_ms.is_some());
+        assert!(rec.revoked_ms.is_none());
+    }
+
+    #[test]
+    fn malformed_tokens_are_rejected() {
+        let store = TokenStore::new(fresh());
+        store.create("admin", b"{}").unwrap();
+        assert!(matches!(
+            store.verify("not-a-token"),
+            Err(TokenError::Malformed)
+        ));
+        assert!(matches!(
+            store.verify("oxh_short"),
+            Err(TokenError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn unknown_token_yields_unknown_error() {
+        let store = TokenStore::new(fresh());
+        store.create("admin", b"{}").unwrap();
+        // Synthesize a 32-byte secret that won't match our row.
+        let other = format_token(&[7u8; TOKEN_BYTES]);
+        assert!(matches!(store.verify(&other), Err(TokenError::Unknown)));
+    }
+
+    #[test]
+    fn revoked_token_cannot_verify() {
+        let store = TokenStore::new(fresh());
+        let issued = store.create("admin", b"{}").unwrap();
+        assert!(store.revoke(&issued.id).expect("revoke"));
+        assert!(matches!(
+            store.verify(&issued.plaintext),
+            Err(TokenError::Revoked)
+        ));
+        // Idempotent: second revoke reports no change.
+        assert!(!store.revoke(&issued.id).unwrap());
+    }
+
+    #[test]
+    fn list_orders_by_creation() {
+        let store = TokenStore::new(fresh());
+        let a = store.create("a", b"{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = store.create("b", b"{}").unwrap();
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, a.id);
+        assert_eq!(listed[1].id, b.id);
+    }
+
+    #[test]
+    fn base64url_roundtrip_is_lossless() {
+        for input in [&b""[..], b"\x00", b"\x01\x02\x03", b"\xff\xfe\xfd\xfc"] {
+            let enc = base64url_no_pad(input);
+            let dec = base64url_no_pad_decode(&enc).expect("decode");
+            assert_eq!(dec, input);
+        }
+    }
+
+    /// Canonicality check: trailing partial-group bits must be zero.
+    /// `AA` (canonical) decodes to `[0]`; `AB`, `AC`, `AD` all have
+    /// non-zero trailing bits and would all round-trip to `[0]` if
+    /// we accepted them — so we reject. Same logic for the 32-byte
+    /// 43-char case the token format uses (last char must come from
+    /// the 4-bit-aligned subset).
+    #[test]
+    fn base64url_rejects_non_canonical_trailing_bits() {
+        // 2-char form: canonical only when the low 4 bits of the
+        // second char are zero. Encoded body == decoded one byte.
+        assert_eq!(base64url_no_pad_decode("AA").as_deref(), Some(&[0u8][..]));
+        assert!(base64url_no_pad_decode("AB").is_none());
+        assert!(base64url_no_pad_decode("AC").is_none());
+        // Length ≡ 1 mod 4 is structurally impossible.
+        assert!(base64url_no_pad_decode("A").is_none());
+        // Wrong charset.
+        assert!(base64url_no_pad_decode("A+").is_none());
+        assert!(base64url_no_pad_decode("A/").is_none());
+    }
+
+    /// `create_if_empty` mints on an empty store, becomes a no-op
+    /// once any token exists, and (most importantly) does both in
+    /// the same `BEGIN IMMEDIATE` write so two concurrent calls
+    /// can't both mint. Hard to drive a real two-process race in
+    /// a unit test; the next-best signal is "first call mints,
+    /// second call sees the row and returns None even with the
+    /// same `db` handle".
+    #[test]
+    fn create_if_empty_mints_once_then_is_noop() {
+        let store = TokenStore::new(fresh());
+        let first = store
+            .create_if_empty("admin", b"[\"*\"]")
+            .expect("first call");
+        assert!(first.is_some(), "first call should mint");
+        assert_eq!(store.count().unwrap(), 1);
+
+        let second = store
+            .create_if_empty("admin", b"[\"*\"]")
+            .expect("second call");
+        assert!(second.is_none(), "second call must see the row and bail");
+        assert_eq!(store.count().unwrap(), 1, "still exactly one row");
+    }
+
+    /// Verify still bumps `last_used_ms` after the split into
+    /// `db.read` + `db.write`. Pins the contract so future
+    /// optimizations (e.g. coalescing the write to a 30-60s
+    /// window) can't drop the bump entirely.
+    #[test]
+    fn verify_bumps_last_used_ms_via_separate_write() {
+        let store = TokenStore::new(fresh());
+        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let pre = store.get(&issued.id).unwrap().unwrap();
+        assert!(pre.last_used_ms.is_none());
+        let rec = store.verify(&issued.plaintext).expect("verify");
+        assert!(rec.last_used_ms.is_some());
+        let post = store.get(&issued.id).unwrap().unwrap();
+        assert!(post.last_used_ms.is_some());
+        assert_eq!(rec.last_used_ms, post.last_used_ms);
+    }
+}
