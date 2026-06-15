@@ -61,7 +61,14 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 # at rest (argon2 would be overengineering for 256-bit random secrets
 # — argon2's slow KDF is for low-entropy passwords). `rand` generates
 # the secrets themselves.
-axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "tokio", "ws"] }
-rand = { version = "0.9.2", default-features = false, features = ["os_rng", "std", "std_rng"] }
-sha2 = { version = "0.11.0", default-features = false }
+# `axum` features kept minimal. `ws` joins the list when 12-API-b
+# lands `events tail` (pulls `tokio-tungstenite` + `tungstenite` +
+# `sha1`).
+axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "tokio"] }
+# `rand` and `sha2` versions match what wasmtime / wasmtime-wasi
+# pull in transitively so the dep graph contains exactly one copy
+# of each. Bumping our pin past wasmtime's would double-count both
+# crates in the binary.
+rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng", "sys_rng"] }
+sha2 = { version = "0.10.9", default-features = false }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }

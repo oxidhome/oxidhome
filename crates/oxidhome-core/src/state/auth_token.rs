@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::TryRngCore;
+use rand::TryRng;
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -327,7 +327,11 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRecord> {
 
 fn generate_secret() -> [u8; TOKEN_BYTES] {
     let mut buf = [0u8; TOKEN_BYTES];
-    rand::rngs::OsRng
+    // `SysRng` is rand 0.10's stateless OS-CSPRNG interface
+    // (the renamed-from-0.9 `OsRng`). Token minting is rare; we
+    // pull bytes straight from the OS rather than threading a
+    // seeded PRNG.
+    rand::rngs::SysRng
         .try_fill_bytes(&mut buf)
         .expect("OS CSPRNG must be available for token generation");
     buf
