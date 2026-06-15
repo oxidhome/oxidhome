@@ -52,6 +52,40 @@ pub(crate) struct AuthState {
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
 /// in `server::router`.
+///
+/// After the inner handler runs, emits **one** audit event per
+/// authenticated request through `tracing::info!` with the constant
+/// `target = "api.audit"` — that's the fixed tracing target the
+/// existing `LogStore` layer in `main.rs` indexes on. The
+/// per-request method+path lives in the `audit_target` field
+/// (e.g. `audit_target = "api.GET-/api/v1/instances"`) so a future
+/// `logs query --target api.audit --field audit_target=…` can pivot
+/// on it. Other structured fields: `{token_id, actor_kind, method,
+/// path, status, decision, required_scope?}` — `required_scope` is
+/// only set on `decision=deny` rows from a scope failure (smuggled
+/// back from the handler via [`crate::api::scopes::DeniedScope`] on
+/// the response's extension map).
+///
+/// `decision` values:
+/// - `"allow"` — 2xx
+/// - `"deny"` — any 4xx returned by the handler (e.g. 403 from a
+///   scope check). 401 / 5xx from this very middleware (missing
+///   credentials, `Sqlite` verify error) return *before*
+///   `emit_audit` runs and are deliberately not audited — no
+///   authenticated principal to attribute them to.
+/// - `"error"` — handler-returned 5xx.
+///
+/// Anonymous (`PUBLIC_PATHS`) requests skip audit emission — no
+/// token id to attribute them to.
+///
+/// **Lossy-channel note.** Audit events ride the same bounded
+/// `tracing` channel as regular logs; under load the `LogStore`
+/// layer drops events rather than blocking (the drop counter is
+/// surfaced separately). This is a deliberate inheritance —
+/// blocking on audit would block the request thread — but it
+/// means a determined flooder can punch holes in the audit trail.
+/// A dedicated never-drop channel for `target = "api.audit"` is a
+/// candidate follow-up if this becomes a real forensic gap.
 pub(crate) async fn require_token(
     State(state): State<AuthState>,
     mut req: Request,
@@ -65,18 +99,85 @@ pub(crate) async fn require_token(
         return unauthorized();
     };
 
-    match state.tokens.verify(bearer) {
+    let (token_id, actor_kind, http_path, method) = match state.tokens.verify(bearer) {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
+            // Snapshot the strings we'll need post-handler for the
+            // audit row *before* moving `actor` onto the request
+            // extension, so the audit path doesn't need to clone the
+            // Arc-backed `Actor` (or bump-then-drop the refcount).
+            let token_id = actor.id().to_string();
+            let actor_kind = actor.kind().as_str().to_string();
+            let path = req.uri().path().to_string();
+            let method = req.method().to_string();
             req.extensions_mut().insert(actor);
-            next.run(req).await
+            (token_id, actor_kind, path, method)
         }
-        Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => unauthorized(),
+        Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
+            return unauthorized();
+        }
         Err(TokenError::Sqlite(err)) => {
             tracing::error!(target: "api.auth", error = %err, "token verify failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
-    }
+    };
+
+    let response = next.run(req).await;
+    let denied_scope = response
+        .extensions()
+        .get::<crate::api::scopes::DeniedScope>()
+        .map(|d| d.0);
+    emit_audit(
+        &token_id,
+        &actor_kind,
+        &method,
+        &http_path,
+        response.status(),
+        denied_scope,
+    );
+    response
+}
+
+/// One audit event per authenticated request. Routed through
+/// `tracing::info!` with `target = "api.audit"`; the existing
+/// `LogStore` layer captures it. See [`require_token`]'s docstring
+/// for the field shape.
+fn emit_audit(
+    token_id: &str,
+    actor_kind: &str,
+    method: &str,
+    path: &str,
+    status: StatusCode,
+    required_scope: Option<&'static str>,
+) {
+    let decision = if status.is_success() {
+        "allow"
+    } else if status.is_server_error() {
+        "error"
+    } else {
+        "deny"
+    };
+    let audit_target = format!("api.{method}-{path}");
+    // `required_scope` is only populated on scope-denial 403s
+    // (`DeniedScope` came back on the response extension). Other
+    // denies — and every allow — record it as an empty string so
+    // the log_event row's `fields_blob` shape stays uniform across
+    // every audit entry. A query like `--field required_scope=
+    // devices:list` then picks the rows where that scope was the
+    // tripwire.
+    let required = required_scope.unwrap_or("");
+    tracing::info!(
+        target: "api.audit",
+        audit_target = %audit_target,
+        token_id = %token_id,
+        actor_kind = %actor_kind,
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        decision = %decision,
+        required_scope = %required,
+        "api request",
+    );
 }
 
 /// Build an [`Actor`] from a verified record. Scopes are parsed
