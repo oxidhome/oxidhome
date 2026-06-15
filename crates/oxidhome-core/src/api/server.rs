@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 
 use crate::Engine;
 use crate::auth::Actor;
+use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
 use crate::state::{HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogValue};
 
@@ -200,14 +201,24 @@ async fn list_devices(
 /// rows).
 ///
 /// **Ordering note.** Axum runs extractors in declaration order; a
-/// malformed (non-WS) request rejects at `WebSocketUpgrade` with
-/// 400 *before* the scope check runs. That's a deliberate
-/// information-leak property, not a bug: a probing caller without
+/// non-WS request rejects at `WebSocketUpgrade` with **426
+/// Upgrade Required** (no `OnUpgrade` in request extensions)
+/// *before* the scope check runs. That's a deliberate
+/// information-leak property: a probing caller without
 /// `events:tail` and without a proper WS handshake gets the same
-/// 400 a wrong-method probe would, so they can't distinguish
+/// 426 a wrong-method probe would, so they can't distinguish
 /// "scope missing" from "wrong shape". Real WS handshakes (the
 /// only ones operators actually send) reach the handler body and
 /// get the 403 they should.
+///
+/// **Audit consequence.** A non-WS probe (426) never reaches the
+/// handler body, so `emit_audit` doesn't run — non-WS requests to
+/// this path leave no audit row. Real WS handshakes (success or
+/// scope-deny) are audited normally. This is the same shape as
+/// the `WWW-Authenticate: Bearer` 401 from `require_token`: failed
+/// extractor → no audit because there's no authenticated request
+/// to record. Documenting so a future audit-completeness audit
+/// doesn't read it as a gap.
 async fn tail_events(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
@@ -219,30 +230,47 @@ async fn tail_events(
 }
 
 async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
+    use axum::extract::ws::Message;
+    use tokio::sync::broadcast::error::RecvError;
     let mut sub = engine.events().subscribe_all();
     loop {
-        match sub.receiver.recv().await {
-            Ok(event) => {
-                let wire = WireEvent::from_host(&event);
-                let Ok(text) = serde_json::to_string(&wire) else {
-                    continue;
-                };
-                if socket
-                    .send(axum::extract::ws::Message::Text(text.into()))
-                    .await
-                    .is_err()
-                {
-                    break;
+        // Select between the bus (events to push) and the socket
+        // (client frames + disconnects). Polling `socket.recv()`
+        // is what makes axum drive the WS control frames —
+        // auto-Pong on client Ping, Close handling — and what
+        // notices a client disconnect *promptly* on quiet event
+        // buses rather than waiting for the next publish to find
+        // a dead send target.
+        tokio::select! {
+            ev = sub.receiver.recv() => match ev {
+                Ok(event) => {
+                    let wire = WireEvent::from_host(&event);
+                    let Ok(text) = serde_json::to_string(&wire) else {
+                        continue;
+                    };
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
                 }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                let _ = socket
-                    .send(axum::extract::ws::Message::Text(
-                        format!("{{\"lagged\":{n}}}").into(),
-                    ))
-                    .await;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(RecvError::Lagged(n)) => {
+                    let _ = socket
+                        .send(Message::Text(format!("{{\"lagged\":{n}}}").into()))
+                        .await;
+                }
+                Err(RecvError::Closed) => break,
+            },
+            client = socket.recv() => match client {
+                // Client gone (None) or socket error → exit. Close
+                // frame is the polite version of the same thing.
+                None
+                | Some(Err(_) | Ok(Message::Close(_))) => break,
+                // Other client frames (Text, Binary, Pong) are
+                // ignored; the WS protocol forbids text from the
+                // client on this endpoint anyway. `Ping` is
+                // handled automatically by axum's WebSocket
+                // implementation as part of `recv()` polling.
+                Some(Ok(_)) => {}
+            },
         }
     }
 }
@@ -265,13 +293,32 @@ struct WireEvent {
     payload: WireEventPayload,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireEventPayload {
-    StateChanged { capability: String },
-    Button { variant: &'static str },
-    Inference { model: String, payload: String },
-    Custom { topic: String, payload: String },
+    StateChanged {
+        capability: String,
+    },
+    Button {
+        /// One of `"pressed"` / `"released"` / `"single_press"`
+        /// / `"double_press"` / `"long_press"` / `"rotated"`.
+        /// Matches the WIT `button-event` variant 1:1.
+        variant: &'static str,
+        /// Rotational delta (positive = clockwise), only set on
+        /// the `"rotated"` variant per the WIT comment on
+        /// `button-event::rotated`. `None` for the discrete
+        /// press/release variants.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delta: Option<f64>,
+    },
+    Inference {
+        model: String,
+        payload: String,
+    },
+    Custom {
+        topic: String,
+        payload: String,
+    },
 }
 
 impl WireEvent {
@@ -283,14 +330,20 @@ impl WireEvent {
                     capability: sc.capability.clone(),
                 },
             ),
-            EventPayload::Button(_) => (
-                "button".to_string(),
-                // Button-variant detail isn't projected here; v1
-                // wire surface is "something happened on the
-                // button capability". The richer projection
-                // matches the WIT variant 1:1 in a follow-up.
-                WireEventPayload::Button { variant: "event" },
-            ),
+            EventPayload::Button(b) => {
+                let (variant, delta) = match *b {
+                    ButtonEvent::Pressed => ("pressed", None),
+                    ButtonEvent::Released => ("released", None),
+                    ButtonEvent::SinglePress => ("single_press", None),
+                    ButtonEvent::DoublePress => ("double_press", None),
+                    ButtonEvent::LongPress => ("long_press", None),
+                    ButtonEvent::Rotated(d) => ("rotated", Some(d)),
+                };
+                (
+                    "button".to_string(),
+                    WireEventPayload::Button { variant, delta },
+                )
+            }
             EventPayload::Inference(i) => (
                 "inference".to_string(),
                 WireEventPayload::Inference {
@@ -383,11 +436,12 @@ fn run_logs_query(
     query: &LogQuery,
     limit: u32,
 ) -> Result<Vec<HistoricalLogEvent>, crate::state::LogStoreError> {
-    // `LogStore::query` takes `usize`; we cap at
-    // `LOGS_QUERY_MAX_LIMIT` (1_000) at the handler so the cast is
-    // always safe even on 16-bit targets (which we don't target,
-    // but the explicit upcast keeps clippy quiet anyway).
-    store.query(query, limit as usize)
+    // `LogStore::query` takes `usize`; `usize::from(u32)` is only
+    // defined on 64+-bit targets. The handler clamps `limit` to
+    // `LOGS_QUERY_MAX_LIMIT` (1_000) so any reasonable `usize`
+    // width (≥16 bits) holds it; `try_from` keeps it explicit.
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    store.query(query, limit)
 }
 
 /// Composite error for `query_logs` so a 403 (scope) and a 500
@@ -445,6 +499,47 @@ impl WireLogEvent {
             span_path: row.span_path,
             message: row.message,
             fields: row.fields,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_impl::plugin::oxidhome::plugin::events::{
+        ButtonEvent as WitButtonEvent, Event,
+    };
+
+    /// `WireEvent::from_host` projects each `ButtonEvent` variant to
+    /// the matching `snake_case` string, with `delta` set only on
+    /// `Rotated`. Pre-fix the wire shape collapsed every button
+    /// event to `variant: "event"` — a UI tailing button events had
+    /// no way to distinguish a press from a release.
+    #[test]
+    fn button_variant_projects_one_to_one() {
+        let cases = [
+            (WitButtonEvent::Pressed, "pressed", None),
+            (WitButtonEvent::Released, "released", None),
+            (WitButtonEvent::SinglePress, "single_press", None),
+            (WitButtonEvent::DoublePress, "double_press", None),
+            (WitButtonEvent::LongPress, "long_press", None),
+            (WitButtonEvent::Rotated(1.5), "rotated", Some(1.5)),
+        ];
+        for (input, expected_variant, expected_delta) in cases {
+            let event = Event {
+                device: Some("dev-1".into()),
+                timestamp: 0,
+                payload: EventPayload::Button(input),
+            };
+            let wire = WireEvent::from_host(&event);
+            match wire.payload {
+                WireEventPayload::Button { variant, delta } => {
+                    assert_eq!(variant, expected_variant, "variant mismatch for {input:?}");
+                    assert_eq!(delta, expected_delta, "delta mismatch for {input:?}");
+                }
+                other => panic!("expected Button payload, got {other:?}"),
+            }
+            assert_eq!(wire.topic, "button");
         }
     }
 }
