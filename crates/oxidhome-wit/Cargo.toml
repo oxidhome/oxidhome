@@ -30,4 +30,4 @@ streaming-ai-plugin = []
 # silent minor bump in bindgen output could break either side. Bumps land
 # as deliberate PRs that re-run both bindgens. See the exact-pinning
 # policy in ARCHITECTURE.md "Implementation decisions".
-wit-bindgen = "=0.57.1"
+wit-bindgen = "=0.58.0"
