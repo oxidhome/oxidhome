@@ -127,6 +127,12 @@ pub(crate) const INSTANCES_LIST: Scope = Scope::new("instances:list");
 /// `devices:list` — see `GET /api/v1/devices`.
 pub(crate) const DEVICES_LIST: Scope = Scope::new("devices:list");
 
+/// `events:tail` — see `GET /api/v1/events/tail` (WebSocket).
+pub(crate) const EVENTS_TAIL: Scope = Scope::new("events:tail");
+
+/// `logs:read` — see `GET /api/v1/logs`.
+pub(crate) const LOGS_READ: Scope = Scope::new("logs:read");
+
 #[cfg(test)]
 mod tests {
     use super::*;
