@@ -31,15 +31,23 @@ async fn body_to_json(body: Body) -> Value {
     serde_json::from_slice(&bytes).expect("response body must be JSON")
 }
 
-/// Pull `(decision, status)` out of an audit row's structured fields.
+/// Snapshot of the audit fields a test cares about.
+struct AuditFields {
+    decision: String,
+    status: i64,
+    /// Empty string on allow / non-scope-deny rows; populated on
+    /// scope-denial 403s with the missing scope name.
+    required_scope: String,
+}
+
+/// Pull the structured fields out of an audit row.
 /// Used by `audit_log_records_one_event_per_authenticated_request`.
-fn extract_audit_fields(
-    fields: &[(String, oxidhome_core::state::LogValue)],
-) -> (String, i64) {
+fn extract_audit_fields(fields: &[(String, oxidhome_core::state::LogValue)]) -> AuditFields {
     use oxidhome_core::state::LogValue;
     let mut decision: Option<String> = None;
     let mut token_id: Option<String> = None;
     let mut status: Option<i64> = None;
+    let mut required_scope: Option<String> = None;
     for (k, v) in fields {
         match (k.as_str(), v) {
             ("decision", LogValue::String(s) | LogValue::Debug(s)) => {
@@ -47,6 +55,9 @@ fn extract_audit_fields(
             }
             ("token_id", LogValue::String(s) | LogValue::Debug(s)) => {
                 token_id = Some(s.clone());
+            }
+            ("required_scope", LogValue::String(s) | LogValue::Debug(s)) => {
+                required_scope = Some(s.clone());
             }
             ("status", LogValue::Int(n)) => status = Some(*n),
             ("status", LogValue::UInt(n)) => {
@@ -56,10 +67,11 @@ fn extract_audit_fields(
         }
     }
     assert!(token_id.is_some(), "token_id field present");
-    (
-        decision.expect("decision field present"),
-        status.expect("status field present"),
-    )
+    AuditFields {
+        decision: decision.expect("decision field present"),
+        status: status.expect("status field present"),
+        required_scope: required_scope.unwrap_or_default(),
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -355,13 +367,25 @@ fn audit_log_records_one_event_per_authenticated_request() {
     let mut decisions: Vec<String> = Vec::new();
     for row in &rows {
         assert_eq!(row.target, "api.audit");
-        let (decision, status) = extract_audit_fields(&row.fields);
-        match decision.as_str() {
-            "allow" => assert_eq!(status, 200),
-            "deny" => assert_eq!(status, 403),
+        let fields = extract_audit_fields(&row.fields);
+        match fields.decision.as_str() {
+            "allow" => {
+                assert_eq!(fields.status, 200);
+                // Allow rows don't carry a required_scope value
+                // — the field is present (uniform shape) but
+                // empty.
+                assert_eq!(fields.required_scope, "");
+            }
+            "deny" => {
+                assert_eq!(fields.status, 403);
+                // Scope-denial 403s must surface *which* scope was
+                // missing — the whole point of the response-
+                // extension plumbing in `ScopeDenied`.
+                assert_eq!(fields.required_scope, "instances:list");
+            }
             other => panic!("unexpected decision `{other}`"),
         }
-        decisions.push(decision);
+        decisions.push(fields.decision);
     }
     assert!(decisions.contains(&"allow".to_string()));
     assert!(decisions.contains(&"deny".to_string()));

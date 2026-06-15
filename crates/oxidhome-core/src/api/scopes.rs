@@ -65,29 +65,35 @@ impl Scope {
 /// Handler-level denial response. Handlers pull `Extension<Actor>`,
 /// call [`require_scope`], and propagate the `Err` with `?`; the
 /// `IntoResponse` impl below turns the failure into a 403 with an
-/// empty body. The required scope name is left on the current
-/// `tracing::Span` so the audit-log middleware can record it; we
-/// deliberately don't include it in the response body so a probing
-/// caller can't enumerate required scopes.
+/// empty body. The required scope name travels back to the auth
+/// middleware via a [`DeniedScope`] response extension so the audit
+/// event can record *which* scope was missing — we deliberately
+/// don't include it in the response body so a probing caller can't
+/// enumerate required scopes.
 ///
 /// We don't expose a per-scope axum extractor (would require
 /// `const &str` generics that aren't stable yet); the
 /// `require_scope` helper keeps handler signatures readable.
 #[derive(Debug)]
 pub(crate) struct ScopeDenied {
-    /// Name of the scope that was required and missing. Surfaced in
-    /// the audit event via `tracing::Span::current().record(...)`;
-    /// not returned to the caller (the 403 body is intentionally
-    /// empty so a probing caller can't enumerate required scopes).
     pub(crate) required: &'static str,
 }
 
+/// Smuggled on the response's extension map by [`ScopeDenied`] so
+/// the audit-log middleware ([`crate::api::auth::require_token`])
+/// can surface the missing-scope name as a structured field on the
+/// `decision=deny` audit row. Cheap to clone (`&'static str`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeniedScope(pub(crate) &'static str);
+
 impl IntoResponse for ScopeDenied {
     fn into_response(self) -> Response {
-        // Record the required scope on the current request span so
-        // the audit-log middleware sees it via the tracing layer.
-        tracing::Span::current().record("required_scope", self.required);
-        (StatusCode::FORBIDDEN, "").into_response()
+        let mut resp = (StatusCode::FORBIDDEN, "").into_response();
+        // Auth middleware reads this back off the response extension
+        // after the handler returns; see `emit_audit` for the field
+        // it lands in.
+        resp.extensions_mut().insert(DeniedScope(self.required));
+        resp
     }
 }
 
