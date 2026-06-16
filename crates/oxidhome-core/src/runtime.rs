@@ -288,6 +288,7 @@ impl Engine {
         let registry = Arc::clone(&self.instances);
         let plugin_dir_for_spawn = plugin_dir;
         let instance_id_for_spawn = instance_id.clone();
+        let plugin_id_for_spawn = plugin_id.clone();
         let plugin_id_for_reaper = plugin_id.clone();
         let instance_id_for_reaper = instance_id.clone();
         self.instances
@@ -296,6 +297,7 @@ impl Engine {
                     engine_for_spawn,
                     plugin_dir_for_spawn,
                     instance_id_for_spawn,
+                    plugin_id_for_spawn,
                     overrides,
                     tuning,
                 );

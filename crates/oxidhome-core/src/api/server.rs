@@ -7,13 +7,15 @@
 
 use std::net::SocketAddr;
 
+use std::collections::HashMap;
+
 use axum::{
     Extension, Json, Router,
-    extract::{Query, State, WebSocketUpgrade, ws::WebSocket},
+    extract::{Path, Query, State, WebSocketUpgrade, ws::WebSocket},
     http::StatusCode,
     middleware::from_fn_with_state,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -21,12 +23,15 @@ use tokio::net::TcpListener;
 use crate::Engine;
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
+use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
+use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
 use crate::state::{HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogValue};
 
 use super::auth::{AuthState, require_token};
 use super::scopes::{
-    DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, ScopeDenied, require_scope,
+    DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_LIST,
+    ScopeDenied, require_scope,
 };
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
@@ -55,6 +60,8 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/instances", get(list_instances))
         .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/devices/{device_id}/command", post(send_command))
+        .route("/api/v1/plugins", get(list_plugins))
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/logs", get(query_logs))
         .layer(from_fn_with_state(auth_state.clone(), require_token))
@@ -119,10 +126,13 @@ struct InstancesBody {
 #[derive(Serialize)]
 struct InstanceSummary {
     instance_id: String,
+    /// Manifest-resolved plugin id (e.g. `example.simulated-switch`).
+    /// 12-API-d wired this onto `InstanceHandle`; before that the
+    /// API only carried `instance_id` here.
+    plugin_id: String,
     /// `Debug` repr of the current [`InstanceState`](crate::InstanceState).
-    /// The richer shape (plus `plugin_id`, `state_changed_at`, etc.)
-    /// lands in 12-API-b once `InstanceHandle` grows the matching
-    /// accessors — keeping this skeleton dependency-free.
+    /// A structured projection (with `state_changed_at` etc.) is a
+    /// follow-up once a UI/CLI consumer asks for it.
     state: String,
 }
 
@@ -139,6 +149,7 @@ async fn list_instances(
     for handle in state.engine.instances().list() {
         instances.push(InstanceSummary {
             instance_id: handle.instance_id().to_string(),
+            plugin_id: handle.plugin_id().to_string(),
             state: format!("{:?}", handle.state()),
         });
     }
@@ -185,6 +196,260 @@ async fn list_devices(
         })
         .collect();
     Ok(Json(DevicesBody { devices }))
+}
+
+// ── Device command (write path) ──────────────────────────────────
+
+/// `POST /api/v1/devices/{device_id}/command` body.
+#[derive(Deserialize)]
+struct CommandBody {
+    /// Capability key — `"switch"`, `"dimmer"`, etc. — that the
+    /// plugin's `execute-command` matches on alongside `action`.
+    capability: String,
+    /// Action verb — `"set"`, `"toggle"`, `"increment"`, … — the
+    /// plugin's command dispatch interprets.
+    action: String,
+    /// `key=value` arguments. Each `value` is the JSON-tagged
+    /// [`WireValue`] enum (mirrors the WIT `value` variant so the
+    /// CLI / UI can pass typed payloads without losing precision).
+    #[serde(default)]
+    args: Vec<WireKeyValue>,
+}
+
+/// JSON wire mirror of the WIT `key-value` record. The on-wire
+/// `value` is the tagged-JSON [`WireValue`] below.
+#[derive(Deserialize)]
+struct WireKeyValue {
+    key: String,
+    value: WireValue,
+}
+
+/// JSON wire mirror of the WIT `value` variant — same tag/content
+/// shape as the storage encoding so a future API <-> persisted
+/// record migration is a pure-Rust transform.
+#[derive(Deserialize)]
+#[serde(tag = "t", content = "v")]
+enum WireValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    Json(String),
+}
+
+impl From<WireValue> for Value {
+    fn from(v: WireValue) -> Self {
+        match v {
+            WireValue::Bool(b) => Value::BoolVal(b),
+            WireValue::Int(i) => Value::IntVal(i),
+            WireValue::Float(f) => Value::FloatVal(f),
+            WireValue::String(s) => Value::StringVal(s),
+            WireValue::Bytes(b) => Value::BytesVal(b),
+            WireValue::Json(j) => Value::JsonVal(j),
+        }
+    }
+}
+
+/// Wire mirror of the WIT `command-result` variant. `ok` carries
+/// no body; `ok_with_state` carries a `{key: WireValue}` map (a
+/// keyed dict reads better in JSON than the WIT `Vec<KeyValue>`);
+/// `err` carries the host's [`WitError`] mapped to a tagged
+/// `{kind, message}` shape.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireCommandResult {
+    Ok,
+    OkWithState {
+        state: HashMap<String, serde_json::Value>,
+    },
+    Err {
+        error: WireWitError,
+    },
+}
+
+/// Wire mirror of the WIT `error` variant. Same shape clients can
+/// already see on other endpoints' error responses.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireWitError {
+    NotFound { message: String },
+    InvalidArgument { message: String },
+    PermissionDenied { message: String },
+    Unavailable { message: String },
+    Internal { message: String },
+}
+
+impl From<WitError> for WireWitError {
+    fn from(e: WitError) -> Self {
+        match e {
+            WitError::NotFound(m) => WireWitError::NotFound { message: m },
+            WitError::InvalidArgument(m) => WireWitError::InvalidArgument { message: m },
+            WitError::PermissionDenied(m) => WireWitError::PermissionDenied { message: m },
+            WitError::Unavailable(m) => WireWitError::Unavailable { message: m },
+            WitError::Internal(m) => WireWitError::Internal { message: m },
+        }
+    }
+}
+
+fn value_to_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::BoolVal(b) => J::Bool(*b),
+        Value::IntVal(i) => J::Number((*i).into()),
+        Value::FloatVal(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
+        Value::StringVal(s) => J::String(s.clone()),
+        Value::BytesVal(b) => J::Array(b.iter().map(|n| J::Number((*n).into())).collect()),
+        Value::JsonVal(j) => serde_json::from_str(j).unwrap_or(J::Null),
+    }
+}
+
+fn command_result_to_wire(r: CommandResult) -> WireCommandResult {
+    match r {
+        CommandResult::Ok => WireCommandResult::Ok,
+        CommandResult::OkWithState(kvs) => WireCommandResult::OkWithState {
+            state: kvs
+                .into_iter()
+                .map(|kv| (kv.key, value_to_json(&kv.value)))
+                .collect(),
+        },
+        CommandResult::Err(e) => WireCommandResult::Err { error: e.into() },
+    }
+}
+
+/// `POST /api/v1/devices/{device_id}/command` — route a command
+/// through the owning plugin instance's `execute-command` export
+/// and return the result.
+///
+/// **Sensitive.** Gated on the `devices:command` scope: this is
+/// the write-side device endpoint that can physically actuate
+/// locks, garage doors, alarms, etc. The audit log already records
+/// every authenticated request (`api.audit` target); 12-CLI's
+/// `logs query --target api.audit --field path=/api/v1/devices/...`
+/// surfaces the trail.
+///
+/// **Error shape** (5xx are reserved for *host* failures; 4xx mean
+/// the request was structurally rejected; 2xx with a `kind: "err"`
+/// in the body means the plugin returned a structured error):
+/// - `404 not_found` — no device with that id, or its owning
+///   instance isn't currently running. Indistinguishable from
+///   "wrong id" so a probing caller can't enumerate device ids.
+/// - `403` — scope check failed.
+/// - `500` — supervisor channel error / plugin trap (the dispatch
+///   path crashed the owning instance).
+/// - `200` — plugin processed the command; the body's
+///   `WireCommandResult` says whether the plugin returned `Ok`,
+///   `OkWithState`, or `Err`.
+async fn send_command(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(device_id): Path<String>,
+    Json(body): Json<CommandBody>,
+) -> Result<Json<WireCommandResult>, CommandError> {
+    require_scope(&actor, DEVICES_COMMAND).map_err(CommandError::Scope)?;
+
+    // Resolve device → owning instance (cross-instance lookup;
+    // the API caller isn't a plugin, so device-registry owner
+    // scoping doesn't apply).
+    let owner = state
+        .engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|m| m.id == device_id)
+        .ok_or(CommandError::NotFound)?
+        .owner_instance
+        .clone();
+    let handle = state
+        .engine
+        .instances()
+        .get(&owner)
+        .ok_or(CommandError::NotFound)?;
+
+    // Build the WIT command. JSON `value` shapes map to typed
+    // `Value` variants via the `From<WireValue>` impl.
+    let cmd = Command {
+        capability: body.capability,
+        action: body.action,
+        args: body
+            .args
+            .into_iter()
+            .map(|kv| KeyValue {
+                key: kv.key,
+                value: kv.value.into(),
+            })
+            .collect(),
+    };
+
+    let result = handle
+        .execute_command(device_id, cmd)
+        .await
+        .map_err(CommandError::Dispatch)?;
+    Ok(Json(command_result_to_wire(result)))
+}
+
+enum CommandError {
+    Scope(ScopeDenied),
+    NotFound,
+    Dispatch(anyhow::Error),
+}
+
+impl IntoResponse for CommandError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            CommandError::Scope(s) => s.into_response(),
+            CommandError::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            CommandError::Dispatch(err) => {
+                tracing::error!(target: "api.devices", error = %err, "device command dispatch failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        }
+    }
+}
+
+// ── Plugins (aggregate by plugin_id) ─────────────────────────────
+
+#[derive(Serialize)]
+struct PluginsBody {
+    plugins: Vec<PluginSummary>,
+}
+
+#[derive(Serialize)]
+struct PluginSummary {
+    plugin_id: String,
+    /// How many supervised instances are currently registered for
+    /// this plugin. `0` is never returned (a plugin with no live
+    /// instances isn't in the registry at all in 12-API-d; a real
+    /// "installed plugins" registry that tracks packages
+    /// independent of running copies lands with `plugin install`
+    /// in a follow-up slice).
+    instance_count: u32,
+}
+
+/// `GET /api/v1/plugins` — list of plugins with currently-running
+/// instances on this host. Aggregated from
+/// [`InstanceRegistry::list`] by `plugin_id`; counts unique
+/// instance ids per plugin. Gated on `plugins:list`.
+async fn list_plugins(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+) -> Result<Json<PluginsBody>, ScopeDenied> {
+    require_scope(&actor, PLUGINS_LIST)?;
+    let mut by_plugin: HashMap<String, u32> = HashMap::new();
+    for handle in state.engine.instances().list() {
+        *by_plugin.entry(handle.plugin_id().to_string()).or_default() += 1;
+    }
+    let mut plugins: Vec<PluginSummary> = by_plugin
+        .into_iter()
+        .map(|(plugin_id, instance_count)| PluginSummary {
+            plugin_id,
+            instance_count,
+        })
+        .collect();
+    // Stable order so the CLI's `plugin list` output isn't a
+    // HashMap-iteration coin flip across requests.
+    plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+    Ok(Json(PluginsBody { plugins }))
 }
 
 // ── Events tail (WebSocket) ──────────────────────────────────────
