@@ -68,22 +68,33 @@ pub fn build_router(engine: Engine) -> Router {
         .with_state(ApiState { engine })
 }
 
-/// Run the API server until the future is dropped.
+/// Bind a TCP listener at the configured address.
 ///
-/// Returns the bound [`SocketAddr`] once the listener is up; the
-/// future keeps running until the caller drops it. The daemon's
-/// `main.rs` will hold this future inside a `tokio::select!` against
-/// a shutdown signal in a follow-up PR; for this slice the test
-/// harness drives it via `tokio::spawn` + a oneshot abort.
+/// Split out from [`serve`] so the daemon can log the resolved
+/// address (`listener.local_addr()`) *before* moving into the
+/// accept loop, and so integration tests can drive a real
+/// `127.0.0.1:0` listener through a `tokio::spawn`ed [`serve`]
+/// without losing the ephemeral port.
 ///
 /// # Errors
 ///
 /// - `TcpListener::bind` failure (port in use, permission denied).
+pub async fn bind(config: ApiConfig) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(config.bind)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+/// Run the API accept loop on `listener` until the future is dropped.
+///
+/// The daemon's `main.rs` holds this future inside a `tokio::select!`
+/// against `tokio::signal::ctrl_c` (and SIGTERM on Unix). The test
+/// harness drives it via `tokio::spawn` + `abort()` on drop.
+///
+/// # Errors
+///
 /// - `axum::serve` errors (rare; mostly accept-loop failures).
-pub async fn serve(engine: Engine, config: ApiConfig) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(config.bind).await?;
-    let actual = listener.local_addr()?;
-    tracing::info!(addr = %actual, "oxidhome API listening");
+pub async fn serve(engine: Engine, listener: TcpListener) -> anyhow::Result<()> {
     axum::serve(listener, build_router(engine))
         .await
         .map_err(anyhow::Error::from)

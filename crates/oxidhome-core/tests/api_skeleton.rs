@@ -906,3 +906,103 @@ async fn instances_list_includes_plugin_id() {
 
     handle.stop().await.expect("stop");
 }
+
+/// Phase 12-API-e — real WS round-trip on `/api/v1/events/tail`.
+///
+/// Every previous WS coverage in this file goes through
+/// `build_router(...).oneshot(...)` — `tower::ServiceExt` calls
+/// `poll_ready` + `call`, so the HTTP handshake is exercised but
+/// the connection never actually upgrades (the test client doesn't
+/// drive the upgrade response into a real socket). That means the
+/// `tail_events_loop` (the spawn target inside `upgrade.on_upgrade`)
+/// has never been exercised in tests — backpressure, ping/pong,
+/// disconnect handling all live there.
+///
+/// This test closes the loop: bind a real `127.0.0.1:0` listener,
+/// spawn the daemon's `serve(engine, listener)`, connect via
+/// `tokio-tungstenite` with a `Bearer` header, publish an event
+/// through the in-process bus, and assert the JSON frame the
+/// client reads back is the same shape `WireEvent` ships on the
+/// `oneshot` path. Validates the bind/serve split, the WS handler's
+/// scope gate, the supervisor-less bus → WS dispatch, and the JSON
+/// payload all at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_tail_ws_round_trip_with_real_listener() {
+    use futures_util::StreamExt as _;
+    use oxidhome_core::api::{ApiConfig, bind, serve};
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload,
+    };
+    use std::net::SocketAddr;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+
+    let engine = Engine::new().expect("engine");
+    // `events:tail` only — the scope gate inside the handler
+    // upgrades only if it passes.
+    let token = engine
+        .auth_tokens()
+        .create("ws-test", br#"["events:tail"]"#)
+        .expect("mint token");
+
+    let listener = bind(ApiConfig {
+        bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+    })
+    .await
+    .expect("bind listener");
+    let addr = listener.local_addr().expect("local_addr");
+
+    // Spawn the accept loop. Aborted at the end of the test so
+    // the harness doesn't leak the task.
+    let server_engine = engine.clone();
+    let server = tokio::spawn(async move {
+        serve(server_engine, listener).await.expect("serve");
+    });
+
+    // Connect the WS client with a Bearer header (the WS upgrade
+    // request still goes through `require_token`).
+    let url = format!("ws://{addr}/api/v1/events/tail");
+    let mut request = url.into_client_request().expect("parse ws url");
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        format!("Bearer {}", token.plaintext)
+            .parse()
+            .expect("bearer header"),
+    );
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("ws connect");
+
+    // Publish an event the test can recognize. A `Custom` topic
+    // is the simplest payload — no `device-state-changed` setup
+    // needed.
+    engine.events().publish(Event {
+        device: None,
+        timestamp: 0,
+        payload: EventPayload::Custom(CustomEvent {
+            topic: "api-e2e.toggle".into(),
+            payload: String::new(),
+        }),
+    });
+
+    // Pull one frame off the socket. 2 s is comfortably above
+    // the publish → broadcast → handler → socket latency on any
+    // realistic CI runner; below it points at a hang in the
+    // dispatch path.
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .expect("ws frame within 2s")
+        .expect("stream not closed")
+        .expect("ws frame ok");
+    let text = msg.into_text().expect("text frame");
+    let json: Value = serde_json::from_str(&text).expect("json frame");
+    // The same tagged-`WireEvent` shape the oneshot tests assert
+    // on `/api/v1/events/tail`.
+    assert_eq!(json["payload"]["kind"], "custom");
+    assert_eq!(json["payload"]["topic"], "api-e2e.toggle");
+
+    // Polite close, then abort the server task.
+    let _ = ws.close(None).await;
+    server.abort();
+    let _ = server.await;
+}

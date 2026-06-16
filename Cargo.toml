@@ -65,6 +65,16 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 # the `events/tail` WebSocket endpoint (pulls in
 # `tokio-tungstenite` + `tungstenite` + `sha1`).
 axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+# Already pulled in transitively by `axum`'s `ws` feature; lifting it
+# to a workspace dep lets the WS integration test in 12-API-e drive
+# a real round-trip client without dragging a second copy into the
+# dep graph.
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect"] }
+# Pulled in transitively (axum / tokio-tungstenite); lifted to a
+# workspace dep so the WS round-trip test in 12-API-e can call
+# `.next()` / `.send()` / `.close()` on the `WebSocketStream` (those
+# methods come from `futures-util`'s `StreamExt` / `SinkExt`).
+futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
 # `rand` and `sha2` versions match what wasmtime / wasmtime-wasi
 # pull in transitively so the dep graph contains exactly one copy
 # of each. Bumping our pin past wasmtime's would double-count both

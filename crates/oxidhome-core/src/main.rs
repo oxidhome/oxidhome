@@ -1,28 +1,37 @@
-//! `oxidhome` host runtime entrypoint.
+//! `oxidhome` host daemon entrypoint.
 //!
-//! Loads one plugin from its install directory (containing
-//! `manifest.toml` + the `.wasm` it points at), runs `init()` →
-//! `shutdown()`, prints the round-trip on stdout via
-//! `tracing-subscriber`. Phase 6+ grows this into a real daemon with
-//! multi-instance lifecycle, the external API (Phase 12), the UI
-//! (Phase 13), and the MCP server (Phase 14).
+//! Opens the state directory, mints the first-run admin token if
+//! the store is empty, optionally starts one plugin handed on argv
+//! (a dev-time affordance — the supervised lifecycle endpoints
+//! land in 12-API-f), and then serves the Phase-12 HTTP/WS API
+//! until a shutdown signal arrives.
 //!
-//! ## State directory
+//! ## Environment
 //!
-//! Phase 5 stores need a `<state_dir>` for `oxidhome.db`. The binary
-//! resolves it as:
+//! - `OXIDHOME_STATE_DIR` — path to the daemon's state dir.
+//!   Default: `<cwd>/.oxidhome-state`. Contains `oxidhome.db` +
+//!   the first-run `admin-token` file.
+//! - `OXIDHOME_BIND` — `host:port` the API listens on.
+//!   Default: [`DEFAULT_BIND`] (loopback-only; the daemon is
+//!   meant to sit behind the household reverse proxy / UI for
+//!   any non-localhost traffic).
+//! - `RUST_LOG` — fmt-subscriber filter for stdout. The `LogStore`
+//!   `SQLite` layer captures every level regardless.
 //!
-//! 1. `$OXIDHOME_STATE_DIR` if set.
-//! 2. Otherwise `<cwd>/.oxidhome-state`.
+//! ## Signals
 //!
-//! Phase 12's CLI will replace this with a proper host config file;
-//! this is the smallest workable default for the demo runtime.
+//! `SIGINT` (ctrl-c) and (on Unix) `SIGTERM` both initiate a
+//! graceful shutdown. The accept loop stops, the log writer
+//! flushes within [`SHUTDOWN_FLUSH_BUDGET`], and the process
+//! exits cleanly.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
 use oxidhome_core::Engine;
+use oxidhome_core::api::{ApiConfig, bind, ensure_admin_token, serve};
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -35,18 +44,14 @@ use tracing_subscriber::{EnvFilter, fmt};
 /// exit.
 const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 
+/// Loopback-only by default — the API isn't meant to face the
+/// open network. Operators who want a different listen address
+/// set `OXIDHOME_BIND`; the daemon parses the value as a
+/// `SocketAddr` (so `0.0.0.0:7780` and `[::1]:7780` both work).
+const DEFAULT_BIND: &str = "127.0.0.1:7780";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let plugin_dir: PathBuf = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "usage: {} <plugin-dir>   (directory containing manifest.toml + the .wasm)",
-                env!("CARGO_BIN_NAME"),
-            )
-        })?;
-
     let state_dir = resolve_state_dir()?;
     // Engine first — its `log_store` provides the SQLite tracing
     // layer that the global subscriber composes below.
@@ -55,10 +60,7 @@ async fn main() -> anyhow::Result<()> {
     // itself (the SQLite migrations, WAL setup, KvStore /
     // EventLog / LogStore construction) land before the subscriber
     // is installed — they're visible on stdout's default-ish
-    // tracing target but not persisted. There's no way around that
-    // ordering without an in-memory buffer the layer flushes after
-    // installation, and engine construction is operator-observed
-    // anyway. The plugin lifecycle (load / init / shutdown) and
+    // tracing target but not persisted. The plugin lifecycle and
     // every subsequent host event are captured.
     let engine = Engine::with_state_dir(&state_dir).with_context(|| {
         format!(
@@ -67,40 +69,63 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     let log_store = engine.log_store();
-
     init_tracing(&engine);
 
-    tracing::info!(
-        state_dir = %state_dir.display(),
-        "host starting",
-    );
+    tracing::info!(state_dir = %state_dir.display(), "host starting");
 
-    // Phase 6 lifecycle: hand the plugin to `Engine::start_instance`
-    // and let the supervisor task run the load → init → serve cycle.
-    // The host accepts one plugin at a time and mints the instance id
-    // from the directory name; Phase 12's CLI will read multiple
-    // plugins from a host config file and mint per-config-row ids.
-    let instance_id = plugin_dir
-        .file_name()
-        .map_or_else(|| "plugin".to_owned(), |s| s.to_string_lossy().into_owned());
-    let handle = engine
-        .start_instance(plugin_dir.clone(), &instance_id, None)
+    // First-run admin token. Idempotent — only mints when the
+    // token store is empty.
+    ensure_admin_token(&engine.auth_tokens(), &state_dir)?;
+
+    // Optional dev-time plugin start. Preserves the Phase-6 demo
+    // affordance (point at one plugin dir on argv to get it
+    // running) so local iteration doesn't need to go through the
+    // 12-API-f install endpoints. The handle is held in scope so
+    // the supervised task isn't dropped; we don't otherwise act
+    // on it from main.
+    let _plugin_handle = if let Some(plugin_dir) = std::env::args_os().nth(1) {
+        let plugin_dir = PathBuf::from(plugin_dir);
+        let instance_id = plugin_dir
+            .file_name()
+            .map_or_else(|| "plugin".to_owned(), |s| s.to_string_lossy().into_owned());
+        let handle = engine
+            .start_instance(plugin_dir.clone(), &instance_id, None)
+            .await
+            .with_context(|| format!("starting plugin from {}", plugin_dir.display()))?;
+        tracing::info!(instance_id = %instance_id, "plugin started");
+        Some(handle)
+    } else {
+        None
+    };
+
+    // Bind the listener; log the actual bound address (matters
+    // when `$OXIDHOME_BIND` ends in `:0` for ephemeral-port
+    // testing) before moving into the accept loop.
+    let bind_addr = resolve_bind_addr()?;
+    let listener = bind(ApiConfig { bind: bind_addr })
         .await
-        .with_context(|| format!("starting plugin from {}", plugin_dir.display()))?;
-    tracing::info!(instance_id = %instance_id, "plugin started");
+        .with_context(|| format!("binding the API listener at {bind_addr}"))?;
+    let actual = listener.local_addr()?;
+    tracing::info!(addr = %actual, "oxidhome API listening");
 
-    // Demo flow: wait for the instance to come up, then ask it to
-    // shut down cleanly. The daemon model (run until SIGTERM, supervise
-    // multiple instances) lands with Phase 12.
-    handle.wait_for_running().await?;
-    handle.stop().await?;
+    // Serve until a shutdown signal arrives. `serve` returning
+    // Err here means the accept loop itself died (rare); we
+    // surface that as the daemon's exit code so systemd / runit
+    // can restart.
+    tokio::select! {
+        result = serve(engine.clone(), listener) => {
+            result.context("api server stopped unexpectedly")?;
+        }
+        signal = shutdown_signal() => {
+            tracing::info!(signal = signal, "shutdown signal received; draining");
+        }
+    }
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s
     // bounded flush covers unexpected returns, but the explicit
     // call here keeps the happy path deterministic for operators
-    // who run the binary in foreground and check the log
-    // immediately after.
+    // who check the log immediately after a graceful shutdown.
     if !log_store.flush(SHUTDOWN_FLUSH_BUDGET) {
         tracing::warn!(
             sent = log_store.sent(),
@@ -121,6 +146,44 @@ fn resolve_state_dir() -> anyhow::Result<PathBuf> {
     Ok(cwd.join(".oxidhome-state"))
 }
 
+fn resolve_bind_addr() -> anyhow::Result<SocketAddr> {
+    let raw = std::env::var("OXIDHOME_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    raw.parse::<SocketAddr>()
+        .with_context(|| format!("parsing $OXIDHOME_BIND ({raw:?}) as a socket address"))
+}
+
+/// Waits for the first arriving shutdown signal and returns its
+/// name for the tracing line. On non-Unix platforms only `SIGINT`
+/// (ctrl-c) is observable; `SIGTERM` is Unix-only.
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        // `ctrl_c()` returning Err means the handler couldn't
+        // be installed (very rare). Treat that as "ctrl-c won't
+        // ever fire from here" rather than crashing the daemon.
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        "SIGINT"
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+                "SIGTERM"
+            }
+            Err(_) => std::future::pending::<&'static str>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = async { std::future::pending::<&'static str>().await };
+    tokio::select! {
+        s = ctrl_c => s,
+        s = terminate => s,
+    }
+}
+
 fn init_tracing(engine: &Engine) {
     // `EnvFilter` wraps the fmt layer **only**, not the whole
     // registry. A registry-level filter would gate *both* layers —
@@ -130,15 +193,11 @@ fn init_tracing(engine: &Engine) {
     // store and schema have first-class slots for them. Phase 5c's
     // contract is "capture every host tracing event"; operators
     // tune stdout verbosity via `RUST_LOG` independently of what
-    // we persist. The Phase-12 retention/level config will grow a
-    // separate per-host filter for the SQLite layer when there's a
-    // workload that needs it.
+    // we persist.
     //
     // `try_init` returns Err if another subscriber is already
-    // global — e.g. an integration test in the same process
-    // already called `set_global_default`. Treat that as "tracing
-    // is already wired up; we're done" rather than aborting the
-    // binary.
+    // global — treat that as "tracing is already wired up; we're
+    // done" rather than aborting the binary.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
         .with(fmt::layer().with_filter(filter))
