@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Extension, Json, Router,
@@ -26,12 +26,14 @@ use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
-use crate::state::{HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogValue};
+use crate::state::{
+    HistoricalLogEvent, InstallError, LogLevel, LogQuery, LogStore, LogValue, UninstallError,
+};
 
 use super::auth::{AuthState, require_token};
 use super::scopes::{
-    DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_LIST,
-    ScopeDenied, require_scope,
+    DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL,
+    PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, ScopeDenied, require_scope,
 };
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
@@ -61,7 +63,19 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/instances", get(list_instances))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{device_id}/command", post(send_command))
-        .route("/api/v1/plugins", get(list_plugins))
+        .route("/api/v1/plugins", get(list_plugins).post(install_plugin))
+        .route(
+            "/api/v1/plugins/{plugin_id}",
+            axum::routing::delete(uninstall_plugin),
+        )
+        .route(
+            "/api/v1/plugins/{plugin_id}/start",
+            post(start_plugin_instance),
+        )
+        .route(
+            "/api/v1/plugins/{plugin_id}/stop",
+            post(stop_plugin_instances),
+        )
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/logs", get(query_logs))
         .layer(from_fn_with_state(auth_state.clone(), require_token))
@@ -433,39 +447,394 @@ struct PluginsBody {
 #[derive(Serialize)]
 struct PluginSummary {
     plugin_id: String,
+    /// `true` if `<state_dir>/plugins/<plugin_id>/` is present on
+    /// disk. A row with `installed = false` means there's a
+    /// running instance whose plugin id isn't in the installed
+    /// registry — typically the dev-time argv-driven start path
+    /// in the daemon, not an actual install.
+    installed: bool,
+    /// Semver from the installed manifest, or `null` for the
+    /// running-but-not-installed case above.
+    version: Option<String>,
     /// How many supervised instances are currently registered for
-    /// this plugin. `0` is never returned (a plugin with no live
-    /// instances isn't in the registry at all in 12-API-d; a real
-    /// "installed plugins" registry that tracks packages
-    /// independent of running copies lands with `plugin install`
-    /// in a follow-up slice).
+    /// this plugin. Zero is valid for installed-but-stopped plugins;
+    /// it's how the CLI distinguishes "ready to start" from
+    /// "actively running".
     instance_count: u32,
 }
 
-/// `GET /api/v1/plugins` — list of plugins with currently-running
-/// instances on this host. Aggregated from
-/// [`InstanceRegistry::list`] by `plugin_id`; counts unique
-/// instance ids per plugin. Gated on `plugins:list`.
+/// `GET /api/v1/plugins` — list of every plugin known to the host:
+/// every entry in the installed-plugin registry plus any
+/// running-but-uninstalled instances (the dev-time argv path).
+/// `instance_count` is aggregated from
+/// [`InstanceRegistry::list`] by `plugin_id`. Gated on
+/// `plugins:list`. Sorted by plugin id for stable CLI output.
 async fn list_plugins(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
 ) -> Result<Json<PluginsBody>, ScopeDenied> {
     require_scope(&actor, PLUGINS_LIST)?;
+    // First, count running instances by plugin id.
     let mut by_plugin: HashMap<String, u32> = HashMap::new();
     for handle in state.engine.instances().list() {
         *by_plugin.entry(handle.plugin_id().to_string()).or_default() += 1;
     }
-    let mut plugins: Vec<PluginSummary> = by_plugin
-        .into_iter()
-        .map(|(plugin_id, instance_count)| PluginSummary {
+    // Then merge in installed plugins; an installed-but-stopped
+    // plugin lands as `instance_count = 0` (the typical CLI
+    // listing on a fresh boot — install endpoints don't auto-start).
+    let mut plugins: Vec<PluginSummary> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for installed in state.engine.installed_plugins().list() {
+        let id = installed.plugin_id.to_string();
+        let count = by_plugin.remove(&id).unwrap_or(0);
+        plugins.push(PluginSummary {
+            plugin_id: id.clone(),
+            installed: true,
+            version: Some(installed.version),
+            instance_count: count,
+        });
+        seen.insert(id);
+    }
+    // Any leftover entries in `by_plugin` are running-but-not-
+    // installed (dev argv flow).
+    for (plugin_id, instance_count) in by_plugin {
+        if seen.contains(&plugin_id) {
+            continue;
+        }
+        plugins.push(PluginSummary {
             plugin_id,
+            installed: false,
+            version: None,
             instance_count,
-        })
-        .collect();
-    // Stable order so the CLI's `plugin list` output isn't a
-    // HashMap-iteration coin flip across requests.
+        });
+    }
     plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
     Ok(Json(PluginsBody { plugins }))
+}
+
+// ── Plugin lifecycle (install / start / stop / uninstall) ────────
+
+/// `POST /api/v1/plugins` body. `source_dir` is a path on the
+/// daemon-local filesystem the operator already staged; the daemon
+/// copies it into `<state_dir>/plugins/<plugin_id>/`. A remote-fetch
+/// / multipart-upload variant is a follow-up that layers on top.
+#[derive(Deserialize)]
+struct InstallBody {
+    source_dir: std::path::PathBuf,
+}
+
+#[derive(Serialize)]
+struct InstalledRow {
+    plugin_id: String,
+    version: String,
+    installed_path: String,
+}
+
+/// `POST /api/v1/plugins` — install. Reads
+/// `<source_dir>/manifest.toml` to extract the canonical plugin id,
+/// then recursively copies `source_dir` into
+/// `<state_dir>/plugins/<plugin_id>/`. Gated on `plugins:install`
+/// (sensitive — installs new code on the host).
+///
+/// Does **not** start the plugin: the operator follows up with
+/// `POST /api/v1/plugins/{plugin_id}/start`. Auto-start on install
+/// would surprise an operator who wanted to inspect the staged
+/// install before letting it run.
+async fn install_plugin(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Json(body): Json<InstallBody>,
+) -> Result<Json<InstalledRow>, PluginLifecycleError> {
+    require_scope(&actor, PLUGINS_INSTALL)?;
+    // The registry's install is sync (filesystem + manifest read
+    // is fast enough not to need tokio::fs). Wrap in `spawn_blocking`
+    // so a slow disk doesn't stall the axum runtime; a `cp -r` of a
+    // 10 MB wasm + manifest is sub-100 ms on the slowest hardware
+    // but the API thread shouldn't own it either way.
+    let installed_registry = state.engine.installed_plugins();
+    let source = body.source_dir;
+    let installed = tokio::task::spawn_blocking(move || installed_registry.install(&source))
+        .await
+        .map_err(|err| PluginLifecycleError::Internal(err.into()))??;
+    Ok(Json(InstalledRow {
+        plugin_id: installed.plugin_id.to_string(),
+        version: installed.version,
+        installed_path: installed.path.display().to_string(),
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct StartBody {
+    /// Defaults to `plugin_id` if omitted — matches the dev
+    /// argv-driven path where the instance id is implicit.
+    #[serde(default)]
+    instance_id: Option<String>,
+    /// Per-instance config overrides (the same TOML-shaped JSON
+    /// blob the supervisor accepts via `start_instance`'s
+    /// `overrides` parameter).
+    #[serde(default)]
+    config_overrides: Option<toml::Value>,
+}
+
+#[derive(Serialize)]
+struct StartedRow {
+    plugin_id: String,
+    instance_id: String,
+    state: String,
+}
+
+/// `POST /api/v1/plugins/{plugin_id}/start` — start a supervised
+/// instance of an installed plugin. Returns once the instance
+/// reaches `Running` (or fails to). Gated on `plugins:start`.
+async fn start_plugin_instance(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+    body: Option<Json<StartBody>>,
+) -> Result<Json<StartedRow>, PluginLifecycleError> {
+    require_scope(&actor, PLUGINS_START)?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let instance_id = body
+        .instance_id
+        .clone()
+        .unwrap_or_else(|| plugin_id.clone());
+    let installed = state
+        .engine
+        .installed_plugins()
+        .get(&plugin_id)
+        .ok_or(PluginLifecycleError::NotFound)?;
+    // `start_instance` is itself async and supervises in the
+    // background; we await its initial Running transition so the
+    // API response reflects the reach-Running outcome.
+    let handle = state
+        .engine
+        .start_instance(installed.path.clone(), &instance_id, body.config_overrides)
+        .await
+        .map_err(PluginLifecycleError::Start)?;
+    handle
+        .wait_for_running()
+        .await
+        .map_err(PluginLifecycleError::Start)?;
+    Ok(Json(StartedRow {
+        plugin_id,
+        instance_id,
+        state: format!("{:?}", handle.state()),
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct StopBody {
+    /// If provided, only this instance is stopped. If omitted,
+    /// every supervised instance of `plugin_id` is stopped.
+    #[serde(default)]
+    instance_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StoppedRow {
+    stopped: Vec<String>,
+}
+
+/// `POST /api/v1/plugins/{plugin_id}/stop` — stop one or all
+/// running instances of `plugin_id`. Gated on `plugins:stop`.
+/// Returns the list of `instance_id`s actually stopped (empty
+/// if none were running, which is success — idempotent).
+async fn stop_plugin_instances(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+    body: Option<Json<StopBody>>,
+) -> Result<Json<StoppedRow>, PluginLifecycleError> {
+    require_scope(&actor, PLUGINS_STOP)?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let mut stopped = Vec::new();
+    let registry = state.engine.instances();
+    for handle in registry.list() {
+        if handle.plugin_id() != plugin_id {
+            continue;
+        }
+        if let Some(want) = &body.instance_id
+            && handle.instance_id() != want
+        {
+            continue;
+        }
+        let id = handle.instance_id().to_string();
+        if let Err(err) = handle.stop().await {
+            tracing::warn!(
+                instance_id = %id,
+                error = %err,
+                "stop instance failed; continuing with siblings",
+            );
+            continue;
+        }
+        // `stop()` returns when the supervisor acks the shutdown
+        // command. `wait_terminal()` returns when the supervisor
+        // task ends. The InstanceRegistry's reaper task — which
+        // does the actual `unregister` — runs in a *separately*
+        // spawned tokio task that awaits the same `wait_terminal`
+        // we just awaited. So there's a brief window where we've
+        // observed the terminal state but the reaper hasn't run
+        // yet, and a follow-up `DELETE /api/v1/plugins/{id}`
+        // would see the entry and return 409. Poll the registry
+        // for clear — under realistic scheduling the reaper runs
+        // within a few ticks of the wait_terminal completion.
+        let _ = handle.wait_terminal().await;
+        wait_for_registry_clear(&registry, &id).await;
+        stopped.push(id);
+    }
+    Ok(Json(StoppedRow { stopped }))
+}
+
+/// Bounded poll for the instance to leave the registry after its
+/// supervisor reached a terminal state. Under realistic scheduling
+/// the reaper runs within a few ticks; this just guarantees the
+/// API caller sees a consistent post-stop state. 5 s is comfortably
+/// above any plausible reaper-scheduling latency.
+async fn wait_for_registry_clear(registry: &crate::InstanceRegistry, instance_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while registry.get(instance_id).is_some() {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                instance_id = %instance_id,
+                "instance registry didn't clear after 5s — reaper task lagging?",
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[derive(Serialize)]
+struct UninstalledRow {
+    plugin_id: String,
+}
+
+/// `DELETE /api/v1/plugins/{plugin_id}` — remove the installed
+/// plugin's directory recursively. Refuses if any supervised
+/// instance of the plugin is still running (`409 Conflict`); the
+/// operator must `POST .../stop` first. Gated on
+/// `plugins:uninstall` (sensitive).
+async fn uninstall_plugin(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<UninstalledRow>, PluginLifecycleError> {
+    require_scope(&actor, PLUGINS_UNINSTALL)?;
+    let running: Vec<String> = state
+        .engine
+        .instances()
+        .list()
+        .into_iter()
+        .filter(|h| h.plugin_id() == plugin_id)
+        .map(|h| h.instance_id().to_string())
+        .collect();
+    if !running.is_empty() {
+        return Err(PluginLifecycleError::InstancesRunning(running));
+    }
+    let registry = state.engine.installed_plugins();
+    let id_for_blocking = plugin_id.clone();
+    let result = tokio::task::spawn_blocking(move || registry.uninstall(&id_for_blocking))
+        .await
+        .map_err(|err| PluginLifecycleError::Internal(err.into()))?;
+    result?;
+    Ok(Json(UninstalledRow { plugin_id }))
+}
+
+/// Mapped error taxonomy for the install / start / stop /
+/// uninstall handlers. Each variant lands on a distinct HTTP
+/// status so a caller can tell "plugin not installed" from
+/// "instances still running" from "transient IO error".
+enum PluginLifecycleError {
+    Scope(ScopeDenied),
+    /// Plugin not installed (start, uninstall) or — for install —
+    /// the source dir doesn't exist.
+    NotFound,
+    /// `<plugins_root>/<plugin_id>/` already exists (install).
+    AlreadyInstalled(String),
+    /// One or more instances of the plugin are still running
+    /// (uninstall). Carries the offending instance ids so the
+    /// caller can `POST .../stop` and retry.
+    InstancesRunning(Vec<String>),
+    /// 400-class manifest / source-dir validation error from the
+    /// install path.
+    BadInstall(String),
+    /// Internal failure that doesn't fit the buckets above. 500.
+    Internal(anyhow::Error),
+    /// `start_instance` or `wait_for_running` returned Err — the
+    /// supervisor either failed to load the plugin or it crashed
+    /// before reaching Running. 500.
+    Start(anyhow::Error),
+    /// In-memory engines have no plugins root. 503.
+    NoPluginsRoot,
+}
+
+impl From<ScopeDenied> for PluginLifecycleError {
+    fn from(s: ScopeDenied) -> Self {
+        Self::Scope(s)
+    }
+}
+
+impl From<InstallError> for PluginLifecycleError {
+    fn from(err: InstallError) -> Self {
+        match err {
+            InstallError::NoPluginsRoot => Self::NoPluginsRoot,
+            InstallError::SourceMissing(_) => Self::NotFound,
+            InstallError::AlreadyInstalled { plugin_id } => Self::AlreadyInstalled(plugin_id),
+            InstallError::BadManifest { reason, .. } => Self::BadInstall(reason),
+            InstallError::Io(err) => Self::Internal(err.into()),
+        }
+    }
+}
+
+impl From<UninstallError> for PluginLifecycleError {
+    fn from(err: UninstallError) -> Self {
+        match err {
+            UninstallError::NoPluginsRoot => Self::NoPluginsRoot,
+            UninstallError::NotInstalled(_) => Self::NotFound,
+            UninstallError::Io(err) => Self::Internal(err.into()),
+        }
+    }
+}
+
+impl IntoResponse for PluginLifecycleError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            Self::AlreadyInstalled(id) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "already_installed", "plugin_id": id})),
+            )
+                .into_response(),
+            Self::InstancesRunning(ids) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "instances_running", "instance_ids": ids})),
+            )
+                .into_response(),
+            Self::BadInstall(reason) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "bad_install", "reason": reason})),
+            )
+                .into_response(),
+            Self::Internal(err) => {
+                tracing::error!(target: "api.plugins", error = %err, "plugin lifecycle internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+            Self::Start(err) => {
+                tracing::error!(target: "api.plugins", error = %err, "plugin start failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "start_failed", "reason": err.to_string()})),
+                )
+                    .into_response()
+            }
+            Self::NoPluginsRoot => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "no_plugins_root"})),
+            )
+                .into_response(),
+        }
+    }
 }
 
 // ── Events tail (WebSocket) ──────────────────────────────────────

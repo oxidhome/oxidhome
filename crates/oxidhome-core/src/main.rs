@@ -74,7 +74,25 @@ async fn main() -> anyhow::Result<()> {
     let log_store = engine.log_store();
     init_tracing(&engine);
 
-    tracing::info!(state_dir = %state_dir.display(), "host starting");
+    let installed = engine.installed_plugins().list();
+    tracing::info!(
+        state_dir = %state_dir.display(),
+        installed_plugins = installed.len(),
+        "host starting",
+    );
+    // 12-API-f: log the installed plugin inventory so operators can
+    // confirm what's available before they `start`. The daemon does
+    // NOT auto-start anything; each instance has to come up via
+    // `POST /api/v1/plugins/{plugin_id}/start` (or the legacy argv
+    // dev path below).
+    for row in &installed {
+        tracing::info!(
+            plugin_id = %row.plugin_id,
+            version = %row.version,
+            path = %row.path.display(),
+            "installed plugin available",
+        );
+    }
 
     // First-run admin token. Idempotent — only mints when the
     // token store is empty.

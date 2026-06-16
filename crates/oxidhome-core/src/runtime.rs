@@ -34,7 +34,8 @@ use anyhow::Context;
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
 use crate::state::{
-    BlobStore, Db, DeviceRegistry, EventBus, EventLog, KvStore, LogStore, ServiceRegistry,
+    BlobStore, Db, DeviceRegistry, EventBus, EventLog, InstalledPluginRegistry, KvStore, LogStore,
+    ServiceRegistry,
 };
 
 /// Process-wide Wasmtime engine. Components are compiled once per engine
@@ -62,6 +63,7 @@ pub struct Engine {
     services: Arc<ServiceRegistry>,
     instances: Arc<InstanceRegistry>,
     auth_tokens: Arc<crate::state::TokenStore>,
+    installed_plugins: Arc<InstalledPluginRegistry>,
 }
 
 impl Engine {
@@ -81,7 +83,11 @@ impl Engine {
         // No FS root → in-memory engine — blob writes return
         // `BlobError::Unavailable`. Tests that need to exercise the
         // blob store construct `Engine::with_state_dir(...)`.
-        Self::with_db(Db::open_in_memory()?, None)
+        Self::with_db(
+            Db::open_in_memory()?,
+            None,
+            InstalledPluginRegistry::empty(),
+        )
     }
 
     /// Build the engine with a file-backed `SQLite` database at
@@ -95,10 +101,17 @@ impl Engine {
     /// open / migration errors.
     pub fn with_state_dir(state_dir: &Path) -> anyhow::Result<Self> {
         let blobs_root = state_dir.join("blobs");
-        Self::with_db(Db::open_file(state_dir)?, Some(blobs_root))
+        let plugins_root = state_dir.join("plugins");
+        let installed = InstalledPluginRegistry::scan(plugins_root)
+            .with_context(|| format!("scanning installed plugins under {}", state_dir.display()))?;
+        Self::with_db(Db::open_file(state_dir)?, Some(blobs_root), installed)
     }
 
-    fn with_db(db: Db, blobs_root: Option<PathBuf>) -> anyhow::Result<Self> {
+    fn with_db(
+        db: Db,
+        blobs_root: Option<PathBuf>,
+        installed_plugins: InstalledPluginRegistry,
+    ) -> anyhow::Result<Self> {
         let mut cfg = Config::new();
         cfg.wasm_component_model(true);
         // `async_support(true)` is the default in wasmtime 44 (and was
@@ -130,6 +143,7 @@ impl Engine {
             blobs: Arc::new(BlobStore::new(db, blobs_root)),
             services: Arc::new(ServiceRegistry::new()),
             instances: Arc::new(InstanceRegistry::new()),
+            installed_plugins: Arc::new(installed_plugins),
         })
     }
 
@@ -218,6 +232,19 @@ impl Engine {
     #[must_use]
     pub fn auth_tokens(&self) -> Arc<crate::state::TokenStore> {
         Arc::clone(&self.auth_tokens)
+    }
+
+    /// Installed-plugin registry — Phase 12-API-f. Tracks plugin
+    /// packages copied into `<state_dir>/plugins/<plugin_id>/`. The
+    /// API's `POST /api/v1/plugins` (install),
+    /// `DELETE /api/v1/plugins/{id}` (uninstall) endpoints, and the
+    /// daemon's boot scan reach the registry through this accessor.
+    /// In-memory engines (`Engine::new`) carry an empty registry;
+    /// install / uninstall return `NoPluginsRoot` until an FS root
+    /// is configured.
+    #[must_use]
+    pub fn installed_plugins(&self) -> Arc<InstalledPluginRegistry> {
+        Arc::clone(&self.installed_plugins)
     }
 
     /// Start a supervised plugin instance under this engine. Reads

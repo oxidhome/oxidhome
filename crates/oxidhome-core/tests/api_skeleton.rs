@@ -1020,3 +1020,478 @@ async fn events_tail_ws_round_trip_with_real_listener() {
     server.abort();
     let _ = server.await;
 }
+
+// ── Phase 12-API-f — install / start / stop / uninstall ──────────
+
+/// Build the SDK manifest the install endpoint can swallow. Mirrors
+/// the kv-counter pattern (no tick) so the staged plugin doesn't
+/// race the test's start/stop commands.
+fn lifecycle_manifest(plugin_id: &str) -> String {
+    format!(
+        r#"manifest_version = 1
+[plugin]
+id = "{plugin_id}"
+name = "Lifecycle Test Plugin"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "kv_counter.wasm"
+[capabilities]
+storage_quota_kb = 4
+"#,
+    )
+}
+
+/// Stage a tempdir mirroring what a real install would expect on
+/// disk: `<dir>/manifest.toml` + `<dir>/kv_counter.wasm`. Avoids
+/// touching the simulated-switch build output for tests that don't
+/// need a real instance.
+fn stage_install_source(prefix: &str, plugin_id: &str) -> support::TempDir {
+    let wasm = support::build_example("kv-counter", "kv_counter.wasm");
+    support::stage_plugin(
+        prefix,
+        &wasm,
+        "kv_counter.wasm",
+        &lifecycle_manifest(plugin_id),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_requires_plugins_install_scope() {
+    let state_dir = support::tempdir("install-scope");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let token = engine
+        .auth_tokens()
+        .create("no-install", b"[\"plugins:list\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"source_dir":"/nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// In-memory engines (`Engine::new`) have no `<state_dir>/plugins/`
+/// root — install must return 503 with a structured body so a CLI
+/// can surface a helpful error rather than misreading it as
+/// "source dir bad" or "unauthorized".
+#[tokio::test(flavor = "multi_thread")]
+async fn install_returns_503_on_in_memory_engine() {
+    let engine = Engine::new().expect("engine");
+    let token = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"source_dir":"/tmp/anything"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["error"], "no_plugins_root");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_returns_404_when_source_dir_missing() {
+    let state_dir = support::tempdir("install-missing");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"source_dir":"/no/such/dir/anywhere-on-this-host"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_returns_422_when_manifest_malformed() {
+    let state_dir = support::tempdir("install-bad");
+    let bad_source = support::tempdir("bad-source");
+    std::fs::write(
+        bad_source.path().join("manifest.toml"),
+        "this is not [valid toml",
+    )
+    .unwrap();
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let body = serde_json::json!({"source_dir": bad_source.path().to_str().unwrap()});
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["error"], "bad_install");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_succeeds_and_shows_up_in_listing() {
+    let state_dir = support::tempdir("install-ok");
+    let source = stage_install_source("kvc-source-ok", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+
+    let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(install_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["plugin_id"], "example.kv-counter");
+    assert_eq!(body["version"], "0.1.0");
+    let installed_path = body["installed_path"].as_str().expect("installed_path");
+    assert!(installed_path.contains("plugins/example.kv-counter"));
+    assert!(
+        std::path::Path::new(installed_path)
+            .join("manifest.toml")
+            .exists()
+    );
+    assert!(
+        std::path::Path::new(installed_path)
+            .join("kv_counter.wasm")
+            .exists()
+    );
+
+    // Listing now shows it as installed, stopped (instance_count = 0).
+    let list = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let listing = body_to_json(list.into_body()).await;
+    let plugins = listing["plugins"].as_array().expect("plugins array");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0]["plugin_id"], "example.kv-counter");
+    assert_eq!(plugins[0]["installed"], true);
+    assert_eq!(plugins[0]["version"], "0.1.0");
+    assert_eq!(plugins[0]["instance_count"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_returns_409_on_collision() {
+    let state_dir = support::tempdir("install-collide");
+    let source = stage_install_source("kvc-source-collide", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
+
+    // First install succeeds.
+    let first = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(install_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // Second install of the same plugin_id collides.
+    let second = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(install_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body = body_to_json(second.into_body()).await;
+    assert_eq!(body["error"], "already_installed");
+    assert_eq!(body["plugin_id"], "example.kv-counter");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn start_requires_plugins_start_scope() {
+    let state_dir = support::tempdir("start-scope");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let token = engine
+        .auth_tokens()
+        .create("no-start", b"[\"plugins:list\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.anything/start")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn start_returns_404_for_unknown_plugin() {
+    let state_dir = support::tempdir("start-unknown");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.never-installed/start")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_returns_409_when_instances_running() {
+    let state_dir = support::tempdir("uninstall-busy");
+    let source = stage_install_source("kvc-source-busy", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine.clone());
+
+    // Install + start.
+    let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
+    let install = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(install_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(install.status(), StatusCode::OK);
+
+    let start = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.kv-counter/start")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+
+    // Uninstall while running -> 409 + offending instance ids.
+    let uninstall = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/plugins/example.kv-counter")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uninstall.status(), StatusCode::CONFLICT);
+    let body = body_to_json(uninstall.into_body()).await;
+    assert_eq!(body["error"], "instances_running");
+    let ids = body["instance_ids"].as_array().expect("ids array");
+    assert!(ids.iter().any(|v| v == "example.kv-counter"));
+
+    // Cleanup: stop everything before letting Engine drop.
+    for handle in engine.instances().list() {
+        let _ = handle.stop().await;
+    }
+}
+
+/// Full happy-path round trip — install → start (reach Running) →
+/// stop → uninstall — through the API surface. The most important
+/// integration test for 12-API-f: confirms the four endpoints work
+/// end-to-end together and that the daemon's state-dir layout
+/// matches what `Engine::start_instance` reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn install_start_stop_uninstall_end_to_end() {
+    let state_dir = support::tempdir("lifecycle-e2e");
+    let source = stage_install_source("kvc-source-e2e", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine.clone());
+
+    // 1. Install.
+    let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
+    let install = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(install_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(install.status(), StatusCode::OK);
+
+    // 2. Start. Expect 200 with the instance landing in Running.
+    let start = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.kv-counter/start")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"instance_id": "kvc-1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+    let body = body_to_json(start.into_body()).await;
+    assert_eq!(body["plugin_id"], "example.kv-counter");
+    assert_eq!(body["instance_id"], "kvc-1");
+    assert_eq!(body["state"], "Running");
+
+    // List now shows instance_count = 1.
+    let list = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listing = body_to_json(list.into_body()).await;
+    let row = &listing["plugins"][0];
+    assert_eq!(row["plugin_id"], "example.kv-counter");
+    assert_eq!(row["installed"], true);
+    assert_eq!(row["instance_count"], 1);
+
+    // 3. Stop.
+    let stop = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.kv-counter/stop")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop.status(), StatusCode::OK);
+    let body = body_to_json(stop.into_body()).await;
+    assert_eq!(body["stopped"][0], "kvc-1");
+
+    // 4. Uninstall.
+    let uninstall = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/plugins/example.kv-counter")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uninstall.status(), StatusCode::OK);
+    let body = body_to_json(uninstall.into_body()).await;
+    assert_eq!(body["plugin_id"], "example.kv-counter");
+
+    // List is now empty + the install dir is gone.
+    let final_list = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listing = body_to_json(final_list.into_body()).await;
+    assert!(listing["plugins"].as_array().unwrap().is_empty());
+    assert!(!state_dir.path().join("plugins/example.kv-counter").exists());
+}

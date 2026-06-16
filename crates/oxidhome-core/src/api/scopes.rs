@@ -143,6 +143,26 @@ pub(crate) const DEVICES_COMMAND: Scope = Scope::new("devices:command");
 /// `plugins:list` — see `GET /api/v1/plugins`.
 pub(crate) const PLUGINS_LIST: Scope = Scope::new("plugins:list");
 
+/// `plugins:install` — see `POST /api/v1/plugins`.
+/// **Sensitive**: installing a plugin stages new code into
+/// `<state_dir>/plugins/<plugin_id>/` and makes it ready to
+/// `execute-command` against the household. A token holding this
+/// scope can effectively load arbitrary `.wasm` into the host.
+pub(crate) const PLUGINS_INSTALL: Scope = Scope::new("plugins:install");
+
+/// `plugins:start` — see `POST /api/v1/plugins/{plugin_id}/start`.
+pub(crate) const PLUGINS_START: Scope = Scope::new("plugins:start");
+
+/// `plugins:stop` — see `POST /api/v1/plugins/{plugin_id}/stop`.
+pub(crate) const PLUGINS_STOP: Scope = Scope::new("plugins:stop");
+
+/// `plugins:uninstall` — see `DELETE /api/v1/plugins/{plugin_id}`.
+/// **Sensitive**: removes `<state_dir>/plugins/<plugin_id>/`
+/// recursively. The handler refuses if any instance of the plugin
+/// is running, but a held token + the API-level stop endpoint is
+/// enough to do both. Audited.
+pub(crate) const PLUGINS_UNINSTALL: Scope = Scope::new("plugins:uninstall");
+
 #[cfg(test)]
 mod tests {
     use super::*;
