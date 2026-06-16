@@ -824,8 +824,9 @@ mod tests {
             (Value::BoolVal(x), Value::BoolVal(y)) => x == y,
             (Value::IntVal(x), Value::IntVal(y)) => x == y,
             (Value::FloatVal(x), Value::FloatVal(y)) => x.to_bits() == y.to_bits(),
-            (Value::StringVal(x), Value::StringVal(y))
-            | (Value::JsonVal(x), Value::JsonVal(y)) => x == y,
+            (Value::StringVal(x), Value::StringVal(y)) | (Value::JsonVal(x), Value::JsonVal(y)) => {
+                x == y
+            }
             (Value::BytesVal(x), Value::BytesVal(y)) => x == y,
             _ => false,
         }
