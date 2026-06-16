@@ -21,6 +21,7 @@
 
 mod auth;
 mod bootstrap;
+mod connect_rpc;
 mod scopes;
 mod server;
 

@@ -1,0 +1,54 @@
+# Buf code-generation pipeline. Mirrors the layout used by
+# Anthropic's `connect-rust` eliza example (`examples/eliza/`):
+# message types and service stubs go to separate subdirectories,
+# each with its own packaging-plugin pass to build the `mod.rs`
+# tree, so the Connect-codegen output can reach buffa's message
+# types via a clean `crate::proto::...` path.
+#
+# Pipeline (four plugin invocations, in order):
+#
+#   1. protoc-gen-buffa            → src/gen/buffa/<file>.rs
+#      Rust message types, one Rust file per .proto file.
+#   2. protoc-gen-buffa-packaging  → src/gen/buffa/mod.rs
+#      Module tree (strategy: all so it sees every file).
+#   3. protoc-gen-connect-rust     → src/gen/connect/<file>.__connect.rs
+#      Connect service traits + clients. Reads buffa's message
+#      types via `buffa_module=crate::proto` — see lib.rs which
+#      mounts `#[path = "gen/buffa/mod.rs"] mod proto;`.
+#   4. protoc-gen-buffa-packaging  → src/gen/connect/mod.rs
+#      A second pass with `filter=services` so the connect-side
+#      `mod.rs` only includes service-stub files.
+#
+# Output lands in `crates/oxidhome-proto/src/gen/` and is committed
+# to the repo so a casual `cargo build` doesn't depend on having
+# buf / the plugins installed. CI re-runs `buf generate` and fails
+# if the regenerated tree disagrees with the committed copy.
+version: v2
+plugins:
+  - local: protoc-gen-buffa
+    out: crates/oxidhome-proto/src/gen/buffa
+    opt:
+      # Match the eliza example's defaults: per-message view
+      # accessors + JSON (de)serializers. JSON is load-bearing for
+      # the Connect wire format we keep curl-debuggable.
+      - views=true
+      - json=true
+  - local: protoc-gen-buffa-packaging
+    out: crates/oxidhome-proto/src/gen/buffa
+    strategy: all
+  - local: protoc-gen-connect-rust
+    out: crates/oxidhome-proto/src/gen/connect
+    opt:
+      # Where buffa's message types are mounted in the crate root —
+      # the lib.rs alias for the buffa output dir. The connect
+      # codegen prefixes every referenced proto type with this
+      # path.
+      - buffa_module=crate::proto
+  - local: protoc-gen-buffa-packaging
+    out: crates/oxidhome-proto/src/gen/connect
+    strategy: all
+    opt:
+      # The connect dir contains *only* service stubs; filter so
+      # the generated `mod.rs` doesn't reach for message-file
+      # siblings that live in the buffa dir instead.
+      - filter=services

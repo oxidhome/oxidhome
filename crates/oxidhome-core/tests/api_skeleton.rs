@@ -1495,3 +1495,57 @@ async fn install_start_stop_uninstall_end_to_end() {
     assert!(listing["plugins"].as_array().unwrap().is_empty());
     assert!(!state_dir.path().join("plugins/example.kv-counter").exists());
 }
+
+// ── Phase 15-a — Connect RPC (mounted as fallback_service) ──────
+
+/// `POST /oxidhome.v1.HealthService/Check` with Connect's JSON wire
+/// format must reach the new Connect dispatcher (mounted alongside
+/// the existing JSON `/api/v1/*` router) and return the same
+/// `status: "ok"` + `version` payload the JSON endpoint surfaces.
+///
+/// Anonymous, like the JSON `/api/v1/health` — Connect's path lives
+/// outside the auth middleware via axum's `fallback_service` mount,
+/// so this is the dual-protocol-on-one-listener proof that 15-a
+/// promises.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_health_check_returns_ok_with_version() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.HealthService/Check")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["status"], "ok");
+    // `version` mirrors `oxidhome-core`'s `Cargo.toml` package
+    // version; locked exact so the two protocols can't drift.
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// The JSON `/api/v1/health` endpoint still works — confirms the
+/// Connect fallback didn't shadow the existing axum route.
+#[tokio::test(flavor = "current_thread")]
+async fn json_health_still_works_after_connect_mount() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["status"], "ok");
+}

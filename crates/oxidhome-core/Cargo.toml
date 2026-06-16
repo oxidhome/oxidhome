@@ -133,6 +133,12 @@ rand.workspace = true
 sha2.workspace = true
 tower.workspace = true
 
+# Phase 15-a — Connect RPC. `oxidhome-proto` holds the generated
+# service traits; `connectrpc` provides the Router that mounts onto
+# axum via `into_axum_service()`.
+connectrpc.workspace = true
+oxidhome-proto.workspace = true
+
 [dev-dependencies]
 # 12-API-e — real WS round-trip test. Already in the dep graph via
 # `axum`'s `ws` feature, pinned to the same version so the lockfile

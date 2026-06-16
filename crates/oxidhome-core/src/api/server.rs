@@ -54,10 +54,19 @@ impl Default for ApiConfig {
 
 /// Build the API router. Public for integration tests; the
 /// `serve(...)` entry point that production callers use lives below.
+///
+/// The router serves **two protocols on one listener**:
+///
+/// - JSON `/api/v1/*` (Phase 12) — every existing handler.
+/// - Connect-RPC `/oxidhome.v1.{Service}/{Method}` (Phase 15-a+) —
+///   mounted as a `fallback_service` so any path not matched by the
+///   JSON routes above falls through to the Connect dispatcher.
+///   See [`super::connect_rpc`] for the registered services.
 pub fn build_router(engine: Engine) -> Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
     };
+    let connect_service = super::connect_rpc::router().into_axum_service();
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/instances", get(list_instances))
@@ -79,6 +88,7 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/logs", get(query_logs))
         .layer(from_fn_with_state(auth_state.clone(), require_token))
+        .fallback_service(connect_service)
         .with_state(ApiState { engine })
 }
 

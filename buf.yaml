@@ -1,0 +1,20 @@
+# Buf module config for OxidHome's Connect RPC surface.
+#
+# Single workspace module rooted at `proto/`. Lint + breaking rules
+# follow Buf's defaults; the daemon's wire surface is small enough
+# that the defaults catch the common mistakes (unused imports,
+# inconsistent casing, breaking-on-tag-reuse) without per-package
+# tuning.
+#
+# Run `buf lint` and `buf build` locally before regenerating; CI
+# runs `buf generate` + `git diff --exit-code` to catch out-of-sync
+# commits (see .github/workflows/checks.yaml).
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

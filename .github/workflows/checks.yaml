@@ -187,6 +187,35 @@ jobs:
       - name: Check status
         if: ${{ needs.TestsJob.result != 'success' }}
         run: exit 1
+  Buf:
+    name: Verify Connect-RPC codegen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v6.0.0
+        with:
+          go-version: stable
+      - name: Install buf + codegen plugins
+        run: scripts/install-buf-tools.sh
+      - name: Add tool binaries to PATH
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Lint .proto files
+        run: buf lint
+      - name: Regenerate Connect-RPC code
+        run: buf generate
+      - name: Verify committed code matches regen
+        # If buf generate produced a different tree than what's
+        # committed, the dev forgot to run regen + commit. Fail
+        # loudly so the staleness can't reach main.
+        run: |
+          if ! git diff --quiet -- crates/oxidhome-proto/src/gen; then
+            echo "::error::Connect-RPC generated code is stale. Run 'buf generate' locally and commit the result."
+            git --no-pager diff -- crates/oxidhome-proto/src/gen
+            exit 1
+          fi
   Deps:
     name: Check dependencies
     runs-on: ubuntu-latest
@@ -234,6 +263,7 @@ jobs:
       - Build
       - Format
       - Wit
+      - Buf
       - Clippy
       - WasmClippy
       - Tests

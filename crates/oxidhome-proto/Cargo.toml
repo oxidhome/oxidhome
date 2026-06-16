@@ -1,0 +1,42 @@
+# Generated Connect-RPC types for OxidHome.
+#
+# This crate holds the Rust types `buf generate` emits from the
+# `.proto` files under the workspace `proto/` directory. The output
+# is checked in: `cargo build` here doesn't depend on having `buf`
+# or the codegen plugins installed. Regenerate with the
+# `scripts/install-buf-tools.sh` helpers + `buf generate` from the
+# workspace root.
+#
+# CI runs `buf generate` and fails on a non-empty diff, so a stale
+# regen can't ship.
+
+[package]
+name = "oxidhome-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Generated Connect-RPC types for OxidHome (Phase 15)."
+
+# This crate is **entirely** generated code from `buf generate`. We
+# don't hand-write any source here, so the workspace's pedantic
+# clippy suite would force us to either (a) hand-patch the generated
+# output on every regen or (b) ship a stale tree CI rejects. Neither
+# is workable. Instead, opt out of the pedantic / nursery groups
+# and keep just the default lint set + `unsafe_code = "deny"`.
+# Real bugs in the generated code surface upstream in `connectrpc` /
+# `buffa`, not here.
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+buffa.workspace = true
+connectrpc.workspace = true
+# Generated client trait bounds reference `::http_body::Body` —
+# included explicitly so a casual `cargo build -p oxidhome-proto`
+# doesn't need the transitive dep chain to surface it.
+http-body = "1"
+serde.workspace = true
