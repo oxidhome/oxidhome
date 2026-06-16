@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use axum::{
     Extension, Json, Router,
@@ -483,24 +483,23 @@ async fn list_plugins(
     // plugin lands as `instance_count = 0` (the typical CLI
     // listing on a fresh boot — install endpoints don't auto-start).
     let mut plugins: Vec<PluginSummary> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
     for installed in state.engine.installed_plugins().list() {
         let id = installed.plugin_id.to_string();
+        // `remove` doubles as "found?" — every installed id
+        // disappears from `by_plugin` here, so the leftover-loop
+        // below sees only running-but-not-installed entries
+        // without needing a separate seen-set.
         let count = by_plugin.remove(&id).unwrap_or(0);
         plugins.push(PluginSummary {
-            plugin_id: id.clone(),
+            plugin_id: id,
             installed: true,
             version: Some(installed.version),
             instance_count: count,
         });
-        seen.insert(id);
     }
-    // Any leftover entries in `by_plugin` are running-but-not-
-    // installed (dev argv flow).
+    // Whatever's left in `by_plugin` is running-but-not-installed
+    // (the dev-time argv flow).
     for (plugin_id, instance_count) in by_plugin {
-        if seen.contains(&plugin_id) {
-            continue;
-        }
         plugins.push(PluginSummary {
             plugin_id,
             installed: false,

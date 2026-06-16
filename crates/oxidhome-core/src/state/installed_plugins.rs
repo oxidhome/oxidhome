@@ -50,6 +50,24 @@ pub struct InstalledPlugin {
     pub path: PathBuf,
 }
 
+/// Validates a `plugin_id` for use as a filesystem segment.
+/// Shared between [`InstalledPluginRegistry::install`] (which
+/// rejects on entry to the registry) and
+/// [`InstalledPluginRegistry::scan`] (which skips with a warn so
+/// a corrupt hand-placed manifest doesn't poison the index).
+///
+/// 12-API-f review surfaced this as defense-in-depth — the
+/// destructive `uninstall` path relies on "all registry ids are
+/// FS-safe," and without a check in both insertion sites that
+/// invariant rests on an undocumented assumption. Now enforced.
+fn is_safe_plugin_id(plugin_id: &str) -> bool {
+    !plugin_id.is_empty()
+        && !plugin_id.contains('/')
+        && !plugin_id.contains('\\')
+        && !plugin_id.contains("..")
+        && !plugin_id.starts_with('.')
+}
+
 /// Why an install or uninstall failed. Mapped to HTTP status codes
 /// by the API layer; unit tests pattern-match on the variants.
 #[derive(Debug, thiserror::Error)]
@@ -174,6 +192,21 @@ impl InstalledPluginRegistry {
             // rename the dir safely (might race a `start`); we
             // just log.
             let manifest_id = manifest.plugin.id.clone();
+            // Defense in depth: refuse to index an unsafe id, even
+            // if it was placed on disk by hand. Without this an
+            // attacker with `<state_dir>/plugins/` write access
+            // could plant a manifest with `id = "../../..."` and
+            // make the API's `DELETE` path escape the plugins root.
+            // (The API gate is install's `is_safe_plugin_id` check;
+            // this closes the second insertion path.)
+            if !is_safe_plugin_id(&manifest_id) {
+                tracing::warn!(
+                    path = %path.display(),
+                    manifest_id = %manifest_id,
+                    "skipping installed dir whose manifest plugin.id is unsafe for use as a filesystem segment",
+                );
+                continue;
+            }
             let dir_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if dir_name != manifest_id {
                 tracing::warn!(
@@ -244,14 +277,12 @@ impl InstalledPluginRegistry {
 
         let plugin_id = manifest.plugin.id.clone();
         // Reject directory traversal / path separator chicanery in
-        // the manifest id. Validate.rs in `oxidhome-manifest` also
+        // the manifest id. `validate.rs` in `oxidhome-manifest` also
         // enforces a kebab-case reverse-DNS shape, but defense in
         // depth — the id is about to become a filesystem segment.
-        if plugin_id.is_empty()
-            || plugin_id.contains('/')
-            || plugin_id.contains('\\')
-            || plugin_id.contains("..")
-        {
+        // Same check fires in `scan` so a hand-placed dir with an
+        // unsafe `manifest.plugin.id` doesn't enter the registry.
+        if !is_safe_plugin_id(&plugin_id) {
             return Err(InstallError::BadManifest {
                 path: manifest_path,
                 reason: format!("plugin id {plugin_id:?} contains an unsafe character"),
@@ -268,7 +299,25 @@ impl InstalledPluginRegistry {
         if staging.exists() {
             std::fs::remove_dir_all(&staging)?;
         }
-        copy_dir_recursive(source_dir, &staging)?;
+        // `copy_dir_recursive` returns `InvalidInput` specifically
+        // when the source dir contains a symlink — that's a fixable
+        // operator-side mistake, not a host internal failure, so we
+        // surface it as `BadManifest` (→ 422 BadInstall at the API)
+        // rather than `Io` (→ 500). Other IO errors stay as `Io`.
+        // Either way, a partial copy left in `staging` is cleaned
+        // up so a subsequent install attempt doesn't see (or have
+        // to skip over) the half-baked tree.
+        if let Err(err) = copy_dir_recursive(source_dir, &staging) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(if err.kind() == std::io::ErrorKind::InvalidInput {
+                InstallError::BadManifest {
+                    path: source_dir.to_path_buf(),
+                    reason: err.to_string(),
+                }
+            } else {
+                InstallError::Io(err)
+            });
+        }
         // Validate the copied manifest just in case (the wasm path
         // inside might be relative and depend on the copied
         // layout). Errors here aren't great — the staging dir is
@@ -318,15 +367,41 @@ impl InstalledPluginRegistry {
         // don't want a parallel `install` for the same id slipping
         // in between the `remove_dir_all` and the index drop.
         let mut entries = self.write_entries();
-        if !entries.contains_key(plugin_id) {
+        let Some(entry) = entries.get(plugin_id) else {
+            return Err(UninstallError::NotInstalled(plugin_id.to_string()));
+        };
+        // **Path safety: use the stored path, not a recomputed
+        // `plugins_root.join(plugin_id)`.** `install` validates ids
+        // before they enter the registry, and `scan` skips
+        // unsafe ones — but defense in depth, deleting the path
+        // we observed and recorded keeps the destructive operation
+        // safe-by-construction. Belt + suspenders: re-verify
+        // containment against `plugins_root` before yanking. A
+        // safe id's stored path is always under `plugins_root`;
+        // any divergence is a sign of registry corruption and
+        // we'd rather refuse than `remove_dir_all` outside it.
+        let dest = entry.path.clone();
+        if !dest.starts_with(plugins_root) {
+            tracing::error!(
+                plugin_id = %plugin_id,
+                path = %dest.display(),
+                root = %plugins_root.display(),
+                "uninstall refused: registry path escapes plugins root",
+            );
+            // Treat as "not installed" from the caller's POV —
+            // the on-disk state is inconsistent and we won't act
+            // on it. Operator must clean up manually.
             return Err(UninstallError::NotInstalled(plugin_id.to_string()));
         }
-        let dest = plugins_root.join(plugin_id);
         if dest.exists() {
             std::fs::remove_dir_all(&dest)?;
         }
         entries.remove(plugin_id);
-        tracing::info!(plugin_id = %plugin_id, "plugin uninstalled");
+        tracing::info!(
+            plugin_id = %plugin_id,
+            path = %dest.display(),
+            "plugin uninstalled",
+        );
         Ok(())
     }
 }
@@ -359,10 +434,15 @@ fn read_manifest_sync(path: &Path) -> anyhow::Result<PluginManifest> {
     Ok(manifest)
 }
 
-/// Pure-Rust recursive copy. Doesn't follow symlinks (the source
-/// dir is operator-supplied; we don't want a symlink-to-/etc to
-/// drag arbitrary files into `<state_dir>/plugins/`). Empty dirs
-/// are preserved.
+/// Pure-Rust recursive copy. **Refuses symlinks** rather than
+/// silently skipping them: an operator who points install at a
+/// dir whose `.wasm` is a `ln -s` (common in `nix develop` /
+/// shared-target-dir dev flows) would otherwise end up with a
+/// broken install (no `.wasm` at the installed path) and a
+/// confusing failure at first `start`. A hard error surfaces the
+/// problem here instead. The "don't follow symlinks to /etc"
+/// safety property is preserved — we never traverse one.
+/// Empty dirs are preserved.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -370,18 +450,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let ty = entry.file_type()?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
+        if ty.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to install: source contains a symlink at {} — \
+                     resolve it before install (the daemon does not follow \
+                     symlinks during the copy)",
+                    from.display(),
+                ),
+            ));
+        }
         if ty.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else if ty.is_file() {
             std::fs::copy(&from, &to)?;
-        } else if ty.is_symlink() {
-            // Skip symlinks. A plugin package that needs a
-            // symlink can't be installed via this endpoint;
-            // operator can stage by hand if they really want it.
-            tracing::warn!(
-                from = %from.display(),
-                "skipping symlink during install copy",
-            );
         }
     }
     Ok(())
@@ -498,6 +581,79 @@ wasm = "plugin.wasm"
         std::fs::write(bad.join("manifest.toml"), "this is not valid toml [[[").unwrap();
         let err = reg.install(&bad).unwrap_err();
         assert!(matches!(err, InstallError::BadManifest { .. }));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Pins the PR #48 review hardening: an install whose source
+    /// dir contains a symlink (even just dangling) is refused
+    /// with `BadManifest` (→ 422 at the API) rather than
+    /// `Io` (→ 500) or a silent skip that produces a broken
+    /// install. Common in `nix develop` / shared-target-dir dev
+    /// workflows where `.wasm` artifacts are symlinks.
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_source_containing_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir("symlink");
+        let plugins_root = root.join("plugins");
+        let reg = InstalledPluginRegistry::scan(plugins_root).unwrap();
+
+        let source = write_plugin_dir(&root, "example.with-symlink");
+        // Replace `plugin.wasm` with a symlink pointing to a real
+        // file outside the source dir.
+        let real_file = root.join("elsewhere.wasm");
+        std::fs::write(&real_file, b"\0asm\x01\x00\x00\x00").unwrap();
+        std::fs::remove_file(source.join("plugin.wasm")).unwrap();
+        symlink(&real_file, source.join("plugin.wasm")).unwrap();
+
+        let err = reg.install(&source).unwrap_err();
+        assert!(
+            matches!(err, InstallError::BadManifest { .. }),
+            "got {err:?}"
+        );
+        // Staging dir was cleaned up — no `.staging-...` left around.
+        assert!(!root.join("plugins/.staging-example.with-symlink").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Pins the PR #48 review hardening: `scan` refuses to index
+    /// a hand-placed dir whose `manifest.toml` declares an unsafe
+    /// `plugin.id` (`..`, slashes, etc.). Without this check,
+    /// `uninstall(id)` could pass `contains_key` and the stored
+    /// `path` validation would be the only guard against
+    /// `remove_dir_all` escaping the plugins root.
+    #[test]
+    fn scan_skips_unsafe_manifest_id() {
+        let root = tempdir("unsafe-id-scan");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+
+        // Hand-place a dir whose manifest claims a traversal id.
+        let bad_dir = plugins_root.join("legit-looking-dirname");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "../../../etc/cron.d"
+name = "Evil"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "x.wasm"
+"#,
+        )
+        .unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root).unwrap();
+        assert!(
+            reg.list().is_empty(),
+            "scan must skip unsafe ids, got {:?}",
+            reg.list(),
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
