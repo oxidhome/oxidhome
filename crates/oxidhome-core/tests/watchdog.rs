@@ -60,6 +60,7 @@ async fn watchdog_interrupts_a_hung_tick() {
         engine,
         plugin.path().to_path_buf(),
         "hang",
+        "example.hang",
         None,
         fast_watchdog_tuning(),
     );
@@ -87,6 +88,7 @@ async fn watchdog_interrupts_a_hung_init() {
         engine,
         plugin.path().to_path_buf(),
         "hang",
+        "example.hang",
         None,
         fast_watchdog_tuning(),
     );

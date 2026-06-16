@@ -133,6 +133,16 @@ pub(crate) const EVENTS_TAIL: Scope = Scope::new("events:tail");
 /// `logs:read` — see `GET /api/v1/logs`.
 pub(crate) const LOGS_READ: Scope = Scope::new("logs:read");
 
+/// `devices:command` — see `POST /api/v1/devices/{id}/command`.
+/// **Sensitive** by the cross-cutting policy in
+/// [`ARCHITECTURE.md`](../../../../../ARCHITECTURE.md): controls
+/// device actuation (locks, garage doors, alarms). A token holding
+/// this scope is empowered to drive physical-world effects.
+pub(crate) const DEVICES_COMMAND: Scope = Scope::new("devices:command");
+
+/// `plugins:list` — see `GET /api/v1/plugins`.
+pub(crate) const PLUGINS_LIST: Scope = Scope::new("plugins:list");
+
 #[cfg(test)]
 mod tests {
     use super::*;

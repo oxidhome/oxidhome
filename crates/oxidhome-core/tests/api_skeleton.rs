@@ -14,6 +14,9 @@
 //!    + `{"instances":[]}`.
 //! 7. The mint-then-verify flow bumps `last_used_ms`.
 
+#[path = "support.rs"]
+mod support;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use oxidhome_core::Engine;
@@ -607,4 +610,299 @@ async fn logs_query_accepts_overlarge_limit_without_400() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ── Device-command + plugins (Phase 12-API-d) ────────────────────
+
+/// `POST /api/v1/devices/{id}/command` without `devices:command`
+/// returns 403 — even with a real device id and a valid body.
+#[tokio::test(flavor = "current_thread")]
+async fn device_command_returns_403_without_scope() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("no-cmd", b"[\"devices:list\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/dev-0/command")
+                .method("POST")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"capability":"switch","action":"toggle","args":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// Sending to a non-existent device with the right scope returns
+/// 404 (indistinguishable from "no such device id" — no
+/// enumeration channel).
+#[tokio::test(flavor = "current_thread")]
+async fn device_command_unknown_device_returns_404() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("cmd", b"[\"devices:command\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/does-not-exist/command")
+                .method("POST")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"capability":"switch","action":"toggle","args":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// End-to-end: spin up `simulated-switch`, find its device through
+/// `/api/v1/devices`, send `switch.toggle` through
+/// `/api/v1/devices/{id}/command`, observe the published
+/// `state-changed` event. Proves the dispatch path routes through
+/// the supervisor's `execute_command` and the plugin's WIT
+/// `execute-command` export.
+#[tokio::test(flavor = "multi_thread")]
+async fn device_command_end_to_end_through_simulated_switch() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+
+    let handle = engine
+        .start_instance(switch_dir, "switch", None)
+        .await
+        .expect("start_instance");
+    handle.wait_for_running().await.expect("reach Running");
+
+    // Subscribe *after* `init` finished — `simulated-switch`
+    // publishes a `state-changed` event only on `execute-command`,
+    // so the bus is quiet until our toggle below. (Subscribing
+    // before init wouldn't hurt; the broadcast channel just had
+    // nothing to deliver, and the previous version of this test
+    // hung trying to drain a never-published initial event.)
+    let mut events = engine.events().subscribe_all();
+
+    // Find the registered device id (the host minted `dev-N`).
+    let device_id = engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|m| m.owner_instance == "switch")
+        .expect("simulated-switch registered a device")
+        .id
+        .clone();
+
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine.clone());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{device_id}/command"))
+                .method("POST")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"capability":"switch","action":"toggle","args":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "command dispatch should succeed for an admin token",
+    );
+    let body = body_to_json(response.into_body()).await;
+    // The plugin returns either `Ok` or `OkWithState`; both are
+    // structural successes — assert `kind` is present and not
+    // `err`.
+    let kind = body["kind"].as_str().expect("kind field on response");
+    assert!(
+        kind == "ok" || kind == "ok_with_state",
+        "expected ok / ok_with_state, got kind={kind} body={body:?}",
+    );
+    // If the plugin returned state, each entry must use the tagged
+    // `WireValue` shape (`{"t":..,"v":..}`) — pins the response-
+    // side round-trip contract that 12-API-d's review surfaced.
+    if kind == "ok_with_state" {
+        let state = body["state"]
+            .as_object()
+            .expect("state object on ok_with_state");
+        for (key, value) in state {
+            assert!(
+                value.get("t").and_then(Value::as_str).is_some(),
+                "state[{key}] must carry tagged `t`, got {value:?}",
+            );
+            assert!(
+                value.get("v").is_some(),
+                "state[{key}] must carry tagged `v`, got {value:?}",
+            );
+        }
+    }
+
+    // The toggle should have published a `state-changed` event on
+    // the bus carrying the new state.
+    let post_toggle =
+        tokio::time::timeout(std::time::Duration::from_secs(2), events.receiver.recv())
+            .await
+            .expect("toggle event delivered within 2s")
+            .expect("event recv");
+    assert_eq!(post_toggle.device.as_deref(), Some(device_id.as_str()));
+
+    handle.stop().await.expect("stop");
+}
+
+/// `GET /api/v1/plugins` without `plugins:list` returns 403; with
+/// the scope and no instances running, returns 200 + an empty
+/// `plugins` array.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_list_enforces_scope_and_returns_empty_array() {
+    let engine = Engine::new().expect("engine");
+    let denied = engine
+        .auth_tokens()
+        .create("no-list", b"[\"devices:list\"]")
+        .unwrap();
+    let allowed = engine
+        .auth_tokens()
+        .create("lister", b"[\"plugins:list\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    let denied_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", denied.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied_resp.status(), StatusCode::FORBIDDEN);
+
+    let ok_resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", allowed.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+    let body = body_to_json(ok_resp.into_body()).await;
+    assert!(body["plugins"].is_array(), "got {body:?}");
+    assert!(body["plugins"].as_array().unwrap().is_empty());
+}
+
+/// Plugins endpoint aggregates running instances by plugin id and
+/// reports `instance_count` per plugin. Two instances of the same
+/// plugin show as one row with `instance_count = 2`.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_list_aggregates_running_instances() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+
+    let a = engine
+        .start_instance(switch_dir.clone(), "switch-a", None)
+        .await
+        .expect("start switch-a");
+    a.wait_for_running().await.expect("a Running");
+    let b = engine
+        .start_instance(switch_dir, "switch-b", None)
+        .await
+        .expect("start switch-b");
+    b.wait_for_running().await.expect("b Running");
+
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let plugins = body["plugins"].as_array().expect("plugins array");
+    assert_eq!(plugins.len(), 1, "expected one plugin row, got {body:?}");
+    assert_eq!(plugins[0]["plugin_id"], "example.simulated-switch");
+    assert_eq!(plugins[0]["instance_count"], 2);
+
+    a.stop().await.expect("stop a");
+    b.stop().await.expect("stop b");
+}
+
+/// `GET /api/v1/instances` carries `plugin_id` per instance now
+/// that `InstanceHandle` exposes it (the deferred shape change
+/// from 12-API-a).
+#[tokio::test(flavor = "multi_thread")]
+async fn instances_list_includes_plugin_id() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+
+    let handle = engine
+        .start_instance(switch_dir, "switch-one", None)
+        .await
+        .expect("start switch-one");
+    handle.wait_for_running().await.expect("reach Running");
+
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/instances")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let instances = body["instances"].as_array().expect("instances array");
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0]["instance_id"], "switch-one");
+    assert_eq!(instances[0]["plugin_id"], "example.simulated-switch");
+
+    handle.stop().await.expect("stop");
 }

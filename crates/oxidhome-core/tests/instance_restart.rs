@@ -69,6 +69,7 @@ async fn never_policy_fails_after_one_crash() {
         engine,
         plugin.path().to_path_buf(),
         "crasher",
+        "example.crasher",
         None,
         fast_tuning(),
     );
@@ -101,8 +102,14 @@ async fn on_trap_restarts_a_tick_trap_until_the_cap() {
     let tuning = fast_tuning();
     let cap = tuning.max_restarts;
 
-    let handle =
-        supervise_with_tuning(engine, plugin.path().to_path_buf(), "crasher", None, tuning);
+    let handle = supervise_with_tuning(
+        engine,
+        plugin.path().to_path_buf(),
+        "crasher",
+        "example.crasher",
+        None,
+        tuning,
+    );
 
     match handle.wait_terminal().await {
         InstanceState::Failed { error } => {
@@ -130,6 +137,7 @@ async fn on_trap_init_failure_is_terminal() {
         engine,
         crasher_dir,
         "crasher",
+        "example.crasher",
         Some(overrides),
         fast_tuning(),
     );

@@ -199,6 +199,12 @@ enum ControlCommand {
 #[derive(Debug, Clone)]
 pub struct InstanceHandle {
     instance_id: Arc<str>,
+    /// Manifest-resolved `plugin.id` (e.g. `example.simulated-switch`).
+    /// Cached on the handle so API / CLI consumers can join instance
+    /// listings on the plugin without reading the manifest again, and
+    /// the registry / dispatcher can attribute work in audit logs by
+    /// plugin without an extra lookup.
+    plugin_id: Arc<str>,
     control: mpsc::Sender<ControlCommand>,
     state: watch::Receiver<InstanceState>,
 }
@@ -208,6 +214,14 @@ impl InstanceHandle {
     #[must_use]
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// The manifest-resolved `plugin.id` this instance is a copy of.
+    /// Stable across the instance's lifetime (the manifest is
+    /// read-once at load and pinned to the supervisor).
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
     }
 
     /// A snapshot of the current [`InstanceState`].
@@ -401,12 +415,14 @@ pub fn supervise(
     engine: Engine,
     plugin_dir: PathBuf,
     instance_id: impl Into<String>,
+    plugin_id: impl Into<String>,
     overrides: Option<toml::Value>,
 ) -> InstanceHandle {
     supervise_with_tuning(
         engine,
         plugin_dir,
         instance_id,
+        plugin_id,
         overrides,
         SupervisorTuning::default(),
     )
@@ -421,14 +437,17 @@ pub fn supervise_with_tuning(
     engine: Engine,
     plugin_dir: PathBuf,
     instance_id: impl Into<String>,
+    plugin_id: impl Into<String>,
     overrides: Option<toml::Value>,
     tuning: SupervisorTuning,
 ) -> InstanceHandle {
     let instance_id: Arc<str> = Arc::from(instance_id.into());
+    let plugin_id: Arc<str> = Arc::from(plugin_id.into());
     let (control_tx, control_rx) = mpsc::channel(16);
     let (state_tx, state_rx) = watch::channel(InstanceState::Loading);
     let handle = InstanceHandle {
         instance_id: Arc::clone(&instance_id),
+        plugin_id: Arc::clone(&plugin_id),
         control: control_tx,
         state: state_rx,
     };

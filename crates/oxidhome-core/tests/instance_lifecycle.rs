@@ -57,7 +57,13 @@ async fn supervisor_executes_commands_and_stops() {
     let state_dir = support::tempdir("sup-cmd-state");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
 
-    let handle = supervise(engine, plugin.path().to_path_buf(), "kv_counter", None);
+    let handle = supervise(
+        engine,
+        plugin.path().to_path_buf(),
+        "kv_counter",
+        "example.kv-counter",
+        None,
+    );
     handle.wait_for_running().await.expect("reach Running");
 
     assert_eq!(read_count(&handle, "counter", "read").await, 0);
@@ -77,7 +83,13 @@ async fn supervisor_ticks_on_manifest_cadence() {
     let state_dir = support::tempdir("sup-tick-state");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
 
-    let handle = supervise(engine, plugin.path().to_path_buf(), "kv_counter", None);
+    let handle = supervise(
+        engine,
+        plugin.path().to_path_buf(),
+        "kv_counter",
+        "example.kv-counter",
+        None,
+    );
     handle.wait_for_running().await.expect("reach Running");
 
     let count = poll_count_until(&handle, "counter", "read", 3).await;
@@ -102,7 +114,13 @@ async fn supervisor_delivers_bus_events() {
         .join("event-recorder");
     let engine = Engine::new().expect("engine");
 
-    let handle = supervise(engine.clone(), recorder_dir, "event_recorder", None);
+    let handle = supervise(
+        engine.clone(),
+        recorder_dir,
+        "event_recorder",
+        "example.event-recorder",
+        None,
+    );
     // Running ⇒ `init` finished ⇒ the recorder has subscribed.
     handle.wait_for_running().await.expect("reach Running");
 
@@ -138,7 +156,7 @@ async fn supervisor_load_failure_lands_in_failed() {
         .join("examples")
         .join("does-not-exist");
 
-    let handle = supervise(engine, missing, "ghost", None);
+    let handle = supervise(engine, missing, "ghost", "example.ghost", None);
 
     let err = handle
         .wait_for_running()
