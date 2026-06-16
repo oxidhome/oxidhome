@@ -11,19 +11,22 @@
 //! - `OXIDHOME_STATE_DIR` — path to the daemon's state dir.
 //!   Default: `<cwd>/.oxidhome-state`. Contains `oxidhome.db` +
 //!   the first-run `admin-token` file.
-//! - `OXIDHOME_BIND` — `host:port` the API listens on.
-//!   Default: [`DEFAULT_BIND`] (loopback-only; the daemon is
-//!   meant to sit behind the household reverse proxy / UI for
-//!   any non-localhost traffic).
+//! - `OXIDHOME_BIND` — `<ip>:<port>` the API listens on, parsed
+//!   as a [`SocketAddr`] (IPv4 / IPv6 literals only — hostnames
+//!   like `localhost` are **not** resolved). Default:
+//!   [`DEFAULT_BIND`] (loopback-only; the daemon is meant to sit
+//!   behind the household reverse proxy / UI for any non-localhost
+//!   traffic).
 //! - `RUST_LOG` — fmt-subscriber filter for stdout. The `LogStore`
 //!   `SQLite` layer captures every level regardless.
 //!
 //! ## Signals
 //!
-//! `SIGINT` (ctrl-c) and (on Unix) `SIGTERM` both initiate a
-//! graceful shutdown. The accept loop stops, the log writer
-//! flushes within [`SHUTDOWN_FLUSH_BUDGET`], and the process
-//! exits cleanly.
+//! `SIGINT` (ctrl-c) and (on Unix) `SIGTERM` both initiate
+//! shutdown. The accept loop stops immediately (in-flight HTTP
+//! requests and open `WebSockets` are dropped — see the comment on
+//! the `tokio::select!` in `main`), the log writer flushes within
+//! [`SHUTDOWN_FLUSH_BUDGET`], and the process exits.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -112,6 +115,23 @@ async fn main() -> anyhow::Result<()> {
     // Err here means the accept loop itself died (rare); we
     // surface that as the daemon's exit code so systemd / runit
     // can restart.
+    //
+    // **Hard-drop on signal — deliberate.** Dropping the `serve`
+    // future aborts axum's in-flight connection tasks, including
+    // any open `events/tail` WebSocket and any HTTP request mid-
+    // flight (the actuation `POST /devices/{id}/command` client
+    // loses its response even if the command already executed).
+    // The "obvious" upgrade — `axum::serve(...).with_graceful_shutdown(...)`
+    // — waits for *every* connection to close before returning,
+    // and the `events/tail` WS never closes on its own (its
+    // `select!` runs until the client hangs up), so a single
+    // connected tail client would wedge daemon shutdown
+    // indefinitely. A bounded graceful shutdown (HTTP drains for
+    // N seconds, then hard-drop) is the right shape if/when an
+    // operator hits this; deferring until there's a real
+    // incident, since for a home hub a missed actuation response
+    // is recoverable from the audit log + state, and a wedged
+    // shutdown is not.
     tokio::select! {
         result = serve(engine.clone(), listener) => {
             result.context("api server stopped unexpectedly")?;

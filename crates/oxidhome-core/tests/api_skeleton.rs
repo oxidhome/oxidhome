@@ -973,27 +973,41 @@ async fn events_tail_ws_round_trip_with_real_listener() {
         .await
         .expect("ws connect");
 
-    // Publish an event the test can recognize. A `Custom` topic
-    // is the simplest payload — no `device-state-changed` setup
-    // needed.
-    engine.events().publish(Event {
-        device: None,
-        timestamp: 0,
-        payload: EventPayload::Custom(CustomEvent {
-            topic: "api-e2e.toggle".into(),
-            payload: String::new(),
-        }),
+    // **Race-proof publish loop.** `connect_async` returning only
+    // tells us the *client* received the HTTP 101 — the server's
+    // `tail_events_loop` (where `engine.events().subscribe_all()`
+    // is called) runs in the task spawned by `upgrade.on_upgrade(...)`
+    // *after* the 101 frame is flushed. `tokio::broadcast` does
+    // not buffer messages for not-yet-existing receivers, so a
+    // single `publish` at this point can lose to the subscribe.
+    // Fix: re-publish every 50 ms in a background task until the
+    // recv side aborts us. Idempotent — the test inspects only
+    // the first received frame.
+    let publisher_engine = engine.clone();
+    let publisher = tokio::spawn(async move {
+        loop {
+            publisher_engine.events().publish(Event {
+                device: None,
+                timestamp: 0,
+                payload: EventPayload::Custom(CustomEvent {
+                    topic: "api-e2e.toggle".into(),
+                    payload: String::new(),
+                }),
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     });
 
     // Pull one frame off the socket. 2 s is comfortably above
     // the publish → broadcast → handler → socket latency on any
-    // realistic CI runner; below it points at a hang in the
-    // dispatch path.
+    // realistic CI runner with the re-publish loop above; below
+    // it points at a hang in the dispatch path.
     let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
         .await
         .expect("ws frame within 2s")
         .expect("stream not closed")
         .expect("ws frame ok");
+    publisher.abort();
     let text = msg.into_text().expect("text frame");
     let json: Value = serde_json::from_str(&text).expect("json frame");
     // The same tagged-`WireEvent` shape the oneshot tests assert
