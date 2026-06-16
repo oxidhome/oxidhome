@@ -743,6 +743,24 @@ async fn device_command_end_to_end_through_simulated_switch() {
         kind == "ok" || kind == "ok_with_state",
         "expected ok / ok_with_state, got kind={kind} body={body:?}",
     );
+    // If the plugin returned state, each entry must use the tagged
+    // `WireValue` shape (`{"t":..,"v":..}`) — pins the response-
+    // side round-trip contract that 12-API-d's review surfaced.
+    if kind == "ok_with_state" {
+        let state = body["state"]
+            .as_object()
+            .expect("state object on ok_with_state");
+        for (key, value) in state {
+            assert!(
+                value.get("t").and_then(Value::as_str).is_some(),
+                "state[{key}] must carry tagged `t`, got {value:?}",
+            );
+            assert!(
+                value.get("v").is_some(),
+                "state[{key}] must carry tagged `v`, got {value:?}",
+            );
+        }
+    }
 
     // The toggle should have published a `state-changed` event on
     // the bus carrying the new state.

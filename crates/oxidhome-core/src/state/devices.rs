@@ -146,6 +146,28 @@ impl DeviceRegistry {
         }
     }
 
+    /// Cross-instance lookup — the host-routing primitive. Unlike
+    /// [`Self::get`], this is *not* owner-scoped: the caller is the
+    /// host (API, CLI, future MCP), not a plugin, so the
+    /// scope-by-owner property doesn't apply. Mirrors
+    /// [`ServiceRegistry::get_any`](crate::state::ServiceRegistry::get_any)
+    /// for the device registry. Returns `None` if the id isn't
+    /// registered.
+    #[must_use]
+    pub fn get_any(&self, id: &DeviceId) -> Option<Arc<DeviceMeta>> {
+        self.read().get(id).map(Arc::clone)
+    }
+
+    /// Cross-instance owner-only lookup — what the API's
+    /// device-command handler actually needs. Returns just the
+    /// owning instance id (one `String` clone, no `Arc<DeviceMeta>`
+    /// and no `Vec` allocation), parallel to
+    /// [`ServiceRegistry::get_owner`](crate::state::ServiceRegistry::get_owner).
+    #[must_use]
+    pub fn get_owner(&self, id: &DeviceId) -> Option<String> {
+        self.read().get(id).map(|m| m.owner_instance.clone())
+    }
+
     /// Snapshot of every registered device — cheap (one `Arc::clone`
     /// per entry, no deep copies). The `Vec` is pre-sized so the
     /// `Arc::clone` loop doesn't realloc-grow under the read lock.

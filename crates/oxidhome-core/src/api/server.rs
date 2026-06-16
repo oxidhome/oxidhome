@@ -226,8 +226,14 @@ struct WireKeyValue {
 
 /// JSON wire mirror of the WIT `value` variant — same tag/content
 /// shape as the storage encoding so a future API <-> persisted
-/// record migration is a pure-Rust transform.
-#[derive(Deserialize)]
+/// record migration is a pure-Rust transform. Round-trippable in
+/// **both directions**: clients deserialize into [`Value`] via
+/// `From<WireValue>`, and the API serializes responses into
+/// [`WireValue`] via `From<Value>` so the input `{t,v}` shape on
+/// command args matches the `{t,v}` shape on the
+/// `OkWithState` state map. Drop the round-trip and a client
+/// can't tell `Int(5)` from `Float(5.0)`.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "t", content = "v")]
 enum WireValue {
     Bool(bool),
@@ -251,21 +257,34 @@ impl From<WireValue> for Value {
     }
 }
 
+impl From<Value> for WireValue {
+    fn from(v: Value) -> Self {
+        match v {
+            Value::BoolVal(b) => WireValue::Bool(b),
+            Value::IntVal(i) => WireValue::Int(i),
+            Value::FloatVal(f) => WireValue::Float(f),
+            Value::StringVal(s) => WireValue::String(s),
+            Value::BytesVal(b) => WireValue::Bytes(b),
+            Value::JsonVal(j) => WireValue::Json(j),
+        }
+    }
+}
+
 /// Wire mirror of the WIT `command-result` variant. `ok` carries
-/// no body; `ok_with_state` carries a `{key: WireValue}` map (a
-/// keyed dict reads better in JSON than the WIT `Vec<KeyValue>`);
-/// `err` carries the host's [`WitError`] mapped to a tagged
+/// no body; `ok_with_state` carries a `{key: WireValue}` map — a
+/// keyed dict reads better in JSON than the WIT `Vec<KeyValue>`,
+/// and using [`WireValue`] (tagged) instead of a flat
+/// `serde_json::Value` keeps the round-trip lossless: a client
+/// that sent `{"t":"int","v":5}` and reads `{"t":"int","v":5}`
+/// back can distinguish int from float, json-payload from string,
+/// etc. `err` carries the host's [`WitError`] mapped to a tagged
 /// `{kind, message}` shape.
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireCommandResult {
     Ok,
-    OkWithState {
-        state: HashMap<String, serde_json::Value>,
-    },
-    Err {
-        error: WireWitError,
-    },
+    OkWithState { state: HashMap<String, WireValue> },
+    Err { error: WireWitError },
 }
 
 /// Wire mirror of the WIT `error` variant. Same shape clients can
@@ -292,25 +311,13 @@ impl From<WitError> for WireWitError {
     }
 }
 
-fn value_to_json(v: &Value) -> serde_json::Value {
-    use serde_json::Value as J;
-    match v {
-        Value::BoolVal(b) => J::Bool(*b),
-        Value::IntVal(i) => J::Number((*i).into()),
-        Value::FloatVal(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
-        Value::StringVal(s) => J::String(s.clone()),
-        Value::BytesVal(b) => J::Array(b.iter().map(|n| J::Number((*n).into())).collect()),
-        Value::JsonVal(j) => serde_json::from_str(j).unwrap_or(J::Null),
-    }
-}
-
 fn command_result_to_wire(r: CommandResult) -> WireCommandResult {
     match r {
         CommandResult::Ok => WireCommandResult::Ok,
         CommandResult::OkWithState(kvs) => WireCommandResult::OkWithState {
             state: kvs
                 .into_iter()
-                .map(|kv| (kv.key, value_to_json(&kv.value)))
+                .map(|kv| (kv.key, kv.value.into()))
                 .collect(),
         },
         CommandResult::Err(e) => WireCommandResult::Err { error: e.into() },
@@ -348,18 +355,16 @@ async fn send_command(
 ) -> Result<Json<WireCommandResult>, CommandError> {
     require_scope(&actor, DEVICES_COMMAND).map_err(CommandError::Scope)?;
 
-    // Resolve device → owning instance (cross-instance lookup;
-    // the API caller isn't a plugin, so device-registry owner
-    // scoping doesn't apply).
+    // Resolve device → owning instance via the registry's
+    // cross-instance owner-only lookup (mirrors the dispatcher's
+    // `ServiceRegistry::get_owner` shape). The previous
+    // `list().into_iter().find(...)` was O(n) + Vec-alloc per
+    // command; this is one read-lock + map lookup.
     let owner = state
         .engine
         .devices()
-        .list()
-        .into_iter()
-        .find(|m| m.id == device_id)
-        .ok_or(CommandError::NotFound)?
-        .owner_instance
-        .clone();
+        .get_owner(&device_id)
+        .ok_or(CommandError::NotFound)?;
     let handle = state
         .engine
         .instances()
@@ -780,6 +785,52 @@ mod tests {
     /// `Rotated`. Pre-fix the wire shape collapsed every button
     /// event to `variant: "event"` — a UI tailing button events had
     /// no way to distinguish a press from a release.
+    /// `WireValue` round-trips losslessly through both directions
+    /// of the API: a client posts `{"t":"int","v":5}` and reads
+    /// `{"t":"int","v":5}` back from `OkWithState`. Pins the
+    /// tagged-shape symmetry so a future code change can't
+    /// silently flatten the response side.
+    #[test]
+    fn wire_value_roundtrips_in_both_directions() {
+        let cases = [
+            Value::BoolVal(true),
+            Value::IntVal(-42),
+            Value::FloatVal(3.5),
+            Value::StringVal("hi".into()),
+            Value::BytesVal(vec![0x00, 0xff, 0x42]),
+            Value::JsonVal(r#"{"nested":1}"#.into()),
+        ];
+        for input in cases {
+            // Host -> wire (response side, e.g. OkWithState).
+            let wire = WireValue::from(input.clone());
+            let json = serde_json::to_string(&wire).expect("serialize");
+            // Round trip through JSON like a client would.
+            let parsed: WireValue = serde_json::from_str(&json).expect("deserialize");
+            let back = Value::from(parsed);
+            assert!(
+                values_equal(&input, &back),
+                "round trip failed for {input:?} (json={json})",
+            );
+        }
+    }
+
+    /// Variant-aware equality for the round-trip test. Compares
+    /// floats by `to_bits` so the assertion can't be fooled by a
+    /// `Float(0.0) == Float(-0.0)` quirk, and so clippy doesn't
+    /// flag a strict `==` on `f64` (the test's whole point is that
+    /// the wire encoding is bit-exact for the same input).
+    fn values_equal(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::BoolVal(x), Value::BoolVal(y)) => x == y,
+            (Value::IntVal(x), Value::IntVal(y)) => x == y,
+            (Value::FloatVal(x), Value::FloatVal(y)) => x.to_bits() == y.to_bits(),
+            (Value::StringVal(x), Value::StringVal(y))
+            | (Value::JsonVal(x), Value::JsonVal(y)) => x == y,
+            (Value::BytesVal(x), Value::BytesVal(y)) => x == y,
+            _ => false,
+        }
+    }
+
     #[test]
     fn button_variant_projects_one_to_one() {
         let cases = [
