@@ -206,13 +206,21 @@ jobs:
         run: buf lint
       - name: Regenerate Connect-RPC code
         run: buf generate
+      - name: Apply rustfmt to the regen tree
+        # The committed code is the post-`cargo fmt --all` form (the
+        # dev pre-commit gate runs fmt across the whole workspace),
+        # so the diff check below has to compare apples to apples.
+        # Otherwise the only divergence ends up being rustfmt's
+        # `max_width` wrap of buffa's long single-line `#![allow(…)]`
+        # attributes, and CI fails on a non-substantive diff.
+        run: cargo fmt --all
       - name: Verify committed code matches regen
         # If buf generate produced a different tree than what's
         # committed, the dev forgot to run regen + commit. Fail
         # loudly so the staleness can't reach main.
         run: |
           if ! git diff --quiet -- crates/oxidhome-proto/src/gen; then
-            echo "::error::Connect-RPC generated code is stale. Run 'buf generate' locally and commit the result."
+            echo "::error::Connect-RPC generated code is stale. Run 'buf generate && cargo fmt --all' locally and commit the result."
             git --no-pager diff -- crates/oxidhome-proto/src/gen
             exit 1
           fi

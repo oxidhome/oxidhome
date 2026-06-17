@@ -57,8 +57,12 @@ Make sure both \$GOPATH/bin (\$(go env GOPATH)/bin) and
 the plugins. Then regenerate with:
 
     buf generate
+    cargo fmt --all   # see note below
 
 The committed code under crates/oxidhome-proto/src/gen/ must
-match the regen output; CI enforces this via
-\`git diff --exit-code\` in the buf-verify job.
+match the post-fmt regen output; CI enforces this via
+\`git diff --exit-code\` in the buf-verify job. The cargo fmt
+step matters because rustfmt wraps buffa's long single-line
+\`#![allow(...)]\` attributes — the CI buf-verify job runs the
+same two commands in the same order.
 EOF
