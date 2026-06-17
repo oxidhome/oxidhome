@@ -193,15 +193,18 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v6.0.0
-        with:
-          go-version: stable
-      - name: Install buf + codegen plugins
-        run: scripts/install-buf-tools.sh
-      - name: Add tool binaries to PATH
-        run: |
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install buf CLI
+        # Pre-built binary from buf's releases — no Go toolchain
+        # needed on the runner just to compile buf itself. No
+        # `version:` pin: track the latest buf release so codegen
+        # behavior stays aligned with the latest plugins.
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+      - name: Install codegen plugins (protoc-gen-buffa{,-packaging},
+          protoc-gen-connect-rust)
+        # The same alias that installs cargo-deny / cargo-nextest /
+        # etc. — the Rust codegen plugins live alongside the other
+        # workspace toolchain bins.
+        run: cargo install-tools
       - name: Lint .proto files
         run: buf lint
       - name: Regenerate Connect-RPC code
