@@ -73,7 +73,7 @@ axum = { version = "0.8.7", default-features = false, features = ["http1", "json
 # dep graph.
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect"] }
 
-# Phase 15 — Connect RPC. Generated code lives in `oxidhome-proto`;
+# Connect RPC. Generated code lives in `oxidhome-proto`;
 # `oxidhome-core` mounts a `connectrpc::Router` into the existing
 # axum app via `into_axum_service()` so both protocols share one
 # listener. Versions pinned exact to keep the regen output (checked

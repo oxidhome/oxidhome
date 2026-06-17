@@ -1,4 +1,4 @@
-//! Phase 15-a — Connect RPC handler wiring.
+//! Connect RPC handler wiring.
 //!
 //! Builds a [`connectrpc::Router`] populated with `OxidHome`'s Connect
 //! services and exposes it as an axum-compatible `tower::Service`
@@ -13,9 +13,9 @@
 //!
 //! The split is invisible to a JSON client and the Connect surface
 //! reuses the same axum middleware (auth, audit) once a Connect
-//! endpoint requires authentication — for the Phase-15-a slice the
-//! only Connect endpoint is `Health.Check`, which is anonymous, so
-//! it lands *outside* the auth middleware (same as the JSON
+//! endpoint requires authentication — the only Connect endpoint
+//! today is `Health.Check`, which is anonymous, so it lands
+//! *outside* the auth middleware (same as the JSON
 //! `/api/v1/health`).
 
 use std::sync::Arc;

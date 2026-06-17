@@ -1,18 +1,18 @@
-//! Phase 12-API-a — HTTP API skeleton end-to-end test.
+//! HTTP API skeleton end-to-end test.
 //!
 //! Drives `build_router` directly via `tower::ServiceExt::oneshot`
 //! (no TCP bind, no real socket) and verifies:
 //!
-//! 1. `GET /api/v1/health` — 200 with `{"status":"ok",...}` and no
-//!    `Authorization` header required.
-//! 2. `GET /api/v1/instances` without a token — 401 + the
+//! 1. `GET /api/v1/instances` without a token — 401 + the
 //!    `WWW-Authenticate: Bearer` header.
-//! 3. `GET /api/v1/instances` with a bogus token — 401.
-//! 4. `GET /api/v1/instances` with a malformed token — 401.
-//! 5. `GET /api/v1/instances` with a revoked token — 401.
-//! 6. `GET /api/v1/instances` with a freshly-minted token — 200
+//! 2. `GET /api/v1/instances` with a bogus token — 401.
+//! 3. `GET /api/v1/instances` with a malformed token — 401.
+//! 4. `GET /api/v1/instances` with a revoked token — 401.
+//! 5. `GET /api/v1/instances` with a freshly-minted token — 200
 //!    + `{"instances":[]}`.
-//! 7. The mint-then-verify flow bumps `last_used_ms`.
+//! 6. The mint-then-verify flow bumps `last_used_ms`.
+//! 7. `POST /oxidhome.v1.HealthService/Check` (Connect, anonymous)
+//!    returns the daemon version — the canonical liveness probe.
 
 #[path = "support.rs"]
 mod support;
@@ -75,25 +75,6 @@ fn extract_audit_fields(fields: &[(String, oxidhome_core::state::LogValue)]) -> 
         status: status.expect("status field present"),
         required_scope: required_scope.unwrap_or_default(),
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn health_endpoint_is_anonymous_and_ok() {
-    let engine = Engine::new().expect("engine");
-    let router = build_router(engine);
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response.into_body()).await;
-    assert_eq!(body["status"], "ok");
-    assert!(body["version"].is_string());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1496,7 +1477,7 @@ async fn install_start_stop_uninstall_end_to_end() {
     assert!(!state_dir.path().join("plugins/example.kv-counter").exists());
 }
 
-// ── Phase 15-a — Connect RPC (mounted as fallback_service) ──────
+// ── Connect RPC (mounted as fallback_service) ───────────────────
 
 /// `POST /oxidhome.v1.HealthService/Check` with Connect's JSON wire
 /// format must reach the new Connect dispatcher (mounted alongside
@@ -1528,24 +1509,4 @@ async fn connect_health_check_returns_ok_with_version() {
     // `version` mirrors `oxidhome-core`'s `Cargo.toml` package
     // version; locked exact so the two protocols can't drift.
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-}
-
-/// The JSON `/api/v1/health` endpoint still works — confirms the
-/// Connect fallback didn't shadow the existing axum route.
-#[tokio::test(flavor = "current_thread")]
-async fn json_health_still_works_after_connect_mount() {
-    let engine = Engine::new().expect("engine");
-    let router = build_router(engine);
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response.into_body()).await;
-    assert_eq!(body["status"], "ok");
 }

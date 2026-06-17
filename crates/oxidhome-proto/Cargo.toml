@@ -19,7 +19,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Generated Connect-RPC types for OxidHome (Phase 15)."
+description = "Generated Connect-RPC types for OxidHome."
 
 # This crate is **entirely** generated code from `buf generate`. We
 # don't hand-write any source here, so the workspace's pedantic

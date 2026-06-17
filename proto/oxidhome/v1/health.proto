@@ -1,13 +1,11 @@
 // OxidHome v1 health-check service.
 //
-// Mirrors `GET /api/v1/health` on the existing JSON API surface
-// (Phase 12-API-a) — anonymous liveness probe used by service
-// meshes, container orchestrators, and the upcoming CLI.
-//
-// Phase 15-a is the first slice of the JSON → Connect migration.
-// The Connect endpoint lives alongside the JSON one on the same
-// listener; both protocols stay supported until the CLI / UI move
-// over fully (see ARCHITECTURE.md for the migration plan).
+// Mirrors `GET /api/v1/health` on the existing JSON API surface —
+// anonymous liveness probe used by service meshes, container
+// orchestrators, and the upcoming CLI. The Connect endpoint lives
+// alongside the JSON one on the same listener; both protocols
+// stay supported until the CLI / UI move over fully (see
+// ARCHITECTURE.md for the migration plan).
 syntax = "proto3";
 
 package oxidhome.v1;

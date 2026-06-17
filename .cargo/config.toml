@@ -6,10 +6,10 @@
 # - Test / coverage / publish gates: cargo-deny, cargo-llvm-cov,
 #   cargo-machete, cargo-nextest, cargo-action-fmt.
 # - WIT pipeline: wit-deps-cli, wasm-tools.
-# - Phase-15 Connect-RPC codegen: protoc-gen-buffa,
-#   protoc-gen-buffa-packaging, and connectrpc-codegen (which ships
-#   the `protoc-gen-connect-rust` binary). `buf` itself isn't a
-#   cargo crate; CI installs it via `bufbuild/buf-setup-action`
-#   (pre-built binary, no Go toolchain), and local devs typically
-#   already have it from a package manager or `go install`.
+# - Connect-RPC codegen: protoc-gen-buffa, protoc-gen-buffa-packaging,
+#   and connectrpc-codegen (which ships the `protoc-gen-connect-rust`
+#   binary). `buf` itself isn't a cargo crate; CI installs it via
+#   `bufbuild/buf-setup-action` (pre-built binary, no Go toolchain),
+#   and local devs typically already have it from a package manager
+#   or `go install`.
 install-tools = "install --locked cargo-deny cargo-llvm-cov cargo-machete cargo-nextest cargo-action-fmt wit-deps-cli wasm-tools protoc-gen-buffa protoc-gen-buffa-packaging connectrpc-codegen"
