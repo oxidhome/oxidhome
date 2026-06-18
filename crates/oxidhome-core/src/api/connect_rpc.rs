@@ -97,6 +97,10 @@ pub fn router(_engine: Engine) -> ConnectRouter {
 /// scope check happens inside each handler via
 /// [`super::scopes::require_scope`]; the middleware here only
 /// enforces authentication and emits the audit row.
+///
+/// Linear scan is fine at one entry. If the list grows past a
+/// handful (anonymous discovery endpoint, `/readyz` mirror, …),
+/// swap to a `HashSet<&'static str>` or compile-time `match`.
 const ANONYMOUS_CONNECT_PATHS: &[&str] = &["/oxidhome.v1.HealthService/Check"];
 
 /// Build the Connect surface as an `axum::Router` wrapped with the
@@ -139,13 +143,24 @@ async fn connect_auth_middleware(
     mut req: Request,
     next: Next,
 ) -> AxumResponse {
-    let path = req.uri().path().to_string();
-    if ANONYMOUS_CONNECT_PATHS.iter().any(|p| *p == path) {
+    // Allow-list check FIRST, against a borrowed `&str` — anonymous
+    // probes (Health.Check, the hot path for orchestrators) shouldn't
+    // pay for a `String` allocation they'll never use.
+    if ANONYMOUS_CONNECT_PATHS
+        .iter()
+        .any(|p| *p == req.uri().path())
+    {
         return next.run(req).await;
     }
+    let path = req.uri().path().to_string();
 
     let Some(bearer) = extract_bearer(&req) else {
-        return connect_error_response(&ConnectError::unauthenticated("missing bearer token"));
+        // Collapse missing / malformed / unknown / revoked into one
+        // opaque message — matches the JSON `require_token`'s "can't
+        // probe shape, validity, or revocation" stance from
+        // 12-API-a so a Connect client can't tell the four cases
+        // apart either.
+        return connect_error_response(&ConnectError::unauthenticated("unauthenticated"));
     };
     let (token_id, actor_kind, method) = match state.tokens.verify(bearer) {
         Ok(rec) => {
@@ -160,7 +175,7 @@ async fn connect_auth_middleware(
             (token_id, actor_kind, method)
         }
         Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
-            return connect_error_response(&ConnectError::unauthenticated("invalid bearer token"));
+            return connect_error_response(&ConnectError::unauthenticated("unauthenticated"));
         }
         Err(TokenError::Sqlite(err)) => {
             tracing::error!(target: "api.auth", error = %err, "token verify failed");
