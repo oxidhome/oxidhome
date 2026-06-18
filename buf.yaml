@@ -1,5 +1,12 @@
 # Buf module config for OxidHome's Connect RPC surface.
 #
+# **Owns the top-level `buf.yaml` / `buf.gen.yaml` namespace.** Any
+# future proto consumer that wants its own buf config (a Wasm
+# plugin SDK, an MCP-side schema set, …) needs a nested directory
+# with its own pair so this root one isn't shadowed. The
+# `modules.path` below scopes the daemon API to `proto/`, leaving
+# other roots free for that.
+#
 # Single workspace module rooted at `proto/`. Lint + breaking rules
 # follow Buf's defaults; the daemon's wire surface is small enough
 # that the defaults catch the common mistakes (unused imports,

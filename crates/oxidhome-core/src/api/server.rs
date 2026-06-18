@@ -67,7 +67,7 @@ pub fn build_router(engine: Engine) -> Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
     };
-    let connect_service = super::connect_rpc::router().into_axum_service();
+    let connect_service = super::connect_rpc::router(engine.clone()).into_axum_service();
     Router::new()
         .route("/api/v1/instances", get(list_instances))
         .route("/api/v1/devices", get(list_devices))
