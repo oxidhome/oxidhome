@@ -147,7 +147,11 @@ pub(crate) async fn require_token(
 /// `tracing::info!` with `target = "api.audit"`; the existing
 /// `LogStore` layer captures it. See [`require_token`]'s docstring
 /// for the field shape.
-fn emit_audit(
+///
+/// `pub(super)` so the Connect-side auth middleware
+/// ([`super::connect_rpc`]) emits the same shape — single source
+/// of truth for the audit-row contract.
+pub(super) fn emit_audit(
     token_id: &str,
     actor_kind: &str,
     method: &str,
@@ -191,7 +195,10 @@ fn emit_audit(
 /// operator who saved a malformed scope blob with the CLI gets a
 /// useful "every request is denied" signal in the audit log rather
 /// than the entire API going down.
-fn actor_from_record(rec: &TokenRecord) -> Actor {
+///
+/// `pub(super)` so the Connect-side auth middleware reuses the
+/// same record → actor projection.
+pub(super) fn actor_from_record(rec: &TokenRecord) -> Actor {
     let scopes = parse_scopes(&rec.scope_json).unwrap_or_else(|| {
         tracing::warn!(
             target: "api.auth",
@@ -222,7 +229,11 @@ pub(crate) fn parse_scopes(blob: &[u8]) -> Option<Vec<String>> {
 /// SP between the scheme and the credential are tolerated. `None`
 /// if the header is missing, the scheme isn't `Bearer`, or the
 /// credential is empty.
-fn extract_bearer(req: &Request) -> Option<&str> {
+///
+/// `pub(super)` so the Connect-side auth middleware uses exactly
+/// the same extractor — case-handling drift between the two
+/// surfaces would be a footgun.
+pub(super) fn extract_bearer(req: &Request) -> Option<&str> {
     let h = req.headers().get(header::AUTHORIZATION)?;
     let s = h.to_str().ok()?;
     let (scheme, rest) = s.split_once(' ')?;
