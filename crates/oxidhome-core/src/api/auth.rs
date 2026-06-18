@@ -37,10 +37,15 @@ use axum::{
 use crate::auth::Actor;
 use crate::state::{TokenError, TokenRecord, TokenStore};
 
-/// Routes that don't require a bearer token. Health is the canonical
-/// liveness probe — has to work for an orchestrator / load balancer
-/// that doesn't carry credentials.
-pub(crate) const PUBLIC_PATHS: &[&str] = &["/api/v1/health"];
+/// Routes that don't require a bearer token. The canonical liveness
+/// probe lives on the Connect surface
+/// (`POST /oxidhome.v1.HealthService/Check`), and the Connect router
+/// is mounted as a `fallback_service` **outside** the bearer-auth
+/// middleware — so Connect health requests already skip this gate
+/// without needing an entry here. The list stays as the seam for
+/// future anonymous routes (e.g. a JSON-side `/readyz` if an
+/// orchestrator wants something simpler than a Connect probe).
+pub(crate) const PUBLIC_PATHS: &[&str] = &[];
 
 /// Shared state the middleware needs. Held behind `Arc` and cloned
 /// per request — both fields are already `Arc`-backed, so the clone

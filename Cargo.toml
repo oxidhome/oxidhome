@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/oxidhome-core",
   "crates/oxidhome-manifest",
+  "crates/oxidhome-proto",
   "crates/oxidhome-sdk",
   "crates/oxidhome-wit",
 ]
@@ -28,6 +29,7 @@ pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
 oxidhome-manifest = { path = "crates/oxidhome-manifest", version = "0.1.0" }
+oxidhome-proto = { path = "crates/oxidhome-proto", version = "0.1.0" }
 oxidhome-sdk = { path = "crates/oxidhome-sdk", version = "0.1.0" }
 oxidhome-wit = { path = "crates/oxidhome-wit", version = "0.1.0" }
 
@@ -70,6 +72,20 @@ axum = { version = "0.8.7", default-features = false, features = ["http1", "json
 # a real round-trip client without dragging a second copy into the
 # dep graph.
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect"] }
+
+# Connect RPC. Generated code lives in `oxidhome-proto`;
+# `oxidhome-core` mounts a `connectrpc::Router` into the existing
+# axum app via `into_axum_service()` so both protocols share one
+# listener. Versions pinned exact to keep the regen output (checked
+# in under `crates/oxidhome-proto/src/gen/`) reproducible. Bumps
+# must touch both the runtime pin here and the codegen pin in
+# `scripts/install-buf-tools.sh` together.
+connectrpc = { version = "=0.7.0", default-features = false, features = ["axum", "server"] }
+# `buffa` is the message-codegen runtime the generated code links
+# against. The Connect runtime (`connectrpc`) carries its own
+# transitive pin; this one keeps the generated message types in
+# sync with the version `protoc-gen-buffa` produced.
+buffa = { version = "=0.7.1", default-features = false, features = ["json"] }
 # Pulled in transitively (axum / tokio-tungstenite); lifted to a
 # workspace dep so the WS round-trip test in 12-API-e can call
 # `.next()` / `.send()` / `.close()` on the `WebSocketStream` (those

@@ -187,6 +187,46 @@ jobs:
       - name: Check status
         if: ${{ needs.TestsJob.result != 'success' }}
         run: exit 1
+  Buf:
+    name: Verify Connect-RPC codegen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - name: Install buf CLI
+        # Pre-built binary from buf's releases — no Go toolchain
+        # needed on the runner just to compile buf itself. No
+        # `version:` pin: track the latest buf release so codegen
+        # behavior stays aligned with the latest plugins.
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+      - name: Install codegen plugins (protoc-gen-buffa{,-packaging},
+          protoc-gen-connect-rust)
+        # The same alias that installs cargo-deny / cargo-nextest /
+        # etc. — the Rust codegen plugins live alongside the other
+        # workspace toolchain bins.
+        run: cargo install-tools
+      - name: Lint .proto files
+        run: buf lint
+      - name: Regenerate Connect-RPC code
+        run: buf generate
+      - name: Apply rustfmt to the regen tree
+        # The committed code is the post-`cargo fmt --all` form (the
+        # dev pre-commit gate runs fmt across the whole workspace),
+        # so the diff check below has to compare apples to apples.
+        # Otherwise the only divergence ends up being rustfmt's
+        # `max_width` wrap of buffa's long single-line `#![allow(…)]`
+        # attributes, and CI fails on a non-substantive diff.
+        run: cargo fmt --all
+      - name: Verify committed code matches regen
+        # If buf generate produced a different tree than what's
+        # committed, the dev forgot to run regen + commit. Fail
+        # loudly so the staleness can't reach main.
+        run: |
+          if ! git diff --quiet -- crates/oxidhome-proto/src/gen; then
+            echo "::error::Connect-RPC generated code is stale. Run 'buf generate && cargo fmt --all' locally and commit the result."
+            git --no-pager diff -- crates/oxidhome-proto/src/gen
+            exit 1
+          fi
   Deps:
     name: Check dependencies
     runs-on: ubuntu-latest
@@ -234,6 +274,7 @@ jobs:
       - Build
       - Format
       - Wit
+      - Buf
       - Clippy
       - WasmClippy
       - Tests

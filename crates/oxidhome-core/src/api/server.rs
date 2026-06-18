@@ -54,12 +54,21 @@ impl Default for ApiConfig {
 
 /// Build the API router. Public for integration tests; the
 /// `serve(...)` entry point that production callers use lives below.
+///
+/// The router serves **two protocols on one listener**:
+///
+/// - JSON `/api/v1/*` — every existing handler.
+/// - Connect-RPC `/oxidhome.v1.{Service}/{Method}` — mounted as a
+///   `fallback_service` so any path not matched by the JSON routes
+///   above falls through to the Connect dispatcher (this is where
+///   `HealthService.Check` and the rest of the migrating surface
+///   live). See [`super::connect_rpc`] for the registered services.
 pub fn build_router(engine: Engine) -> Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
     };
+    let connect_service = super::connect_rpc::router(engine.clone()).into_axum_service();
     Router::new()
-        .route("/api/v1/health", get(health))
         .route("/api/v1/instances", get(list_instances))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{device_id}/command", post(send_command))
@@ -79,6 +88,7 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/logs", get(query_logs))
         .layer(from_fn_with_state(auth_state.clone(), require_token))
+        .fallback_service(connect_service)
         .with_state(ApiState { engine })
 }
 
@@ -123,25 +133,6 @@ struct ApiState {
 }
 
 // ── Handlers ─────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct HealthBody {
-    status: &'static str,
-    version: &'static str,
-}
-
-/// Anonymous liveness probe. Lives outside [`PUBLIC_PATHS`] only
-/// nominally — the route is wired before the middleware via the
-/// path-match in `require_token`.
-async fn health() -> (StatusCode, Json<HealthBody>) {
-    (
-        StatusCode::OK,
-        Json(HealthBody {
-            status: "ok",
-            version: env!("CARGO_PKG_VERSION"),
-        }),
-    )
-}
 
 #[derive(Serialize)]
 struct InstancesBody {

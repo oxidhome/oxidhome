@@ -1,0 +1,34 @@
+// OxidHome v1 health-check service.
+//
+// Mirrors `GET /api/v1/health` on the existing JSON API surface —
+// anonymous liveness probe used by service meshes, container
+// orchestrators, and the upcoming CLI. The Connect endpoint lives
+// alongside the JSON one on the same listener; both protocols
+// stay supported until the CLI / UI move over fully (see
+// ARCHITECTURE.md for the migration plan).
+syntax = "proto3";
+
+package oxidhome.v1;
+
+// HealthService — anonymous liveness probe for the daemon. No
+// authentication required; the only signal it carries is "the
+// daemon is up and the API surface is wired."
+service HealthService {
+  // Check returns the daemon's identity + version. Always returns
+  // OK on a reachable daemon. The future plugin-health rollup (which
+  // would surface per-plugin trap state) lands on a separate RPC
+  // when there's a real consumer.
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+message CheckRequest {}
+
+message CheckResponse {
+  // Always "ok" for now. Reserves the field for a future
+  // degraded-mode signal without breaking the wire shape.
+  string status = 1;
+
+  // `cargo`-resolved version of `oxidhome-core` — same value the
+  // JSON `/api/v1/health` endpoint reports.
+  string version = 2;
+}
