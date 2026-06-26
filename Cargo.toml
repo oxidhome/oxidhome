@@ -85,7 +85,7 @@ connectrpc = { version = "=0.7.0", default-features = false, features = ["axum",
 # against. The Connect runtime (`connectrpc`) carries its own
 # transitive pin; this one keeps the generated message types in
 # sync with the version `protoc-gen-buffa` produced.
-buffa = { version = "=0.7.1", default-features = false, features = ["json"] }
+buffa = { version = "=0.8.0", default-features = false, features = ["json"] }
 # Pulled in transitively (axum / tokio-tungstenite); lifted to a
 # workspace dep so the WS round-trip test in 12-API-e can call
 # `.next()` / `.send()` / `.close()` on the `WebSocketStream` (those
