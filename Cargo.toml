@@ -80,7 +80,7 @@ tokio-tungstenite = { version = "0.29.0", default-features = false, features = [
 # in under `crates/oxidhome-proto/src/gen/`) reproducible. Bumps
 # must touch both the runtime pin here and the codegen pin in
 # `scripts/install-buf-tools.sh` together.
-connectrpc = { version = "=0.7.0", default-features = false, features = ["axum", "server"] }
+connectrpc = { version = "=0.8.0", default-features = false, features = ["axum", "server"] }
 # `buffa` is the message-codegen runtime the generated code links
 # against. The Connect runtime (`connectrpc`) carries its own
 # transitive pin; this one keeps the generated message types in
