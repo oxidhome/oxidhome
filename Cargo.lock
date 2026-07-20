@@ -173,6 +173,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffa"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b97ce1f34252b8e2516042e1002d56c160908a7ff8a1c9d47e97836558d1c83a"
+dependencies = [
+ "base64",
+ "bytes",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
+ "once_cell",
+ "rustversion",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -333,7 +350,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
- "buffa",
+ "buffa 0.7.1",
  "bytes",
  "futures",
  "http",
@@ -1337,7 +1354,7 @@ dependencies = [
 name = "oxidhome-proto"
 version = "0.1.0"
 dependencies = [
- "buffa",
+ "buffa 0.9.0",
  "connectrpc",
  "http-body",
  "serde",
