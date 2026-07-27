@@ -24,6 +24,26 @@ use oxidhome_core::api::build_router;
 use serde_json::Value;
 use tower::ServiceExt;
 
+/// Serializes every test that installs a thread-local tracing
+/// subscriber via `tracing::subscriber::with_default`.
+///
+/// **Why the whole file, not just the audit tests:** empirically
+/// (see PR #50 review), the connect-side audit test can flake with
+/// `sent=0` even though its own middleware emit ran on the same
+/// thread as the `with_default` install, when a *sibling* connect
+/// test runs concurrently and drives the same middleware path.
+/// Solo passes were 20/20; parallel with the other Connect tests
+/// on the review's box, ~1/3 saw the audit row lost. Serializing
+/// the two `with_default` + connect-middleware-emit tests
+/// eliminates the race window and is the same shape as the
+/// reviewer's `--test-threads=1` workaround, targeted at the
+/// specific set of tests that share the mechanism.
+///
+/// Poison recovery is intentional: a panic in one audit test
+/// shouldn't cascade-fail every sibling; the mutex has no invariant
+/// beyond exclusivity of the tracing install.
+static TRACING_SUBSCRIBER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 async fn body_to_json(body: Body) -> Value {
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
@@ -308,6 +328,9 @@ fn audit_log_records_one_event_per_authenticated_request() {
     let log_store = engine.log_store();
     let subscriber = Registry::default().with(log_store.layer());
 
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     with_default(subscriber, || {
         rt.block_on(async {
             let router = build_router(engine.clone());
@@ -533,14 +556,19 @@ fn logs_query_returns_emitted_events_through_layer() {
     let log_store = engine.log_store();
     let subscriber = Registry::default().with(log_store.layer());
 
-    with_default(subscriber, || {
-        // Emit a recognisable log row through the layer.
-        tracing::info!(
-            target: "test.api_logs_query",
-            kind = "manual-emit",
-            "hello from the test",
-        );
-    });
+    {
+        let _serial = TRACING_SUBSCRIBER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        with_default(subscriber, || {
+            // Emit a recognisable log row through the layer.
+            tracing::info!(
+                target: "test.api_logs_query",
+                kind = "manual-emit",
+                "hello from the test",
+            );
+        });
+    }
     log_store.wait_drained_for_test();
 
     let response = rt.block_on(async {
@@ -1509,4 +1537,301 @@ async fn connect_health_check_returns_ok_with_version() {
     // `version` mirrors `oxidhome-core`'s `Cargo.toml` package
     // version; locked exact so the two protocols can't drift.
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// A non-allow-listed Connect path without an Authorization header
+/// must trip the Connect-side auth interceptor and come back as a
+/// Connect-shaped 401 (HTTP 401 + JSON body
+/// `{"code":"unauthenticated", …}`), not the JSON middleware's
+/// plain-text 401 + `WWW-Authenticate: Bearer`. The Connect dispatcher
+/// is never reached, so the path doesn't have to be a real service —
+/// the auth gate runs first.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_unauth_path_without_token_returns_connect_unauthenticated() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.InstancesService/List")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(
+        body["code"], "unauthenticated",
+        "expected a Connect-shaped error JSON, got {body:?}",
+    );
+}
+
+/// A Connect path with an *invalid* bearer comes back the same way
+/// — `unauthenticated`. Distinguishing "no token" from "bad token"
+/// to the caller would let a probing client enumerate the difference,
+/// so the JSON middleware also collapses these two cases; the Connect
+/// middleware matches.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_unauth_path_with_bogus_token_returns_connect_unauthenticated() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+    let bogus = "oxh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.InstancesService/List")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {bogus}"))
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["code"], "unauthenticated");
+}
+
+/// The Connect middleware returns transport-appropriate errors.
+///
+/// A gRPC-Web client hitting the middleware with `Content-Type:
+/// application/grpc-web+proto` expects the gRPC-Web wire shape:
+/// **HTTP 200** with `grpc-status` + `grpc-message` in trailers
+/// (encoded in the body for gRPC-Web). A plain HTTP 401 + JSON
+/// error body — which is right for a Connect unary client — is
+/// wrong here: gRPC-Web tooling reads status-in-trailers and
+/// surfaces the 401 as a *transport* failure rather than an
+/// `Unauthenticated` RPC error.
+///
+/// Pins the fix from PR #50 review: the middleware now delegates
+/// error-response construction to
+/// [`ConnectError::into_http_response`], which detects the inbound
+/// transport via the `Content-Type` header and picks the right
+/// shape.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_auth_failure_uses_grpc_shape_for_grpc_web_transport() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.InstancesService/List")
+                .header(header::CONTENT_TYPE, "application/grpc-web+proto")
+                .body(Body::from(""))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // gRPC-Web returns HTTP 200 with the RPC error encoded in the
+    // body/trailers, not an HTTP 401.
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "gRPC-Web transport must not surface auth failures as an HTTP 401",
+    );
+    // The trailers are either HTTP trailers or encoded in the body
+    // per the gRPC-Web wire spec. Either way there must NOT be a
+    // JSON body starting with `{"code":`, which would be the
+    // Connect-unary shape leaking through.
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    assert!(
+        !bytes.starts_with(b"{\"code\""),
+        "gRPC-Web response body should not be a Connect-JSON error, got: {:?}",
+        String::from_utf8_lossy(&bytes),
+    );
+}
+
+/// Authenticated requests to a non-existent Connect method pass the
+/// auth gate and reach the Connect dispatcher, which 404s. Pins the
+/// contract: the middleware doesn't shadow real 404s on valid tokens,
+/// and audit emission happens even for not-found cases (otherwise an
+/// operator probing for endpoints with a valid token would leave no
+/// trail).
+// Sync `#[test]` (not `#[tokio::test]`) so the sync `MutexGuard`
+// serializing against parallel audit tests doesn't sit across an
+// `.await` in the outer async fn (clippy::await_holding_lock).
+// Builds its own current-thread runtime the same way the audit
+// tests do; the async work only happens inside `block_on`, where
+// the guard being held on the same thread is fine.
+#[test]
+fn connect_valid_token_reaches_dispatcher_and_404s_unknown_method() {
+    // Serialize against every audit test — this test authenticates
+    // successfully and thus fires the `emit_audit → SqliteLayer`
+    // path. Empirically that path racing a parallel
+    // `with_default`-installed audit test loses the row on the
+    // audit test's side (see TRACING_SUBSCRIBER_LOCK docstring).
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let issued = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = rt.block_on(async {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oxidhome.v1.NoSuchService/Method")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", issued.plaintext),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    // ConnectError::Unimplemented (the dispatcher's response for an
+    // unknown method) maps to HTTP 501 per the Connect spec; ditto
+    // 404 for unrouted. Either way it's not 401/403, which would
+    // mean we shadowed a real status with auth.
+    assert!(
+        !matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "auth shouldn't intercept a valid-token call to an unknown method, got {}",
+        response.status(),
+    );
+}
+
+/// An authenticated Connect call lands one `api.audit` tracing row
+/// with the same field shape the JSON middleware emits. Pins that
+/// the two surfaces converge on a single audit-row contract — a
+/// CLI query (`logs query --target api.audit --field token_id=…`)
+/// returns Connect + JSON rows uniformly.
+#[test]
+fn connect_authenticated_call_emits_audit_row_in_same_shape_as_json() {
+    use oxidhome_core::state::{LogQuery, LogValue};
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let log_store = engine.log_store();
+    let subscriber = Registry::default().with(log_store.layer());
+
+    // See `TRACING_SUBSCRIBER_LOCK` — audit tests share the mutex so
+    // parallel `with_default` installs on the harness's thread pool
+    // don't race the `emit_audit → SqliteLayer` path in the
+    // middleware and lose the row to a NoSubscriber dispatch. Panic
+    // recovery on the lock is intentional; a poisoned mutex means an
+    // earlier audit test panicked mid-request and we still want to
+    // run this one.
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            let _resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/oxidhome.v1.NoSuchService/Method")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+    });
+
+    log_store.wait_drained_for_test();
+    let rows = log_store
+        .query(
+            &LogQuery {
+                target_prefix: Some("api.audit".into()),
+                ..LogQuery::default()
+            },
+            32,
+        )
+        .expect("query api.audit");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected one audit row from the Connect call, got {rows:?}",
+    );
+    let fields = extract_audit_fields(&rows[0].fields);
+    // The handler 404'd / 501'd (unknown method) — the audit row
+    // records the actual status the dispatcher returned, with the
+    // matching `deny` decision (decision logic mirrors the JSON
+    // middleware: <400 → allow, 5xx → error, otherwise deny).
+    let status = u16::try_from(fields.status).unwrap_or_default();
+    let decision_ok = (status >= 400 && fields.decision == "deny")
+        || (status >= 500 && fields.decision == "error");
+    assert!(
+        decision_ok,
+        "unexpected status={status}, decision={}",
+        fields.decision,
+    );
+    // No scoped Connect endpoints in 15-b, so the audit row never
+    // carries a `required_scope` field yet — pin this so 15-c knows
+    // to extend it.
+    assert!(
+        fields.required_scope.is_empty(),
+        "no scoped Connect endpoints exist yet; required_scope should be empty",
+    );
+    // The audit target shape: `api.{METHOD}-{PATH}` — same as the
+    // JSON side. Confirms Connect rows land under the same prefix
+    // a CLI query would filter on.
+    let target_field: Vec<_> = rows[0]
+        .fields
+        .iter()
+        .filter(|(k, _)| k == "audit_target")
+        .collect();
+    assert_eq!(target_field.len(), 1, "audit_target field present");
+    let target_str = match &target_field[0].1 {
+        LogValue::String(s) | LogValue::Debug(s) => s.as_str(),
+        other => panic!("audit_target should be a string, got {other:?}"),
+    };
+    assert_eq!(target_str, "api.POST-/oxidhome.v1.NoSuchService/Method");
+}
+
+/// Connect's `Health.Check` is anonymous *with or without* an
+/// Authorization header — the allow-list is the source of truth, not
+/// the presence of a token. Pins that a probing client which happens
+/// to carry a token doesn't accidentally end up in the audit log.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_health_check_remains_anonymous_even_with_token() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.HealthService/Check")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
