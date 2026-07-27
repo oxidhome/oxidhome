@@ -35,8 +35,4 @@ unsafe_code = "deny"
 [dependencies]
 buffa.workspace = true
 connectrpc.workspace = true
-# Generated client trait bounds reference `::http_body::Body` —
-# included explicitly so a casual `cargo build -p oxidhome-proto`
-# doesn't need the transitive dep chain to surface it.
-http-body = "1"
 serde.workspace = true

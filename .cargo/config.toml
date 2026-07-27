@@ -12,4 +12,12 @@
 #   `bufbuild/buf-setup-action` (pre-built binary, no Go toolchain),
 #   and local devs typically already have it from a package manager
 #   or `go install`.
-install-tools = "install --locked cargo-deny cargo-llvm-cov cargo-machete cargo-nextest cargo-action-fmt wit-deps-cli wasm-tools protoc-gen-buffa protoc-gen-buffa-packaging connectrpc-codegen"
+#
+# The three codegen plugins are version-pinned; everything else
+# floats. `crates/oxidhome-proto/src/gen/` is committed and the
+# `Codegen` CI job fails when `buf generate` disagrees with it, so an
+# unpinned plugin turns every unrelated PR red the moment a new
+# plugin release lands on crates.io. Each pin must move together with
+# its runtime pin in the root `Cargo.toml` (`buffa` / `connectrpc`)
+# and a regenerated tree in the same commit.
+install-tools = "install --locked cargo-deny cargo-llvm-cov cargo-machete cargo-nextest cargo-action-fmt wit-deps-cli wasm-tools protoc-gen-buffa@0.8.1 protoc-gen-buffa-packaging@0.8.1 connectrpc-codegen@0.8.0"
