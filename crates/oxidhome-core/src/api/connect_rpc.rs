@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, header};
+use axum::http::HeaderMap;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::Response as AxumResponse;
 use connectrpc::{
@@ -160,7 +160,10 @@ async fn connect_auth_middleware(
         // probe shape, validity, or revocation" stance from
         // 12-API-a so a Connect client can't tell the four cases
         // apart either.
-        return connect_error_response(&ConnectError::unauthenticated("unauthenticated"));
+        return connect_error_response(
+            ConnectError::unauthenticated("unauthenticated"),
+            req.headers(),
+        );
     };
     let (token_id, actor_kind, method) = match state.tokens.verify(bearer) {
         Ok(rec) => {
@@ -175,11 +178,14 @@ async fn connect_auth_middleware(
             (token_id, actor_kind, method)
         }
         Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
-            return connect_error_response(&ConnectError::unauthenticated("unauthenticated"));
+            return connect_error_response(
+                ConnectError::unauthenticated("unauthenticated"),
+                req.headers(),
+            );
         }
         Err(TokenError::Sqlite(err)) => {
             tracing::error!(target: "api.auth", error = %err, "token verify failed");
-            return connect_error_response(&ConnectError::internal("internal error"));
+            return connect_error_response(ConnectError::internal("internal error"), req.headers());
         }
     };
 
@@ -199,21 +205,27 @@ async fn connect_auth_middleware(
     response
 }
 
-/// Build an HTTP response from a [`ConnectError`]. The Connect spec
-/// pairs each `ErrorCode` with a specific HTTP status (via
-/// [`ConnectError::http_status`]) and a JSON body
-/// (`{"code": "...", "message": "..."}` shape from
-/// [`ConnectError::to_json`]). Clients on the wire decode the body
-/// regardless of which transport (Connect / gRPC / gRPC-Web) is
-/// negotiated; this is the Connect-protocol form.
-fn connect_error_response(err: &ConnectError) -> AxumResponse {
-    let status = err.http_status();
-    let bytes = err.to_json();
-    let mut resp = AxumResponse::new(Body::from(bytes));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    resp
+/// Build an HTTP response from a [`ConnectError`], **matching the
+/// caller's transport.**
+///
+/// The Connect spec pairs each transport with a distinct error
+/// shape:
+/// - Connect unary (`application/proto`, `application/json`, or
+///   absent) → non-200 HTTP status + JSON body `{"code","message"}`.
+/// - Connect streaming (`application/connect+{proto,json}`) →
+///   HTTP 200 with the error inside an `EndStreamResponse` envelope.
+/// - gRPC / gRPC-Web (`application/grpc*`) → HTTP 200 with
+///   `grpc-status` + `grpc-message` trailers (HTTP/2 trailers for
+///   gRPC, encoded in the body for gRPC-Web).
+///
+/// `ConnectError::into_http_response(request_headers)` (available
+/// since connectrpc 0.7) inspects the inbound `Content-Type` via
+/// `Protocol::detect` and picks the right shape. Hand-rolling the
+/// JSON 401 shape (as this used to) worked for a curl-JSON client
+/// but caused a transport/protocol failure at gRPC / gRPC-Web
+/// clients that expect status-in-trailers — flagged in the
+/// PR #50 review.
+fn connect_error_response(err: ConnectError, req_headers: &HeaderMap) -> AxumResponse {
+    let (parts, body) = err.into_http_response(req_headers).into_parts();
+    AxumResponse::from_parts(parts, Body::new(body))
 }
