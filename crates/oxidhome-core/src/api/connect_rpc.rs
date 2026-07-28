@@ -11,9 +11,12 @@
 //! - Connect paths (`POST /oxidhome.v1.HealthService/Check` etc.) fall
 //!   through to the Connect router.
 //!
-//! **Auth + audit shape.** The Connect surface is wrapped by
-//! [`axum_service`]'s own `from_fn_with_state` middleware (see
-//! [`connect_auth_middleware`]) — added in 15-b — which
+//! **Auth + audit shape.** axum's `.layer(...)` on the outer
+//! `build_router` covers the explicit `/api/v1/*` routes but does
+//! **not** wrap what a caller passes to `.fallback_service(...)`.
+//! Connect therefore carries its own wrapper middleware — installed
+//! by [`axum_service`] on the sub-router the JSON side mounts as
+//! fallback (see [`connect_auth_middleware`], added in 15-b). It
 //! authenticates every non-anonymous request against the same
 //! [`TokenStore`](crate::state::TokenStore) the JSON `require_token`
 //! uses, stamps an [`Actor`] into `req.extensions_mut()` (forwarded
