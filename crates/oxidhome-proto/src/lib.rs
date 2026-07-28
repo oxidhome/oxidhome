@@ -36,3 +36,13 @@ pub mod proto;
 // Connect service stubs (traits, handlers, clients).
 #[path = "gen/connect/mod.rs"]
 pub mod connect;
+
+/// Re-export the buffa runtime types the generated code uses in
+/// its public field signatures so consumers of `oxidhome-proto`
+/// (the host handlers in `oxidhome-core`) don't need to depend on
+/// `buffa` directly to pattern-match on
+/// `oxidhome_proto::runtime::EnumValue<...>` etc.
+pub mod runtime {
+    pub use buffa::EnumValue;
+    pub use buffa::MessageField;
+}

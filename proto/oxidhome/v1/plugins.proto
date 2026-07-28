@@ -1,0 +1,45 @@
+// OxidHome v1 plugins service.
+//
+// Read side of the plugin catalogue: mirrors `GET /api/v1/plugins`
+// on the JSON API. Aggregates the installed-plugin registry (added
+// in 12-API-f) with the count of running instances per plugin id.
+// Gated on `plugins:list`. Write-side (install / start / stop /
+// uninstall) lands in the next slice.
+syntax = "proto3";
+
+package oxidhome.v1;
+
+// PluginsService — the installed-and/or-running plugin catalogue.
+service PluginsService {
+  // List every plugin the host knows about: entries in the
+  // installed-plugin registry PLUS any dev-time argv-started
+  // instances whose plugin id isn't in the registry
+  // (`installed = false` for those rows).
+  // Method name repeats the service noun so message names satisfy
+  // buf's standard-naming rule uniquely across services — see
+  // `InstancesService` for the same pattern.
+  rpc ListPlugins(ListPluginsRequest) returns (ListPluginsResponse);
+}
+
+message ListPluginsRequest {}
+
+message ListPluginsResponse {
+  repeated Plugin plugins = 1;
+}
+
+message Plugin {
+  // Manifest-resolved plugin id.
+  string plugin_id = 1;
+  // `true` if `<state_dir>/plugins/<plugin_id>/` is on disk — the
+  // "installed and startable" state. `false` means a running
+  // instance is registered but no matching install (the dev
+  // argv-start path).
+  bool installed = 2;
+  // Manifest-declared semver, present when `installed = true`. The
+  // JSON side sends `null` for the dev-argv rows; Connect uses
+  // `optional string`.
+  optional string version = 3;
+  // How many supervised instances of this plugin are currently
+  // registered. Zero for installed-but-stopped rows.
+  uint32 instance_count = 4;
+}

@@ -1835,3 +1835,367 @@ async fn connect_health_check_remains_anonymous_even_with_token() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+// ── Connect read cluster (15-c) ─────────────────────────────────
+
+/// Every scoped Connect RPC in this cluster reads the `Actor` back
+/// out of `ctx.extensions().get::<Actor>()`. That's the round-trip
+/// through the connectrpc dispatcher (opencode #2 on PR #50). If
+/// the middleware forgot to stamp or the dispatcher failed to
+/// forward extensions, `require_scope_connect` would return
+/// `ConnectError::internal("connect handler ran without an Actor
+/// extension")` — HTTP 500 — instead of a 200 with the empty
+/// listing. Any of the four happy-path tests below serves as that
+/// smoke check; picking Instances.List (empty response) is the
+/// simplest.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_instances_list_reaches_handler_via_actor_extension_round_trip() {
+    let engine = Engine::new().expect("engine");
+    let admin = engine
+        .auth_tokens()
+        .create("admin", b"[\"instances:list\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.InstancesService/ListInstances")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    // Fresh engine → no instances. Connect's canonical protobuf-JSON
+    // omits fields at their default value (empty repeated → no
+    // key), so we accept either the missing key or an explicit empty
+    // array; the semantic assertion is "no instances came back."
+    let instances = body
+        .get("instances")
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, Clone::clone);
+    assert!(instances.is_empty(), "got {body:?}");
+}
+
+/// Non-empty Instances.List: start a supervised plugin, then hit
+/// the Connect endpoint and assert the `Instance` payload includes
+/// both `instance_id` and `plugin_id` (12-API-d added the latter to
+/// `InstanceHandle`; Connect exposes it via the proto message the
+/// same way the JSON side does).
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_instances_list_returns_running_instance_payload() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+
+    let handle = engine
+        .start_instance(switch_dir, "switch-one", None)
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("running");
+
+    let router = build_router(engine.clone());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.InstancesService/ListInstances")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let instances = body["instances"].as_array().expect("instances array");
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0]["instanceId"], "switch-one");
+    assert_eq!(instances[0]["pluginId"], "example.simulated-switch");
+
+    handle.stop().await.expect("stop");
+}
+
+/// Scope-deny on Connect returns `ConnectError::permission_denied`
+/// which the Connect spec maps to HTTP 403 for the unary transport,
+/// with the standard Connect-JSON body `{"code":"permission_denied",…}`.
+/// One test per service; the paths differ but the shape doesn't.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_instances_list_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.InstancesService/ListInstances",
+        b"[\"devices:list\"]",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_devices_list_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.DevicesService/ListDevices",
+        b"[\"instances:list\"]",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_plugins_list_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.PluginsService/ListPlugins",
+        b"[\"instances:list\"]",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_logs_query_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.LogsService/QueryLogs",
+        b"[\"instances:list\"]",
+    )
+    .await;
+}
+
+/// Shared harness for the four scope-deny tests: mint a token with
+/// a scope that *isn't* the one the target RPC requires, POST an
+/// empty message body, assert 403 + Connect-JSON `permission_denied`.
+async fn assert_connect_scope_denied(uri: &str, scope_json: &[u8]) {
+    let engine = Engine::new().expect("engine");
+    let issued = engine.auth_tokens().create("scoped", scope_json).unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "scope-deny on {uri} should be 403 (Connect PermissionDenied)",
+    );
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(
+        body["code"], "permission_denied",
+        "expected Connect-shaped permission_denied on {uri}, got {body:?}",
+    );
+}
+
+/// `Logs.QueryLogs` with a `min_level` value that isn't a known
+/// enum variant must be rejected as `invalid_argument`, not
+/// silently interpreted as "no filter." The proto3 default
+/// (`LOG_LEVEL_UNSPECIFIED = 0`) means "no filter"; an unknown
+/// numeric value is a client bug and should surface as such.
+/// Pins the fix for PR #67 review finding #2.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_logs_query_rejects_unknown_min_level_as_invalid_argument() {
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // 999 is well past any known LogLevel variant. Connect's JSON
+    // wire format accepts an int here; buffa lands it as
+    // `EnumValue::Unknown(999)`.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.LogsService/QueryLogs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(r#"{"minLevel":999}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Connect's `InvalidArgument` maps to HTTP 400 on the unary
+    // transport.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["code"], "invalid_argument");
+    // Message includes the offending numeric value so a client can
+    // diagnose without guessing.
+    assert!(
+        body["message"].as_str().unwrap_or_default().contains("999"),
+        "expected offending value in error message, got {body:?}",
+    );
+}
+
+/// The Connect audit row on a scope denial now carries the missing
+/// scope name in `required_scope` — the JSON side has done this
+/// since 12-API-b via a `DeniedScope` response-extension smuggle,
+/// and the Connect side matches it via a request-extension slot
+/// the handler's `require_scope_connect` writes to. Uses the sync
+/// `#[test]` + `block_on` shape so the mutex guard doesn't sit
+/// across an `.await` (`clippy::await_holding_lock`, same pattern as
+/// the sibling audit tests).
+#[test]
+fn connect_scope_deny_audit_row_carries_required_scope() {
+    use oxidhome_core::state::LogQuery;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    // Token has `logs:read` but the RPC we hit requires
+    // `devices:list` — a clean scope-deny with a known missing
+    // scope name.
+    let issued = engine
+        .auth_tokens()
+        .create("scoped", b"[\"logs:read\"]")
+        .unwrap();
+    let log_store = engine.log_store();
+    let subscriber = Registry::default().with(log_store.layer());
+
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            let _resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/oxidhome.v1.DevicesService/ListDevices")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", issued.plaintext),
+                        )
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+    });
+    log_store.wait_drained_for_test();
+    let rows = log_store
+        .query(
+            &LogQuery {
+                target_prefix: Some("api.audit".into()),
+                ..LogQuery::default()
+            },
+            32,
+        )
+        .expect("query api.audit");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected one audit row from the scope-denied Connect call, got {rows:?}",
+    );
+    let fields = extract_audit_fields(&rows[0].fields);
+    assert_eq!(fields.status, 403);
+    assert_eq!(fields.decision, "deny");
+    assert_eq!(
+        fields.required_scope, "devices:list",
+        "audit row should name the missing scope, got fields {:?}",
+        rows[0].fields
+    );
+}
+
+/// Same scope-denied Connect call as
+/// `connect_scope_deny_audit_row_carries_required_scope`, but on
+/// the **gRPC-Web** transport. The Connect spec renders RPC errors
+/// for gRPC / gRPC-Web as HTTP 200 with the status in body/trailers;
+/// naively classifying the audit `decision` off `response.status()`
+/// would call this `allow` even though the handler denied the
+/// request — see PR #67 review finding #1. Pins the middleware's
+/// transport-independent classification: when the handler
+/// recorded a `DeniedScope`, the audit row is `deny` regardless of
+/// the wire shape.
+#[test]
+fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
+    use oxidhome_core::state::LogQuery;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("scoped", b"[\"logs:read\"]")
+        .unwrap();
+    let log_store = engine.log_store();
+    let subscriber = Registry::default().with(log_store.layer());
+
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            // A well-formed gRPC-Web frame is required for the
+            // dispatcher to reach the handler — otherwise the
+            // dispatcher rejects on framing before scope check
+            // runs and we never populate `DeniedScopeSlot`.
+            // ListDevicesRequest is an empty proto3 message
+            // (zero-byte payload); framing is 1 byte flags
+            // (0 = uncompressed data frame) + 4 bytes big-endian
+            // length (0) + 0 bytes payload = 5 bytes total.
+            let frame = &[0u8, 0, 0, 0, 0][..];
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/oxidhome.v1.DevicesService/ListDevices")
+                        .header(header::CONTENT_TYPE, "application/grpc-web+proto")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", issued.plaintext),
+                        )
+                        .body(Body::from(frame.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // gRPC-Web puts the RPC error in trailers on top of
+            // HTTP 200 — the audit classifier must not mistake
+            // that for a success.
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+    log_store.wait_drained_for_test();
+    let rows = log_store
+        .query(
+            &LogQuery {
+                target_prefix: Some("api.audit".into()),
+                ..LogQuery::default()
+            },
+            32,
+        )
+        .expect("query api.audit");
+    assert_eq!(rows.len(), 1);
+    let fields = extract_audit_fields(&rows[0].fields);
+    assert_eq!(
+        fields.decision, "deny",
+        "gRPC-Web scope denial must audit as deny, got fields {:?}",
+        rows[0].fields
+    );
+    assert_eq!(fields.required_scope, "devices:list");
+}

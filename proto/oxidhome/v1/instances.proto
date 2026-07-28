@@ -1,0 +1,44 @@
+// OxidHome v1 instances service.
+//
+// Read side of the plugin-instance surface: mirrors
+// `GET /api/v1/instances` on the JSON API. Gated on the
+// `instances:list` scope (enforced inside the handler via
+// `require_scope`, not the middleware).
+syntax = "proto3";
+
+package oxidhome.v1;
+
+// InstancesService — the running plugin-instance catalogue.
+service InstancesService {
+  // List every supervised instance the engine currently tracks.
+  // Response is unordered; the CLI / UI sort client-side.
+  //
+  // Method name repeats the service noun so the message names
+  // (`ListInstancesRequest` / `ListInstancesResponse`) satisfy
+  // buf's `RPC_REQUEST_STANDARD_NAME` rule *and* don't collide
+  // with the other three services' list methods in this same
+  // `oxidhome.v1` package.
+  rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
+}
+
+message ListInstancesRequest {}
+
+message ListInstancesResponse {
+  repeated Instance instances = 1;
+}
+
+// One row per running `InstanceHandle`. Field shape matches the
+// JSON `/api/v1/instances` response so a client migrating to
+// Connect doesn't need to relearn key names.
+message Instance {
+  // Host-minted instance id (e.g. `switch-one`) — the routing key
+  // for command dispatch.
+  string instance_id = 1;
+  // Manifest-resolved plugin id (e.g. `example.simulated-switch`).
+  // Cached on the handle since 12-API-d.
+  string plugin_id = 2;
+  // `Debug` repr of the supervisor's current lifecycle state.
+  // A structured projection lands when a UI / CLI consumer needs
+  // the distinct transition timestamps.
+  string state = 3;
+}
