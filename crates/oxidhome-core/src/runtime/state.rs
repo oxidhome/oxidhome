@@ -118,6 +118,18 @@ pub struct PluginState {
     /// the target's owner through `services.get_any(...)` and then
     /// looks up that owner's handle here to dispatch.
     pub instances: Arc<InstanceRegistry>,
+    /// Per-instance wake `Notify` — C2d wake-isolation. Signaled by
+    /// the [`EventBus`] every time a published event matches one
+    /// of this plugin's active subscription filters. The
+    /// supervisor's `select!` awaits `notify.notified()` so it
+    /// only wakes when a delivery would land, not on every bus
+    /// event system-wide (the pre-C2d amplification path).
+    ///
+    /// Held by two owners: this struct (used at
+    /// `subscribe_with_wake` call time), and the supervisor's
+    /// serve loop (retrieved through
+    /// [`crate::PluginInstance::wake`]).
+    pub wake: Arc<tokio::sync::Notify>,
 }
 
 impl PluginState {
@@ -156,6 +168,7 @@ impl PluginState {
             manifest,
             actor,
             config,
+            wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -552,6 +565,35 @@ impl host_events::Host for PluginState {
         ev.origin_plugin_id = self.manifest.plugin.id.clone();
         ev.origin_instance_id = self.instance_id.clone();
 
+        // C2d admission (PR #82 review, F2): consult the per-instance
+        // rate limiter *before* the durable-mirror spawn_blocking.
+        // The first cut of C2d put admission at the end of this
+        // function, so a flooder still consumed a blocking-pool
+        // thread + a SQLite write per over-quota publish; on refusal
+        // the caller saw `Unavailable` even though the row was
+        // already committed to `event_log`. Admission-first means a
+        // refused publish never spends disk or blocking-pool budget
+        // and never leaves a durable side effect for the caller to
+        // reconcile.
+        if let Err(crate::state::PublishDenied::RateLimited {
+            capacity,
+            refill_per_sec,
+            ..
+        }) = self.events.admit_publish(&self.instance_id)
+        {
+            tracing::warn!(
+                target: "host.events",
+                instance_id = %self.instance_id,
+                capacity,
+                refill_per_sec,
+                "publish rate-limited (pre-persistence)",
+            );
+            return Err(WitError::Unavailable(format!(
+                "publish-event: per-instance publish quota exhausted \
+                 (capacity {capacity} events, refill {refill_per_sec}/s)",
+            )));
+        }
+
         // Durable mirror first (Phase 5d): if the write fails — disk
         // full, sqlite corruption, etc. — we'd rather refuse the
         // publish than silently lose history. Live broadcast comes
@@ -585,6 +627,11 @@ impl host_events::Host for PluginState {
             }
         }
 
+        // Admission already consumed above (pre-persistence). The
+        // bus's `publish` sends the event onto the broadcast ring
+        // and signals matching wakes — see `EventBus::publish` for
+        // the send-before-signal ordering that keeps waking
+        // supervisors from racing an empty receiver.
         let _delivered = self.events.publish(ev);
         Ok(())
     }
@@ -611,7 +658,17 @@ impl host_events::Host for PluginState {
                     .into(),
             ));
         }
-        let subscription = self.events.subscribe(filter);
+        // C2d: register this subscription's filter on the bus with
+        // our per-instance wake `Notify`. Publishes whose payload
+        // matches the filter signal the notify — the supervisor's
+        // serve loop awaits on it and calls `drain_events()` next.
+        // Dropping the returned `EventSubscription` drops its
+        // `WakeToken`, which deregisters the wake — so unsubscribe
+        // is automatic on drop and `unsubscribe()` (below) just
+        // removes the local entry.
+        let subscription = self
+            .events
+            .subscribe_with_wake(filter, Arc::clone(&self.wake));
         let id = subscription.id;
         self.subscriptions.push(subscription);
         Ok(id)
@@ -1499,6 +1556,143 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WitError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_event_returns_unavailable_over_rate_limit() {
+        // C2d: `PluginState::publish_event` routes through the
+        // bus's per-instance token bucket, which refuses over-
+        // quota bursts. The response maps to `WitError::Unavailable`
+        // with a message naming the capacity + refill rate so the
+        // plugin's `?` propagates a signal the operator can act
+        // on. Post-PR-#82 review: admission happens *before* the
+        // durable event-log write, so a refused publish leaves no
+        // side effect for the caller to reconcile.
+        let mut state = fresh_state("alpha");
+        let id = host_devices::Host::register_device(&mut state, switch_device("d-1"))
+            .await
+            .expect("register");
+        // Drain the burst — no wall-clock time elapses so refill
+        // stays at 0 across the loop and the (N+1)th call trips
+        // the limit.
+        let mut denied: Option<WitError> = None;
+        for _ in 0..256 {
+            match host_events::Host::publish_event(&mut state, state_change_event(&id)).await {
+                Ok(()) => {}
+                Err(err @ WitError::Unavailable(_)) => {
+                    denied = Some(err);
+                    break;
+                }
+                Err(other) => panic!("unexpected publish error: {other:?}"),
+            }
+        }
+        let err = denied.expect("burst should exceed the default rate ceiling");
+        let WitError::Unavailable(msg) = err else {
+            unreachable!()
+        };
+        assert!(
+            msg.contains("publish quota"),
+            "message should name the quota, got {msg}",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_registers_wake_on_bus() {
+        // C2d wake-isolation: an authorized subscribe registers
+        // a wake handle on the bus that fires the plugin's
+        // supervisor `Notify` on matching publishes. Verify from
+        // the state side that both the wake registration and the
+        // notify fire.
+        let mut state = fresh_state("alpha");
+        let id = host_devices::Host::register_device(&mut state, switch_device("d-1"))
+            .await
+            .expect("register");
+        let wake = Arc::clone(&state.wake);
+
+        host_events::Host::subscribe(
+            &mut state,
+            EventFilter {
+                device: Some(id.clone()),
+                topic: None,
+            },
+        )
+        .await
+        .expect("subscribe");
+
+        // Publishing for the matching device fires the wake.
+        host_events::Host::publish_event(&mut state, state_change_event(&id))
+            .await
+            .expect("publish");
+        // Notify has a permit stored from the notify_one above;
+        // notified() resolves immediately.
+        let permit = wake.notified();
+        tokio::pin!(permit);
+        assert!(
+            std::future::Future::poll(
+                permit.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            )
+            .is_ready(),
+            "wake must fire on matching publish",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn denied_subscribe_leaves_no_wake_registered() {
+        // C2c + C2d interaction: a plugin without
+        // `subscribes_events` is refused at subscribe time, so no
+        // wake registration lands on the bus. Under a flood from
+        // another plugin, this instance's supervisor wake never
+        // fires — the F2 amplification path is closed.
+        use oxidhome_manifest::CapabilitiesSection;
+        let mut manifest = (*fixture_manifest("no.subscribe")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            subscribes_events: false,
+            ..manifest.capabilities
+        };
+        let events = Arc::new(EventBus::new());
+        let mut state = PluginState::new(
+            "beta",
+            Arc::new(manifest),
+            Actor::plugin("beta"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::clone(&events),
+            fresh_kv("beta", 0),
+            fresh_event_log(),
+            fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
+        );
+        let wake = Arc::clone(&state.wake);
+
+        // subscribe → denied, no wake registered.
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let err = host_events::Host::subscribe(&mut state, filter)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+
+        // Now a flood from an external publisher (bus.publish
+        // bypasses the plugin-facing rate limit). The wake must
+        // not fire — this beta instance opted out of the bus.
+        for _ in 0..10 {
+            events.publish(custom_event("firehose"));
+        }
+
+        let permit = wake.notified();
+        tokio::pin!(permit);
+        assert!(
+            std::future::Future::poll(
+                permit.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            )
+            .is_pending(),
+            "wake must NOT fire when no subscription was ever registered",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
