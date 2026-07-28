@@ -90,24 +90,50 @@ pub struct AuditEntry {
     /// Request path — either the JSON REST path (`/api/v1/instances`)
     /// or the Connect RPC path (`/oxidhome.v1.Devices/ListDevices`).
     pub path: String,
-    /// Final HTTP status the middleware saw. `0` on a pending row;
-    /// set by [`AuditLog::finalize`] on completion. On gRPC /
+    /// Final wire HTTP status the middleware saw. `0` on a pending
+    /// row; set by [`AuditLog::finalize`] on completion. On gRPC /
     /// gRPC-Web transports the middleware may synthesize this from
     /// the handler's `HandlerOutcomeSlot` rather than the wire
-    /// status.
+    /// status. **This is the transport-level status only** — a
+    /// domain-level execution failure that rides HTTP 200 leaves
+    /// this at 200 and populates [`Self::execution_outcome`] +
+    /// [`Self::domain_error`] instead.
     pub status: u16,
-    /// Coarse outcome tag:
+    /// **Authorization** outcome — kept independent from execution
+    /// outcome (architecture-review F4 follow-up):
     /// - `"pending"` — intent recorded, handler still running (or
     ///   already abandoned).
-    /// - `"allow"` — handler returned 2xx.
-    /// - `"deny"` — handler returned 4xx (scope failure, bad input,
-    ///   not-found, …).
-    /// - `"error"` — handler returned 5xx.
+    /// - `"allow"` — the request passed authorization and the wire
+    ///   response was 2xx.
+    /// - `"deny"` — the request was rejected at the auth / scope /
+    ///   dispatch layer (scope failure, unknown device, bad input,
+    ///   …). 4xx wire response.
+    /// - `"error"` — server-side failure returning 5xx.
+    ///
+    /// A plugin returning `CommandResult::Err` on an *authorized*
+    /// request records `decision = "allow"` here — the auth check
+    /// succeeded — and populates [`Self::execution_outcome`] with
+    /// `"failed"` to surface the domain-level failure.
     pub decision: String,
     /// The scope the handler required, populated only on scope-deny
     /// 403s finalized from a `DeniedScope` extension. `None` for
     /// every allow and for non-scope denies.
     pub required_scope: Option<String>,
+    /// **Execution** outcome — independent of [`Self::decision`]
+    /// (architecture-review F4 follow-up).
+    /// - `None` — the request never reached execution (auth deny,
+    ///   dispatch `NotFound`, transport error, still pending).
+    /// - `Some("success")` — the plugin returned `Ok` /
+    ///   `OkWithState`.
+    /// - `Some("failed")` — the plugin returned
+    ///   `CommandResult::Err`; the specific error kind lives in
+    ///   [`Self::domain_error`].
+    pub execution_outcome: Option<String>,
+    /// WIT error kind when [`Self::execution_outcome`] is
+    /// `Some("failed")`. `"not_found"` / `"invalid_argument"` /
+    /// `"permission_denied"` / `"unavailable"` / `"internal"`.
+    /// `None` otherwise.
+    pub domain_error: Option<String>,
     /// Short SHA-256 prefix of the presented bearer, populated on
     /// anonymous-probe rows so a forensic sweep can correlate
     /// repeat probes across requests. `None` when a token was
@@ -194,8 +220,8 @@ impl AuditLog {
             .write(|conn| -> Result<i64, AuditLogError> {
                 conn.execute(
                     "INSERT INTO audit_event \
-                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp) \
-                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6)",
+                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error) \
+                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6, NULL, NULL)",
                     params![
                         intent_ms,
                         &entry.token_id,
@@ -232,6 +258,8 @@ impl AuditLog {
         status: u16,
         decision: &str,
         required_scope: Option<&str>,
+        execution_outcome: Option<&str>,
+        domain_error: Option<&str>,
     ) -> Result<(), AuditLogError> {
         let finalized_ms = now_unix_ms();
         let rows = self.db.write(|conn| -> Result<usize, AuditLogError> {
@@ -239,13 +267,16 @@ impl AuditLog {
             let id_i = id as i64;
             Ok(conn.execute(
                 "UPDATE audit_event \
-                 SET finalized_ms = ?1, status = ?2, decision = ?3, required_scope = ?4 \
-                 WHERE id = ?5",
+                 SET finalized_ms = ?1, status = ?2, decision = ?3, required_scope = ?4, \
+                     execution_outcome = ?5, domain_error = ?6 \
+                 WHERE id = ?7",
                 params![
                     finalized_ms,
                     i64::from(status),
                     decision,
                     required_scope,
+                    execution_outcome,
+                    domain_error,
                     id_i,
                 ],
             )?)
@@ -275,8 +306,8 @@ impl AuditLog {
             .write(|conn| -> Result<i64, AuditLogError> {
                 conn.execute(
                     "INSERT INTO audit_event \
-                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp) \
-                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error) \
+                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         now,
                         &entry.token_id,
@@ -287,6 +318,8 @@ impl AuditLog {
                         &entry.decision,
                         &entry.required_scope,
                         &entry.credential_fp,
+                        &entry.execution_outcome,
+                        &entry.domain_error,
                     ],
                 )?;
                 Ok(conn.last_insert_rowid())
@@ -310,7 +343,7 @@ impl AuditLog {
         use std::fmt::Write as _;
 
         let mut sql = String::from(
-            "SELECT intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp \
+            "SELECT intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error \
              FROM audit_event WHERE 1=1",
         );
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -359,6 +392,8 @@ impl AuditLog {
                     decision: row.get(7)?,
                     required_scope: row.get(8)?,
                     credential_fp: row.get(9)?,
+                    execution_outcome: row.get(10)?,
+                    domain_error: row.get(11)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -426,6 +461,8 @@ mod tests {
             status: 0,
             decision: "pending".into(),
             required_scope: None,
+            execution_outcome: None,
+            domain_error: None,
             credential_fp: None,
         }
     }
@@ -451,7 +488,8 @@ mod tests {
         let id = log
             .record_intent(&sample_intent("tok", "/api/v1/x"))
             .unwrap();
-        log.finalize(id, 200, "allow", None).expect("finalize");
+        log.finalize(id, 200, "allow", None, None, None)
+            .expect("finalize");
         let rows = log.query(&AuditQuery::default(), 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].decision, "allow");
@@ -466,7 +504,7 @@ mod tests {
         let id = log
             .record_intent(&sample_intent("tok", "/api/v1/instances"))
             .unwrap();
-        log.finalize(id, 403, "deny", Some("instances:list"))
+        log.finalize(id, 403, "deny", Some("instances:list"), None, None)
             .expect("finalize");
         let rows = log.query(&AuditQuery::default(), 1).unwrap();
         assert_eq!(rows[0].required_scope.as_deref(), Some("instances:list"));
@@ -475,8 +513,37 @@ mod tests {
     #[test]
     fn finalize_unknown_id_returns_not_found() {
         let log = store();
-        let err = log.finalize(999, 200, "allow", None).unwrap_err();
+        let err = log
+            .finalize(999, 200, "allow", None, None, None)
+            .unwrap_err();
         assert!(matches!(err, AuditLogError::NotFound(999)));
+    }
+
+    #[test]
+    fn finalize_records_execution_outcome_independently() {
+        // F4 architecture-review pushback — the ledger keeps
+        // authorization and execution outcomes as distinct fields.
+        // A plugin returning `CommandResult::Err` on an *authorized*
+        // request records `decision = "allow"` (auth passed) with
+        // `execution_outcome = "failed"` + a domain error kind.
+        let log = store();
+        let id = log
+            .record_intent(&sample_intent("tok", "/api/v1/devices/d-1/command"))
+            .unwrap();
+        log.finalize(
+            id,
+            200,
+            "allow",
+            None,
+            Some("failed"),
+            Some("invalid_argument"),
+        )
+        .expect("finalize");
+        let rows = log.query(&AuditQuery::default(), 1).unwrap();
+        assert_eq!(rows[0].decision, "allow", "auth outcome, not overridden");
+        assert_eq!(rows[0].status, 200, "wire status, not synthesized");
+        assert_eq!(rows[0].execution_outcome.as_deref(), Some("failed"));
+        assert_eq!(rows[0].domain_error.as_deref(), Some("invalid_argument"));
     }
 
     #[test]
@@ -491,7 +558,7 @@ mod tests {
         let _b = log
             .record_intent(&sample_intent("tok-b", "/api/v1/b"))
             .unwrap();
-        log.finalize(a, 200, "allow", None).unwrap();
+        log.finalize(a, 200, "allow", None, None, None).unwrap();
 
         let pending = log
             .query(
@@ -520,6 +587,8 @@ mod tests {
             status: 401,
             decision: "deny".into(),
             required_scope: None,
+            execution_outcome: None,
+            domain_error: None,
             credential_fp: Some("deadbeef".into()),
         };
         log.record_completed(&entry).unwrap();
@@ -545,6 +614,8 @@ mod tests {
                 status: 200,
                 decision: "allow".into(),
                 required_scope: None,
+                execution_outcome: None,
+                domain_error: None,
                 credential_fp: None,
             }
         }

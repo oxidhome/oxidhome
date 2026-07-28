@@ -2741,6 +2741,174 @@ async fn connect_devices_execute_command_end_to_end_through_simulated_switch() {
     handle.stop().await.expect("stop");
 }
 
+/// F4 regression — JSON path. `POST /api/v1/devices/{id}/command`
+/// sending an unknown action to a real registered device gets a
+/// `CommandResult::Err(InvalidArgument)` back from the plugin
+/// (simulated-switch's `execute_command` refuses any action that
+/// isn't a `switch` toggle/on/off — see
+/// `examples/simulated-switch/src/lib.rs:82`). The wire response
+/// is HTTP 200 with the error inside the body, and — this is the
+/// F4 invariant, revised on the PR-#79 review — the audit ledger
+/// records the transport and authorization outcomes *independently*
+/// from the execution outcome:
+///
+/// - `status = 200` (wire status)
+/// - `decision = "allow"` (authorization passed — the plugin ran)
+/// - `execution_outcome = "failed"` (plugin's domain result)
+/// - `domain_error = "invalid_argument"` (WIT error kind)
+///
+/// An earlier cut of F4 collapsed the execution failure into
+/// `decision = "deny"` + `status = 400`, which polluted forensic
+/// authorization queries with plugin validation errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_command_domain_error_audits_execution_failure() {
+    use oxidhome_core::state::AuditQuery;
+
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let audit_log = engine.audit_log();
+    let handle = engine
+        .start_instance(switch_dir, "switch-one", None)
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("running");
+
+    let device_id = engine
+        .devices()
+        .list()
+        .first()
+        .expect("switch registered a device")
+        .id
+        .clone();
+
+    let router = build_router(engine.clone());
+    // The plugin's execute_command returns InvalidArgument for any
+    // action other than the switch verbs — dispatch an unknown one.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{device_id}/command"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(
+                    r#"{"capability":"switch","action":"self-destruct","args":[]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Wire response is HTTP 200 with the error inside the body —
+    // that's the whole shape F4 is about. Confirm before checking
+    // the audit ledger.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["kind"], "err");
+
+    // The audit row keeps authorization and execution outcomes
+    // as distinct fields.
+    let rows = audit_log.query(&AuditQuery::default(), 8).expect("audit");
+    let hit = rows
+        .iter()
+        .find(|r| r.path == format!("/api/v1/devices/{device_id}/command"))
+        .expect("command audit row present");
+    assert_eq!(hit.status, 200, "wire status preserved, got {hit:?}");
+    assert_eq!(hit.decision, "allow", "auth outcome, got {hit:?}");
+    assert_eq!(
+        hit.execution_outcome.as_deref(),
+        Some("failed"),
+        "execution outcome, got {hit:?}",
+    );
+    assert_eq!(
+        hit.domain_error.as_deref(),
+        Some("invalid_argument"),
+        "domain error kind, got {hit:?}",
+    );
+
+    handle.stop().await.expect("stop");
+}
+
+/// F4 regression — Connect path. Same shape as the JSON test
+/// above, dispatched via `Devices.ExecuteCommand`. Connect's Ok /
+/// gRPC / gRPC-Web all ride HTTP 200 for a successful RPC even
+/// when the response payload is `Outcome::Err`; the middleware
+/// records the execution failure on the ledger's independent
+/// `execution_outcome` / `domain_error` columns while leaving
+/// `status = 200` and `decision = "allow"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_execute_command_domain_error_audits_execution_failure() {
+    use oxidhome_core::state::AuditQuery;
+
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let audit_log = engine.audit_log();
+    let handle = engine
+        .start_instance(switch_dir, "switch-one", None)
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("running");
+
+    let device_id = engine
+        .devices()
+        .list()
+        .first()
+        .expect("switch registered a device")
+        .id
+        .clone();
+
+    let router = build_router(engine.clone());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.DevicesService/ExecuteCommand")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(format!(
+                    r#"{{"deviceId":"{device_id}","capability":"switch","action":"self-destruct"}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Wire response is HTTP 200 with `err` inside the Outcome oneof.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert!(
+        body.get("err").is_some(),
+        "expected err outcome, got {body:?}",
+    );
+
+    // Audit row records execution + authorization separately.
+    let rows = audit_log.query(&AuditQuery::default(), 8).expect("audit");
+    let hit = rows
+        .iter()
+        .find(|r| r.path == "/oxidhome.v1.DevicesService/ExecuteCommand")
+        .expect("execute-command audit row present");
+    assert_eq!(hit.status, 200, "wire status preserved, got {hit:?}");
+    assert_eq!(hit.decision, "allow", "auth outcome, got {hit:?}");
+    assert_eq!(
+        hit.execution_outcome.as_deref(),
+        Some("failed"),
+        "got {hit:?}",
+    );
+    assert_eq!(
+        hit.domain_error.as_deref(),
+        Some("invalid_argument"),
+        "got {hit:?}",
+    );
+
+    handle.stop().await.expect("stop");
+}
+
 /// Full install → start → stop → uninstall round-trip through
 /// Connect. Mirrors the JSON-side end-to-end
 /// (`install_start_stop_uninstall_end_to_end` in 12-API-f) so both

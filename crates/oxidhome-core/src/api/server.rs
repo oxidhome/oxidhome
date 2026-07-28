@@ -369,7 +369,7 @@ async fn send_command(
     State(state): State<ApiState>,
     Path(device_id): Path<String>,
     Json(body): Json<CommandBody>,
-) -> Result<Json<WireCommandResult>, CommandError> {
+) -> Result<axum::response::Response, CommandError> {
     require_scope(&actor, DEVICES_COMMAND).map_err(CommandError::Scope)?;
 
     // Resolve device → owning instance via the registry's
@@ -407,7 +407,27 @@ async fn send_command(
         .execute_command(device_id, cmd)
         .await
         .map_err(CommandError::Dispatch)?;
-    Ok(Json(command_result_to_wire(result)))
+
+    // F4: the wire response stays HTTP 200 (the RPC itself
+    // succeeded and the authorization check passed), but a
+    // `CommandResult::Err` is a domain-level failure. Smuggle the
+    // WIT error kind onto the response extensions so the auth
+    // middleware populates the ledger's `execution_outcome` +
+    // `domain_error` columns *without* touching the transport
+    // status or the authorization `decision`. See
+    // `super::auth::DomainOutcome` for why authorization and
+    // execution outcomes are kept independent.
+    let domain_outcome = match &result {
+        CommandResult::Ok | CommandResult::OkWithState(_) => None,
+        CommandResult::Err(err) => Some(crate::api::auth::DomainOutcome {
+            domain_error: crate::api::auth::wit_error_kind(err),
+        }),
+    };
+    let mut response = Json(command_result_to_wire(result)).into_response();
+    if let Some(outcome) = domain_outcome {
+        response.extensions_mut().insert(outcome);
+    }
+    Ok(response)
 }
 
 enum CommandError {

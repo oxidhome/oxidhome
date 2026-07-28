@@ -60,9 +60,55 @@ use axum::{
 };
 
 use crate::auth::Actor;
+use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
 use crate::state::{
     AuditEntry, AuditLog, TokenError, TokenRecord, TokenStore, credential_fingerprint,
 };
+
+/// Smuggled on a response's extension map by JSON handlers when the
+/// wire response is HTTP 200 but the *plugin's domain outcome* is a
+/// failure — the canonical case being `POST
+/// /api/v1/devices/{id}/command` returning `WireCommandResult::Err`.
+/// The auth middleware reads this back post-handler and populates
+/// the audit row's `execution_outcome` and `domain_error` fields
+/// (see [`crate::state::AuditEntry`]), leaving `status` at the wire
+/// 200 and `decision` at the authorization outcome (`"allow"` — the
+/// request was authorized before it reached the plugin).
+///
+/// **Independence** — architecture-review F4 pushback. An earlier
+/// cut of this signal fed a synthesized status into the classifier,
+/// which collapsed execution failure into `decision = "deny"` and
+/// broke forensic queries: plugin validation errors mixed with real
+/// authorization denials in `WHERE decision = 'deny'` results. The
+/// current shape keeps authorization and execution outcomes as
+/// distinct audit fields so operators can filter each independently.
+///
+/// The Connect side smuggles the same information via
+/// [`super::connect_rpc::HandlerOutcomeSlot`] — a request-side
+/// slot that already existed for gRPC / gRPC-Web scope-denial
+/// classification.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DomainOutcome {
+    /// The plugin's WIT error kind (`"not_found"`,
+    /// `"invalid_argument"`, `"permission_denied"`, `"unavailable"`,
+    /// `"internal"`), stamped when the handler returns
+    /// `CommandResult::Err(<variant>)`.
+    pub(crate) domain_error: &'static str,
+}
+
+/// WIT `error` variant → the stable `snake_case` tag written to the
+/// audit ledger's `domain_error` column. The set of legal values
+/// matches the WIT `error` variant one-for-one.
+#[must_use]
+pub(crate) fn wit_error_kind(err: &WitError) -> &'static str {
+    match err {
+        WitError::NotFound(_) => "not_found",
+        WitError::InvalidArgument(_) => "invalid_argument",
+        WitError::PermissionDenied(_) => "permission_denied",
+        WitError::Unavailable(_) => "unavailable",
+        WitError::Internal(_) => "internal",
+    }
+}
 
 /// Routes that don't require a bearer token. The canonical liveness
 /// probe lives on the Connect surface
@@ -168,6 +214,8 @@ pub(crate) async fn require_token(
         status: 0,
         decision: "pending".into(),
         required_scope: None,
+        execution_outcome: None,
+        domain_error: None,
         credential_fp: None,
     };
     let audit_id = match record_intent_blocking(&state.audit_log, intent).await {
@@ -196,6 +244,15 @@ pub(crate) async fn require_token(
         .extensions()
         .get::<crate::api::scopes::DeniedScope>()
         .map(|d| d.0);
+    // F4: handlers whose wire response is HTTP 200 but whose
+    // *plugin domain outcome* is a failure stamp a `DomainOutcome`
+    // response extension. The middleware records that in the
+    // audit ledger's separate `execution_outcome` + `domain_error`
+    // fields, leaving `status` at the wire status and `decision`
+    // at the authorization outcome. See `DomainOutcome`'s
+    // docstring for why authorization and execution outcomes are
+    // kept independent.
+    let domain_outcome = response.extensions().get::<DomainOutcome>().copied();
     let status = response.status();
     finalize_audit(
         &state.audit_log,
@@ -206,6 +263,7 @@ pub(crate) async fn require_token(
         &http_path,
         status,
         denied_scope,
+        domain_outcome,
     )
     .await;
     response
@@ -232,6 +290,8 @@ pub(super) async fn record_anonymous_probe(
         status,
         decision: "deny".into(),
         required_scope: None,
+        execution_outcome: None,
+        domain_error: None,
         credential_fp,
     };
     let al = Arc::clone(audit_log);
@@ -309,7 +369,13 @@ pub(super) async fn finalize_audit(
     path: &str,
     status: StatusCode,
     required_scope: Option<&'static str>,
+    domain_outcome: Option<DomainOutcome>,
 ) {
+    // Authorization outcome — depends *only* on the transport
+    // status. A plugin returning `CommandResult::Err` on an
+    // authorized request still records `decision = "allow"` here
+    // (the auth check succeeded); the execution failure lives in
+    // the separate `execution_outcome` / `domain_error` columns.
     let decision = if status.is_success() {
         "allow"
     } else if status.is_server_error() {
@@ -317,18 +383,38 @@ pub(super) async fn finalize_audit(
     } else {
         "deny"
     };
+    // Execution outcome — orthogonal to authorization. Populated
+    // when the request reached the plugin and the plugin reported
+    // a domain-level result; `None` when the request was rejected
+    // at auth / dispatch (or when the handler doesn't expose a
+    // domain outcome at all, which is every current endpoint
+    // except device-command dispatch).
+    let (execution_outcome, domain_error) = match (status.is_success(), domain_outcome) {
+        (true, Some(o)) => (Some("failed"), Some(o.domain_error)),
+        // Success without a `DomainOutcome` extension = the handler
+        // has no domain-outcome contract or the plugin returned Ok.
+        // Recording "success" here overreaches for handlers that
+        // aren't in the domain-outcome contract at all (list /
+        // query endpoints), so treat every other case as "not
+        // applicable" and leave the columns NULL.
+        _ => (None, None),
+    };
 
     let al = Arc::clone(audit_log);
     let required = required_scope.map(str::to_owned);
     let status_u16 = status.as_u16();
     let decision_owned = decision.to_owned();
     let required_for_task = required.clone();
+    let execution_for_task = execution_outcome.map(str::to_owned);
+    let domain_error_for_task = domain_error.map(str::to_owned);
     let join = tokio::task::spawn_blocking(move || {
         al.finalize(
             audit_id,
             status_u16,
             &decision_owned,
             required_for_task.as_deref(),
+            execution_for_task.as_deref(),
+            domain_error_for_task.as_deref(),
         )
     })
     .await;
@@ -353,9 +439,13 @@ pub(super) async fn finalize_audit(
 
     // Tracing mirror — same shape the pre-C3 code emitted, so a
     // subscriber that installs the LogStore layer sees every request
-    // live in `logs query --target api.audit`. Best-effort by design.
+    // live in `logs query --target api.audit`. Best-effort by
+    // design. Includes the F4 execution-outcome fields so a stderr
+    // tail carries the same distinction the ledger does.
     let audit_target = format!("api.{method}-{path}");
     let required_field = required.as_deref().unwrap_or("");
+    let execution_field = execution_outcome.unwrap_or("");
+    let domain_error_field = domain_error.unwrap_or("");
     tracing::info!(
         target: "api.audit",
         audit_target = %audit_target,
@@ -366,6 +456,8 @@ pub(super) async fn finalize_audit(
         status = status_u16,
         decision = %decision,
         required_scope = %required_field,
+        execution_outcome = %execution_field,
+        domain_error = %domain_error_field,
         "api request",
     );
 }

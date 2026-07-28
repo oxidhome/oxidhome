@@ -124,12 +124,24 @@ struct HandlerOutcome {
     /// `response.status()`, because gRPC and gRPC-Web RPC errors ride at
     /// HTTP 200 with the status in trailers/body — see finding #1 on
     /// the PR #67 review.
-    status: axum::http::StatusCode,
+    ///
+    /// `None` when this outcome was recorded by
+    /// [`record_domain_outcome`] — the RPC itself succeeded (HTTP
+    /// 200 / gRPC OK) but the plugin returned `CommandResult::Err`.
+    /// See the module doc + [`super::auth::DomainOutcome`] for why
+    /// authorization and execution outcomes must not share the
+    /// same audit field.
+    status: Option<axum::http::StatusCode>,
     /// The missing scope, if this outcome was a
     /// `PermissionDenied` recorded by [`require_scope_connect`].
     /// Middleware populates the `required_scope` audit field from
     /// this — mirrors the JSON side's `DeniedScope` smuggle.
     denied_scope: Option<Scope>,
+    /// The plugin's WIT error kind for a `CommandResult::Err` on
+    /// an authorized RPC. Populated by [`record_domain_outcome`];
+    /// the middleware forwards it to the audit ledger's
+    /// `domain_error` column (F4).
+    domain_error: Option<&'static str>,
 }
 
 /// Request-scoped smuggling channel from Connect handlers to the
@@ -184,8 +196,9 @@ impl HandlerOutcomeSlot {
 fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
     if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
         slot.set(HandlerOutcome {
-            status: err.http_status(),
+            status: Some(err.http_status()),
             denied_scope: None,
+            domain_error: None,
         });
     }
     err
@@ -218,8 +231,9 @@ fn require_scope_connect(ctx: &RequestContext, required: Scope) -> Result<(), Co
     if let Err(ScopeDenied { required }) = require_scope(actor, required) {
         if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
             slot.set(HandlerOutcome {
-                status: axum::http::StatusCode::FORBIDDEN,
+                status: Some(axum::http::StatusCode::FORBIDDEN),
                 denied_scope: Some(Scope::new(required)),
+                domain_error: None,
             });
         }
         return Err(ConnectError::permission_denied(format!(
@@ -331,7 +345,34 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
                 tracing::error!(target: "api.devices", error = %err, "device command dispatch failed");
                 rpc_err(&ctx, ConnectError::internal("device command dispatch failed"))
             })?;
+        // F4: the RPC succeeded (wire response is HTTP 200 / gRPC
+        // OK / Connect Ok) but a `CommandResult::Err` payload is a
+        // domain failure. Record it on the outcome slot so the
+        // middleware audits with a synthesized status instead of a
+        // spurious `allow`. Mirrors the JSON side's `DomainOutcome`
+        // response-extension smuggle.
+        if let CommandResult::Err(ref err) = result {
+            record_domain_outcome(&ctx, err);
+        }
         Response::ok(command_result_to_proto(result))
+    }
+}
+
+/// F4 helper — stamps the [`HandlerOutcomeSlot`] with the *domain*
+/// error kind for a WIT failure carried inside an otherwise-
+/// successful RPC response. The middleware reads
+/// `domain_error` off the slot and writes it into the audit ledger's
+/// `execution_outcome` / `domain_error` columns — *without* touching
+/// the transport status or the authorization decision. See
+/// [`super::auth::DomainOutcome`] for why authorization and
+/// execution outcomes are kept as distinct audit fields.
+fn record_domain_outcome(ctx: &RequestContext, err: &WitError) {
+    if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
+        slot.set(HandlerOutcome {
+            status: None,
+            denied_scope: None,
+            domain_error: Some(super::auth::wit_error_kind(err)),
+        });
     }
 }
 
@@ -1026,6 +1067,11 @@ pub fn axum_service(engine: Engine) -> axum::Router {
 ///    `ctx.extensions().get::<Actor>()`).
 /// 3. After the handler runs, emit one `api.audit` event with the
 ///    same field shape the JSON middleware uses.
+//
+// Reads linearly top-to-bottom (allow-list → extract → verify →
+// intent → run → finalize). Splitting for `too_many_lines` would
+// hurt more than it'd help.
+#[allow(clippy::too_many_lines)]
 async fn connect_auth_middleware(
     State(state): State<AuthState>,
     mut req: Request,
@@ -1094,6 +1140,8 @@ async fn connect_auth_middleware(
         status: 0,
         decision: "pending".into(),
         required_scope: None,
+        execution_outcome: None,
+        domain_error: None,
         credential_fp: None,
     };
     let audit_id = {
@@ -1152,8 +1200,25 @@ async fn connect_auth_middleware(
     // protocol misuse); a peek-at-trailers pass is deferred until
     // a real gap appears.
     let outcome = outcome_slot.take();
-    let audit_status = outcome.map_or_else(|| response.status(), |o| o.status);
+    // Authorization / transport status. `outcome.status` is `Some`
+    // for handler-returned errors (`rpc_err` / scope-deny), and
+    // `None` for successful RPCs — including the F4 case where
+    // `record_domain_outcome` stamped a `domain_error` but no
+    // synthesized status. Falling back to `response.status()` on
+    // `None` handles both a normal 200 and any handler that didn't
+    // touch the slot.
+    let audit_status = outcome
+        .and_then(|o| o.status)
+        .unwrap_or_else(|| response.status());
     let denied_scope = outcome.and_then(|o| o.denied_scope).map(Scope::name);
+    // F4: execution outcome (`CommandResult::Err` kind). Lives on
+    // the same slot but is orthogonal to the transport status —
+    // see `super::auth::DomainOutcome` for the split. The JSON
+    // side smuggles the same information through a
+    // `DomainOutcome` response extension.
+    let domain_outcome = outcome
+        .and_then(|o| o.domain_error)
+        .map(|domain_error| super::auth::DomainOutcome { domain_error });
     finalize_audit(
         &state.audit_log,
         audit_id,
@@ -1163,6 +1228,7 @@ async fn connect_auth_middleware(
         &path,
         audit_status,
         denied_scope,
+        domain_outcome,
     )
     .await;
     response
