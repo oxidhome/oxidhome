@@ -1,0 +1,92 @@
+// OxidHome v1 logs service.
+//
+// Historical log query against the `LogStore` SQLite table:
+// mirrors `GET /api/v1/logs?…` on the JSON API. Gated on the
+// `logs:read` scope. Filter fields AND-combine; a nil field is
+// "no constraint on this axis." Returns rows newest-first (the
+// store's native order).
+syntax = "proto3";
+
+package oxidhome.v1;
+
+// LogsService — read-only query surface on the daemon's persistent
+// tracing store.
+service LogsService {
+  // Method name repeats the service noun so the message names
+  // (`QueryLogsRequest` / `QueryLogsResponse`) don't collide with
+  // any future `Query`-shaped method on another service — same
+  // pattern the sibling read services use.
+  rpc QueryLogs(QueryLogsRequest) returns (QueryLogsResponse);
+}
+
+// Every field is optional; the store AND-combines the ones set.
+// Absence means "no filter on this axis."
+message QueryLogsRequest {
+  optional int64 since_ms = 1;
+  optional int64 until_ms = 2;
+  optional LogLevel min_level = 3;
+  optional string instance_id = 4;
+  optional string plugin_id = 5;
+  optional string device_id = 6;
+  // Exact-match on the tracing `target`. `target_prefix` is the
+  // starts-with variant; if both are set, the store applies both.
+  optional string target = 7;
+  optional string target_prefix = 8;
+  optional string span_path_prefix = 9;
+  // Maximum rows to return. Default 100; clamped server-side to
+  // 1000 (see `LOGS_QUERY_MAX_LIMIT` on the handler side).
+  optional uint32 limit = 10;
+}
+
+message QueryLogsResponse {
+  repeated LogEvent logs = 1;
+}
+
+message LogEvent {
+  uint64 id = 1;
+  int64 ts_unix_ms = 2;
+  LogLevel level = 3;
+  optional string instance_id = 4;
+  optional string plugin_id = 5;
+  optional string device_id = 6;
+  string target = 7;
+  optional string span_path = 8;
+  string message = 9;
+  // Structured event fields; order preserved from the tracing
+  // event's field visitor.
+  repeated LogField fields = 10;
+}
+
+message LogField {
+  string key = 1;
+  LogValue value = 2;
+}
+
+// Mirrors the host-side `LogValue` enum's serde-tagged JSON
+// shape (`{"t": "int", "v": 5}`), just via a proto oneof so a
+// gRPC / protobuf client sees a typed union rather than a
+// stringly-tagged blob.
+message LogValue {
+  oneof value {
+    bool bool_val = 1;
+    int64 int_val = 2;
+    uint64 uint_val = 3;
+    double float_val = 4;
+    string string_val = 5;
+    // Catchall for `tracing::field::Visit::record_debug` and
+    // non-finite floats that JSON can't otherwise round-trip.
+    string debug_val = 6;
+  }
+}
+
+// Owned mirror of `tracing::Level`. `LOG_LEVEL_UNSPECIFIED` is
+// the proto3 default sentinel; the host mapping never surfaces
+// it (a stored row always has one of TRACE..ERROR).
+enum LogLevel {
+  LOG_LEVEL_UNSPECIFIED = 0;
+  LOG_LEVEL_TRACE = 1;
+  LOG_LEVEL_DEBUG = 2;
+  LOG_LEVEL_INFO = 3;
+  LOG_LEVEL_WARN = 4;
+  LOG_LEVEL_ERROR = 5;
+}

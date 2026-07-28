@@ -1,0 +1,36 @@
+// OxidHome v1 devices service.
+//
+// Read side of the device catalogue: mirrors
+// `GET /api/v1/devices` on the JSON API. Gated on the
+// `devices:list` scope. Write-side (`Devices.Command`) lands in
+// the next slice.
+syntax = "proto3";
+
+package oxidhome.v1;
+
+// DevicesService — plugin-registered devices the household holds.
+service DevicesService {
+  // List every device any supervised instance has registered with
+  // the host. Snapshot; the ordering isn't stable across requests.
+  // Method noun repeats the service (`ListDevices`) so the message
+  // names don't collide with the other services' `ListRequest` /
+  // `ListResponse` — see the analogue on `InstancesService`.
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+}
+
+message ListDevicesRequest {}
+
+message ListDevicesResponse {
+  repeated Device devices = 1;
+}
+
+message Device {
+  // Host-assigned device id — the routing key for command dispatch.
+  string device_id = 1;
+  // Owning plugin-instance id (whose `execute-command` receives
+  // routed commands for this device).
+  string owner_instance = 2;
+  // Human-readable name from the plugin's `DeviceInfo` at
+  // registration time.
+  string name = 3;
+}
