@@ -33,19 +33,9 @@ pub use state::{DeviceMeta, DeviceRegistry, EventBus, EventSubscription};
 /// Bumped in lockstep with the `oxidhome-sdk` release for external
 /// plugin authors — see the WIT/SDK versioning note in
 /// `ARCHITECTURE.md`.
-///
-/// **0.2.0 (this bump):** the WIT `event` record grew required
-/// `origin-plugin-id` / `origin-instance-id` fields (architecture-
-/// review C2b). That's a structural component-type change — a
-/// plugin compiled against 0.1.x has an incompatible `on-event`
-/// signature and Wasmtime rejects it at instantiation. Pre-1.0
-/// policy treats each minor as its own ABI line
-/// ([`oxidhome_manifest::compatibility::check`]), so bumping to
-/// 0.2.0 turns that opaque runtime failure into a clean load-time
-/// preflight error naming the mismatch.
-pub const OXIDHOME_SDK_VERSION: &str = "0.2.0";
+pub const OXIDHOME_SDK_VERSION: &str = "0.1.0";
 
 /// Oldest `sdk_version` the host will accept from a plugin manifest.
 /// Below this, the load fails with a clear "rebuild your plugin
 /// against SDK ≥ X" error.
-pub const MIN_SUPPORTED_SDK_VERSION: &str = "0.2.0";
+pub const MIN_SUPPORTED_SDK_VERSION: &str = "0.1.0";

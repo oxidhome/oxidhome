@@ -1311,7 +1311,7 @@ id = "{plugin_id}"
 name = "Lifecycle Test Plugin"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.2.0"
+sdk_version = "0.1.0"
 [runtime]
 wasm = "kv_counter.wasm"
 [capabilities]

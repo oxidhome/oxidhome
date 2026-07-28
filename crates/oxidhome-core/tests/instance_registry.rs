@@ -23,7 +23,7 @@ id = "example.simulated-switch"
 name = "Simulated Switch"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.2.0"
+sdk_version = "0.1.0"
 [runtime]
 wasm = "simulated_switch.wasm"
 singleton = {singleton}

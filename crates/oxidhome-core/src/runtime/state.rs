@@ -982,7 +982,7 @@ mod tests {
                 license: None,
                 keywords: Vec::new(),
                 world: World::Plugin,
-                sdk_version: Version::new(0, 2, 0),
+                sdk_version: Version::new(0, 1, 0),
             },
             runtime: RuntimeSection {
                 wasm: std::path::PathBuf::from("plugin.wasm"),

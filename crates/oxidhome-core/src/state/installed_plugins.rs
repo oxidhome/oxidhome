@@ -502,7 +502,7 @@ id = "{plugin_id}"
 name = "Test Plugin"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.2.0"
+sdk_version = "0.1.0"
 [runtime]
 wasm = "plugin.wasm"
 "#,
@@ -641,7 +641,7 @@ id = "../../../etc/cron.d"
 name = "Evil"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.2.0"
+sdk_version = "0.1.0"
 [runtime]
 wasm = "x.wasm"
 "#,
