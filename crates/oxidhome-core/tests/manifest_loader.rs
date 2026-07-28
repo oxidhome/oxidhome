@@ -47,7 +47,7 @@ id = "NotReverseDNS"
 name = "broken"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 [runtime]
 wasm = "irrelevant.wasm"
 "#,
@@ -89,6 +89,48 @@ wasm = "irrelevant.wasm"
     let engine = Engine::new().expect("engine");
     let Err(err) = PluginInstance::load(&engine, dir.path(), "too_old").await else {
         panic!("plugin below MIN_SUPPORTED_SDK_VERSION must fail")
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("below the host's minimum supported version") || msg.contains("incompatible"),
+        "error should describe the SDK mismatch, got: {msg}",
+    );
+}
+
+/// C2b regression: a plugin compiled against SDK 0.1.x has a
+/// pre-C2b `event` record signature (no `origin-plugin-id` /
+/// `origin-instance-id`), so Wasmtime would reject it during
+/// component instantiation with an opaque type mismatch. The
+/// pre-1.0 ABI-line compat check catches it at load time instead
+/// with a clear "rebuild against SDK ≥ 0.2.0" error.
+///
+/// This test uses an SDK-0.1.0 manifest against a *stub* wasm path
+/// — the compat preflight runs before Wasmtime instantiation, so
+/// the missing wasm never gets loaded and the fixture stays cheap.
+/// The point isn't to verify the Wasmtime type check; it's to
+/// verify the preflight catches the incompatibility first, with
+/// a message the operator can act on.
+#[tokio::test(flavor = "current_thread")]
+async fn sdk_0_1_x_plugin_rejected_after_c2b_bump() {
+    let dir = tempdir();
+    std::fs::write(
+        dir.path().join("manifest.toml"),
+        r#"manifest_version = 1
+[plugin]
+id = "example.pre-c2b"
+name = "Pre-C2b Plugin"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.9"
+[runtime]
+wasm = "irrelevant.wasm"
+"#,
+    )
+    .expect("write manifest");
+
+    let engine = Engine::new().expect("engine");
+    let Err(err) = PluginInstance::load(&engine, dir.path(), "pre_c2b").await else {
+        panic!("SDK-0.1.x plugin must fail preflight after the C2b bump")
     };
     let msg = format!("{err:#}");
     assert!(
@@ -139,7 +181,7 @@ id = "example.bare-switch"
 name = "Bare Switch"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 [runtime]
 wasm = "simulated_switch.wasm"
 [capabilities]

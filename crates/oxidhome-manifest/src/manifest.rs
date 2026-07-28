@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! manifest_version = 1
-//! [plugin] id = "..." version = "..." world = "plugin" sdk_version = "0.1.0"
+//! [plugin] id = "..." version = "..." world = "plugin" sdk_version = "0.2.0"
 //! [runtime] wasm = "..." singleton = false tick_interval_ms = 1000
 //!           restart = "on-trap"
 //! [capabilities] network = [...] storage_quota_kb = 64 ...
@@ -254,7 +254,7 @@ source = "https://github.com/oxidhome/oxidhome/tree/main/examples/simulated-swit
 license = "MIT OR Apache-2.0"
 keywords = ["switch", "example", "simulated"]
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 
 [runtime]
 wasm = "simulated-switch.wasm"
@@ -334,7 +334,7 @@ id = "x"
 name = "x"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 [runtime]
 wasm = "x.wasm"
 "#,
@@ -374,7 +374,7 @@ id = "x"
 name = "x"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 [runtime]
 wasm = "x.wasm"
 "#,

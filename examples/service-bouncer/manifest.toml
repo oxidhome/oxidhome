@@ -10,7 +10,7 @@ source = "https://github.com/oxidhome/oxidhome/tree/main/examples/service-bounce
 license = "MIT OR Apache-2.0"
 keywords = ["example", "service", "cycle"]
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 
 [runtime]
 # Multi-instance so the dispatch test can spin up A *and* B from this

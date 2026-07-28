@@ -143,7 +143,7 @@ id = "example.kv-counter-bare"
 name = "Bare KV Counter"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 [runtime]
 wasm = "kv_counter.wasm"
 [capabilities]

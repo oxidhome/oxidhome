@@ -672,7 +672,7 @@ mod tests {
                 license: None,
                 keywords: vec![],
                 world: World::Plugin,
-                sdk_version: Version::new(0, 1, 0),
+                sdk_version: Version::new(0, 2, 0),
             },
             runtime: RuntimeSection {
                 wasm: "x.wasm".into(),

@@ -57,7 +57,7 @@ id = "example.service-counter-bare"
 name = "Bare Service Counter"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 [runtime]
 wasm = "service_counter.wasm"
 [capabilities]

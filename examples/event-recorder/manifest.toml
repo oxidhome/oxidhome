@@ -10,7 +10,7 @@ source = "https://github.com/oxidhome/oxidhome/tree/main/examples/event-recorder
 license = "MIT OR Apache-2.0"
 keywords = ["example", "event-recorder"]
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 
 [runtime]
 wasm = "target/wasm32-wasip2/debug/event_recorder.wasm"

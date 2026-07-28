@@ -43,7 +43,7 @@ id = "example.crasher"
 name = "Crasher"
 version = "0.1.0"
 world = "plugin"
-sdk_version = "0.1.0"
+sdk_version = "0.2.0"
 [runtime]
 wasm = "crasher.wasm"
 tick_interval_ms = 10
