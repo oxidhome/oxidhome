@@ -110,15 +110,16 @@ pub(crate) fn wit_error_kind(err: &WitError) -> &'static str {
     }
 }
 
-/// Routes that don't require a bearer token. The canonical liveness
-/// probe lives on the Connect surface
-/// (`POST /oxidhome.v1.HealthService/Check`), and the Connect router
-/// is mounted as a `fallback_service` **outside** the bearer-auth
-/// middleware — so Connect health requests already skip this gate
-/// without needing an entry here. The list stays as the seam for
-/// future anonymous routes (e.g. a JSON-side `/readyz` if an
-/// orchestrator wants something simpler than a Connect probe).
-pub(crate) const PUBLIC_PATHS: &[&str] = &[];
+/// Routes that don't require a bearer token. The canonical Connect
+/// liveness probe (`POST /oxidhome.v1.HealthService/Check`) is
+/// mounted as a `fallback_service` **outside** the bearer-auth
+/// middleware and doesn't need an entry here.
+///
+/// The JSON-side `GET /api/v1/readyz` mirror exists for
+/// orchestrators that can't POST a Connect envelope (systemd's
+/// `ExecStartPost`, docker's `HEALTHCHECK`, k8s's `httpGet`
+/// probe) — same `{status, version}` body shape as `Health.Check`.
+pub(crate) const PUBLIC_PATHS: &[&str] = &["/api/v1/readyz"];
 
 /// Sentinel `token_id` used on audit rows for unauthenticated
 /// probes — missing / malformed / unknown / revoked bearer.

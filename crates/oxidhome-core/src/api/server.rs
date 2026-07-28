@@ -70,6 +70,7 @@ pub fn build_router(engine: Engine) -> Router {
     };
     let connect_service = super::connect_rpc::axum_service(engine.clone());
     Router::new()
+        .route("/api/v1/readyz", get(readyz))
         .route("/api/v1/instances", get(list_instances))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{device_id}/command", post(send_command))
@@ -91,6 +92,29 @@ pub fn build_router(engine: Engine) -> Router {
         .layer(from_fn_with_state(auth_state.clone(), require_token))
         .fallback_service(connect_service)
         .with_state(ApiState { engine })
+}
+
+/// `GET /api/v1/readyz` — anonymous JSON liveness probe. Same body
+/// shape as the Connect `HealthService.Check` RPC
+/// (`{"status": "ok", "version": "<crate-version>"}`) so an
+/// orchestrator that doesn't speak Connect (systemd's
+/// `ExecStartPost`, docker's `HEALTHCHECK`, k8s's `httpGet`
+/// probe) can still assert the daemon is up with a plain HTTP GET.
+///
+/// The route is on the anonymous allow-list in
+/// [`crate::api::auth::PUBLIC_PATHS`], so the auth middleware
+/// passes it through without requiring a bearer.
+async fn readyz() -> Json<ReadyzBody> {
+    Json(ReadyzBody {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+#[derive(Serialize)]
+struct ReadyzBody {
+    status: &'static str,
+    version: &'static str,
 }
 
 /// Bind a TCP listener at the configured address.
