@@ -454,6 +454,25 @@ impl host_services::Host for PluginState {
 
 impl host_events::Host for PluginState {
     async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
+        // Ownership gate (architecture-review C2). A plugin may only
+        // publish events attributed to devices it owns — i.e. ones
+        // registered from this instance. Bus-only events (`device =
+        // None`: plugin lifecycle, custom-topic broadcasts) skip the
+        // check. Foreign and unregistered device IDs both collapse
+        // to `permission-denied` so this call can't be used to probe
+        // for device existence from a neighbouring plugin.
+        if let Some(device_id) = ev.device.as_ref() {
+            let owned = self
+                .devices
+                .get_owner(device_id)
+                .is_some_and(|owner| owner == self.instance_id);
+            if !owned {
+                return Err(WitError::PermissionDenied(format!(
+                    "publish-event: device `{device_id}` is not owned by this instance",
+                )));
+            }
+        }
+
         // Durable mirror first (Phase 5d): if the write fails — disk
         // full, sqlite corruption, etc. — we'd rather refuse the
         // publish than silently lose history. Live broadcast comes
@@ -1108,12 +1127,60 @@ mod tests {
         let mut sub = bus.subscribe_all();
         let mut state = shared_state("alpha", registry, bus);
 
-        host_events::Host::publish_event(&mut state, state_change_event("d-1"))
+        // The C2 ownership gate refuses publishes for unregistered
+        // device IDs, so register first and then publish under the
+        // returned id — same shape a real plugin would use.
+        let id = host_devices::Host::register_device(&mut state, empty_device("d-1"))
+            .await
+            .expect("register");
+        host_events::Host::publish_event(&mut state, state_change_event(&id))
             .await
             .expect("publish");
 
         let ev = sub.receiver.try_recv().expect("event delivered");
-        assert_eq!(ev.device.as_deref(), Some("d-1"));
+        assert_eq!(ev.device.as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_rejects_unregistered_device() {
+        let mut state = fresh_state("alpha");
+        // No device was ever registered — publishing for a fabricated
+        // id must be refused (architecture-review C2 spoofing gate).
+        let err = host_events::Host::publish_event(&mut state, state_change_event("ghost"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_rejects_foreign_device() {
+        let registry = Arc::new(DeviceRegistry::new());
+        let bus = Arc::new(EventBus::new());
+        let mut alpha = shared_state("alpha", registry.clone(), bus.clone());
+        let mut beta = shared_state("beta", registry, bus);
+
+        let id = host_devices::Host::register_device(&mut alpha, empty_device("d-1"))
+            .await
+            .expect("alpha register");
+
+        // Beta publishing for alpha's device is refused — same
+        // permission-denied shape as an unregistered id, so the call
+        // can't be used to probe for device existence.
+        let err = host_events::Host::publish_event(&mut beta, state_change_event(&id))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_allows_bus_only_events() {
+        // Bus-only events (`device: None` — custom topics, lifecycle)
+        // skip the ownership check; a plugin with no devices at all
+        // can still publish them.
+        let mut state = fresh_state("alpha");
+        host_events::Host::publish_event(&mut state, custom_event("automation.morning"))
+            .await
+            .expect("bus-only publish");
     }
 
     #[tokio::test(flavor = "current_thread")]
