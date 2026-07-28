@@ -2747,10 +2747,21 @@ async fn connect_devices_execute_command_end_to_end_through_simulated_switch() {
 /// (simulated-switch's `execute_command` refuses any action that
 /// isn't a `switch` toggle/on/off — see
 /// `examples/simulated-switch/src/lib.rs:82`). The wire response
-/// is HTTP 200 with the error inside the body, but the audit
-/// ledger must classify it as `deny` (status 400), not `allow`.
+/// is HTTP 200 with the error inside the body, and — this is the
+/// F4 invariant, revised on the PR-#79 review — the audit ledger
+/// records the transport and authorization outcomes *independently*
+/// from the execution outcome:
+///
+/// - `status = 200` (wire status)
+/// - `decision = "allow"` (authorization passed — the plugin ran)
+/// - `execution_outcome = "failed"` (plugin's domain result)
+/// - `domain_error = "invalid_argument"` (WIT error kind)
+///
+/// An earlier cut of F4 collapsed the execution failure into
+/// `decision = "deny"` + `status = 400`, which polluted forensic
+/// authorization queries with plugin validation errors.
 #[tokio::test(flavor = "multi_thread")]
-async fn send_command_domain_error_audits_as_deny() {
+async fn send_command_domain_error_audits_execution_failure() {
     use oxidhome_core::state::AuditQuery;
 
     let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
@@ -2798,15 +2809,25 @@ async fn send_command_domain_error_audits_as_deny() {
     let body = body_to_json(response.into_body()).await;
     assert_eq!(body["kind"], "err");
 
-    // The audit row must reflect the domain outcome, not the wire
-    // 200. `InvalidArgument` → status 400 → decision "deny".
+    // The audit row keeps authorization and execution outcomes
+    // as distinct fields.
     let rows = audit_log.query(&AuditQuery::default(), 8).expect("audit");
     let hit = rows
         .iter()
         .find(|r| r.path == format!("/api/v1/devices/{device_id}/command"))
         .expect("command audit row present");
-    assert_eq!(hit.decision, "deny", "got {hit:?}");
-    assert_eq!(hit.status, 400);
+    assert_eq!(hit.status, 200, "wire status preserved, got {hit:?}");
+    assert_eq!(hit.decision, "allow", "auth outcome, got {hit:?}");
+    assert_eq!(
+        hit.execution_outcome.as_deref(),
+        Some("failed"),
+        "execution outcome, got {hit:?}",
+    );
+    assert_eq!(
+        hit.domain_error.as_deref(),
+        Some("invalid_argument"),
+        "domain error kind, got {hit:?}",
+    );
 
     handle.stop().await.expect("stop");
 }
@@ -2815,10 +2836,11 @@ async fn send_command_domain_error_audits_as_deny() {
 /// above, dispatched via `Devices.ExecuteCommand`. Connect's Ok /
 /// gRPC / gRPC-Web all ride HTTP 200 for a successful RPC even
 /// when the response payload is `Outcome::Err`; the middleware
-/// must audit with the synthesized status carried on the
-/// `HandlerOutcomeSlot`, not the wire 200.
+/// records the execution failure on the ledger's independent
+/// `execution_outcome` / `domain_error` columns while leaving
+/// `status = 200` and `decision = "allow"`.
 #[tokio::test(flavor = "multi_thread")]
-async fn connect_execute_command_domain_error_audits_as_deny() {
+async fn connect_execute_command_domain_error_audits_execution_failure() {
     use oxidhome_core::state::AuditQuery;
 
     let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
@@ -2865,15 +2887,24 @@ async fn connect_execute_command_domain_error_audits_as_deny() {
         "expected err outcome, got {body:?}",
     );
 
-    // Audit row classifies via synthesized status. InvalidArgument
-    // → 400 → decision "deny".
+    // Audit row records execution + authorization separately.
     let rows = audit_log.query(&AuditQuery::default(), 8).expect("audit");
     let hit = rows
         .iter()
         .find(|r| r.path == "/oxidhome.v1.DevicesService/ExecuteCommand")
         .expect("execute-command audit row present");
-    assert_eq!(hit.decision, "deny", "got {hit:?}");
-    assert_eq!(hit.status, 400);
+    assert_eq!(hit.status, 200, "wire status preserved, got {hit:?}");
+    assert_eq!(hit.decision, "allow", "auth outcome, got {hit:?}");
+    assert_eq!(
+        hit.execution_outcome.as_deref(),
+        Some("failed"),
+        "got {hit:?}",
+    );
+    assert_eq!(
+        hit.domain_error.as_deref(),
+        Some("invalid_argument"),
+        "got {hit:?}",
+    );
 
     handle.stop().await.expect("stop");
 }

@@ -409,15 +409,19 @@ async fn send_command(
         .map_err(CommandError::Dispatch)?;
 
     // F4: the wire response stays HTTP 200 (the RPC itself
-    // succeeded), but a `CommandResult::Err` is still a domain
-    // failure. Smuggle a synthesized status onto the response
-    // extensions so the auth middleware audits with the right
-    // `decision` instead of a spurious `allow`.
+    // succeeded and the authorization check passed), but a
+    // `CommandResult::Err` is a domain-level failure. Smuggle the
+    // WIT error kind onto the response extensions so the auth
+    // middleware populates the ledger's `execution_outcome` +
+    // `domain_error` columns *without* touching the transport
+    // status or the authorization `decision`. See
+    // `super::auth::DomainOutcome` for why authorization and
+    // execution outcomes are kept independent.
     let domain_outcome = match &result {
         CommandResult::Ok | CommandResult::OkWithState(_) => None,
-        CommandResult::Err(err) => Some(crate::api::auth::DomainOutcome(
-            crate::api::auth::wit_error_to_status(err),
-        )),
+        CommandResult::Err(err) => Some(crate::api::auth::DomainOutcome {
+            domain_error: crate::api::auth::wit_error_kind(err),
+        }),
     };
     let mut response = Json(command_result_to_wire(result)).into_response();
     if let Some(outcome) = domain_outcome {

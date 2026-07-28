@@ -418,6 +418,43 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX audit_intent   ON audit_event(intent_ms);
     CREATE INDEX audit_token_ts ON audit_event(token_id, intent_ms);
     ",
+    // Migration 10 — architecture-review F4: split execution outcome
+    // from authorization outcome on the audit ledger.
+    //
+    // Before this migration `decision` and `status` served two
+    // purposes at once: they carried the *authorization* result
+    // (allow / deny / error / pending) *and* the transport
+    // classification, and — after PR #79's first cut of F4 — a
+    // domain-execution failure was folded into the same fields via
+    // a synthesized status. That conflation broke forensic queries:
+    // a plugin returning `CommandResult::Err(InvalidArgument)` on
+    // an authorized request would show up in `WHERE decision =
+    // 'deny'` searches next to real authorization denials, and the
+    // real wire status (HTTP 200) was overwritten.
+    //
+    // Two new nullable columns capture the execution outcome
+    // separately:
+    //
+    // - `execution_outcome`: NULL when the request never reached
+    //   the plugin (auth deny, dispatch NotFound, transport error),
+    //   `"success"` when the plugin returned Ok / OkWithState, and
+    //   `"failed"` when the plugin returned `CommandResult::Err`.
+    // - `domain_error`: the WIT error kind
+    //   (`"not_found"` / `"invalid_argument"` / `"permission_denied"`
+    //   / `"unavailable"` / `"internal"`) on `execution_outcome =
+    //   "failed"`, NULL otherwise.
+    //
+    // `status` returns to being the wire HTTP status, and `decision`
+    // returns to being the pure authorization outcome. Every
+    // pre-existing row is backfilled with NULLs for the new
+    // columns (they'd been rolled up into `decision` / `status`
+    // under the old semantics — leaving the values there preserves
+    // the historical record without pretending to know which entries
+    // were execution-failures vs. real denials).
+    "
+    ALTER TABLE audit_event ADD COLUMN execution_outcome TEXT;
+    ALTER TABLE audit_event ADD COLUMN domain_error TEXT;
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.
