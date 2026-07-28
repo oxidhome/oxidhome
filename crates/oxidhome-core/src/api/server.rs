@@ -951,6 +951,14 @@ struct WireEvent {
     /// `"inference"` for those variants, or the custom-event topic
     /// for `Custom`. Mirrors `EventBus::subscribe`'s topic match.
     topic: String,
+    /// Plugin id of the publisher — host-populated on publish
+    /// (architecture-review C2b), immutable. Lets a subscriber
+    /// distinguish legitimate events from forgeries without having
+    /// to trust the payload.
+    origin_plugin_id: String,
+    /// Instance id of the publishing plugin instance. Same host-
+    /// populated / immutable contract as `origin_plugin_id`.
+    origin_instance_id: String,
     payload: WireEventPayload,
 }
 
@@ -1024,6 +1032,8 @@ impl WireEvent {
             device_id: event.device.clone(),
             timestamp_ms: event.timestamp,
             topic,
+            origin_plugin_id: event.origin_plugin_id.clone(),
+            origin_instance_id: event.origin_instance_id.clone(),
             payload,
         }
     }
@@ -1237,6 +1247,8 @@ mod tests {
             let event = Event {
                 device: Some("dev-1".into()),
                 timestamp: 0,
+                origin_plugin_id: String::new(),
+                origin_instance_id: String::new(),
                 payload: EventPayload::Button(input),
             };
             let wire = WireEvent::from_host(&event);
@@ -1249,5 +1261,34 @@ mod tests {
             }
             assert_eq!(wire.topic, "button");
         }
+    }
+
+    /// C2b: the `WireEvent` projection carries `origin_plugin_id` /
+    /// `origin_instance_id` verbatim from the bus-side event. The
+    /// host stamps these on publish (see the C2b tests in
+    /// `runtime::state`); this test pins that the wire shape
+    /// actually surfaces them to a JSON subscriber.
+    #[test]
+    fn wire_event_carries_origin_envelope() {
+        let event = Event {
+            device: None,
+            timestamp: 0,
+            origin_plugin_id: "com.example.publisher".into(),
+            origin_instance_id: "publisher-42".into(),
+            payload: EventPayload::Custom(
+                crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
+                    topic: "automation.morning".into(),
+                    payload: String::new(),
+                },
+            ),
+        };
+        let wire = WireEvent::from_host(&event);
+        assert_eq!(wire.origin_plugin_id, "com.example.publisher");
+        assert_eq!(wire.origin_instance_id, "publisher-42");
+        // The origin fields serialize into the wire JSON so a
+        // tailing client can filter by them.
+        let json = serde_json::to_value(&wire).expect("serialize");
+        assert_eq!(json["origin_plugin_id"], "com.example.publisher");
+        assert_eq!(json["origin_instance_id"], "publisher-42");
     }
 }

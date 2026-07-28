@@ -1264,6 +1264,8 @@ async fn events_tail_ws_round_trip_with_real_listener() {
             publisher_engine.events().publish(Event {
                 device: None,
                 timestamp: 0,
+                origin_plugin_id: String::new(),
+                origin_instance_id: String::new(),
                 payload: EventPayload::Custom(CustomEvent {
                     topic: "api-e2e.toggle".into(),
                     payload: String::new(),
@@ -3123,6 +3125,8 @@ async fn connect_events_tail_streams_a_custom_event() {
             publisher_engine.events().publish(Event {
                 device: None,
                 timestamp: 0,
+                origin_plugin_id: String::new(),
+                origin_instance_id: String::new(),
                 payload: EventPayload::Custom(CustomEvent {
                     topic: "connect-e2e.toggle".into(),
                     payload: String::new(),
@@ -3237,6 +3241,8 @@ async fn connect_events_tail_state_changed_preserves_fields_and_unsigned_timesta
             publisher_engine.events().publish(Event {
                 device: Some("switch-1".into()),
                 timestamp: BIG_TS,
+                origin_plugin_id: String::new(),
+                origin_instance_id: String::new(),
                 payload: EventPayload::StateChanged(StateChange {
                     capability: "switch".into(),
                     fields: vec![KeyValue {

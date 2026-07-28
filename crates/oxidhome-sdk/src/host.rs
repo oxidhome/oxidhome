@@ -177,6 +177,11 @@ pub fn call_service(
 
 /// Push a fully-constructed [`Event`] onto the host's event bus.
 ///
+/// The host stamps `origin-plugin-id` and `origin-instance-id` on
+/// publish from this instance's manifest + instance id — any values
+/// on `event` for those fields are overwritten. Subscribers see the
+/// immutable origin regardless.
+///
 /// # Errors
 ///
 /// Forwards host errors. The host enforces device-ownership on
@@ -210,6 +215,12 @@ pub fn publish_state_change(
     publish_event(&Event {
         device: Some(device_id),
         timestamp: 0,
+        // `origin-plugin-id` / `origin-instance-id` are host-
+        // populated at publish time (see the WIT `event` docstring).
+        // Any value passed here is overwritten by the host, so send
+        // empty strings from the plugin-side helpers.
+        origin_plugin_id: String::new(),
+        origin_instance_id: String::new(),
         payload: EventPayload::StateChanged(StateChange {
             capability: capability.into(),
             fields,
@@ -230,6 +241,9 @@ pub fn publish_custom_event(
     publish_event(&Event {
         device: device_id,
         timestamp: 0,
+        // Host-populated on publish — see `publish_state_change`.
+        origin_plugin_id: String::new(),
+        origin_instance_id: String::new(),
         payload: EventPayload::Custom(CustomEvent {
             topic: topic.into(),
             payload: payload.into(),

@@ -628,6 +628,21 @@ pub struct EventView<'a> {
     ///
     /// Field 2: `timestamp_ms`
     pub timestamp_ms: u64,
+    /// Plugin id (`plugin.id` from the publisher's manifest) that
+    /// produced this event. **Host-populated** — the host overwrites
+    /// any client-supplied value before the event is broadcast, so
+    /// subscribers can trust this as the immutable event origin.
+    /// Mirror of WIT `event.origin-plugin-id`.
+    ///
+    /// Field 7: `origin_plugin_id`
+    pub origin_plugin_id: &'a str,
+    /// Instance id of the publishing plugin instance. Same host-
+    /// populated contract as `origin_plugin_id`; together they
+    /// uniquely identify the publisher. Mirror of WIT
+    /// `event.origin-instance-id`.
+    ///
+    /// Field 8: `origin_instance_id`
+    pub origin_instance_id: &'a str,
     pub payload: ::core::option::Option<
         super::super::__buffa::view::oneof::event::Payload<'a>,
     >,
@@ -673,6 +688,20 @@ impl<'a> ::buffa::MessageView<'a> for EventView<'a> {
                     ::buffa::encoding::WireType::Varint,
                 )?;
                 view.timestamp_ms = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.origin_plugin_id = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.origin_instance_id = ::buffa::types::borrow_str(&mut cur)?;
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -822,6 +851,8 @@ impl<'a> ::buffa::MessageView<'a> for EventView<'a> {
         ::core::result::Result::Ok(super::super::Event {
             device_id: self.device_id.map(|s| s.to_string()),
             timestamp_ms: self.timestamp_ms,
+            origin_plugin_id: self.origin_plugin_id.to_string(),
+            origin_instance_id: self.origin_instance_id.to_string(),
             payload: match self.payload.as_ref() {
                 ::core::option::Option::Some(v) => {
                     ::core::option::Option::Some(
@@ -920,6 +951,17 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
                 }
             }
         }
+        if !self.origin_plugin_id.is_empty() {
+            size
+                += 1u32
+                    + ::buffa::types::string_encoded_len(&self.origin_plugin_id) as u32;
+        }
+        if !self.origin_instance_id.is_empty() {
+            size
+                += 1u32
+                    + ::buffa::types::string_encoded_len(&self.origin_instance_id)
+                        as u32;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u32;
         size
     }
@@ -973,6 +1015,12 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
                 }
             }
         }
+        if !self.origin_plugin_id.is_empty() {
+            ::buffa::types::put_string_field(7u32, &self.origin_plugin_id, buf);
+        }
+        if !self.origin_instance_id.is_empty() {
+            ::buffa::types::put_string_field(8u32, &self.origin_instance_id, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -1003,6 +1051,12 @@ impl<'__a> ::serde::Serialize for EventView<'__a> {
                     "timestampMs",
                     &::buffa::json_helpers::ProtoJson(&self.timestamp_ms),
                 )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.origin_plugin_id) {
+            __map.serialize_entry("originPluginId", self.origin_plugin_id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.origin_instance_id) {
+            __map.serialize_entry("originInstanceId", self.origin_instance_id)?;
         }
         if let ::core::option::Option::Some(ref __ov) = self.payload {
             match __ov {
@@ -1122,6 +1176,27 @@ impl EventOwnedView {
     #[must_use]
     pub fn timestamp_ms(&self) -> u64 {
         self.0.reborrow().timestamp_ms
+    }
+    /// Plugin id (`plugin.id` from the publisher's manifest) that
+    /// produced this event. **Host-populated** — the host overwrites
+    /// any client-supplied value before the event is broadcast, so
+    /// subscribers can trust this as the immutable event origin.
+    /// Mirror of WIT `event.origin-plugin-id`.
+    ///
+    /// Field 7: `origin_plugin_id`
+    #[must_use]
+    pub fn origin_plugin_id(&self) -> &'_ str {
+        self.0.reborrow().origin_plugin_id
+    }
+    /// Instance id of the publishing plugin instance. Same host-
+    /// populated contract as `origin_plugin_id`; together they
+    /// uniquely identify the publisher. Mirror of WIT
+    /// `event.origin-instance-id`.
+    ///
+    /// Field 8: `origin_instance_id`
+    #[must_use]
+    pub fn origin_instance_id(&self) -> &'_ str {
+        self.0.reborrow().origin_instance_id
     }
     /// Oneof `payload`.
     #[must_use]

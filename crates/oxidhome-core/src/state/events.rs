@@ -185,6 +185,8 @@ mod tests {
         Event {
             device: Some(device.into()),
             timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::StateChanged(StateChange {
                 capability: capability.into(),
                 fields: Vec::new(),
@@ -196,6 +198,8 @@ mod tests {
         Event {
             device: device.map(Into::into),
             timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),
