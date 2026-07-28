@@ -848,15 +848,15 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
             futures_util::stream::unfold(subscription.receiver, |mut receiver| async move {
                 use tokio::sync::broadcast::error::RecvError;
                 let body = match receiver.recv().await {
-                    Ok(event) => tail_events_response::Body::Event(Box::new(
-                        wit_event_to_proto(event),
-                    )),
-                    Err(RecvError::Lagged(n)) => tail_events_response::Body::Lagged(Box::new(
-                        ProtoLagged {
+                    Ok(event) => {
+                        tail_events_response::Body::Event(Box::new(wit_event_to_proto(event)))
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        tail_events_response::Body::Lagged(Box::new(ProtoLagged {
                             skipped: n,
                             ..Default::default()
-                        },
-                    )),
+                        }))
+                    }
                     // Channel closed — publisher gone (engine
                     // shutting down). End the stream cleanly.
                     Err(RecvError::Closed) => return None,
