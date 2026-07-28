@@ -138,6 +138,17 @@ pub struct CapabilitiesSection {
     /// ⇒ `register-service` returns `permission-denied`.
     #[serde(default)]
     pub declares_services: Vec<String>,
+    /// Whether the plugin is allowed to observe the host event bus
+    /// via `host-events::subscribe`. `false` (or absent) ⇒ every
+    /// `subscribe` call returns `permission-denied`.
+    /// Architecture-review C2c — before this gate every plugin
+    /// could read every event, including ones published by
+    /// unrelated instances. Publishers gate themselves through the
+    /// C2/C2b ownership + capability checks; the subscribe side
+    /// needs its own capability so the "who sees what" surface is
+    /// declared in the manifest and reviewable at install time.
+    #[serde(default)]
+    pub subscribes_events: bool,
 }
 
 /// What the Phase-6 instance supervisor does after a crash. A "crash"
