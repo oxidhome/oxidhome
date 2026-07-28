@@ -17,6 +17,12 @@ syntax = "proto3";
 
 package oxidhome.v1;
 
+// `KeyValue` + `Value` are defined alongside `DevicesService`
+// (device-command args land there first). Reused here for the
+// `StateChanged.fields` list — same shape as the state-map values
+// devices return.
+import "oxidhome/v1/devices.proto";
+
 service EventsService {
   // Subscribe to the host event bus. `TailEventsRequest` is
   // reserved for future filter fields (topic prefix, device id);
@@ -51,8 +57,11 @@ message Event {
   // Device the event is attributable to. Empty for bus-only
   // (plugin lifecycle, custom-topic) events.
   optional string device_id = 1;
-  // Millisecond Unix timestamp the host stamped at publish time.
-  int64 timestamp_ms = 2;
+  // Millisecond Unix timestamp — plugin-supplied at publish time
+  // (see the WIT `event.timestamp` docstring). `uint64` matches
+  // the WIT `unix-ms` type; encoding as `int64` would wrap large
+  // values past `i64::MAX` back to negative on the wire.
+  uint64 timestamp_ms = 2;
   // Payload variants map one-to-one to WIT `event-payload`.
   oneof payload {
     StateChanged state_changed = 3;
@@ -62,13 +71,21 @@ message Event {
   }
 }
 
-// Wire mirror of WIT `state-change`. The JSON side ships just
-// `capability`; Connect matches that shape for parity. If a client
-// needs the state fields, they arrive on the next `Devices.List` /
-// device-scoped query — the event carries only the changed-fact
-// signal, not the full snapshot.
+// Wire mirror of WIT `state-change` — the full record, not just
+// the capability tag. Includes the partial-state `fields` so a
+// Connect client can learn the new value from the event itself,
+// same shape a `Devices.Get` (once it exists) would return. The
+// PR #75 review flagged the earlier capability-only shape as
+// silently dropping the actual changed values, since neither
+// `Devices.List` nor any other RPC surfaces device state today.
 message StateChanged {
+  // The capability whose state changed (`"switch"`, `"dimmer"`,
+  // `"lock"`, …).
   string capability = 1;
+  // New values for the changed fields (partial state — a subset
+  // of the device's full state vector). Same tagged-value shape
+  // as device-command arguments.
+  repeated KeyValue fields = 2;
 }
 
 message Button {
@@ -98,7 +115,9 @@ message Inference {
   string model = 1;
   string payload = 2;
   // Frame timestamp (Unix ms) if applicable, `None` otherwise.
-  optional int64 frame_timestamp_ms = 3;
+  // `uint64` matches the WIT `unix-ms` type — see the note on
+  // `Event.timestamp_ms`.
+  optional uint64 frame_timestamp_ms = 3;
 }
 
 message CustomEvent {

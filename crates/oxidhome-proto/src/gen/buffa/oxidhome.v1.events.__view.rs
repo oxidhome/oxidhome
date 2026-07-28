@@ -621,10 +621,13 @@ pub struct EventView<'a> {
     ///
     /// Field 1: `device_id`
     pub device_id: ::core::option::Option<&'a str>,
-    /// Millisecond Unix timestamp the host stamped at publish time.
+    /// Millisecond Unix timestamp — plugin-supplied at publish time
+    /// (see the WIT `event.timestamp` docstring). `uint64` matches
+    /// the WIT `unix-ms` type; encoding as `int64` would wrap large
+    /// values past `i64::MAX` back to negative on the wire.
     ///
     /// Field 2: `timestamp_ms`
-    pub timestamp_ms: i64,
+    pub timestamp_ms: u64,
     pub payload: ::core::option::Option<
         super::super::__buffa::view::oneof::event::Payload<'a>,
     >,
@@ -669,7 +672,7 @@ impl<'a> ::buffa::MessageView<'a> for EventView<'a> {
                     tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
-                view.timestamp_ms = ::buffa::types::decode_int64(&mut cur)?;
+                view.timestamp_ms = ::buffa::types::decode_uint64(&mut cur)?;
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -878,8 +881,8 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
         if let Some(ref v) = self.device_id {
             size += 1u32 + ::buffa::types::string_encoded_len(v) as u32;
         }
-        if self.timestamp_ms != 0i64 {
-            size += 1u32 + ::buffa::types::int64_encoded_len(self.timestamp_ms) as u32;
+        if self.timestamp_ms != 0u64 {
+            size += 1u32 + ::buffa::types::uint64_encoded_len(self.timestamp_ms) as u32;
         }
         if let ::core::option::Option::Some(ref v) = self.payload {
             match v {
@@ -931,8 +934,8 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
         if let Some(ref v) = self.device_id {
             ::buffa::types::put_string_field(1u32, v, buf);
         }
-        if self.timestamp_ms != 0i64 {
-            ::buffa::types::put_int64_field(2u32, self.timestamp_ms, buf);
+        if self.timestamp_ms != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.timestamp_ms, buf);
         }
         if let ::core::option::Option::Some(ref v) = self.payload {
             match v {
@@ -994,7 +997,7 @@ impl<'__a> ::serde::Serialize for EventView<'__a> {
         if let ::core::option::Option::Some(__v) = self.device_id {
             __map.serialize_entry("deviceId", __v)?;
         }
-        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.timestamp_ms) {
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.timestamp_ms) {
             __map
                 .serialize_entry(
                     "timestampMs",
@@ -1110,11 +1113,14 @@ impl EventOwnedView {
     pub fn device_id(&self) -> ::core::option::Option<&'_ str> {
         self.0.reborrow().device_id
     }
-    /// Millisecond Unix timestamp the host stamped at publish time.
+    /// Millisecond Unix timestamp — plugin-supplied at publish time
+    /// (see the WIT `event.timestamp` docstring). `uint64` matches
+    /// the WIT `unix-ms` type; encoding as `int64` would wrap large
+    /// values past `i64::MAX` back to negative on the wire.
     ///
     /// Field 2: `timestamp_ms`
     #[must_use]
-    pub fn timestamp_ms(&self) -> i64 {
+    pub fn timestamp_ms(&self) -> u64 {
         self.0.reborrow().timestamp_ms
     }
     /// Oneof `payload`.
@@ -1154,15 +1160,26 @@ impl ::serde::Serialize for EventOwnedView {
         ::serde::Serialize::serialize(&self.0, __s)
     }
 }
-/// Wire mirror of WIT `state-change`. The JSON side ships just
-/// `capability`; Connect matches that shape for parity. If a client
-/// needs the state fields, they arrive on the next `Devices.List` /
-/// device-scoped query — the event carries only the changed-fact
-/// signal, not the full snapshot.
+/// Wire mirror of WIT `state-change` — the full record, not just
+/// the capability tag. Includes the partial-state `fields` so a
+/// Connect client can learn the new value from the event itself,
+/// same shape a `Devices.Get` (once it exists) would return. The
+/// PR #75 review flagged the earlier capability-only shape as
+/// silently dropping the actual changed values, since neither
+/// `Devices.List` nor any other RPC surfaces device state today.
 #[derive(Clone, Debug, Default)]
 pub struct StateChangedView<'a> {
+    /// The capability whose state changed (`"switch"`, `"dimmer"`,
+    /// `"lock"`, …).
+    ///
     /// Field 1: `capability`
     pub capability: &'a str,
+    /// New values for the changed fields (partial state — a subset
+    /// of the device's full state vector). Same tagged-value shape
+    /// as device-command arguments.
+    ///
+    /// Field 2: `fields`
+    pub fields: ::buffa::RepeatedView<'a, super::super::__buffa::view::KeyValueView<'a>>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for StateChangedView<'a> {
@@ -1199,6 +1216,21 @@ impl<'a> ::buffa::MessageView<'a> for StateChangedView<'a> {
                 )?;
                 view.capability = ::buffa::types::borrow_str(&mut cur)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                view.fields
+                    .push(
+                        <super::super::__buffa::view::KeyValueView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -1222,6 +1254,11 @@ impl<'a> ::buffa::MessageView<'a> for StateChangedView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::StateChanged {
             capability: self.capability.to_string(),
+            fields: self
+                .fields
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1229,12 +1266,20 @@ impl<'a> ::buffa::MessageView<'a> for StateChangedView<'a> {
 }
 impl<'a> ::buffa::ViewEncode<'a> for StateChangedView<'a> {
     #[allow(clippy::needless_borrow, clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u32;
         if !self.capability.is_empty() {
             size += 1u32 + ::buffa::types::string_encoded_len(&self.capability) as u32;
+        }
+        for v in &self.fields {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
+                    + inner_size;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u32;
         size
@@ -1242,13 +1287,17 @@ impl<'a> ::buffa::ViewEncode<'a> for StateChangedView<'a> {
     #[allow(clippy::needless_borrow)]
     fn write_to(
         &self,
-        _cache: &mut ::buffa::SizeCache,
+        __cache: &mut ::buffa::SizeCache,
         buf: &mut impl ::buffa::bytes::BufMut,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         if !self.capability.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.capability, buf);
+        }
+        for v in &self.fields {
+            ::buffa::types::put_len_delimited_header(2u32, __cache.consume_next(), buf);
+            v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1273,6 +1322,9 @@ impl<'__a> ::serde::Serialize for StateChangedView<'__a> {
         let mut __map = __s.serialize_map(::core::option::Option::None)?;
         if !::buffa::json_helpers::skip_if::is_empty_str(self.capability) {
             __map.serialize_entry("capability", self.capability)?;
+        }
+        if !self.fields.is_empty() {
+            __map.serialize_entry("fields", &*self.fields)?;
         }
         __map.end()
     }
@@ -1363,10 +1415,24 @@ impl StateChangedOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
+    /// The capability whose state changed (`"switch"`, `"dimmer"`,
+    /// `"lock"`, …).
+    ///
     /// Field 1: `capability`
     #[must_use]
     pub fn capability(&self) -> &'_ str {
         self.0.reborrow().capability
+    }
+    /// New values for the changed fields (partial state — a subset
+    /// of the device's full state vector). Same tagged-value shape
+    /// as device-command arguments.
+    ///
+    /// Field 2: `fields`
+    #[must_use]
+    pub fn fields(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::KeyValueView<'_>> {
+        &self.0.reborrow().fields
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<StateChangedView<'static>>>
@@ -1692,9 +1758,11 @@ pub struct InferenceView<'a> {
     /// Field 2: `payload`
     pub payload: &'a str,
     /// Frame timestamp (Unix ms) if applicable, `None` otherwise.
+    /// `uint64` matches the WIT `unix-ms` type — see the note on
+    /// `Event.timestamp_ms`.
     ///
     /// Field 3: `frame_timestamp_ms`
-    pub frame_timestamp_ms: ::core::option::Option<i64>,
+    pub frame_timestamp_ms: ::core::option::Option<u64>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for InferenceView<'a> {
@@ -1743,7 +1811,7 @@ impl<'a> ::buffa::MessageView<'a> for InferenceView<'a> {
                     tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
-                view.frame_timestamp_ms = Some(::buffa::types::decode_int64(&mut cur)?);
+                view.frame_timestamp_ms = Some(::buffa::types::decode_uint64(&mut cur)?);
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
@@ -1788,7 +1856,7 @@ impl<'a> ::buffa::ViewEncode<'a> for InferenceView<'a> {
             size += 1u32 + ::buffa::types::string_encoded_len(&self.payload) as u32;
         }
         if let Some(v) = self.frame_timestamp_ms {
-            size += 1u32 + ::buffa::types::int64_encoded_len(v) as u32;
+            size += 1u32 + ::buffa::types::uint64_encoded_len(v) as u32;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u32;
         size
@@ -1808,7 +1876,7 @@ impl<'a> ::buffa::ViewEncode<'a> for InferenceView<'a> {
             ::buffa::types::put_string_field(2u32, &self.payload, buf);
         }
         if let Some(v) = self.frame_timestamp_ms {
-            ::buffa::types::put_int64_field(3u32, v, buf);
+            ::buffa::types::put_uint64_field(3u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1944,10 +2012,12 @@ impl InferenceOwnedView {
         self.0.reborrow().payload
     }
     /// Frame timestamp (Unix ms) if applicable, `None` otherwise.
+    /// `uint64` matches the WIT `unix-ms` type — see the note on
+    /// `Event.timestamp_ms`.
     ///
     /// Field 3: `frame_timestamp_ms`
     #[must_use]
-    pub fn frame_timestamp_ms(&self) -> ::core::option::Option<i64> {
+    pub fn frame_timestamp_ms(&self) -> ::core::option::Option<u64> {
         self.0.reborrow().frame_timestamp_ms
     }
 }

@@ -878,6 +878,13 @@ fn wit_event_to_proto(event: WitEvent) -> ProtoEvent {
         EventPayload::StateChanged(sc) => Some(proto_event::Payload::StateChanged(Box::new(
             ProtoStateChanged {
                 capability: sc.capability,
+                // Full state-change record — capability + the
+                // partial-state fields. PR #75 review flagged the
+                // earlier `capability`-only shape as silently
+                // dropping the actual changed values; the WIT
+                // record carries them and Connect clients have no
+                // other RPC to fetch device state from.
+                fields: sc.fields.into_iter().map(wit_key_value_to_proto).collect(),
                 ..Default::default()
             },
         ))),
@@ -900,7 +907,11 @@ fn wit_event_to_proto(event: WitEvent) -> ProtoEvent {
             Some(proto_event::Payload::Inference(Box::new(ProtoInference {
                 model: i.model,
                 payload: i.payload,
-                frame_timestamp_ms: i.frame_timestamp.map(u64::cast_signed),
+                // WIT `unix-ms` is `u64`; proto field is `uint64`.
+                // Direct assignment — the previous `cast_signed` on
+                // an `int64` field wrapped large timestamps to
+                // negative on the wire.
+                frame_timestamp_ms: i.frame_timestamp,
                 ..Default::default()
             })))
         }
@@ -912,8 +923,23 @@ fn wit_event_to_proto(event: WitEvent) -> ProtoEvent {
     };
     ProtoEvent {
         device_id: event.device,
-        timestamp_ms: event.timestamp.cast_signed(),
+        // Plugin-supplied timestamp; `uint64` on the proto matches
+        // the WIT `unix-ms` type. Preserves values above `i64::MAX`
+        // that the earlier `int64` encoding would have wrapped
+        // negative.
+        timestamp_ms: event.timestamp,
         payload,
+        ..Default::default()
+    }
+}
+
+/// Convert a WIT `key-value` (as used inside `StateChanged.fields`)
+/// to the proto `KeyValue` message shared with `Devices.ExecuteCommand`.
+/// Reuses the existing `wit_value_to_proto` variant projection.
+fn wit_key_value_to_proto(kv: KeyValue) -> ProtoKeyValue {
+    ProtoKeyValue {
+        key: kv.key,
+        value: wit_value_to_proto(kv.value).into(),
         ..Default::default()
     }
 }

@@ -589,16 +589,19 @@ pub struct Event {
         skip_serializing_if = "::core::option::Option::is_none"
     )]
     pub device_id: ::core::option::Option<::buffa::alloc::string::String>,
-    /// Millisecond Unix timestamp the host stamped at publish time.
+    /// Millisecond Unix timestamp — plugin-supplied at publish time
+    /// (see the WIT `event.timestamp` docstring). `uint64` matches
+    /// the WIT `unix-ms` type; encoding as `int64` would wrap large
+    /// values past `i64::MAX` back to negative on the wire.
     ///
     /// Field 2: `timestamp_ms`
     #[serde(
         rename = "timestampMs",
         alias = "timestamp_ms",
-        with = "::buffa::json_helpers::int64",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
-    pub timestamp_ms: i64,
+    pub timestamp_ms: u64,
     #[serde(flatten)]
     pub payload: ::core::option::Option<__buffa::oneof::event::Payload>,
     #[serde(skip)]
@@ -654,8 +657,8 @@ impl ::buffa::Message for Event {
         if let Some(ref v) = self.device_id {
             size += 1u32 + ::buffa::types::string_encoded_len(v) as u32;
         }
-        if self.timestamp_ms != 0i64 {
-            size += 1u32 + ::buffa::types::int64_encoded_len(self.timestamp_ms) as u32;
+        if self.timestamp_ms != 0u64 {
+            size += 1u32 + ::buffa::types::uint64_encoded_len(self.timestamp_ms) as u32;
         }
         if let ::core::option::Option::Some(ref v) = self.payload {
             match v {
@@ -706,8 +709,8 @@ impl ::buffa::Message for Event {
         if let Some(ref v) = self.device_id {
             ::buffa::types::put_string_field(1u32, v, buf);
         }
-        if self.timestamp_ms != 0i64 {
-            ::buffa::types::put_int64_field(2u32, self.timestamp_ms, buf);
+        if self.timestamp_ms != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.timestamp_ms, buf);
         }
         if let ::core::option::Option::Some(ref v) = self.payload {
             match v {
@@ -775,7 +778,7 @@ impl ::buffa::Message for Event {
                     tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
-                self.timestamp_ms = ::buffa::types::decode_int64(buf)?;
+                self.timestamp_ms = ::buffa::types::decode_uint64(buf)?;
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -866,7 +869,7 @@ impl ::buffa::Message for Event {
     }
     fn clear(&mut self) {
         self.device_id = ::core::option::Option::None;
-        self.timestamp_ms = 0i64;
+        self.timestamp_ms = 0u64;
         self.payload = ::core::option::Option::None;
         self.__buffa_unknown_fields.clear();
     }
@@ -898,7 +901,7 @@ impl<'de> serde::Deserialize<'de> for Event {
                 let mut __f_device_id: ::core::option::Option<
                     ::core::option::Option<::buffa::alloc::string::String>,
                 > = None;
-                let mut __f_timestamp_ms: ::core::option::Option<i64> = None;
+                let mut __f_timestamp_ms: ::core::option::Option<u64> = None;
                 let mut __oneof_payload: ::core::option::Option<
                     __buffa::oneof::event::Payload,
                 > = None;
@@ -916,12 +919,12 @@ impl<'de> serde::Deserialize<'de> for Event {
                             __f_timestamp_ms = Some({
                                 struct _S;
                                 impl<'de> serde::de::DeserializeSeed<'de> for _S {
-                                    type Value = i64;
+                                    type Value = u64;
                                     fn deserialize<D: serde::Deserializer<'de>>(
                                         self,
                                         d: D,
-                                    ) -> ::core::result::Result<i64, D::Error> {
-                                        ::buffa::json_helpers::int64::deserialize(d)
+                                    ) -> ::core::result::Result<u64, D::Error> {
+                                        ::buffa::json_helpers::uint64::deserialize(d)
                                     }
                                 }
                                 map.next_value_seed(_S)?
@@ -1070,15 +1073,20 @@ pub mod event {
     #[doc(inline)]
     pub use super::__buffa::view::oneof::event::Payload as PayloadView;
 }
-/// Wire mirror of WIT `state-change`. The JSON side ships just
-/// `capability`; Connect matches that shape for parity. If a client
-/// needs the state fields, they arrive on the next `Devices.List` /
-/// device-scoped query — the event carries only the changed-fact
-/// signal, not the full snapshot.
+/// Wire mirror of WIT `state-change` — the full record, not just
+/// the capability tag. Includes the partial-state `fields` so a
+/// Connect client can learn the new value from the event itself,
+/// same shape a `Devices.Get` (once it exists) would return. The
+/// PR #75 review flagged the earlier capability-only shape as
+/// silently dropping the actual changed values, since neither
+/// `Devices.List` nor any other RPC surfaces device state today.
 #[derive(Clone, PartialEq, Default)]
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct StateChanged {
+    /// The capability whose state changed (`"switch"`, `"dimmer"`,
+    /// `"lock"`, …).
+    ///
     /// Field 1: `capability`
     #[serde(
         rename = "capability",
@@ -1086,13 +1094,27 @@ pub struct StateChanged {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub capability: ::buffa::alloc::string::String,
+    /// New values for the changed fields (partial state — a subset
+    /// of the device's full state vector). Same tagged-value shape
+    /// as device-command arguments.
+    ///
+    /// Field 2: `fields`
+    #[serde(
+        rename = "fields",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub fields: ::buffa::alloc::vec::Vec<KeyValue>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for StateChanged {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("StateChanged").field("capability", &self.capability).finish()
+        f.debug_struct("StateChanged")
+            .field("capability", &self.capability)
+            .field("fields", &self.fields)
+            .finish()
     }
 }
 impl StateChanged {
@@ -1116,25 +1138,37 @@ impl ::buffa::Message for StateChanged {
     /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
     /// compliant message will never overflow this type.
     #[allow(clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u32;
         if !self.capability.is_empty() {
             size += 1u32 + ::buffa::types::string_encoded_len(&self.capability) as u32;
         }
+        for v in &self.fields {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
+                    + inner_size;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u32;
         size
     }
     fn write_to(
         &self,
-        _cache: &mut ::buffa::SizeCache,
+        __cache: &mut ::buffa::SizeCache,
         buf: &mut impl ::buffa::bytes::BufMut,
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         if !self.capability.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.capability, buf);
+        }
+        for v in &self.fields {
+            ::buffa::types::put_len_delimited_header(2u32, __cache.consume_next(), buf);
+            v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1156,6 +1190,15 @@ impl ::buffa::Message for StateChanged {
                 )?;
                 ::buffa::types::merge_string(&mut self.capability, buf)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.fields.push(elem);
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1165,6 +1208,7 @@ impl ::buffa::Message for StateChanged {
     }
     fn clear(&mut self) {
         self.capability.clear();
+        self.fields.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -1378,15 +1422,17 @@ pub struct Inference {
     )]
     pub payload: ::buffa::alloc::string::String,
     /// Frame timestamp (Unix ms) if applicable, `None` otherwise.
+    /// `uint64` matches the WIT `unix-ms` type — see the note on
+    /// `Event.timestamp_ms`.
     ///
     /// Field 3: `frame_timestamp_ms`
     #[serde(
         rename = "frameTimestampMs",
         alias = "frame_timestamp_ms",
-        with = "::buffa::json_helpers::opt_int64",
+        with = "::buffa::json_helpers::opt_uint64",
         skip_serializing_if = "::core::option::Option::is_none"
     )]
-    pub frame_timestamp_ms: ::core::option::Option<i64>,
+    pub frame_timestamp_ms: ::core::option::Option<u64>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1411,7 +1457,7 @@ impl Inference {
     #[must_use = "with_* setters return `self` by value; assign or chain the result"]
     #[inline]
     ///Sets [`Self::frame_timestamp_ms`] to `Some(value)`, consuming and returning `self`.
-    pub fn with_frame_timestamp_ms(mut self, value: i64) -> Self {
+    pub fn with_frame_timestamp_ms(mut self, value: u64) -> Self {
         self.frame_timestamp_ms = Some(value);
         self
     }
@@ -1441,7 +1487,7 @@ impl ::buffa::Message for Inference {
             size += 1u32 + ::buffa::types::string_encoded_len(&self.payload) as u32;
         }
         if let Some(v) = self.frame_timestamp_ms {
-            size += 1u32 + ::buffa::types::int64_encoded_len(v) as u32;
+            size += 1u32 + ::buffa::types::uint64_encoded_len(v) as u32;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u32;
         size
@@ -1460,7 +1506,7 @@ impl ::buffa::Message for Inference {
             ::buffa::types::put_string_field(2u32, &self.payload, buf);
         }
         if let Some(v) = self.frame_timestamp_ms {
-            ::buffa::types::put_int64_field(3u32, v, buf);
+            ::buffa::types::put_uint64_field(3u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1495,7 +1541,7 @@ impl ::buffa::Message for Inference {
                     ::buffa::encoding::WireType::Varint,
                 )?;
                 self.frame_timestamp_ms = ::core::option::Option::Some(
-                    ::buffa::types::decode_int64(buf)?,
+                    ::buffa::types::decode_uint64(buf)?,
                 );
             }
             _ => {
