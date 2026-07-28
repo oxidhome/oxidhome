@@ -27,11 +27,14 @@
 //!
 //! Per-RPC scope enforcement happens inside each handler via
 //! [`require_scope_connect`], mirroring the JSON handler-side
-//! `require_scope` pattern. Denials surface as
-//! `ConnectError::permission_denied` and the missing scope name
-//! is smuggled back to the middleware through a [`DeniedScopeSlot`]
-//! request-extension so the audit row's `required_scope` field
-//! matches the JSON side's shape.
+//! `require_scope` pattern. Handlers record their outcome (the
+//! denied scope on `permission_denied`, or the synthesized HTTP
+//! status of any other [`ConnectError`] via [`rpc_err`]) into a
+//! [`HandlerOutcomeSlot`] request-extension the middleware reads
+//! back — that's what keeps the audit row's decision classification
+//! and `required_scope` field correct across all transports,
+//! including gRPC / gRPC-Web where RPC errors ride at HTTP 200
+//! with the status in trailers rather than on the response status.
 
 use std::sync::{Arc, Mutex};
 
@@ -48,20 +51,29 @@ use oxidhome_proto::connect::oxidhome::v1::{
     DevicesServiceExt, HealthServiceExt, InstancesServiceExt, LogsServiceExt, PluginsServiceExt,
 };
 use oxidhome_proto::proto::oxidhome::v1::{
-    CheckRequest, CheckResponse, Device, Instance, ListDevicesRequest, ListDevicesResponse,
+    CheckRequest, CheckResponse, Device, ExecuteCommandError as ProtoCmdError,
+    ExecuteCommandRequest, ExecuteCommandResponse, InstallPluginRequest, InstallPluginResponse,
+    Instance, KeyValue as ProtoKeyValue, ListDevicesRequest, ListDevicesResponse,
     ListInstancesRequest, ListInstancesResponse, ListPluginsRequest, ListPluginsResponse,
     LogEvent as ProtoLogEvent, LogField as ProtoLogField, LogLevel as ProtoLogLevel,
     LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest, QueryLogsResponse,
-    log_value,
+    StartPluginRequest, StartPluginResponse, StopPluginRequest, StopPluginResponse,
+    UninstallPluginRequest, UninstallPluginResponse, Value as ProtoValue, execute_command_error,
+    execute_command_response, log_value, value,
 };
 
 use crate::Engine;
 use crate::auth::Actor;
-use crate::state::{HistoricalLogEvent, LogLevel, LogQuery, LogValue, TokenError};
+use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
+use crate::state::{
+    HistoricalLogEvent, InstallError, LogLevel, LogQuery, LogValue, TokenError, UninstallError,
+};
 
 use super::auth::{AuthState, actor_from_record, emit_audit, extract_bearer};
 use super::scopes::{
-    DEVICES_LIST, INSTANCES_LIST, LOGS_READ, PLUGINS_LIST, Scope, ScopeDenied, require_scope,
+    DEVICES_COMMAND, DEVICES_LIST, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST,
+    PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope, ScopeDenied, require_scope,
 };
 
 /// `HealthService` implementation. Anonymous — no engine state is
@@ -90,58 +102,116 @@ impl oxidhome_proto::connect::oxidhome::v1::HealthService for OxidHomeHealth {
     }
 }
 
-// ── Scope-check helper ──────────────────────────────────────────
+// ── Scope-check + outcome-record helpers ────────────────────────
 
-/// Request-scoped smuggling channel for the scope name a handler
-/// denied on. The middleware inserts an `Arc<Mutex<Option<Scope>>>`
-/// into `req.extensions_mut()` before running the handler; the
-/// handler's `require_scope_connect` call writes the failing scope
-/// name to it; the middleware reads it back after the handler
-/// returns to populate the `required_scope` field on the audit row.
+/// What a Connect handler recorded as it returned. Serves the
+/// middleware's audit classifier — see [`connect_auth_middleware`].
+#[derive(Debug, Clone, Copy)]
+struct HandlerOutcome {
+    /// Synthesized HTTP status for the audit row. `ConnectError::http_status()`
+    /// on the error path (403 for `PermissionDenied`, 404 for `NotFound`,
+    /// 409 for `AlreadyExists`, 422 for `InvalidArgument`, etc.). This is
+    /// what the audit classifier consumes rather than
+    /// `response.status()`, because gRPC and gRPC-Web RPC errors ride at
+    /// HTTP 200 with the status in trailers/body — see finding #1 on
+    /// the PR #67 review.
+    status: axum::http::StatusCode,
+    /// The missing scope, if this outcome was a
+    /// `PermissionDenied` recorded by [`require_scope_connect`].
+    /// Middleware populates the `required_scope` audit field from
+    /// this — mirrors the JSON side's `DeniedScope` smuggle.
+    denied_scope: Option<Scope>,
+}
+
+/// Request-scoped smuggling channel from Connect handlers to the
+/// [`connect_auth_middleware`]. The middleware installs an empty
+/// slot on `req.extensions_mut()` before running the handler;
+/// handlers write to it on the error path via
+/// [`require_scope_connect`] (for scope denials) or [`rpc_err`]
+/// (for every other `ConnectError`); the middleware reads it after
+/// the handler returns.
 ///
-/// Same purpose as the JSON side's `DeniedScope` response-extension
-/// smuggle, but Connect responses are constructed by the connectrpc
-/// dispatcher (not the handler), so the request-extension +
-/// interior-mutability shape is what actually reaches the middleware
-/// on both success and failure paths.
+/// **Why a request-side slot instead of reading the response status:**
+/// The Connect response type — `Response<ConnectRpcBody>` — carries
+/// the RPC outcome in transport-shaped places (HTTP status for
+/// Connect unary, `grpc-status` trailers for gRPC / gRPC-Web,
+/// `EndStreamResponse` envelope for Connect streaming). By the time
+/// the response reaches the axum middleware it's just
+/// `AxumResponse<Body>` — the middleware can only see HTTP status,
+/// which is 200 for every gRPC / gRPC-Web error. Recording the
+/// outcome pre-return preserves the classification cleanly across
+/// every transport without the middleware having to parse trailer
+/// frames out of the body.
 #[derive(Clone, Default)]
-struct DeniedScopeSlot(Arc<Mutex<Option<Scope>>>);
+struct HandlerOutcomeSlot(Arc<Mutex<Option<HandlerOutcome>>>);
 
-impl DeniedScopeSlot {
-    fn take(&self) -> Option<Scope> {
+impl HandlerOutcomeSlot {
+    fn take(&self) -> Option<HandlerOutcome> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
 
-    fn set(&self, scope: Scope) {
+    fn set(&self, outcome: HandlerOutcome) {
         *self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
     }
+}
+
+/// Wrap a [`ConnectError`] on the error-return site so the audit
+/// row picks up the outcome. Idiomatic use — at every `return Err(...)`
+/// inside a Connect handler that isn't a scope denial:
+///
+/// ```ignore
+/// return Err(rpc_err(&ctx, ConnectError::not_found("device x")));
+/// ```
+///
+/// [`require_scope_connect`] does the equivalent for scope denials
+/// via the same slot; no double-record and no ambiguity.
+#[must_use]
+fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
+    if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
+        slot.set(HandlerOutcome {
+            status: err.http_status(),
+            denied_scope: None,
+        });
+    }
+    err
 }
 
 /// Handler-side scope check for Connect RPCs. Mirrors the JSON
 /// [`require_scope`] but returns a [`ConnectError::permission_denied`]
 /// instead of a `ScopeDenied` axum response, and records the
-/// missing scope on the request's [`DeniedScopeSlot`] so the
-/// middleware can put it on the audit row (same field shape as
-/// the JSON `DeniedScope` extension smuggle).
+/// missing scope on the request's [`HandlerOutcomeSlot`] so the
+/// middleware populates `required_scope` on the audit row (same
+/// field shape as the JSON `DeniedScope` extension smuggle).
 ///
 /// The `Actor` is read out of `ctx.extensions()`. Its presence is a
 /// contract with the middleware (which stamps it during auth);
 /// missing it is an internal bug rather than a client error →
 /// `ConnectError::internal`, not `Unauthenticated`.
 fn require_scope_connect(ctx: &RequestContext, required: Scope) -> Result<(), ConnectError> {
-    let actor = ctx
-        .extensions()
-        .get::<Actor>()
-        .ok_or_else(|| ConnectError::internal("connect handler ran without an Actor extension"))?;
+    // If the middleware failed to stamp `Actor` into extensions,
+    // wrap the internal error through `rpc_err` too — otherwise a
+    // gRPC / gRPC-Web caller of a scoped RPC in a broken pipeline
+    // would audit as `allow` on an HTTP 200 wire response. Defense
+    // in depth for the same class of bug PR #74 review flagged on
+    // `query_logs`.
+    let actor = ctx.extensions().get::<Actor>().ok_or_else(|| {
+        rpc_err(
+            ctx,
+            ConnectError::internal("connect handler ran without an Actor extension"),
+        )
+    })?;
     if let Err(ScopeDenied { required }) = require_scope(actor, required) {
-        if let Some(slot) = ctx.extensions().get::<DeniedScopeSlot>() {
-            slot.set(Scope::new(required));
+        if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
+            slot.set(HandlerOutcome {
+                status: axum::http::StatusCode::FORBIDDEN,
+                denied_scope: Some(Scope::new(required)),
+            });
         }
         return Err(ConnectError::permission_denied(format!(
             "scope {required} required"
@@ -213,6 +283,123 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             ..Default::default()
         })
     }
+
+    async fn execute_command<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ExecuteCommandRequest>,
+    ) -> ServiceResult<impl Encodable<ExecuteCommandResponse> + Send + use<'a>> {
+        require_scope_connect(&ctx, DEVICES_COMMAND)?;
+        let req = request.to_owned_message();
+
+        // Resolve device → owning instance via the same
+        // `get_owner` primitive the JSON side uses (single read-
+        // lock + map lookup, mirrors `ServiceRegistry::get_owner`).
+        // Unknown device *and* non-running owner both collapse to
+        // NotFound so a probing caller can't distinguish the two
+        // cases — same no-enumeration-leak property as the JSON
+        // handler.
+        let owner = self
+            .engine
+            .devices()
+            .get_owner(&req.device_id)
+            .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("device not found")))?;
+        let handle = self
+            .engine
+            .instances()
+            .get(&owner)
+            .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("device not found")))?;
+
+        let cmd = Command {
+            capability: req.capability,
+            action: req.action,
+            args: req.args.into_iter().map(proto_key_value_to_wit).collect(),
+        };
+        let result = handle
+            .execute_command(req.device_id.clone(), cmd)
+            .await
+            .map_err(|err| {
+                tracing::error!(target: "api.devices", error = %err, "device command dispatch failed");
+                rpc_err(&ctx, ConnectError::internal("device command dispatch failed"))
+            })?;
+        Response::ok(command_result_to_proto(result))
+    }
+}
+
+/// Convert an incoming proto [`ProtoValue`] to the WIT `value`
+/// variant the plugin expects. Mirrors the JSON side's
+/// `From<WireValue> for Value` — same six-way variant projection.
+/// A missing / `None` inner `kind` (proto3 default for a message
+/// with an unset `oneof`) maps to the empty JSON payload, which
+/// the plugin can pattern-match if it accepts arbitrary shapes.
+fn proto_key_value_to_wit(kv: ProtoKeyValue) -> KeyValue {
+    let value = match kv.value.into_option().and_then(|v| v.kind) {
+        Some(value::Kind::BoolVal(b)) => Value::BoolVal(b),
+        Some(value::Kind::IntVal(i)) => Value::IntVal(i),
+        Some(value::Kind::FloatVal(f)) => Value::FloatVal(f),
+        Some(value::Kind::StringVal(s)) => Value::StringVal(s),
+        Some(value::Kind::BytesVal(b)) => Value::BytesVal(b),
+        Some(value::Kind::JsonVal(j)) => Value::JsonVal(j),
+        None => Value::JsonVal(String::new()),
+    };
+    KeyValue { key: kv.key, value }
+}
+
+fn wit_value_to_proto(value: Value) -> ProtoValue {
+    let kind = match value {
+        Value::BoolVal(b) => value::Kind::BoolVal(b),
+        Value::IntVal(i) => value::Kind::IntVal(i),
+        Value::FloatVal(f) => value::Kind::FloatVal(f),
+        Value::StringVal(s) => value::Kind::StringVal(s),
+        Value::BytesVal(b) => value::Kind::BytesVal(b),
+        Value::JsonVal(j) => value::Kind::JsonVal(j),
+    };
+    ProtoValue {
+        kind: Some(kind),
+        ..Default::default()
+    }
+}
+
+fn command_result_to_proto(result: CommandResult) -> ExecuteCommandResponse {
+    let outcome = match result {
+        CommandResult::Ok => {
+            execute_command_response::Outcome::Ok(Box::<execute_command_response::Ok>::default())
+        }
+        CommandResult::OkWithState(kvs) => execute_command_response::Outcome::OkWithState(
+            Box::new(execute_command_response::OkWithState {
+                state: kvs
+                    .into_iter()
+                    .map(|kv| ProtoKeyValue {
+                        key: kv.key,
+                        value: wit_value_to_proto(kv.value).into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        ),
+        CommandResult::Err(err) => {
+            execute_command_response::Outcome::Err(Box::new(wit_error_to_proto(err)))
+        }
+    };
+    ExecuteCommandResponse {
+        outcome: Some(outcome),
+        ..Default::default()
+    }
+}
+
+fn wit_error_to_proto(err: WitError) -> ProtoCmdError {
+    let kind = match err {
+        WitError::NotFound(m) => execute_command_error::Kind::NotFound(m),
+        WitError::PermissionDenied(m) => execute_command_error::Kind::PermissionDenied(m),
+        WitError::InvalidArgument(m) => execute_command_error::Kind::InvalidArgument(m),
+        WitError::Unavailable(m) => execute_command_error::Kind::Unavailable(m),
+        WitError::Internal(m) => execute_command_error::Kind::Internal(m),
+    };
+    ProtoCmdError {
+        kind: Some(kind),
+        ..Default::default()
+    }
 }
 
 struct OxidHomePlugins {
@@ -261,6 +448,225 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
             ..Default::default()
         })
     }
+
+    async fn install_plugin<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, InstallPluginRequest>,
+    ) -> ServiceResult<impl Encodable<InstallPluginResponse> + Send + use<'a>> {
+        require_scope_connect(&ctx, PLUGINS_INSTALL)?;
+        let req = request.to_owned_message();
+        let installed_registry = self.engine.installed_plugins();
+        let source_dir = std::path::PathBuf::from(req.source_dir);
+        let installed = tokio::task::spawn_blocking(move || {
+            installed_registry.install(&source_dir)
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!(target: "api.plugins", error = %err, "install spawn_blocking failed");
+            rpc_err(&ctx, ConnectError::internal("install task join failed"))
+        })?
+        .map_err(|err| rpc_err(&ctx, install_error_to_connect(err)))?;
+        Response::ok(InstallPluginResponse {
+            plugin_id: installed.plugin_id.to_string(),
+            version: installed.version,
+            installed_path: installed.path.display().to_string(),
+            ..Default::default()
+        })
+    }
+
+    async fn start_plugin<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, StartPluginRequest>,
+    ) -> ServiceResult<impl Encodable<StartPluginResponse> + Send + use<'a>> {
+        require_scope_connect(&ctx, PLUGINS_START)?;
+        let req = request.to_owned_message();
+        let installed = self
+            .engine
+            .installed_plugins()
+            .get(&req.plugin_id)
+            .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("plugin not installed")))?;
+        let instance_id = req.instance_id.unwrap_or_else(|| req.plugin_id.clone());
+        // `config_overrides_json` is optional; empty / absent
+        // means "use manifest defaults."
+        let overrides = match req.config_overrides_json.as_deref() {
+            None | Some("") => None,
+            Some(json) => match serde_json::from_str::<toml::Value>(json) {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    return Err(rpc_err(
+                        &ctx,
+                        ConnectError::invalid_argument(format!("config_overrides_json: {err}")),
+                    ));
+                }
+            },
+        };
+        let handle = self
+            .engine
+            .start_instance(installed.path.clone(), &instance_id, overrides)
+            .await
+            .map_err(|err| {
+                tracing::error!(target: "api.plugins", error = %err, "start_instance failed");
+                rpc_err(
+                    &ctx,
+                    ConnectError::internal(format!("start_instance failed: {err}")),
+                )
+            })?;
+        handle.wait_for_running().await.map_err(|err| {
+            tracing::error!(target: "api.plugins", error = %err, "wait_for_running failed");
+            rpc_err(
+                &ctx,
+                ConnectError::internal(format!("wait_for_running failed: {err}")),
+            )
+        })?;
+        Response::ok(StartPluginResponse {
+            plugin_id: req.plugin_id,
+            instance_id,
+            state: format!("{:?}", handle.state()),
+            ..Default::default()
+        })
+    }
+
+    async fn stop_plugin<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, StopPluginRequest>,
+    ) -> ServiceResult<impl Encodable<StopPluginResponse> + Send + use<'a>> {
+        require_scope_connect(&ctx, PLUGINS_STOP)?;
+        let req = request.to_owned_message();
+        let mut stopped_ids = Vec::new();
+        let registry = self.engine.instances();
+        for handle in registry.list() {
+            if handle.plugin_id() != req.plugin_id {
+                continue;
+            }
+            if let Some(want) = &req.instance_id
+                && handle.instance_id() != want
+            {
+                continue;
+            }
+            let id = handle.instance_id().to_string();
+            if let Err(err) = handle.stop().await {
+                tracing::warn!(
+                    instance_id = %id,
+                    error = %err,
+                    "stop instance failed; continuing with siblings",
+                );
+                continue;
+            }
+            let _ = handle.wait_terminal().await;
+            wait_for_registry_clear(&registry, &id).await;
+            stopped_ids.push(id);
+        }
+        Response::ok(StopPluginResponse {
+            stopped_ids,
+            ..Default::default()
+        })
+    }
+
+    async fn uninstall_plugin<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UninstallPluginRequest>,
+    ) -> ServiceResult<impl Encodable<UninstallPluginResponse> + Send + use<'a>> {
+        require_scope_connect(&ctx, PLUGINS_UNINSTALL)?;
+        let req = request.to_owned_message();
+        // Refuse if any instance of the plugin is running. Same
+        // fail-closed shape the JSON handler enforces — operator
+        // stops first. FAILED_PRECONDITION is the Connect-side
+        // equivalent of the JSON 409 code.
+        let running: Vec<String> = self
+            .engine
+            .instances()
+            .list()
+            .into_iter()
+            .filter(|h| h.plugin_id() == req.plugin_id)
+            .map(|h| h.instance_id().to_string())
+            .collect();
+        if !running.is_empty() {
+            return Err(rpc_err(
+                &ctx,
+                ConnectError::failed_precondition(format!(
+                    "plugin instances still running: {running:?}"
+                )),
+            ));
+        }
+        let registry = self.engine.installed_plugins();
+        let id_for_blocking = req.plugin_id.clone();
+        let result =
+            tokio::task::spawn_blocking(move || registry.uninstall(&id_for_blocking))
+                .await
+                .map_err(|err| {
+                    tracing::error!(target: "api.plugins", error = %err, "uninstall spawn_blocking failed");
+                    rpc_err(&ctx, ConnectError::internal("uninstall task join failed"))
+                })?;
+        result.map_err(|err| rpc_err(&ctx, uninstall_error_to_connect(err)))?;
+        Response::ok(UninstallPluginResponse {
+            plugin_id: req.plugin_id,
+            ..Default::default()
+        })
+    }
+}
+
+/// Map an install-side registry error to a Connect-spec error
+/// code. Same shape mapping the JSON `PluginLifecycleError` uses
+/// — kept in one place so the audit / client experience stays
+/// consistent across surfaces.
+fn install_error_to_connect(err: InstallError) -> ConnectError {
+    match err {
+        InstallError::NoPluginsRoot => {
+            ConnectError::unavailable("plugin install requires a state-dir-backed engine")
+        }
+        InstallError::SourceMissing(path) => ConnectError::not_found(format!(
+            "source dir missing or has no manifest.toml: {}",
+            path.display()
+        )),
+        InstallError::AlreadyInstalled { plugin_id } => {
+            ConnectError::already_exists(format!("plugin {plugin_id} is already installed"))
+        }
+        InstallError::BadManifest { path, reason } => {
+            ConnectError::invalid_argument(format!("manifest at {}: {reason}", path.display()))
+        }
+        InstallError::Io(err) => {
+            tracing::error!(target: "api.plugins", error = %err, "install io error");
+            ConnectError::internal("install io error")
+        }
+    }
+}
+
+fn uninstall_error_to_connect(err: UninstallError) -> ConnectError {
+    match err {
+        UninstallError::NoPluginsRoot => {
+            ConnectError::unavailable("plugin uninstall requires a state-dir-backed engine")
+        }
+        UninstallError::NotInstalled(id) => {
+            ConnectError::not_found(format!("plugin {id} is not installed"))
+        }
+        UninstallError::Io(err) => {
+            tracing::error!(target: "api.plugins", error = %err, "uninstall io error");
+            ConnectError::internal("uninstall io error")
+        }
+    }
+}
+
+/// Bounded poll for the instance registry to clear after a
+/// supervisor reaches terminal — copied from the JSON side for the
+/// same reason (the reaper task lags `wait_terminal`; a follow-up
+/// uninstall would see the ghost). See the JSON `server.rs` for
+/// the full rationale.
+async fn wait_for_registry_clear(registry: &crate::InstanceRegistry, instance_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while registry.get(instance_id).is_some() {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                instance_id = %instance_id,
+                "instance registry didn't clear after 5s — reaper task lagging?",
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 struct OxidHomeLogs {
@@ -306,9 +712,12 @@ impl oxidhome_proto::connect::oxidhome::v1::LogsService for OxidHomeLogs {
                 proto_log_level_to_host(known)
             }
             Some(oxidhome_proto::runtime::EnumValue::Unknown(v)) => {
-                return Err(ConnectError::invalid_argument(format!(
-                    "min_level: unknown log-level value {v}"
-                )));
+                return Err(rpc_err(
+                    &ctx,
+                    ConnectError::invalid_argument(format!(
+                        "min_level: unknown log-level value {v}"
+                    )),
+                ));
             }
         };
         let query = LogQuery {
@@ -329,7 +738,7 @@ impl oxidhome_proto::connect::oxidhome::v1::LogsService for OxidHomeLogs {
             .query(&query, limit_usize)
             .map_err(|err| {
                 tracing::error!(target: "api.logs", error = %err, "logs query failed");
-                ConnectError::internal("logs query failed")
+                rpc_err(&ctx, ConnectError::internal("logs query failed"))
             })?;
         let logs = rows.into_iter().map(historical_to_proto).collect();
         Response::ok(QueryLogsResponse {
@@ -504,7 +913,7 @@ async fn connect_auth_middleware(
             req.headers(),
         );
     };
-    let denied_scope_slot = DeniedScopeSlot::default();
+    let outcome_slot = HandlerOutcomeSlot::default();
     let (token_id, actor_kind, method) = match state.tokens.verify(bearer) {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
@@ -515,10 +924,12 @@ async fn connect_auth_middleware(
             let actor_kind = actor.kind().as_str().to_string();
             let method = req.method().to_string();
             req.extensions_mut().insert(actor);
-            // Give the handler a way to smuggle back the failing
-            // scope name if `require_scope_connect` denies — mirrors
-            // the JSON side's `DeniedScope` response-extension trick.
-            req.extensions_mut().insert(denied_scope_slot.clone());
+            // Give the handler a way to smuggle back its outcome
+            // (scope-deny name + a synthesized HTTP status for the
+            // audit classifier). See the `HandlerOutcomeSlot`
+            // docstring for why we can't just read the response
+            // status on gRPC / gRPC-Web transports.
+            req.extensions_mut().insert(outcome_slot.clone());
             (token_id, actor_kind, method)
         }
         Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
@@ -534,33 +945,30 @@ async fn connect_auth_middleware(
     };
 
     let response = next.run(req).await;
-    // `DeniedScopeSlot` is `Arc`-shared with what the request now
-    // owned; `take()` on our clone reads whatever the handler wrote
-    // before the request was consumed. `None` on happy paths → the
-    // audit row's `required_scope` field stays empty (same shape as
-    // the JSON side's allow rows).
-    let denied_scope = denied_scope_slot.take().map(Scope::name);
-    // **Transport-independent decision classification.** Non-unary
-    // Connect transports (gRPC, gRPC-Web) render RPC errors as
-    // HTTP 200 with `grpc-status` in headers/trailers (or in the
-    // body for gRPC-Web) — `emit_audit`'s response-status classifier
-    // would then mis-audit a scope denial as `decision=allow` on
-    // those transports. When the handler explicitly recorded a
-    // scope denial via `DeniedScopeSlot`, that IS the ground truth
-    // and we synthesize a 403 status for the audit row so
-    // `emit_audit`'s classifier picks the right decision on every
-    // transport.
+    // `HandlerOutcomeSlot` is `Arc`-shared with the request; `take()`
+    // on our clone reads whatever the handler wrote before the
+    // request was consumed. `None` on happy paths → we fall back to
+    // `response.status()`, which is correct for Connect unary and
+    // for `Ok` outcomes across every transport.
     //
-    // The broader gap (non-scope Connect errors like
-    // `ConnectError::not_found` still audit as `allow` on
-    // gRPC/gRPC-Web) needs peeking at `grpc-status`
-    // trailers/bodies; leaving as a documented follow-up until a
-    // handler actually returns those.
-    let audit_status = if denied_scope.is_some() {
-        axum::http::StatusCode::FORBIDDEN
-    } else {
-        response.status()
-    };
+    // **Transport-independent decision classification.** gRPC and
+    // gRPC-Web render RPC errors as HTTP 200 with `grpc-status` in
+    // trailers/body, so `response.status()` alone would mis-audit
+    // handler-returned errors as `decision=allow` on those
+    // transports. `HandlerOutcomeSlot` sidesteps that by having the
+    // handler record its outcome at return time (see [`rpc_err`]
+    // and [`require_scope_connect`]) — the middleware then trusts
+    // that record over the wire-shaped HTTP status.
+    //
+    // Residual gap: framing / dispatch errors that reject BEFORE
+    // any handler runs (bad `Content-Type`, unknown method,
+    // malformed proto) leave the slot empty. On gRPC / gRPC-Web
+    // those still audit as `allow`. Rare in practice (client
+    // protocol misuse); a peek-at-trailers pass is deferred until
+    // a real gap appears.
+    let outcome = outcome_slot.take();
+    let audit_status = outcome.map_or_else(|| response.status(), |o| o.status);
+    let denied_scope = outcome.and_then(|o| o.denied_scope).map(Scope::name);
     emit_audit(
         &token_id,
         &actor_kind,

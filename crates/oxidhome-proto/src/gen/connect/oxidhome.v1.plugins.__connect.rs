@@ -6,6 +6,38 @@ pub type OwnedListPluginsRequestView = ::buffa::view::OwnedView<
 pub type OwnedListPluginsResponseView = ::buffa::view::OwnedView<
     crate::proto::oxidhome::v1::__buffa::view::ListPluginsResponseView<'static>,
 >;
+///Shorthand for `OwnedView<InstallPluginRequestView<'static>>`.
+pub type OwnedInstallPluginRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::InstallPluginRequestView<'static>,
+>;
+///Shorthand for `OwnedView<InstallPluginResponseView<'static>>`.
+pub type OwnedInstallPluginResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::InstallPluginResponseView<'static>,
+>;
+///Shorthand for `OwnedView<StartPluginRequestView<'static>>`.
+pub type OwnedStartPluginRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::StartPluginRequestView<'static>,
+>;
+///Shorthand for `OwnedView<StartPluginResponseView<'static>>`.
+pub type OwnedStartPluginResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::StartPluginResponseView<'static>,
+>;
+///Shorthand for `OwnedView<StopPluginRequestView<'static>>`.
+pub type OwnedStopPluginRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::StopPluginRequestView<'static>,
+>;
+///Shorthand for `OwnedView<StopPluginResponseView<'static>>`.
+pub type OwnedStopPluginResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::StopPluginResponseView<'static>,
+>;
+///Shorthand for `OwnedView<UninstallPluginRequestView<'static>>`.
+pub type OwnedUninstallPluginRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::UninstallPluginRequestView<'static>,
+>;
+///Shorthand for `OwnedView<UninstallPluginResponseView<'static>>`.
+pub type OwnedUninstallPluginResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::UninstallPluginResponseView<'static>,
+>;
 impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListPluginsResponse>
 for crate::proto::oxidhome::v1::__buffa::view::ListPluginsResponseView<'_> {
     fn encode(
@@ -26,6 +58,86 @@ for ::buffa::view::OwnedView<
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
 }
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::InstallPluginResponse>
+for crate::proto::oxidhome::v1::__buffa::view::InstallPluginResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::InstallPluginResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::InstallPluginResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::StartPluginResponse>
+for crate::proto::oxidhome::v1::__buffa::view::StartPluginResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::StartPluginResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::StartPluginResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::StopPluginResponse>
+for crate::proto::oxidhome::v1::__buffa::view::StopPluginResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::StopPluginResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::StopPluginResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::UninstallPluginResponse>
+for crate::proto::oxidhome::v1::__buffa::view::UninstallPluginResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::UninstallPluginResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::UninstallPluginResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+}
 /// Full service name for this service.
 pub const PLUGINS_SERVICE_SERVICE_NAME: &str = "oxidhome.v1.PluginsService";
 /// Static [`Spec`](::connectrpc::Spec) for the server-side `ListPlugins` RPC.
@@ -34,6 +146,42 @@ pub const PLUGINS_SERVICE_SERVICE_NAME: &str = "oxidhome.v1.PluginsService";
 /// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
 pub const PLUGINS_SERVICE_LIST_PLUGINS_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/oxidhome.v1.PluginsService/ListPlugins",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `InstallPlugin` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const PLUGINS_SERVICE_INSTALL_PLUGIN_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/InstallPlugin",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `StartPlugin` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const PLUGINS_SERVICE_START_PLUGIN_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/StartPlugin",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `StopPlugin` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const PLUGINS_SERVICE_STOP_PLUGIN_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/StopPlugin",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `UninstallPlugin` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const PLUGINS_SERVICE_UNINSTALL_PLUGIN_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/UninstallPlugin",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
@@ -117,6 +265,108 @@ pub trait PluginsService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
+    /// Install a plugin from a local source directory. Sensitive
+    /// (`plugins:install` scope) — copies operator-supplied code
+    /// into `<state_dir>/plugins/<plugin_id>/`. Same shape as
+    /// `POST /api/v1/plugins` on the JSON API.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn install_plugin<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::InstallPluginRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::InstallPluginResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Start a supervised instance of an installed plugin. Gated on
+    /// `plugins:start`. Same shape as
+    /// `POST /api/v1/plugins/{plugin_id}/start`; blocks until the
+    /// instance reaches `Running` before returning.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn start_plugin<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::StartPluginRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::StartPluginResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Stop one or all running instances of a plugin. Gated on
+    /// `plugins:stop`. Idempotent — returns an empty `stopped_ids`
+    /// when nothing was running.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn stop_plugin<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::StopPluginRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::StopPluginResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Uninstall a plugin — removes `<state_dir>/plugins/<plugin_id>/`.
+    /// Sensitive (`plugins:uninstall` scope). Refuses with FAILED_PRECONDITION
+    /// if any instance of the plugin is running.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn uninstall_plugin<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::UninstallPluginRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::UninstallPluginResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -178,6 +428,122 @@ impl<S: PluginsService> PluginsServiceExt for S {
                 },
             )
             .with_spec(PLUGINS_SERVICE_LIST_PLUGINS_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "InstallPlugin",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::InstallPluginRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::InstallPluginRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.install_plugin(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::InstallPluginResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_INSTALL_PLUGIN_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "StartPlugin",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::StartPluginRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::StartPluginRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.start_plugin(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::StartPluginResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_START_PLUGIN_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "StopPlugin",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::StopPluginRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::StopPluginRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.stop_plugin(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::StopPluginResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_STOP_PLUGIN_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "UninstallPlugin",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::UninstallPluginRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::UninstallPluginRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.uninstall_plugin(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::UninstallPluginResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_UNINSTALL_PLUGIN_SPEC)
     }
 }
 /// Type-inference marker used by [`Router::add_service`](::connectrpc::Router::add_service).
@@ -238,6 +604,30 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                         .with_spec(PLUGINS_SERVICE_LIST_PLUGINS_SPEC),
                 )
             }
+            "InstallPlugin" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_INSTALL_PLUGIN_SPEC),
+                )
+            }
+            "StartPlugin" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_START_PLUGIN_SPEC),
+                )
+            }
+            "StopPlugin" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_STOP_PLUGIN_SPEC),
+                )
+            }
+            "UninstallPlugin" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_UNINSTALL_PLUGIN_SPEC),
+                )
+            }
             _ => None,
         }
     }
@@ -271,6 +661,88 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                         .await?
                         .encode::<
                             crate::proto::oxidhome::v1::ListPluginsResponse,
+                        >(format)
+                })
+            }
+            "InstallPlugin" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::InstallPluginRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::InstallPluginRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::InstallPluginRequest,
+                    >::from_parts(&req, &body);
+                    svc.install_plugin(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::InstallPluginResponse,
+                        >(format)
+                })
+            }
+            "StartPlugin" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::StartPluginRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::StartPluginRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::StartPluginRequest,
+                    >::from_parts(&req, &body);
+                    svc.start_plugin(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::StartPluginResponse,
+                        >(format)
+                })
+            }
+            "StopPlugin" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::StopPluginRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::StopPluginRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::StopPluginRequest,
+                    >::from_parts(&req, &body);
+                    svc.stop_plugin(ctx, req)
+                        .await?
+                        .encode::<crate::proto::oxidhome::v1::StopPluginResponse>(format)
+                })
+            }
+            "UninstallPlugin" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::UninstallPluginRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::UninstallPluginRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::UninstallPluginRequest,
+                    >::from_parts(&req, &body);
+                    svc.uninstall_plugin(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::UninstallPluginResponse,
                         >(format)
                 })
             }
@@ -442,6 +914,186 @@ where
                 &self.config,
                 PLUGINS_SERVICE_SERVICE_NAME,
                 "ListPlugins",
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the InstallPlugin RPC. Sends a request to /oxidhome.v1.PluginsService/InstallPlugin.
+    pub async fn install_plugin(
+        &self,
+        request: crate::proto::oxidhome::v1::InstallPluginRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::InstallPluginResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.install_plugin_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the InstallPlugin RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn install_plugin_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::InstallPluginRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::InstallPluginResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "InstallPlugin",
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the StartPlugin RPC. Sends a request to /oxidhome.v1.PluginsService/StartPlugin.
+    pub async fn start_plugin(
+        &self,
+        request: crate::proto::oxidhome::v1::StartPluginRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::StartPluginResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.start_plugin_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the StartPlugin RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn start_plugin_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::StartPluginRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::StartPluginResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "StartPlugin",
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the StopPlugin RPC. Sends a request to /oxidhome.v1.PluginsService/StopPlugin.
+    pub async fn stop_plugin(
+        &self,
+        request: crate::proto::oxidhome::v1::StopPluginRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::StopPluginResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.stop_plugin_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the StopPlugin RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn stop_plugin_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::StopPluginRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::StopPluginResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "StopPlugin",
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the UninstallPlugin RPC. Sends a request to /oxidhome.v1.PluginsService/UninstallPlugin.
+    pub async fn uninstall_plugin(
+        &self,
+        request: crate::proto::oxidhome::v1::UninstallPluginRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::UninstallPluginResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.uninstall_plugin_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the UninstallPlugin RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn uninstall_plugin_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::UninstallPluginRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::UninstallPluginResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "UninstallPlugin",
                 request,
                 options,
             )

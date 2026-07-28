@@ -16,6 +16,15 @@ service DevicesService {
   // names don't collide with the other services' `ListRequest` /
   // `ListResponse` — see the analogue on `InstancesService`.
   rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+
+  // Execute a capability command against a device. Sensitive
+  // (`devices:command` scope) — controls physical actuation
+  // (switches, dimmers, locks). Same routing as the JSON
+  // `POST /api/v1/devices/{id}/command`: the host looks up the
+  // device's owning instance and forwards `execute-command` to
+  // it. Unknown device and non-running owner both collapse to
+  // NotFound (no enumeration leak).
+  rpc ExecuteCommand(ExecuteCommandRequest) returns (ExecuteCommandResponse);
 }
 
 message ListDevicesRequest {}
@@ -33,4 +42,75 @@ message Device {
   // Human-readable name from the plugin's `DeviceInfo` at
   // registration time.
   string name = 3;
+}
+
+message ExecuteCommandRequest {
+  // Host-assigned device id (from `ListDevices` or a `state-changed`
+  // event).
+  string device_id = 1;
+  // Capability key — `"switch"`, `"dimmer"`, etc. — that the
+  // plugin's `execute-command` matches on alongside `action`.
+  string capability = 2;
+  // Action verb — `"set"`, `"toggle"`, `"increment"`, … — the
+  // plugin's command dispatch interprets.
+  string action = 3;
+  // `key=value` arguments the command takes. Order is preserved
+  // client → host → plugin; capabilities that treat args as a
+  // dict resolve duplicates plugin-side.
+  repeated KeyValue args = 4;
+}
+
+// One-of-many typed value that arg values and state entries carry.
+// Mirrors the host-side `WIT value` variant and the JSON `WireValue`
+// tagged shape, just structured as a proto `oneof` so gRPC /
+// protobuf clients see a typed union rather than a stringly-tagged
+// blob.
+message Value {
+  oneof kind {
+    bool bool_val = 1;
+    int64 int_val = 2;
+    double float_val = 3;
+    string string_val = 4;
+    bytes bytes_val = 5;
+    // Free-form JSON body — carries payloads that don't fit the
+    // typed variants above (nested objects, sparse arrays, …).
+    string json_val = 6;
+  }
+}
+
+message KeyValue {
+  string key = 1;
+  Value value = 2;
+}
+
+message ExecuteCommandResponse {
+  oneof outcome {
+    // Command executed, no state readout.
+    Ok ok = 1;
+    // Command executed and returned a fresh state snapshot the
+    // caller should treat as authoritative until the next
+    // `state-changed` event.
+    OkWithState ok_with_state = 2;
+    // Plugin-returned structured error (as opposed to a Connect
+    // transport error). RPC-level failures (unknown device, no
+    // running owner) come back as ConnectError codes on the wire.
+    ExecuteCommandError err = 3;
+  }
+
+  message Ok {}
+
+  message OkWithState {
+    repeated KeyValue state = 1;
+  }
+}
+
+// Wire mirror of the WIT `error` variant returned by the plugin.
+message ExecuteCommandError {
+  oneof kind {
+    string not_found = 1;
+    string permission_denied = 2;
+    string invalid_argument = 3;
+    string unavailable = 4;
+    string internal = 5;
+  }
 }

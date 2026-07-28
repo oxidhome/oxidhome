@@ -2199,3 +2199,390 @@ fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
     );
     assert_eq!(fields.required_scope, "devices:list");
 }
+
+/// **Non-scope** handler-returned Connect error on gRPC-Web still
+/// audits as `deny`, not `allow`. Sibling of the scope-deny test
+/// above — verifies the outcome slot fix (PR #74 review) covers
+/// every `rpc_err(&ctx, ...)` path, not just the scope one.
+///
+/// Setup: valid token with `logs:read`, gRPC-Web POST to
+/// `Logs.QueryLogs` carrying `min_level = 999` (unknown enum). The
+/// handler `return Err(rpc_err(&ctx, ConnectError::invalid_argument(...)))`s,
+/// which on gRPC-Web comes back as HTTP 200 with `grpc-status: 3`.
+/// Without the outcome slot the audit would classify this as `allow`
+/// (the very bug the PR review flagged as still present in this
+/// handler after 15-d shipped).
+#[test]
+fn connect_non_scope_error_on_grpc_web_transport_still_audits_as_deny() {
+    use oxidhome_core::state::LogQuery;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("reader", b"[\"logs:read\"]")
+        .unwrap();
+    let log_store = engine.log_store();
+    let subscriber = Registry::default().with(log_store.layer());
+
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            // Frame a `QueryLogsRequest{min_level: 999}` as a
+            // gRPC-Web message. On the JSON codec the body is just
+            // the JSON — but `application/grpc-web+proto` needs the
+            // proto-encoded body wrapped in a 5-byte frame header.
+            // Easier: use `application/grpc-web+json` (Connect
+            // supports it) with a JSON body carrying `min_level`.
+            //
+            // gRPC-Web frame: 1 byte flag (0 = data) + 4 bytes
+            // big-endian length + payload bytes.
+            let payload = br#"{"minLevel":999}"#;
+            let mut frame = Vec::with_capacity(5 + payload.len());
+            frame.push(0u8);
+            frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(payload);
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/oxidhome.v1.LogsService/QueryLogs")
+                        .header(header::CONTENT_TYPE, "application/grpc-web+json")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", issued.plaintext),
+                        )
+                        .body(Body::from(frame))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // gRPC-Web transport pushes the RPC error into trailers
+            // on top of HTTP 200 — the audit classifier must not
+            // read this as a success.
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+    log_store.wait_drained_for_test();
+    let rows = log_store
+        .query(
+            &LogQuery {
+                target_prefix: Some("api.audit".into()),
+                ..LogQuery::default()
+            },
+            8,
+        )
+        .expect("audit query");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected one audit row for the failed gRPC-Web query, got {rows:?}",
+    );
+    let fields = extract_audit_fields(&rows[0].fields);
+    assert_eq!(
+        fields.status, 400,
+        "InvalidArgument should record as HTTP 400 in the audit row",
+    );
+    assert_eq!(
+        fields.decision, "deny",
+        "gRPC-Web non-scope handler error must audit as deny, got fields {:?}",
+        rows[0].fields
+    );
+    // Not a scope denial → required_scope stays empty.
+    assert!(fields.required_scope.is_empty());
+}
+
+// ── Connect write cluster (15-d) ─────────────────────────────────
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_devices_execute_command_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.DevicesService/ExecuteCommand",
+        b"[\"devices:list\"]",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_plugins_install_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.PluginsService/InstallPlugin",
+        b"[\"plugins:list\"]",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_plugins_start_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.PluginsService/StartPlugin",
+        b"[\"plugins:list\"]",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_plugins_stop_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.PluginsService/StopPlugin",
+        b"[\"plugins:list\"]",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_plugins_uninstall_scope_deny_returns_permission_denied() {
+    assert_connect_scope_denied(
+        "/oxidhome.v1.PluginsService/UninstallPlugin",
+        b"[\"plugins:list\"]",
+    )
+    .await;
+}
+
+/// `ExecuteCommand` on an unknown device — the middleware sees a
+/// Connect `NotFound` error, and the audit row records
+/// `status=404, decision=deny` (via the outcome slot introduced
+/// this slice; would otherwise mis-classify as `allow` on
+/// non-unary transports). No enumeration leak — a real-but-not-
+/// running device gets the same `NotFound`.
+#[test]
+fn connect_devices_execute_command_unknown_device_audits_as_deny() {
+    use oxidhome_core::state::LogQuery;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let admin = engine
+        .auth_tokens()
+        .create("admin", b"[\"devices:command\"]")
+        .unwrap();
+    let log_store = engine.log_store();
+    let subscriber = Registry::default().with(log_store.layer());
+
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/oxidhome.v1.DevicesService/ExecuteCommand")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                        .body(Body::from(
+                            r#"{"deviceId":"nope","capability":"switch","action":"toggle"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = body_to_json(response.into_body()).await;
+            assert_eq!(body["code"], "not_found");
+        });
+    });
+    log_store.wait_drained_for_test();
+    let rows = log_store
+        .query(
+            &LogQuery {
+                target_prefix: Some("api.audit".into()),
+                ..LogQuery::default()
+            },
+            8,
+        )
+        .expect("audit query");
+    assert_eq!(rows.len(), 1, "one audit row expected, got {rows:?}");
+    let fields = extract_audit_fields(&rows[0].fields);
+    assert_eq!(fields.status, 404);
+    assert_eq!(fields.decision, "deny");
+    // NotFound isn't a scope denial — required_scope stays empty.
+    assert!(fields.required_scope.is_empty());
+}
+
+/// Full round-trip through Connect's Devices.ExecuteCommand: stage a
+/// simulated-switch plugin, mint an admin token, send `switch.toggle`
+/// via Connect JSON, assert the response carries the toggled state.
+/// Verifies the WIT `Value` variant → proto `Value` oneof projection
+/// and the reverse direction.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_devices_execute_command_end_to_end_through_simulated_switch() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let handle = engine
+        .start_instance(switch_dir, "switch-one", None)
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("running");
+
+    let device_id = engine
+        .devices()
+        .list()
+        .first()
+        .expect("switch registered a device")
+        .id
+        .clone();
+
+    let router = build_router(engine.clone());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.DevicesService/ExecuteCommand")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(format!(
+                    r#"{{"deviceId":"{device_id}","capability":"switch","action":"toggle"}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    // The Connect JSON encoding of a message with an unset oneof
+    // omits the field, so we accept either `ok` or `okWithState`.
+    // simulated-switch's toggle returns state, so `okWithState` is
+    // the expected variant; assert one of the two payload keys
+    // exists rather than pinning to a specific variant name.
+    let has_ok = body.get("ok").is_some();
+    let has_state = body.get("okWithState").is_some();
+    assert!(
+        has_ok || has_state,
+        "expected ok or okWithState payload, got {body:?}",
+    );
+
+    handle.stop().await.expect("stop");
+}
+
+/// Full install → start → stop → uninstall round-trip through
+/// Connect. Mirrors the JSON-side end-to-end
+/// (`install_start_stop_uninstall_end_to_end` in 12-API-f) so both
+/// surfaces exercise the same operator workflow.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_plugins_install_start_stop_uninstall_end_to_end() {
+    let state_dir = support::tempdir("connect-lifecycle-e2e");
+    let source = stage_install_source("connect-kvc-source", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine.clone());
+
+    // 1. Install.
+    let install = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.PluginsService/InstallPlugin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(format!(
+                    r#"{{"sourceDir":"{}"}}"#,
+                    source.path().display(),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(install.status(), StatusCode::OK);
+    let body = body_to_json(install.into_body()).await;
+    assert_eq!(body["pluginId"], "example.kv-counter");
+
+    // 2. Start with an explicit instance id.
+    let start = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.PluginsService/StartPlugin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(
+                    r#"{"pluginId":"example.kv-counter","instanceId":"kvc-1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+    let body = body_to_json(start.into_body()).await;
+    assert_eq!(body["state"], "Running");
+
+    // 3. Uninstall while running -> FailedPrecondition (Connect
+    //    HTTP 400 status, per the spec's InvalidArgument /
+    //    FailedPrecondition status mapping).
+    let uninstall_busy = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.PluginsService/UninstallPlugin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(r#"{"pluginId":"example.kv-counter"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Connect maps FailedPrecondition → HTTP 400 for the unary
+    // transport. Body has code=failed_precondition.
+    assert!(uninstall_busy.status().is_client_error());
+    let body = body_to_json(uninstall_busy.into_body()).await;
+    assert_eq!(body["code"], "failed_precondition");
+
+    // 4. Stop.
+    let stop = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.PluginsService/StopPlugin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(r#"{"pluginId":"example.kv-counter"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop.status(), StatusCode::OK);
+    let body = body_to_json(stop.into_body()).await;
+    let stopped = body["stoppedIds"].as_array().expect("stoppedIds array");
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0], "kvc-1");
+
+    // 5. Uninstall now works.
+    let uninstall = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.PluginsService/UninstallPlugin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(r#"{"pluginId":"example.kv-counter"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uninstall.status(), StatusCode::OK);
+    assert!(!state_dir.path().join("plugins/example.kv-counter").exists());
+}
