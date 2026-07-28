@@ -1,0 +1,117 @@
+// OxidHome v1 events service.
+//
+// Server-streaming counterpart to the JSON `GET /api/v1/events/tail`
+// WebSocket: opens a durable subscription to the host event bus and
+// yields one message per bus event until the client disconnects or
+// the daemon shuts down. First streaming RPC in the Connect surface
+// — every other cluster is unary.
+//
+// Same lagged-notice semantics as the JSON WebSocket: if the client
+// falls behind the broadcast channel's capacity, subsequent events
+// are dropped and the stream emits a `Lagged` variant carrying the
+// gap size, so the caller can decide whether to reconnect or accept
+// the drop. Gated on `events:tail` — the middleware runs auth once
+// before the stream is established, and a scope denial short-
+// circuits before the first message is emitted.
+syntax = "proto3";
+
+package oxidhome.v1;
+
+service EventsService {
+  // Subscribe to the host event bus. `TailEventsRequest` is
+  // reserved for future filter fields (topic prefix, device id);
+  // v1 streams every event.
+  rpc TailEvents(TailEventsRequest) returns (stream TailEventsResponse);
+}
+
+message TailEventsRequest {}
+
+// Each streamed message is either a bus event (via [`Event`]) or a
+// lagged-broadcast notice. Modeled as a `oneof` so a client that
+// only cares about real events pattern-matches on the variant and
+// ignores the sentinel; a client that wants to react to backpressure
+// gets a first-class field to look at.
+message TailEventsResponse {
+  oneof body {
+    // An event delivered by the host bus.
+    Event event = 1;
+    // The broadcast channel dropped `skipped` events because this
+    // subscriber fell behind capacity. Same shape as the JSON
+    // side's `{"lagged": N}` sentinel frame.
+    Lagged lagged = 2;
+  }
+}
+
+// Mirrors the WIT `event` record from `oxidhome::plugin::events`.
+// The JSON `WireEvent` shape ships the same field set — the
+// `topic` field the JSON side synthesizes at the top level is
+// omitted here since Connect clients can derive it from the
+// `payload` variant directly.
+message Event {
+  // Device the event is attributable to. Empty for bus-only
+  // (plugin lifecycle, custom-topic) events.
+  optional string device_id = 1;
+  // Millisecond Unix timestamp the host stamped at publish time.
+  int64 timestamp_ms = 2;
+  // Payload variants map one-to-one to WIT `event-payload`.
+  oneof payload {
+    StateChanged state_changed = 3;
+    Button button = 4;
+    Inference inference = 5;
+    CustomEvent custom = 6;
+  }
+}
+
+// Wire mirror of WIT `state-change`. The JSON side ships just
+// `capability`; Connect matches that shape for parity. If a client
+// needs the state fields, they arrive on the next `Devices.List` /
+// device-scoped query — the event carries only the changed-fact
+// signal, not the full snapshot.
+message StateChanged {
+  string capability = 1;
+}
+
+message Button {
+  // Which kind of button event fired. Mirrors the WIT
+  // `button-event` variant tags one-for-one.
+  ButtonKind kind = 1;
+  // Rotary delta for `BUTTON_KIND_ROTATED` (positive = clockwise).
+  // Unused for the other variants (proto3 default = 0.0).
+  double delta = 2;
+}
+
+enum ButtonKind {
+  BUTTON_KIND_UNSPECIFIED = 0;
+  BUTTON_KIND_PRESSED = 1;
+  BUTTON_KIND_RELEASED = 2;
+  BUTTON_KIND_SINGLE_PRESS = 3;
+  BUTTON_KIND_DOUBLE_PRESS = 4;
+  BUTTON_KIND_LONG_PRESS = 5;
+  BUTTON_KIND_ROTATED = 6;
+}
+
+// Wire mirror of WIT `inference-result` — detection bboxes,
+// classification scores, embeddings, etc. Plugin-specific schema
+// lives in the JSON `payload` body; `model` names the pipeline
+// that produced this result.
+message Inference {
+  string model = 1;
+  string payload = 2;
+  // Frame timestamp (Unix ms) if applicable, `None` otherwise.
+  optional int64 frame_timestamp_ms = 3;
+}
+
+message CustomEvent {
+  // Free-form topic string. Same field name the JSON WebSocket
+  // uses (`payload.topic`).
+  string topic = 1;
+  // Opaque payload body — plugins pick their own encoding.
+  string payload = 2;
+}
+
+message Lagged {
+  // Count of events the broadcast channel dropped since this
+  // subscriber last saw a message. Matches the JSON WebSocket's
+  // `{"lagged": N}` shape.
+  uint64 skipped = 1;
+}
