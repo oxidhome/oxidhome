@@ -17,5 +17,8 @@ wasm = "target/wasm32-wasip2/debug/event_recorder.wasm"
 singleton = false
 
 [capabilities]
-# Event-recorder doesn't register any devices; pub/sub is always
-# allowed in 0.1 (no event-related capability to declare).
+# Event-recorder doesn't register any devices; it only observes.
+# C2c requires the `subscribes_events` flag for any `subscribe`
+# call — without it, `host::subscribe_all()` in the plugin's
+# `init` returns `permission-denied`.
+subscribes_events = true

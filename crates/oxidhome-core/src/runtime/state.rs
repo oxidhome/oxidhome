@@ -590,6 +590,27 @@ impl host_events::Host for PluginState {
     }
 
     async fn subscribe(&mut self, filter: EventFilter) -> Result<SubscriptionId, WitError> {
+        // Architecture-review C2c: gate subscribe on
+        // `capabilities.subscribes_events`. Without the flag the
+        // plugin has no declared reason to observe the bus, so
+        // every subscribe fails permission-denied. Publishers are
+        // already gated by C2 ownership + capability checks; this
+        // is the parallel check on the subscriber side so
+        // cross-plugin observability is a manifest-declared
+        // decision, not a default. `unsubscribe` is deliberately
+        // uncapped — cleaning up a subscription that shouldn't
+        // exist is fine.
+        if !self.manifest.capabilities.subscribes_events {
+            tracing::warn!(
+                target: "host.events",
+                instance_id = %self.instance_id,
+                "subscribe denied — capabilities.subscribes_events is not set",
+            );
+            return Err(WitError::PermissionDenied(
+                "subscribe requires `capabilities.subscribes_events = true` in the plugin manifest"
+                    .into(),
+            ));
+        }
         let subscription = self.events.subscribe(filter);
         let id = subscription.id;
         self.subscriptions.push(subscription);
@@ -1004,6 +1025,11 @@ mod tests {
                     "video-stream".into(),
                     "audio-stream".into(),
                 ],
+                // C2c: the default fixture is subscribe-capable so
+                // the pre-existing subscribe/unsubscribe unit tests
+                // keep passing. The denial test below builds its
+                // own manifest without the flag.
+                subscribes_events: true,
                 ..CapabilitiesSection::default()
             },
             config: std::collections::BTreeMap::new(),
@@ -1400,6 +1426,79 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WitError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_subscribe_denied_without_capability() {
+        // Architecture-review C2c: a plugin whose manifest does not
+        // declare `subscribes_events = true` cannot observe the
+        // bus. The default fixture manifest sets the flag; this
+        // test rebuilds the manifest with the flag stripped and
+        // asserts subscribe refuses.
+        use oxidhome_manifest::CapabilitiesSection;
+        let mut manifest = (*fixture_manifest("no.subscribe")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            subscribes_events: false,
+            ..manifest.capabilities
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
+            fresh_event_log(),
+            fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
+        );
+
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let err = host_events::Host::subscribe(&mut state, filter)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+        assert!(
+            state.subscriptions.is_empty(),
+            "denied subscribe must not persist a subscription",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_unsubscribe_is_uncapped() {
+        // C2c gates `subscribe`, not `unsubscribe` — cleaning up a
+        // subscription that shouldn't exist is fine, and gating
+        // both would trap a plugin whose capability was revoked
+        // mid-flight in an un-cleanable-state limbo.
+        use oxidhome_manifest::CapabilitiesSection;
+        let mut manifest = (*fixture_manifest("no.subscribe")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            subscribes_events: false,
+            ..manifest.capabilities
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
+            fresh_event_log(),
+            fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
+        );
+        // No subscription exists → NotFound (not PermissionDenied).
+        let err = host_events::Host::unsubscribe(&mut state, 42)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::NotFound(_)), "got {err:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
