@@ -331,7 +331,29 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
                 tracing::error!(target: "api.devices", error = %err, "device command dispatch failed");
                 rpc_err(&ctx, ConnectError::internal("device command dispatch failed"))
             })?;
+        // F4: the RPC succeeded (wire response is HTTP 200 / gRPC
+        // OK / Connect Ok) but a `CommandResult::Err` payload is a
+        // domain failure. Record it on the outcome slot so the
+        // middleware audits with a synthesized status instead of a
+        // spurious `allow`. Mirrors the JSON side's `DomainOutcome`
+        // response-extension smuggle.
+        if let CommandResult::Err(ref err) = result {
+            record_domain_outcome(&ctx, err);
+        }
         Response::ok(command_result_to_proto(result))
+    }
+}
+
+/// F4 helper — stamps the [`HandlerOutcomeSlot`] with the
+/// synthesized status for a WIT domain error carried inside an
+/// otherwise-successful RPC response. See [`connect_auth_middleware`]
+/// for how the middleware reads it.
+fn record_domain_outcome(ctx: &RequestContext, err: &WitError) {
+    if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
+        slot.set(HandlerOutcome {
+            status: super::auth::wit_error_to_status(err),
+            denied_scope: None,
+        });
     }
 }
 

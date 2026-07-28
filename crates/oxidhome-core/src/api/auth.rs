@@ -60,9 +60,42 @@ use axum::{
 };
 
 use crate::auth::Actor;
+use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
 use crate::state::{
     AuditEntry, AuditLog, TokenError, TokenRecord, TokenStore, credential_fingerprint,
 };
+
+/// Smuggled on a response's extension map by JSON handlers whose
+/// wire response is HTTP 200 but whose *domain outcome* is a
+/// failure — the canonical case being `POST
+/// /api/v1/devices/{id}/command` returning `WireCommandResult::Err`.
+/// The auth middleware reads this back post-handler and audits with
+/// the carried status instead of the response's HTTP 200, so the
+/// ledger's `decision` column reflects the plugin's actual outcome
+/// (F4 architecture-review follow-up).
+///
+/// The Connect side achieves the same effect via
+/// [`super::connect_rpc::HandlerOutcomeSlot`] — a request-side
+/// smuggling channel — because gRPC / gRPC-Web responses already
+/// ride HTTP 200 for every RPC error.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DomainOutcome(pub(crate) StatusCode);
+
+/// WIT `error` variant → synthesized HTTP status for audit
+/// classification. Uses the same mapping the wire layer already
+/// applies at other boundaries (see `install_error_to_connect` for
+/// the Connect analog, and axum's default 4xx choices for the JSON
+/// side).
+#[must_use]
+pub(crate) fn wit_error_to_status(err: &WitError) -> StatusCode {
+    match err {
+        WitError::NotFound(_) => StatusCode::NOT_FOUND,
+        WitError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+        WitError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+        WitError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        WitError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
 
 /// Routes that don't require a bearer token. The canonical liveness
 /// probe lives on the Connect surface
@@ -196,7 +229,15 @@ pub(crate) async fn require_token(
         .extensions()
         .get::<crate::api::scopes::DeniedScope>()
         .map(|d| d.0);
-    let status = response.status();
+    // F4: handlers that return HTTP 200 with a domain-error body
+    // (e.g. `send_command` when the plugin returns `CommandResult::Err`)
+    // smuggle the synthesized status via a `DomainOutcome` response
+    // extension. Prefer that over the wire status so the audit
+    // ledger's `decision` reflects the actual outcome.
+    let status = response
+        .extensions()
+        .get::<DomainOutcome>()
+        .map_or_else(|| response.status(), |d| d.0);
     finalize_audit(
         &state.audit_log,
         audit_id,

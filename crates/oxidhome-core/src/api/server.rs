@@ -369,7 +369,7 @@ async fn send_command(
     State(state): State<ApiState>,
     Path(device_id): Path<String>,
     Json(body): Json<CommandBody>,
-) -> Result<Json<WireCommandResult>, CommandError> {
+) -> Result<axum::response::Response, CommandError> {
     require_scope(&actor, DEVICES_COMMAND).map_err(CommandError::Scope)?;
 
     // Resolve device → owning instance via the registry's
@@ -407,7 +407,23 @@ async fn send_command(
         .execute_command(device_id, cmd)
         .await
         .map_err(CommandError::Dispatch)?;
-    Ok(Json(command_result_to_wire(result)))
+
+    // F4: the wire response stays HTTP 200 (the RPC itself
+    // succeeded), but a `CommandResult::Err` is still a domain
+    // failure. Smuggle a synthesized status onto the response
+    // extensions so the auth middleware audits with the right
+    // `decision` instead of a spurious `allow`.
+    let domain_outcome = match &result {
+        CommandResult::Ok | CommandResult::OkWithState(_) => None,
+        CommandResult::Err(err) => Some(crate::api::auth::DomainOutcome(
+            crate::api::auth::wit_error_to_status(err),
+        )),
+    };
+    let mut response = Json(command_result_to_wire(result)).into_response();
+    if let Some(outcome) = domain_outcome {
+        response.extensions_mut().insert(outcome);
+    }
+    Ok(response)
 }
 
 enum CommandError {
