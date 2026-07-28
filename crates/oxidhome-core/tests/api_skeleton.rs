@@ -1998,6 +1998,45 @@ async fn assert_connect_scope_denied(uri: &str, scope_json: &[u8]) {
     );
 }
 
+/// `Logs.QueryLogs` with a `min_level` value that isn't a known
+/// enum variant must be rejected as `invalid_argument`, not
+/// silently interpreted as "no filter." The proto3 default
+/// (`LOG_LEVEL_UNSPECIFIED = 0`) means "no filter"; an unknown
+/// numeric value is a client bug and should surface as such.
+/// Pins the fix for PR #67 review finding #2.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_logs_query_rejects_unknown_min_level_as_invalid_argument() {
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // 999 is well past any known LogLevel variant. Connect's JSON
+    // wire format accepts an int here; buffa lands it as
+    // `EnumValue::Unknown(999)`.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.LogsService/QueryLogs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(r#"{"minLevel":999}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Connect's `InvalidArgument` maps to HTTP 400 on the unary
+    // transport.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["code"], "invalid_argument");
+    // Message includes the offending numeric value so a client can
+    // diagnose without guessing.
+    assert!(
+        body["message"].as_str().unwrap_or_default().contains("999"),
+        "expected offending value in error message, got {body:?}",
+    );
+}
+
 /// The Connect audit row on a scope denial now carries the missing
 /// scope name in `required_scope` — the JSON side has done this
 /// since 12-API-b via a `DeniedScope` response-extension smuggle,
@@ -2074,4 +2113,89 @@ fn connect_scope_deny_audit_row_carries_required_scope() {
         "audit row should name the missing scope, got fields {:?}",
         rows[0].fields
     );
+}
+
+/// Same scope-denied Connect call as
+/// `connect_scope_deny_audit_row_carries_required_scope`, but on
+/// the **gRPC-Web** transport. The Connect spec renders RPC errors
+/// for gRPC / gRPC-Web as HTTP 200 with the status in body/trailers;
+/// naively classifying the audit `decision` off `response.status()`
+/// would call this `allow` even though the handler denied the
+/// request — see PR #67 review finding #1. Pins the middleware's
+/// transport-independent classification: when the handler
+/// recorded a `DeniedScope`, the audit row is `deny` regardless of
+/// the wire shape.
+#[test]
+fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
+    use oxidhome_core::state::LogQuery;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("scoped", b"[\"logs:read\"]")
+        .unwrap();
+    let log_store = engine.log_store();
+    let subscriber = Registry::default().with(log_store.layer());
+
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            // A well-formed gRPC-Web frame is required for the
+            // dispatcher to reach the handler — otherwise the
+            // dispatcher rejects on framing before scope check
+            // runs and we never populate `DeniedScopeSlot`.
+            // ListDevicesRequest is an empty proto3 message
+            // (zero-byte payload); framing is 1 byte flags
+            // (0 = uncompressed data frame) + 4 bytes big-endian
+            // length (0) + 0 bytes payload = 5 bytes total.
+            let frame = &[0u8, 0, 0, 0, 0][..];
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/oxidhome.v1.DevicesService/ListDevices")
+                        .header(header::CONTENT_TYPE, "application/grpc-web+proto")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", issued.plaintext),
+                        )
+                        .body(Body::from(frame.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // gRPC-Web puts the RPC error in trailers on top of
+            // HTTP 200 — the audit classifier must not mistake
+            // that for a success.
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+    log_store.wait_drained_for_test();
+    let rows = log_store
+        .query(
+            &LogQuery {
+                target_prefix: Some("api.audit".into()),
+                ..LogQuery::default()
+            },
+            32,
+        )
+        .expect("query api.audit");
+    assert_eq!(rows.len(), 1);
+    let fields = extract_audit_fields(&rows[0].fields);
+    assert_eq!(
+        fields.decision, "deny",
+        "gRPC-Web scope denial must audit as deny, got fields {:?}",
+        rows[0].fields
+    );
+    assert_eq!(fields.required_scope, "devices:list");
 }

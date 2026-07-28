@@ -11,21 +11,24 @@
 //! - Connect paths (`POST /oxidhome.v1.HealthService/Check` etc.) fall
 //!   through to the Connect router.
 //!
-//! **Auth status (load-bearing for the migration):** axum's
-//! [`Router::fallback_service`] is registered *after* the
-//! `require_token` `.layer(...)` and is therefore **not** wrapped
-//! by it. Every Connect path is currently served **unauthenticated
-//! and unaudited.** That's correct today — `Health.Check` is an
-//! anonymous liveness probe by design — but it is a strict
-//! prerequisite for migrating any of the existing scoped JSON
-//! endpoints (`instances:list`, `devices:command`, `plugins:*`)
-//! onto the Connect surface: doing so without first wiring a
-//! Connect-side auth + scope + audit interceptor would expose
-//! those endpoints unauthenticated. The `connectrpc` runtime
-//! supports tower-style interceptors for exactly this; that
-//! interceptor (with `Health.Check` allow-listed) lands as the
-//! first slice of the next phase, before any authenticated
-//! service joins this router.
+//! **Auth + audit shape.** The Connect surface is wrapped by
+//! [`axum_service`]'s own `from_fn_with_state` middleware (see
+//! [`connect_auth_middleware`]) — added in 15-b — which
+//! authenticates every non-anonymous request against the same
+//! [`TokenStore`](crate::state::TokenStore) the JSON `require_token`
+//! uses, stamps an [`Actor`] into `req.extensions_mut()` (forwarded
+//! into [`RequestContext::extensions()`] by the Connect dispatcher),
+//! and emits one `api.audit` row per authenticated request. The
+//! `Health.Check` path is on the anonymous allow-list so liveness
+//! probes still work without credentials.
+//!
+//! Per-RPC scope enforcement happens inside each handler via
+//! [`require_scope_connect`], mirroring the JSON handler-side
+//! `require_scope` pattern. Denials surface as
+//! `ConnectError::permission_denied` and the missing scope name
+//! is smuggled back to the middleware through a [`DeniedScopeSlot`]
+//! request-extension so the audit row's `required_scope` field
+//! matches the JSON side's shape.
 
 use std::sync::{Arc, Mutex};
 
@@ -285,13 +288,30 @@ impl oxidhome_proto::connect::oxidhome::v1::LogsService for OxidHomeLogs {
             .limit
             .unwrap_or(LOGS_QUERY_DEFAULT_LIMIT)
             .clamp(1, LOGS_QUERY_MAX_LIMIT);
+        // `min_level` handling: `LOG_LEVEL_UNSPECIFIED` is the
+        // proto3 default sentinel and means "no filter" (a client
+        // that omits the field gets it back as Unspecified). A wire
+        // value that doesn't map to any known variant is instead a
+        // client bug — silently treating `Unknown(999)` as "no
+        // filter" would broaden a client's intended query in a way
+        // they can't observe. Reject those with `invalid_argument`.
+        let min_level = match req.min_level {
+            None | Some(oxidhome_proto::runtime::EnumValue::Known(ProtoLogLevel::Unspecified)) => {
+                None
+            }
+            Some(oxidhome_proto::runtime::EnumValue::Known(known)) => {
+                proto_log_level_to_host(known)
+            }
+            Some(oxidhome_proto::runtime::EnumValue::Unknown(v)) => {
+                return Err(ConnectError::invalid_argument(format!(
+                    "min_level: unknown log-level value {v}"
+                )));
+            }
+        };
         let query = LogQuery {
             since_ms: req.since_ms,
             until_ms: req.until_ms,
-            min_level: req
-                .min_level
-                .and_then(|ev| ev.as_known())
-                .and_then(proto_log_level_to_host),
+            min_level,
             instance_id: req.instance_id,
             plugin_id: req.plugin_id,
             device_id: req.device_id,
@@ -517,12 +537,33 @@ async fn connect_auth_middleware(
     // audit row's `required_scope` field stays empty (same shape as
     // the JSON side's allow rows).
     let denied_scope = denied_scope_slot.take().map(Scope::name);
+    // **Transport-independent decision classification.** Non-unary
+    // Connect transports (gRPC, gRPC-Web) render RPC errors as
+    // HTTP 200 with `grpc-status` in headers/trailers (or in the
+    // body for gRPC-Web) — `emit_audit`'s response-status classifier
+    // would then mis-audit a scope denial as `decision=allow` on
+    // those transports. When the handler explicitly recorded a
+    // scope denial via `DeniedScopeSlot`, that IS the ground truth
+    // and we synthesize a 403 status for the audit row so
+    // `emit_audit`'s classifier picks the right decision on every
+    // transport.
+    //
+    // The broader gap (non-scope Connect errors like
+    // `ConnectError::not_found` still audit as `allow` on
+    // gRPC/gRPC-Web) needs peeking at `grpc-status`
+    // trailers/bodies; leaving as a documented follow-up until a
+    // handler actually returns those.
+    let audit_status = if denied_scope.is_some() {
+        axum::http::StatusCode::FORBIDDEN
+    } else {
+        response.status()
+    };
     emit_audit(
         &token_id,
         &actor_kind,
         &method,
         &path,
-        response.status(),
+        audit_status,
         denied_scope,
     );
     response
