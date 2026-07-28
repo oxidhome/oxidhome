@@ -48,23 +48,29 @@ use connectrpc::{
     ServiceResult,
 };
 use oxidhome_proto::connect::oxidhome::v1::{
-    DevicesServiceExt, HealthServiceExt, InstancesServiceExt, LogsServiceExt, PluginsServiceExt,
+    DevicesServiceExt, EventsServiceExt, HealthServiceExt, InstancesServiceExt, LogsServiceExt,
+    PluginsServiceExt,
 };
 use oxidhome_proto::proto::oxidhome::v1::{
-    CheckRequest, CheckResponse, Device, ExecuteCommandError as ProtoCmdError,
-    ExecuteCommandRequest, ExecuteCommandResponse, InstallPluginRequest, InstallPluginResponse,
-    Instance, KeyValue as ProtoKeyValue, ListDevicesRequest, ListDevicesResponse,
+    Button as ProtoButton, ButtonKind as ProtoButtonKind, CheckRequest, CheckResponse,
+    CustomEvent as ProtoCustomEvent, Device, Event as ProtoEvent,
+    ExecuteCommandError as ProtoCmdError, ExecuteCommandRequest, ExecuteCommandResponse,
+    Inference as ProtoInference, InstallPluginRequest, InstallPluginResponse, Instance,
+    KeyValue as ProtoKeyValue, Lagged as ProtoLagged, ListDevicesRequest, ListDevicesResponse,
     ListInstancesRequest, ListInstancesResponse, ListPluginsRequest, ListPluginsResponse,
     LogEvent as ProtoLogEvent, LogField as ProtoLogField, LogLevel as ProtoLogLevel,
     LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest, QueryLogsResponse,
-    StartPluginRequest, StartPluginResponse, StopPluginRequest, StopPluginResponse,
-    UninstallPluginRequest, UninstallPluginResponse, Value as ProtoValue, execute_command_error,
-    execute_command_response, log_value, value,
+    StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged, StopPluginRequest,
+    StopPluginResponse, TailEventsRequest, TailEventsResponse, UninstallPluginRequest,
+    UninstallPluginResponse, Value as ProtoValue, event as proto_event, execute_command_error,
+    execute_command_response, log_value, tail_events_response, value,
 };
 
 use crate::Engine;
 use crate::auth::Actor;
+use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent as WitButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::events::{Event as WitEvent, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
 use crate::state::{
     HistoricalLogEvent, InstallError, LogLevel, LogQuery, LogValue, TokenError, UninstallError,
@@ -72,8 +78,9 @@ use crate::state::{
 
 use super::auth::{AuthState, actor_from_record, emit_audit, extract_bearer};
 use super::scopes::{
-    DEVICES_COMMAND, DEVICES_LIST, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST,
-    PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope, ScopeDenied, require_scope,
+    DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL,
+    PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope, ScopeDenied,
+    require_scope,
 };
 
 /// `HealthService` implementation. Anonymous — no engine state is
@@ -811,6 +818,132 @@ fn log_value_to_proto(value: LogValue) -> ProtoLogValue {
     }
 }
 
+// ── Events.TailEvents (server-streaming) ────────────────────────
+
+struct OxidHomeEvents {
+    engine: Engine,
+}
+
+impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
+    async fn tail_events(
+        &self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, TailEventsRequest>,
+    ) -> ServiceResult<connectrpc::ServiceStream<impl Encodable<TailEventsResponse> + Send + use<>>>
+    {
+        // Auth + scope check runs BEFORE the stream is established
+        // — a denied caller sees a clean Connect error, no wasted
+        // stream setup, and the audit row lands with the right
+        // decision via the outcome slot.
+        require_scope_connect(&ctx, EVENTS_TAIL)?;
+
+        // Subscribe *before* returning the stream so the caller
+        // doesn't miss an event that fires between `stream_ok`
+        // returning and the future being polled for the first
+        // time. The broadcast receiver buffers up to the channel
+        // capacity independently of when the subscriber first
+        // reads.
+        let subscription = self.engine.events().subscribe_all();
+        let response_stream =
+            futures_util::stream::unfold(subscription.receiver, |mut receiver| async move {
+                use tokio::sync::broadcast::error::RecvError;
+                let body = match receiver.recv().await {
+                    Ok(event) => {
+                        tail_events_response::Body::Event(Box::new(wit_event_to_proto(event)))
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        tail_events_response::Body::Lagged(Box::new(ProtoLagged {
+                            skipped: n,
+                            ..Default::default()
+                        }))
+                    }
+                    // Channel closed — publisher gone (engine
+                    // shutting down). End the stream cleanly.
+                    Err(RecvError::Closed) => return None,
+                };
+                Some((
+                    Ok(TailEventsResponse {
+                        body: Some(body),
+                        ..Default::default()
+                    }),
+                    receiver,
+                ))
+            });
+        Response::stream_ok(response_stream)
+    }
+}
+
+fn wit_event_to_proto(event: WitEvent) -> ProtoEvent {
+    let payload = match event.payload {
+        EventPayload::StateChanged(sc) => Some(proto_event::Payload::StateChanged(Box::new(
+            ProtoStateChanged {
+                capability: sc.capability,
+                // Full state-change record — capability + the
+                // partial-state fields. PR #75 review flagged the
+                // earlier `capability`-only shape as silently
+                // dropping the actual changed values; the WIT
+                // record carries them and Connect clients have no
+                // other RPC to fetch device state from.
+                fields: sc.fields.into_iter().map(wit_key_value_to_proto).collect(),
+                ..Default::default()
+            },
+        ))),
+        EventPayload::Button(button) => {
+            let (kind, delta) = match button {
+                WitButtonEvent::Pressed => (ProtoButtonKind::Pressed, 0.0),
+                WitButtonEvent::Released => (ProtoButtonKind::Released, 0.0),
+                WitButtonEvent::SinglePress => (ProtoButtonKind::SinglePress, 0.0),
+                WitButtonEvent::DoublePress => (ProtoButtonKind::DoublePress, 0.0),
+                WitButtonEvent::LongPress => (ProtoButtonKind::LongPress, 0.0),
+                WitButtonEvent::Rotated(d) => (ProtoButtonKind::Rotated, d),
+            };
+            Some(proto_event::Payload::Button(Box::new(ProtoButton {
+                kind: kind.into(),
+                delta,
+                ..Default::default()
+            })))
+        }
+        EventPayload::Inference(i) => {
+            Some(proto_event::Payload::Inference(Box::new(ProtoInference {
+                model: i.model,
+                payload: i.payload,
+                // WIT `unix-ms` is `u64`; proto field is `uint64`.
+                // Direct assignment — the previous `cast_signed` on
+                // an `int64` field wrapped large timestamps to
+                // negative on the wire.
+                frame_timestamp_ms: i.frame_timestamp,
+                ..Default::default()
+            })))
+        }
+        EventPayload::Custom(c) => Some(proto_event::Payload::Custom(Box::new(ProtoCustomEvent {
+            topic: c.topic,
+            payload: c.payload,
+            ..Default::default()
+        }))),
+    };
+    ProtoEvent {
+        device_id: event.device,
+        // Plugin-supplied timestamp; `uint64` on the proto matches
+        // the WIT `unix-ms` type. Preserves values above `i64::MAX`
+        // that the earlier `int64` encoding would have wrapped
+        // negative.
+        timestamp_ms: event.timestamp,
+        payload,
+        ..Default::default()
+    }
+}
+
+/// Convert a WIT `key-value` (as used inside `StateChanged.fields`)
+/// to the proto `KeyValue` message shared with `Devices.ExecuteCommand`.
+/// Reuses the existing `wit_value_to_proto` variant projection.
+fn wit_key_value_to_proto(kv: KeyValue) -> ProtoKeyValue {
+    ProtoKeyValue {
+        key: kv.key,
+        value: wit_value_to_proto(kv.value).into(),
+        ..Default::default()
+    }
+}
+
 /// Build the Connect router with every `OxidHome` service registered.
 /// The caller mounts it on the axum app via
 /// [`connectrpc::Router::into_axum_service`].
@@ -830,7 +963,11 @@ pub fn router(engine: Engine) -> ConnectRouter {
         engine: engine.clone(),
     })
     .register(router);
-    Arc::new(OxidHomeLogs { engine }).register(router)
+    let router = Arc::new(OxidHomeLogs {
+        engine: engine.clone(),
+    })
+    .register(router);
+    Arc::new(OxidHomeEvents { engine }).register(router)
 }
 
 // ── Auth + audit middleware ─────────────────────────────────────

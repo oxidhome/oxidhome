@@ -97,6 +97,11 @@ buffa = { version = "=0.8.1", default-features = false, features = ["json"] }
 # `.next()` / `.send()` / `.close()` on the `WebSocketStream` (those
 # methods come from `futures-util`'s `StreamExt` / `SinkExt`).
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
+# `http-body-util` also lands in the graph via `axum` / `connectrpc`.
+# Lifting it to a workspace dep so the Connect server-streaming
+# integration test in 15-e can read one frame off the response
+# body via `BodyExt::frame()` without pulling in a second copy.
+http-body-util = "0.1.3"
 # `rand` and `sha2` versions match what wasmtime / wasmtime-wasi
 # pull in transitively so the dep graph contains exactly one copy
 # of each. Bumping our pin past wasmtime's would double-count both

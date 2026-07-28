@@ -1239,6 +1239,7 @@ dependencies = [
  "axum",
  "connectrpc",
  "futures-util",
+ "http-body-util",
  "oxidhome-manifest",
  "oxidhome-proto",
  "rand 0.10.2",

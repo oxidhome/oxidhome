@@ -138,10 +138,20 @@ tower.workspace = true
 # `into_axum_service()`.
 connectrpc.workspace = true
 oxidhome-proto.workspace = true
+# `futures-util` was originally a dev-dep for the 12-API-e WS
+# round-trip test; 15-e's `Events.TailEvents` server-streaming
+# handler builds its response stream via `futures::stream::unfold`
+# so the dep moves up to a regular dep. Still one lockfile copy —
+# the dev tests keep pulling it via this same workspace pin.
+futures-util.workspace = true
 
 [dev-dependencies]
 # 12-API-e — real WS round-trip test. Already in the dep graph via
 # `axum`'s `ws` feature, pinned to the same version so the lockfile
 # stays single-copy.
 tokio-tungstenite.workspace = true
-futures-util.workspace = true
+# 15-e — the Connect server-streaming integration test uses
+# `BodyExt::frame()` to peel one Connect-JSON envelope frame off
+# the response body without waiting for the (never-ending) stream
+# to close.
+http-body-util.workspace = true

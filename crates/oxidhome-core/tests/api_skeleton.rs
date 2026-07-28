@@ -2586,3 +2586,299 @@ async fn connect_plugins_install_start_stop_uninstall_end_to_end() {
     assert_eq!(uninstall.status(), StatusCode::OK);
     assert!(!state_dir.path().join("plugins/example.kv-counter").exists());
 }
+
+// ── Connect Events.TailEvents (15-e, streaming) ─────────────────
+
+/// Wrap a JSON message payload in a Connect stream envelope frame:
+/// 1 byte flag (0 = data) + 4 bytes big-endian length + payload.
+/// The dispatcher expects this shape on `application/connect+json`
+/// requests — a bare JSON body is rejected as
+/// `incomplete request envelope` before any handler runs.
+fn connect_stream_request_envelope(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0u8);
+    frame.extend_from_slice(
+        &u32::try_from(payload.len())
+            .expect("payload fits in u32")
+            .to_be_bytes(),
+    );
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Scope-deny on a **streaming** Connect endpoint. The shared
+/// `assert_connect_scope_denied` helper uses `application/json`
+/// (Connect unary Content-Type), which the dispatcher rejects on
+/// streaming methods with `unimplemented` — different code path.
+/// This test sends `application/connect+json` (Connect streaming
+/// Content-Type) so it reaches the handler; the scope check runs
+/// before the stream is established and comes back as HTTP 200
+/// with a gRPC-style trailer carrying `permission_denied`
+/// (streaming errors ride in trailers, not on the HTTP status).
+#[tokio::test(flavor = "current_thread")]
+async fn connect_events_tail_scope_deny_returns_permission_denied() {
+    let engine = Engine::new().expect("engine");
+    let token = engine
+        .auth_tokens()
+        .create("scoped", b"[\"logs:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+    // Connect streaming expects a framed request envelope (5-byte
+    // header + payload), same shape as the response frames — so a
+    // bare `{}` body would be rejected by the dispatcher with
+    // `incomplete request envelope` before the auth check runs.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.EventsService/TailEvents")
+                .header(header::CONTENT_TYPE, "application/connect+json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.plaintext))
+                .body(Body::from(connect_stream_request_envelope(b"{}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Connect streaming puts errors in the response body/trailers
+    // on top of HTTP 200, not on the HTTP status.
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    // The body must carry the `permission_denied` code in a
+    // Connect end-stream envelope — a naive substring check is
+    // enough here since the code appears verbatim in the JSON.
+    let body_str = String::from_utf8_lossy(&bytes);
+    assert!(
+        body_str.contains("permission_denied"),
+        "expected permission_denied in streaming body, got: {body_str}",
+    );
+}
+
+/// Publish an event via the in-process bus, then drain the
+/// Connect server-streaming response body until the first Data
+/// frame arrives. Parses the Connect JSON envelope:
+/// 5-byte frame header (1 byte flag + 4 bytes big-endian length)
+/// + N bytes JSON payload. Yields the first message's parsed JSON
+/// so the test can assert the payload variant.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_events_tail_streams_a_custom_event() {
+    use http_body_util::BodyExt as _;
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload,
+    };
+    use std::time::Duration;
+
+    let engine = Engine::new().expect("engine");
+    let token = engine
+        .auth_tokens()
+        .create("streamer", b"[\"events:tail\"]")
+        .unwrap();
+    let router = build_router(engine.clone());
+
+    // Race-proof publish loop — same shape as the JSON WS test.
+    // `connect_async` returning tells us HTTP 200 + headers landed;
+    // the handler's `subscribe_all` runs a moment after. A single
+    // publish before the subscriber exists is dropped by
+    // `tokio::broadcast`, so we publish on a 50 ms cadence until
+    // the recv side aborts us. Idempotent — the test only inspects
+    // the first frame.
+    let publisher_engine = engine.clone();
+    let publisher = tokio::spawn(async move {
+        loop {
+            publisher_engine.events().publish(Event {
+                device: None,
+                timestamp: 0,
+                payload: EventPayload::Custom(CustomEvent {
+                    topic: "connect-e2e.toggle".into(),
+                    payload: String::new(),
+                }),
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.EventsService/TailEvents")
+                .header(header::CONTENT_TYPE, "application/connect+json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.plaintext))
+                .body(Body::from(connect_stream_request_envelope(b"{}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    // Drain body frames until we've read the first Connect message
+    // (5-byte header + payload). Small messages usually arrive in a
+    // single HTTP data frame, but nothing in axum guarantees that,
+    // so buffer across frames.
+    let mut buf: Vec<u8> = Vec::new();
+    let message_json = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame_opt = body.frame().await;
+            let Some(Ok(frame)) = frame_opt else {
+                return None;
+            };
+            if let Ok(data) = frame.into_data() {
+                buf.extend_from_slice(&data);
+            }
+            if buf.len() < 5 {
+                continue;
+            }
+            // Frame header: 1 byte flag (0 = data, 2 = end-of-stream)
+            // + 4 bytes big-endian length.
+            let flag = buf[0];
+            let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            if buf.len() < 5 + len {
+                continue;
+            }
+            // Skip end-of-stream frames — we want a data frame with
+            // the published event.
+            if flag & 0x02 != 0 {
+                buf.drain(..5 + len);
+                continue;
+            }
+            let payload_bytes = buf[5..5 + len].to_vec();
+            return Some(payload_bytes);
+        }
+    })
+    .await
+    .expect("first frame within 5s")
+    .expect("frame body available");
+    publisher.abort();
+
+    let json: Value = serde_json::from_slice(&message_json).expect("json message");
+    // The envelope carries `event.payload.custom.topic` for a
+    // Custom event — same shape a Connect client sees via the
+    // generated `TailEventsResponse` message.
+    let custom = &json["event"]["custom"];
+    assert!(
+        !custom.is_null(),
+        "expected a Custom event payload, got {json:?}",
+    );
+    assert_eq!(custom["topic"], "connect-e2e.toggle");
+}
+
+/// PR #75 review findings — `StateChanged` carries the WIT
+/// `state-change.fields` list, and `Event.timestamp_ms` /
+/// `Inference.frame_timestamp_ms` are `uint64` on the wire (not
+/// `int64`), so plugin-supplied timestamps above `i64::MAX` don't
+/// wrap negative in transit.
+///
+/// Publishes a `StateChanged` event with a `brightness = 42` field
+/// AND a timestamp above `i64::MAX`; asserts the streamed proto
+/// carries both the field and the unsigned timestamp verbatim.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_events_tail_state_changed_preserves_fields_and_unsigned_timestamp() {
+    use http_body_util::BodyExt as _;
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        Event, EventPayload, StateChange,
+    };
+    // Rename the WIT `Value` on import so it doesn't shadow the
+    // `serde_json::Value` alias `Value` this test file imports at
+    // the top for JSON assertions.
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value as WitValue};
+    use std::time::Duration;
+
+    // A timestamp above `i64::MAX` — the previous `int64` proto
+    // shape + `cast_signed` would render this as a negative value
+    // on the wire.
+    const BIG_TS: u64 = u64::MAX - 42;
+
+    let engine = Engine::new().expect("engine");
+    let token = engine
+        .auth_tokens()
+        .create("streamer", b"[\"events:tail\"]")
+        .unwrap();
+    let router = build_router(engine.clone());
+
+    let publisher_engine = engine.clone();
+    let publisher = tokio::spawn(async move {
+        loop {
+            publisher_engine.events().publish(Event {
+                device: Some("switch-1".into()),
+                timestamp: BIG_TS,
+                payload: EventPayload::StateChanged(StateChange {
+                    capability: "switch".into(),
+                    fields: vec![KeyValue {
+                        key: "brightness".into(),
+                        value: WitValue::IntVal(42),
+                    }],
+                }),
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.EventsService/TailEvents")
+                .header(header::CONTENT_TYPE, "application/connect+json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.plaintext))
+                .body(Body::from(connect_stream_request_envelope(b"{}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    let mut buf: Vec<u8> = Vec::new();
+    let message_json = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame_opt = body.frame().await;
+            let Some(Ok(frame)) = frame_opt else {
+                return None;
+            };
+            if let Ok(data) = frame.into_data() {
+                buf.extend_from_slice(&data);
+            }
+            if buf.len() < 5 {
+                continue;
+            }
+            let flag = buf[0];
+            let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            if buf.len() < 5 + len {
+                continue;
+            }
+            if flag & 0x02 != 0 {
+                buf.drain(..5 + len);
+                continue;
+            }
+            let payload_bytes = buf[5..5 + len].to_vec();
+            return Some(payload_bytes);
+        }
+    })
+    .await
+    .expect("first frame within 5s")
+    .expect("frame body available");
+    publisher.abort();
+
+    let json: Value = serde_json::from_slice(&message_json).expect("json message");
+    let event = &json["event"];
+    // StateChanged variant lands under `event.stateChanged` in
+    // Connect's canonical protobuf-JSON.
+    let sc = &event["stateChanged"];
+    assert!(
+        !sc.is_null(),
+        "expected a StateChanged payload, got {json:?}",
+    );
+    assert_eq!(sc["capability"], "switch");
+    // `fields` was silently dropped by the previous handler shape.
+    let fields = sc["fields"].as_array().expect("fields array");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["key"], "brightness");
+    assert_eq!(fields[0]["value"]["intVal"], "42"); // int64 → JSON string per proto3 canonical
+    // Timestamp preserved as an unsigned decimal string. Numeric
+    // JSON strings are protobuf-JSON's canonical representation
+    // for 64-bit integers; the important assertion is that the
+    // value equals BIG_TS, not that it's a negative number.
+    assert_eq!(event["timestampMs"], BIG_TS.to_string());
+}
