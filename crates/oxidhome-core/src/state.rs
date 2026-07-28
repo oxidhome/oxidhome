@@ -27,7 +27,7 @@ pub mod kv;
 pub mod log_store;
 pub mod services;
 
-pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery};
+pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery, credential_fingerprint};
 pub use auth_token::{IssuedToken, TokenError, TokenRecord, TokenStore};
 pub use blobs::{BlobError, BlobInfo, BlobStore};
 pub use db::Db;

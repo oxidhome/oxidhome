@@ -76,7 +76,9 @@ use crate::state::{
     HistoricalLogEvent, InstallError, LogLevel, LogQuery, LogValue, TokenError, UninstallError,
 };
 
-use super::auth::{AuthState, actor_from_record, emit_audit, extract_bearer};
+use super::auth::{
+    AuthState, actor_from_record, extract_bearer, finalize_audit, record_anonymous_probe,
+};
 use super::scopes::{
     DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL,
     PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope, ScopeDenied,
@@ -1039,28 +1041,24 @@ async fn connect_auth_middleware(
         return next.run(req).await;
     }
     let path = req.uri().path().to_string();
+    let method = req.method().to_string();
 
-    let Some(bearer) = extract_bearer(&req) else {
-        // Collapse missing / malformed / unknown / revoked into one
-        // opaque message — matches the JSON `require_token`'s "can't
-        // probe shape, validity, or revocation" stance from
-        // 12-API-a so a Connect client can't tell the four cases
-        // apart either.
+    let Some(bearer) = extract_bearer(&req).map(str::to_owned) else {
+        // No `Authorization` header — record an anonymous probe (no
+        // fingerprint, nothing was presented) then respond with the
+        // Connect-native "unauthenticated" shape.
+        record_anonymous_probe(&state.audit_log, &method, &path, 401, None).await;
         return connect_error_response(
             ConnectError::unauthenticated("unauthenticated"),
             req.headers(),
         );
     };
     let outcome_slot = HandlerOutcomeSlot::default();
-    let (token_id, actor_kind, method) = match state.tokens.verify(bearer) {
+    let (token_id, actor_kind) = match state.tokens.verify(&bearer) {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
-            // Snapshot the strings we'll need post-handler for the
-            // audit row *before* moving `actor` onto the request
-            // extension — same pattern as `require_token`.
             let token_id = actor.id().to_string();
             let actor_kind = actor.kind().as_str().to_string();
-            let method = req.method().to_string();
             req.extensions_mut().insert(actor);
             // Give the handler a way to smuggle back its outcome
             // (scope-deny name + a synthesized HTTP status for the
@@ -1068,9 +1066,11 @@ async fn connect_auth_middleware(
             // docstring for why we can't just read the response
             // status on gRPC / gRPC-Web transports.
             req.extensions_mut().insert(outcome_slot.clone());
-            (token_id, actor_kind, method)
+            (token_id, actor_kind)
         }
         Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
+            let fp = crate::state::credential_fingerprint(&bearer);
+            record_anonymous_probe(&state.audit_log, &method, &path, 401, Some(fp)).await;
             return connect_error_response(
                 ConnectError::unauthenticated("unauthenticated"),
                 req.headers(),
@@ -1079,6 +1079,53 @@ async fn connect_auth_middleware(
         Err(TokenError::Sqlite(err)) => {
             tracing::error!(target: "api.auth", error = %err, "token verify failed");
             return connect_error_response(ConnectError::internal("internal error"), req.headers());
+        }
+    };
+
+    // (F1) Pre-audit intent — same shape as the JSON middleware.
+    // Fail-closed on ledger error.
+    let intent = crate::state::AuditEntry {
+        intent_ms: 0,
+        finalized_ms: None,
+        token_id: token_id.clone(),
+        actor_kind: actor_kind.clone(),
+        method: method.clone(),
+        path: path.clone(),
+        status: 0,
+        decision: "pending".into(),
+        required_scope: None,
+        credential_fp: None,
+    };
+    let audit_id = {
+        let al = Arc::clone(&state.audit_log);
+        match tokio::task::spawn_blocking(move || al.record_intent(&intent)).await {
+            Ok(Ok(id)) => id,
+            Ok(Err(err)) => {
+                eprintln!(
+                    "oxidhome audit_log: connect record_intent failed; refusing request: {err}",
+                );
+                tracing::error!(
+                    target: "api.audit",
+                    error = %err,
+                    token_id = %token_id,
+                    method = %method,
+                    path = %path,
+                    "audit-ledger intent write failed — refusing request",
+                );
+                return connect_error_response(
+                    ConnectError::internal("internal error"),
+                    req.headers(),
+                );
+            }
+            Err(join_err) => {
+                eprintln!(
+                    "oxidhome audit_log: connect record_intent join failed; refusing request: {join_err}",
+                );
+                return connect_error_response(
+                    ConnectError::internal("internal error"),
+                    req.headers(),
+                );
+            }
         }
     };
 
@@ -1107,15 +1154,17 @@ async fn connect_auth_middleware(
     let outcome = outcome_slot.take();
     let audit_status = outcome.map_or_else(|| response.status(), |o| o.status);
     let denied_scope = outcome.and_then(|o| o.denied_scope).map(Scope::name);
-    emit_audit(
+    finalize_audit(
         &state.audit_log,
+        audit_id,
         &token_id,
         &actor_kind,
         &method,
         &path,
         audit_status,
         denied_scope,
-    );
+    )
+    .await;
     response
 }
 
