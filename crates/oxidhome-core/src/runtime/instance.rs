@@ -633,6 +633,20 @@ impl PluginInstance {
     pub fn manifest(&self) -> &PluginManifest {
         &self.store.data().manifest
     }
+
+    /// Per-instance wake `Notify` — C2d wake-isolation. Held on
+    /// the `PluginState` inside `store.data()` and shared with the
+    /// [`EventBus`](crate::state::EventBus) at
+    /// `subscribe_with_wake` time. The supervisor's serve loop
+    /// awaits `notified()` on this so it only wakes when a
+    /// published event matches one of the plugin's active
+    /// subscription filters, replacing the pre-C2d unconditional
+    /// `subscribe_all()` broadcast wakeup that woke every
+    /// supervisor on every publish.
+    #[must_use]
+    pub fn wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.store.data().wake)
+    }
 }
 
 /// Join `plugin_dir + manifest.runtime.wasm`, canonicalize both, and

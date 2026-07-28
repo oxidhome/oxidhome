@@ -31,13 +31,11 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use oxidhome_manifest::RestartPolicy;
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use crate::Engine;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
-use crate::host_impl::plugin::oxidhome::plugin::events::Event;
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
 use crate::runtime::dispatcher::{CALL_STACK, CallFrame};
 use crate::state::CallGuard;
@@ -603,11 +601,16 @@ async fn run_supervisor(
     mut control_rx: mpsc::Receiver<ControlCommand>,
     state_tx: watch::Sender<InstanceState>,
 ) {
-    // Subscribe the wakeup receiver *before* loading so no publish
-    // between now and the run loop is missed: the broadcast channel
-    // buffers wakeups until the loop's first `recv`. Reused across
-    // restarts — a fresh instance re-subscribes its own receivers.
-    let mut wakeup = engine.events().subscribe_all().receiver;
+    // C2d — the pre-C2d supervisor eagerly subscribed to
+    // `subscribe_all()` so every published event woke every
+    // supervisor system-wide (F2 amplification). That subscription
+    // is gone. The wake handle now lives on each freshly-loaded
+    // `PluginInstance` (see `PluginInstance::wake`) and the bus
+    // only signals it when a published event matches one of the
+    // plugin's active subscription filters. Pre-init publishes
+    // don't wake the supervisor for this instance — that's the
+    // intended shape, since the plugin hasn't declared any
+    // interest in the bus yet.
     let backoff = BackoffPolicy::new(tuning.backoff_base, tuning.backoff_max);
     // Consecutive restarts; reset once an instance runs healthily.
     let mut restarts: u32 = 0;
@@ -621,7 +624,6 @@ async fn run_supervisor(
             tuning.healthy_reset,
             tuning.watchdog,
             &mut control_rx,
-            &mut wakeup,
             &state_tx,
         )
         .await;
@@ -705,7 +707,6 @@ async fn run_one_lifecycle(
     healthy_reset: Duration,
     watchdog: Duration,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
-    wakeup: &mut broadcast::Receiver<Event>,
     state_tx: &watch::Sender<InstanceState>,
 ) -> LifecycleOutcome {
     // Sweep any device/service registry entries this instance left
@@ -760,12 +761,18 @@ async fn run_one_lifecycle(
 
     let tick = build_tick_interval(&instance);
     let running_since = Instant::now();
+    // C2d — grab the wake AFTER load, because it's constructed
+    // inside `PluginState::new()`. Each restart gets a fresh
+    // `Notify` (the freshly-loaded `PluginInstance` has its own
+    // wake), and the bus's subscription wake registrations are
+    // scoped to that instance's live subscriptions.
+    let wake = instance.wake();
     transition(state_tx, instance_id, InstanceState::Running);
 
     match serve_loop(
         &mut instance,
         control_rx,
-        wakeup,
+        &wake,
         state_tx,
         instance_id,
         tick,
@@ -801,12 +808,11 @@ fn build_tick_interval(instance: &PluginInstance) -> Option<Interval> {
 async fn serve_loop(
     instance: &mut PluginInstance,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
-    wakeup: &mut broadcast::Receiver<Event>,
+    wake: &tokio::sync::Notify,
     state_tx: &watch::Sender<InstanceState>,
     instance_id: &str,
     mut tick: Option<Interval>,
 ) -> ServeOutcome {
-    let mut bus_open = true;
     loop {
         let outcome: anyhow::Result<LoopAction> = tokio::select! {
             ctrl = control_rx.recv() => {
@@ -817,19 +823,15 @@ async fn serve_loop(
             _ = async { tick.as_mut().unwrap().tick().await }, if tick.is_some() => {
                 instance.tick().await.map(|()| LoopAction::Continue)
             }
-            ev = wakeup.recv(), if bus_open => {
-                match ev {
-                    // A real event or a lag both mean "events happened,
-                    // go drain". The drain below reads the plugin's own
-                    // filtered receivers; this one is only a wakeup.
-                    Ok(_) | Err(RecvError::Lagged(_)) => Ok(LoopAction::Continue),
-                    // Bus sender gone (engine dropped): stop selecting
-                    // on it so the arm can't busy-loop.
-                    Err(RecvError::Closed) => {
-                        bus_open = false;
-                        Ok(LoopAction::Continue)
-                    }
-                }
+            // C2d wake path — signaled by `EventBus::signal_wakes`
+            // when a published event matches one of the plugin's
+            // active subscription filters. `Notify` deduplicates
+            // multiple `notify_one` calls that land between two
+            // `notified().await`s to a single wake, so a burst of
+            // matching publishes drains together in one pass —
+            // exactly the behaviour we want.
+            () = wake.notified() => {
+                Ok(LoopAction::Continue)
             }
         };
 
