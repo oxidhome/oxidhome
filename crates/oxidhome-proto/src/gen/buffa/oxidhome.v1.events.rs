@@ -602,6 +602,33 @@ pub struct Event {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub timestamp_ms: u64,
+    /// Plugin id (`plugin.id` from the publisher's manifest) that
+    /// produced this event. **Host-populated** — the host overwrites
+    /// any client-supplied value before the event is broadcast, so
+    /// subscribers can trust this as the immutable event origin.
+    /// Mirror of WIT `event.origin-plugin-id`.
+    ///
+    /// Field 7: `origin_plugin_id`
+    #[serde(
+        rename = "originPluginId",
+        alias = "origin_plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub origin_plugin_id: ::buffa::alloc::string::String,
+    /// Instance id of the publishing plugin instance. Same host-
+    /// populated contract as `origin_plugin_id`; together they
+    /// uniquely identify the publisher. Mirror of WIT
+    /// `event.origin-instance-id`.
+    ///
+    /// Field 8: `origin_instance_id`
+    #[serde(
+        rename = "originInstanceId",
+        alias = "origin_instance_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub origin_instance_id: ::buffa::alloc::string::String,
     #[serde(flatten)]
     pub payload: ::core::option::Option<__buffa::oneof::event::Payload>,
     #[serde(skip)]
@@ -613,6 +640,8 @@ impl ::core::fmt::Debug for Event {
         f.debug_struct("Event")
             .field("device_id", &self.device_id)
             .field("timestamp_ms", &self.timestamp_ms)
+            .field("origin_plugin_id", &self.origin_plugin_id)
+            .field("origin_instance_id", &self.origin_instance_id)
             .field("payload", &self.payload)
             .finish()
     }
@@ -696,6 +725,17 @@ impl ::buffa::Message for Event {
                 }
             }
         }
+        if !self.origin_plugin_id.is_empty() {
+            size
+                += 1u32
+                    + ::buffa::types::string_encoded_len(&self.origin_plugin_id) as u32;
+        }
+        if !self.origin_instance_id.is_empty() {
+            size
+                += 1u32
+                    + ::buffa::types::string_encoded_len(&self.origin_instance_id)
+                        as u32;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u32;
         size
     }
@@ -747,6 +787,12 @@ impl ::buffa::Message for Event {
                     x.write_to(__cache, buf);
                 }
             }
+        }
+        if !self.origin_plugin_id.is_empty() {
+            ::buffa::types::put_string_field(7u32, &self.origin_plugin_id, buf);
+        }
+        if !self.origin_instance_id.is_empty() {
+            ::buffa::types::put_string_field(8u32, &self.origin_instance_id, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -860,6 +906,20 @@ impl ::buffa::Message for Event {
                     );
                 }
             }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.origin_plugin_id, buf)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.origin_instance_id, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -871,6 +931,8 @@ impl ::buffa::Message for Event {
         self.device_id = ::core::option::Option::None;
         self.timestamp_ms = 0u64;
         self.payload = ::core::option::Option::None;
+        self.origin_plugin_id.clear();
+        self.origin_instance_id.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -902,6 +964,12 @@ impl<'de> serde::Deserialize<'de> for Event {
                     ::core::option::Option<::buffa::alloc::string::String>,
                 > = None;
                 let mut __f_timestamp_ms: ::core::option::Option<u64> = None;
+                let mut __f_origin_plugin_id: ::core::option::Option<
+                    ::buffa::alloc::string::String,
+                > = None;
+                let mut __f_origin_instance_id: ::core::option::Option<
+                    ::buffa::alloc::string::String,
+                > = None;
                 let mut __oneof_payload: ::core::option::Option<
                     __buffa::oneof::event::Payload,
                 > = None;
@@ -925,6 +993,42 @@ impl<'de> serde::Deserialize<'de> for Event {
                                         d: D,
                                     ) -> ::core::result::Result<u64, D::Error> {
                                         ::buffa::json_helpers::uint64::deserialize(d)
+                                    }
+                                }
+                                map.next_value_seed(_S)?
+                            });
+                        }
+                        "originPluginId" | "origin_plugin_id" => {
+                            __f_origin_plugin_id = Some({
+                                struct _S;
+                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                    type Value = ::buffa::alloc::string::String;
+                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                        self,
+                                        d: D,
+                                    ) -> ::core::result::Result<
+                                        ::buffa::alloc::string::String,
+                                        D::Error,
+                                    > {
+                                        ::buffa::json_helpers::proto_string::deserialize(d)
+                                    }
+                                }
+                                map.next_value_seed(_S)?
+                            });
+                        }
+                        "originInstanceId" | "origin_instance_id" => {
+                            __f_origin_instance_id = Some({
+                                struct _S;
+                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                    type Value = ::buffa::alloc::string::String;
+                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                        self,
+                                        d: D,
+                                    ) -> ::core::result::Result<
+                                        ::buffa::alloc::string::String,
+                                        D::Error,
+                                    > {
+                                        ::buffa::json_helpers::proto_string::deserialize(d)
                                     }
                                 }
                                 map.next_value_seed(_S)?
@@ -1037,6 +1141,12 @@ impl<'de> serde::Deserialize<'de> for Event {
                 }
                 if let ::core::option::Option::Some(v) = __f_timestamp_ms {
                     __r.timestamp_ms = v;
+                }
+                if let ::core::option::Option::Some(v) = __f_origin_plugin_id {
+                    __r.origin_plugin_id = v;
+                }
+                if let ::core::option::Option::Some(v) = __f_origin_instance_id {
+                    __r.origin_instance_id = v;
                 }
                 __r.payload = __oneof_payload;
                 Ok(__r)

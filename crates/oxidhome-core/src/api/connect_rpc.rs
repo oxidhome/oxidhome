@@ -971,6 +971,12 @@ fn wit_event_to_proto(event: WitEvent) -> ProtoEvent {
         // that the earlier `int64` encoding would have wrapped
         // negative.
         timestamp_ms: event.timestamp,
+        // Host-populated origin (C2b). Set on publish by
+        // `PluginState::publish_event` from the caller's manifest
+        // and instance id, so a Connect subscriber can trust these
+        // as the immutable event source.
+        origin_plugin_id: event.origin_plugin_id,
+        origin_instance_id: event.origin_instance_id,
         payload,
         ..Default::default()
     }

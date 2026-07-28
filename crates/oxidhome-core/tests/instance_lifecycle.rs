@@ -128,6 +128,12 @@ async fn supervisor_delivers_bus_events() {
         engine.events().publish(Event {
             device: None,
             timestamp: 0,
+            // Test-side publisher bypasses the host's C2b stamping —
+            // this test injects directly onto the bus without going
+            // through `PluginState::publish_event`. Empty strings
+            // reflect that the row wasn't produced by a real plugin.
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),

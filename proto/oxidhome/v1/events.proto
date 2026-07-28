@@ -69,6 +69,17 @@ message Event {
     Inference inference = 5;
     CustomEvent custom = 6;
   }
+  // Plugin id (`plugin.id` from the publisher's manifest) that
+  // produced this event. **Host-populated** — the host overwrites
+  // any client-supplied value before the event is broadcast, so
+  // subscribers can trust this as the immutable event origin.
+  // Mirror of WIT `event.origin-plugin-id`.
+  string origin_plugin_id = 7;
+  // Instance id of the publishing plugin instance. Same host-
+  // populated contract as `origin_plugin_id`; together they
+  // uniquely identify the publisher. Mirror of WIT
+  // `event.origin-instance-id`.
+  string origin_instance_id = 8;
 }
 
 // Wire mirror of WIT `state-change` — the full record, not just

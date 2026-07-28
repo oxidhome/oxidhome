@@ -238,6 +238,8 @@ mod tests {
         Event {
             device: None,
             timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: Vec::new(),

@@ -542,6 +542,16 @@ impl host_events::Host for PluginState {
         //    of their own, so their capability check is a no-op.
         require_publish_authorized(&self.devices, &self.instance_id, &ev)?;
 
+        // Architecture-review C2b: stamp the event's origin from the
+        // publisher's own instance / manifest identity. Any value the
+        // plugin passed for these fields is discarded — subscribers
+        // (WIT `on-event`, JSON `/events/tail`, Connect
+        // `Events.TailEvents`) trust `origin-plugin-id` /
+        // `origin-instance-id` as the immutable event origin.
+        let mut ev = ev;
+        ev.origin_plugin_id = self.manifest.plugin.id.clone();
+        ev.origin_instance_id = self.instance_id.clone();
+
         // Durable mirror first (Phase 5d): if the write fails — disk
         // full, sqlite corruption, etc. — we'd rather refuse the
         // publish than silently lose history. Live broadcast comes
@@ -1184,6 +1194,10 @@ mod tests {
         Event {
             device: Some(device.into()),
             timestamp: 0,
+            // Host-populated on publish (C2b); test fixtures pass
+            // empty strings and rely on `publish_event` overwriting.
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: Vec::new(),
@@ -1195,6 +1209,8 @@ mod tests {
         Event {
             device,
             timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::StateChanged(StateChange {
                 capability: capability.into(),
                 fields: Vec::new(),
@@ -1207,6 +1223,8 @@ mod tests {
         Event {
             device,
             timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::Button(ButtonEvent::Pressed),
         }
     }
@@ -1215,6 +1233,8 @@ mod tests {
         Event {
             device: None,
             timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),
@@ -1241,6 +1261,45 @@ mod tests {
 
         let ev = sub.receiver.try_recv().expect("event delivered");
         assert_eq!(ev.device.as_deref(), Some(id.as_str()));
+        // C2b: host stamped the origin from the publisher's identity.
+        assert_eq!(ev.origin_instance_id, "alpha");
+        assert_eq!(ev.origin_plugin_id, "test.fixture");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_stamps_origin_over_client_supplied_values() {
+        // Architecture-review C2b: the host overwrites `origin-plugin-id`
+        // / `origin-instance-id` on every publish. A plugin that
+        // fabricates values there — trying to impersonate another
+        // plugin to a downstream subscriber — has those values
+        // discarded before the event reaches the bus.
+        let registry = Arc::new(DeviceRegistry::new());
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe_all();
+        let mut state = shared_state("alpha", registry, bus);
+        let id = host_devices::Host::register_device(&mut state, switch_device("d-1"))
+            .await
+            .expect("register");
+
+        // Publish with hostile origin fields.
+        let mut forged = state_change_event(&id);
+        forged.origin_plugin_id = "com.evil.impostor".into();
+        forged.origin_instance_id = "evil-instance-42".into();
+        host_events::Host::publish_event(&mut state, forged)
+            .await
+            .expect("publish");
+
+        let ev = sub.receiver.try_recv().expect("event delivered");
+        assert_eq!(
+            ev.origin_plugin_id, "test.fixture",
+            "host must overwrite forged origin_plugin_id, got {:?}",
+            ev.origin_plugin_id,
+        );
+        assert_eq!(
+            ev.origin_instance_id, "alpha",
+            "host must overwrite forged origin_instance_id, got {:?}",
+            ev.origin_instance_id,
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

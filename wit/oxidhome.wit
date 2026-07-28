@@ -314,11 +314,23 @@ interface events {
 
   record event {
     /// Empty when the event isn't tied to a specific device (e.g. plugin
-    /// lifecycle).
+    /// lifecycle, custom-topic broadcast).
     device: option<device-id>,
     /// Plugin-supplied wall-clock timestamp. The host records its own
     /// receive time separately for trust-sensitive ordering and retention.
     timestamp: unix-ms,
+    /// Plugin id (`plugin.id` from the publisher's manifest) that
+    /// produced this event. **Host-populated on publish** — any value
+    /// a plugin passes to `publish-event` is overwritten by the host
+    /// before the event is durably logged or broadcast. Subscribers
+    /// (WIT `on-event`, JSON `/events/tail`, Connect `Events.TailEvents`)
+    /// can trust this as the immutable origin of the event.
+    origin-plugin-id: string,
+    /// Instance id of the plugin instance that produced this event.
+    /// Same host-populated / immutable contract as `origin-plugin-id`.
+    /// Together they identify the exact publisher, so a subscriber can
+    /// distinguish two instances of the same plugin without ambiguity.
+    origin-instance-id: string,
     payload: event-payload,
   }
 

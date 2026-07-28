@@ -533,6 +533,8 @@ mod tests {
         Event {
             device: Some(device.into()),
             timestamp: ts,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: vec![KeyValue {
@@ -547,6 +549,8 @@ mod tests {
         Event {
             device: None,
             timestamp: payload_ms,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: "{}".into(),
@@ -600,6 +604,8 @@ mod tests {
                 Event {
                     device: Some("d-2".into()),
                     timestamp: 2,
+                    origin_plugin_id: String::new(),
+                    origin_instance_id: String::new(),
                     payload: EventPayload::Button(ButtonEvent::DoublePress),
                 },
             ),
@@ -608,6 +614,8 @@ mod tests {
                 Event {
                     device: None,
                     timestamp: 3,
+                    origin_plugin_id: String::new(),
+                    origin_instance_id: String::new(),
                     payload: EventPayload::Inference(InferenceResult {
                         model: "yolov8n".into(),
                         payload: r#"{"hits":[]}"#.into(),
