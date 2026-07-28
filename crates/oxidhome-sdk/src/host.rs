@@ -179,8 +179,11 @@ pub fn call_service(
 ///
 /// # Errors
 ///
-/// Forwards host errors (e.g. [`Error::PermissionDenied`] if a future
-/// phase gates publishes by capability).
+/// Forwards host errors. The host enforces device-ownership on
+/// publish: an event whose `device` field references a device this
+/// plugin instance did not register is refused with
+/// [`Error::PermissionDenied`]. Bus-only events (`device: None`,
+/// used for lifecycle and custom topics) bypass that check.
 pub fn publish_event(event: &Event) -> Result<(), Error> {
     host_events::publish_event(event)
 }

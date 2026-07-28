@@ -34,7 +34,7 @@ use crate::host_impl::plugin::oxidhome::plugin::{
     capabilities,
     devices::{self, CommandResult, DeviceInfo},
     events,
-    events::{Event, EventFilter},
+    events::{Event, EventFilter, EventPayload},
     host_config, host_devices, host_events, host_services,
     logging::{self, Level as WitLevel},
     services::{self, ServiceInfo},
@@ -452,8 +452,96 @@ impl host_services::Host for PluginState {
 // per-instance tokio task so delivery happens automatically.
 // `unsubscribe` removes the entry.
 
+/// Payload → required device capability name, or `None` if the
+/// payload variant doesn't imply a device capability. Kept as a free
+/// function so the trait impl body stays readable.
+fn required_capability_for_payload(payload: &EventPayload) -> Option<String> {
+    match payload {
+        // `state-changed.capability` names the changed capability —
+        // require the device to actually declare it.
+        EventPayload::StateChanged(sc) => Some(sc.capability.clone()),
+        // The `button` variant only fires on devices with the button
+        // capability.
+        EventPayload::Button(_) => Some("button".into()),
+        // `inference` results are ML-pipeline output; the tap can
+        // attach to any capability (video-stream, audio-stream, or
+        // even sensor). `custom` topics are free-form by design.
+        // Neither implies a device capability contract.
+        EventPayload::Inference(_) | EventPayload::Custom(_) => None,
+    }
+}
+
+/// Publish gate — see the block comment in `publish_event`.
+fn require_publish_authorized(
+    devices: &DeviceRegistry,
+    instance_id: &InstanceId,
+    ev: &Event,
+) -> Result<(), WitError> {
+    match (&ev.device, &ev.payload) {
+        // Variants that describe something *about a device* refuse
+        // `device: None`. Without a device the subscriber has no
+        // way to attribute the event, and — since the wire shape
+        // carries no host-populated origin today — accepting these
+        // would let any plugin forge arbitrary state-changes,
+        // button presses, or inference results.
+        (
+            None,
+            EventPayload::StateChanged(_) | EventPayload::Button(_) | EventPayload::Inference(_),
+        ) => Err(WitError::InvalidArgument(
+            "publish-event: this payload variant requires a `device` field".into(),
+        )),
+        // Bus-only custom event — no device implies no ownership or
+        // capability check.
+        (None, EventPayload::Custom(_)) => Ok(()),
+        // Owned-device path. `DeviceRegistry::get` collapses foreign
+        // and unregistered into the same `NotFound`; we map it to
+        // `PermissionDenied` here so the error framing matches the
+        // spoofing-gate semantics.
+        (Some(device_id), payload) => {
+            let meta = devices.get(instance_id, device_id).map_err(|_| {
+                WitError::PermissionDenied(format!(
+                    "publish-event: device `{device_id}` is not owned by this instance",
+                ))
+            })?;
+            if let Some(required) = required_capability_for_payload(payload)
+                && !meta
+                    .info
+                    .capabilities
+                    .iter()
+                    .any(|spec| capability_name(spec) == required)
+            {
+                return Err(WitError::PermissionDenied(format!(
+                    "publish-event: device `{device_id}` does not declare capability `{required}`",
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 impl host_events::Host for PluginState {
     async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
+        // Architecture-review C2 — three gates before the event
+        // reaches the bus:
+        //
+        // 1. Payload/device consistency: `state-changed`, `button`,
+        //    and `inference` are all *about* something on a device,
+        //    so `device: None` for those variants is malformed —
+        //    the subscriber has no way to attribute the event
+        //    otherwise. Only `custom` may skip the device.
+        // 2. Ownership: when the event does carry a device, that
+        //    device must have been registered from this instance.
+        //    Foreign and unregistered IDs collapse to the same
+        //    `permission-denied` message so the call can't be used
+        //    to probe for device existence.
+        // 3. Capability: the event variant must be consistent with
+        //    the device's declared capabilities — a device with no
+        //    `switch` cap can't publish a `state-changed("switch")`,
+        //    a device without `button` can't fire `button` events.
+        //    `inference` and `custom` carry no capability contract
+        //    of their own, so their capability check is a no-op.
+        require_publish_authorized(&self.devices, &self.instance_id, &ev)?;
+
         // Durable mirror first (Phase 5d): if the write fails — disk
         // full, sqlite corruption, etc. — we'd rather refuse the
         // publish than silently lose history. Live broadcast comes
@@ -1079,6 +1167,19 @@ mod tests {
 
     // ── host-events ───────────────────────────────────────────────
 
+    fn switch_device(local: &str) -> DeviceInfo {
+        DeviceInfo {
+            local_id: local.into(),
+            name: local.into(),
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            capabilities: vec![capabilities::CapabilitySpec::Switch],
+            initial_state: Vec::new(),
+            metadata: Vec::new(),
+        }
+    }
+
     fn state_change_event(device: &str) -> Event {
         Event {
             device: Some(device.into()),
@@ -1087,6 +1188,26 @@ mod tests {
                 capability: "switch".into(),
                 fields: Vec::new(),
             }),
+        }
+    }
+
+    fn state_change_event_of(device: Option<String>, capability: &str) -> Event {
+        Event {
+            device,
+            timestamp: 0,
+            payload: EventPayload::StateChanged(StateChange {
+                capability: capability.into(),
+                fields: Vec::new(),
+            }),
+        }
+    }
+
+    fn button_event(device: Option<String>) -> Event {
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
+        Event {
+            device,
+            timestamp: 0,
+            payload: EventPayload::Button(ButtonEvent::Pressed),
         }
     }
 
@@ -1108,12 +1229,95 @@ mod tests {
         let mut sub = bus.subscribe_all();
         let mut state = shared_state("alpha", registry, bus);
 
-        host_events::Host::publish_event(&mut state, state_change_event("d-1"))
+        // The C2 gates refuse unregistered/foreign devices and
+        // capability mismatches, so register a `switch`-capable
+        // device first and publish a matching `state-changed`.
+        let id = host_devices::Host::register_device(&mut state, switch_device("d-1"))
+            .await
+            .expect("register");
+        host_events::Host::publish_event(&mut state, state_change_event(&id))
             .await
             .expect("publish");
 
         let ev = sub.receiver.try_recv().expect("event delivered");
-        assert_eq!(ev.device.as_deref(), Some("d-1"));
+        assert_eq!(ev.device.as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_rejects_unregistered_device() {
+        let mut state = fresh_state("alpha");
+        // No device was ever registered — publishing for a fabricated
+        // id must be refused (architecture-review C2 spoofing gate).
+        let err = host_events::Host::publish_event(&mut state, state_change_event("ghost"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_rejects_foreign_device() {
+        let registry = Arc::new(DeviceRegistry::new());
+        let bus = Arc::new(EventBus::new());
+        let mut alpha = shared_state("alpha", registry.clone(), bus.clone());
+        let mut beta = shared_state("beta", registry, bus);
+
+        let id = host_devices::Host::register_device(&mut alpha, switch_device("d-1"))
+            .await
+            .expect("alpha register");
+
+        // Beta publishing for alpha's device is refused — same
+        // permission-denied shape as an unregistered id, so the call
+        // can't be used to probe for device existence.
+        let err = host_events::Host::publish_event(&mut beta, state_change_event(&id))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_rejects_capability_not_declared() {
+        // Owner + registered, but the device declares no
+        // capabilities. Publishing a `switch` state-change is still
+        // refused: register-device gates *declaration* against the
+        // manifest, publish-event gates *event variants* against the
+        // device's own declared capabilities.
+        let mut state = fresh_state("alpha");
+        let id = host_devices::Host::register_device(&mut state, empty_device("d-1"))
+            .await
+            .expect("register empty");
+        let err = host_events::Host::publish_event(&mut state, state_change_event(&id))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_rejects_state_changed_without_device() {
+        // `state-changed` describes something *about a device* — a
+        // publisher with no device is malformed and refused with
+        // invalid-argument. Same rule holds for `button` and
+        // `inference`.
+        let mut state = fresh_state("alpha");
+        let err =
+            host_events::Host::publish_event(&mut state, state_change_event_of(None, "switch"))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, WitError::InvalidArgument(_)), "got {err:?}");
+
+        let err = host_events::Host::publish_event(&mut state, button_event(None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_allows_bus_only_custom_events() {
+        // Only `custom` may skip the device field — that's the
+        // deliberate lifecycle / free-topic escape hatch.
+        let mut state = fresh_state("alpha");
+        host_events::Host::publish_event(&mut state, custom_event("automation.morning"))
+            .await
+            .expect("bus-only publish");
     }
 
     #[tokio::test(flavor = "current_thread")]
