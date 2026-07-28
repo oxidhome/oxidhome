@@ -357,6 +357,67 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE UNIQUE INDEX auth_token_hash ON auth_token(hash);
     ",
+    // Migration 9 — architecture-review C3 dedicated audit ledger.
+    //
+    // Every API request lands here, synchronously from the middleware
+    // before the handler executes. Separate from `log_event` (which
+    // is the drop-tolerant diagnostic stream) so audit rows can't be
+    // evicted by a burst of debug logs — the whole point of C3.
+    //
+    // The row is written in **two phases**:
+    //
+    // 1. `record_intent` at the top of the middleware. Inserts with
+    //    `decision = "pending"`, `status = 0`, `finalized_ms = NULL`.
+    //    Committing this row *before* the handler runs is what makes
+    //    the ledger cancellation-safe: if the client disconnects
+    //    mid-handler (a common exploit path — `spawn_blocking`
+    //    handler tasks continue after the request future is dropped),
+    //    the intent row stays behind as evidence of the attempted
+    //    action, unambiguously flagged as unfinished. Fail-closed —
+    //    if the insert errors, the middleware refuses the request
+    //    with 500 rather than executing an unauditable operation.
+    // 2. `finalize` after the handler returns. UPDATEs the pending
+    //    row with the outcome (`allow` / `deny` / `error`), the
+    //    final HTTP status, `required_scope` (populated only on
+    //    scope-deny 403s), and stamps `finalized_ms`. Best-effort:
+    //    a finalize failure logs an ERROR but doesn't undo the
+    //    handler's already-committed side effects — the operator
+    //    still sees the pending row and knows something is wrong.
+    //
+    // Single-shot writes (`record_completed`) are used for
+    // unauthenticated probes — no handler runs, so the outcome is
+    // known at insert time. That path fills `finalized_ms` immediately
+    // and records `token_id = "anonymous"` + a `credential_fp` short
+    // SHA-256 prefix (never the raw presented secret) so a
+    // forensic sweep can correlate probes without giving an
+    // attacker anything to verify a guess against.
+    //
+    // See `state::audit_log` for the write path.
+    //
+    // Indexes:
+    // - `audit_intent`   for time-range scans on `intent_ms`
+    //                    (retention sweep + generic time-window
+    //                    queries + "abandoned intents" —
+    //                    `finalized_ms IS NULL AND intent_ms < ?`).
+    // - `audit_token_ts` so forensic drill-down on a specific token
+    //                    seeks the B-tree without a full scan.
+    "
+    CREATE TABLE audit_event (
+      id             INTEGER PRIMARY KEY,
+      intent_ms      INTEGER NOT NULL,
+      finalized_ms   INTEGER,
+      token_id       TEXT NOT NULL,
+      actor_kind     TEXT NOT NULL,
+      method         TEXT NOT NULL,
+      path           TEXT NOT NULL,
+      status         INTEGER NOT NULL,
+      decision       TEXT NOT NULL,
+      required_scope TEXT,
+      credential_fp  TEXT
+    ) STRICT;
+    CREATE INDEX audit_intent   ON audit_event(intent_ms);
+    CREATE INDEX audit_token_ts ON audit_event(token_id, intent_ms);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

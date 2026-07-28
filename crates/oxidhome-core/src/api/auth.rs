@@ -11,19 +11,44 @@
 //!    secret with SHA-256 and looks the row up by hash.
 //! 3. On success, builds an [`Actor::api(token_id, scopes)`] from
 //!    the matched row's `id` + parsed `scope_json`, attaches it to
-//!    the request via [`Extension`], and forwards to the route.
+//!    the request via `Extension`, records a **pending audit intent
+//!    row** through [`AuditLog::record_intent`] (fail-closed: if
+//!    that write errors the request 500s without executing the
+//!    handler), then forwards to the route. After the handler
+//!    returns [`AuditLog::finalize`] updates the intent row with the
+//!    outcome.
 //! 4. On any failure (missing header, malformed token, unknown
 //!    secret, revoked) responds with **`401 Unauthorized`** with a
 //!    `WWW-Authenticate: Bearer` header and an empty body. The
 //!    variants are not distinguished externally so an attacker can't
-//!    probe shape, validity, or revocation state.
+//!    probe shape, validity, or revocation state. Each failed
+//!    attempt is recorded as an anonymous audit row
+//!    ([`record_anonymous_probe`]) with a short SHA-256
+//!    fingerprint of the presented bearer (never the raw secret),
+//!    so a forensic sweep can correlate probes.
 //!
-//! Anonymous routes (`/api/v1/health`) skip the bearer extraction
-//! entirely. They still go through the same middleware so the
-//! request span / actor extension shape is consistent — an anonymous
-//! request gets no `Actor` extension; route handlers that need one
-//! pull it via `Extension<Actor>` and short-circuit to 500 if it's
-//! missing (which would be a routing bug, not an auth failure).
+//! Anonymous routes (`PUBLIC_PATHS`) skip the bearer extraction and
+//! the audit path entirely.
+//!
+//! ## Blocking discipline
+//!
+//! Every `AuditLog` call runs under a `std::sync::Mutex` over the
+//! shared `rusqlite::Connection`. Calling it directly from an
+//! `async fn` would park the tokio worker under contention. The
+//! middleware wraps each of the three audit calls
+//! (`record_intent`, `finalize`, `record_completed`) in
+//! [`tokio::task::spawn_blocking`] so slow disks + log-store /
+//! blob-store contention can't stall the runtime.
+//!
+//! ## Cancellation safety
+//!
+//! The pre-audit intent row commits *before* the handler runs. If
+//! the client disconnects mid-handler — which cancels the request
+//! future but leaves any `spawn_blocking` filesystem work the
+//! handler kicked off to complete on the blocking pool
+//! (`spawn_blocking` doesn't observe join-handle drops) — the
+//! pending row stays behind as the ledger's evidence of intent. An
+//! operator queries `decision = "pending"` for abandoned intents.
 
 use std::sync::Arc;
 
@@ -35,7 +60,9 @@ use axum::{
 };
 
 use crate::auth::Actor;
-use crate::state::{TokenError, TokenRecord, TokenStore};
+use crate::state::{
+    AuditEntry, AuditLog, TokenError, TokenRecord, TokenStore, credential_fingerprint,
+};
 
 /// Routes that don't require a bearer token. The canonical liveness
 /// probe lives on the Connect surface
@@ -47,50 +74,45 @@ use crate::state::{TokenError, TokenRecord, TokenStore};
 /// orchestrator wants something simpler than a Connect probe).
 pub(crate) const PUBLIC_PATHS: &[&str] = &[];
 
+/// Sentinel `token_id` used on audit rows for unauthenticated
+/// probes — missing / malformed / unknown / revoked bearer.
+pub(super) const ANONYMOUS_TOKEN_ID: &str = "anonymous";
+
 /// Shared state the middleware needs. Held behind `Arc` and cloned
-/// per request — both fields are already `Arc`-backed, so the clone
+/// per request — every field is already `Arc`-backed, so the clone
 /// is cheap.
 #[derive(Clone)]
 pub(crate) struct AuthState {
     pub tokens: Arc<TokenStore>,
+    /// Dedicated audit ledger — architecture-review C3. See the
+    /// module-level doc for the two-phase write contract and the
+    /// blocking / cancellation-safety discipline.
+    pub audit_log: Arc<AuditLog>,
 }
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
 /// in `server::router`.
 ///
-/// After the inner handler runs, emits **one** audit event per
-/// authenticated request through `tracing::info!` with the constant
-/// `target = "api.audit"` — that's the fixed tracing target the
-/// existing `LogStore` layer in `main.rs` indexes on. The
-/// per-request method+path lives in the `audit_target` field
-/// (e.g. `audit_target = "api.GET-/api/v1/instances"`) so a future
-/// `logs query --target api.audit --field audit_target=…` can pivot
-/// on it. Other structured fields: `{token_id, actor_kind, method,
-/// path, status, decision, required_scope?}` — `required_scope` is
-/// only set on `decision=deny` rows from a scope failure (smuggled
-/// back from the handler via [`crate::api::scopes::DeniedScope`] on
-/// the response's extension map).
+/// See the module doc for the full flow; the short version:
 ///
-/// `decision` values:
-/// - `"allow"` — 2xx
-/// - `"deny"` — any 4xx returned by the handler (e.g. 403 from a
-///   scope check). 401 / 5xx from this very middleware (missing
-///   credentials, `Sqlite` verify error) return *before*
-///   `emit_audit` runs and are deliberately not audited — no
-///   authenticated principal to attribute them to.
-/// - `"error"` — handler-returned 5xx.
+/// 1. `PUBLIC_PATHS` → pass through, no audit.
+/// 2. Extract bearer; on failure record an anonymous probe row and
+///    return 401 (see [`record_anonymous_probe`]).
+/// 3. Verify token; on failure same as above (also 401).
+/// 4. Record a `pending` intent row. Fail-closed on ledger error:
+///    return 500 without running the handler — a mutation with no
+///    audit trail is not acceptable.
+/// 5. Run the handler.
+/// 6. `finalize` the intent row with the handler's outcome. Best-
+///    effort — the pending row is already committed as evidence of
+///    intent.
 ///
-/// Anonymous (`PUBLIC_PATHS`) requests skip audit emission — no
-/// token id to attribute them to.
-///
-/// **Lossy-channel note.** Audit events ride the same bounded
-/// `tracing` channel as regular logs; under load the `LogStore`
-/// layer drops events rather than blocking (the drop counter is
-/// surfaced separately). This is a deliberate inheritance —
-/// blocking on audit would block the request thread — but it
-/// means a determined flooder can punch holes in the audit trail.
-/// A dedicated never-drop channel for `target = "api.audit"` is a
-/// candidate follow-up if this becomes a real forensic gap.
+/// `decision` values written to the ledger:
+/// - `"allow"` — handler returned 2xx
+/// - `"deny"` — handler returned 4xx (incl. scope failure 403s)
+/// - `"error"` — handler returned 5xx
+/// - `"pending"` — intent recorded; handler still running, or the
+///   request was abandoned before finalize
 pub(crate) async fn require_token(
     State(state): State<AuthState>,
     mut req: Request,
@@ -100,29 +122,71 @@ pub(crate) async fn require_token(
         return next.run(req).await;
     }
 
-    let Some(bearer) = extract_bearer(&req) else {
+    let http_path = req.uri().path().to_string();
+    let method = req.method().to_string();
+
+    let Some(bearer) = extract_bearer(&req).map(str::to_owned) else {
+        // No `Authorization` header at all — no fingerprint to
+        // record (the client presented nothing). Still audit as
+        // anonymous so the probe volume is visible.
+        record_anonymous_probe(&state.audit_log, &method, &http_path, 401, None).await;
         return unauthorized();
     };
 
-    let (token_id, actor_kind, http_path, method) = match state.tokens.verify(bearer) {
+    let (token_id, actor_kind) = match state.tokens.verify(&bearer) {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
-            // Snapshot the strings we'll need post-handler for the
-            // audit row *before* moving `actor` onto the request
-            // extension, so the audit path doesn't need to clone the
-            // Arc-backed `Actor` (or bump-then-drop the refcount).
             let token_id = actor.id().to_string();
             let actor_kind = actor.kind().as_str().to_string();
-            let path = req.uri().path().to_string();
-            let method = req.method().to_string();
             req.extensions_mut().insert(actor);
-            (token_id, actor_kind, path, method)
+            (token_id, actor_kind)
         }
         Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
+            // Malformed / unknown / revoked — record the probe with
+            // a fingerprint so a forensic sweep can correlate
+            // repeats. Never store the raw secret.
+            let fp = credential_fingerprint(&bearer);
+            record_anonymous_probe(&state.audit_log, &method, &http_path, 401, Some(fp)).await;
             return unauthorized();
         }
         Err(TokenError::Sqlite(err)) => {
             tracing::error!(target: "api.auth", error = %err, "token verify failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    // (F1) Pre-audit intent — commit the row *before* the handler
+    // executes so a mid-handler cancellation still leaves evidence.
+    // (F2) Fail-closed: ledger unreachable ⇒ refuse the request.
+    let intent = AuditEntry {
+        intent_ms: 0,
+        finalized_ms: None,
+        token_id: token_id.clone(),
+        actor_kind: actor_kind.clone(),
+        method: method.clone(),
+        path: http_path.clone(),
+        status: 0,
+        decision: "pending".into(),
+        required_scope: None,
+        credential_fp: None,
+    };
+    let audit_id = match record_intent_blocking(&state.audit_log, intent).await {
+        Ok(id) => id,
+        Err(msg) => {
+            // Backstop: `eprintln!` because the tracing side rides
+            // the drop-tolerant `LogStore` and this is exactly the
+            // moment we can't trust it. The ERROR-level tracing
+            // event still fires alongside — most of the time it'll
+            // land — but stderr is the ledger's parting words.
+            eprintln!("oxidhome audit_log: record_intent failed; refusing request: {msg}");
+            tracing::error!(
+                target: "api.audit",
+                error = %msg,
+                token_id = %token_id,
+                method = %method,
+                path = %http_path,
+                "audit-ledger intent write failed — refusing request",
+            );
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
@@ -132,26 +196,113 @@ pub(crate) async fn require_token(
         .extensions()
         .get::<crate::api::scopes::DeniedScope>()
         .map(|d| d.0);
-    emit_audit(
+    let status = response.status();
+    finalize_audit(
+        &state.audit_log,
+        audit_id,
         &token_id,
         &actor_kind,
         &method,
         &http_path,
-        response.status(),
+        status,
         denied_scope,
-    );
+    )
+    .await;
     response
 }
 
-/// One audit event per authenticated request. Routed through
-/// `tracing::info!` with `target = "api.audit"`; the existing
-/// `LogStore` layer captures it. See [`require_token`]'s docstring
-/// for the field shape.
+/// Record an anonymous-probe audit row for a request that failed
+/// authentication. Best-effort — the auth check has already decided
+/// the outcome and no handler will run, so a ledger failure here
+/// only loses this one row (no unaudited mutation).
+pub(super) async fn record_anonymous_probe(
+    audit_log: &Arc<AuditLog>,
+    method: &str,
+    path: &str,
+    status: u16,
+    credential_fp: Option<String>,
+) {
+    let entry = AuditEntry {
+        intent_ms: 0,
+        finalized_ms: None,
+        token_id: ANONYMOUS_TOKEN_ID.into(),
+        actor_kind: ANONYMOUS_TOKEN_ID.into(),
+        method: method.to_owned(),
+        path: path.to_owned(),
+        status,
+        decision: "deny".into(),
+        required_scope: None,
+        credential_fp,
+    };
+    let al = Arc::clone(audit_log);
+    let join = tokio::task::spawn_blocking(move || al.record_completed(&entry)).await;
+    match join {
+        Ok(Ok(_id)) => {}
+        Ok(Err(err)) => {
+            eprintln!("oxidhome audit_log: record_completed (anonymous probe) failed: {err}");
+            tracing::error!(
+                target: "api.audit",
+                error = %err,
+                method = %method,
+                path = %path,
+                "audit-ledger anonymous-probe write failed",
+            );
+        }
+        Err(join_err) => {
+            eprintln!(
+                "oxidhome audit_log: record_completed (anonymous probe) join failed: {join_err}",
+            );
+        }
+    }
+    // Best-effort tracing mirror so operators tailing stderr still
+    // see the probe (and the existing `logs query --target api.audit`
+    // API keeps returning it). This path can drop under load — the
+    // ledger row above is the forensic source of truth.
+    tracing::info!(
+        target: "api.audit",
+        audit_target = %format!("api.{method}-{path}"),
+        token_id = %ANONYMOUS_TOKEN_ID,
+        actor_kind = %ANONYMOUS_TOKEN_ID,
+        method = %method,
+        path = %path,
+        status = status,
+        decision = %"deny",
+        required_scope = %"",
+        "api request",
+    );
+}
+
+/// Blocking-safe wrapper around [`AuditLog::record_intent`]. Runs the
+/// insert on the blocking pool so the tokio worker isn't parked on
+/// the shared `Db` mutex. Returns a `String` error on either the
+/// SQL failure or a `spawn_blocking` join failure — the middleware
+/// only needs "something went wrong" to fail-closed with a 500.
+async fn record_intent_blocking(
+    audit_log: &Arc<AuditLog>,
+    entry: AuditEntry,
+) -> Result<u64, String> {
+    let al = Arc::clone(audit_log);
+    match tokio::task::spawn_blocking(move || al.record_intent(&entry)).await {
+        Ok(Ok(id)) => Ok(id),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(join_err) => Err(format!("spawn_blocking join: {join_err}")),
+    }
+}
+
+/// Two-phase finalize + tracing mirror. Wraps [`AuditLog::finalize`]
+/// on the blocking pool, then emits the same tracing target the
+/// pre-C3 code used so operators tailing stderr keep seeing every
+/// request and the current `logs query --target api.audit` API
+/// path keeps working. Best-effort — the pending row is already
+/// committed evidence of intent.
 ///
-/// `pub(super)` so the Connect-side auth middleware
-/// ([`super::connect_rpc`]) emits the same shape — single source
-/// of truth for the audit-row contract.
-pub(super) fn emit_audit(
+/// `pub(super)` so the Connect-side middleware calls the same
+/// helper — single source of truth for the audit-row contract
+/// across both surfaces.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn finalize_audit(
+    audit_log: &Arc<AuditLog>,
+    audit_id: u64,
     token_id: &str,
     actor_kind: &str,
     method: &str,
@@ -166,15 +317,45 @@ pub(super) fn emit_audit(
     } else {
         "deny"
     };
+
+    let al = Arc::clone(audit_log);
+    let required = required_scope.map(str::to_owned);
+    let status_u16 = status.as_u16();
+    let decision_owned = decision.to_owned();
+    let required_for_task = required.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        al.finalize(
+            audit_id,
+            status_u16,
+            &decision_owned,
+            required_for_task.as_deref(),
+        )
+    })
+    .await;
+    match join {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            eprintln!("oxidhome audit_log: finalize failed: {err}");
+            tracing::error!(
+                target: "api.audit",
+                error = %err,
+                audit_id,
+                token_id = %token_id,
+                method = %method,
+                path = %path,
+                "audit-ledger finalize failed — pending row remains",
+            );
+        }
+        Err(join_err) => {
+            eprintln!("oxidhome audit_log: finalize join failed: {join_err}");
+        }
+    }
+
+    // Tracing mirror — same shape the pre-C3 code emitted, so a
+    // subscriber that installs the LogStore layer sees every request
+    // live in `logs query --target api.audit`. Best-effort by design.
     let audit_target = format!("api.{method}-{path}");
-    // `required_scope` is only populated on scope-denial 403s
-    // (`DeniedScope` came back on the response extension). Other
-    // denies — and every allow — record it as an empty string so
-    // the log_event row's `fields_blob` shape stays uniform across
-    // every audit entry. A query like `--field required_scope=
-    // devices:list` then picks the rows where that scope was the
-    // tripwire.
-    let required = required_scope.unwrap_or("");
+    let required_field = required.as_deref().unwrap_or("");
     tracing::info!(
         target: "api.audit",
         audit_target = %audit_target,
@@ -182,9 +363,9 @@ pub(super) fn emit_audit(
         actor_kind = %actor_kind,
         method = %method,
         path = %path,
-        status = status.as_u16(),
+        status = status_u16,
         decision = %decision,
-        required_scope = %required,
+        required_scope = %required_field,
         "api request",
     );
 }

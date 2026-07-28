@@ -398,6 +398,272 @@ fn audit_log_records_one_event_per_authenticated_request() {
     assert!(decisions.contains(&"deny".to_string()));
 }
 
+/// Architecture-review C3 regression. The `LogStore` `try_send`
+/// channel drops rows under saturation — that's the deliberate
+/// diagnostic-log trade-off. Audit *must not* share that fate.
+///
+/// The test wires up an `Engine`, installs the log-store subscriber,
+/// then floods the channel with more diagnostic events than its
+/// capacity (`DEFAULT_CAPACITY = 1024`) before any writer drains
+/// have a chance to run. That guarantees the channel is saturated
+/// on the very next `try_send` — evidenced by a non-zero drop
+/// counter. Meanwhile a real authenticated request goes through
+/// `build_router`, so `emit_audit` fires both the tracing mirror
+/// (which competes for that same saturated channel) and the
+/// dedicated `AuditLog::record` synchronous write.
+///
+/// The invariant: `AuditLog::count()` reports the row landed even
+/// when the `LogStore` reports drops. Proves the audit ledger is
+/// isolated from diagnostic-log backpressure.
+#[test]
+fn audit_ledger_row_survives_log_store_channel_saturation() {
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+
+    let log_store = engine.log_store();
+    let audit_log = engine.audit_log();
+    assert_eq!(audit_log.count().unwrap(), 0);
+
+    let subscriber = Registry::default().with(log_store.layer());
+
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        // Saturate the diagnostic channel. `DEFAULT_CAPACITY` is
+        // 1024; we emit well over that from a synchronous loop so
+        // the writer thread can't keep up and `try_send` starts
+        // returning `Full`, bumping the `dropped` counter.
+        for i in 0..8192 {
+            tracing::info!(target: "flooder", i, "burst");
+        }
+
+        // Now the request that must be audited. Its `emit_audit`
+        // hits both paths — the tracing mirror (into the saturated
+        // channel, may drop) *and* `AuditLog::record` (synchronous
+        // SQLite insert, no channel).
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/instances")
+                        .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        });
+    });
+
+    // The diagnostic channel dropped a bunch of rows — that's the
+    // whole premise of the test.
+    assert!(
+        log_store.dropped() > 0,
+        "flooder must have saturated the log_store channel; dropped={}",
+        log_store.dropped(),
+    );
+
+    // The audit ledger, which is the point of C3, has the row
+    // regardless. Query directly — no `wait_drained_for_test` needed;
+    // the write is synchronous by design.
+    let rows = audit_log
+        .query(&oxidhome_core::state::AuditQuery::default(), 8)
+        .expect("query audit_log");
+    assert_eq!(
+        rows.len(),
+        1,
+        "audit ledger must retain the row even when diagnostic drops \
+         are non-zero; rows = {rows:?}",
+    );
+    assert_eq!(rows[0].decision, "allow");
+    assert_eq!(rows[0].status, 200);
+    assert_eq!(rows[0].path, "/api/v1/instances");
+    assert_eq!(rows[0].method, "GET");
+    // Two-phase invariant: the row was pending, then finalized.
+    // `finalized_ms` set proves the middleware ran the phase-2 UPDATE.
+    assert!(
+        rows[0].finalized_ms.is_some(),
+        "audit row must be finalized, not left pending; got {:?}",
+        rows[0],
+    );
+    assert!(rows[0].finalized_ms.unwrap() >= rows[0].intent_ms);
+}
+
+/// F5 regression — the pre-C3 review-fixup surface. A request with
+/// no `Authorization` header at all must land a `deny` row in the
+/// ledger with `token_id = "anonymous"` and no credential
+/// fingerprint (nothing was presented). Pre-fixup, credential
+/// probes bypassed the ledger entirely.
+#[test]
+fn audit_records_anonymous_probe_for_missing_bearer() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let audit_log = engine.audit_log();
+
+    rt.block_on(async {
+        let router = build_router(engine.clone());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/instances")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    });
+
+    let rows = audit_log
+        .query(&oxidhome_core::state::AuditQuery::default(), 8)
+        .expect("query");
+    assert_eq!(rows.len(), 1, "missing-bearer probe must be audited");
+    assert_eq!(rows[0].token_id, "anonymous");
+    assert_eq!(rows[0].actor_kind, "anonymous");
+    assert_eq!(rows[0].decision, "deny");
+    assert_eq!(rows[0].status, 401);
+    assert!(
+        rows[0].credential_fp.is_none(),
+        "no bearer was presented — no fingerprint to record; got {:?}",
+        rows[0].credential_fp,
+    );
+    assert!(rows[0].finalized_ms.is_some());
+}
+
+/// F5 regression — same idea, but for a *presented but invalid*
+/// bearer. The row must carry a short SHA-256 fingerprint of the
+/// presented secret so a forensic sweep can correlate repeat probes
+/// with the same fake credential, while never storing the raw
+/// secret.
+#[test]
+fn audit_records_anonymous_probe_for_bogus_bearer() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let audit_log = engine.audit_log();
+
+    let bogus_bearer = "definitely-not-a-real-token";
+    rt.block_on(async {
+        let router = build_router(engine.clone());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {bogus_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    });
+
+    let rows = audit_log
+        .query(&oxidhome_core::state::AuditQuery::default(), 8)
+        .expect("query");
+    assert_eq!(rows.len(), 1, "invalid-bearer probe must be audited");
+    assert_eq!(rows[0].token_id, "anonymous");
+    assert_eq!(rows[0].decision, "deny");
+    assert_eq!(rows[0].status, 401);
+    let fp = rows[0]
+        .credential_fp
+        .as_deref()
+        .expect("invalid bearer must be recorded with a fingerprint");
+    assert_eq!(fp.len(), 8, "fingerprint is 8 hex chars, got `{fp}`");
+    assert!(fp.chars().all(|ch| ch.is_ascii_hexdigit()));
+    // Never store the raw secret.
+    assert!(
+        !fp.contains(bogus_bearer),
+        "fingerprint must not echo the presented secret; got `{fp}`",
+    );
+    // Fingerprint must be stable + non-trivial (SHA-256 of a fixed
+    // string is deterministic — regressions would flip these bytes).
+    // `sha2::Sha256("definitely-not-a-real-token")[..4]` = `7315a20c`.
+    assert_eq!(fp, "7315a20c");
+}
+
+/// F1 regression — the two-phase invariant is that the intent row
+/// lands at `record_intent` time, *before* `next.run(req).await`
+/// starts. Directly exercising cancellation from an integration
+/// test is racy (the handlers are fast); the unit test
+/// `abandoned_intent_stays_visible_as_pending` in
+/// `state::audit_log::tests` covers the pending-row shape at the
+/// API layer. This test pins the finalize half of the contract for
+/// a healthy request end-to-end: after the response returns,
+/// exactly one row exists and every column carries the expected
+/// finalized value (no pending rows leaking through).
+#[test]
+fn audit_ledger_row_is_finalized_end_to_end() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let allow_token = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let audit_log = engine.audit_log();
+
+    rt.block_on(async {
+        let router = build_router(engine.clone());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/instances")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", allow_token.plaintext),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    });
+
+    // Confirm exactly one row, finalized (not left pending).
+    let all = audit_log
+        .query(&oxidhome_core::state::AuditQuery::default(), 8)
+        .expect("query all");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].decision, "allow");
+    assert_eq!(all[0].status, 200);
+    assert!(all[0].finalized_ms.is_some());
+    assert!(all[0].credential_fp.is_none());
+
+    // Confirm no pending rows leaked (the pending → finalized UPDATE
+    // must have succeeded; a leaked pending row would show up here).
+    let pending = audit_log
+        .query(
+            &oxidhome_core::state::AuditQuery {
+                decision: Some("pending".into()),
+                ..oxidhome_core::state::AuditQuery::default()
+            },
+            8,
+        )
+        .expect("query pending");
+    assert!(
+        pending.is_empty(),
+        "no request should leave a pending row after finalize; got {pending:?}",
+    );
+}
+
 /// The wildcard `["*"]` admin / bootstrap token satisfies every
 /// scoped route. Pins the wildcard contract (see
 /// `api::scopes::WILDCARD`) end-to-end through the HTTP path.

@@ -34,8 +34,8 @@ use anyhow::Context;
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
 use crate::state::{
-    BlobStore, Db, DeviceRegistry, EventBus, EventLog, InstalledPluginRegistry, KvStore, LogStore,
-    ServiceRegistry,
+    AuditLog, BlobStore, Db, DeviceRegistry, EventBus, EventLog, InstalledPluginRegistry, KvStore,
+    LogStore, ServiceRegistry,
 };
 
 /// Process-wide Wasmtime engine. Components are compiled once per engine
@@ -59,6 +59,7 @@ pub struct Engine {
     kv: Arc<KvStore>,
     event_log: Arc<EventLog>,
     log_store: Arc<LogStore>,
+    audit_log: Arc<AuditLog>,
     blobs: Arc<BlobStore>,
     services: Arc<ServiceRegistry>,
     instances: Arc<InstanceRegistry>,
@@ -139,6 +140,7 @@ impl Engine {
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
+            audit_log: Arc::new(AuditLog::new(Arc::clone(&db))),
             auth_tokens: Arc::new(crate::state::TokenStore::new(Arc::clone(&db))),
             blobs: Arc::new(BlobStore::new(db, blobs_root)),
             services: Arc::new(ServiceRegistry::new()),
@@ -193,6 +195,17 @@ impl Engine {
     #[must_use]
     pub fn log_store(&self) -> Arc<LogStore> {
         Arc::clone(&self.log_store)
+    }
+
+    /// Dedicated audit ledger — architecture-review C3. Separate from
+    /// [`Self::log_store`] so audit rows can't be evicted by a burst
+    /// of diagnostic logs. The API's auth middleware records here
+    /// synchronously before returning the response; a follow-up will
+    /// route the `logs query --target api.audit` API path through
+    /// this store rather than through `log_store`.
+    #[must_use]
+    pub fn audit_log(&self) -> Arc<AuditLog> {
+        Arc::clone(&self.audit_log)
     }
 
     /// Shared blob store — Phase 5b. Bytes live on the filesystem
