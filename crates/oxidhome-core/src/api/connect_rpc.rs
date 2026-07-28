@@ -194,10 +194,18 @@ fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
 /// missing it is an internal bug rather than a client error →
 /// `ConnectError::internal`, not `Unauthenticated`.
 fn require_scope_connect(ctx: &RequestContext, required: Scope) -> Result<(), ConnectError> {
-    let actor = ctx
-        .extensions()
-        .get::<Actor>()
-        .ok_or_else(|| ConnectError::internal("connect handler ran without an Actor extension"))?;
+    // If the middleware failed to stamp `Actor` into extensions,
+    // wrap the internal error through `rpc_err` too — otherwise a
+    // gRPC / gRPC-Web caller of a scoped RPC in a broken pipeline
+    // would audit as `allow` on an HTTP 200 wire response. Defense
+    // in depth for the same class of bug PR #74 review flagged on
+    // `query_logs`.
+    let actor = ctx.extensions().get::<Actor>().ok_or_else(|| {
+        rpc_err(
+            ctx,
+            ConnectError::internal("connect handler ran without an Actor extension"),
+        )
+    })?;
     if let Err(ScopeDenied { required }) = require_scope(actor, required) {
         if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
             slot.set(HandlerOutcome {
@@ -704,9 +712,12 @@ impl oxidhome_proto::connect::oxidhome::v1::LogsService for OxidHomeLogs {
                 proto_log_level_to_host(known)
             }
             Some(oxidhome_proto::runtime::EnumValue::Unknown(v)) => {
-                return Err(ConnectError::invalid_argument(format!(
-                    "min_level: unknown log-level value {v}"
-                )));
+                return Err(rpc_err(
+                    &ctx,
+                    ConnectError::invalid_argument(format!(
+                        "min_level: unknown log-level value {v}"
+                    )),
+                ));
             }
         };
         let query = LogQuery {
@@ -727,7 +738,7 @@ impl oxidhome_proto::connect::oxidhome::v1::LogsService for OxidHomeLogs {
             .query(&query, limit_usize)
             .map_err(|err| {
                 tracing::error!(target: "api.logs", error = %err, "logs query failed");
-                ConnectError::internal("logs query failed")
+                rpc_err(&ctx, ConnectError::internal("logs query failed"))
             })?;
         let logs = rows.into_iter().map(historical_to_proto).collect();
         Response::ok(QueryLogsResponse {

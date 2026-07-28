@@ -2200,6 +2200,107 @@ fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
     assert_eq!(fields.required_scope, "devices:list");
 }
 
+/// **Non-scope** handler-returned Connect error on gRPC-Web still
+/// audits as `deny`, not `allow`. Sibling of the scope-deny test
+/// above — verifies the outcome slot fix (PR #74 review) covers
+/// every `rpc_err(&ctx, ...)` path, not just the scope one.
+///
+/// Setup: valid token with `logs:read`, gRPC-Web POST to
+/// `Logs.QueryLogs` carrying `min_level = 999` (unknown enum). The
+/// handler `return Err(rpc_err(&ctx, ConnectError::invalid_argument(...)))`s,
+/// which on gRPC-Web comes back as HTTP 200 with `grpc-status: 3`.
+/// Without the outcome slot the audit would classify this as `allow`
+/// (the very bug the PR review flagged as still present in this
+/// handler after 15-d shipped).
+#[test]
+fn connect_non_scope_error_on_grpc_web_transport_still_audits_as_deny() {
+    use oxidhome_core::state::LogQuery;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("reader", b"[\"logs:read\"]")
+        .unwrap();
+    let log_store = engine.log_store();
+    let subscriber = Registry::default().with(log_store.layer());
+
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            // Frame a `QueryLogsRequest{min_level: 999}` as a
+            // gRPC-Web message. On the JSON codec the body is just
+            // the JSON — but `application/grpc-web+proto` needs the
+            // proto-encoded body wrapped in a 5-byte frame header.
+            // Easier: use `application/grpc-web+json` (Connect
+            // supports it) with a JSON body carrying `min_level`.
+            //
+            // gRPC-Web frame: 1 byte flag (0 = data) + 4 bytes
+            // big-endian length + payload bytes.
+            let payload = br#"{"minLevel":999}"#;
+            let mut frame = Vec::with_capacity(5 + payload.len());
+            frame.push(0u8);
+            frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(payload);
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/oxidhome.v1.LogsService/QueryLogs")
+                        .header(header::CONTENT_TYPE, "application/grpc-web+json")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", issued.plaintext),
+                        )
+                        .body(Body::from(frame))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // gRPC-Web transport pushes the RPC error into trailers
+            // on top of HTTP 200 — the audit classifier must not
+            // read this as a success.
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    });
+    log_store.wait_drained_for_test();
+    let rows = log_store
+        .query(
+            &LogQuery {
+                target_prefix: Some("api.audit".into()),
+                ..LogQuery::default()
+            },
+            8,
+        )
+        .expect("audit query");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected one audit row for the failed gRPC-Web query, got {rows:?}",
+    );
+    let fields = extract_audit_fields(&rows[0].fields);
+    assert_eq!(
+        fields.status, 400,
+        "InvalidArgument should record as HTTP 400 in the audit row",
+    );
+    assert_eq!(
+        fields.decision, "deny",
+        "gRPC-Web non-scope handler error must audit as deny, got fields {:?}",
+        rows[0].fields
+    );
+    // Not a scope denial → required_scope stays empty.
+    assert!(fields.required_scope.is_empty());
+}
+
 // ── Connect write cluster (15-d) ─────────────────────────────────
 
 #[tokio::test(flavor = "current_thread")]
