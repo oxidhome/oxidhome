@@ -99,7 +99,7 @@ The host (Rust core) owns:
 5. **Configuration** — plugin instance configs, user preferences
 6. **Media pipelines** — when streaming plugins describe pipelines, the host runs them natively
 7. **Model registry** (0.x+) — when AI plugins request inference, the host loads/runs models natively
-8. **UI / API surface** — REST/WebSocket/whatever for clients to consume
+8. **UI / API surface** — HTTP endpoints for clients to consume, currently split across a JSON/REST + WebSocket surface and a Connect RPC surface (which speaks Connect, gRPC, and gRPC-Web off the same handlers) on one shared listener
 
 ## Streaming and media (the camera problem)
 
@@ -255,7 +255,7 @@ The remaining items below are still deferred:
 > - **Plugin manifest schema** — *settled* TOML.
 > - **WIT versioning policy** — *settled* semver, not enforced until first external SDK release.
 > - **Storage backend** — *settled* SQLite.
-> - **UI / API surface** — REST/WebSocket on the existing listener (Phase 12), web UI as the primary surface (Phase 13; the SvelteKit shell lives in the separate `oxidhome/ui` repo and the JS plugin-author package in `oxidhome/ui-sdk`), MCP server first-class (Phase 14). GraphQL/gRPC remain out of scope.
+> - **UI / API surface** — the daemon serves two RPC surfaces off the same axum listener: the JSON/REST + WebSocket surface (Phase 12) and a Connect RPC surface (Phase 15) whose `connectrpc` router speaks Connect JSON, gRPC, and gRPC-Web off the same handler set. Every 0.1 cluster (`health`, `instances`, `devices`, `plugins`, `logs`, `events` — including `events.tail` as server-streaming) exists on both surfaces; the JSON side stays for browser/curl debuggability and the Connect side is the SDK-facing contract. Auth, scope, and audit are enforced by shared code paths so both surfaces route into the same LogStore audit ledger. Web UI as the primary consumer surface (Phase 13; the SvelteKit shell lives in the separate `oxidhome/ui` repo and the JS plugin-author package in `oxidhome/ui-sdk`), MCP server first-class (Phase 14). GraphQL remains out of scope.
 
 Still open:
 
