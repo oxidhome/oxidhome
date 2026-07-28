@@ -1006,6 +1006,7 @@ const ANONYMOUS_CONNECT_PATHS: &[&str] = &["/oxidhome.v1.HealthService/Check"];
 pub fn axum_service(engine: Engine) -> axum::Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
+        audit_log: engine.audit_log(),
     };
     let inner = router(engine).into_axum_service();
     axum::Router::new()
@@ -1107,6 +1108,7 @@ async fn connect_auth_middleware(
     let audit_status = outcome.map_or_else(|| response.status(), |o| o.status);
     let denied_scope = outcome.and_then(|o| o.denied_scope).map(Scope::name);
     emit_audit(
+        &state.audit_log,
         &token_id,
         &actor_kind,
         &method,

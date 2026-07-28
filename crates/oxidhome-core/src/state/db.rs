@@ -357,6 +357,45 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE UNIQUE INDEX auth_token_hash ON auth_token(hash);
     ",
+    // Migration 9 — architecture-review C3 dedicated audit ledger.
+    //
+    // Every authenticated API request records exactly one row here,
+    // synchronously from the middleware's own thread. Separate from
+    // `log_event` (which is the drop-tolerant diagnostic stream) so
+    // audit rows can't be evicted by a burst of debug logs — the
+    // whole point of C3. See `state::audit_log` for the write path.
+    //
+    // Columns match `state::audit_log::AuditEntry` one-for-one:
+    // - `ts_unix_ms` — host-stamped commit time (never the caller's).
+    // - `token_id` / `actor_kind` — from the verified `TokenRecord`.
+    // - `method` / `path` — the HTTP method + request path (JSON
+    //   REST or Connect RPC — both surfaces route here).
+    // - `status` — final HTTP status the middleware saw. On gRPC /
+    //   gRPC-Web the middleware may synthesize this from the
+    //   handler's `HandlerOutcomeSlot`.
+    // - `decision` — `"allow"` / `"deny"` / `"error"`.
+    // - `required_scope` — populated only on scope-deny 403s.
+    //
+    // Two indexes:
+    // - `audit_ts` for time-range scans (retention sweep + generic
+    //   time-window queries).
+    // - `audit_token_ts` so `token_id = ? ORDER BY ts_unix_ms DESC`
+    //   can seek without a scan — the primary forensic drill-down.
+    "
+    CREATE TABLE audit_event (
+      id             INTEGER PRIMARY KEY,
+      ts_unix_ms     INTEGER NOT NULL,
+      token_id       TEXT NOT NULL,
+      actor_kind     TEXT NOT NULL,
+      method         TEXT NOT NULL,
+      path           TEXT NOT NULL,
+      status         INTEGER NOT NULL,
+      decision       TEXT NOT NULL,
+      required_scope TEXT
+    ) STRICT;
+    CREATE INDEX audit_ts       ON audit_event(ts_unix_ms);
+    CREATE INDEX audit_token_ts ON audit_event(token_id, ts_unix_ms);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

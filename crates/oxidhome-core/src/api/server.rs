@@ -66,6 +66,7 @@ impl Default for ApiConfig {
 pub fn build_router(engine: Engine) -> Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
+        audit_log: engine.audit_log(),
     };
     let connect_service = super::connect_rpc::axum_service(engine.clone());
     Router::new()

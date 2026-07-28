@@ -35,7 +35,7 @@ use axum::{
 };
 
 use crate::auth::Actor;
-use crate::state::{TokenError, TokenRecord, TokenStore};
+use crate::state::{AuditEntry, AuditLog, TokenError, TokenRecord, TokenStore};
 
 /// Routes that don't require a bearer token. The canonical liveness
 /// probe lives on the Connect surface
@@ -48,11 +48,17 @@ use crate::state::{TokenError, TokenRecord, TokenStore};
 pub(crate) const PUBLIC_PATHS: &[&str] = &[];
 
 /// Shared state the middleware needs. Held behind `Arc` and cloned
-/// per request — both fields are already `Arc`-backed, so the clone
+/// per request — every field is already `Arc`-backed, so the clone
 /// is cheap.
 #[derive(Clone)]
 pub(crate) struct AuthState {
     pub tokens: Arc<TokenStore>,
+    /// Dedicated audit ledger — architecture-review C3. The
+    /// middleware records here synchronously before returning the
+    /// response so audit rows can't be evicted by a burst of
+    /// diagnostic logs the way a `LogStore` `try_send` drop would
+    /// let them.
+    pub audit_log: Arc<AuditLog>,
 }
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
@@ -83,14 +89,13 @@ pub(crate) struct AuthState {
 /// Anonymous (`PUBLIC_PATHS`) requests skip audit emission — no
 /// token id to attribute them to.
 ///
-/// **Lossy-channel note.** Audit events ride the same bounded
-/// `tracing` channel as regular logs; under load the `LogStore`
-/// layer drops events rather than blocking (the drop counter is
-/// surfaced separately). This is a deliberate inheritance —
-/// blocking on audit would block the request thread — but it
-/// means a determined flooder can punch holes in the audit trail.
-/// A dedicated never-drop channel for `target = "api.audit"` is a
-/// candidate follow-up if this becomes a real forensic gap.
+/// **Never-drop audit path.** Rows land synchronously in the
+/// dedicated [`AuditLog`] ledger via [`emit_audit`] before the
+/// response returns. The parallel `tracing::info!(target =
+/// "api.audit", ...)` still fires for interactive stderr tail and
+/// for the existing `logs query --target api.audit` API path, but
+/// the forensic source of truth is the ledger — that path has no
+/// bounded channel and no `try_send` drop mode.
 pub(crate) async fn require_token(
     State(state): State<AuthState>,
     mut req: Request,
@@ -133,6 +138,7 @@ pub(crate) async fn require_token(
         .get::<crate::api::scopes::DeniedScope>()
         .map(|d| d.0);
     emit_audit(
+        &state.audit_log,
         &token_id,
         &actor_kind,
         &method,
@@ -143,15 +149,31 @@ pub(crate) async fn require_token(
     response
 }
 
-/// One audit event per authenticated request. Routed through
-/// `tracing::info!` with `target = "api.audit"`; the existing
-/// `LogStore` layer captures it. See [`require_token`]'s docstring
-/// for the field shape.
+/// One audit event per authenticated request. Written **twice**:
+///
+/// 1. **Ledger (canonical, never-drop).** Synchronously inserted
+///    into the dedicated [`AuditLog`] before this function returns.
+///    Blocks the request thread on the `SQLite` write — small
+///    single-row insert against an indexed table, sub-millisecond
+///    at normal disk latency. A ledger write error is logged at
+///    ERROR level via the tracing target below (an operator alert
+///    that itself rides the drop-tolerant `LogStore`) but the
+///    request is *not* failed — the failing write itself is the
+///    useful signal.
+/// 2. **Tracing target (mirror, best-effort).** `tracing::info!`
+///    with `target = "api.audit"` — the existing `LogStore` layer
+///    captures it, so operators tailing stderr see every request
+///    live and the current `logs query --target api.audit` API
+///    keeps working. This path *can* drop under sustained load —
+///    that's why the ledger is the source of truth. A follow-up
+///    will migrate the query API and tests off this mirror and
+///    retire it.
 ///
 /// `pub(super)` so the Connect-side auth middleware
 /// ([`super::connect_rpc`]) emits the same shape — single source
 /// of truth for the audit-row contract.
 pub(super) fn emit_audit(
+    audit_log: &Arc<AuditLog>,
     token_id: &str,
     actor_kind: &str,
     method: &str,
@@ -166,14 +188,43 @@ pub(super) fn emit_audit(
     } else {
         "deny"
     };
+
+    // (1) Canonical ledger write. `AuditEntry::ts_unix_ms` is
+    // stamped by `record` — the value here is a placeholder.
+    let entry = AuditEntry {
+        ts_unix_ms: 0,
+        token_id: token_id.to_owned(),
+        actor_kind: actor_kind.to_owned(),
+        method: method.to_owned(),
+        path: path.to_owned(),
+        status: status.as_u16(),
+        decision: decision.to_owned(),
+        required_scope: required_scope.map(str::to_owned),
+    };
+    if let Err(err) = audit_log.record(entry) {
+        // Ledger write failed. Surface an ERROR so the operator sees
+        // it — the alert itself may still land through the tracing
+        // side. Do not fail the response: the request has already
+        // completed, and drowning the caller in a 500 wouldn't
+        // restore the missing audit row.
+        tracing::error!(
+            target: "api.audit",
+            error = %err,
+            token_id = %token_id,
+            method = %method,
+            path = %path,
+            "audit-ledger write failed",
+        );
+    }
+
+    // (2) Best-effort tracing mirror. `required_scope` is only
+    // populated on scope-denial 403s (`DeniedScope` came back on
+    // the response extension). Other denies — and every allow —
+    // record it as an empty string so the log_event row's
+    // `fields_blob` shape stays uniform across every audit entry. A
+    // query like `--field required_scope=devices:list` then picks
+    // the rows where that scope was the tripwire.
     let audit_target = format!("api.{method}-{path}");
-    // `required_scope` is only populated on scope-denial 403s
-    // (`DeniedScope` came back on the response extension). Other
-    // denies — and every allow — record it as an empty string so
-    // the log_event row's `fields_blob` shape stays uniform across
-    // every audit entry. A query like `--field required_scope=
-    // devices:list` then picks the rows where that scope was the
-    // tripwire.
     let required = required_scope.unwrap_or("");
     tracing::info!(
         target: "api.audit",

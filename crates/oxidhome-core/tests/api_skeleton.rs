@@ -398,6 +398,101 @@ fn audit_log_records_one_event_per_authenticated_request() {
     assert!(decisions.contains(&"deny".to_string()));
 }
 
+/// Architecture-review C3 regression. The `LogStore` `try_send`
+/// channel drops rows under saturation — that's the deliberate
+/// diagnostic-log trade-off. Audit *must not* share that fate.
+///
+/// The test wires up an `Engine`, installs the log-store subscriber,
+/// then floods the channel with more diagnostic events than its
+/// capacity (`DEFAULT_CAPACITY = 1024`) before any writer drains
+/// have a chance to run. That guarantees the channel is saturated
+/// on the very next `try_send` — evidenced by a non-zero drop
+/// counter. Meanwhile a real authenticated request goes through
+/// `build_router`, so `emit_audit` fires both the tracing mirror
+/// (which competes for that same saturated channel) and the
+/// dedicated `AuditLog::record` synchronous write.
+///
+/// The invariant: `AuditLog::count()` reports the row landed even
+/// when the `LogStore` reports drops. Proves the audit ledger is
+/// isolated from diagnostic-log backpressure.
+#[test]
+fn audit_ledger_row_survives_log_store_channel_saturation() {
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+
+    let log_store = engine.log_store();
+    let audit_log = engine.audit_log();
+    assert_eq!(audit_log.count().unwrap(), 0);
+
+    let subscriber = Registry::default().with(log_store.layer());
+
+    let _serial = TRACING_SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_default(subscriber, || {
+        // Saturate the diagnostic channel. `DEFAULT_CAPACITY` is
+        // 1024; we emit well over that from a synchronous loop so
+        // the writer thread can't keep up and `try_send` starts
+        // returning `Full`, bumping the `dropped` counter.
+        for i in 0..8192 {
+            tracing::info!(target: "flooder", i, "burst");
+        }
+
+        // Now the request that must be audited. Its `emit_audit`
+        // hits both paths — the tracing mirror (into the saturated
+        // channel, may drop) *and* `AuditLog::record` (synchronous
+        // SQLite insert, no channel).
+        rt.block_on(async {
+            let router = build_router(engine.clone());
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/instances")
+                        .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        });
+    });
+
+    // The diagnostic channel dropped a bunch of rows — that's the
+    // whole premise of the test.
+    assert!(
+        log_store.dropped() > 0,
+        "flooder must have saturated the log_store channel; dropped={}",
+        log_store.dropped(),
+    );
+
+    // The audit ledger, which is the point of C3, has the row
+    // regardless. Query directly — no `wait_drained_for_test` needed;
+    // the write is synchronous by design.
+    let rows = audit_log
+        .query(&oxidhome_core::state::AuditQuery::default(), 8)
+        .expect("query audit_log");
+    assert_eq!(
+        rows.len(),
+        1,
+        "audit ledger must retain the row even when diagnostic drops \
+         are non-zero; rows = {rows:?}",
+    );
+    assert_eq!(rows[0].decision, "allow");
+    assert_eq!(rows[0].status, 200);
+    assert_eq!(rows[0].path, "/api/v1/instances");
+    assert_eq!(rows[0].method, "GET");
+}
+
 /// The wildcard `["*"]` admin / bootstrap token satisfies every
 /// scoped route. Pins the wildcard contract (see
 /// `api::scopes::WILDCARD`) end-to-end through the HTTP path.

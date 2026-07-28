@@ -15,6 +15,7 @@
 //! takes another at load time, and host-import callbacks reach them
 //! through `PluginState`.
 
+pub mod audit_log;
 pub mod auth_token;
 pub mod blobs;
 pub mod db;
@@ -26,6 +27,7 @@ pub mod kv;
 pub mod log_store;
 pub mod services;
 
+pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery};
 pub use auth_token::{IssuedToken, TokenError, TokenRecord, TokenStore};
 pub use blobs::{BlobError, BlobInfo, BlobStore};
 pub use db::Db;
