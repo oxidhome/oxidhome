@@ -565,6 +565,35 @@ impl host_events::Host for PluginState {
         ev.origin_plugin_id = self.manifest.plugin.id.clone();
         ev.origin_instance_id = self.instance_id.clone();
 
+        // C2d admission (PR #82 review, F2): consult the per-instance
+        // rate limiter *before* the durable-mirror spawn_blocking.
+        // The first cut of C2d put admission at the end of this
+        // function, so a flooder still consumed a blocking-pool
+        // thread + a SQLite write per over-quota publish; on refusal
+        // the caller saw `Unavailable` even though the row was
+        // already committed to `event_log`. Admission-first means a
+        // refused publish never spends disk or blocking-pool budget
+        // and never leaves a durable side effect for the caller to
+        // reconcile.
+        if let Err(crate::state::PublishDenied::RateLimited {
+            capacity,
+            refill_per_sec,
+            ..
+        }) = self.events.admit_publish(&self.instance_id)
+        {
+            tracing::warn!(
+                target: "host.events",
+                instance_id = %self.instance_id,
+                capacity,
+                refill_per_sec,
+                "publish rate-limited (pre-persistence)",
+            );
+            return Err(WitError::Unavailable(format!(
+                "publish-event: per-instance publish quota exhausted \
+                 (capacity {capacity} events, refill {refill_per_sec}/s)",
+            )));
+        }
+
         // Durable mirror first (Phase 5d): if the write fails — disk
         // full, sqlite corruption, etc. — we'd rather refuse the
         // publish than silently lose history. Live broadcast comes
@@ -598,33 +627,13 @@ impl host_events::Host for PluginState {
             }
         }
 
-        // C2d: rate-limited publish. `try_publish` consults a
-        // per-instance token bucket on the bus and refuses over-
-        // quota bursts. The default ceiling is well above any
-        // real device-cadence workload — plugins with legitimate
-        // publish rates never see this. Rogue publishers can't
-        // monopolize the shared broadcast ring or amplify their
-        // own load onto every subscriber's supervisor.
-        match self.events.try_publish(&self.instance_id, ev) {
-            Ok(_delivered) => Ok(()),
-            Err(crate::state::PublishDenied::RateLimited {
-                capacity,
-                refill_per_sec,
-                ..
-            }) => {
-                tracing::warn!(
-                    target: "host.events",
-                    instance_id = %self.instance_id,
-                    capacity,
-                    refill_per_sec,
-                    "publish rate-limited",
-                );
-                Err(WitError::Unavailable(format!(
-                    "publish-event: per-instance publish quota exhausted \
-                     (capacity {capacity} events, refill {refill_per_sec}/s)",
-                )))
-            }
-        }
+        // Admission already consumed above (pre-persistence). The
+        // bus's `publish` sends the event onto the broadcast ring
+        // and signals matching wakes — see `EventBus::publish` for
+        // the send-before-signal ordering that keeps waking
+        // supervisors from racing an empty receiver.
+        let _delivered = self.events.publish(ev);
+        Ok(())
     }
 
     async fn subscribe(&mut self, filter: EventFilter) -> Result<SubscriptionId, WitError> {
@@ -1551,21 +1560,23 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn publish_event_returns_unavailable_over_rate_limit() {
-        // C2d: `PluginState::publish_event` routes through
-        // `EventBus::try_publish`, whose per-instance token bucket
-        // refuses over-quota bursts. The response maps to
-        // `WitError::Unavailable` with a message naming the
-        // capacity + refill rate so the plugin's `?` propagates a
-        // signal the operator can act on.
+        // C2d: `PluginState::publish_event` routes through the
+        // bus's per-instance token bucket, which refuses over-
+        // quota bursts. The response maps to `WitError::Unavailable`
+        // with a message naming the capacity + refill rate so the
+        // plugin's `?` propagates a signal the operator can act
+        // on. Post-PR-#82 review: admission happens *before* the
+        // durable event-log write, so a refused publish leaves no
+        // side effect for the caller to reconcile.
         let mut state = fresh_state("alpha");
         let id = host_devices::Host::register_device(&mut state, switch_device("d-1"))
             .await
             .expect("register");
-        // Drain the default burst (500) plus one — the +1 should
-        // trip the limit because no wall-clock time has elapsed
-        // to refill.
+        // Drain the burst — no wall-clock time elapses so refill
+        // stays at 0 across the loop and the (N+1)th call trips
+        // the limit.
         let mut denied: Option<WitError> = None;
-        for _ in 0..600 {
+        for _ in 0..256 {
             match host_events::Host::publish_event(&mut state, state_change_event(&id)).await {
                 Ok(()) => {}
                 Err(err @ WitError::Unavailable(_)) => {

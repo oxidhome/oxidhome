@@ -53,21 +53,26 @@ const BUS_CAPACITY: usize = 256;
 /// Default per-instance publish rate ceiling (events/second). A
 /// well-behaved plugin publishing at natural device cadences
 /// (state changes, button events, occasional custom broadcasts) is
-/// nowhere near this — 500/sec is roughly one event every 2 ms
-/// sustained. The refuse-and-count-a-drop path fires when a
-/// misbehaving or compromised publisher tries to fill the shared
-/// broadcast ring faster than any real subscriber could consume it.
+/// nowhere near this — 100/sec is one event every 10 ms sustained,
+/// which is faster than any real home-automation device fires.
 ///
-/// The bucket is refilled at the same rate as its capacity, so the
-/// steady-state ceiling is `DEFAULT_PUBLISH_RATE_PER_SEC` and
-/// bursts up to the capacity are allowed. When plugin manifests
-/// grow a per-plugin publish-rate configuration this becomes the
-/// default only.
-const DEFAULT_PUBLISH_RATE_PER_SEC: f64 = 500.0;
-/// Max burst — how many tokens the bucket can hold. Same value as
-/// the refill rate gives one full second of sustained burst at
-/// once, then falls back to the refill rate.
-const DEFAULT_PUBLISH_BURST: f64 = 500.0;
+/// PR #82 review, F3 — the first cut of C2d permitted a 500-event
+/// burst against a 256-slot broadcast ring, so one instance's
+/// burst alone could evict every subscriber's un-drained events.
+/// Bringing the burst well below the ring's per-slot capacity
+/// bounds the worst-case cross-subscriber eviction to whatever
+/// slack the slowest subscriber has, not the ring's total.
+///
+/// Not a full fix — per-subscriber queues (filed as a follow-up)
+/// are still what closes cross-subscriber eviction properly. The
+/// rate limit here bounds the *arrival* rate; per-subscriber
+/// queues bound the *retention*.
+const DEFAULT_PUBLISH_RATE_PER_SEC: f64 = 100.0;
+/// Max burst — how many tokens the bucket can hold. Sized well
+/// below [`BUS_CAPACITY`] so a single instance's full burst plus
+/// a modest amount of already-buffered events from other
+/// publishers fits in the ring without evicting anything.
+const DEFAULT_PUBLISH_BURST: f64 = 64.0;
 
 /// Live pub/sub for plugin-published events.
 ///
@@ -203,26 +208,43 @@ impl EventBus {
     /// synthesize events) that don't have a plugin instance
     /// identity. Returns the number of broadcast subscribers that
     /// received it (0 = no listeners — fine).
+    #[allow(clippy::needless_pass_by_value)]
     pub fn publish(&self, event: Event) -> usize {
-        // Signal wakes first so a subscriber whose receiver is
-        // ready gets notified before the broadcast subscriber count
-        // in the tokio-broadcast internal state changes. Ordering
-        // is otherwise irrelevant — signal_wakes only reads.
+        // Ordering matters (PR #82 review, F1). The event MUST be
+        // on the broadcast ring *before* the wake fires — otherwise
+        // a subscriber woken by `notify_one` in another task can
+        // drain its receiver, find nothing, and go back to sleep
+        // before the send() call actually enqueues the event. Under
+        // a multi-thread runtime, that races the supervisor into
+        // dropping events on the floor.
+        //
+        // Cost: one clone of `event` (broadcast::send already clones
+        // internally per subscriber, so this is one *extra* clone
+        // for the wake-side filter check). Correctness > perf; event
+        // payloads are small structs.
+        let n = self.sender.send(event.clone()).unwrap_or(0);
         self.signal_wakes(&event);
-        self.sender.send(event).unwrap_or(0)
+        n
     }
 
-    /// Rate-limited publish. Consult the per-instance token bucket
-    /// keyed on `instance_id`; on success push onto the broadcast
-    /// ring and signal matching wake registrations.
+    /// Consume one publish token from `instance_id`'s bucket. This
+    /// is the *admission* half of the rate-limited publish path —
+    /// separate from [`Self::publish`] so
+    /// [`PluginState::publish_event`](crate::runtime::PluginState)
+    /// can rate-check *before* it spends a blocking-pool thread
+    /// on the durable event-log write.
+    ///
+    /// PR #82 review, F2 — the first cut of C2d called
+    /// `try_publish` (which combined admission + persistence-side
+    /// broadcast) after the durable mirror, so a flooder consumed
+    /// disk + threads freely and only got refused on the way out.
+    /// Admission now runs first.
     ///
     /// # Errors
     ///
     /// [`PublishDenied::RateLimited`] when the caller's per-second
-    /// quota is exhausted. The event is dropped — never enters
-    /// the broadcast ring, never triggers a wake, never lands in
-    /// the durable event log.
-    pub fn try_publish(&self, instance_id: &str, event: Event) -> Result<usize, PublishDenied> {
+    /// quota is exhausted.
+    pub fn admit_publish(&self, instance_id: &str) -> Result<(), PublishDenied> {
         let limiter = self.limiter_for(instance_id);
         if !limiter.consume() {
             return Err(PublishDenied::RateLimited {
@@ -231,7 +253,7 @@ impl EventBus {
                 refill_per_sec: self.rate_refill_per_sec,
             });
         }
-        Ok(self.publish(event))
+        Ok(())
     }
 
     fn limiter_for(&self, instance_id: &str) -> Arc<RateLimiter> {
@@ -518,33 +540,25 @@ mod tests {
     // ── C2d rate-limit tests ────────────────────────────────────────
 
     #[test]
-    fn try_publish_ok_under_rate_limit() {
+    fn admit_publish_ok_under_rate_limit() {
         let bus = EventBus::new();
-        // A handful of publishes should succeed comfortably —
-        // default burst is 500.
         for _ in 0..10 {
-            let n = bus
-                .try_publish("alpha", custom(None, "test"))
-                .expect("under-limit publish must succeed");
-            // With no subscribers `send` returns 0 delivered.
-            assert_eq!(n, 0);
+            bus.admit_publish("alpha")
+                .expect("under-limit admission must succeed");
         }
     }
 
     #[test]
-    fn try_publish_refuses_when_burst_exhausted() {
+    fn admit_publish_refuses_when_burst_exhausted() {
         let bus = EventBus::new();
         // Consume every token in the burst.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         for _ in 0..DEFAULT_PUBLISH_BURST as u32 {
-            bus.try_publish("alpha", custom(None, "burst"))
-                .expect("initial burst allowed");
+            bus.admit_publish("alpha").expect("initial burst allowed");
         }
         // Next call should be refused immediately (no time has
         // elapsed to refill).
-        let err = bus
-            .try_publish("alpha", custom(None, "over-quota"))
-            .unwrap_err();
+        let err = bus.admit_publish("alpha").unwrap_err();
         assert!(
             matches!(err, PublishDenied::RateLimited { .. }),
             "got {err:?}",
@@ -557,11 +571,66 @@ mod tests {
         // Exhaust alpha's bucket.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         for _ in 0..DEFAULT_PUBLISH_BURST as u32 {
-            bus.try_publish("alpha", custom(None, "spam")).unwrap();
+            bus.admit_publish("alpha").unwrap();
         }
         // Beta gets a fresh bucket.
-        bus.try_publish("beta", custom(None, "hello"))
+        bus.admit_publish("beta")
             .expect("distinct instance keeps its own bucket");
+    }
+
+    #[test]
+    fn default_burst_stays_below_ring_capacity() {
+        // PR #82 review, F3 — burst must be sized well below the
+        // shared broadcast ring so one instance's full burst can't
+        // evict every subscriber's un-drained events. This
+        // constant guard fires if someone bumps the burst back
+        // above the ring without also fixing the shared-ring
+        // isolation story (per-subscriber queues — see C2e).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let burst = DEFAULT_PUBLISH_BURST as usize;
+        assert!(
+            burst < BUS_CAPACITY,
+            "burst {DEFAULT_PUBLISH_BURST} must be < BUS_CAPACITY {BUS_CAPACITY}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wake_fires_after_send_makes_event_visible() {
+        // PR #82 review, F1 regression — the wake must not fire
+        // before the event is on the ring, or a woken subscriber
+        // draining its receiver can find nothing and sleep before
+        // the send lands, losing the event indefinitely. Under a
+        // multi-thread runtime the racing tasks make the bad
+        // ordering observable.
+        let bus = Arc::new(EventBus::new());
+        let notify = Arc::new(Notify::new());
+        let mut sub = bus.subscribe_with_wake(
+            EventFilter {
+                device: None,
+                topic: None,
+            },
+            Arc::clone(&notify),
+        );
+
+        let bus_publisher = Arc::clone(&bus);
+        let subscriber = tokio::spawn(async move {
+            notify.notified().await;
+            // Post-wake, the event MUST be readable.
+            sub.receiver
+                .try_recv()
+                .expect("event must be visible on the ring by the time wake fires")
+        });
+
+        // Give the subscriber time to reach `.notified().await`
+        // before we publish, so the race window (if any) is real.
+        tokio::task::yield_now().await;
+        bus_publisher.publish(custom(None, "test"));
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), subscriber)
+            .await
+            .expect("subscriber did not observe the event before timeout")
+            .expect("subscriber task panicked");
+        assert!(matches!(ev.payload, EventPayload::Custom(_)));
     }
 
     // ── C2d wake-registration tests ─────────────────────────────────
