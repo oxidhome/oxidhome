@@ -6,6 +6,14 @@ pub type OwnedListDevicesRequestView = ::buffa::view::OwnedView<
 pub type OwnedListDevicesResponseView = ::buffa::view::OwnedView<
     crate::proto::oxidhome::v1::__buffa::view::ListDevicesResponseView<'static>,
 >;
+///Shorthand for `OwnedView<ExecuteCommandRequestView<'static>>`.
+pub type OwnedExecuteCommandRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandRequestView<'static>,
+>;
+///Shorthand for `OwnedView<ExecuteCommandResponseView<'static>>`.
+pub type OwnedExecuteCommandResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandResponseView<'static>,
+>;
 impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListDevicesResponse>
 for crate::proto::oxidhome::v1::__buffa::view::ListDevicesResponseView<'_> {
     fn encode(
@@ -26,6 +34,26 @@ for ::buffa::view::OwnedView<
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
 }
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ExecuteCommandResponse>
+for crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ExecuteCommandResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+}
 /// Full service name for this service.
 pub const DEVICES_SERVICE_SERVICE_NAME: &str = "oxidhome.v1.DevicesService";
 /// Static [`Spec`](::connectrpc::Spec) for the server-side `ListDevices` RPC.
@@ -34,6 +62,15 @@ pub const DEVICES_SERVICE_SERVICE_NAME: &str = "oxidhome.v1.DevicesService";
 /// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
 pub const DEVICES_SERVICE_LIST_DEVICES_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/oxidhome.v1.DevicesService/ListDevices",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the server-side `ExecuteCommand` RPC.
+///
+/// The dispatcher surfaces this on
+/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+pub const DEVICES_SERVICE_EXECUTE_COMMAND_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.DevicesService/ExecuteCommand",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
@@ -115,6 +152,35 @@ pub trait DevicesService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
+    /// Execute a capability command against a device. Sensitive
+    /// (`devices:command` scope) — controls physical actuation
+    /// (switches, dimmers, locks). Same routing as the JSON
+    /// `POST /api/v1/devices/{id}/command`: the host looks up the
+    /// device's owning instance and forwards `execute-command` to
+    /// it. Unknown device and non-running owner both collapse to
+    /// NotFound (no enumeration leak).
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn execute_command<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::ExecuteCommandRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::ExecuteCommandResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -176,6 +242,35 @@ impl<S: DevicesService> DevicesServiceExt for S {
                 },
             )
             .with_spec(DEVICES_SERVICE_LIST_DEVICES_SPEC)
+            .route_view(
+                DEVICES_SERVICE_SERVICE_NAME,
+                "ExecuteCommand",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::ExecuteCommandRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.execute_command(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::ExecuteCommandResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(DEVICES_SERVICE_EXECUTE_COMMAND_SPEC)
     }
 }
 /// Type-inference marker used by [`Router::add_service`](::connectrpc::Router::add_service).
@@ -236,6 +331,12 @@ impl<T: DevicesService> ::connectrpc::Dispatcher for DevicesServiceServer<T> {
                         .with_spec(DEVICES_SERVICE_LIST_DEVICES_SPEC),
                 )
             }
+            "ExecuteCommand" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(DEVICES_SERVICE_EXECUTE_COMMAND_SPEC),
+                )
+            }
             _ => None,
         }
     }
@@ -269,6 +370,27 @@ impl<T: DevicesService> ::connectrpc::Dispatcher for DevicesServiceServer<T> {
                         .await?
                         .encode::<
                             crate::proto::oxidhome::v1::ListDevicesResponse,
+                        >(format)
+                })
+            }
+            "ExecuteCommand" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::ExecuteCommandRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::ExecuteCommandRequest,
+                    >::from_parts(&req, &body);
+                    svc.execute_command(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::ExecuteCommandResponse,
                         >(format)
                 })
             }
@@ -440,6 +562,51 @@ where
                 &self.config,
                 DEVICES_SERVICE_SERVICE_NAME,
                 "ListDevices",
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the ExecuteCommand RPC. Sends a request to /oxidhome.v1.DevicesService/ExecuteCommand.
+    pub async fn execute_command(
+        &self,
+        request: crate::proto::oxidhome::v1::ExecuteCommandRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.execute_command_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the ExecuteCommand RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn execute_command_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::ExecuteCommandRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                DEVICES_SERVICE_SERVICE_NAME,
+                "ExecuteCommand",
                 request,
                 options,
             )

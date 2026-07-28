@@ -30,12 +30,14 @@ pub mod __buffa {
         pub mod oneof {
             #[allow(unused_imports)]
             use super::*;
+            include!("oxidhome.v1.devices.__view_oneof.rs");
             include!("oxidhome.v1.logs.__view_oneof.rs");
         }
     }
     pub mod oneof {
         #[allow(unused_imports)]
         use super::*;
+        include!("oxidhome.v1.devices.__oneof.rs");
         include!("oxidhome.v1.logs.__oneof.rs");
     }
     /// Register this package's `Any` type entries and extension entries.
@@ -43,6 +45,13 @@ pub mod __buffa {
         reg.register_json_any(super::__LIST_DEVICES_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_DEVICES_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__DEVICE_JSON_ANY);
+        reg.register_json_any(super::__EXECUTE_COMMAND_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__VALUE_JSON_ANY);
+        reg.register_json_any(super::__KEY_VALUE_JSON_ANY);
+        reg.register_json_any(super::__EXECUTE_COMMAND_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::execute_command_response::__OK_JSON_ANY);
+        reg.register_json_any(super::execute_command_response::__OK_WITH_STATE_JSON_ANY);
+        reg.register_json_any(super::__EXECUTE_COMMAND_ERROR_JSON_ANY);
         reg.register_json_any(super::__CHECK_REQUEST_JSON_ANY);
         reg.register_json_any(super::__CHECK_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__LIST_INSTANCES_REQUEST_JSON_ANY);
@@ -56,6 +65,14 @@ pub mod __buffa {
         reg.register_json_any(super::__LIST_PLUGINS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_PLUGINS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__PLUGIN_JSON_ANY);
+        reg.register_json_any(super::__INSTALL_PLUGIN_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__INSTALL_PLUGIN_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__START_PLUGIN_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__START_PLUGIN_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__STOP_PLUGIN_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__STOP_PLUGIN_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__UNINSTALL_PLUGIN_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__UNINSTALL_PLUGIN_RESPONSE_JSON_ANY);
     }
 }
 #[doc(inline)]
@@ -70,6 +87,26 @@ pub use self::__buffa::view::ListDevicesResponseOwnedView;
 pub use self::__buffa::view::DeviceView;
 #[doc(inline)]
 pub use self::__buffa::view::DeviceOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ExecuteCommandRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ExecuteCommandRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ValueView;
+#[doc(inline)]
+pub use self::__buffa::view::ValueOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::KeyValueView;
+#[doc(inline)]
+pub use self::__buffa::view::KeyValueOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ExecuteCommandResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ExecuteCommandResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ExecuteCommandErrorView;
+#[doc(inline)]
+pub use self::__buffa::view::ExecuteCommandErrorOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::CheckRequestView;
 #[doc(inline)]
@@ -122,5 +159,37 @@ pub use self::__buffa::view::ListPluginsResponseOwnedView;
 pub use self::__buffa::view::PluginView;
 #[doc(inline)]
 pub use self::__buffa::view::PluginOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::InstallPluginRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::InstallPluginRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::InstallPluginResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::InstallPluginResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::StartPluginRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::StartPluginRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::StartPluginResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::StartPluginResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::StopPluginRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::StopPluginRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::StopPluginResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::StopPluginResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::UninstallPluginRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::UninstallPluginRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::UninstallPluginResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::UninstallPluginResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

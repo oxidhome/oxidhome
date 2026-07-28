@@ -412,3 +412,1736 @@ pub const __DEVICE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::typ
     from_json: ::buffa::type_registry::any_from_json::<Device>,
     is_wkt: false,
 };
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct ExecuteCommandRequest {
+    /// Host-assigned device id (from `ListDevices` or a `state-changed`
+    /// event).
+    ///
+    /// Field 1: `device_id`
+    #[serde(
+        rename = "deviceId",
+        alias = "device_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub device_id: ::buffa::alloc::string::String,
+    /// Capability key — `"switch"`, `"dimmer"`, etc. — that the
+    /// plugin's `execute-command` matches on alongside `action`.
+    ///
+    /// Field 2: `capability`
+    #[serde(
+        rename = "capability",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub capability: ::buffa::alloc::string::String,
+    /// Action verb — `"set"`, `"toggle"`, `"increment"`, … — the
+    /// plugin's command dispatch interprets.
+    ///
+    /// Field 3: `action`
+    #[serde(
+        rename = "action",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub action: ::buffa::alloc::string::String,
+    /// `key=value` arguments the command takes. Order is preserved
+    /// client → host → plugin; capabilities that treat args as a
+    /// dict resolve duplicates plugin-side.
+    ///
+    /// Field 4: `args`
+    #[serde(
+        rename = "args",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub args: ::buffa::alloc::vec::Vec<KeyValue>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for ExecuteCommandRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ExecuteCommandRequest")
+            .field("device_id", &self.device_id)
+            .field("capability", &self.capability)
+            .field("action", &self.action)
+            .field("args", &self.args)
+            .finish()
+    }
+}
+impl ExecuteCommandRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandRequest";
+}
+::buffa::impl_default_instance!(ExecuteCommandRequest);
+impl ::buffa::MessageName for ExecuteCommandRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ExecuteCommandRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.ExecuteCommandRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandRequest";
+}
+impl ::buffa::Message for ExecuteCommandRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.device_id.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.device_id) as u32;
+        }
+        if !self.capability.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.capability) as u32;
+        }
+        if !self.action.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.action) as u32;
+        }
+        for v in &self.args {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
+                    + inner_size;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.device_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.device_id, buf);
+        }
+        if !self.capability.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.capability, buf);
+        }
+        if !self.action.is_empty() {
+            ::buffa::types::put_string_field(3u32, &self.action, buf);
+        }
+        for v in &self.args {
+            ::buffa::types::put_len_delimited_header(4u32, __cache.consume_next(), buf);
+            v.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.device_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.capability, buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.action, buf)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.args.push(elem);
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.device_id.clear();
+        self.capability.clear();
+        self.action.clear();
+        self.args.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for ExecuteCommandRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.ExecuteCommandRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for ExecuteCommandRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __EXECUTE_COMMAND_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.ExecuteCommandRequest",
+    to_json: ::buffa::type_registry::any_to_json::<ExecuteCommandRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<ExecuteCommandRequest>,
+    is_wkt: false,
+};
+/// One-of-many typed value that arg values and state entries carry.
+/// Mirrors the host-side `WIT value` variant and the JSON `WireValue`
+/// tagged shape, just structured as a proto `oneof` so gRPC /
+/// protobuf clients see a typed union rather than a stringly-tagged
+/// blob.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize)]
+#[serde(default)]
+pub struct Value {
+    #[serde(flatten)]
+    pub kind: ::core::option::Option<__buffa::oneof::value::Kind>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for Value {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("Value").field("kind", &self.kind).finish()
+    }
+}
+impl Value {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Value";
+}
+::buffa::impl_default_instance!(Value);
+impl ::buffa::MessageName for Value {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "Value";
+    const FULL_NAME: &'static str = "oxidhome.v1.Value";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Value";
+}
+impl ::buffa::Message for Value {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if let ::core::option::Option::Some(ref v) = self.kind {
+            match v {
+                __buffa::oneof::value::Kind::BoolVal(_x) => {
+                    size += 1u32 + ::buffa::types::BOOL_ENCODED_LEN as u32;
+                }
+                __buffa::oneof::value::Kind::IntVal(v) => {
+                    size += 1u32 + ::buffa::types::int64_encoded_len(*v) as u32;
+                }
+                __buffa::oneof::value::Kind::FloatVal(_x) => {
+                    size += 1u32 + ::buffa::types::FIXED64_ENCODED_LEN as u32;
+                }
+                __buffa::oneof::value::Kind::StringVal(x) => {
+                    size += 1u32 + ::buffa::types::string_encoded_len(x) as u32;
+                }
+                __buffa::oneof::value::Kind::BytesVal(x) => {
+                    size += 1u32 + ::buffa::types::bytes_encoded_len(x) as u32;
+                }
+                __buffa::oneof::value::Kind::JsonVal(x) => {
+                    size += 1u32 + ::buffa::types::string_encoded_len(x) as u32;
+                }
+            }
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if let ::core::option::Option::Some(ref v) = self.kind {
+            match v {
+                __buffa::oneof::value::Kind::BoolVal(x) => {
+                    ::buffa::types::put_bool_field(1u32, *x, buf);
+                }
+                __buffa::oneof::value::Kind::IntVal(x) => {
+                    ::buffa::types::put_int64_field(2u32, *x, buf);
+                }
+                __buffa::oneof::value::Kind::FloatVal(x) => {
+                    ::buffa::types::put_double_field(3u32, *x, buf);
+                }
+                __buffa::oneof::value::Kind::StringVal(x) => {
+                    ::buffa::types::put_string_field(4u32, x, buf);
+                }
+                __buffa::oneof::value::Kind::BytesVal(x) => {
+                    ::buffa::types::put_bytes_field(5u32, x, buf);
+                }
+                __buffa::oneof::value::Kind::JsonVal(x) => {
+                    ::buffa::types::put_string_field(6u32, x, buf);
+                }
+            }
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::value::Kind::BoolVal(
+                        ::buffa::types::decode_bool(buf)?,
+                    ),
+                );
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::value::Kind::IntVal(
+                        ::buffa::types::decode_int64(buf)?,
+                    ),
+                );
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::value::Kind::FloatVal(
+                        ::buffa::types::decode_double(buf)?,
+                    ),
+                );
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::value::Kind::StringVal(
+                        ::buffa::types::decode_string(buf)?,
+                    ),
+                );
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::value::Kind::BytesVal(
+                        ::buffa::types::decode_bytes(buf)?,
+                    ),
+                );
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::value::Kind::JsonVal(
+                        ::buffa::types::decode_string(buf)?,
+                    ),
+                );
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.kind = ::core::option::Option::None;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for Value {
+    const PROTO_FQN: &'static str = "oxidhome.v1.Value";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl<'de> serde::Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        struct _V;
+        impl<'de> serde::de::Visitor<'de> for _V {
+            type Value = Value;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("struct Value")
+            }
+            #[allow(clippy::field_reassign_with_default)]
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> ::core::result::Result<Value, A::Error> {
+                let mut __oneof_kind: ::core::option::Option<
+                    __buffa::oneof::value::Kind,
+                > = None;
+                while let Some(key) = map.next_key::<::buffa::alloc::string::String>()? {
+                    match key.as_str() {
+                        "boolVal" | "bool_val" => {
+                            let v: ::core::option::Option<bool> = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<bool>::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::value::Kind::BoolVal(v),
+                                );
+                            }
+                        }
+                        "intVal" | "int_val" => {
+                            struct _DeserSeed;
+                            impl<'de> serde::de::DeserializeSeed<'de> for _DeserSeed {
+                                type Value = i64;
+                                fn deserialize<D: serde::Deserializer<'de>>(
+                                    self,
+                                    d: D,
+                                ) -> ::core::result::Result<i64, D::Error> {
+                                    ::buffa::json_helpers::int64::deserialize(d)
+                                }
+                            }
+                            let v: ::core::option::Option<i64> = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(_DeserSeed),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(__buffa::oneof::value::Kind::IntVal(v));
+                            }
+                        }
+                        "floatVal" | "float_val" => {
+                            struct _DeserSeed;
+                            impl<'de> serde::de::DeserializeSeed<'de> for _DeserSeed {
+                                type Value = f64;
+                                fn deserialize<D: serde::Deserializer<'de>>(
+                                    self,
+                                    d: D,
+                                ) -> ::core::result::Result<f64, D::Error> {
+                                    ::buffa::json_helpers::double::deserialize(d)
+                                }
+                            }
+                            let v: ::core::option::Option<f64> = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(_DeserSeed),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::value::Kind::FloatVal(v),
+                                );
+                            }
+                        }
+                        "stringVal" | "string_val" => {
+                            let v: ::core::option::Option<
+                                ::buffa::alloc::string::String,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            ::buffa::alloc::string::String,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::value::Kind::StringVal(v),
+                                );
+                            }
+                        }
+                        "bytesVal" | "bytes_val" => {
+                            struct _DeserSeed;
+                            impl<'de> serde::de::DeserializeSeed<'de> for _DeserSeed {
+                                type Value = ::buffa::alloc::vec::Vec<u8>;
+                                fn deserialize<D: serde::Deserializer<'de>>(
+                                    self,
+                                    d: D,
+                                ) -> ::core::result::Result<
+                                    ::buffa::alloc::vec::Vec<u8>,
+                                    D::Error,
+                                > {
+                                    ::buffa::json_helpers::bytes::deserialize(d)
+                                }
+                            }
+                            let v: ::core::option::Option<
+                                ::buffa::alloc::vec::Vec<u8>,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(_DeserSeed),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::value::Kind::BytesVal(v),
+                                );
+                            }
+                        }
+                        "jsonVal" | "json_val" => {
+                            let v: ::core::option::Option<
+                                ::buffa::alloc::string::String,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            ::buffa::alloc::string::String,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::value::Kind::JsonVal(v),
+                                );
+                            }
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let mut __r = <Value as ::core::default::Default>::default();
+                __r.kind = __oneof_kind;
+                Ok(__r)
+            }
+        }
+        d.deserialize_map(_V)
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for Value {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __VALUE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.Value",
+    to_json: ::buffa::type_registry::any_to_json::<Value>,
+    from_json: ::buffa::type_registry::any_from_json::<Value>,
+    is_wkt: false,
+};
+pub mod value {
+    #[allow(unused_imports)]
+    use super::*;
+    #[doc(inline)]
+    pub use super::__buffa::oneof::value::Kind;
+    #[doc(inline)]
+    pub use super::__buffa::view::oneof::value::Kind as KindView;
+}
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct KeyValue {
+    /// Field 1: `key`
+    #[serde(
+        rename = "key",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub key: ::buffa::alloc::string::String,
+    /// Field 2: `value`
+    #[serde(
+        rename = "value",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+    )]
+    pub value: ::buffa::MessageField<Value>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for KeyValue {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("KeyValue")
+            .field("key", &self.key)
+            .field("value", &self.value)
+            .finish()
+    }
+}
+impl KeyValue {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.KeyValue";
+}
+::buffa::impl_default_instance!(KeyValue);
+impl ::buffa::MessageName for KeyValue {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "KeyValue";
+    const FULL_NAME: &'static str = "oxidhome.v1.KeyValue";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.KeyValue";
+}
+impl ::buffa::Message for KeyValue {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.key.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.key) as u32;
+        }
+        if self.value.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.value.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
+                    + inner_size;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.key.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.key, buf);
+        }
+        if self.value.is_set() {
+            ::buffa::types::put_len_delimited_header(2u32, __cache.consume_next(), buf);
+            self.value.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.key, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::Message::merge_length_delimited(
+                    self.value.get_or_insert_default(),
+                    buf,
+                    ctx,
+                )?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.key.clear();
+        self.value = ::buffa::MessageField::none();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for KeyValue {
+    const PROTO_FQN: &'static str = "oxidhome.v1.KeyValue";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for KeyValue {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __KEY_VALUE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.KeyValue",
+    to_json: ::buffa::type_registry::any_to_json::<KeyValue>,
+    from_json: ::buffa::type_registry::any_from_json::<KeyValue>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize)]
+#[serde(default)]
+pub struct ExecuteCommandResponse {
+    #[serde(flatten)]
+    pub outcome: ::core::option::Option<
+        __buffa::oneof::execute_command_response::Outcome,
+    >,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for ExecuteCommandResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ExecuteCommandResponse").field("outcome", &self.outcome).finish()
+    }
+}
+impl ExecuteCommandResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse";
+}
+::buffa::impl_default_instance!(ExecuteCommandResponse);
+impl ::buffa::MessageName for ExecuteCommandResponse {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ExecuteCommandResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.ExecuteCommandResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse";
+}
+impl ::buffa::Message for ExecuteCommandResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if let ::core::option::Option::Some(ref v) = self.outcome {
+            match v {
+                __buffa::oneof::execute_command_response::Outcome::Ok(x) => {
+                    let __slot = __cache.reserve();
+                    let inner = x.compute_size(__cache);
+                    __cache.set(__slot, inner);
+                    size
+                        += 1u32 + ::buffa::encoding::varint_len(inner as u64) as u32
+                            + inner;
+                }
+                __buffa::oneof::execute_command_response::Outcome::OkWithState(x) => {
+                    let __slot = __cache.reserve();
+                    let inner = x.compute_size(__cache);
+                    __cache.set(__slot, inner);
+                    size
+                        += 1u32 + ::buffa::encoding::varint_len(inner as u64) as u32
+                            + inner;
+                }
+                __buffa::oneof::execute_command_response::Outcome::Err(x) => {
+                    let __slot = __cache.reserve();
+                    let inner = x.compute_size(__cache);
+                    __cache.set(__slot, inner);
+                    size
+                        += 1u32 + ::buffa::encoding::varint_len(inner as u64) as u32
+                            + inner;
+                }
+            }
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if let ::core::option::Option::Some(ref v) = self.outcome {
+            match v {
+                __buffa::oneof::execute_command_response::Outcome::Ok(x) => {
+                    ::buffa::types::put_len_delimited_header(
+                        1u32,
+                        __cache.consume_next(),
+                        buf,
+                    );
+                    x.write_to(__cache, buf);
+                }
+                __buffa::oneof::execute_command_response::Outcome::OkWithState(x) => {
+                    ::buffa::types::put_len_delimited_header(
+                        2u32,
+                        __cache.consume_next(),
+                        buf,
+                    );
+                    x.write_to(__cache, buf);
+                }
+                __buffa::oneof::execute_command_response::Outcome::Err(x) => {
+                    ::buffa::types::put_len_delimited_header(
+                        3u32,
+                        __cache.consume_next(),
+                        buf,
+                    );
+                    x.write_to(__cache, buf);
+                }
+            }
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                if let ::core::option::Option::Some(
+                    __buffa::oneof::execute_command_response::Outcome::Ok(
+                        ref mut existing,
+                    ),
+                ) = self.outcome
+                {
+                    ::buffa::Message::merge_length_delimited(&mut **existing, buf, ctx)?;
+                } else {
+                    let mut val = ::core::default::Default::default();
+                    ::buffa::Message::merge_length_delimited(&mut val, buf, ctx)?;
+                    self.outcome = ::core::option::Option::Some(
+                        __buffa::oneof::execute_command_response::Outcome::Ok(
+                            ::buffa::alloc::boxed::Box::new(val),
+                        ),
+                    );
+                }
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                if let ::core::option::Option::Some(
+                    __buffa::oneof::execute_command_response::Outcome::OkWithState(
+                        ref mut existing,
+                    ),
+                ) = self.outcome
+                {
+                    ::buffa::Message::merge_length_delimited(&mut **existing, buf, ctx)?;
+                } else {
+                    let mut val = ::core::default::Default::default();
+                    ::buffa::Message::merge_length_delimited(&mut val, buf, ctx)?;
+                    self.outcome = ::core::option::Option::Some(
+                        __buffa::oneof::execute_command_response::Outcome::OkWithState(
+                            ::buffa::alloc::boxed::Box::new(val),
+                        ),
+                    );
+                }
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                if let ::core::option::Option::Some(
+                    __buffa::oneof::execute_command_response::Outcome::Err(
+                        ref mut existing,
+                    ),
+                ) = self.outcome
+                {
+                    ::buffa::Message::merge_length_delimited(&mut **existing, buf, ctx)?;
+                } else {
+                    let mut val = ::core::default::Default::default();
+                    ::buffa::Message::merge_length_delimited(&mut val, buf, ctx)?;
+                    self.outcome = ::core::option::Option::Some(
+                        __buffa::oneof::execute_command_response::Outcome::Err(
+                            ::buffa::alloc::boxed::Box::new(val),
+                        ),
+                    );
+                }
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.outcome = ::core::option::Option::None;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for ExecuteCommandResponse {
+    const PROTO_FQN: &'static str = "oxidhome.v1.ExecuteCommandResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl<'de> serde::Deserialize<'de> for ExecuteCommandResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        struct _V;
+        impl<'de> serde::de::Visitor<'de> for _V {
+            type Value = ExecuteCommandResponse;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("struct ExecuteCommandResponse")
+            }
+            #[allow(clippy::field_reassign_with_default)]
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> ::core::result::Result<ExecuteCommandResponse, A::Error> {
+                let mut __oneof_outcome: ::core::option::Option<
+                    __buffa::oneof::execute_command_response::Outcome,
+                > = None;
+                while let Some(key) = map.next_key::<::buffa::alloc::string::String>()? {
+                    match key.as_str() {
+                        "ok" => {
+                            let v: ::core::option::Option<
+                                execute_command_response::Ok,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            execute_command_response::Ok,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_outcome.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'outcome'",
+                                        ),
+                                    );
+                                }
+                                __oneof_outcome = Some(
+                                    __buffa::oneof::execute_command_response::Outcome::Ok(
+                                        ::buffa::alloc::boxed::Box::new(v),
+                                    ),
+                                );
+                            }
+                        }
+                        "okWithState" | "ok_with_state" => {
+                            let v: ::core::option::Option<
+                                execute_command_response::OkWithState,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            execute_command_response::OkWithState,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_outcome.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'outcome'",
+                                        ),
+                                    );
+                                }
+                                __oneof_outcome = Some(
+                                    __buffa::oneof::execute_command_response::Outcome::OkWithState(
+                                        ::buffa::alloc::boxed::Box::new(v),
+                                    ),
+                                );
+                            }
+                        }
+                        "err" => {
+                            let v: ::core::option::Option<ExecuteCommandError> = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            ExecuteCommandError,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_outcome.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'outcome'",
+                                        ),
+                                    );
+                                }
+                                __oneof_outcome = Some(
+                                    __buffa::oneof::execute_command_response::Outcome::Err(
+                                        ::buffa::alloc::boxed::Box::new(v),
+                                    ),
+                                );
+                            }
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let mut __r = <ExecuteCommandResponse as ::core::default::Default>::default();
+                __r.outcome = __oneof_outcome;
+                Ok(__r)
+            }
+        }
+        d.deserialize_map(_V)
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for ExecuteCommandResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __EXECUTE_COMMAND_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse",
+    to_json: ::buffa::type_registry::any_to_json::<ExecuteCommandResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<ExecuteCommandResponse>,
+    is_wkt: false,
+};
+pub mod execute_command_response {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Clone, PartialEq, Default)]
+    #[derive(::serde::Serialize, ::serde::Deserialize)]
+    #[serde(default)]
+    pub struct Ok {
+        #[serde(skip)]
+        #[doc(hidden)]
+        pub __buffa_unknown_fields: ::buffa::UnknownFields,
+    }
+    impl ::core::fmt::Debug for Ok {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            f.debug_struct("Ok").finish()
+        }
+    }
+    impl Ok {
+        /// Protobuf type URL for this message, for use with `Any::pack` and
+        /// `Any::unpack_if`.
+        ///
+        /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+        pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse.Ok";
+    }
+    ::buffa::impl_default_instance!(Ok);
+    impl ::buffa::MessageName for Ok {
+        const PACKAGE: &'static str = "oxidhome.v1";
+        const NAME: &'static str = "ExecuteCommandResponse.Ok";
+        const FULL_NAME: &'static str = "oxidhome.v1.ExecuteCommandResponse.Ok";
+        const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse.Ok";
+    }
+    impl ::buffa::Message for Ok {
+        /// Returns the total encoded size in bytes.
+        ///
+        /// The result is a `u32`; the protobuf specification requires all
+        /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+        /// compliant message will never overflow this type.
+        #[allow(clippy::let_and_return)]
+        fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+            #[allow(unused_imports)]
+            use ::buffa::Enumeration as _;
+            let mut size = 0u32;
+            size += self.__buffa_unknown_fields.encoded_len() as u32;
+            size
+        }
+        fn write_to(
+            &self,
+            _cache: &mut ::buffa::SizeCache,
+            buf: &mut impl ::buffa::bytes::BufMut,
+        ) {
+            #[allow(unused_imports)]
+            use ::buffa::Enumeration as _;
+            self.__buffa_unknown_fields.write_to(buf);
+        }
+        fn merge_field(
+            &mut self,
+            tag: ::buffa::encoding::Tag,
+            buf: &mut impl ::buffa::bytes::Buf,
+            ctx: ::buffa::DecodeContext<'_>,
+        ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+            #[allow(unused_imports)]
+            use ::buffa::bytes::Buf as _;
+            #[allow(unused_imports)]
+            use ::buffa::Enumeration as _;
+            match tag.field_number() {
+                _ => {
+                    self.__buffa_unknown_fields
+                        .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        fn clear(&mut self) {
+            self.__buffa_unknown_fields.clear();
+        }
+    }
+    impl ::buffa::ExtensionSet for Ok {
+        const PROTO_FQN: &'static str = "oxidhome.v1.ExecuteCommandResponse.Ok";
+        fn unknown_fields(&self) -> &::buffa::UnknownFields {
+            &self.__buffa_unknown_fields
+        }
+        fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+            &mut self.__buffa_unknown_fields
+        }
+    }
+    impl ::buffa::json_helpers::ProtoElemJson for Ok {
+        fn serialize_proto_json<S: ::serde::Serializer>(
+            v: &Self,
+            s: S,
+        ) -> ::core::result::Result<S::Ok, S::Error> {
+            ::serde::Serialize::serialize(v, s)
+        }
+        fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+            d: D,
+        ) -> ::core::result::Result<Self, D::Error> {
+            <Self as ::serde::Deserialize>::deserialize(d)
+        }
+    }
+    #[doc(hidden)]
+    pub const __OK_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+        type_url: "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse.Ok",
+        to_json: ::buffa::type_registry::any_to_json::<Ok>,
+        from_json: ::buffa::type_registry::any_from_json::<Ok>,
+        is_wkt: false,
+    };
+    #[derive(Clone, PartialEq, Default)]
+    #[derive(::serde::Serialize, ::serde::Deserialize)]
+    #[serde(default)]
+    pub struct OkWithState {
+        /// Field 1: `state`
+        #[serde(
+            rename = "state",
+            skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+            deserialize_with = "::buffa::json_helpers::null_as_default"
+        )]
+        pub state: ::buffa::alloc::vec::Vec<super::KeyValue>,
+        #[serde(skip)]
+        #[doc(hidden)]
+        pub __buffa_unknown_fields: ::buffa::UnknownFields,
+    }
+    impl ::core::fmt::Debug for OkWithState {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            f.debug_struct("OkWithState").field("state", &self.state).finish()
+        }
+    }
+    impl OkWithState {
+        /// Protobuf type URL for this message, for use with `Any::pack` and
+        /// `Any::unpack_if`.
+        ///
+        /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+        pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse.OkWithState";
+    }
+    ::buffa::impl_default_instance!(OkWithState);
+    impl ::buffa::MessageName for OkWithState {
+        const PACKAGE: &'static str = "oxidhome.v1";
+        const NAME: &'static str = "ExecuteCommandResponse.OkWithState";
+        const FULL_NAME: &'static str = "oxidhome.v1.ExecuteCommandResponse.OkWithState";
+        const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse.OkWithState";
+    }
+    impl ::buffa::Message for OkWithState {
+        /// Returns the total encoded size in bytes.
+        ///
+        /// The result is a `u32`; the protobuf specification requires all
+        /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+        /// compliant message will never overflow this type.
+        #[allow(clippy::let_and_return)]
+        fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+            #[allow(unused_imports)]
+            use ::buffa::Enumeration as _;
+            let mut size = 0u32;
+            for v in &self.state {
+                let __slot = __cache.reserve();
+                let inner_size = v.compute_size(__cache);
+                __cache.set(__slot, inner_size);
+                size
+                    += 1u32 + ::buffa::encoding::varint_len(inner_size as u64) as u32
+                        + inner_size;
+            }
+            size += self.__buffa_unknown_fields.encoded_len() as u32;
+            size
+        }
+        fn write_to(
+            &self,
+            __cache: &mut ::buffa::SizeCache,
+            buf: &mut impl ::buffa::bytes::BufMut,
+        ) {
+            #[allow(unused_imports)]
+            use ::buffa::Enumeration as _;
+            for v in &self.state {
+                ::buffa::types::put_len_delimited_header(
+                    1u32,
+                    __cache.consume_next(),
+                    buf,
+                );
+                v.write_to(__cache, buf);
+            }
+            self.__buffa_unknown_fields.write_to(buf);
+        }
+        fn merge_field(
+            &mut self,
+            tag: ::buffa::encoding::Tag,
+            buf: &mut impl ::buffa::bytes::Buf,
+            ctx: ::buffa::DecodeContext<'_>,
+        ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+            #[allow(unused_imports)]
+            use ::buffa::bytes::Buf as _;
+            #[allow(unused_imports)]
+            use ::buffa::Enumeration as _;
+            match tag.field_number() {
+                1u32 => {
+                    ::buffa::encoding::check_wire_type(
+                        tag,
+                        ::buffa::encoding::WireType::LengthDelimited,
+                    )?;
+                    let mut elem = ::core::default::Default::default();
+                    ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                    self.state.push(elem);
+                }
+                _ => {
+                    self.__buffa_unknown_fields
+                        .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+                }
+            }
+            ::core::result::Result::Ok(())
+        }
+        fn clear(&mut self) {
+            self.state.clear();
+            self.__buffa_unknown_fields.clear();
+        }
+    }
+    impl ::buffa::ExtensionSet for OkWithState {
+        const PROTO_FQN: &'static str = "oxidhome.v1.ExecuteCommandResponse.OkWithState";
+        fn unknown_fields(&self) -> &::buffa::UnknownFields {
+            &self.__buffa_unknown_fields
+        }
+        fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+            &mut self.__buffa_unknown_fields
+        }
+    }
+    impl ::buffa::json_helpers::ProtoElemJson for OkWithState {
+        fn serialize_proto_json<S: ::serde::Serializer>(
+            v: &Self,
+            s: S,
+        ) -> ::core::result::Result<S::Ok, S::Error> {
+            ::serde::Serialize::serialize(v, s)
+        }
+        fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+            d: D,
+        ) -> ::core::result::Result<Self, D::Error> {
+            <Self as ::serde::Deserialize>::deserialize(d)
+        }
+    }
+    #[doc(hidden)]
+    pub const __OK_WITH_STATE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+        type_url: "type.googleapis.com/oxidhome.v1.ExecuteCommandResponse.OkWithState",
+        to_json: ::buffa::type_registry::any_to_json::<OkWithState>,
+        from_json: ::buffa::type_registry::any_from_json::<OkWithState>,
+        is_wkt: false,
+    };
+    #[doc(inline)]
+    pub use super::__buffa::oneof::execute_command_response::Outcome;
+    #[doc(inline)]
+    pub use super::__buffa::view::execute_command_response::OkView;
+    #[doc(inline)]
+    pub use super::__buffa::view::execute_command_response::OkOwnedView;
+    #[doc(inline)]
+    pub use super::__buffa::view::execute_command_response::OkWithStateView;
+    #[doc(inline)]
+    pub use super::__buffa::view::execute_command_response::OkWithStateOwnedView;
+    #[doc(inline)]
+    pub use super::__buffa::view::oneof::execute_command_response::Outcome as OutcomeView;
+}
+/// Wire mirror of the WIT `error` variant returned by the plugin.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize)]
+#[serde(default)]
+pub struct ExecuteCommandError {
+    #[serde(flatten)]
+    pub kind: ::core::option::Option<__buffa::oneof::execute_command_error::Kind>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for ExecuteCommandError {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ExecuteCommandError").field("kind", &self.kind).finish()
+    }
+}
+impl ExecuteCommandError {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandError";
+}
+::buffa::impl_default_instance!(ExecuteCommandError);
+impl ::buffa::MessageName for ExecuteCommandError {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ExecuteCommandError";
+    const FULL_NAME: &'static str = "oxidhome.v1.ExecuteCommandError";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ExecuteCommandError";
+}
+impl ::buffa::Message for ExecuteCommandError {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if let ::core::option::Option::Some(ref v) = self.kind {
+            match v {
+                __buffa::oneof::execute_command_error::Kind::NotFound(x) => {
+                    size += 1u32 + ::buffa::types::string_encoded_len(x) as u32;
+                }
+                __buffa::oneof::execute_command_error::Kind::PermissionDenied(x) => {
+                    size += 1u32 + ::buffa::types::string_encoded_len(x) as u32;
+                }
+                __buffa::oneof::execute_command_error::Kind::InvalidArgument(x) => {
+                    size += 1u32 + ::buffa::types::string_encoded_len(x) as u32;
+                }
+                __buffa::oneof::execute_command_error::Kind::Unavailable(x) => {
+                    size += 1u32 + ::buffa::types::string_encoded_len(x) as u32;
+                }
+                __buffa::oneof::execute_command_error::Kind::Internal(x) => {
+                    size += 1u32 + ::buffa::types::string_encoded_len(x) as u32;
+                }
+            }
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if let ::core::option::Option::Some(ref v) = self.kind {
+            match v {
+                __buffa::oneof::execute_command_error::Kind::NotFound(x) => {
+                    ::buffa::types::put_string_field(1u32, x, buf);
+                }
+                __buffa::oneof::execute_command_error::Kind::PermissionDenied(x) => {
+                    ::buffa::types::put_string_field(2u32, x, buf);
+                }
+                __buffa::oneof::execute_command_error::Kind::InvalidArgument(x) => {
+                    ::buffa::types::put_string_field(3u32, x, buf);
+                }
+                __buffa::oneof::execute_command_error::Kind::Unavailable(x) => {
+                    ::buffa::types::put_string_field(4u32, x, buf);
+                }
+                __buffa::oneof::execute_command_error::Kind::Internal(x) => {
+                    ::buffa::types::put_string_field(5u32, x, buf);
+                }
+            }
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::execute_command_error::Kind::NotFound(
+                        ::buffa::types::decode_string(buf)?,
+                    ),
+                );
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::execute_command_error::Kind::PermissionDenied(
+                        ::buffa::types::decode_string(buf)?,
+                    ),
+                );
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::execute_command_error::Kind::InvalidArgument(
+                        ::buffa::types::decode_string(buf)?,
+                    ),
+                );
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::execute_command_error::Kind::Unavailable(
+                        ::buffa::types::decode_string(buf)?,
+                    ),
+                );
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.kind = ::core::option::Option::Some(
+                    __buffa::oneof::execute_command_error::Kind::Internal(
+                        ::buffa::types::decode_string(buf)?,
+                    ),
+                );
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.kind = ::core::option::Option::None;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for ExecuteCommandError {
+    const PROTO_FQN: &'static str = "oxidhome.v1.ExecuteCommandError";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl<'de> serde::Deserialize<'de> for ExecuteCommandError {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        struct _V;
+        impl<'de> serde::de::Visitor<'de> for _V {
+            type Value = ExecuteCommandError;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("struct ExecuteCommandError")
+            }
+            #[allow(clippy::field_reassign_with_default)]
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> ::core::result::Result<ExecuteCommandError, A::Error> {
+                let mut __oneof_kind: ::core::option::Option<
+                    __buffa::oneof::execute_command_error::Kind,
+                > = None;
+                while let Some(key) = map.next_key::<::buffa::alloc::string::String>()? {
+                    match key.as_str() {
+                        "notFound" | "not_found" => {
+                            let v: ::core::option::Option<
+                                ::buffa::alloc::string::String,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            ::buffa::alloc::string::String,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::execute_command_error::Kind::NotFound(v),
+                                );
+                            }
+                        }
+                        "permissionDenied" | "permission_denied" => {
+                            let v: ::core::option::Option<
+                                ::buffa::alloc::string::String,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            ::buffa::alloc::string::String,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::execute_command_error::Kind::PermissionDenied(
+                                        v,
+                                    ),
+                                );
+                            }
+                        }
+                        "invalidArgument" | "invalid_argument" => {
+                            let v: ::core::option::Option<
+                                ::buffa::alloc::string::String,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            ::buffa::alloc::string::String,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::execute_command_error::Kind::InvalidArgument(
+                                        v,
+                                    ),
+                                );
+                            }
+                        }
+                        "unavailable" => {
+                            let v: ::core::option::Option<
+                                ::buffa::alloc::string::String,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            ::buffa::alloc::string::String,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::execute_command_error::Kind::Unavailable(v),
+                                );
+                            }
+                        }
+                        "internal" => {
+                            let v: ::core::option::Option<
+                                ::buffa::alloc::string::String,
+                            > = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            ::buffa::alloc::string::String,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_kind.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'kind'",
+                                        ),
+                                    );
+                                }
+                                __oneof_kind = Some(
+                                    __buffa::oneof::execute_command_error::Kind::Internal(v),
+                                );
+                            }
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let mut __r = <ExecuteCommandError as ::core::default::Default>::default();
+                __r.kind = __oneof_kind;
+                Ok(__r)
+            }
+        }
+        d.deserialize_map(_V)
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for ExecuteCommandError {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __EXECUTE_COMMAND_ERROR_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.ExecuteCommandError",
+    to_json: ::buffa::type_registry::any_to_json::<ExecuteCommandError>,
+    from_json: ::buffa::type_registry::any_from_json::<ExecuteCommandError>,
+    is_wkt: false,
+};
+pub mod execute_command_error {
+    #[allow(unused_imports)]
+    use super::*;
+    #[doc(inline)]
+    pub use super::__buffa::oneof::execute_command_error::Kind;
+    #[doc(inline)]
+    pub use super::__buffa::view::oneof::execute_command_error::Kind as KindView;
+}

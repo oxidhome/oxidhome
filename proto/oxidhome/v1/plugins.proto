@@ -19,6 +19,28 @@ service PluginsService {
   // buf's standard-naming rule uniquely across services — see
   // `InstancesService` for the same pattern.
   rpc ListPlugins(ListPluginsRequest) returns (ListPluginsResponse);
+
+  // Install a plugin from a local source directory. Sensitive
+  // (`plugins:install` scope) — copies operator-supplied code
+  // into `<state_dir>/plugins/<plugin_id>/`. Same shape as
+  // `POST /api/v1/plugins` on the JSON API.
+  rpc InstallPlugin(InstallPluginRequest) returns (InstallPluginResponse);
+
+  // Start a supervised instance of an installed plugin. Gated on
+  // `plugins:start`. Same shape as
+  // `POST /api/v1/plugins/{plugin_id}/start`; blocks until the
+  // instance reaches `Running` before returning.
+  rpc StartPlugin(StartPluginRequest) returns (StartPluginResponse);
+
+  // Stop one or all running instances of a plugin. Gated on
+  // `plugins:stop`. Idempotent — returns an empty `stopped_ids`
+  // when nothing was running.
+  rpc StopPlugin(StopPluginRequest) returns (StopPluginResponse);
+
+  // Uninstall a plugin — removes `<state_dir>/plugins/<plugin_id>/`.
+  // Sensitive (`plugins:uninstall` scope). Refuses with FAILED_PRECONDITION
+  // if any instance of the plugin is running.
+  rpc UninstallPlugin(UninstallPluginRequest) returns (UninstallPluginResponse);
 }
 
 message ListPluginsRequest {}
@@ -42,4 +64,65 @@ message Plugin {
   // How many supervised instances of this plugin are currently
   // registered. Zero for installed-but-stopped rows.
   uint32 instance_count = 4;
+}
+
+message InstallPluginRequest {
+  // Path on the daemon-local filesystem to a directory containing
+  // `manifest.toml` + the manifest's `runtime.wasm` file. The host
+  // reads the manifest to extract the canonical plugin id, then
+  // recursively copies the tree into
+  // `<state_dir>/plugins/<plugin_id>/` via a `.staging-<id>`
+  // rename for atomicity.
+  string source_dir = 1;
+}
+
+message InstallPluginResponse {
+  string plugin_id = 1;
+  string version = 2;
+  // Absolute path where the install landed
+  // (`<state_dir>/plugins/<plugin_id>/`) — the daemon's canonical
+  // location, useful for logs / CLI display.
+  string installed_path = 3;
+}
+
+message StartPluginRequest {
+  // Plugin to start (from `ListPlugins`).
+  string plugin_id = 1;
+  // Optional instance id — defaults to the plugin id on the JSON
+  // side.
+  optional string instance_id = 2;
+  // Optional TOML-shaped config overrides, encoded as JSON so it
+  // rides the proto wire cleanly. Empty / absent means "use the
+  // manifest defaults."
+  optional string config_overrides_json = 3;
+}
+
+message StartPluginResponse {
+  string plugin_id = 1;
+  string instance_id = 2;
+  // `Debug` repr of the supervisor's state after `wait_for_running`
+  // returns. `Running` on success; a `Failed { ... }` variant if
+  // the supervisor reached terminal before `Running`.
+  string state = 3;
+}
+
+message StopPluginRequest {
+  string plugin_id = 1;
+  // If set, stops just this one instance; otherwise every running
+  // instance of `plugin_id` is stopped.
+  optional string instance_id = 2;
+}
+
+message StopPluginResponse {
+  // Instance ids the stop call actually stopped. Empty on
+  // idempotent success (nothing was running).
+  repeated string stopped_ids = 1;
+}
+
+message UninstallPluginRequest {
+  string plugin_id = 1;
+}
+
+message UninstallPluginResponse {
+  string plugin_id = 1;
 }

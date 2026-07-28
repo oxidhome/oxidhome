@@ -450,3 +450,1240 @@ pub const __PLUGIN_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::typ
     from_json: ::buffa::type_registry::any_from_json::<Plugin>,
     is_wkt: false,
 };
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct InstallPluginRequest {
+    /// Path on the daemon-local filesystem to a directory containing
+    /// `manifest.toml` + the manifest's `runtime.wasm` file. The host
+    /// reads the manifest to extract the canonical plugin id, then
+    /// recursively copies the tree into
+    /// `<state_dir>/plugins/<plugin_id>/` via a `.staging-<id>`
+    /// rename for atomicity.
+    ///
+    /// Field 1: `source_dir`
+    #[serde(
+        rename = "sourceDir",
+        alias = "source_dir",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub source_dir: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for InstallPluginRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("InstallPluginRequest")
+            .field("source_dir", &self.source_dir)
+            .finish()
+    }
+}
+impl InstallPluginRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.InstallPluginRequest";
+}
+::buffa::impl_default_instance!(InstallPluginRequest);
+impl ::buffa::MessageName for InstallPluginRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "InstallPluginRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.InstallPluginRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.InstallPluginRequest";
+}
+impl ::buffa::Message for InstallPluginRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.source_dir.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.source_dir) as u32;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.source_dir.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.source_dir, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.source_dir, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.source_dir.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for InstallPluginRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.InstallPluginRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for InstallPluginRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __INSTALL_PLUGIN_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.InstallPluginRequest",
+    to_json: ::buffa::type_registry::any_to_json::<InstallPluginRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<InstallPluginRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct InstallPluginResponse {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    /// Field 2: `version`
+    #[serde(
+        rename = "version",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub version: ::buffa::alloc::string::String,
+    /// Absolute path where the install landed
+    /// (`<state_dir>/plugins/<plugin_id>/`) — the daemon's canonical
+    /// location, useful for logs / CLI display.
+    ///
+    /// Field 3: `installed_path`
+    #[serde(
+        rename = "installedPath",
+        alias = "installed_path",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub installed_path: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for InstallPluginResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("InstallPluginResponse")
+            .field("plugin_id", &self.plugin_id)
+            .field("version", &self.version)
+            .field("installed_path", &self.installed_path)
+            .finish()
+    }
+}
+impl InstallPluginResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.InstallPluginResponse";
+}
+::buffa::impl_default_instance!(InstallPluginResponse);
+impl ::buffa::MessageName for InstallPluginResponse {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "InstallPluginResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.InstallPluginResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.InstallPluginResponse";
+}
+impl ::buffa::Message for InstallPluginResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.plugin_id.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.plugin_id) as u32;
+        }
+        if !self.version.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.version) as u32;
+        }
+        if !self.installed_path.is_empty() {
+            size
+                += 1u32
+                    + ::buffa::types::string_encoded_len(&self.installed_path) as u32;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        if !self.version.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.version, buf);
+        }
+        if !self.installed_path.is_empty() {
+            ::buffa::types::put_string_field(3u32, &self.installed_path, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.version, buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.installed_path, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.version.clear();
+        self.installed_path.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for InstallPluginResponse {
+    const PROTO_FQN: &'static str = "oxidhome.v1.InstallPluginResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for InstallPluginResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __INSTALL_PLUGIN_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.InstallPluginResponse",
+    to_json: ::buffa::type_registry::any_to_json::<InstallPluginResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<InstallPluginResponse>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct StartPluginRequest {
+    /// Plugin to start (from `ListPlugins`).
+    ///
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    /// Optional instance id — defaults to the plugin id on the JSON
+    /// side.
+    ///
+    /// Field 2: `instance_id`
+    #[serde(
+        rename = "instanceId",
+        alias = "instance_id",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub instance_id: ::core::option::Option<::buffa::alloc::string::String>,
+    /// Optional TOML-shaped config overrides, encoded as JSON so it
+    /// rides the proto wire cleanly. Empty / absent means "use the
+    /// manifest defaults."
+    ///
+    /// Field 3: `config_overrides_json`
+    #[serde(
+        rename = "configOverridesJson",
+        alias = "config_overrides_json",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub config_overrides_json: ::core::option::Option<::buffa::alloc::string::String>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for StartPluginRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("StartPluginRequest")
+            .field("plugin_id", &self.plugin_id)
+            .field("instance_id", &self.instance_id)
+            .field("config_overrides_json", &self.config_overrides_json)
+            .finish()
+    }
+}
+impl StartPluginRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.StartPluginRequest";
+}
+impl StartPluginRequest {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::instance_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_instance_id(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.instance_id = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::config_overrides_json`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_config_overrides_json(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.config_overrides_json = Some(value.into());
+        self
+    }
+}
+::buffa::impl_default_instance!(StartPluginRequest);
+impl ::buffa::MessageName for StartPluginRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "StartPluginRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.StartPluginRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.StartPluginRequest";
+}
+impl ::buffa::Message for StartPluginRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.plugin_id.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.plugin_id) as u32;
+        }
+        if let Some(ref v) = self.instance_id {
+            size += 1u32 + ::buffa::types::string_encoded_len(v) as u32;
+        }
+        if let Some(ref v) = self.config_overrides_json {
+            size += 1u32 + ::buffa::types::string_encoded_len(v) as u32;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        if let Some(ref v) = self.instance_id {
+            ::buffa::types::put_string_field(2u32, v, buf);
+        }
+        if let Some(ref v) = self.config_overrides_json {
+            ::buffa::types::put_string_field(3u32, v, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(
+                    self
+                        .instance_id
+                        .get_or_insert_with(::buffa::alloc::string::String::new),
+                    buf,
+                )?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(
+                    self
+                        .config_overrides_json
+                        .get_or_insert_with(::buffa::alloc::string::String::new),
+                    buf,
+                )?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.instance_id = ::core::option::Option::None;
+        self.config_overrides_json = ::core::option::Option::None;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for StartPluginRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.StartPluginRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for StartPluginRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __START_PLUGIN_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.StartPluginRequest",
+    to_json: ::buffa::type_registry::any_to_json::<StartPluginRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<StartPluginRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct StartPluginResponse {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    /// Field 2: `instance_id`
+    #[serde(
+        rename = "instanceId",
+        alias = "instance_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub instance_id: ::buffa::alloc::string::String,
+    /// `Debug` repr of the supervisor's state after `wait_for_running`
+    /// returns. `Running` on success; a `Failed { ... }` variant if
+    /// the supervisor reached terminal before `Running`.
+    ///
+    /// Field 3: `state`
+    #[serde(
+        rename = "state",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub state: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for StartPluginResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("StartPluginResponse")
+            .field("plugin_id", &self.plugin_id)
+            .field("instance_id", &self.instance_id)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+impl StartPluginResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.StartPluginResponse";
+}
+::buffa::impl_default_instance!(StartPluginResponse);
+impl ::buffa::MessageName for StartPluginResponse {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "StartPluginResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.StartPluginResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.StartPluginResponse";
+}
+impl ::buffa::Message for StartPluginResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.plugin_id.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.plugin_id) as u32;
+        }
+        if !self.instance_id.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.instance_id) as u32;
+        }
+        if !self.state.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.state) as u32;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        if !self.instance_id.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.instance_id, buf);
+        }
+        if !self.state.is_empty() {
+            ::buffa::types::put_string_field(3u32, &self.state, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.instance_id, buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.state, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.instance_id.clear();
+        self.state.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for StartPluginResponse {
+    const PROTO_FQN: &'static str = "oxidhome.v1.StartPluginResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for StartPluginResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __START_PLUGIN_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.StartPluginResponse",
+    to_json: ::buffa::type_registry::any_to_json::<StartPluginResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<StartPluginResponse>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct StopPluginRequest {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    /// If set, stops just this one instance; otherwise every running
+    /// instance of `plugin_id` is stopped.
+    ///
+    /// Field 2: `instance_id`
+    #[serde(
+        rename = "instanceId",
+        alias = "instance_id",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub instance_id: ::core::option::Option<::buffa::alloc::string::String>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for StopPluginRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("StopPluginRequest")
+            .field("plugin_id", &self.plugin_id)
+            .field("instance_id", &self.instance_id)
+            .finish()
+    }
+}
+impl StopPluginRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.StopPluginRequest";
+}
+impl StopPluginRequest {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::instance_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_instance_id(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.instance_id = Some(value.into());
+        self
+    }
+}
+::buffa::impl_default_instance!(StopPluginRequest);
+impl ::buffa::MessageName for StopPluginRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "StopPluginRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.StopPluginRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.StopPluginRequest";
+}
+impl ::buffa::Message for StopPluginRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.plugin_id.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.plugin_id) as u32;
+        }
+        if let Some(ref v) = self.instance_id {
+            size += 1u32 + ::buffa::types::string_encoded_len(v) as u32;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        if let Some(ref v) = self.instance_id {
+            ::buffa::types::put_string_field(2u32, v, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(
+                    self
+                        .instance_id
+                        .get_or_insert_with(::buffa::alloc::string::String::new),
+                    buf,
+                )?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.instance_id = ::core::option::Option::None;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for StopPluginRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.StopPluginRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for StopPluginRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __STOP_PLUGIN_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.StopPluginRequest",
+    to_json: ::buffa::type_registry::any_to_json::<StopPluginRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<StopPluginRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct StopPluginResponse {
+    /// Instance ids the stop call actually stopped. Empty on
+    /// idempotent success (nothing was running).
+    ///
+    /// Field 1: `stopped_ids`
+    #[serde(
+        rename = "stoppedIds",
+        alias = "stopped_ids",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub stopped_ids: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for StopPluginResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("StopPluginResponse")
+            .field("stopped_ids", &self.stopped_ids)
+            .finish()
+    }
+}
+impl StopPluginResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.StopPluginResponse";
+}
+::buffa::impl_default_instance!(StopPluginResponse);
+impl ::buffa::MessageName for StopPluginResponse {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "StopPluginResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.StopPluginResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.StopPluginResponse";
+}
+impl ::buffa::Message for StopPluginResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        for v in &self.stopped_ids {
+            size += 1u32 + ::buffa::types::string_encoded_len(v) as u32;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        for v in &self.stopped_ids {
+            ::buffa::types::put_string_field(1u32, v, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                self.stopped_ids.push(::buffa::types::decode_string(buf)?);
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.stopped_ids.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for StopPluginResponse {
+    const PROTO_FQN: &'static str = "oxidhome.v1.StopPluginResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for StopPluginResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __STOP_PLUGIN_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.StopPluginResponse",
+    to_json: ::buffa::type_registry::any_to_json::<StopPluginResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<StopPluginResponse>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct UninstallPluginRequest {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for UninstallPluginRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("UninstallPluginRequest")
+            .field("plugin_id", &self.plugin_id)
+            .finish()
+    }
+}
+impl UninstallPluginRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.UninstallPluginRequest";
+}
+::buffa::impl_default_instance!(UninstallPluginRequest);
+impl ::buffa::MessageName for UninstallPluginRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "UninstallPluginRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.UninstallPluginRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.UninstallPluginRequest";
+}
+impl ::buffa::Message for UninstallPluginRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.plugin_id.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.plugin_id) as u32;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for UninstallPluginRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.UninstallPluginRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for UninstallPluginRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __UNINSTALL_PLUGIN_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.UninstallPluginRequest",
+    to_json: ::buffa::type_registry::any_to_json::<UninstallPluginRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<UninstallPluginRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct UninstallPluginResponse {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for UninstallPluginResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("UninstallPluginResponse")
+            .field("plugin_id", &self.plugin_id)
+            .finish()
+    }
+}
+impl UninstallPluginResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.UninstallPluginResponse";
+}
+::buffa::impl_default_instance!(UninstallPluginResponse);
+impl ::buffa::MessageName for UninstallPluginResponse {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "UninstallPluginResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.UninstallPluginResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.UninstallPluginResponse";
+}
+impl ::buffa::Message for UninstallPluginResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// The result is a `u32`; the protobuf specification requires all
+    /// messages to fit within 2 GiB (2,147,483,647 bytes), so a
+    /// compliant message will never overflow this type.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u32;
+        if !self.plugin_id.is_empty() {
+            size += 1u32 + ::buffa::types::string_encoded_len(&self.plugin_id) as u32;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u32;
+        size
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::bytes::BufMut,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for UninstallPluginResponse {
+    const PROTO_FQN: &'static str = "oxidhome.v1.UninstallPluginResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for UninstallPluginResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __UNINSTALL_PLUGIN_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.UninstallPluginResponse",
+    to_json: ::buffa::type_registry::any_to_json::<UninstallPluginResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<UninstallPluginResponse>,
+    is_wkt: false,
+};
