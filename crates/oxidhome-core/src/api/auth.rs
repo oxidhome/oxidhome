@@ -1,8 +1,10 @@
 //! Bearer-token auth middleware.
 //!
 //! Every request the router serves goes through [`require_token`]
-//! except for the explicit anonymous list ([`PUBLIC_PATHS`]). The
-//! middleware:
+//! except for anonymous routes that mount outside this middleware
+//! (see `server::build_router` — currently `GET /api/v1/readyz`).
+//! Everything on the authenticated router flows through this
+//! middleware, which:
 //!
 //! 1. Reads `Authorization: Bearer <token>` (case-insensitive on
 //!    the scheme per RFC 6750 §1.1; one or more SP between scheme
@@ -27,8 +29,8 @@
 //!    fingerprint of the presented bearer (never the raw secret),
 //!    so a forensic sweep can correlate probes.
 //!
-//! Anonymous routes (`PUBLIC_PATHS`) skip the bearer extraction and
-//! the audit path entirely.
+//! Anonymous routes mount outside this middleware and don't touch
+//! either the bearer path or the audit ledger.
 //!
 //! ## Blocking discipline
 //!
@@ -110,16 +112,12 @@ pub(crate) fn wit_error_kind(err: &WitError) -> &'static str {
     }
 }
 
-/// Routes that don't require a bearer token. The canonical Connect
-/// liveness probe (`POST /oxidhome.v1.HealthService/Check`) is
-/// mounted as a `fallback_service` **outside** the bearer-auth
-/// middleware and doesn't need an entry here.
-///
-/// The JSON-side `GET /api/v1/readyz` mirror exists for
-/// orchestrators that can't POST a Connect envelope (systemd's
-/// `ExecStartPost`, docker's `HEALTHCHECK`, k8s's `httpGet`
-/// probe) — same `{status, version}` body shape as `Health.Check`.
-pub(crate) const PUBLIC_PATHS: &[&str] = &["/api/v1/readyz"];
+// Anonymous routes are mounted **outside** this middleware — see
+// `server::build_router`. The `PUBLIC_PATHS` inside-the-middleware
+// short-circuit that briefly lived here (PR-#83 review, F2) matched
+// only on path, so any HTTP method against a public path bypassed
+// authentication. Physical router separation via `merge` gives
+// per-(method, path) safety by construction.
 
 /// Sentinel `token_id` used on audit rows for unauthenticated
 /// probes — missing / malformed / unknown / revoked bearer.
@@ -142,15 +140,14 @@ pub(crate) struct AuthState {
 ///
 /// See the module doc for the full flow; the short version:
 ///
-/// 1. `PUBLIC_PATHS` → pass through, no audit.
-/// 2. Extract bearer; on failure record an anonymous probe row and
+/// 1. Extract bearer; on failure record an anonymous probe row and
 ///    return 401 (see [`record_anonymous_probe`]).
-/// 3. Verify token; on failure same as above (also 401).
-/// 4. Record a `pending` intent row. Fail-closed on ledger error:
+/// 2. Verify token; on failure same as above (also 401).
+/// 3. Record a `pending` intent row. Fail-closed on ledger error:
 ///    return 500 without running the handler — a mutation with no
 ///    audit trail is not acceptable.
-/// 5. Run the handler.
-/// 6. `finalize` the intent row with the handler's outcome. Best-
+/// 4. Run the handler.
+/// 5. `finalize` the intent row with the handler's outcome. Best-
 ///    effort — the pending row is already committed as evidence of
 ///    intent.
 ///
@@ -165,10 +162,6 @@ pub(crate) async fn require_token(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if PUBLIC_PATHS.iter().any(|p| *p == req.uri().path()) {
-        return next.run(req).await;
-    }
-
     let http_path = req.uri().path().to_string();
     let method = req.method().to_string();
 

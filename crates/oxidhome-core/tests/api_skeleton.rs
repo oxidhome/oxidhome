@@ -2146,6 +2146,37 @@ fn readyz_leaves_no_audit_row() {
     );
 }
 
+/// PR-#83 review, F2 regression — `/readyz` is a GET-only public
+/// route. The pre-fix `PUBLIC_PATHS` string-compare short-circuit
+/// matched every HTTP method against the path, so POST / DELETE /
+/// PUT `/api/v1/readyz` bypassed auth (invisibly today because
+/// axum returns 405 for unregistered methods, but a hazard if
+/// anyone later adds a handler on that path for a different
+/// method). Router-level separation makes only GET reachable.
+#[tokio::test(flavor = "current_thread")]
+async fn readyz_non_get_methods_return_405() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+    for method in ["POST", "PUT", "DELETE"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/api/v1/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "expected 405 for {method} /api/v1/readyz",
+        );
+    }
+}
+
 /// `GET /api/v1/readyz` stays anonymous even when a bearer is
 /// present. Mirrors `connect_health_check_remains_anonymous_even_with_token`:
 /// the allow-list is the source of truth, not the presence of a

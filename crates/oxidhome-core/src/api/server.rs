@@ -14,7 +14,7 @@ use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::WebSocket},
     http::StatusCode,
     middleware::from_fn_with_state,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -69,8 +69,9 @@ pub fn build_router(engine: Engine) -> Router {
         audit_log: engine.audit_log(),
     };
     let connect_service = super::connect_rpc::axum_service(engine.clone());
-    Router::new()
-        .route("/api/v1/readyz", get(readyz))
+    // The authenticated cluster — every JSON handler except the
+    // anonymous `/readyz` probe wears the `require_token` layer.
+    let authenticated: Router<ApiState> = Router::new()
         .route("/api/v1/instances", get(list_instances))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{device_id}/command", post(send_command))
@@ -89,26 +90,66 @@ pub fn build_router(engine: Engine) -> Router {
         )
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/logs", get(query_logs))
-        .layer(from_fn_with_state(auth_state.clone(), require_token))
+        .layer(from_fn_with_state(auth_state.clone(), require_token));
+
+    // `/readyz` mounts **outside** the authenticated router (PR-#83
+    // review, F2). The pre-fix shape short-circuited a
+    // `PUBLIC_PATHS` path-string comparison inside the auth
+    // middleware, which also matched POST/PUT/DELETE on the same
+    // path — invisible today because axum returns 405 for
+    // unregistered methods, but a future handler on that path
+    // would silently become anonymous. Physical separation via
+    // router mounting means only the GET registered here is
+    // publicly reachable; any other method returns 405, and any
+    // route added to `authenticated` above requires auth by
+    // construction.
+    let public: Router<ApiState> = Router::new().route("/api/v1/readyz", get(readyz));
+
+    public
+        .merge(authenticated)
         .fallback_service(connect_service)
         .with_state(ApiState { engine })
 }
 
-/// `GET /api/v1/readyz` — anonymous JSON liveness probe. Same body
+/// `GET /api/v1/readyz` — anonymous JSON readiness probe. Same body
 /// shape as the Connect `HealthService.Check` RPC
 /// (`{"status": "ok", "version": "<crate-version>"}`) so an
 /// orchestrator that doesn't speak Connect (systemd's
 /// `ExecStartPost`, docker's `HEALTHCHECK`, k8s's `httpGet`
-/// probe) can still assert the daemon is up with a plain HTTP GET.
+/// probe) can assert the daemon is ready with a plain HTTP GET.
 ///
-/// The route is on the anonymous allow-list in
-/// [`crate::api::auth::PUBLIC_PATHS`], so the auth middleware
-/// passes it through without requiring a bearer.
-async fn readyz() -> Json<ReadyzBody> {
-    Json(ReadyzBody {
-        status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
-    })
+/// **Readiness contract** (PR-#83 review, F1). This does more than
+/// echo `200 OK` — it consults the shared `SQLite` handle via
+/// [`Engine::db_ping`] before responding. Every persistent sub-
+/// store (audit ledger, token store, KV, blob index, event log,
+/// log store) hangs off that connection, so a failed ping means
+/// the daemon can't serve authenticated requests — including the
+/// fail-closed audit path — and the probe returns `503 Service
+/// Unavailable` with `{"status": "not_ready"}`. An orchestrator
+/// pointed at this endpoint pulls the daemon out of load-balancer
+/// rotation on DB failure instead of routing traffic to a shell.
+async fn readyz(State(state): State<ApiState>) -> Response {
+    match state.engine.db_ping() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ReadyzBody {
+                status: "ok",
+                version: env!("CARGO_PKG_VERSION"),
+            }),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(target: "api.readyz", error = %err, "db ping failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ReadyzBody {
+                    status: "not_ready",
+                    version: env!("CARGO_PKG_VERSION"),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Serialize)]
