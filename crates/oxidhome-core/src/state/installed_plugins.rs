@@ -285,18 +285,16 @@ impl InstalledPluginRegistry {
         // Pull live installation rows keyed by plugin_id so the scan
         // loop can look up (and mint-if-missing) in one pass.
         let live_uuids = load_live_installation_uuids(&db)?;
-        // Also pull the set of plugin_ids whose *most recent* rows
-        // are tombstoned (i.e. no live row exists). An FS entry with
-        // no live row **but** a tombstone in that set means the
-        // previous uninstall was interrupted between the FS-remove
-        // step and the SQL tombstone — see the uninstall body's F2
-        // fix. Silently backfilling a fresh UUID there would rotate
-        // identity for a plugin the operator saw as "in-flight,"
-        // so instead we retry `remove_dir_all` and skip indexing.
-        let tombstoned_plugin_ids = load_tombstoned_plugin_ids(&db)?;
 
         let mut entries: HashMap<Arc<str>, InstalledPlugin> = HashMap::new();
         let mut backfills: Vec<InstalledPlugin> = Vec::new();
+        // Every directory whose name is observed on disk, regardless
+        // of whether we successfully indexed it. Used by the orphan-
+        // live-row sweep so a temporarily-unreadable manifest on a
+        // legitimate install doesn't cause its still-valid SQL row
+        // to be tombstoned. Fixup review F2.
+        let mut observed_dir_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for child in std::fs::read_dir(&plugins_root)? {
             let child = match child {
                 Ok(c) => c,
@@ -335,6 +333,14 @@ impl InstalledPluginRegistry {
                     ),
                 }
                 continue;
+            }
+            // Remember every non-staging directory before we try
+            // to read its manifest. A read failure below `continue`s,
+            // and the orphan-live-row sweep uses this set to avoid
+            // tombstoning a live row whose dir is temporarily
+            // unreadable (broken manifest, permissions blip).
+            if !dir_name.is_empty() {
+                observed_dir_names.insert(dir_name.to_string());
             }
             let manifest_path = path.join("manifest.toml");
             let manifest = match read_manifest_sync(&manifest_path) {
@@ -378,42 +384,38 @@ impl InstalledPluginRegistry {
                     "installed dir name disagrees with manifest plugin.id; indexing by manifest id",
                 );
             }
+            // Also protect the manifest-declared id (may differ from
+            // dir name) from the orphan-live-row sweep.
+            observed_dir_names.insert(manifest_id.clone());
             let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
             let installation_uuid = if let Some(uuid) = live_uuids.get(&*id_arc) {
                 Arc::clone(uuid)
-            } else if tombstoned_plugin_ids.contains(&*id_arc) {
-                // Interrupted uninstall (F2 recovery path). Retry
-                // the FS remove — if it succeeds we're in the
-                // fully-uninstalled steady state, so we skip
-                // indexing this dir. If it fails, log an error
-                // and skip indexing anyway; the operator sees
-                // "live SQL row without a dir" won't apply here
-                // (the row is tombstoned) but the FS leak is
-                // visible in the plugins dir listing.
-                match std::fs::remove_dir_all(&path) {
-                    Ok(()) => tracing::info!(
-                        plugin_id = %manifest_id,
-                        path = %path.display(),
-                        "completed interrupted uninstall on scan",
-                    ),
-                    Err(err) => tracing::error!(
-                        plugin_id = %manifest_id,
-                        path = %path.display(),
-                        %err,
-                        "cannot complete interrupted uninstall — leftover \
-                         plugin dir remains; identity is not rotated (SQL \
-                         row for this plugin_id is tombstoned)",
-                    ),
-                }
-                continue;
             } else {
                 // FS entry with no live SQL row — mint one.
-                // Recorded in `backfills` for post-scan INSERT
-                // so the in-memory map and the DB agree even
-                // if the INSERT itself races with a concurrent
-                // reader (which doesn't happen — scan runs at
-                // Engine construction only, before any handler
-                // has an `Arc<Engine>` reference).
+                //
+                // Fixup review F3: the previous cut of this branch
+                // tried to distinguish "interrupted uninstall"
+                // (retry FS remove) from "hand-placed / restored
+                // package" (backfill new UUID) by looking at
+                // whether a tombstoned row existed for this
+                // `plugin_id`. That heuristic destroys legitimate
+                // hand-placed packages installed after a prior
+                // uninstall — tombstone presence can't establish
+                // that the current directory pre-dates the
+                // tombstone.
+                //
+                // Under the FS-first uninstall order (see
+                // `uninstall` body), an interrupted uninstall
+                // whose `remove_dir_all` failed leaves the
+                // **live** SQL row in place (tombstone step never
+                // ran), so this branch is unreachable for that
+                // shape. Any FS entry with no live row is either a
+                // legit pre-C1b install (backfill new UUID) or a
+                // legit post-uninstall restoration (also backfill
+                // — a "reinstall by hand" should mint fresh
+                // device ids, matching what the API's `install`
+                // would have done). Both paths converge on the
+                // same right answer: backfill.
                 let uuid = mint_installation_uuid();
                 backfills.push(InstalledPlugin {
                     plugin_id: Arc::clone(&id_arc),
@@ -434,27 +436,34 @@ impl InstalledPluginRegistry {
             );
         }
 
-        // Live SQL rows without an FS entry — auto-tombstone.
+        // Live SQL rows whose plugin_id has NO matching directory
+        // on disk (via `observed_dir_names`) — auto-tombstone.
         //
-        // This shape appears from three distinct failure paths:
+        // Fixup review F2: the check consults `observed_dir_names`,
+        // not `entries`. A directory whose manifest is temporarily
+        // unreadable is present on disk (so its plugin_id is in
+        // `observed_dir_names` via the dir-name observation) but
+        // absent from `entries` (we skipped indexing). Consulting
+        // `entries` alone would tombstone its still-valid live SQL
+        // row — turning a fixable manifest-read blip into
+        // permanent identity rotation on the next scan.
+        //
+        // The auto-tombstone shape covers:
         // - Install crashed after INSERT but before rename → row
         //   never had a working install.
         // - Uninstall's `remove_dir_all` succeeded but the SQL
-        //   tombstone failed → row is effectively dead but flagged
-        //   live.
-        // - Operator manually deleted the plugin dir → identity
-        //   should not survive; a reinstall should mint a new UUID.
+        //   tombstone failed → row is effectively dead.
+        // - Operator manually deleted the plugin dir → a reinstall
+        //   should mint a new UUID.
         //
-        // Leaving the row live in any of these cases has the same
-        // bad effect: a subsequent `install` for the same
-        // `plugin_id` hits the `plugin_installation_live` unique
-        // index and returns `AlreadyInstalled`, even though nothing
-        // is on disk. Tombstone on sight — identity does not
-        // rotate for anything that survived (there is no FS
-        // entry, so nothing was actively minting device ids
-        // against this row).
+        // Without this sweep, a subsequent `install` for the same
+        // `plugin_id` would hit `plugin_installation_live`'s unique
+        // index and return `AlreadyInstalled` despite nothing on
+        // disk. Identity does not rotate for anything that survived
+        // (there is no FS entry, so nothing was actively minting
+        // device ids against this row).
         for (plugin_id, uuid) in &live_uuids {
-            if !entries.contains_key(plugin_id.as_str()) {
+            if !observed_dir_names.contains(plugin_id.as_str()) {
                 match tombstone_installation_row(&db, uuid) {
                     Ok(()) => tracing::warn!(
                         plugin_id = %plugin_id,
@@ -768,31 +777,6 @@ fn load_live_installation_uuids(db: &Db) -> Result<HashMap<String, Arc<str>>, ru
         for row in rows {
             let (plugin_id, uuid) = row?;
             out.insert(plugin_id, uuid);
-        }
-        Ok(out)
-    })
-}
-
-/// Load the set of `plugin_id`s that appear in `plugin_installation`
-/// **only** as tombstoned rows — i.e. every row for that `plugin_id`
-/// has `uninstalled_ms IS NOT NULL`. Used by scan to detect the F2
-/// recovery path (FS entry left behind by a partially-completed
-/// uninstall; do not silently backfill a fresh UUID).
-fn load_tombstoned_plugin_ids(
-    db: &Db,
-) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
-    db.read(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT plugin_id
-             FROM plugin_installation
-             WHERE plugin_id NOT IN (
-                 SELECT plugin_id FROM plugin_installation WHERE uninstalled_ms IS NULL
-             )",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = std::collections::HashSet::new();
-        for row in rows {
-            out.insert(row?);
         }
         Ok(out)
     })
@@ -1287,13 +1271,16 @@ wasm = "plugin.wasm"
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// C1b review F2 (P1): a partially-completed uninstall (FS dir
-    /// still present, SQL row already tombstoned) must not silently
-    /// mint a fresh UUID for the leftover dir on the next scan.
-    /// Scan retries the FS remove and skips indexing.
+    /// C1b fixup review F3 (P2): a hand-placed / restored plugin
+    /// dir whose `plugin_id` has an existing tombstone must NOT
+    /// be silently deleted by scan (the earlier cut of this
+    /// recovery path did that). The operator restored the package
+    /// intentionally; scan should mint a fresh UUID and keep the
+    /// dir. The historical tombstone survives so the identity
+    /// rotation is auditable.
     #[test]
-    fn scan_completes_interrupted_uninstall_and_does_not_backfill() {
-        let root = tempdir("interrupted-uninstall");
+    fn scan_backfills_hand_placed_dir_with_tombstoned_history() {
+        let root = tempdir("restored-after-tombstone");
         let plugins_root = root.join("plugins");
         let db = fresh_db();
         let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
@@ -1301,37 +1288,92 @@ wasm = "plugin.wasm"
         let source = write_plugin_dir(&root, "example.rotate");
         let first = reg.install(&source).expect("install");
         let first_uuid = Arc::clone(&first.installation_uuid);
-
-        // Simulate the "FS-remove failed, tombstone landed" state:
-        // hand-tombstone the row, keep the dir on disk.
-        tombstone_installation_row(&db, &first_uuid).unwrap();
-        assert!(plugins_root.join("example.rotate").exists());
+        reg.uninstall("example.rotate").expect("uninstall");
         drop(reg);
 
-        // Fresh scan: must complete the uninstall (delete dir) and
-        // must NOT backfill a fresh UUID.
+        // Operator hand-restores the plugin dir (or a valid
+        // replacement package) under the same `plugin_id` after
+        // the tombstone landed.
+        let restored = plugins_root.join("example.rotate");
+        std::fs::create_dir_all(&restored).unwrap();
+        std::fs::copy(source.join("manifest.toml"), restored.join("manifest.toml")).unwrap();
+        std::fs::copy(source.join("plugin.wasm"), restored.join("plugin.wasm")).unwrap();
+
         let reg2 = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+        let listed = reg2.list();
+        assert_eq!(listed.len(), 1, "restored package must be indexed");
         assert!(
-            reg2.list().is_empty(),
-            "interrupted uninstall must not resurface as an install",
+            restored.exists(),
+            "restored dir must not be destroyed by scan",
         );
-        assert!(
-            !plugins_root.join("example.rotate").exists(),
-            "scan must complete the FS removal",
+        assert_ne!(
+            &*listed[0].installation_uuid, &*first_uuid,
+            "restoration must mint a fresh UUID (not resurrect the tombstoned identity)",
         );
 
-        // The tombstoned row is still there — no fresh row was
-        // inserted for the same plugin_id.
-        let row_count: i64 = db
+        // The historical tombstone survives; a live row was
+        // inserted for the fresh identity.
+        let rows: Vec<(String, Option<i64>)> = db
+            .read(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT installation_uuid, uninstalled_ms
+                     FROM plugin_installation
+                     WHERE plugin_id = ?1
+                     ORDER BY installed_ms",
+                )?;
+                let rows = stmt.query_map(["example.rotate"], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].1.is_some(), "historical tombstone preserved");
+        assert!(rows[1].1.is_none(), "restoration inserts a fresh live row");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b fixup review F2 (P1): a temporarily-unreadable manifest
+    /// on an installed plugin dir must NOT cause its live SQL row
+    /// to be tombstoned by the orphan-live-row sweep. That would
+    /// turn a fixable file blip into permanent identity rotation.
+    #[test]
+    fn scan_does_not_tombstone_live_row_for_dir_with_bad_manifest() {
+        let root = tempdir("bad-manifest-live");
+        let plugins_root = root.join("plugins");
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+        let source = write_plugin_dir(&root, "example.brokenmani");
+        let installed = reg.install(&source).expect("install");
+        let uuid = Arc::clone(&installed.installation_uuid);
+        drop(reg);
+
+        // Corrupt the manifest of the installed dir so scan can't
+        // parse it (the dir is still there).
+        std::fs::write(
+            plugins_root.join("example.brokenmani/manifest.toml"),
+            "not valid toml [[[",
+        )
+        .unwrap();
+
+        let _reg2 = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
+        // Live row must survive — the dir is on disk, just
+        // unreadable.
+        let uninstalled_ms: Option<i64> = db
             .read(|conn| {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM plugin_installation WHERE plugin_id = ?1",
-                    ["example.rotate"],
+                    "SELECT uninstalled_ms FROM plugin_installation
+                     WHERE installation_uuid = ?1",
+                    [&*uuid],
                     |r| r.get(0),
                 )
             })
             .unwrap();
-        assert_eq!(row_count, 1, "no fresh identity row minted");
+        assert!(
+            uninstalled_ms.is_none(),
+            "unreadable manifest must not tombstone the live SQL row",
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
