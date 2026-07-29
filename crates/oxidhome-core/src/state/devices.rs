@@ -81,18 +81,43 @@ pub struct DeviceRegistry {
 /// use the same key material to correlate stored rows with fresh
 /// registrations.
 ///
+/// **Encoding.** Each field is preceded by its byte length as a
+/// big-endian `u32` — unambiguous tuple encoding. A plain
+/// `"::"` delimiter (which the first cut used, and PR #84 review
+/// caught, defect F1) collides for any tuple where an id itself
+/// contains `"::"`: `("p", "alpha::beta", "d")` and
+/// `("p", "alpha", "beta::d")` hash identical bytes and produce
+/// the same device id. Length-prefix framing is the standard
+/// fix — the digest byte stream now describes the tuple bijectively.
+///
+/// A leading domain-separation tag pins this hash to
+/// `oxidhome:device-id:v1` so a future format change (widening the
+/// truncation, moving to a different digest, etc.) doesn't collide
+/// with the current shape.
+///
 /// SHA-256 truncated to 8 bytes = 64 bits of collision space. On a
 /// single host with ≤10^6 devices the birthday collision risk is
 /// ~2^{-24}; well below any operational threshold. Widening the
-/// truncation is a `format!` change if the ceiling ever moves.
+/// truncation would bump the version tag so old and new ids don't
+/// alias.
 #[must_use]
 pub fn stable_device_id(plugin_id: &str, instance_id: &str, local_id: &str) -> DeviceId {
     let mut h = Sha256::new();
-    h.update(plugin_id.as_bytes());
-    h.update(b"::");
-    h.update(instance_id.as_bytes());
-    h.update(b"::");
-    h.update(local_id.as_bytes());
+    // Domain-separation tag — locks this digest to the current
+    // encoding version.
+    let tag = b"oxidhome:device-id:v1";
+    #[allow(clippy::cast_possible_truncation)]
+    h.update((tag.len() as u32).to_be_bytes());
+    h.update(tag);
+    for field in [plugin_id, instance_id, local_id] {
+        let bytes = field.as_bytes();
+        // `u32` big-endian length prefix is enough for any real
+        // identifier (max 4 GiB); a name that overflows a `u32`
+        // would already be broken everywhere else.
+        #[allow(clippy::cast_possible_truncation)]
+        h.update((bytes.len() as u32).to_be_bytes());
+        h.update(bytes);
+    }
     let digest = h.finalize();
     let mut hex = String::with_capacity(16);
     for byte in digest.iter().take(8) {
@@ -156,6 +181,19 @@ impl DeviceRegistry {
     /// has to go through `remove` + `register`. The Arc is rebuilt
     /// rather than mutated so outstanding read snapshots see the
     /// pre-update info.
+    ///
+    /// **C1 immutability.** `info.local_id` must match the
+    /// original registration's `local_id` — the host-minted device
+    /// id is derived from it (see [`stable_device_id`]), so
+    /// changing `local_id` mid-life would silently break the
+    /// restart-stability contract (the plugin would compute a
+    /// different id after restart, and every external reference
+    /// citing the old id — audit rows, API paths, log queries —
+    /// would point nowhere). A caller that wants to rename the
+    /// physical device must `remove` + `register` under the new
+    /// name explicitly, which the audit trail correctly attributes
+    /// as a distinct device. Mismatched `local_id` ⇒
+    /// `WitError::InvalidArgument`.
     pub fn update(
         &self,
         owner_instance: &str,
@@ -165,6 +203,13 @@ impl DeviceRegistry {
         let mut guard = self.write();
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
+                if meta.info.local_id != info.local_id {
+                    return Err(WitError::InvalidArgument(format!(
+                        "update-device: local_id is immutable after registration \
+                         (was `{}`, got `{}`) — use remove-device + register-device to rename",
+                        meta.info.local_id, info.local_id,
+                    )));
+                }
                 let new = Arc::new(DeviceMeta {
                     id: meta.id.clone(),
                     owner_instance: meta.owner_instance.clone(),
@@ -357,5 +402,55 @@ mod tests {
             first, second,
             "same (plugin, instance, local_id) must yield the same device id across restarts",
         );
+    }
+
+    /// PR #84 review, F1 regression — the pre-fix `"::"` delimiter
+    /// collided for any tuple containing `"::"` in an id. Two
+    /// distinct legal tuples hashed identical bytes and the second
+    /// registration silently overwrote the first, mis-routing every
+    /// subsequent command. Length-prefix framing makes the digest
+    /// stream bijective; distinct tuples get distinct ids.
+    #[test]
+    fn delimiter_ambiguity_no_longer_collides() {
+        // Both would have hashed `plugin.a::alpha::beta::front-door`
+        // under the pre-fix encoding.
+        let a = stable_device_id("plugin.a", "alpha::beta", "front-door");
+        let b = stable_device_id("plugin.a", "alpha", "beta::front-door");
+        assert_ne!(a, b, "length-prefix encoding must disambiguate `::`");
+    }
+
+    /// PR #84 review, F2 regression — `update-device` must refuse a
+    /// changed `local_id`. Silently accepting it would break the
+    /// C1 restart-stability contract: the plugin's next
+    /// registration would compute a *different* id from the new
+    /// `local_id`, and every external reference to the old id
+    /// would point nowhere.
+    #[test]
+    fn update_rejects_local_id_change() {
+        let reg = DeviceRegistry::new();
+        let mut original = empty_info();
+        original.local_id = "front-door".into();
+        original.name = "Front Door".into();
+        let id = reg.register("plugin.a", "alpha".into(), original);
+
+        // Legitimate update — same local_id, different `name`.
+        let mut renamed = empty_info();
+        renamed.local_id = "front-door".into();
+        renamed.name = "Foyer Door".into();
+        reg.update("alpha", &id, renamed).expect("rename ok");
+
+        // Illegitimate update — different local_id.
+        let mut moved = empty_info();
+        moved.local_id = "back-door".into();
+        let err = reg.update("alpha", &id, moved).unwrap_err();
+        assert!(
+            matches!(err, WitError::InvalidArgument(_)),
+            "changing local_id must be refused, got {err:?}",
+        );
+
+        // Registry still has the original device unchanged.
+        let after = reg.get("alpha", &id).expect("still there");
+        assert_eq!(after.info.local_id, "front-door");
+        assert_eq!(after.info.name, "Foyer Door");
     }
 }
