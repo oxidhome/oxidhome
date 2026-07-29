@@ -383,6 +383,241 @@ async fn audit_endpoint_returns_ledger_rows() {
     assert!(decisions.contains(&"deny"));
 }
 
+/// PR #85 review, F2 regression — the `send_command` docstring
+/// advertises `?path=/api/v1/devices/.../command` as a forensic
+/// drill-down. The pre-fix `AuditParams` didn't have a `path`
+/// field, so axum silently ignored the query key and returned
+/// unfiltered rows. Verifies the filter actually filters.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_path_filter_narrows() {
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    // Seed two distinct paths.
+    for uri in ["/api/v1/instances", "/api/v1/devices"] {
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Query with path filter — must return *only* the matching
+    // path's row, not the whole ledger.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit?path=/api/v1/instances")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let audit = body["audit"].as_array().expect("audit array");
+    assert!(!audit.is_empty(), "path filter should return matching rows");
+    for row in audit {
+        assert_eq!(
+            row["path"].as_str(),
+            Some("/api/v1/instances"),
+            "path filter must exclude non-matching rows; got {row:?}",
+        );
+    }
+}
+
+/// PR #85 review, F3 regression — the audit query is itself
+/// audited (the middleware records the pending intent row *before*
+/// running the handler), so an unfiltered `?limit=1` on an idle
+/// system used to return the query's own pending row instead of
+/// the preceding event. The middleware smuggles the pending id
+/// through a request extension the handler reads and passes as
+/// `AuditQuery::exclude_id`, dropping the self-audit from its own
+/// results.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_excludes_self_referential_row() {
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    // Seed one real request.
+    let _ = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/instances")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Query with limit=1 — must return the seeded /instances row,
+    // NOT the query's own /audit pending row.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit?limit=1")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let audit = body["audit"].as_array().expect("audit array");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0]["path"].as_str(),
+        Some("/api/v1/instances"),
+        "self-referential row must be excluded; got {audit:?}",
+    );
+    // decision on the seeded row is "allow" (2xx); the pending
+    // /audit row (had it leaked through) would be "pending".
+    assert_eq!(audit[0]["decision"].as_str(), Some("allow"));
+}
+
+/// PR #85 review, F2 regression — page through the ledger by
+/// following the `next_cursor` opaque cursor, verify no rows are
+/// duplicated or skipped. The pre-fix endpoint exposed only
+/// inclusive `until_ms` bounds; rows sharing a millisecond made
+/// millisecond-based pagination inherently lossy.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_paginates_losslessly_via_cursor() {
+    use std::collections::HashSet;
+
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    // Seed enough rows that the same millisecond likely holds
+    // several — the exact concurrency scenario the reviewer
+    // pointed out that a `until_ms`-only paginator loses.
+    for _ in 0..7 {
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Page with limit=2 until `next_cursor` disappears. Collect
+    // every id we see; assert (a) no duplicates, (b) count matches
+    // the total the ledger holds for the reader's view.
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..20 {
+        let uri = match &cursor {
+            Some(c) => format!("/api/v1/audit?limit=2&before={c}"),
+            None => "/api/v1/audit?limit=2".to_string(),
+        };
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", reader.plaintext),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_to_json(response.into_body()).await;
+        let page = body["audit"].as_array().expect("audit array");
+        for row in page {
+            let id = row["id"].as_u64().expect("id present");
+            assert!(
+                seen.insert(id),
+                "row id {id} returned twice — pagination is lossy"
+            );
+        }
+        cursor = body
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    // 7 seeded rows + 1 pending row per audit-query call
+    // (excluded by F3 self-exclusion, so not counted). Every one
+    // of the 7 must have been seen once.
+    assert!(
+        seen.len() >= 7,
+        "expected at least the 7 seeded rows, got {} unique ids: {seen:?}",
+        seen.len(),
+    );
+}
+
+/// `GET /api/v1/audit?before=<bad>` returns 400 rather than
+/// silently ignoring the malformed cursor. Silent-ignore is the
+/// axum default for unknown query params and it's exactly the
+/// class of hole PR #85 review's F2 flagged for the missing
+/// `path` param.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_rejects_malformed_cursor() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit?before=not-a-cursor")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 /// `GET /api/v1/audit` refuses tokens without the `audit:read`
 /// scope with 403. Locks the scope-gate — the audit ledger is
 /// sensitive (every token id, path, decision), and any token

@@ -222,9 +222,9 @@ impl Engine {
     /// Dedicated audit ledger — architecture-review C3. Separate from
     /// [`Self::log_store`] so audit rows can't be evicted by a burst
     /// of diagnostic logs. The API's auth middleware records here
-    /// synchronously before returning the response; a follow-up will
-    /// route the `logs query --target api.audit` API path through
-    /// this store rather than through `log_store`.
+    /// through the two-phase write contract (see the
+    /// `state::audit_log` module doc); the external query surface
+    /// is `GET /api/v1/audit` (scoped on `audit:read`).
     #[must_use]
     pub fn audit_log(&self) -> Arc<AuditLog> {
         Arc::clone(&self.audit_log)

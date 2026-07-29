@@ -1261,6 +1261,15 @@ struct AuditParams {
     until_ms: Option<i64>,
     token_id: Option<String>,
     decision: Option<String>,
+    /// Exact `path` match — the forensic drill-down for a
+    /// specific endpoint, e.g.
+    /// `path=/api/v1/devices/dev-abc/command`.
+    path: Option<String>,
+    /// Cursor for lossless pagination. Opaque `"<intent_ms>:<id>"`
+    /// string returned as `next_cursor` on the previous page.
+    /// Callers should not construct it by hand — pass the previous
+    /// response's `next_cursor` verbatim.
+    before: Option<String>,
     limit: Option<u32>,
 }
 
@@ -1269,9 +1278,11 @@ const AUDIT_QUERY_MAX_LIMIT: u32 = 1_000;
 
 /// `GET /api/v1/audit?…` — historical audit query against the
 /// dedicated C3 `audit_event` `SQLite` table. Gated on
-/// `audit:read`. Returns rows newest-first.
+/// `audit:read`. Returns rows newest-first with a `next_cursor`
+/// for lossless pagination.
 async fn query_audit(
     Extension(actor): Extension<Actor>,
+    Extension(self_id): Extension<crate::api::auth::AuditIntentId>,
     State(state): State<ApiState>,
     Query(params): Query<AuditParams>,
 ) -> Result<Json<AuditBody>, AuditError> {
@@ -1280,25 +1291,78 @@ async fn query_audit(
         .limit
         .unwrap_or(AUDIT_QUERY_DEFAULT_LIMIT)
         .clamp(1, AUDIT_QUERY_MAX_LIMIT);
+    // Parse the opaque cursor. Bad shape is a 400 rather than
+    // silently ignored, so a client that constructs one by hand and
+    // gets it wrong learns immediately.
+    let before = params
+        .before
+        .as_deref()
+        .map(parse_audit_cursor)
+        .transpose()
+        .map_err(AuditError::BadCursor)?;
     let query = AuditQuery {
         since_ms: params.since_ms,
         until_ms: params.until_ms,
         token_id: params.token_id,
         decision: params.decision,
+        path: params.path,
+        before,
+        // F3 self-exclusion: hide the query's own pending intent
+        // row from its results.
+        exclude_id: Some(self_id.0),
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-    let rows = state
-        .engine
-        .audit_log()
-        .query(&query, limit_usize)
+    // `AuditLog::query` grabs the shared `std::sync::Mutex` on the
+    // `Db` connection and decodes up to `AUDIT_QUERY_MAX_LIMIT`
+    // rows synchronously. Doing that directly from an async
+    // context would park the tokio worker under contention — the
+    // AuditLog contract explicitly requires callers to hop to the
+    // blocking pool (see `state::audit_log` module doc).
+    let audit_log = state.engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit_log.query(&query, limit_usize))
+        .await
+        .map_err(|join_err| {
+            tracing::error!(
+                target: "api.audit",
+                error = %join_err,
+                "audit query blocking task panicked",
+            );
+            AuditError::Storage(crate::state::AuditLogError::Sql(
+                rusqlite::Error::InvalidQuery,
+            ))
+        })?
         .map_err(AuditError::Storage)?;
+    // Cursor for the next page — the last row's (intent_ms, id).
+    // If we returned fewer rows than the caller's limit, there's
+    // nothing more to paginate through, so leave `next_cursor` at
+    // `None` so callers don't loop forever.
+    let next_cursor = if rows.len() == limit_usize {
+        rows.last()
+            .map(|last| format!("{}:{}", last.intent_ms, last.id))
+    } else {
+        None
+    };
     let audit = rows.into_iter().map(WireAuditEntry::from_row).collect();
-    Ok(Json(AuditBody { audit }))
+    Ok(Json(AuditBody { audit, next_cursor }))
+}
+
+/// Parse the opaque `<intent_ms>:<id>` cursor string. Both halves
+/// must be integers; either malformed and the endpoint returns
+/// 400 rather than silently ignore the cursor and hand back
+/// unfiltered rows.
+fn parse_audit_cursor(s: &str) -> Result<(i64, u64), &'static str> {
+    let (ms, id) = s
+        .split_once(':')
+        .ok_or("cursor must be `<intent_ms>:<id>`")?;
+    let ms: i64 = ms.parse().map_err(|_| "cursor intent_ms must be an i64")?;
+    let id: u64 = id.parse().map_err(|_| "cursor id must be a u64")?;
+    Ok((ms, id))
 }
 
 enum AuditError {
     Scope(ScopeDenied),
     Storage(crate::state::AuditLogError),
+    BadCursor(&'static str),
 }
 
 impl IntoResponse for AuditError {
@@ -1309,6 +1373,7 @@ impl IntoResponse for AuditError {
                 tracing::error!(target: "api.audit", error = %err, "audit query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
             }
+            AuditError::BadCursor(reason) => (StatusCode::BAD_REQUEST, reason).into_response(),
         }
     }
 }
@@ -1316,10 +1381,16 @@ impl IntoResponse for AuditError {
 #[derive(Serialize)]
 struct AuditBody {
     audit: Vec<WireAuditEntry>,
+    /// Opaque `"<intent_ms>:<id>"` pagination cursor. When present,
+    /// the caller passes it back as `?before=…` to fetch the next
+    /// page. `None` indicates the last page (`rows.len() < limit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
 struct WireAuditEntry {
+    id: u64,
     intent_ms: i64,
     finalized_ms: Option<i64>,
     token_id: String,
@@ -1341,6 +1412,7 @@ struct WireAuditEntry {
 impl WireAuditEntry {
     fn from_row(row: crate::state::AuditEntry) -> Self {
         Self {
+            id: row.id,
             intent_ms: row.intent_ms,
             finalized_ms: row.finalized_ms,
             token_id: row.token_id,

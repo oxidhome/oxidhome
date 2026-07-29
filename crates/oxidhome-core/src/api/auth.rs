@@ -123,6 +123,14 @@ pub(crate) fn wit_error_kind(err: &WitError) -> &'static str {
 /// probes — missing / malformed / unknown / revoked bearer.
 pub(super) const ANONYMOUS_TOKEN_ID: &str = "anonymous";
 
+/// Request-extension smuggle from [`require_token`] to a handler
+/// that needs to see its own audit intent row's id (currently just
+/// [`super::server::query_audit`], which excludes itself from the
+/// result set to avoid returning the self-referential pending row).
+/// PR-#85 review, F3 regression.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuditIntentId(pub(crate) u64);
+
 /// Shared state the middleware needs. Held behind `Arc` and cloned
 /// per request — every field is already `Arc`-backed, so the clone
 /// is cheap.
@@ -199,6 +207,7 @@ pub(crate) async fn require_token(
     // executes so a mid-handler cancellation still leaves evidence.
     // (F2) Fail-closed: ledger unreachable ⇒ refuse the request.
     let intent = AuditEntry {
+        id: 0,
         intent_ms: 0,
         finalized_ms: None,
         token_id: token_id.clone(),
@@ -232,6 +241,13 @@ pub(crate) async fn require_token(
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
+    // Smuggle the pending row's id to the handler. `GET
+    // /api/v1/audit` reads it off the request extension and
+    // excludes it from the query result — otherwise the audit
+    // query's own pending intent is always the newest row and
+    // `?limit=1` on an idle system returns the query, not the
+    // preceding event.
+    req.extensions_mut().insert(AuditIntentId(audit_id));
 
     let response = next.run(req).await;
     let denied_scope = response
@@ -274,6 +290,7 @@ pub(super) async fn record_anonymous_probe(
     credential_fp: Option<String>,
 ) {
     let entry = AuditEntry {
+        id: 0,
         intent_ms: 0,
         finalized_ms: None,
         token_id: ANONYMOUS_TOKEN_ID.into(),

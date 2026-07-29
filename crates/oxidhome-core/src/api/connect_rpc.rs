@@ -1139,6 +1139,7 @@ async fn connect_auth_middleware(
     // (F1) Pre-audit intent — same shape as the JSON middleware.
     // Fail-closed on ledger error.
     let intent = crate::state::AuditEntry {
+        id: 0,
         intent_ms: 0,
         finalized_ms: None,
         token_id: token_id.clone(),

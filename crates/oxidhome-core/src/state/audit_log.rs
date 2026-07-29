@@ -64,6 +64,13 @@ use super::event_log::now_unix_ms;
 /// can't rewrite ledger time by setting `intent_ms` on the input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
+    /// Host-assigned monotonically-increasing row id — the ledger's
+    /// primary key. Assigned by the database on
+    /// [`AuditLog::record_intent`] / [`AuditLog::record_completed`]
+    /// and returned as the method's `u64` result. Reserved as the
+    /// tiebreaker for cursor pagination when two rows share the
+    /// same `intent_ms`.
+    pub id: u64,
     /// Host-stamped millisecond Unix timestamp of the intent
     /// (top-of-middleware) write. Assigned by [`AuditLog::record_intent`]
     /// or [`AuditLog::record_completed`]; any value on the input is
@@ -156,6 +163,26 @@ pub struct AuditQuery {
     /// Filter on `decision` — including `"pending"` to surface
     /// abandoned intents.
     pub decision: Option<String>,
+    /// Exact match on the request `path`. The forensic
+    /// drill-down for a specific endpoint —
+    /// `path = "/api/v1/devices/dev-abc/command"` returns every
+    /// command dispatch against that device.
+    pub path: Option<String>,
+    /// Cursor-based pagination floor: return only rows strictly
+    /// *older* than `(before.0, before.1)` in `(intent_ms, id)`
+    /// order. The default `ORDER BY intent_ms DESC, id DESC LIMIT
+    /// ?` ordering combined with this filter gives lossless
+    /// pagination — the next page is the client passing the last
+    /// row's `(intent_ms, id)` here. Millisecond timestamps
+    /// collide under bursts, so filtering only by `until_ms` would
+    /// either drop rows or duplicate them at boundaries.
+    pub before: Option<(i64, u64)>,
+    /// Exclude a single row id from the result. Used by the
+    /// `GET /api/v1/audit` handler to exclude the *self-audit* row
+    /// (the query's own pending intent row) — otherwise
+    /// `?limit=1` on an idle system always returns that pending
+    /// row instead of the preceding event.
+    pub exclude_id: Option<u64>,
 }
 
 /// Errors returned by [`AuditLog`]. Every insert/update path funnels
@@ -343,7 +370,7 @@ impl AuditLog {
         use std::fmt::Write as _;
 
         let mut sql = String::from(
-            "SELECT intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error \
+            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error \
              FROM audit_event WHERE 1=1",
         );
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -366,6 +393,33 @@ impl AuditLog {
         if let Some(d) = &filter.decision {
             push(&mut binds, &mut sql, "decision =", d.clone().into());
         }
+        if let Some(p) = &filter.path {
+            push(&mut binds, &mut sql, "path =", p.clone().into());
+        }
+        // Cursor pagination — lexicographic `(intent_ms, id) <
+        // (before_ms, before_id)`. SQLite's row-value comparison
+        // reads exactly like the tuple: `(a, b) < (?, ?)`. Cheaper
+        // than the OR-expanded form and index-friendly (the
+        // `audit_intent` index covers `intent_ms` for the primary
+        // partition; the `id` PK then breaks ties on rows that
+        // share a millisecond).
+        if let Some((before_ms, before_id)) = filter.before {
+            binds.push(before_ms.into());
+            #[allow(clippy::cast_possible_wrap)]
+            binds.push((before_id as i64).into());
+            let n = binds.len();
+            let _ = write!(sql, " AND (intent_ms, id) < (?{}, ?{})", n - 1, n);
+        }
+        // Self-exclusion for the audit-query endpoint — the
+        // middleware records the query's own pending intent
+        // *before* the handler runs, so an unfiltered `limit=1`
+        // would otherwise return that pending row every time. The
+        // handler passes its own row id here.
+        if let Some(id) = filter.exclude_id {
+            #[allow(clippy::cast_possible_wrap)]
+            let id_i = id as i64;
+            push(&mut binds, &mut sql, "id !=", id_i.into());
+        }
         let _ = write!(
             sql,
             " ORDER BY intent_ms DESC, id DESC LIMIT ?{}",
@@ -379,21 +433,23 @@ impl AuditLog {
             let bind_refs: Vec<&dyn rusqlite::ToSql> =
                 binds.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
             let rows = stmt.query_map(bind_refs.as_slice(), |row| {
-                let status_i: i64 = row.get(6)?;
+                let id_i: i64 = row.get(0)?;
+                let status_i: i64 = row.get(7)?;
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 Ok(AuditEntry {
-                    intent_ms: row.get(0)?,
-                    finalized_ms: row.get(1)?,
-                    token_id: row.get(2)?,
-                    actor_kind: row.get(3)?,
-                    method: row.get(4)?,
-                    path: row.get(5)?,
+                    id: id_i as u64,
+                    intent_ms: row.get(1)?,
+                    finalized_ms: row.get(2)?,
+                    token_id: row.get(3)?,
+                    actor_kind: row.get(4)?,
+                    method: row.get(5)?,
+                    path: row.get(6)?,
                     status: status_i as u16,
-                    decision: row.get(7)?,
-                    required_scope: row.get(8)?,
-                    credential_fp: row.get(9)?,
-                    execution_outcome: row.get(10)?,
-                    domain_error: row.get(11)?,
+                    decision: row.get(8)?,
+                    required_scope: row.get(9)?,
+                    credential_fp: row.get(10)?,
+                    execution_outcome: row.get(11)?,
+                    domain_error: row.get(12)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -452,6 +508,7 @@ mod tests {
 
     fn sample_intent(token: &str, path: &str) -> AuditEntry {
         AuditEntry {
+            id: 0,
             intent_ms: 0,
             finalized_ms: None,
             token_id: token.into(),
@@ -578,6 +635,7 @@ mod tests {
     fn record_completed_writes_all_columns() {
         let log = store();
         let entry = AuditEntry {
+            id: 0,
             intent_ms: 0,
             finalized_ms: None,
             token_id: "anonymous".into(),
@@ -605,6 +663,7 @@ mod tests {
     fn query_filters_by_token_id() {
         fn allow_row(token: &str) -> AuditEntry {
             AuditEntry {
+                id: 0,
                 intent_ms: 0,
                 finalized_ms: None,
                 token_id: token.into(),
