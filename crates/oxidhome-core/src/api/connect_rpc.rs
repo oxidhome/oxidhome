@@ -21,7 +21,8 @@
 //! [`TokenStore`](crate::state::TokenStore) the JSON `require_token`
 //! uses, stamps an [`Actor`] into `req.extensions_mut()` (forwarded
 //! into [`RequestContext::extensions()`] by the Connect dispatcher),
-//! and emits one `api.audit` row per authenticated request. The
+//! and records one row per authenticated request in the C3 audit
+//! ledger via [`crate::api::auth::finalize_audit`]. The
 //! `Health.Check` path is on the anonymous allow-list so liveness
 //! probes still work without credentials.
 //!
@@ -1050,8 +1051,8 @@ const ANONYMOUS_CONNECT_PATHS: &[&str] = &["/oxidhome.v1.HealthService/Check"];
 /// Connect client. This middleware shares the **same audit emit
 /// helper** and the **same `TokenStore::verify`** as the JSON path
 /// so a token issued via the CLI works on both surfaces and the
-/// audit-row shape stays uniform (`api.audit` tracing target, same
-/// fields).
+/// C3 audit ledger sees uniform rows regardless of which
+/// transport served the request.
 pub fn axum_service(engine: Engine) -> axum::Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
@@ -1071,8 +1072,9 @@ pub fn axum_service(engine: Engine) -> axum::Router {
 ///    `req.extensions()` into [`RequestContext::extensions()`], so
 ///    a future scoped handler reads it via
 ///    `ctx.extensions().get::<Actor>()`).
-/// 3. After the handler runs, emit one `api.audit` event with the
-///    same field shape the JSON middleware uses.
+/// 3. After the handler runs, finalize one audit-ledger row via
+///    [`crate::api::auth::finalize_audit`] — same shape and same
+///    ledger the JSON middleware uses.
 //
 // Reads linearly top-to-bottom (allow-list → extract → verify →
 // intent → run → finalize). Splitting for `too_many_lines` would
@@ -1137,6 +1139,7 @@ async fn connect_auth_middleware(
     // (F1) Pre-audit intent — same shape as the JSON middleware.
     // Fail-closed on ledger error.
     let intent = crate::state::AuditEntry {
+        id: 0,
         intent_ms: 0,
         finalized_ms: None,
         token_id: token_id.clone(),
@@ -1229,7 +1232,6 @@ async fn connect_auth_middleware(
         &state.audit_log,
         audit_id,
         &token_id,
-        &actor_kind,
         &method,
         &path,
         audit_status,

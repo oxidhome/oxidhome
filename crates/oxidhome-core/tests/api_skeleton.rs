@@ -24,24 +24,15 @@ use oxidhome_core::api::build_router;
 use serde_json::Value;
 use tower::ServiceExt;
 
-/// Serializes every test that installs a thread-local tracing
-/// subscriber via `tracing::subscriber::with_default`.
+/// Serializes tests that install a thread-local tracing
+/// subscriber via `tracing::subscriber::with_default`. Two
+/// parallel `with_default` installs on the harness's thread pool
+/// can race with each other and lose events; the mutex funnels
+/// them through one at a time.
 ///
-/// **Why the whole file, not just the audit tests:** empirically
-/// (see PR #50 review), the connect-side audit test can flake with
-/// `sent=0` even though its own middleware emit ran on the same
-/// thread as the `with_default` install, when a *sibling* connect
-/// test runs concurrently and drives the same middleware path.
-/// Solo passes were 20/20; parallel with the other Connect tests
-/// on the review's box, ~1/3 saw the audit row lost. Serializing
-/// the two `with_default` + connect-middleware-emit tests
-/// eliminates the race window and is the same shape as the
-/// reviewer's `--test-threads=1` workaround, targeted at the
-/// specific set of tests that share the mechanism.
-///
-/// Poison recovery is intentional: a panic in one audit test
-/// shouldn't cascade-fail every sibling; the mutex has no invariant
-/// beyond exclusivity of the tracing install.
+/// Poison recovery is intentional: a panic in one test shouldn't
+/// cascade-fail every sibling; the mutex has no invariant beyond
+/// exclusivity of the tracing install.
 static TRACING_SUBSCRIBER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 async fn body_to_json(body: Body) -> Value {
@@ -52,49 +43,6 @@ async fn body_to_json(body: Body) -> Value {
         return Value::Null;
     }
     serde_json::from_slice(&bytes).expect("response body must be JSON")
-}
-
-/// Snapshot of the audit fields a test cares about.
-struct AuditFields {
-    decision: String,
-    status: i64,
-    /// Empty string on allow / non-scope-deny rows; populated on
-    /// scope-denial 403s with the missing scope name.
-    required_scope: String,
-}
-
-/// Pull the structured fields out of an audit row.
-/// Used by `audit_log_records_one_event_per_authenticated_request`.
-fn extract_audit_fields(fields: &[(String, oxidhome_core::state::LogValue)]) -> AuditFields {
-    use oxidhome_core::state::LogValue;
-    let mut decision: Option<String> = None;
-    let mut token_id: Option<String> = None;
-    let mut status: Option<i64> = None;
-    let mut required_scope: Option<String> = None;
-    for (k, v) in fields {
-        match (k.as_str(), v) {
-            ("decision", LogValue::String(s) | LogValue::Debug(s)) => {
-                decision = Some(s.clone());
-            }
-            ("token_id", LogValue::String(s) | LogValue::Debug(s)) => {
-                token_id = Some(s.clone());
-            }
-            ("required_scope", LogValue::String(s) | LogValue::Debug(s)) => {
-                required_scope = Some(s.clone());
-            }
-            ("status", LogValue::Int(n)) => status = Some(*n),
-            ("status", LogValue::UInt(n)) => {
-                status = Some(i64::try_from(*n).expect("status fits in i64"));
-            }
-            _ => {}
-        }
-    }
-    assert!(token_id.is_some(), "token_id field present");
-    AuditFields {
-        decision: decision.expect("decision field present"),
-        status: status.expect("status field present"),
-        required_scope: required_scope.unwrap_or_default(),
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -301,22 +249,14 @@ async fn devices_list_enforces_scope() {
     assert!(body["devices"].as_array().unwrap().is_empty());
 }
 
-/// Every authenticated request lands one row in the log store with
-/// `target = "api.<METHOD>-<path>"` and the structured fields the
-/// CLI's `logs query --target api.* --field decision=deny` will
-/// pivot on. Pins the audit-log contract end-to-end through the
-/// `LogStore` layer.
-#[test]
-fn audit_log_records_one_event_per_authenticated_request() {
-    use oxidhome_core::state::LogQuery;
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("rt");
+/// Every authenticated request lands exactly one row in the C3
+/// audit ledger, with the outcome + fields the CLI's `logs query
+/// --target api.audit` used to pivot on pre-C3-followup. Post-C3-
+/// followup the mirror is gone; consumers read `AuditLog::query`
+/// (surfaced via `GET /api/v1/audit` for external callers).
+#[tokio::test(flavor = "current_thread")]
+async fn audit_log_records_one_event_per_authenticated_request() {
+    use oxidhome_core::state::AuditQuery;
 
     let engine = Engine::new().expect("engine");
     let allow_token = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
@@ -324,47 +264,27 @@ fn audit_log_records_one_event_per_authenticated_request() {
         .auth_tokens()
         .create("no-instances", b"[\"devices:list\"]")
         .unwrap();
+    let audit_log = engine.audit_log();
 
-    let log_store = engine.log_store();
-    let subscriber = Registry::default().with(log_store.layer());
+    let router = build_router(engine.clone());
+    // One allow + one deny so we can assert both audit rows.
+    for secret in [&allow_token.plaintext, &deny_token.plaintext] {
+        let _resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
 
-    let _serial = TRACING_SUBSCRIBER_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    with_default(subscriber, || {
-        rt.block_on(async {
-            let router = build_router(engine.clone());
-            // One allow + one deny so we can assert both audit rows.
-            for secret in [&allow_token.plaintext, &deny_token.plaintext] {
-                let _resp = router
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .uri("/api/v1/instances")
-                            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-            }
-        });
-    });
-
-    // Layer is async + bounded-channel; the writer thread drains
-    // when the channel idles. The store's test helper blocks until
-    // every queued row is committed.
-    log_store.wait_drained_for_test();
-
-    let rows = log_store
-        .query(
-            &LogQuery {
-                target_prefix: Some("api.audit".into()),
-                ..LogQuery::default()
-            },
-            32,
-        )
-        .expect("query api.audit");
+    let rows = audit_log
+        .query(&AuditQuery::default(), 32)
+        .expect("query audit");
     assert_eq!(
         rows.len(),
         2,
@@ -373,50 +293,375 @@ fn audit_log_records_one_event_per_authenticated_request() {
 
     let mut decisions: Vec<String> = Vec::new();
     for row in &rows {
-        assert_eq!(row.target, "api.audit");
-        let fields = extract_audit_fields(&row.fields);
-        match fields.decision.as_str() {
+        assert_eq!(row.path, "/api/v1/instances");
+        match row.decision.as_str() {
             "allow" => {
-                assert_eq!(fields.status, 200);
-                // Allow rows don't carry a required_scope value
-                // — the field is present (uniform shape) but
-                // empty.
-                assert_eq!(fields.required_scope, "");
+                assert_eq!(row.status, 200);
+                // Allow rows carry no required_scope — the field
+                // is only populated on scope-deny 403s.
+                assert!(row.required_scope.is_none());
             }
             "deny" => {
-                assert_eq!(fields.status, 403);
+                assert_eq!(row.status, 403);
                 // Scope-denial 403s must surface *which* scope was
                 // missing — the whole point of the response-
                 // extension plumbing in `ScopeDenied`.
-                assert_eq!(fields.required_scope, "instances:list");
+                assert_eq!(row.required_scope.as_deref(), Some("instances:list"));
             }
             other => panic!("unexpected decision `{other}`"),
         }
-        decisions.push(fields.decision);
+        decisions.push(row.decision.clone());
     }
     assert!(decisions.contains(&"allow".to_string()));
     assert!(decisions.contains(&"deny".to_string()));
 }
 
-/// Architecture-review C3 regression. The `LogStore` `try_send`
-/// channel drops rows under saturation — that's the deliberate
-/// diagnostic-log trade-off. Audit *must not* share that fate.
+/// `GET /api/v1/audit` — the external query surface for the C3
+/// ledger, replaces the pre-retirement
+/// `logs query --target api.audit` path. Scoped on `audit:read`.
+/// This test seeds two rows via authenticated requests (one allow,
+/// one deny), then queries the endpoint and asserts both come back
+/// in the expected `{status, decision, path, ...}` shape.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_returns_ledger_rows() {
+    let engine = Engine::new().expect("engine");
+    let allow_token = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let deny_token = engine
+        .auth_tokens()
+        .create("no-instances", b"[\"devices:list\"]")
+        .unwrap();
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    // Seed two authenticated requests — one allow, one deny.
+    for secret in [&allow_token.plaintext, &deny_token.plaintext] {
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Query the audit endpoint with the reader token.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let audit = body["audit"].as_array().expect("audit array");
+    // 3 rows: the two seeded requests + this very audit-query call
+    // itself (also authenticated → audited).
+    assert!(
+        audit.len() >= 2,
+        "at least the two seeded rows, got {audit:?}"
+    );
+    let decisions: Vec<&str> = audit
+        .iter()
+        .filter_map(|row| row["decision"].as_str())
+        .collect();
+    assert!(decisions.contains(&"allow"));
+    assert!(decisions.contains(&"deny"));
+}
+
+/// PR #85 review, F2 regression — the `send_command` docstring
+/// advertises `?path=/api/v1/devices/.../command` as a forensic
+/// drill-down. The pre-fix `AuditParams` didn't have a `path`
+/// field, so axum silently ignored the query key and returned
+/// unfiltered rows. Verifies the filter actually filters.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_path_filter_narrows() {
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    // Seed two distinct paths.
+    for uri in ["/api/v1/instances", "/api/v1/devices"] {
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Query with path filter — must return *only* the matching
+    // path's row, not the whole ledger.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit?path=/api/v1/instances")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let audit = body["audit"].as_array().expect("audit array");
+    assert!(!audit.is_empty(), "path filter should return matching rows");
+    for row in audit {
+        assert_eq!(
+            row["path"].as_str(),
+            Some("/api/v1/instances"),
+            "path filter must exclude non-matching rows; got {row:?}",
+        );
+    }
+}
+
+/// PR #85 review, F3 regression — the audit query is itself
+/// audited (the middleware records the pending intent row *before*
+/// running the handler), so an unfiltered `?limit=1` on an idle
+/// system used to return the query's own pending row instead of
+/// the preceding event. The middleware smuggles the pending id
+/// through a request extension the handler reads and passes as
+/// `AuditQuery::exclude_id`, dropping the self-audit from its own
+/// results.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_excludes_self_referential_row() {
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    // Seed one real request.
+    let _ = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/instances")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Query with limit=1 — must return the seeded /instances row,
+    // NOT the query's own /audit pending row.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit?limit=1")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let audit = body["audit"].as_array().expect("audit array");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0]["path"].as_str(),
+        Some("/api/v1/instances"),
+        "self-referential row must be excluded; got {audit:?}",
+    );
+    // decision on the seeded row is "allow" (2xx); the pending
+    // /audit row (had it leaked through) would be "pending".
+    assert_eq!(audit[0]["decision"].as_str(), Some("allow"));
+}
+
+/// PR #85 review, F2 regression — page through the ledger by
+/// following the `next_cursor` opaque cursor, verify no rows are
+/// duplicated or skipped. The pre-fix endpoint exposed only
+/// inclusive `until_ms` bounds; rows sharing a millisecond made
+/// millisecond-based pagination inherently lossy.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_paginates_losslessly_via_cursor() {
+    use std::collections::HashSet;
+
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+
+    // Seed enough rows that the same millisecond likely holds
+    // several — the exact concurrency scenario the reviewer
+    // pointed out that a `until_ms`-only paginator loses.
+    for _ in 0..7 {
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Page with limit=2 until `next_cursor` disappears. Collect
+    // every id we see; assert (a) no duplicates, (b) count matches
+    // the total the ledger holds for the reader's view.
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..20 {
+        let uri = match &cursor {
+            Some(c) => format!("/api/v1/audit?limit=2&before={c}"),
+            None => "/api/v1/audit?limit=2".to_string(),
+        };
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", reader.plaintext),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_to_json(response.into_body()).await;
+        let page = body["audit"].as_array().expect("audit array");
+        for row in page {
+            let id = row["id"].as_u64().expect("id present");
+            assert!(
+                seen.insert(id),
+                "row id {id} returned twice — pagination is lossy"
+            );
+        }
+        cursor = body
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    // 7 seeded rows + 1 pending row per audit-query call
+    // (excluded by F3 self-exclusion, so not counted). Every one
+    // of the 7 must have been seen once.
+    assert!(
+        seen.len() >= 7,
+        "expected at least the 7 seeded rows, got {} unique ids: {seen:?}",
+        seen.len(),
+    );
+}
+
+/// `GET /api/v1/audit?before=<bad>` returns 400 rather than
+/// silently ignoring the malformed cursor. Silent-ignore is the
+/// axum default for unknown query params and it's exactly the
+/// class of hole PR #85 review's F2 flagged for the missing
+/// `path` param.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_rejects_malformed_cursor() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"audit:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit?before=not-a-cursor")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `GET /api/v1/audit` refuses tokens without the `audit:read`
+/// scope with 403. Locks the scope-gate — the audit ledger is
+/// sensitive (every token id, path, decision), and any token
+/// lacking `audit:read` must not enumerate it.
+#[tokio::test(flavor = "current_thread")]
+async fn audit_endpoint_requires_audit_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("no-audit", b"[\"logs:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// Architecture-review C3 + follow-up guard. Pre-retirement,
+/// `emit_audit` fired *both* a `tracing::info!(target = "api.audit",
+/// ...)` mirror **and** an `AuditLog::record` — this test used to
+/// prove the ledger row survived even when the tracing mirror lost
+/// to `LogStore` channel saturation. Post-retirement the mirror is
+/// gone, so this test now guards the retirement itself:
 ///
-/// The test wires up an `Engine`, installs the log-store subscriber,
-/// then floods the channel with more diagnostic events than its
-/// capacity (`DEFAULT_CAPACITY = 1024`) before any writer drains
-/// have a chance to run. That guarantees the channel is saturated
-/// on the very next `try_send` — evidenced by a non-zero drop
-/// counter. Meanwhile a real authenticated request goes through
-/// `build_router`, so `emit_audit` fires both the tracing mirror
-/// (which competes for that same saturated channel) and the
-/// dedicated `AuditLog::record` synchronous write.
-///
-/// The invariant: `AuditLog::count()` reports the row landed even
-/// when the `LogStore` reports drops. Proves the audit ledger is
-/// isolated from diagnostic-log backpressure.
+/// - An authenticated request lands exactly one row in the
+///   `AuditLog`, fully finalized.
+/// - The `LogStore` receives **zero** `api.audit`-target rows —
+///   the mirror really is retired and no code path is silently
+///   re-introducing it. A regression that re-adds the mirror
+///   would trip the `assert_eq!(mirror_rows, 0, ...)` below.
 #[test]
-fn audit_ledger_row_survives_log_store_channel_saturation() {
+fn audit_ledger_is_sole_source_no_tracing_mirror() {
+    use oxidhome_core::state::{AuditQuery, LogQuery};
     use tracing::subscriber::with_default;
     use tracing_subscriber::Registry;
     use tracing_subscriber::layer::SubscriberExt;
@@ -428,29 +673,14 @@ fn audit_ledger_row_survives_log_store_channel_saturation() {
 
     let engine = Engine::new().expect("engine");
     let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
-
     let log_store = engine.log_store();
     let audit_log = engine.audit_log();
-    assert_eq!(audit_log.count().unwrap(), 0);
-
     let subscriber = Registry::default().with(log_store.layer());
 
     let _serial = TRACING_SUBSCRIBER_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     with_default(subscriber, || {
-        // Saturate the diagnostic channel. `DEFAULT_CAPACITY` is
-        // 1024; we emit well over that from a synchronous loop so
-        // the writer thread can't keep up and `try_send` starts
-        // returning `Full`, bumping the `dropped` counter.
-        for i in 0..8192 {
-            tracing::info!(target: "flooder", i, "burst");
-        }
-
-        // Now the request that must be audited. Its `emit_audit`
-        // hits both paths — the tracing mirror (into the saturated
-        // channel, may drop) *and* `AuditLog::record` (synchronous
-        // SQLite insert, no channel).
         rt.block_on(async {
             let router = build_router(engine.clone());
             let resp = router
@@ -466,39 +696,38 @@ fn audit_ledger_row_survives_log_store_channel_saturation() {
             assert_eq!(resp.status(), StatusCode::OK);
         });
     });
+    log_store.wait_drained_for_test();
 
-    // The diagnostic channel dropped a bunch of rows — that's the
-    // whole premise of the test.
-    assert!(
-        log_store.dropped() > 0,
-        "flooder must have saturated the log_store channel; dropped={}",
-        log_store.dropped(),
-    );
-
-    // The audit ledger, which is the point of C3, has the row
-    // regardless. Query directly — no `wait_drained_for_test` needed;
-    // the write is synchronous by design.
+    // Ledger — the sole source, fully finalized.
     let rows = audit_log
-        .query(&oxidhome_core::state::AuditQuery::default(), 8)
+        .query(&AuditQuery::default(), 8)
         .expect("query audit_log");
-    assert_eq!(
-        rows.len(),
-        1,
-        "audit ledger must retain the row even when diagnostic drops \
-         are non-zero; rows = {rows:?}",
-    );
+    assert_eq!(rows.len(), 1, "one ledger row expected, got {rows:?}");
     assert_eq!(rows[0].decision, "allow");
     assert_eq!(rows[0].status, 200);
     assert_eq!(rows[0].path, "/api/v1/instances");
     assert_eq!(rows[0].method, "GET");
-    // Two-phase invariant: the row was pending, then finalized.
-    // `finalized_ms` set proves the middleware ran the phase-2 UPDATE.
     assert!(
         rows[0].finalized_ms.is_some(),
         "audit row must be finalized, not left pending; got {:?}",
         rows[0],
     );
-    assert!(rows[0].finalized_ms.unwrap() >= rows[0].intent_ms);
+
+    // Retirement guard — LogStore has zero `api.audit`-target rows.
+    let mirror_rows = log_store
+        .query(
+            &LogQuery {
+                target_prefix: Some("api.audit".into()),
+                ..LogQuery::default()
+            },
+            8,
+        )
+        .expect("query mirror");
+    assert!(
+        mirror_rows.is_empty(),
+        "`tracing::info!(target = \"api.audit\", ...)` mirror is retired — \
+         no code path should re-emit it; got {mirror_rows:?}",
+    );
 }
 
 /// F5 regression — the pre-C3 review-fixup surface. A request with
@@ -1976,105 +2205,58 @@ fn connect_valid_token_reaches_dispatcher_and_404s_unknown_method() {
     );
 }
 
-/// An authenticated Connect call lands one `api.audit` tracing row
-/// with the same field shape the JSON middleware emits. Pins that
-/// the two surfaces converge on a single audit-row contract — a
-/// CLI query (`logs query --target api.audit --field token_id=…`)
-/// returns Connect + JSON rows uniformly.
-#[test]
-fn connect_authenticated_call_emits_audit_row_in_same_shape_as_json() {
-    use oxidhome_core::state::{LogQuery, LogValue};
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("rt");
+/// An authenticated Connect call lands one row in the C3 audit
+/// ledger with the same field shape a JSON request would produce.
+/// Pins that both surfaces converge on a single audit-row contract
+/// — a forensic query over the ledger returns Connect and JSON
+/// rows uniformly.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_authenticated_call_emits_audit_row_in_same_shape_as_json() {
+    use oxidhome_core::state::AuditQuery;
 
     let engine = Engine::new().expect("engine");
     let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
-    let log_store = engine.log_store();
-    let subscriber = Registry::default().with(log_store.layer());
+    let audit_log = engine.audit_log();
 
-    // See `TRACING_SUBSCRIBER_LOCK` — audit tests share the mutex so
-    // parallel `with_default` installs on the harness's thread pool
-    // don't race the `emit_audit → SqliteLayer` path in the
-    // middleware and lose the row to a NoSubscriber dispatch. Panic
-    // recovery on the lock is intentional; a poisoned mutex means an
-    // earlier audit test panicked mid-request and we still want to
-    // run this one.
-    let _serial = TRACING_SUBSCRIBER_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    with_default(subscriber, || {
-        rt.block_on(async {
-            let router = build_router(engine.clone());
-            let _resp = router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/oxidhome.v1.NoSuchService/Method")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
-                        .body(Body::from("{}"))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-        });
-    });
-
-    log_store.wait_drained_for_test();
-    let rows = log_store
-        .query(
-            &LogQuery {
-                target_prefix: Some("api.audit".into()),
-                ..LogQuery::default()
-            },
-            32,
+    let router = build_router(engine.clone());
+    let _resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.NoSuchService/Method")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from("{}"))
+                .unwrap(),
         )
-        .expect("query api.audit");
+        .await
+        .unwrap();
+
+    let rows = audit_log
+        .query(&AuditQuery::default(), 32)
+        .expect("query audit");
     assert_eq!(
         rows.len(),
         1,
         "expected one audit row from the Connect call, got {rows:?}",
     );
-    let fields = extract_audit_fields(&rows[0].fields);
+    let row = &rows[0];
     // The handler 404'd / 501'd (unknown method) — the audit row
     // records the actual status the dispatcher returned, with the
-    // matching `deny` decision (decision logic mirrors the JSON
-    // middleware: <400 → allow, 5xx → error, otherwise deny).
-    let status = u16::try_from(fields.status).unwrap_or_default();
-    let decision_ok = (status >= 400 && fields.decision == "deny")
-        || (status >= 500 && fields.decision == "error");
+    // matching decision (<400 → allow, 5xx → error, otherwise deny).
+    let decision_ok = (row.status >= 400 && row.decision == "deny")
+        || (row.status >= 500 && row.decision == "error");
     assert!(
         decision_ok,
-        "unexpected status={status}, decision={}",
-        fields.decision,
+        "unexpected status={}, decision={}",
+        row.status, row.decision,
     );
-    // No scoped Connect endpoints in 15-b, so the audit row never
-    // carries a `required_scope` field yet — pin this so 15-c knows
-    // to extend it.
-    assert!(
-        fields.required_scope.is_empty(),
-        "no scoped Connect endpoints exist yet; required_scope should be empty",
-    );
-    // The audit target shape: `api.{METHOD}-{PATH}` — same as the
-    // JSON side. Confirms Connect rows land under the same prefix
-    // a CLI query would filter on.
-    let target_field: Vec<_> = rows[0]
-        .fields
-        .iter()
-        .filter(|(k, _)| k == "audit_target")
-        .collect();
-    assert_eq!(target_field.len(), 1, "audit_target field present");
-    let target_str = match &target_field[0].1 {
-        LogValue::String(s) | LogValue::Debug(s) => s.as_str(),
-        other => panic!("audit_target should be a string, got {other:?}"),
-    };
-    assert_eq!(target_str, "api.POST-/oxidhome.v1.NoSuchService/Method");
+    // Not a scope denial — required_scope stays None.
+    assert!(row.required_scope.is_none());
+    // Method + path landed verbatim; the audit-target derivation
+    // that used to happen for the tracing mirror is gone.
+    assert_eq!(row.method, "POST");
+    assert_eq!(row.path, "/oxidhome.v1.NoSuchService/Method");
 }
 
 /// `GET /api/v1/readyz` is anonymous — no bearer, still 200 with
@@ -2431,25 +2613,17 @@ async fn connect_logs_query_rejects_unknown_min_level_as_invalid_argument() {
     );
 }
 
-/// The Connect audit row on a scope denial now carries the missing
+/// The Connect audit row on a scope denial carries the missing
 /// scope name in `required_scope` — the JSON side has done this
 /// since 12-API-b via a `DeniedScope` response-extension smuggle,
 /// and the Connect side matches it via a request-extension slot
-/// the handler's `require_scope_connect` writes to. Uses the sync
-/// `#[test]` + `block_on` shape so the mutex guard doesn't sit
-/// across an `.await` (`clippy::await_holding_lock`, same pattern as
-/// the sibling audit tests).
-#[test]
-fn connect_scope_deny_audit_row_carries_required_scope() {
-    use oxidhome_core::state::LogQuery;
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
+/// the handler's `require_scope_connect` writes to. Both surfaces
+/// funnel into the C3 audit ledger; querying it directly returns
+/// the same row shape regardless of transport.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_scope_deny_audit_row_carries_required_scope() {
+    use oxidhome_core::state::AuditQuery;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("rt");
     let engine = Engine::new().expect("engine");
     // Token has `logs:read` but the RPC we hit requires
     // `devices:list` — a clean scope-deny with a known missing
@@ -2458,54 +2632,40 @@ fn connect_scope_deny_audit_row_carries_required_scope() {
         .auth_tokens()
         .create("scoped", b"[\"logs:read\"]")
         .unwrap();
-    let log_store = engine.log_store();
-    let subscriber = Registry::default().with(log_store.layer());
+    let audit_log = engine.audit_log();
 
-    let _serial = TRACING_SUBSCRIBER_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    with_default(subscriber, || {
-        rt.block_on(async {
-            let router = build_router(engine.clone());
-            let _resp = router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/oxidhome.v1.DevicesService/ListDevices")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header(
-                            header::AUTHORIZATION,
-                            format!("Bearer {}", issued.plaintext),
-                        )
-                        .body(Body::from("{}"))
-                        .unwrap(),
+    let router = build_router(engine.clone());
+    let _resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.DevicesService/ListDevices")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
                 )
-                .await
-                .unwrap();
-        });
-    });
-    log_store.wait_drained_for_test();
-    let rows = log_store
-        .query(
-            &LogQuery {
-                target_prefix: Some("api.audit".into()),
-                ..LogQuery::default()
-            },
-            32,
+                .body(Body::from("{}"))
+                .unwrap(),
         )
-        .expect("query api.audit");
+        .await
+        .unwrap();
+
+    let rows = audit_log
+        .query(&AuditQuery::default(), 32)
+        .expect("query audit");
     assert_eq!(
         rows.len(),
         1,
         "expected one audit row from the scope-denied Connect call, got {rows:?}",
     );
-    let fields = extract_audit_fields(&rows[0].fields);
-    assert_eq!(fields.status, 403);
-    assert_eq!(fields.decision, "deny");
+    let row = &rows[0];
+    assert_eq!(row.status, 403);
+    assert_eq!(row.decision, "deny");
     assert_eq!(
-        fields.required_scope, "devices:list",
-        "audit row should name the missing scope, got fields {:?}",
-        rows[0].fields
+        row.required_scope.as_deref(),
+        Some("devices:list"),
+        "audit row should name the missing scope, got {row:?}",
     );
 }
 
@@ -2519,79 +2679,55 @@ fn connect_scope_deny_audit_row_carries_required_scope() {
 /// transport-independent classification: when the handler
 /// recorded a `DeniedScope`, the audit row is `deny` regardless of
 /// the wire shape.
-#[test]
-fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
-    use oxidhome_core::state::LogQuery;
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
+#[tokio::test(flavor = "current_thread")]
+async fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
+    use oxidhome_core::state::AuditQuery;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("rt");
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
         .create("scoped", b"[\"logs:read\"]")
         .unwrap();
-    let log_store = engine.log_store();
-    let subscriber = Registry::default().with(log_store.layer());
+    let audit_log = engine.audit_log();
 
-    let _serial = TRACING_SUBSCRIBER_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    with_default(subscriber, || {
-        rt.block_on(async {
-            let router = build_router(engine.clone());
-            // A well-formed gRPC-Web frame is required for the
-            // dispatcher to reach the handler — otherwise the
-            // dispatcher rejects on framing before scope check
-            // runs and we never populate `DeniedScopeSlot`.
-            // ListDevicesRequest is an empty proto3 message
-            // (zero-byte payload); framing is 1 byte flags
-            // (0 = uncompressed data frame) + 4 bytes big-endian
-            // length (0) + 0 bytes payload = 5 bytes total.
-            let frame = &[0u8, 0, 0, 0, 0][..];
-            let response = router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/oxidhome.v1.DevicesService/ListDevices")
-                        .header(header::CONTENT_TYPE, "application/grpc-web+proto")
-                        .header(
-                            header::AUTHORIZATION,
-                            format!("Bearer {}", issued.plaintext),
-                        )
-                        .body(Body::from(frame.to_vec()))
-                        .unwrap(),
+    let router = build_router(engine.clone());
+    // A well-formed gRPC-Web frame is required for the dispatcher
+    // to reach the handler — otherwise the dispatcher rejects on
+    // framing before scope check runs and we never populate
+    // `DeniedScopeSlot`. ListDevicesRequest is an empty proto3
+    // message (zero-byte payload); framing is 1 byte flags (0 =
+    // uncompressed data frame) + 4 bytes big-endian length (0) +
+    // 0 bytes payload = 5 bytes total.
+    let frame = &[0u8, 0, 0, 0, 0][..];
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.DevicesService/ListDevices")
+                .header(header::CONTENT_TYPE, "application/grpc-web+proto")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
                 )
-                .await
-                .unwrap();
-            // gRPC-Web puts the RPC error in trailers on top of
-            // HTTP 200 — the audit classifier must not mistake
-            // that for a success.
-            assert_eq!(response.status(), StatusCode::OK);
-        });
-    });
-    log_store.wait_drained_for_test();
-    let rows = log_store
-        .query(
-            &LogQuery {
-                target_prefix: Some("api.audit".into()),
-                ..LogQuery::default()
-            },
-            32,
+                .body(Body::from(frame.to_vec()))
+                .unwrap(),
         )
-        .expect("query api.audit");
+        .await
+        .unwrap();
+    // gRPC-Web puts the RPC error in trailers on top of HTTP 200
+    // — the audit classifier must not mistake that for a success.
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = audit_log
+        .query(&AuditQuery::default(), 32)
+        .expect("query audit");
     assert_eq!(rows.len(), 1);
-    let fields = extract_audit_fields(&rows[0].fields);
+    let row = &rows[0];
     assert_eq!(
-        fields.decision, "deny",
-        "gRPC-Web scope denial must audit as deny, got fields {:?}",
-        rows[0].fields
+        row.decision, "deny",
+        "gRPC-Web scope denial must audit as deny, got {row:?}",
     );
-    assert_eq!(fields.required_scope, "devices:list");
+    assert_eq!(row.required_scope.as_deref(), Some("devices:list"));
 }
 
 /// **Non-scope** handler-returned Connect error on gRPC-Web still
@@ -2606,93 +2742,65 @@ fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
 /// Without the outcome slot the audit would classify this as `allow`
 /// (the very bug the PR review flagged as still present in this
 /// handler after 15-d shipped).
-#[test]
-fn connect_non_scope_error_on_grpc_web_transport_still_audits_as_deny() {
-    use oxidhome_core::state::LogQuery;
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
+#[tokio::test(flavor = "current_thread")]
+async fn connect_non_scope_error_on_grpc_web_transport_still_audits_as_deny() {
+    use oxidhome_core::state::AuditQuery;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("rt");
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
         .create("reader", b"[\"logs:read\"]")
         .unwrap();
-    let log_store = engine.log_store();
-    let subscriber = Registry::default().with(log_store.layer());
+    let audit_log = engine.audit_log();
 
-    let _serial = TRACING_SUBSCRIBER_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    with_default(subscriber, || {
-        rt.block_on(async {
-            let router = build_router(engine.clone());
-            // Frame a `QueryLogsRequest{min_level: 999}` as a
-            // gRPC-Web message. On the JSON codec the body is just
-            // the JSON — but `application/grpc-web+proto` needs the
-            // proto-encoded body wrapped in a 5-byte frame header.
-            // Easier: use `application/grpc-web+json` (Connect
-            // supports it) with a JSON body carrying `min_level`.
-            //
-            // gRPC-Web frame: 1 byte flag (0 = data) + 4 bytes
-            // big-endian length + payload bytes.
-            let payload = br#"{"minLevel":999}"#;
-            let mut frame = Vec::with_capacity(5 + payload.len());
-            frame.push(0u8);
-            frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
-            frame.extend_from_slice(payload);
-            let response = router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/oxidhome.v1.LogsService/QueryLogs")
-                        .header(header::CONTENT_TYPE, "application/grpc-web+json")
-                        .header(
-                            header::AUTHORIZATION,
-                            format!("Bearer {}", issued.plaintext),
-                        )
-                        .body(Body::from(frame))
-                        .unwrap(),
+    let router = build_router(engine.clone());
+    // Frame a `QueryLogsRequest{min_level: 999}` as a gRPC-Web
+    // JSON message: 1-byte flag (0 = data) + 4-byte big-endian
+    // length + JSON payload.
+    let payload = br#"{"minLevel":999}"#;
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0u8);
+    frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(payload);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.LogsService/QueryLogs")
+                .header(header::CONTENT_TYPE, "application/grpc-web+json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
                 )
-                .await
-                .unwrap();
-            // gRPC-Web transport pushes the RPC error into trailers
-            // on top of HTTP 200 — the audit classifier must not
-            // read this as a success.
-            assert_eq!(response.status(), StatusCode::OK);
-        });
-    });
-    log_store.wait_drained_for_test();
-    let rows = log_store
-        .query(
-            &LogQuery {
-                target_prefix: Some("api.audit".into()),
-                ..LogQuery::default()
-            },
-            8,
+                .body(Body::from(frame))
+                .unwrap(),
         )
+        .await
+        .unwrap();
+    // gRPC-Web transport pushes the RPC error into trailers on top
+    // of HTTP 200 — the audit classifier must not read this as a
+    // success.
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = audit_log
+        .query(&AuditQuery::default(), 8)
         .expect("audit query");
     assert_eq!(
         rows.len(),
         1,
         "expected one audit row for the failed gRPC-Web query, got {rows:?}",
     );
-    let fields = extract_audit_fields(&rows[0].fields);
+    let row = &rows[0];
     assert_eq!(
-        fields.status, 400,
+        row.status, 400,
         "InvalidArgument should record as HTTP 400 in the audit row",
     );
     assert_eq!(
-        fields.decision, "deny",
-        "gRPC-Web non-scope handler error must audit as deny, got fields {:?}",
-        rows[0].fields
+        row.decision, "deny",
+        "gRPC-Web non-scope handler error must audit as deny, got {row:?}",
     );
-    // Not a scope denial → required_scope stays empty.
-    assert!(fields.required_scope.is_empty());
+    // Not a scope denial → required_scope stays None.
+    assert!(row.required_scope.is_none());
 }
 
 // ── Connect write cluster (15-d) ─────────────────────────────────
@@ -2748,66 +2856,45 @@ async fn connect_plugins_uninstall_scope_deny_returns_permission_denied() {
 /// this slice; would otherwise mis-classify as `allow` on
 /// non-unary transports). No enumeration leak — a real-but-not-
 /// running device gets the same `NotFound`.
-#[test]
-fn connect_devices_execute_command_unknown_device_audits_as_deny() {
-    use oxidhome_core::state::LogQuery;
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
+#[tokio::test(flavor = "current_thread")]
+async fn connect_devices_execute_command_unknown_device_audits_as_deny() {
+    use oxidhome_core::state::AuditQuery;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("rt");
     let engine = Engine::new().expect("engine");
     let admin = engine
         .auth_tokens()
         .create("admin", b"[\"devices:command\"]")
         .unwrap();
-    let log_store = engine.log_store();
-    let subscriber = Registry::default().with(log_store.layer());
+    let audit_log = engine.audit_log();
 
-    let _serial = TRACING_SUBSCRIBER_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    with_default(subscriber, || {
-        rt.block_on(async {
-            let router = build_router(engine.clone());
-            let response = router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/oxidhome.v1.DevicesService/ExecuteCommand")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
-                        .body(Body::from(
-                            r#"{"deviceId":"nope","capability":"switch","action":"toggle"}"#,
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            let body = body_to_json(response.into_body()).await;
-            assert_eq!(body["code"], "not_found");
-        });
-    });
-    log_store.wait_drained_for_test();
-    let rows = log_store
-        .query(
-            &LogQuery {
-                target_prefix: Some("api.audit".into()),
-                ..LogQuery::default()
-            },
-            8,
+    let router = build_router(engine.clone());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oxidhome.v1.DevicesService/ExecuteCommand")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::from(
+                    r#"{"deviceId":"nope","capability":"switch","action":"toggle"}"#,
+                ))
+                .unwrap(),
         )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["code"], "not_found");
+
+    let rows = audit_log
+        .query(&AuditQuery::default(), 8)
         .expect("audit query");
     assert_eq!(rows.len(), 1, "one audit row expected, got {rows:?}");
-    let fields = extract_audit_fields(&rows[0].fields);
-    assert_eq!(fields.status, 404);
-    assert_eq!(fields.decision, "deny");
-    // NotFound isn't a scope denial — required_scope stays empty.
-    assert!(fields.required_scope.is_empty());
+    let row = &rows[0];
+    assert_eq!(row.status, 404);
+    assert_eq!(row.decision, "deny");
+    // NotFound isn't a scope denial — required_scope stays None.
+    assert!(row.required_scope.is_none());
 }
 
 /// Full round-trip through Connect's Devices.ExecuteCommand: stage a

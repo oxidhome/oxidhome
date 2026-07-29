@@ -123,6 +123,14 @@ pub(crate) fn wit_error_kind(err: &WitError) -> &'static str {
 /// probes — missing / malformed / unknown / revoked bearer.
 pub(super) const ANONYMOUS_TOKEN_ID: &str = "anonymous";
 
+/// Request-extension smuggle from [`require_token`] to a handler
+/// that needs to see its own audit intent row's id (currently just
+/// [`super::server::query_audit`], which excludes itself from the
+/// result set to avoid returning the self-referential pending row).
+/// PR-#85 review, F3 regression.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuditIntentId(pub(crate) u64);
+
 /// Shared state the middleware needs. Held behind `Arc` and cloned
 /// per request — every field is already `Arc`-backed, so the clone
 /// is cheap.
@@ -199,6 +207,7 @@ pub(crate) async fn require_token(
     // executes so a mid-handler cancellation still leaves evidence.
     // (F2) Fail-closed: ledger unreachable ⇒ refuse the request.
     let intent = AuditEntry {
+        id: 0,
         intent_ms: 0,
         finalized_ms: None,
         token_id: token_id.clone(),
@@ -232,6 +241,13 @@ pub(crate) async fn require_token(
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
+    // Smuggle the pending row's id to the handler. `GET
+    // /api/v1/audit` reads it off the request extension and
+    // excludes it from the query result — otherwise the audit
+    // query's own pending intent is always the newest row and
+    // `?limit=1` on an idle system returns the query, not the
+    // preceding event.
+    req.extensions_mut().insert(AuditIntentId(audit_id));
 
     let response = next.run(req).await;
     let denied_scope = response
@@ -252,7 +268,6 @@ pub(crate) async fn require_token(
         &state.audit_log,
         audit_id,
         &token_id,
-        &actor_kind,
         &method,
         &http_path,
         status,
@@ -275,6 +290,7 @@ pub(super) async fn record_anonymous_probe(
     credential_fp: Option<String>,
 ) {
     let entry = AuditEntry {
+        id: 0,
         intent_ms: 0,
         finalized_ms: None,
         token_id: ANONYMOUS_TOKEN_ID.into(),
@@ -308,22 +324,9 @@ pub(super) async fn record_anonymous_probe(
             );
         }
     }
-    // Best-effort tracing mirror so operators tailing stderr still
-    // see the probe (and the existing `logs query --target api.audit`
-    // API keeps returning it). This path can drop under load — the
-    // ledger row above is the forensic source of truth.
-    tracing::info!(
-        target: "api.audit",
-        audit_target = %format!("api.{method}-{path}"),
-        token_id = %ANONYMOUS_TOKEN_ID,
-        actor_kind = %ANONYMOUS_TOKEN_ID,
-        method = %method,
-        path = %path,
-        status = status,
-        decision = %"deny",
-        required_scope = %"",
-        "api request",
-    );
+    // C3 follow-up: the `tracing::info!(target: "api.audit", ...)`
+    // mirror that used to fire here is gone. Query surface for the
+    // ledger is `GET /api/v1/audit` (see `server::query_audit`).
 }
 
 /// Blocking-safe wrapper around [`AuditLog::record_intent`]. Runs the
@@ -343,12 +346,16 @@ async fn record_intent_blocking(
     }
 }
 
-/// Two-phase finalize + tracing mirror. Wraps [`AuditLog::finalize`]
-/// on the blocking pool, then emits the same tracing target the
-/// pre-C3 code used so operators tailing stderr keep seeing every
-/// request and the current `logs query --target api.audit` API
-/// path keeps working. Best-effort — the pending row is already
-/// committed evidence of intent.
+/// Phase-2 audit finalize. Wraps [`AuditLog::finalize`] on the
+/// blocking pool. Best-effort — the pending row is already
+/// committed evidence of intent, so a finalize failure logs an
+/// alert but does not fail the request.
+///
+/// External query surface for the ledger: `GET /api/v1/audit`
+/// (scoped on `audit:read`). The C3-followup retirement of the
+/// `tracing::info!(target = "api.audit", ...)` mirror means this
+/// is the sole audit output path — no diagnostic-channel mirror
+/// competes for the row's delivery.
 ///
 /// `pub(super)` so the Connect-side middleware calls the same
 /// helper — single source of truth for the audit-row contract
@@ -358,7 +365,6 @@ pub(super) async fn finalize_audit(
     audit_log: &Arc<AuditLog>,
     audit_id: u64,
     token_id: &str,
-    actor_kind: &str,
     method: &str,
     path: &str,
     status: StatusCode,
@@ -431,29 +437,11 @@ pub(super) async fn finalize_audit(
         }
     }
 
-    // Tracing mirror — same shape the pre-C3 code emitted, so a
-    // subscriber that installs the LogStore layer sees every request
-    // live in `logs query --target api.audit`. Best-effort by
-    // design. Includes the F4 execution-outcome fields so a stderr
-    // tail carries the same distinction the ledger does.
-    let audit_target = format!("api.{method}-{path}");
-    let required_field = required.as_deref().unwrap_or("");
-    let execution_field = execution_outcome.unwrap_or("");
-    let domain_error_field = domain_error.unwrap_or("");
-    tracing::info!(
-        target: "api.audit",
-        audit_target = %audit_target,
-        token_id = %token_id,
-        actor_kind = %actor_kind,
-        method = %method,
-        path = %path,
-        status = status_u16,
-        decision = %decision,
-        required_scope = %required_field,
-        execution_outcome = %execution_field,
-        domain_error = %domain_error_field,
-        "api request",
-    );
+    // C3 follow-up: the `tracing::info!(target: "api.audit", ...)`
+    // mirror is retired. The dedicated ledger (queried at
+    // `GET /api/v1/audit`) is now the sole source of truth. Any
+    // future stderr / structured-log surface for audit rows lands
+    // via the ledger, not via the drop-tolerant `LogStore` channel.
 }
 
 /// Build an [`Actor`] from a verified record. Scopes are parsed
