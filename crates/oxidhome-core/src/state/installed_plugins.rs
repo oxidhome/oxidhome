@@ -288,13 +288,27 @@ impl InstalledPluginRegistry {
 
         let mut entries: HashMap<Arc<str>, InstalledPlugin> = HashMap::new();
         let mut backfills: Vec<InstalledPlugin> = Vec::new();
-        // Every directory whose name is observed on disk, regardless
-        // of whether we successfully indexed it. Used by the orphan-
-        // live-row sweep so a temporarily-unreadable manifest on a
-        // legitimate install doesn't cause its still-valid SQL row
-        // to be tombstoned. Fixup review F2.
-        let mut observed_dir_names: std::collections::HashSet<String> =
+        // `plugin_id`s of directories whose manifest we successfully
+        // parsed. The **authoritative** identifier is the one in
+        // the manifest, not the dir name — `scan` explicitly accepts
+        // a dir whose basename differs from its manifest id. Using
+        // dir names here would double-count (leaving orphan live
+        // rows for renamed manifests) or misidentify (a broken
+        // manifest gets misattributed to the dir name). See fixup2
+        // review F1 / F2.
+        let mut observed_manifest_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // If any non-staging directory has a manifest we can't
+        // parse or that declares an unsafe id, we can't know its
+        // `plugin_id`, so the orphan-live-row sweep can't safely
+        // decide anything for that boot — a live row could belong
+        // to this dir, or genuinely be orphaned. Defer the sweep
+        // entirely: skip it and let the next boot (after the
+        // operator repairs the manifest) reconcile cleanly. This
+        // preserves identity across transient manifest blips at
+        // the cost of leaving genuine orphans in place for one
+        // extra boot.
+        let mut defer_orphan_sweep = false;
         for child in std::fs::read_dir(&plugins_root)? {
             let child = match child {
                 Ok(c) => c,
@@ -334,14 +348,6 @@ impl InstalledPluginRegistry {
                 }
                 continue;
             }
-            // Remember every non-staging directory before we try
-            // to read its manifest. A read failure below `continue`s,
-            // and the orphan-live-row sweep uses this set to avoid
-            // tombstoning a live row whose dir is temporarily
-            // unreadable (broken manifest, permissions blip).
-            if !dir_name.is_empty() {
-                observed_dir_names.insert(dir_name.to_string());
-            }
             let manifest_path = path.join("manifest.toml");
             let manifest = match read_manifest_sync(&manifest_path) {
                 Ok(m) => m,
@@ -349,8 +355,12 @@ impl InstalledPluginRegistry {
                     tracing::warn!(
                         path = %manifest_path.display(),
                         %err,
-                        "skipping installed dir with bad manifest",
+                        "skipping installed dir with bad manifest — deferring orphan-live-row sweep this boot",
                     );
+                    // We can't know this dir's plugin_id, so we
+                    // can't safely tombstone any live row this
+                    // boot. Defer.
+                    defer_orphan_sweep = true;
                     continue;
                 }
             };
@@ -373,8 +383,11 @@ impl InstalledPluginRegistry {
                 tracing::warn!(
                     path = %path.display(),
                     manifest_id = %manifest_id,
-                    "skipping installed dir whose manifest plugin.id is unsafe for use as a filesystem segment",
+                    "skipping installed dir whose manifest plugin.id is unsafe for use as a filesystem segment — deferring orphan-live-row sweep this boot",
                 );
+                // Same reasoning as the bad-manifest branch: we
+                // can't reliably identify this dir, so defer.
+                defer_orphan_sweep = true;
                 continue;
             }
             if dir_name != manifest_id {
@@ -384,9 +397,12 @@ impl InstalledPluginRegistry {
                     "installed dir name disagrees with manifest plugin.id; indexing by manifest id",
                 );
             }
-            // Also protect the manifest-declared id (may differ from
-            // dir name) from the orphan-live-row sweep.
-            observed_dir_names.insert(manifest_id.clone());
+            // Record the authoritative manifest id (not the dir
+            // name — they can legitimately differ; see the warn
+            // above). The orphan-live-row sweep uses this set to
+            // decide which live SQL rows still have a matching
+            // dir on disk.
+            observed_manifest_ids.insert(manifest_id.clone());
             let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
             let installation_uuid = if let Some(uuid) = live_uuids.get(&*id_arc) {
                 Arc::clone(uuid)
@@ -436,17 +452,9 @@ impl InstalledPluginRegistry {
             );
         }
 
-        // Live SQL rows whose plugin_id has NO matching directory
-        // on disk (via `observed_dir_names`) — auto-tombstone.
-        //
-        // Fixup review F2: the check consults `observed_dir_names`,
-        // not `entries`. A directory whose manifest is temporarily
-        // unreadable is present on disk (so its plugin_id is in
-        // `observed_dir_names` via the dir-name observation) but
-        // absent from `entries` (we skipped indexing). Consulting
-        // `entries` alone would tombstone its still-valid live SQL
-        // row — turning a fixable manifest-read blip into
-        // permanent identity rotation on the next scan.
+        // Live SQL rows whose plugin_id has NO successfully-parsed
+        // manifest on disk (via `observed_manifest_ids`) —
+        // auto-tombstone.
         //
         // The auto-tombstone shape covers:
         // - Install crashed after INSERT but before rename → row
@@ -462,20 +470,34 @@ impl InstalledPluginRegistry {
         // disk. Identity does not rotate for anything that survived
         // (there is no FS entry, so nothing was actively minting
         // device ids against this row).
-        for (plugin_id, uuid) in &live_uuids {
-            if !observed_dir_names.contains(plugin_id.as_str()) {
-                match tombstone_installation_row(&db, uuid) {
-                    Ok(()) => tracing::warn!(
-                        plugin_id = %plugin_id,
-                        installation_uuid = %uuid,
-                        "auto-tombstoned live plugin_installation row whose plugin dir is missing (crashed install or interrupted uninstall)",
-                    ),
-                    Err(err) => tracing::error!(
-                        plugin_id = %plugin_id,
-                        installation_uuid = %uuid,
-                        %err,
-                        "failed to auto-tombstone orphan live plugin_installation row",
-                    ),
+        //
+        // Fixup2 review F2: if any directory had an unreadable /
+        // unsafe manifest, we don't know its `plugin_id`, so the
+        // sweep can't safely decide. Defer for one boot — the
+        // operator repairs the manifest, next boot reconciles
+        // cleanly. This preserves identity across transient
+        // manifest blips at the cost of leaving genuine orphans in
+        // place for one extra boot.
+        if defer_orphan_sweep {
+            tracing::warn!(
+                "orphan-live-row sweep deferred this boot due to unresolvable directories (see prior warnings)",
+            );
+        } else {
+            for (plugin_id, uuid) in &live_uuids {
+                if !observed_manifest_ids.contains(plugin_id.as_str()) {
+                    match tombstone_installation_row(&db, uuid) {
+                        Ok(()) => tracing::warn!(
+                            plugin_id = %plugin_id,
+                            installation_uuid = %uuid,
+                            "auto-tombstoned live plugin_installation row whose plugin dir is missing (crashed install or interrupted uninstall)",
+                        ),
+                        Err(err) => tracing::error!(
+                            plugin_id = %plugin_id,
+                            installation_uuid = %uuid,
+                            %err,
+                            "failed to auto-tombstone orphan live plugin_installation row",
+                        ),
+                    }
                 }
             }
         }
@@ -1373,6 +1395,119 @@ wasm = "plugin.wasm"
         assert!(
             uninstalled_ms.is_none(),
             "unreadable manifest must not tombstone the live SQL row",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b fixup2 review F1 (P2): a dir named `example.foo` whose
+    /// manifest declares a different `example.bar` must tombstone
+    /// the live SQL row for `example.foo` (nothing on disk actually
+    /// represents that `plugin_id` anymore) and index / backfill
+    /// `example.bar`. The pre-fix code protected both ids because
+    /// it observed the dir name too.
+    #[test]
+    fn scan_tombstones_live_row_when_manifest_renames_plugin_id() {
+        let root = tempdir("aliased-rename");
+        let plugins_root = root.join("plugins");
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+        let source = write_plugin_dir(&root, "example.foo");
+        let old = reg.install(&source).expect("install foo");
+        let foo_uuid = Arc::clone(&old.installation_uuid);
+        drop(reg);
+
+        // Operator (or corrupt update) rewrites the manifest to
+        // declare `example.bar` while the dir is still named
+        // `example.foo`. `scan` explicitly accepts this and
+        // indexes by the manifest id, so nothing on disk still
+        // represents `example.foo`.
+        std::fs::write(
+            plugins_root.join("example.foo/manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.bar"
+name = "Renamed"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+        )
+        .unwrap();
+
+        let reg2 = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
+        let listed = reg2.list();
+        assert_eq!(listed.len(), 1, "one indexed entry (example.bar)");
+        assert_eq!(&*listed[0].plugin_id, "example.bar");
+
+        // Old `example.foo` row must be tombstoned.
+        let foo_uninstalled: Option<i64> = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT uninstalled_ms FROM plugin_installation
+                     WHERE installation_uuid = ?1",
+                    [&*foo_uuid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(
+            foo_uninstalled.is_some(),
+            "orphaned live row for example.foo must be tombstoned after manifest rename",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b fixup2 review F2 (P2): if any dir on disk has an
+    /// unresolvable manifest (unreadable / unsafe id), the orphan
+    /// sweep must be deferred entirely so a live row for a
+    /// DIFFERENT `plugin_id` — which happens to have no matching
+    /// dir on disk — is NOT tombstoned this boot. The unresolvable
+    /// dir might BE that `plugin_id`; we can't tell.
+    #[test]
+    fn scan_defers_orphan_sweep_when_any_dir_is_unresolvable() {
+        let root = tempdir("defer-sweep");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+        let db = fresh_db();
+
+        // Hand-INSERT a live SQL row for an "orphan" plugin_id
+        // whose dir is absent. Under normal semantics scan would
+        // tombstone this. But we also plant an unresolvable dir
+        // to trigger the defer.
+        let ghost = InstalledPlugin {
+            plugin_id: Arc::from("example.ghost"),
+            installation_uuid: mint_installation_uuid(),
+            version: "0.1.0".to_string(),
+            path: plugins_root.join("example.ghost"),
+        };
+        insert_installation_row(&db, &ghost).unwrap();
+        let ghost_uuid = Arc::clone(&ghost.installation_uuid);
+
+        // Unresolvable dir: valid dir but broken manifest.
+        let broken = plugins_root.join("some-dir");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("manifest.toml"), "not toml [[[").unwrap();
+
+        let _reg = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
+
+        // The orphan row must NOT be tombstoned — deferred.
+        let uninstalled_ms: Option<i64> = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT uninstalled_ms FROM plugin_installation
+                     WHERE installation_uuid = ?1",
+                    [&*ghost_uuid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(
+            uninstalled_ms.is_none(),
+            "orphan sweep must be deferred when any dir is unresolvable",
         );
 
         std::fs::remove_dir_all(&root).unwrap();
