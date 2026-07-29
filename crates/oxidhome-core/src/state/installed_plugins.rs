@@ -1,29 +1,54 @@
 //! Phase 12-API-f — installed-plugin registry.
 //!
 //! Tracks plugin packages copied into `<state_dir>/plugins/<plugin_id>/`.
-//! The filesystem is the source of truth — at boot, [`Self::scan`]
-//! walks the directory and builds an in-memory index; subsequent
-//! `install` / `uninstall` calls keep the index in step.
+//! The filesystem is the source of truth for package *contents* —
+//! at boot, [`Self::scan`] walks the directory and builds an
+//! in-memory index; subsequent `install` / `uninstall` calls keep
+//! the index in step.
 //!
-//! ## Why not a `SQLite` table?
+//! ## Persistent installation identity (C1b)
 //!
-//! - A directory + `manifest.toml` per plugin **is** the
-//!   serializable on-disk shape. Adding a SQL table for the same
-//!   information just creates a sync problem (operator edits dir,
-//!   table now lies). The directory is what the supervisor reads
-//!   at start-instance time; the index here is a cache.
-//! - Install / uninstall are operator-triggered, low-frequency
-//!   events — no need for transactional storage.
+//! Architecture-review C1b: every install mints a
+//! **`installation_uuid`** that is persisted to the `SQLite`
+//! `plugin_installation` table (migration 11). This UUID feeds
+//! [`crate::state::stable_device_id`] so that uninstalling a plugin
+//! and installing a fresh copy with the same `plugin_id` mints
+//! different device ids — the new install can't inherit the old
+//! install's audit / API surface.
+//!
+//! Uninstall **tombstones** the row (sets `uninstalled_ms`) rather
+//! than deleting it: historical audit rows referencing the retired
+//! UUID stay traceable to "that particular install," and a
+//! subsequent `install` of the same `plugin_id` inserts a fresh
+//! row with a distinct UUID. A partial unique index constrains
+//! *live* rows to one-per-`plugin_id`.
+//!
+//! ## Filesystem vs. SQL — who owns what
+//!
+//! - Package **contents** (`manifest.toml`, `<runtime.wasm>`, static
+//!   assets) live on disk; the daemon copies them into
+//!   `<plugins_root>/<plugin_id>/` at install time and reads them
+//!   from there at start-instance time.
+//! - Package **identity** (the `installation_uuid`) lives in SQL.
+//!   Without SQL access (in-memory engines via `Engine::new()`) the
+//!   registry is a plain in-memory cache; install / uninstall
+//!   return [`InstallError::NoPluginsRoot`].
+//! - `scan` reconciles the two on boot: any FS entry without a live
+//!   SQL row gets a fresh UUID backfilled (pre-C1b installs; a hand
+//!   -placed dir; a crash between the FS copy and the SQL insert).
 //!
 //! ## Lifecycle ownership
 //!
-//! - **Install**: copies `source_dir` → `<plugins_root>/<plugin_id>/`,
-//!   reads the manifest to extract the canonical plugin id, refuses
-//!   if a dir for that id already exists (409 at the API layer).
-//! - **Uninstall**: removes `<plugins_root>/<plugin_id>/`
-//!   recursively. The API handler checks the instance registry for
-//!   running instances *before* calling this, so the registry method
-//!   itself is the unconditional "yank the dir" primitive.
+//! - **Install**: mints a `installation_uuid`, INSERTs the SQL row,
+//!   copies `source_dir` → `<plugins_root>/<plugin_id>/`. If the FS
+//!   copy fails the SQL row is rolled back so a retry doesn't fail
+//!   the `plugin_installation_live` unique index. Refuses if a live
+//!   row for `plugin_id` already exists (409 at the API layer).
+//! - **Uninstall**: tombstones the SQL row, then removes
+//!   `<plugins_root>/<plugin_id>/` recursively. The API handler
+//!   checks the instance registry for running instances *before*
+//!   calling this, so the registry method itself is the
+//!   unconditional "yank the dir + tombstone" primitive.
 //! - **Start / stop** are not this module's job — they go through
 //!   the existing `Engine::start_instance` + `InstanceHandle::stop`
 //!   paths. The registry only handles package presence.
@@ -33,13 +58,28 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use oxidhome_manifest::PluginManifest;
+use rand::TryRng;
+use rusqlite::OptionalExtension;
 
-/// One row in the installed-plugin index. Cheap to clone (single
-/// `Arc<str>` plus a `PathBuf`).
+use crate::state::Db;
+
+/// One row in the installed-plugin index. Cheap to clone (two
+/// `Arc<str>`s plus a `PathBuf`).
 #[derive(Debug, Clone)]
 pub struct InstalledPlugin {
-    /// Canonical plugin id from `manifest.plugin.id`.
+    /// Canonical plugin id from `manifest.plugin.id`. A reusable
+    /// name — safe to expose to plugin authors and API callers, but
+    /// **not** stable identity: uninstall + reinstall reuses it. Use
+    /// [`Self::installation_uuid`] for stable identity.
     pub plugin_id: Arc<str>,
+    /// C1b: host-minted per-install UUID (`inst-<32 hex>`).
+    /// Persisted in the `plugin_installation` SQL table; feeds
+    /// [`crate::state::stable_device_id`] so that reinstalling the
+    /// same `plugin_id` produces different device ids. For
+    /// in-memory registries (`Engine::new()` / dev loads without
+    /// install) the fallback is the `plugin_id` itself — see
+    /// [`InstalledPluginRegistry::empty`].
+    pub installation_uuid: Arc<str>,
     /// Semver from `manifest.plugin.version`. Kept as a string for
     /// the API response so the wire shape doesn't have to follow
     /// the `semver` crate's serialization.
@@ -48,6 +88,46 @@ pub struct InstalledPlugin {
     /// `manifest.toml` and whatever the manifest's `runtime.wasm`
     /// pointer resolves to.
     pub path: PathBuf,
+}
+
+/// Mint a fresh installation UUID. Format: `inst-<32 lowercase hex>`
+/// — 16 random bytes = 128 bits of entropy, matching a `UUIDv4`'s
+/// shape without pulling in the `uuid` crate. The `inst-` prefix
+/// is a readability cue in audit logs / API responses.
+fn mint_installation_uuid() -> Arc<str> {
+    let mut bytes = [0u8; 16];
+    // Match the pattern already used by `auth_token::random_token`
+    // for consistency: `SysRng::try_fill_bytes` returns a
+    // `Result<(), _>` whose `Err` variant is `Infallible` on this
+    // platform. `.expect` documents the operational contract.
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system RNG must be available");
+    let mut hex = String::with_capacity(5 + 32);
+    hex.push_str("inst-");
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Arc::from(hex.as_str())
+}
+
+/// Host wall-clock in milliseconds since the Unix epoch. Used for
+/// `plugin_installation.installed_ms` / `uninstalled_ms`. Nanos
+/// aren't needed — install / uninstall are operator-triggered, ms
+/// resolution is plenty and matches the `audit_event` shape.
+fn now_ms() -> i64 {
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        // `as i64` truncates from `u128`, but a `u128` millisecond
+        // count doesn't overflow `i64` until year ~292M — an
+        // absurd horizon for `installed_ms`.
+        Ok(d) => d.as_millis() as i64,
+        // Clock before the epoch (pathological, e.g. wildly wrong
+        // BIOS clock). Fall back to 0 so a row still lands; audit
+        // shows it as "impossibly early" but doesn't crash the install.
+        Err(_) => 0,
+    }
 }
 
 /// Validates a `plugin_id` for use as a filesystem segment.
@@ -93,6 +173,11 @@ pub enum InstallError {
     /// Recursive copy / metadata read failed.
     #[error("io error during install: {0}")]
     Io(#[from] std::io::Error),
+    /// C1b: `plugin_installation` INSERT or backfill failed.
+    /// Distinct from `Io` so the API can classify it as a host
+    /// internal error rather than an operator-fixable I/O issue.
+    #[error("persisting installation identity: {0}")]
+    Persistence(#[from] rusqlite::Error),
 }
 
 /// Why an uninstall failed.
@@ -105,28 +190,42 @@ pub enum UninstallError {
     NotInstalled(String),
     #[error("io error during uninstall: {0}")]
     Io(#[from] std::io::Error),
+    /// C1b: `plugin_installation` tombstone UPDATE failed.
+    #[error("persisting uninstall tombstone: {0}")]
+    Persistence(#[from] rusqlite::Error),
 }
 
-/// In-memory + filesystem registry of installed plugins.
+/// In-memory + filesystem + SQL registry of installed plugins.
 ///
-/// `None` for the FS root means "in-memory engine" — install /
-/// uninstall return [`InstallError::NoPluginsRoot`]. The
-/// `list()` / `get()` reads always succeed; in-memory engines just
-/// stay empty.
+/// - `plugins_root: None` → "in-memory engine": install / uninstall
+///   return [`InstallError::NoPluginsRoot`]. The `list()` / `get()`
+///   reads always succeed; in-memory engines just stay empty.
+/// - `db: None` → no persistent installation UUIDs. The `plugin_id`
+///   is used as the synthetic UUID (see [`Self::empty`]); reinstall
+///   aliases into the previous identity. Only used by `Engine::new()`
+///   and pure-in-memory test loads.
+/// - Both `Some` → C1b persistent identity. Each install mints a
+///   UUID stored in the `plugin_installation` SQL table; uninstall
+///   tombstones the row; reinstall mints a fresh UUID.
 #[derive(Debug)]
 pub struct InstalledPluginRegistry {
     plugins_root: Option<PathBuf>,
+    db: Option<Arc<Db>>,
     entries: RwLock<HashMap<Arc<str>, InstalledPlugin>>,
 }
 
 impl InstalledPluginRegistry {
-    /// Empty registry without a filesystem backing. Used by
+    /// Empty registry without a filesystem or SQL backing. Used by
     /// `Engine::new()` for unit tests that don't need install
-    /// support.
+    /// support. No `installation_uuid` persistence — the fallback
+    /// UUID at device-registration time is `manifest.plugin.id`
+    /// itself (see the loader path in
+    /// [`crate::PluginInstance::instantiate`]).
     #[must_use]
     pub fn empty() -> Self {
         Self {
             plugins_root: None,
+            db: None,
             entries: RwLock::new(HashMap::new()),
         }
     }
@@ -141,12 +240,26 @@ impl InstalledPluginRegistry {
         self.entries.write().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Build by scanning `plugins_root` for installed packages.
-    /// Creates the directory if it doesn't exist yet (first-run
-    /// state dir). Each immediate subdirectory containing a
-    /// readable `manifest.toml` becomes a row.
+    /// Build by scanning `plugins_root` for installed packages and
+    /// reconciling against the `plugin_installation` SQL table for
+    /// installation UUIDs (C1b). Creates the directory if it doesn't
+    /// exist yet (first-run state dir). Each immediate subdirectory
+    /// containing a readable `manifest.toml` becomes a row.
     ///
-    /// Malformed entries (non-dir, manifest missing or invalid)
+    /// Reconciliation rules:
+    /// - FS entry with a **live** SQL row (`uninstalled_ms IS NULL`)
+    ///   → reuse the stored `installation_uuid` (identity survives
+    ///   process restart).
+    /// - FS entry with no live SQL row → mint a fresh UUID + INSERT
+    ///   (backfill for pre-C1b installs or a crash between the FS
+    ///   copy and the SQL insert).
+    /// - Live SQL row with no FS entry → the row is stranded; log
+    ///   and leave it — a subsequent `install` for that
+    ///   `plugin_id` will refuse (unique index), matching operator
+    ///   expectations. Operator can manually tombstone via
+    ///   maintenance tooling if the FS was wiped externally.
+    ///
+    /// Malformed FS entries (non-dir, manifest missing or invalid)
     /// are skipped with a `tracing::warn` so a corrupt install
     /// doesn't block daemon boot.
     ///
@@ -154,9 +267,15 @@ impl InstalledPluginRegistry {
     ///
     /// - Failure to create `plugins_root` if missing.
     /// - Failure to enumerate the directory.
-    pub fn scan(plugins_root: PathBuf) -> std::io::Result<Self> {
+    /// - Failure to load or backfill the `plugin_installation` table.
+    pub fn scan(plugins_root: PathBuf, db: Arc<Db>) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&plugins_root)?;
+        // Pull live installation rows keyed by plugin_id so the scan
+        // loop can look up (and mint-if-missing) in one pass.
+        let live_uuids = load_live_installation_uuids(&db)?;
+
         let mut entries: HashMap<Arc<str>, InstalledPlugin> = HashMap::new();
+        let mut backfills: Vec<InstalledPlugin> = Vec::new();
         for child in std::fs::read_dir(&plugins_root)? {
             let child = match child {
                 Ok(c) => c,
@@ -216,17 +335,66 @@ impl InstalledPluginRegistry {
                 );
             }
             let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
+            let installation_uuid = if let Some(uuid) = live_uuids.get(&*id_arc) {
+                Arc::clone(uuid)
+            } else {
+                // FS entry with no live SQL row — mint one.
+                // Recorded in `backfills` for post-scan INSERT
+                // so the in-memory map and the DB agree even
+                // if the INSERT itself races with a concurrent
+                // reader (which doesn't happen — scan runs at
+                // Engine construction only, before any handler
+                // has an `Arc<Engine>` reference).
+                let uuid = mint_installation_uuid();
+                backfills.push(InstalledPlugin {
+                    plugin_id: Arc::clone(&id_arc),
+                    installation_uuid: Arc::clone(&uuid),
+                    version: manifest.plugin.version.to_string(),
+                    path: path.clone(),
+                });
+                uuid
+            };
             entries.insert(
                 Arc::clone(&id_arc),
                 InstalledPlugin {
                     plugin_id: id_arc,
+                    installation_uuid,
                     version: manifest.plugin.version.to_string(),
                     path,
                 },
             );
         }
+
+        // Warn about live SQL rows without an FS entry — an
+        // operational alarm-bell shape. Doesn't block boot.
+        for (plugin_id, uuid) in &live_uuids {
+            if !entries.contains_key(plugin_id.as_str()) {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    installation_uuid = %uuid,
+                    "plugin_installation row is live but its plugin dir is missing; \
+                     leaving the row in place (operator should tombstone via \
+                     maintenance tooling if the FS state is authoritative)",
+                );
+            }
+        }
+
+        // Persist backfilled UUIDs so the identity survives the
+        // next restart. If any fail we return the error — a
+        // half-persisted registry would be worse than refusing to
+        // boot and letting the operator investigate.
+        for row in &backfills {
+            insert_installation_row(&db, row)?;
+            tracing::info!(
+                plugin_id = %row.plugin_id,
+                installation_uuid = %row.installation_uuid,
+                "backfilled installation UUID for pre-existing plugin dir",
+            );
+        }
+
         Ok(Self {
             plugins_root: Some(plugins_root),
+            db: Some(db),
             entries: RwLock::new(entries),
         })
     }
@@ -333,14 +501,29 @@ impl InstalledPluginRegistry {
         std::fs::rename(&staging, &dest)?;
 
         let id_arc: Arc<str> = Arc::from(plugin_id.as_str());
+        // C1b: mint a fresh installation UUID and persist before
+        // returning. If the INSERT fails (unique index — another
+        // live row exists for this plugin_id, which should have
+        // been caught by the `dest.exists()` check above, or a
+        // real DB error), roll back the FS copy so a retry doesn't
+        // hit "already installed" on disk while the SQL side is
+        // clean.
         let row = InstalledPlugin {
             plugin_id: Arc::clone(&id_arc),
+            installation_uuid: mint_installation_uuid(),
             version: manifest.plugin.version.to_string(),
             path: dest,
         };
+        if let Some(db) = &self.db
+            && let Err(err) = insert_installation_row(db, &row)
+        {
+            let _ = std::fs::remove_dir_all(&row.path);
+            return Err(InstallError::Persistence(err));
+        }
         self.write_entries().insert(id_arc, row.clone());
         tracing::info!(
             plugin_id = %row.plugin_id,
+            installation_uuid = %row.installation_uuid,
             version = %row.version,
             path = %row.path.display(),
             "plugin installed",
@@ -393,6 +576,19 @@ impl InstalledPluginRegistry {
             // on it. Operator must clean up manually.
             return Err(UninstallError::NotInstalled(plugin_id.to_string()));
         }
+        // C1b: tombstone the SQL row before yanking the FS. If
+        // `remove_dir_all` fails after this, the row is already
+        // tombstoned — the next `install` will insert a fresh
+        // row with a new UUID (the leaked FS dir is a maintenance
+        // problem, not an identity problem). If the tombstone
+        // itself fails, refuse the uninstall — the operator
+        // needs the SQL row gone (identity-wise) before the FS
+        // dir disappears, otherwise a subsequent install would
+        // hit the live-row unique index and 409.
+        let installation_uuid = Arc::clone(&entry.installation_uuid);
+        if let Some(db) = &self.db {
+            tombstone_installation_row(db, &installation_uuid)?;
+        }
         if dest.exists() {
             std::fs::remove_dir_all(&dest)?;
         }
@@ -404,6 +600,91 @@ impl InstalledPluginRegistry {
         );
         Ok(())
     }
+}
+
+// ── SQL helpers (C1b) ───────────────────────────────────────────────
+
+/// Load every live `plugin_installation` row (i.e. `uninstalled_ms IS
+/// NULL`), returning a `plugin_id → installation_uuid` map. Used by
+/// [`InstalledPluginRegistry::scan`] to reconcile FS entries against
+/// stored identity.
+fn load_live_installation_uuids(db: &Db) -> Result<HashMap<String, Arc<str>>, rusqlite::Error> {
+    db.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT plugin_id, installation_uuid
+             FROM plugin_installation
+             WHERE uninstalled_ms IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let plugin_id: String = row.get(0)?;
+            let uuid: String = row.get(1)?;
+            Ok((plugin_id, Arc::<str>::from(uuid)))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (plugin_id, uuid) = row?;
+            out.insert(plugin_id, uuid);
+        }
+        Ok(out)
+    })
+}
+
+/// INSERT a fresh installation row. Fails with a unique-constraint
+/// error if a live row already exists for `row.plugin_id` — callers
+/// (both `install` and the scan backfill) must have ruled out that
+/// case beforehand.
+fn insert_installation_row(db: &Db, row: &InstalledPlugin) -> Result<(), rusqlite::Error> {
+    db.write(|conn| {
+        conn.execute(
+            "INSERT INTO plugin_installation
+                 (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            rusqlite::params![
+                &*row.installation_uuid,
+                &*row.plugin_id,
+                &row.version,
+                now_ms(),
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// Mark an installation row as uninstalled. Idempotent — a
+/// subsequent tombstone of the same UUID is a no-op (0 rows
+/// affected). The row remains for historical trace-back.
+fn tombstone_installation_row(db: &Db, installation_uuid: &str) -> Result<(), rusqlite::Error> {
+    db.write(|conn| {
+        conn.execute(
+            "UPDATE plugin_installation
+                SET uninstalled_ms = ?2
+              WHERE installation_uuid = ?1
+                AND uninstalled_ms IS NULL",
+            rusqlite::params![installation_uuid, now_ms()],
+        )?;
+        Ok(())
+    })
+}
+
+/// Look up the current live installation UUID for a given
+/// `plugin_id`, or `None` if no live row exists. Used by the
+/// runtime start path so a freshly-installed plugin picks up its
+/// UUID without a scan round-trip.
+#[allow(dead_code)] // reserved for future direct-lookup callsites
+fn load_live_installation_uuid_for(
+    db: &Db,
+    plugin_id: &str,
+) -> Result<Option<Arc<str>>, rusqlite::Error> {
+    db.read(|conn| {
+        conn.query_row(
+            "SELECT installation_uuid
+             FROM plugin_installation
+             WHERE plugin_id = ?1 AND uninstalled_ms IS NULL",
+            [plugin_id],
+            |row| row.get::<_, String>(0).map(Arc::<str>::from),
+        )
+        .optional()
+    })
 }
 
 /// Sync `manifest.toml` reader. The async variant in
@@ -474,6 +755,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn fresh_db() -> Arc<Db> {
+        Arc::new(Db::open_in_memory().expect("in-memory db"))
+    }
+
     fn tempdir(name: &str) -> PathBuf {
         let pid = u64::from(std::process::id());
         let nanos = u64::from(
@@ -524,7 +809,7 @@ wasm = "plugin.wasm"
     fn scan_then_install_then_uninstall_roundtrip() {
         let root = tempdir("rt");
         let plugins_root = root.join("plugins");
-        let reg = InstalledPluginRegistry::scan(plugins_root.clone()).unwrap();
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).unwrap();
         assert!(reg.list().is_empty());
 
         let source = write_plugin_dir(&root, "example.demo");
@@ -559,7 +844,7 @@ wasm = "plugin.wasm"
     fn install_rejects_source_without_manifest() {
         let root = tempdir("nomanifest");
         let plugins_root = root.join("plugins");
-        let reg = InstalledPluginRegistry::scan(plugins_root).unwrap();
+        let reg = InstalledPluginRegistry::scan(plugins_root, fresh_db()).unwrap();
 
         let bad = root.join("source-bad");
         std::fs::create_dir_all(&bad).unwrap();
@@ -574,7 +859,7 @@ wasm = "plugin.wasm"
     fn install_rejects_malformed_manifest() {
         let root = tempdir("badmanifest");
         let plugins_root = root.join("plugins");
-        let reg = InstalledPluginRegistry::scan(plugins_root).unwrap();
+        let reg = InstalledPluginRegistry::scan(plugins_root, fresh_db()).unwrap();
 
         let bad = root.join("source-bad");
         std::fs::create_dir_all(&bad).unwrap();
@@ -597,7 +882,7 @@ wasm = "plugin.wasm"
         use std::os::unix::fs::symlink;
         let root = tempdir("symlink");
         let plugins_root = root.join("plugins");
-        let reg = InstalledPluginRegistry::scan(plugins_root).unwrap();
+        let reg = InstalledPluginRegistry::scan(plugins_root, fresh_db()).unwrap();
 
         let source = write_plugin_dir(&root, "example.with-symlink");
         // Replace `plugin.wasm` with a symlink pointing to a real
@@ -648,7 +933,7 @@ wasm = "x.wasm"
         )
         .unwrap();
 
-        let reg = InstalledPluginRegistry::scan(plugins_root).unwrap();
+        let reg = InstalledPluginRegistry::scan(plugins_root, fresh_db()).unwrap();
         assert!(
             reg.list().is_empty(),
             "scan must skip unsafe ids, got {:?}",
@@ -662,18 +947,142 @@ wasm = "x.wasm"
     fn scan_repopulates_index_from_existing_install() {
         let root = tempdir("rescan");
         let plugins_root = root.join("plugins");
-        let reg = InstalledPluginRegistry::scan(plugins_root.clone()).unwrap();
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
         let source = write_plugin_dir(&root, "example.persist");
-        reg.install(&source).expect("install");
+        let installed = reg.install(&source).expect("install");
+        let first_uuid = Arc::clone(&installed.installation_uuid);
         drop(reg);
 
-        // Fresh scan against the same FS — the install must
+        // Fresh scan against the same FS + DB — the install must
         // re-surface (boot of a daemon against an existing state
-        // dir).
-        let reg2 = InstalledPluginRegistry::scan(plugins_root).unwrap();
+        // dir) and the UUID must survive (C1b identity persistence).
+        let reg2 = InstalledPluginRegistry::scan(plugins_root, db).unwrap();
         let listed = reg2.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(&*listed[0].plugin_id, "example.persist");
+        assert_eq!(
+            &*listed[0].installation_uuid, &*first_uuid,
+            "installation UUID must survive a scan+restart",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b: uninstall + reinstall of the same `plugin_id` must
+    /// yield a **different** installation UUID. Ensures the
+    /// reviewer's identity-reuse concern from PR #84 is closed —
+    /// the new install can't inherit the old install's audit /
+    /// API surface even though `plugin_id` is unchanged.
+    #[test]
+    fn reinstall_after_uninstall_mints_fresh_installation_uuid() {
+        let root = tempdir("reinstall-uuid");
+        let plugins_root = root.join("plugins");
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root, db).unwrap();
+
+        let source = write_plugin_dir(&root, "example.rotate");
+        let first = reg.install(&source).expect("first install");
+        let first_uuid = Arc::clone(&first.installation_uuid);
+        assert!(first_uuid.starts_with("inst-"));
+
+        reg.uninstall("example.rotate").expect("uninstall");
+        let second = reg.install(&source).expect("second install");
+        assert_eq!(&*second.plugin_id, "example.rotate");
+        assert_ne!(
+            &*second.installation_uuid, &*first_uuid,
+            "reinstall must mint a fresh installation UUID",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b: a live SQL row is preserved as a tombstone after
+    /// uninstall — historical audit rows keep resolving back to
+    /// the retired install. A follow-up install for the same
+    /// `plugin_id` inserts a fresh row.
+    #[test]
+    fn uninstall_tombstones_row_and_reinstall_inserts_fresh() {
+        let root = tempdir("tombstone");
+        let plugins_root = root.join("plugins");
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
+
+        let source = write_plugin_dir(&root, "example.tomb");
+        let first = reg.install(&source).expect("first install");
+        reg.uninstall("example.tomb").expect("uninstall");
+        let second = reg.install(&source).expect("second install");
+
+        // The DB has two rows for this plugin_id: one tombstoned
+        // (first UUID), one live (second UUID).
+        let rows: Vec<(String, Option<i64>)> = db
+            .read(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT installation_uuid, uninstalled_ms
+                     FROM plugin_installation
+                     WHERE plugin_id = ?1
+                     ORDER BY installed_ms",
+                )?;
+                let rows = stmt.query_map(["example.tomb"], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2, "expected tombstone + live row");
+        assert_eq!(rows[0].0, *first.installation_uuid);
+        assert!(rows[0].1.is_some(), "first row must be tombstoned");
+        assert_eq!(rows[1].0, *second.installation_uuid);
+        assert!(rows[1].1.is_none(), "second row must be live");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b: a pre-existing plugin dir with no SQL row (upgrade
+    /// from pre-C1b, or a hand-placed dir) gets a fresh UUID
+    /// backfilled on scan and persists across restart.
+    #[test]
+    fn scan_backfills_installation_uuid_for_pre_c1b_dirs() {
+        let root = tempdir("backfill");
+        let plugins_root = root.join("plugins");
+        // Hand-place a plugin dir directly under plugins_root
+        // (skipping install), simulating an upgrade from before
+        // the plugin_installation table existed.
+        let plugin_dir = plugins_root.join("example.legacy");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.legacy"
+name = "Legacy"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        let backfilled_uuid = Arc::clone(&listed[0].installation_uuid);
+        assert!(backfilled_uuid.starts_with("inst-"));
+
+        // A follow-up scan against the same DB reuses the UUID —
+        // the backfill is one-time, not a source of drift on every
+        // boot.
+        drop(reg);
+        let reg2 = InstalledPluginRegistry::scan(plugins_root, db).unwrap();
+        assert_eq!(
+            &*reg2.list()[0].installation_uuid,
+            &*backfilled_uuid,
+            "backfilled UUID must persist across scans",
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }

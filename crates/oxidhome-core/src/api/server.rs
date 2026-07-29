@@ -861,6 +861,11 @@ impl From<InstallError> for PluginLifecycleError {
             InstallError::AlreadyInstalled { plugin_id } => Self::AlreadyInstalled(plugin_id),
             InstallError::BadManifest { reason, .. } => Self::BadInstall(reason),
             InstallError::Io(err) => Self::Internal(err.into()),
+            // C1b: the `plugin_installation` INSERT failed. Surface
+            // as `Internal` — the operator sees 500 + a log entry;
+            // the FS side effect was rolled back by
+            // `InstalledPluginRegistry::install`.
+            InstallError::Persistence(err) => Self::Internal(err.into()),
         }
     }
 }
@@ -871,6 +876,10 @@ impl From<UninstallError> for PluginLifecycleError {
             UninstallError::NoPluginsRoot => Self::NoPluginsRoot,
             UninstallError::NotInstalled(_) => Self::NotFound,
             UninstallError::Io(err) => Self::Internal(err.into()),
+            // C1b: tombstone UPDATE failed. Surface as `Internal`;
+            // the FS is untouched (tombstone happens *before* the
+            // `remove_dir_all`), so the operator can retry.
+            UninstallError::Persistence(err) => Self::Internal(err.into()),
         }
     }
 }

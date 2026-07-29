@@ -62,6 +62,16 @@ pub struct PluginState {
     /// by the loader caller; Phase 6 wraps the lifecycle that mints
     /// them.
     pub instance_id: InstanceId,
+    /// C1b — host-minted, per-install UUID from
+    /// [`crate::state::InstalledPluginRegistry`]. Pinned at
+    /// [`PluginInstance::load`](crate::PluginInstance::load) time
+    /// so all device ids minted by this instance derive from the
+    /// same installation identity (see [`crate::state::stable_device_id`]).
+    /// For in-memory loads that don't go through the installed-plugin
+    /// registry (test harness, `Engine::new()`), the fallback is
+    /// `manifest.plugin.id` itself — cheap synthetic UUID; identity
+    /// still stable per-run but doesn't survive a fresh process.
+    pub installation_uuid: Arc<str>,
     /// Resource handles owned by this store. Required by Wasmtime's
     /// component model; populated when Phase 5 introduces blob/model
     /// resource handling.
@@ -140,6 +150,7 @@ impl PluginState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         instance_id: impl Into<InstanceId>,
+        installation_uuid: impl Into<Arc<str>>,
         manifest: Arc<PluginManifest>,
         actor: Actor,
         config: InstanceConfig,
@@ -155,6 +166,7 @@ impl PluginState {
         wasi.inherit_stdio();
         Self {
             instance_id: instance_id.into(),
+            installation_uuid: installation_uuid.into(),
             table: ResourceTable::new(),
             wasi: wasi.build(),
             devices,
@@ -297,9 +309,12 @@ impl host_devices::Host for PluginState {
             return Err(err);
         }
 
+        // C1b: derive device_id from `installation_uuid` (host-minted
+        // per-install) rather than `manifest.plugin.id` (reusable
+        // name). Uninstall + reinstall produces different device ids.
         let id = self
             .devices
-            .register(&self.manifest.plugin.id, self.instance_id.clone(), info);
+            .register(&self.installation_uuid, self.instance_id.clone(), info);
         tracing::debug!(
             instance_id = %self.instance_id,
             device_id = %id,
@@ -1132,6 +1147,13 @@ mod tests {
         let manifest = fixture_manifest("test.fixture");
         PluginState::new(
             instance_id,
+            // Synthetic installation_uuid — tests that don't go
+            // through InstalledPluginRegistry use the fixture
+            // plugin_id itself. C1b only changes the *derivation*
+            // input; the test assertions ("dev-*", cross-instance
+            // ownership isolation) don't care about the specific
+            // hex output.
+            "test.fixture",
             manifest,
             Actor::plugin(instance_id),
             InstanceConfig::new(),
@@ -1157,6 +1179,7 @@ mod tests {
         };
         PluginState::new(
             instance_id,
+            "test.fixture",
             Arc::new(manifest),
             Actor::plugin(instance_id),
             InstanceConfig::new(),
@@ -1177,6 +1200,7 @@ mod tests {
     ) -> PluginState {
         PluginState::new(
             instance_id,
+            "test.fixture",
             fixture_manifest("test.fixture"),
             Actor::plugin(instance_id),
             InstanceConfig::new(),
@@ -1502,6 +1526,7 @@ mod tests {
         };
         let mut state = PluginState::new(
             "alpha",
+            "no.subscribe",
             Arc::new(manifest),
             Actor::plugin("alpha"),
             InstanceConfig::new(),
@@ -1542,6 +1567,7 @@ mod tests {
         };
         let mut state = PluginState::new(
             "alpha",
+            "no.subscribe",
             Arc::new(manifest),
             Actor::plugin("alpha"),
             InstanceConfig::new(),
@@ -1655,6 +1681,7 @@ mod tests {
         let events = Arc::new(EventBus::new());
         let mut state = PluginState::new(
             "beta",
+            "no.subscribe",
             Arc::new(manifest),
             Actor::plugin("beta"),
             InstanceConfig::new(),
@@ -1819,6 +1846,7 @@ mod tests {
         };
         let mut state = PluginState::new(
             "alpha",
+            "test.switch-only",
             Arc::new(manifest),
             Actor::plugin("alpha"),
             InstanceConfig::new(),
@@ -1864,6 +1892,7 @@ mod tests {
         };
         let mut state = PluginState::new(
             "alpha",
+            "test.window-shade",
             Arc::new(manifest),
             Actor::plugin("alpha"),
             InstanceConfig::new(),
@@ -1947,6 +1976,7 @@ mod tests {
         };
         let mut state = PluginState::new(
             "alpha",
+            "test.switch-only",
             Arc::new(manifest),
             Actor::plugin("alpha"),
             InstanceConfig::new(),

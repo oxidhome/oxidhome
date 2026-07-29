@@ -108,13 +108,27 @@ impl Engine {
     pub fn with_state_dir(state_dir: &Path) -> anyhow::Result<Self> {
         let blobs_root = state_dir.join("blobs");
         let plugins_root = state_dir.join("plugins");
-        let installed = InstalledPluginRegistry::scan(plugins_root)
+        // C1b: the installed-plugin registry needs `Db` access to
+        // load / mint installation UUIDs, so we open the database
+        // first and then hand a shared `Arc<Db>` to both the
+        // registry (for the plugin_installation table) and
+        // `with_db` (for every other sub-store).
+        let db = Arc::new(Db::open_file(state_dir)?);
+        let installed = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db))
             .with_context(|| format!("scanning installed plugins under {}", state_dir.display()))?;
-        Self::with_db(Db::open_file(state_dir)?, Some(blobs_root), installed)
+        Self::with_db_arc(db, Some(blobs_root), installed)
     }
 
     fn with_db(
         db: Db,
+        blobs_root: Option<PathBuf>,
+        installed_plugins: InstalledPluginRegistry,
+    ) -> anyhow::Result<Self> {
+        Self::with_db_arc(Arc::new(db), blobs_root, installed_plugins)
+    }
+
+    fn with_db_arc(
+        db: Arc<Db>,
         blobs_root: Option<PathBuf>,
         installed_plugins: InstalledPluginRegistry,
     ) -> anyhow::Result<Self> {
@@ -137,7 +151,6 @@ impl Engine {
                 .context("constructing wasmtime engine")?,
         );
         watchdog::EpochTicker::spawn(&inner);
-        let db = Arc::new(db);
         Ok(Self {
             inner,
             devices: Arc::new(DeviceRegistry::new()),

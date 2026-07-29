@@ -683,6 +683,10 @@ fn install_error_to_connect(err: InstallError) -> ConnectError {
             tracing::error!(target: "api.plugins", error = %err, "install io error");
             ConnectError::internal("install io error")
         }
+        InstallError::Persistence(err) => {
+            tracing::error!(target: "api.plugins", error = %err, "install persistence error");
+            ConnectError::internal("install persistence error")
+        }
     }
 }
 
@@ -697,6 +701,10 @@ fn uninstall_error_to_connect(err: UninstallError) -> ConnectError {
         UninstallError::Io(err) => {
             tracing::error!(target: "api.plugins", error = %err, "uninstall io error");
             ConnectError::internal("uninstall io error")
+        }
+        UninstallError::Persistence(err) => {
+            tracing::error!(target: "api.plugins", error = %err, "uninstall persistence error");
+            ConnectError::internal("uninstall persistence error")
         }
     }
 }

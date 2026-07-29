@@ -455,6 +455,47 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE audit_event ADD COLUMN execution_outcome TEXT;
     ALTER TABLE audit_event ADD COLUMN domain_error TEXT;
     ",
+    // Migration 11 — architecture-review C1b: persistent
+    // installation identity.
+    //
+    // C1 gave devices deterministic ids derived from
+    // `(plugin_id, instance_id, local_id)` so restarts stopped
+    // renumbering them. The reviewer flagged that a reusable
+    // `plugin_id` string means uninstall + reinstall (or a
+    // replacement plugin sharing the id) inherits every audit /
+    // API / history reference from the previous installation.
+    // C1b closes that hole by minting a fresh **installation
+    // UUID** on every install and threading it through the
+    // device-id derivation instead of the raw `plugin_id`.
+    //
+    // Row shape:
+    // - `installation_uuid`: 32 random hex chars, prefix
+    //   `inst-`. Minted on install; opaque to plugin authors.
+    //   Feeds `stable_device_id` so a fresh install of the same
+    //   `plugin_id` produces different device ids.
+    // - `plugin_id`: the manifest id — human-facing name. Not
+    //   unique across the table (multiple installs over time
+    //   share the id but not the uuid). Uniqueness is enforced
+    //   only for **live** rows via the partial index below, so
+    //   `install` refuses "already installed" while `uninstall`
+    //   sets `uninstalled_ms` (tombstone) and a subsequent
+    //   `install` inserts a fresh row.
+    // - `version`: manifest version at install time.
+    // - `installed_ms` / `uninstalled_ms`: host wall-clock at
+    //   the transition. `uninstalled_ms IS NULL` means the row
+    //   is live; not-null is a tombstone.
+    "
+    CREATE TABLE plugin_installation (
+      installation_uuid TEXT PRIMARY KEY,
+      plugin_id         TEXT NOT NULL,
+      version           TEXT NOT NULL,
+      installed_ms      INTEGER NOT NULL,
+      uninstalled_ms    INTEGER
+    ) STRICT;
+    CREATE UNIQUE INDEX plugin_installation_live
+      ON plugin_installation(plugin_id)
+      WHERE uninstalled_ms IS NULL;
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

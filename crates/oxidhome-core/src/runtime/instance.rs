@@ -341,8 +341,23 @@ impl PluginInstance {
                 )
             })?;
 
+        // C1b: pin the installation UUID at load time. If the plugin
+        // was installed through the API (`InstalledPluginRegistry`),
+        // this is the host-minted `inst-<hex>` from the SQL row; if
+        // it was loaded directly from a wasm path (test harness /
+        // dev workflow that didn't `install`), fall back to the
+        // manifest `plugin.id` — a synthetic UUID that keeps the
+        // in-process device ids stable for the run without depending
+        // on a persistence layer.
+        let installation_uuid: Arc<str> = match engine.installed_plugins().get(&manifest.plugin.id)
+        {
+            Some(row) => row.installation_uuid,
+            None => Arc::from(manifest.plugin.id.as_str()),
+        };
+
         let state = PluginState::new(
             instance_id,
+            installation_uuid,
             manifest,
             actor,
             config,
