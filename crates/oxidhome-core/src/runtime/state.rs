@@ -297,7 +297,9 @@ impl host_devices::Host for PluginState {
             return Err(err);
         }
 
-        let id = self.devices.register(self.instance_id.clone(), info);
+        let id = self
+            .devices
+            .register(&self.manifest.plugin.id, self.instance_id.clone(), info);
         tracing::debug!(
             instance_id = %self.instance_id,
             device_id = %id,
