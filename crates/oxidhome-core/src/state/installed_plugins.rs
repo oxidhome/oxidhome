@@ -17,11 +17,17 @@
 //! install's audit / API surface.
 //!
 //! Uninstall **tombstones** the row (sets `uninstalled_ms`) rather
-//! than deleting it: historical audit rows referencing the retired
-//! UUID stay traceable to "that particular install," and a
-//! subsequent `install` of the same `plugin_id` inserts a fresh
-//! row with a distinct UUID. A partial unique index constrains
-//! *live* rows to one-per-`plugin_id`.
+//! than deleting it, so an operator can audit *when* identity
+//! rotated for a given `plugin_id` (query
+//! `SELECT * FROM plugin_installation WHERE plugin_id = ?`). Note
+//! that the table stores only `(installation_uuid, plugin_id,
+//! version, timestamps)` — it does **not** persist a mapping from
+//! `device_id`s back to their originating installation, so an audit
+//! row written against a retired install's device id can't be
+//! resolved back through this table alone. Adding a `plugin_device`
+//! mapping is a C1c follow-up if the back-reference becomes
+//! load-bearing. A partial unique index constrains *live* rows to
+//! one-per-`plugin_id`.
 //!
 //! ## Filesystem vs. SQL — who owns what
 //!
@@ -268,11 +274,26 @@ impl InstalledPluginRegistry {
     /// - Failure to create `plugins_root` if missing.
     /// - Failure to enumerate the directory.
     /// - Failure to load or backfill the `plugin_installation` table.
+    // C1b: `scan` is intentionally long — its job is the
+    // exhaustive reconciliation between FS state and SQL state
+    // (live rows, tombstoned-only rows, staging leftovers, orphan
+    // live rows). Splitting it into helpers would fragment the
+    // one place readers look to understand boot-time reconciliation.
+    #[allow(clippy::too_many_lines)]
     pub fn scan(plugins_root: PathBuf, db: Arc<Db>) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&plugins_root)?;
         // Pull live installation rows keyed by plugin_id so the scan
         // loop can look up (and mint-if-missing) in one pass.
         let live_uuids = load_live_installation_uuids(&db)?;
+        // Also pull the set of plugin_ids whose *most recent* rows
+        // are tombstoned (i.e. no live row exists). An FS entry with
+        // no live row **but** a tombstone in that set means the
+        // previous uninstall was interrupted between the FS-remove
+        // step and the SQL tombstone — see the uninstall body's F2
+        // fix. Silently backfilling a fresh UUID there would rotate
+        // identity for a plugin the operator saw as "in-flight,"
+        // so instead we retry `remove_dir_all` and skip indexing.
+        let tombstoned_plugin_ids = load_tombstoned_plugin_ids(&db)?;
 
         let mut entries: HashMap<Arc<str>, InstalledPlugin> = HashMap::new();
         let mut backfills: Vec<InstalledPlugin> = Vec::new();
@@ -289,6 +310,30 @@ impl InstalledPluginRegistry {
                 continue;
             };
             if !file_type.is_dir() {
+                continue;
+            }
+            // C1b review F2 (other reviewer): a crash between the
+            // FS copy and the atomic rename leaves `.staging-<id>/`
+            // populated. Its `manifest.toml` is valid, so the
+            // pre-fix scan would treat it as an installed package —
+            // silently activating an install the operator saw as
+            // failed. Staging directories are, by construction,
+            // transient: delete them on scan. The paired SQL row
+            // (if any) is cleaned up in the orphan-live-row sweep
+            // below.
+            let dir_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if dir_name.starts_with(".staging-") {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => tracing::info!(
+                        path = %path.display(),
+                        "removed leftover install staging directory on scan",
+                    ),
+                    Err(err) => tracing::error!(
+                        path = %path.display(),
+                        %err,
+                        "failed to remove leftover install staging directory",
+                    ),
+                }
                 continue;
             }
             let manifest_path = path.join("manifest.toml");
@@ -326,7 +371,6 @@ impl InstalledPluginRegistry {
                 );
                 continue;
             }
-            let dir_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if dir_name != manifest_id {
                 tracing::warn!(
                     dir = %dir_name,
@@ -337,6 +381,31 @@ impl InstalledPluginRegistry {
             let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
             let installation_uuid = if let Some(uuid) = live_uuids.get(&*id_arc) {
                 Arc::clone(uuid)
+            } else if tombstoned_plugin_ids.contains(&*id_arc) {
+                // Interrupted uninstall (F2 recovery path). Retry
+                // the FS remove — if it succeeds we're in the
+                // fully-uninstalled steady state, so we skip
+                // indexing this dir. If it fails, log an error
+                // and skip indexing anyway; the operator sees
+                // "live SQL row without a dir" won't apply here
+                // (the row is tombstoned) but the FS leak is
+                // visible in the plugins dir listing.
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => tracing::info!(
+                        plugin_id = %manifest_id,
+                        path = %path.display(),
+                        "completed interrupted uninstall on scan",
+                    ),
+                    Err(err) => tracing::error!(
+                        plugin_id = %manifest_id,
+                        path = %path.display(),
+                        %err,
+                        "cannot complete interrupted uninstall — leftover \
+                         plugin dir remains; identity is not rotated (SQL \
+                         row for this plugin_id is tombstoned)",
+                    ),
+                }
+                continue;
             } else {
                 // FS entry with no live SQL row — mint one.
                 // Recorded in `backfills` for post-scan INSERT
@@ -365,17 +434,40 @@ impl InstalledPluginRegistry {
             );
         }
 
-        // Warn about live SQL rows without an FS entry — an
-        // operational alarm-bell shape. Doesn't block boot.
+        // Live SQL rows without an FS entry — auto-tombstone.
+        //
+        // This shape appears from three distinct failure paths:
+        // - Install crashed after INSERT but before rename → row
+        //   never had a working install.
+        // - Uninstall's `remove_dir_all` succeeded but the SQL
+        //   tombstone failed → row is effectively dead but flagged
+        //   live.
+        // - Operator manually deleted the plugin dir → identity
+        //   should not survive; a reinstall should mint a new UUID.
+        //
+        // Leaving the row live in any of these cases has the same
+        // bad effect: a subsequent `install` for the same
+        // `plugin_id` hits the `plugin_installation_live` unique
+        // index and returns `AlreadyInstalled`, even though nothing
+        // is on disk. Tombstone on sight — identity does not
+        // rotate for anything that survived (there is no FS
+        // entry, so nothing was actively minting device ids
+        // against this row).
         for (plugin_id, uuid) in &live_uuids {
             if !entries.contains_key(plugin_id.as_str()) {
-                tracing::warn!(
-                    plugin_id = %plugin_id,
-                    installation_uuid = %uuid,
-                    "plugin_installation row is live but its plugin dir is missing; \
-                     leaving the row in place (operator should tombstone via \
-                     maintenance tooling if the FS state is authoritative)",
-                );
+                match tombstone_installation_row(&db, uuid) {
+                    Ok(()) => tracing::warn!(
+                        plugin_id = %plugin_id,
+                        installation_uuid = %uuid,
+                        "auto-tombstoned live plugin_installation row whose plugin dir is missing (crashed install or interrupted uninstall)",
+                    ),
+                    Err(err) => tracing::error!(
+                        plugin_id = %plugin_id,
+                        installation_uuid = %uuid,
+                        %err,
+                        "failed to auto-tombstone orphan live plugin_installation row",
+                    ),
+                }
             }
         }
 
@@ -460,12 +552,71 @@ impl InstalledPluginRegistry {
         if dest.exists() {
             return Err(InstallError::AlreadyInstalled { plugin_id });
         }
+
+        // C1b review F3: SQL INSERT first, FS copy second.
+        //
+        // A failed install must never silently activate: if we
+        // did FS first and the SQL INSERT (or its rollback) failed,
+        // the leftover dir would get backfilled with a fresh UUID
+        // on the next scan and the "failed" install would become
+        // live with a rotated identity. INSERT-first inverts the
+        // failure mode — if any FS step fails afterwards, we
+        // DELETE the row (not tombstone: this UUID was never
+        // accepted), keeping SQL + FS + in-memory consistent.
+        // If the DELETE also fails, the row is orphaned (live
+        // SQL row without a dir) and scan warns — never rotates
+        // identity for the FS side.
+        let id_arc: Arc<str> = Arc::from(plugin_id.as_str());
+        let row = InstalledPlugin {
+            plugin_id: Arc::clone(&id_arc),
+            installation_uuid: mint_installation_uuid(),
+            version: manifest.plugin.version.to_string(),
+            path: dest.clone(),
+        };
+        if let Some(db) = &self.db {
+            insert_installation_row(db, &row).map_err(|err| {
+                // Unique-live-index collision: another live row
+                // exists for this `plugin_id` even though `dest`
+                // was absent on disk. Surface as `AlreadyInstalled`
+                // so the API's 409 fires; operator can
+                // maintenance-tombstone the orphan row.
+                if is_unique_constraint(&err) {
+                    InstallError::AlreadyInstalled {
+                        plugin_id: (*id_arc).to_string(),
+                    }
+                } else {
+                    InstallError::Persistence(err)
+                }
+            })?;
+        }
+
+        // Any FS failure past this point must roll back the SQL
+        // row so the operator sees a truthful "install failed"
+        // and a retry can converge.
+        let rollback_sql = |err: InstallError| -> InstallError {
+            if let Some(db) = &self.db
+                && let Err(delete_err) = delete_installation_row(db, &row.installation_uuid)
+            {
+                tracing::error!(
+                    plugin_id = %row.plugin_id,
+                    installation_uuid = %row.installation_uuid,
+                    error = %delete_err,
+                    "failed to roll back plugin_installation row after install error; \
+                     row is orphaned (live SQL row without a dir) — \
+                     operator must maintenance-tombstone before a retry"
+                );
+            }
+            err
+        };
+
         let staging = plugins_root.join(format!(".staging-{plugin_id}"));
         // Best-effort: if a previous failed install left a staging
         // dir, blow it away. We *just* checked dest.exists() so we
         // know we're not racing a sibling install for the same id.
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
+        if staging.exists()
+            && let Err(err) = std::fs::remove_dir_all(&staging)
+        {
+            return Err(rollback_sql(InstallError::Io(err)));
         }
         // `copy_dir_recursive` returns `InvalidInput` specifically
         // when the source dir contains a symlink — that's a fixable
@@ -477,14 +628,16 @@ impl InstalledPluginRegistry {
         // to skip over) the half-baked tree.
         if let Err(err) = copy_dir_recursive(source_dir, &staging) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(if err.kind() == std::io::ErrorKind::InvalidInput {
-                InstallError::BadManifest {
-                    path: source_dir.to_path_buf(),
-                    reason: err.to_string(),
-                }
-            } else {
-                InstallError::Io(err)
-            });
+            return Err(rollback_sql(
+                if err.kind() == std::io::ErrorKind::InvalidInput {
+                    InstallError::BadManifest {
+                        path: source_dir.to_path_buf(),
+                        reason: err.to_string(),
+                    }
+                } else {
+                    InstallError::Io(err)
+                },
+            ));
         }
         // Validate the copied manifest just in case (the wasm path
         // inside might be relative and depend on the copied
@@ -493,33 +646,16 @@ impl InstalledPluginRegistry {
         let staged_manifest = staging.join("manifest.toml");
         if let Err(err) = read_manifest_sync(&staged_manifest) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(InstallError::BadManifest {
+            return Err(rollback_sql(InstallError::BadManifest {
                 path: staged_manifest,
                 reason: err.to_string(),
-            });
+            }));
         }
-        std::fs::rename(&staging, &dest)?;
+        if let Err(err) = std::fs::rename(&staging, &dest) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(rollback_sql(InstallError::Io(err)));
+        }
 
-        let id_arc: Arc<str> = Arc::from(plugin_id.as_str());
-        // C1b: mint a fresh installation UUID and persist before
-        // returning. If the INSERT fails (unique index — another
-        // live row exists for this plugin_id, which should have
-        // been caught by the `dest.exists()` check above, or a
-        // real DB error), roll back the FS copy so a retry doesn't
-        // hit "already installed" on disk while the SQL side is
-        // clean.
-        let row = InstalledPlugin {
-            plugin_id: Arc::clone(&id_arc),
-            installation_uuid: mint_installation_uuid(),
-            version: manifest.plugin.version.to_string(),
-            path: dest,
-        };
-        if let Some(db) = &self.db
-            && let Err(err) = insert_installation_row(db, &row)
-        {
-            let _ = std::fs::remove_dir_all(&row.path);
-            return Err(InstallError::Persistence(err));
-        }
         self.write_entries().insert(id_arc, row.clone());
         tracing::info!(
             plugin_id = %row.plugin_id,
@@ -576,21 +712,29 @@ impl InstalledPluginRegistry {
             // on it. Operator must clean up manually.
             return Err(UninstallError::NotInstalled(plugin_id.to_string()));
         }
-        // C1b: tombstone the SQL row before yanking the FS. If
-        // `remove_dir_all` fails after this, the row is already
-        // tombstoned — the next `install` will insert a fresh
-        // row with a new UUID (the leaked FS dir is a maintenance
-        // problem, not an identity problem). If the tombstone
-        // itself fails, refuse the uninstall — the operator
-        // needs the SQL row gone (identity-wise) before the FS
-        // dir disappears, otherwise a subsequent install would
-        // hit the live-row unique index and 409.
+        // C1b review F2: FS remove first, SQL tombstone second.
+        //
+        // Identity rotation is more dangerous than a leaked FS dir.
+        // Tombstoning first and then failing the `remove_dir_all`
+        // (crash / permission bump / file lock) would leave the FS
+        // dir behind with **no live SQL row**; the next scan would
+        // treat it as an untracked install and backfill a fresh
+        // UUID — silently rotating device ids after an uninstall
+        // the operator saw as failed.
+        //
+        // FS-first: if `remove_dir_all` fails, the row is still
+        // live, so the in-memory entry stays intact, identity does
+        // not rotate, and a retry converges. If the tombstone
+        // fails after the FS is gone, the row is orphaned (live
+        // SQL row without a dir) — scan warns; a maintenance tool
+        // can hard-tombstone. Identity still does not rotate on
+        // the historical audit trail.
         let installation_uuid = Arc::clone(&entry.installation_uuid);
-        if let Some(db) = &self.db {
-            tombstone_installation_row(db, &installation_uuid)?;
-        }
         if dest.exists() {
             std::fs::remove_dir_all(&dest)?;
+        }
+        if let Some(db) = &self.db {
+            tombstone_installation_row(db, &installation_uuid)?;
         }
         entries.remove(plugin_id);
         tracing::info!(
@@ -629,6 +773,31 @@ fn load_live_installation_uuids(db: &Db) -> Result<HashMap<String, Arc<str>>, ru
     })
 }
 
+/// Load the set of `plugin_id`s that appear in `plugin_installation`
+/// **only** as tombstoned rows — i.e. every row for that `plugin_id`
+/// has `uninstalled_ms IS NOT NULL`. Used by scan to detect the F2
+/// recovery path (FS entry left behind by a partially-completed
+/// uninstall; do not silently backfill a fresh UUID).
+fn load_tombstoned_plugin_ids(
+    db: &Db,
+) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
+    db.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT plugin_id
+             FROM plugin_installation
+             WHERE plugin_id NOT IN (
+                 SELECT plugin_id FROM plugin_installation WHERE uninstalled_ms IS NULL
+             )",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    })
+}
+
 /// INSERT a fresh installation row. Fails with a unique-constraint
 /// error if a live row already exists for `row.plugin_id` — callers
 /// (both `install` and the scan backfill) must have ruled out that
@@ -648,6 +817,37 @@ fn insert_installation_row(db: &Db, row: &InstalledPlugin) -> Result<(), rusqlit
         )?;
         Ok(())
     })
+}
+
+/// Hard-delete an installation row. Only called from the install
+/// rollback path — a row inserted mid-install that never made it
+/// to a completed on-disk state was never really "accepted," so
+/// tombstoning it would pollute the historical trace with an
+/// entry that never had a working install.
+fn delete_installation_row(db: &Db, installation_uuid: &str) -> Result<(), rusqlite::Error> {
+    db.write(|conn| {
+        conn.execute(
+            "DELETE FROM plugin_installation WHERE installation_uuid = ?1",
+            [installation_uuid],
+        )?;
+        Ok(())
+    })
+}
+
+/// True if `err` is `SQLITE_CONSTRAINT_UNIQUE` (a violation of
+/// the `plugin_installation_live` partial unique index). Used to
+/// map an INSERT collision to `InstallError::AlreadyInstalled`.
+fn is_unique_constraint(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                ..
+            },
+            _,
+        )
+    )
 }
 
 /// Mark an installation row as uninstalled. Idempotent — a
@@ -1082,6 +1282,138 @@ wasm = "plugin.wasm"
             &*reg2.list()[0].installation_uuid,
             &*backfilled_uuid,
             "backfilled UUID must persist across scans",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b review F2 (P1): a partially-completed uninstall (FS dir
+    /// still present, SQL row already tombstoned) must not silently
+    /// mint a fresh UUID for the leftover dir on the next scan.
+    /// Scan retries the FS remove and skips indexing.
+    #[test]
+    fn scan_completes_interrupted_uninstall_and_does_not_backfill() {
+        let root = tempdir("interrupted-uninstall");
+        let plugins_root = root.join("plugins");
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+
+        let source = write_plugin_dir(&root, "example.rotate");
+        let first = reg.install(&source).expect("install");
+        let first_uuid = Arc::clone(&first.installation_uuid);
+
+        // Simulate the "FS-remove failed, tombstone landed" state:
+        // hand-tombstone the row, keep the dir on disk.
+        tombstone_installation_row(&db, &first_uuid).unwrap();
+        assert!(plugins_root.join("example.rotate").exists());
+        drop(reg);
+
+        // Fresh scan: must complete the uninstall (delete dir) and
+        // must NOT backfill a fresh UUID.
+        let reg2 = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+        assert!(
+            reg2.list().is_empty(),
+            "interrupted uninstall must not resurface as an install",
+        );
+        assert!(
+            !plugins_root.join("example.rotate").exists(),
+            "scan must complete the FS removal",
+        );
+
+        // The tombstoned row is still there — no fresh row was
+        // inserted for the same plugin_id.
+        let row_count: i64 = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM plugin_installation WHERE plugin_id = ?1",
+                    ["example.rotate"],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(row_count, 1, "no fresh identity row minted");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b review F2 (other reviewer, P1): a `.staging-<id>/` dir
+    /// left over from a crashed install must not become an active
+    /// install on the next scan.
+    #[test]
+    fn scan_removes_leftover_staging_dir_and_does_not_index_it() {
+        let root = tempdir("staging-crash");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+
+        // Hand-craft a `.staging-<id>/` dir with a valid manifest
+        // (the pre-fix scan would have indexed it as an install).
+        let staging = plugins_root.join(".staging-example.crashed");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.crashed"
+name = "Crashed"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+        )
+        .unwrap();
+        std::fs::write(staging.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).unwrap();
+        assert!(
+            reg.list().is_empty(),
+            "staging dir must not be indexed as an install",
+        );
+        assert!(
+            !staging.exists(),
+            "scan must remove leftover staging directories",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C1b review F3 (P1): after a crashed install (SQL INSERT
+    /// landed but FS didn't) the next scan sees a live SQL row
+    /// with no matching FS dir and must auto-tombstone it so a
+    /// retry install can succeed.
+    #[test]
+    fn scan_auto_tombstones_orphan_live_row_with_no_fs_entry() {
+        let root = tempdir("orphan-live");
+        let plugins_root = root.join("plugins");
+        let db = fresh_db();
+
+        // Hand-INSERT a live row for a plugin_id whose FS dir is
+        // absent — the shape a crashed install leaves behind.
+        let ghost = InstalledPlugin {
+            plugin_id: Arc::from("example.ghost"),
+            installation_uuid: mint_installation_uuid(),
+            version: "0.1.0".to_string(),
+            path: plugins_root.join("example.ghost"),
+        };
+        insert_installation_row(&db, &ghost).unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
+        assert!(reg.list().is_empty());
+
+        // The row was auto-tombstoned by the scan.
+        let uninstalled_ms: Option<i64> = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT uninstalled_ms FROM plugin_installation WHERE plugin_id = ?1",
+                    ["example.ghost"],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(
+            uninstalled_ms.is_some(),
+            "scan must auto-tombstone the orphan live row",
         );
 
         std::fs::remove_dir_all(&root).unwrap();

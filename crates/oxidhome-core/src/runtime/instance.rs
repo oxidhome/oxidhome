@@ -36,6 +36,32 @@ use super::watchdog;
 /// needs the pre-flight parse. The Phase-12 CLI's manifest-validation
 /// command will likely want a public variant; that can lift the
 /// visibility when it lands.
+/// C1b review F1: guard for the installation-UUID lookup in
+/// `PluginInstance::instantiate`. Returns `true` only when the
+/// loaded wasm's parent directory is the same on-disk location the
+/// `InstalledPluginRegistry` row remembers. Canonicalizes both
+/// paths so `..`, symlinks, and non-normalized relative segments
+/// don't defeat the compare.
+///
+/// A mismatch means the caller loaded a different .wasm whose
+/// manifest just happens to declare the installed plugin id
+/// (dev-time argv load, replacement component, test fixture). In
+/// that case the loader falls back to a synthetic UUID, so device
+/// ids for the loaded component can't collide with the installed
+/// package's device ids.
+fn loaded_dir_matches_registry(wasm_path: &Path, registry_path: &Path) -> bool {
+    let Some(load_dir) = wasm_path.parent() else {
+        return false;
+    };
+    let Ok(a) = std::fs::canonicalize(load_dir) else {
+        return false;
+    };
+    let Ok(b) = std::fs::canonicalize(registry_path) else {
+        return false;
+    };
+    a == b
+}
+
 pub(crate) async fn read_manifest(plugin_dir: &Path) -> anyhow::Result<PluginManifest> {
     let manifest_path = plugin_dir.join("manifest.toml");
     let text = tokio::fs::read_to_string(&manifest_path)
@@ -342,16 +368,31 @@ impl PluginInstance {
             })?;
 
         // C1b: pin the installation UUID at load time. If the plugin
-        // was installed through the API (`InstalledPluginRegistry`),
-        // this is the host-minted `inst-<hex>` from the SQL row; if
-        // it was loaded directly from a wasm path (test harness /
-        // dev workflow that didn't `install`), fall back to the
-        // manifest `plugin.id` — a synthetic UUID that keeps the
-        // in-process device ids stable for the run without depending
-        // on a persistence layer.
+        // was installed through the API (`InstalledPluginRegistry`)
+        // AND the loaded directory matches the registry row, use
+        // the host-minted `inst-<hex>` from SQL; otherwise fall
+        // back to the manifest `plugin.id` as a synthetic UUID.
+        //
+        // C1b review F1: the loaded-directory guard prevents a
+        // dev-time load (or a replacement component) whose manifest
+        // happens to declare an installed `plugin_id` from inheriting
+        // the installed package's UUID and minting the same device
+        // ids — exactly the identity-inheritance the C1b change
+        // exists to prevent.
         let installation_uuid: Arc<str> = match engine.installed_plugins().get(&manifest.plugin.id)
         {
-            Some(row) => row.installation_uuid,
+            Some(row) if loaded_dir_matches_registry(wasm_path, &row.path) => row.installation_uuid,
+            Some(row) => {
+                tracing::warn!(
+                    plugin_id = %manifest.plugin.id,
+                    wasm_path = %wasm_path.display(),
+                    registry_path = %row.path.display(),
+                    "loaded plugin dir does not match InstalledPluginRegistry entry; \
+                     using synthetic UUID — device ids will NOT inherit the installed \
+                     plugin's identity (dev-time load, or replacement component)"
+                );
+                Arc::from(manifest.plugin.id.as_str())
+            }
             None => Arc::from(manifest.plugin.id.as_str()),
         };
 
