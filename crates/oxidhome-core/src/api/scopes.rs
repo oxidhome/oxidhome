@@ -133,6 +133,13 @@ pub(crate) const EVENTS_TAIL: Scope = Scope::new("events:tail");
 /// `logs:read` — see `GET /api/v1/logs`.
 pub(crate) const LOGS_READ: Scope = Scope::new("logs:read");
 
+/// `audit:read` — see `GET /api/v1/audit`. **Sensitive**: the
+/// audit ledger holds every authenticated request's token id,
+/// method, path, and outcome. A token holding this scope can
+/// reconstruct who did what across the whole daemon; treat it
+/// like the auth-token store itself.
+pub(crate) const AUDIT_READ: Scope = Scope::new("audit:read");
+
 /// `devices:command` — see `POST /api/v1/devices/{id}/command`.
 /// **Sensitive** by the cross-cutting policy in
 /// [`ARCHITECTURE.md`](../../../../../ARCHITECTURE.md): controls
