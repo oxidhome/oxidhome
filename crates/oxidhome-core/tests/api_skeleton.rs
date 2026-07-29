@@ -2077,6 +2077,132 @@ fn connect_authenticated_call_emits_audit_row_in_same_shape_as_json() {
     assert_eq!(target_str, "api.POST-/oxidhome.v1.NoSuchService/Method");
 }
 
+/// `GET /api/v1/readyz` is anonymous — no bearer, still 200 with
+/// the `{status, version}` body an orchestrator (systemd,
+/// docker, k8s) can probe against.
+#[tokio::test(flavor = "current_thread")]
+async fn readyz_returns_ok_without_auth() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["status"], "ok");
+    // Version matches the `oxidhome-core` crate version — the
+    // daemon binary lives in the same crate so this moves in
+    // lockstep with workspace bumps.
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// The C3 audit ledger must not record `/readyz` — it's an
+/// anonymous liveness probe, and every k8s pod / docker container
+/// polling every second would otherwise flood the ledger. Pins
+/// the `PUBLIC_PATHS` short-circuit above the audit path.
+#[test]
+fn readyz_leaves_no_audit_row() {
+    use oxidhome_core::state::AuditQuery;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let engine = Engine::new().expect("engine");
+    let audit_log = engine.audit_log();
+
+    rt.block_on(async {
+        let router = build_router(engine.clone());
+        // Bang on it a handful of times, mirroring an orchestrator
+        // probe cadence.
+        for _ in 0..5 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    });
+
+    // Ledger has *zero* rows — no anonymous probes, no denials.
+    let rows = audit_log
+        .query(&AuditQuery::default(), 16)
+        .expect("audit query");
+    assert!(
+        rows.is_empty(),
+        "/readyz probes must not be audited; got {rows:?}",
+    );
+}
+
+/// PR-#83 review, F2 regression — `/readyz` is a GET-only public
+/// route. The pre-fix `PUBLIC_PATHS` string-compare short-circuit
+/// matched every HTTP method against the path, so POST / DELETE /
+/// PUT `/api/v1/readyz` bypassed auth (invisibly today because
+/// axum returns 405 for unregistered methods, but a hazard if
+/// anyone later adds a handler on that path for a different
+/// method). Router-level separation makes only GET reachable.
+#[tokio::test(flavor = "current_thread")]
+async fn readyz_non_get_methods_return_405() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+    for method in ["POST", "PUT", "DELETE"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/api/v1/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "expected 405 for {method} /api/v1/readyz",
+        );
+    }
+}
+
+/// `GET /api/v1/readyz` stays anonymous even when a bearer is
+/// present. Mirrors `connect_health_check_remains_anonymous_even_with_token`:
+/// the allow-list is the source of truth, not the presence of a
+/// token, so a probing client that happens to carry one doesn't
+/// end up in the audit log.
+#[tokio::test(flavor = "current_thread")]
+async fn readyz_remains_anonymous_even_with_token() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/readyz")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 /// Connect's `Health.Check` is anonymous *with or without* an
 /// Authorization header — the allow-list is the source of truth, not
 /// the presence of a token. Pins that a probing client which happens

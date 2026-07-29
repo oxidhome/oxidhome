@@ -54,6 +54,11 @@ use crate::state::{
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<WasmtimeEngine>,
+    /// Shared `SQLite` handle every persistent sub-store hangs off.
+    /// Held on `Engine` (in addition to the sub-store handles) so
+    /// operational surfaces like the readiness probe can ping the
+    /// database directly without depending on any one store.
+    db: Arc<Db>,
     devices: Arc<DeviceRegistry>,
     events: Arc<EventBus>,
     kv: Arc<KvStore>,
@@ -142,15 +147,32 @@ impl Engine {
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
             audit_log: Arc::new(AuditLog::new(Arc::clone(&db))),
             auth_tokens: Arc::new(crate::state::TokenStore::new(Arc::clone(&db))),
-            blobs: Arc::new(BlobStore::new(db, blobs_root)),
+            blobs: Arc::new(BlobStore::new(Arc::clone(&db), blobs_root)),
             services: Arc::new(ServiceRegistry::new()),
             instances: Arc::new(InstanceRegistry::new()),
+            db,
             installed_plugins: Arc::new(installed_plugins),
         })
     }
 
     pub(crate) fn raw(&self) -> &WasmtimeEngine {
         &self.inner
+    }
+
+    /// Cheap `SELECT 1` against the shared `SQLite` connection —
+    /// the readiness probe for `GET /api/v1/readyz`. See
+    /// [`crate::state::Db::ping`] for the failure modes it
+    /// surfaces (mutex poisoning, disk I/O, connection loss).
+    /// Every persistent sub-store hangs off the same connection,
+    /// so a successful ping stands in for token verification,
+    /// audit-ledger writes, KV, blob-index, event-log, and
+    /// log-store readiness in one shot.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any `rusqlite` failure.
+    pub fn db_ping(&self) -> Result<(), rusqlite::Error> {
+        self.db.ping()
     }
 
     /// Shared device registry. Use this from host-side code (tests,

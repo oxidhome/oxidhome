@@ -613,6 +613,25 @@ impl Db {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+
+    /// Cheap connectivity check. Grabs the connection mutex and
+    /// runs `SELECT 1` — sub-millisecond on a healthy `SQLite`
+    /// handle, and any of the failure modes worth surfacing to an
+    /// orchestrator (mutex poisoned, connection closed, disk I/O
+    /// error) show up as an error here.
+    ///
+    /// Used by the JSON `GET /api/v1/readyz` readiness probe. The
+    /// audit ledger, token store, KV store, blob index, event log,
+    /// and log store all live on this same connection, so a
+    /// working ping stands in for all of them.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any `rusqlite` failure verbatim.
+    pub fn ping(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row("SELECT 1", [], |_| Ok(()))
+    }
 }
 
 impl std::fmt::Debug for Db {
@@ -650,6 +669,18 @@ mod tests {
             Ok(())
         })
         .expect("read");
+    }
+
+    #[test]
+    fn ping_ok_on_healthy_connection() {
+        // The readiness probe (`GET /api/v1/readyz`) leans on this
+        // as its single dependency check. A fresh in-memory DB
+        // always passes; the operational failure modes (mutex
+        // poisoning, disk I/O errors) are hard to synthesize
+        // without deeper plumbing, so this test just pins the
+        // happy path.
+        let db = Db::open_in_memory().expect("open");
+        db.ping().expect("healthy connection must ping");
     }
 
     #[test]
