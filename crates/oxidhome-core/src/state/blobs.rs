@@ -128,15 +128,27 @@ pub enum BlobError {
 /// filesystem boundary. Called by every blob-store entry point AND
 /// at the API layer so a bad id is rejected before it ever reaches
 /// path construction.
+///
+/// Review F1 (round-2): also cap the byte length at
+/// [`MAX_INSTANCE_ID_BYTES`] (128) so an over-long id can't pass
+/// validation and later `ENAMETOOLONG` at write time. `NAME_MAX`
+/// on Linux/macOS is 255 bytes; 128 keeps well under it AND leaves
+/// budget for the `.tmp/<blob-id>` sub-path names appended below
+/// the instance dir (blob id ≈ 32 chars, `.tmp/` prefix 5 chars).
 #[must_use]
 pub fn is_safe_instance_id(instance_id: &str) -> bool {
     !instance_id.is_empty()
+        && instance_id.len() <= MAX_INSTANCE_ID_BYTES
         && !instance_id.contains('/')
         && !instance_id.contains('\\')
         && !instance_id.contains("..")
         && !instance_id.starts_with('.')
         && !instance_id.contains('\0')
 }
+
+/// Maximum permitted byte length of an `instance_id` — see the
+/// F1 comment on [`is_safe_instance_id`].
+pub const MAX_INSTANCE_ID_BYTES: usize = 128;
 
 fn check_instance_id(instance_id: &str) -> Result<(), BlobError> {
     if is_safe_instance_id(instance_id) {
@@ -1011,7 +1023,15 @@ mod tests {
         let dir = tempdir();
         let db = Arc::new(Db::open_in_memory().expect("db"));
         let blobs = BlobStore::new(db, Some(dir.path.clone()));
-        let unsafe_ids = [
+        // Length + traversal + control-char coverage.
+        // Review F1: an id at exactly MAX_INSTANCE_ID_BYTES + 1
+        // must refuse; boundary (== MAX) is exercised by the
+        // positive-control test below.
+        let too_long = "a".repeat(MAX_INSTANCE_ID_BYTES + 1);
+        // 5-char multibyte string (kanji) that would be 15 bytes,
+        // repeated to just past the byte limit.
+        let too_long_multibyte = "日本語".repeat(30); // 30 * 9 bytes = 270 > 128
+        let unsafe_ids: [&str; 10] = [
             "",
             "..",
             "../etc/passwd",
@@ -1020,6 +1040,8 @@ mod tests {
             "/absolute",
             ".hidden",
             "with\0nul",
+            too_long.as_str(),
+            too_long_multibyte.as_str(),
         ];
         for id in unsafe_ids {
             assert!(
@@ -1074,5 +1096,26 @@ mod tests {
             .expect("write");
         let bytes = blobs.read("example.inst-1", &id).expect("read");
         assert_eq!(bytes, b"hello");
+    }
+
+    /// Review F1 boundary: an id at exactly [`MAX_INSTANCE_ID_BYTES`]
+    /// is accepted; one byte over is refused. Verified by walking
+    /// the boundary on both sides.
+    #[test]
+    fn instance_id_length_boundary() {
+        assert!(
+            is_safe_instance_id(&"a".repeat(MAX_INSTANCE_ID_BYTES)),
+            "id of exactly MAX_INSTANCE_ID_BYTES must be accepted",
+        );
+        assert!(
+            !is_safe_instance_id(&"a".repeat(MAX_INSTANCE_ID_BYTES + 1)),
+            "id of MAX_INSTANCE_ID_BYTES + 1 must be refused",
+        );
+        // A short multibyte id is fine — byte length, not char
+        // count, is what NAME_MAX cares about.
+        assert!(
+            is_safe_instance_id("日本語"),
+            "short multibyte id must be accepted",
+        );
     }
 }
