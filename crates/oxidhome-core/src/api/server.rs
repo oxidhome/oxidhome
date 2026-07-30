@@ -677,6 +677,16 @@ async fn start_plugin_instance(
         .instance_id
         .clone()
         .unwrap_or_else(|| plugin_id.clone());
+    // Follow-up review H1: reject caller-supplied `instance_id`s
+    // that aren't safe as FS segments before they reach the KV /
+    // blob store (which use the id directly in `<blobs_root>/
+    // <instance_id>/...`). Absolute paths would replace the root
+    // under `Path::join`, `..` escapes it, `\0` truncates on
+    // POSIX. Also rejected: empty and leading-`.` which collide
+    // with the blob-store `.tmp` staging convention.
+    if !crate::state::is_safe_instance_id(&instance_id) {
+        return Err(PluginLifecycleError::BadInstanceId(instance_id));
+    }
     let installed = state
         .engine
         .installed_plugins()
@@ -837,6 +847,11 @@ enum PluginLifecycleError {
     /// 400-class manifest / source-dir validation error from the
     /// install path.
     BadInstall(String),
+    /// Follow-up review H1: caller-supplied `instance_id` failed
+    /// the FS-segment safety check (empty, path traversal,
+    /// absolute path, contains a NUL). Rejected with 400 before
+    /// the id ever reaches `start_instance` / the KV/blob store.
+    BadInstanceId(String),
     /// Internal failure that doesn't fit the buckets above. 500.
     Internal(anyhow::Error),
     /// `start_instance` or `wait_for_running` returned Err — the
@@ -902,6 +917,14 @@ impl IntoResponse for PluginLifecycleError {
             Self::BadInstall(reason) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({"error": "bad_install", "reason": reason})),
+            )
+                .into_response(),
+            Self::BadInstanceId(id) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_instance_id",
+                    "reason": format!("instance_id {id:?} is unsafe for use as a filesystem segment"),
+                })),
             )
                 .into_response(),
             Self::Internal(err) => {

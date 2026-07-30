@@ -944,6 +944,14 @@ fn blob_error_to_wit(err: crate::state::BlobError) -> WitError {
         BlobError::UnregisteredInstance { ref instance_id } => WitError::Internal(format!(
             "blob_store: instance `{instance_id}` not registered (host bug)"
         )),
+        // Follow-up review H1: unsafe instance_id caught at the
+        // blob-store boundary. The API layer already refuses these
+        // with 400 before they reach the store, so a leak here
+        // implies a direct-caller path (test harness) with a bad
+        // id — treat as host bug.
+        BlobError::UnsafeInstanceId { ref instance_id } => WitError::Internal(format!(
+            "blob_store: instance_id {instance_id:?} unsafe for use as a filesystem segment (host bug)"
+        )),
         BlobError::QuotaExceeded {
             would_use, allowed, ..
         } => WitError::PermissionDenied(format!(

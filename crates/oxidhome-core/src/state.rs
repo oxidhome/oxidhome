@@ -29,7 +29,7 @@ pub mod services;
 
 pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery, credential_fingerprint};
 pub use auth_token::{IssuedToken, TokenError, TokenRecord, TokenStore};
-pub use blobs::{BlobError, BlobInfo, BlobStore};
+pub use blobs::{BlobError, BlobInfo, BlobStore, is_safe_instance_id};
 pub use db::Db;
 pub use devices::{DeviceMeta, DeviceRegistry};
 pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicMatch};

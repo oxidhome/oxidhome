@@ -539,6 +539,18 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
             .get(&req.plugin_id)
             .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("plugin not installed")))?;
         let instance_id = req.instance_id.unwrap_or_else(|| req.plugin_id.clone());
+        // Follow-up review H1: reject caller-supplied `instance_id`s
+        // that aren't safe as FS segments before they reach the
+        // blob store's path construction. Mirrors the JSON side's
+        // check in `api::server::start_plugin_instance`.
+        if !crate::state::is_safe_instance_id(&instance_id) {
+            return Err(rpc_err(
+                &ctx,
+                ConnectError::invalid_argument(format!(
+                    "instance_id {instance_id:?} is unsafe for use as a filesystem segment"
+                )),
+            ));
+        }
         // `config_overrides_json` is optional; empty / absent
         // means "use manifest defaults."
         let overrides = match req.config_overrides_json.as_deref() {
