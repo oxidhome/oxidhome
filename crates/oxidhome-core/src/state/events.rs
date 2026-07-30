@@ -328,24 +328,33 @@ impl EventBus {
             if !filter_matches(&sub.filter, event.as_ref()) {
                 continue;
             }
-            // C2e review F2: if this subscriber has un-surfaced
-            // drops from prior full-queue publishes, try to
-            // enqueue a `Lagged` frame first so the receiver can
-            // observe the gap. If the queue is still full, the
-            // event send will also fail and we accumulate one
-            // more into `pending_lag` — the counter drains on
-            // the first successful send.
-            let pending = sub.pending_lag.load(Ordering::Relaxed);
-            if pending > 0
+            // C2e review F2 + follow-up review H4: if this
+            // subscriber has un-surfaced drops from prior
+            // full-queue publishes, try to enqueue a `Lagged`
+            // frame first so the receiver can observe the gap.
+            //
+            // The claim is a single `swap(0)` — atomic. Two
+            // concurrent publishers can both hit this: the winner
+            // sees `pending > 0` and sends the notification; the
+            // loser sees `pending == 0` and skips. The prior
+            // load-then-fetch_sub shape let two publishers each
+            // load the same count and each subtract it, wrapping
+            // the counter near `u64::MAX` and hanging the
+            // Lagged path forever.
+            //
+            // If the notification send itself fails (queue still
+            // full), re-inject the claimed count so a future
+            // publish retries. `fetch_add` is safe — no
+            // wraparound because we only add what we previously
+            // owned.
+            let claimed = sub.pending_lag.swap(0, Ordering::AcqRel);
+            if claimed > 0
                 && sub
                     .sender
-                    .try_send(SubscriberMessage::Lagged { skipped: pending })
-                    .is_ok()
+                    .try_send(SubscriberMessage::Lagged { skipped: claimed })
+                    .is_err()
             {
-                // Only zero out the delta we actually surfaced —
-                // `pending_lag` may have grown between the load
-                // and here from a concurrent publish loop.
-                sub.pending_lag.fetch_sub(pending, Ordering::Relaxed);
+                sub.pending_lag.fetch_add(claimed, Ordering::Relaxed);
             }
             match sub
                 .sender
@@ -1090,6 +1099,63 @@ mod tests {
         );
         let ev = sub.receiver.try_recv().expect("event follows lagged");
         assert!(matches!(ev, SubscriberMessage::Event(_)));
+    }
+
+    /// Follow-up review H4: two concurrent publishers must not
+    /// underflow `pending_lag`. Reproduces the race by having
+    /// N publisher threads all attempting to surface the same
+    /// pending count under a stalled subscriber; asserts the
+    /// counter never goes negative-wrapped (stays under a sane
+    /// upper bound).
+    #[test]
+    fn concurrent_publishers_do_not_underflow_pending_lag() {
+        use std::thread;
+        let bus = Arc::new(EventBus::new());
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let sub = bus.subscribe_labeled(filter.clone(), "stalled");
+        let sub_id = sub.id;
+
+        // Fill the queue to full so every publish drops.
+        for i in 0..(SUBSCRIBER_CAPACITY as u64 * 2) {
+            bus.publish(custom(None, &format!("prefill-{i}")));
+        }
+        let prefill_dropped = bus.dropped_for(sub_id).unwrap();
+        assert!(prefill_dropped > 0);
+
+        // Now drain a couple slots so future publishes can enqueue
+        // Lagged frames, and race N threads publishing.
+        let mut sub = sub;
+        for _ in 0..8 {
+            let _ = sub.receiver.try_recv();
+        }
+
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let bus = Arc::clone(&bus);
+                thread::spawn(move || {
+                    for i in 0..64 {
+                        bus.publish(custom(None, &format!("race-{t}-{i}")));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // pending_lag must NOT be near u64::MAX (the underflow
+        // symptom). It's fine for it to be any small number
+        // representing genuine backlog.
+        let subs = bus.subscribers.read().unwrap();
+        let live = subs.get(&sub_id).expect("subscriber still live");
+        let pending = live.pending_lag.load(Ordering::Relaxed);
+        assert!(
+            pending < 10_000_000,
+            "pending_lag underflowed (got {pending}), expected small backlog"
+        );
     }
 
     /// C2e review F3: dropping the `EventBus` must let a consumer
