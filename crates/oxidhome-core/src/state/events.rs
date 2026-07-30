@@ -39,13 +39,37 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 use tokio::sync::{Notify, mpsc};
 
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventFilter};
 use crate::host_impl::plugin::oxidhome::plugin::types::SubscriptionId;
+
+/// What a subscriber receives on its private mpsc queue. C2e review
+/// added the [`Self::Lagged`] variant back: the Connect proto's
+/// `Lagged` body and the JSON tail's `{"lagged": N}` frame are the
+/// contract the pre-C2e `broadcast::Recv::Lagged` error surfaced;
+/// dropping that from the wire meant slow clients silently lost
+/// events with no signal to reconcile.
+///
+/// The payload is an `Arc<Event>` (not `Event`) so `publish` fans
+/// out to every subscriber with a cheap ref-count bump instead of
+/// a full clone per queue slot — with per-subscriber queues of
+/// 256 slots and unbounded custom-event payload size, cloning per
+/// slot would multiply retained memory by subscriber count and let
+/// an `events:tail` credential OOM the daemon (C2e review P1).
+#[derive(Debug, Clone)]
+pub enum SubscriberMessage {
+    /// A published event routed to this subscriber's queue.
+    Event(Arc<Event>),
+    /// This subscriber's queue was full at least `skipped` times
+    /// since the last delivered message. Emitted at the head of
+    /// the next successful send so downstream tail handlers can
+    /// surface the gap to their clients.
+    Lagged { skipped: u64 },
+}
 
 /// C2e — per-subscriber queue depth. A subscriber whose consumer
 /// is slower than the publisher(s) drops events past this many
@@ -55,6 +79,25 @@ use crate::host_impl::plugin::oxidhome::plugin::types::SubscriptionId;
 /// rate, so this depth is about tolerating brief consumer stalls
 /// (GC pause, WebSocket flush blip) without dropping.
 const SUBSCRIBER_CAPACITY: usize = 256;
+
+/// Soft cap on concurrent subscribers. An `events:tail` credential
+/// could otherwise open arbitrarily many stalled streams and
+/// multiply retained queue memory (though the `Arc<Event>` fix in
+/// [`publish`] means the *payload* is shared; per-subscriber cost
+/// is now dominated by the 256 `Arc` slots ≈ 2 KiB). Exceeding
+/// the cap logs an ERROR but doesn't refuse the subscribe — the
+/// intent is "operator sees this and adds a per-actor limit
+/// upstream" rather than "silently break tooling that opened a
+/// spurious extra tail." Fixup review F1 amplification concern.
+const SOFT_SUBSCRIBER_CAP: usize = 1024;
+
+/// Rate-limit the per-drop `tracing::warn` in [`publish`]. Log
+/// the first drop after any successful send, then every N-th
+/// drop, so a flood of overflows against many subscribers doesn't
+/// itself flood the log. The exact drop count is always available
+/// via [`EventBus::dropped_for`] for tests + operator surfaces.
+/// Fixup review F1 amplification concern.
+const LOG_EVERY_N_DROPS: u64 = 100;
 
 /// Default per-instance publish rate ceiling (events/second). A
 /// well-behaved plugin publishing at natural device cadences
@@ -123,13 +166,19 @@ pub struct EventBus {
 struct Subscriber {
     id: SubscriptionId,
     filter: EventFilter,
-    sender: mpsc::Sender<Event>,
+    sender: mpsc::Sender<SubscriberMessage>,
     /// Per-subscriber cumulative drop counter — incremented every
     /// time `publish` sees `TrySendError::Full` for this
     /// subscription. Exposed via [`EventBus::dropped_for`] for
     /// tests + future operator surfaces; the primary consumer is
     /// the `tracing::warn` emitted on each drop.
     dropped: AtomicU64,
+    /// Count of pending lag notices — increments on each `Full`,
+    /// drains to zero when the next `try_send` of a
+    /// [`SubscriberMessage::Lagged`] frame succeeds. Kept separate
+    /// from `dropped` so the cumulative counter (for observability)
+    /// isn't reset when we surface a batch to the receiver.
+    pending_lag: AtomicU64,
     /// Human-readable subscriber label included in the drop-warn
     /// log so an operator can identify which reader is falling
     /// behind ("plugin `example.foo/instance-1`", "http tail
@@ -253,6 +302,14 @@ impl EventBus {
     /// after `try_send` closes the race.
     #[allow(clippy::needless_pass_by_value)]
     pub fn publish(&self, event: Event) -> usize {
+        // C2e review F1: wrap the event once in an `Arc` so
+        // per-subscriber fan-out is a ref-count bump, not a full
+        // clone per queue slot. With unbounded custom-event
+        // payloads and unbounded subscriber count, cloning per
+        // slot would let an `events:tail` credential amplify one
+        // event into O(subscribers × capacity × payload) retained
+        // memory and OOM the daemon.
+        let event = Arc::new(event);
         // Snapshot the Arc<Subscriber>s under the read lock, then
         // drop the lock before doing per-subscriber `try_send`.
         // `try_send` is non-blocking but the lock scope stays tight,
@@ -268,20 +325,51 @@ impl EventBus {
         };
         let mut delivered = 0;
         for sub in &snapshot {
-            if !filter_matches(&sub.filter, &event) {
+            if !filter_matches(&sub.filter, event.as_ref()) {
                 continue;
             }
-            match sub.sender.try_send(event.clone()) {
+            // C2e review F2: if this subscriber has un-surfaced
+            // drops from prior full-queue publishes, try to
+            // enqueue a `Lagged` frame first so the receiver can
+            // observe the gap. If the queue is still full, the
+            // event send will also fail and we accumulate one
+            // more into `pending_lag` — the counter drains on
+            // the first successful send.
+            let pending = sub.pending_lag.load(Ordering::Relaxed);
+            if pending > 0
+                && sub
+                    .sender
+                    .try_send(SubscriberMessage::Lagged { skipped: pending })
+                    .is_ok()
+            {
+                // Only zero out the delta we actually surfaced —
+                // `pending_lag` may have grown between the load
+                // and here from a concurrent publish loop.
+                sub.pending_lag.fetch_sub(pending, Ordering::Relaxed);
+            }
+            match sub
+                .sender
+                .try_send(SubscriberMessage::Event(Arc::clone(&event)))
+            {
                 Ok(()) => delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    let count = sub.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::warn!(
-                        subscription_id = sub.id,
-                        subscriber = %sub.label,
-                        dropped_total = count,
-                        capacity = SUBSCRIBER_CAPACITY,
-                        "event dropped: subscriber queue full (C2e per-subscriber isolation)",
-                    );
+                    let total = sub.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    sub.pending_lag.fetch_add(1, Ordering::Relaxed);
+                    // Rate-limit the warn: log the first drop and
+                    // then every `LOG_EVERY_N_DROPS`-th to keep
+                    // the log line count bounded under a flood
+                    // against many overflowing subscribers.
+                    // Cumulative count is exposed via
+                    // `dropped_for` for observability.
+                    if total == 1 || total.is_multiple_of(LOG_EVERY_N_DROPS) {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            subscriber = %sub.label,
+                            dropped_total = total,
+                            capacity = SUBSCRIBER_CAPACITY,
+                            "event dropped: subscriber queue full (C2e per-subscriber isolation)",
+                        );
+                    }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     // Receiver was dropped without its
@@ -291,7 +379,7 @@ impl EventBus {
                 }
             }
         }
-        self.signal_wakes(&event);
+        self.signal_wakes(event.as_ref());
         delivered
     }
 
@@ -406,6 +494,7 @@ impl EventBus {
             filter: filter.clone(),
             sender,
             dropped: AtomicU64::new(0),
+            pending_lag: AtomicU64::new(0),
             label: label.to_owned(),
         });
         {
@@ -413,7 +502,21 @@ impl EventBus {
                 .subscribers
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = subs.len();
             subs.insert(id, subscriber);
+            let after = subs.len();
+            // Soft cap: log ERROR when the total subscriber count
+            // crosses the cap, so an operator gets an alarm
+            // rather than silent memory growth. Doesn't refuse
+            // the subscribe — a real per-actor cap belongs at
+            // the API layer with actor context.
+            if before < SOFT_SUBSCRIBER_CAP && after >= SOFT_SUBSCRIBER_CAP {
+                tracing::error!(
+                    total = after,
+                    cap = SOFT_SUBSCRIBER_CAP,
+                    "event bus subscriber count crossed the soft cap; consider adding a per-actor limit at the API layer",
+                );
+            }
         }
         EventSubscription {
             id,
@@ -422,7 +525,13 @@ impl EventBus {
             wake_token: None,
             _slot_token: SubscriberToken {
                 id,
-                subscribers: Arc::clone(&self.subscribers),
+                // C2e review F3: `Weak`, not `Arc`. If the token
+                // held a strong ref, the registry (and every
+                // subscriber's `mpsc::Sender` inside it) would
+                // outlive the `EventBus` — a consumer awaiting
+                // `recv()` would never see `None` after engine
+                // shutdown, hanging the API tail loops.
+                subscribers: Arc::downgrade(&self.subscribers),
             },
         }
     }
@@ -474,19 +583,29 @@ impl EventBus {
 /// enclosing [`EventSubscription`] runs this Drop, which removes
 /// the subscriber's `mpsc::Sender` from the bus so `publish` stops
 /// walking a dead entry.
+///
+/// The registry reference is `Weak`, not `Arc`, so a subscription
+/// held past the bus's lifetime doesn't keep the registry (and
+/// every remaining subscriber's `Sender`) alive — the mpsc
+/// receiver's `recv()` correctly returns `None` after engine
+/// shutdown. Fixup review F3.
 #[derive(Debug)]
 struct SubscriberToken {
     id: SubscriptionId,
-    subscribers: Arc<RwLock<HashMap<SubscriptionId, Arc<Subscriber>>>>,
+    subscribers: Weak<RwLock<HashMap<SubscriptionId, Arc<Subscriber>>>>,
 }
 
 impl Drop for SubscriberToken {
     fn drop(&mut self) {
-        let mut subs = self
-            .subscribers
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        subs.remove(&self.id);
+        // Registry may have been dropped alongside the bus — no-op
+        // if so; the map (and this subscriber's Arc slot) is
+        // already gone.
+        if let Some(subs) = self.subscribers.upgrade() {
+            let mut subs = subs
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            subs.remove(&self.id);
+        }
     }
 }
 
@@ -524,7 +643,7 @@ impl Drop for WakeToken {
 pub struct EventSubscription {
     pub id: SubscriptionId,
     pub filter: EventFilter,
-    pub receiver: mpsc::Receiver<Event>,
+    pub receiver: mpsc::Receiver<SubscriberMessage>,
     /// C2d — Some for supervisor-wake-integrated subscriptions,
     /// None for external subscribers that poll `.receiver`
     /// directly. Private because callers never touch it; its
@@ -536,6 +655,23 @@ pub struct EventSubscription {
     /// read directly; Rust would otherwise warn about it.
     #[allow(dead_code)]
     _slot_token: SubscriberToken,
+}
+
+impl SubscriberMessage {
+    /// Expect the [`Self::Event`] variant and return an owned
+    /// [`Event`] — cloning only if the `Arc` has additional
+    /// holders (i.e. multiple subscribers). Panics on the
+    /// [`Self::Lagged`] variant; use plain pattern-matching if
+    /// the caller wants to handle both.
+    #[must_use]
+    pub fn expect_event(self) -> Event {
+        match self {
+            Self::Event(ev) => Arc::unwrap_or_clone(ev),
+            Self::Lagged { skipped } => {
+                panic!("expected SubscriberMessage::Event, got Lagged {{ skipped: {skipped} }}")
+            }
+        }
+    }
 }
 
 impl EventSubscription {
@@ -764,10 +900,11 @@ mod tests {
         tokio::task::yield_now().await;
         bus_publisher.publish(custom(None, "test"));
 
-        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), subscriber)
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), subscriber)
             .await
             .expect("subscriber did not observe the event before timeout")
             .expect("subscriber task panicked");
+        let ev = msg.expect_event();
         assert!(matches!(ev.payload, EventPayload::Custom(_)));
     }
 
@@ -887,17 +1024,22 @@ mod tests {
         // drain it after each publish so it stays empty.
         let overflow: usize = 32;
         let total: usize = SUBSCRIBER_CAPACITY + overflow;
-        let mut fast_received: usize = 0;
+        let mut fast_events: usize = 0;
         for i in 0..total {
             bus.publish(custom(None, &format!("evt-{i}")));
-            while fast.receiver.try_recv().is_ok() {
-                fast_received += 1;
+            while let Ok(msg) = fast.receiver.try_recv() {
+                match msg {
+                    SubscriberMessage::Event(_) => fast_events += 1,
+                    SubscriberMessage::Lagged { skipped } => {
+                        panic!("fast subscriber must not lag, got Lagged {{ skipped: {skipped} }}")
+                    }
+                }
             }
         }
 
         // Fast subscriber saw every publish.
         assert_eq!(
-            fast_received, total,
+            fast_events, total,
             "fast subscriber must receive every publish under C2e",
         );
 
@@ -909,6 +1051,76 @@ mod tests {
             slow_dropped, overflow as u64,
             "slow subscriber must have dropped exactly the overflow past its capacity",
         );
+    }
+
+    /// C2e review F2: an overflow followed by a drain must surface
+    /// a `Lagged` frame on the next successful send so the client
+    /// can reconcile via the durable history.
+    #[test]
+    fn overflow_then_drain_surfaces_lag_notice() {
+        let bus = EventBus::new();
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let mut sub = bus.subscribe_labeled(filter, "test");
+
+        // Fill the queue past capacity so N drops accumulate.
+        let overflow: u64 = 5;
+        for i in 0..(SUBSCRIBER_CAPACITY as u64 + overflow) {
+            bus.publish(custom(None, &format!("evt-{i}")));
+        }
+        assert_eq!(bus.dropped_for(sub.id).unwrap(), overflow);
+
+        // Drain everything already in the queue (the pre-overflow
+        // events).
+        let mut drained = 0;
+        while let Ok(SubscriberMessage::Event(_)) = sub.receiver.try_recv() {
+            drained += 1;
+        }
+        assert_eq!(drained, SUBSCRIBER_CAPACITY);
+
+        // The very next publish MUST land a Lagged frame first,
+        // then the event.
+        bus.publish(custom(None, "next"));
+        let lagged = sub.receiver.try_recv().expect("lagged frame present");
+        assert!(
+            matches!(lagged, SubscriberMessage::Lagged { skipped } if skipped == overflow),
+            "expected Lagged {{ skipped: {overflow} }}, got {lagged:?}",
+        );
+        let ev = sub.receiver.try_recv().expect("event follows lagged");
+        assert!(matches!(ev, SubscriberMessage::Event(_)));
+    }
+
+    /// C2e review F3: dropping the `EventBus` must let a consumer
+    /// awaiting `recv()` see `None` — the `SubscriberToken` holds
+    /// a `Weak` reference to the registry so it doesn't keep the
+    /// bus's `Sender` slots alive past its own lifetime.
+    #[test]
+    fn dropping_bus_closes_subscription_receiver() {
+        let bus = EventBus::new();
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let mut sub = bus.subscribe_labeled(filter, "outliving-bus");
+
+        // Bus drops but subscription (and its receiver) stays.
+        drop(bus);
+
+        // `recv()` on the mpsc receiver must observe channel
+        // closure — every strong ref to the sender is gone.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let got =
+                tokio::time::timeout(std::time::Duration::from_millis(100), sub.receiver.recv())
+                    .await
+                    .expect("recv must return promptly after bus drop, not hang");
+            assert!(got.is_none(), "recv must return None once bus drops");
+        });
     }
 
     /// C2e: dropping an `EventSubscription` deregisters its slot

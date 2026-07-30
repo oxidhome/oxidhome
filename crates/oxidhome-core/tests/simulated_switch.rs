@@ -107,7 +107,8 @@ async fn simulated_switch_round_trip() {
     let event = tokio::time::timeout(Duration::from_secs(1), subscription.receiver.recv())
         .await
         .expect("event arrived within 1s")
-        .expect("subscription receiver was not lagging");
+        .expect("subscription receiver was not lagging")
+        .expect_event();
 
     assert_eq!(event.device.as_deref(), Some(device_id.as_str()));
     match event.payload {

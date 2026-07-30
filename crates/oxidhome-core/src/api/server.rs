@@ -990,13 +990,24 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
         // buses rather than waiting for the next publish to find
         // a dead send target.
         tokio::select! {
-            ev = sub.receiver.recv() => match ev {
-                Some(event) => {
+            msg = sub.receiver.recv() => match msg {
+                Some(crate::state::SubscriberMessage::Event(event)) => {
                     let wire = WireEvent::from_host(&event);
                     let Ok(text) = serde_json::to_string(&wire) else {
                         continue;
                     };
                     if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                // C2e review F2: per-subscriber queue overflowed;
+                // surface the gap to the WebSocket client so it
+                // can reconcile via the durable event history
+                // (`GET /api/v1/events`) — same shape the
+                // pre-C2e broadcast RecvError::Lagged used.
+                Some(crate::state::SubscriberMessage::Lagged { skipped }) => {
+                    let notice = format!("{{\"lagged\":{skipped}}}");
+                    if socket.send(Message::Text(notice.into())).await.is_err() {
                         break;
                     }
                 }

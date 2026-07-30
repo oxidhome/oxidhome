@@ -57,14 +57,14 @@ use oxidhome_proto::proto::oxidhome::v1::{
     CustomEvent as ProtoCustomEvent, Device, Event as ProtoEvent,
     ExecuteCommandError as ProtoCmdError, ExecuteCommandRequest, ExecuteCommandResponse,
     Inference as ProtoInference, InstallPluginRequest, InstallPluginResponse, Instance,
-    KeyValue as ProtoKeyValue, ListDevicesRequest, ListDevicesResponse, ListInstancesRequest,
-    ListInstancesResponse, ListPluginsRequest, ListPluginsResponse, LogEvent as ProtoLogEvent,
-    LogField as ProtoLogField, LogLevel as ProtoLogLevel, LogValue as ProtoLogValue,
-    Plugin as ProtoPlugin, QueryLogsRequest, QueryLogsResponse, StartPluginRequest,
-    StartPluginResponse, StateChanged as ProtoStateChanged, StopPluginRequest, StopPluginResponse,
-    TailEventsRequest, TailEventsResponse, UninstallPluginRequest, UninstallPluginResponse,
-    Value as ProtoValue, event as proto_event, execute_command_error, execute_command_response,
-    log_value, tail_events_response, value,
+    KeyValue as ProtoKeyValue, Lagged as ProtoLagged, ListDevicesRequest, ListDevicesResponse,
+    ListInstancesRequest, ListInstancesResponse, ListPluginsRequest, ListPluginsResponse,
+    LogEvent as ProtoLogEvent, LogField as ProtoLogField, LogLevel as ProtoLogLevel,
+    LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest, QueryLogsResponse,
+    StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged, StopPluginRequest,
+    StopPluginResponse, TailEventsRequest, TailEventsResponse, UninstallPluginRequest,
+    UninstallPluginResponse, Value as ProtoValue, event as proto_event, execute_command_error,
+    execute_command_response, log_value, tail_events_response, value,
 };
 
 use crate::Engine;
@@ -914,9 +914,20 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         // subscription slot on the bus is freed.
         let response_stream =
             futures_util::stream::unfold(subscription, |mut subscription| async move {
+                use crate::state::SubscriberMessage;
                 let body = match subscription.receiver.recv().await {
-                    Some(event) => {
-                        tail_events_response::Body::Event(Box::new(wit_event_to_proto(event)))
+                    Some(SubscriberMessage::Event(event)) => tail_events_response::Body::Event(
+                        Box::new(wit_event_to_proto(std::sync::Arc::unwrap_or_clone(event))),
+                    ),
+                    // C2e review F2: subscriber-side overflow —
+                    // restore the pre-C2e Lagged body so clients
+                    // can detect the gap and reconcile via the
+                    // durable event history.
+                    Some(SubscriberMessage::Lagged { skipped }) => {
+                        tail_events_response::Body::Lagged(Box::new(ProtoLagged {
+                            skipped,
+                            ..Default::default()
+                        }))
                     }
                     // Channel closed — publisher gone (engine
                     // shutting down). End the stream cleanly.
