@@ -677,6 +677,14 @@ async fn start_plugin_instance(
         .instance_id
         .clone()
         .unwrap_or_else(|| plugin_id.clone());
+    // Follow-up review H3: hold the per-plugin_id lifecycle
+    // mutex for the duration of `get + start_instance +
+    // wait_for_running` so a concurrent `uninstall_plugin` for
+    // the same id can't slip between our registry lookup and
+    // supervisor launch — otherwise we could end up with a
+    // running instance whose installation has been deleted.
+    let lifecycle_lock = state.engine.plugin_lifecycle_lock(&plugin_id);
+    let _guard = lifecycle_lock.lock().await;
     let installed = state
         .engine
         .installed_plugins()
@@ -799,6 +807,14 @@ async fn uninstall_plugin(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<UninstalledRow>, PluginLifecycleError> {
     require_scope(&actor, PLUGINS_UNINSTALL)?;
+    // Follow-up review H3: hold the per-plugin_id lifecycle
+    // mutex for the whole check-running + uninstall sequence.
+    // Without it, a concurrent `start_plugin_instance` for the
+    // same id can register a fresh supervisor between our
+    // running-instances check and the FS remove, leaving a
+    // running instance whose backing has been deleted.
+    let lifecycle_lock = state.engine.plugin_lifecycle_lock(&plugin_id);
+    let _guard = lifecycle_lock.lock().await;
     let running: Vec<String> = state
         .engine
         .instances()

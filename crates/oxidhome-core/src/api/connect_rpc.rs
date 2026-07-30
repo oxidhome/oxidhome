@@ -533,6 +533,11 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
     ) -> ServiceResult<impl Encodable<StartPluginResponse> + Send + use<'a>> {
         require_scope_connect(&ctx, PLUGINS_START)?;
         let req = request.to_owned_message();
+        // Follow-up review H3: serialize with concurrent
+        // uninstall for the same plugin_id. Held across
+        // `get + start_instance + wait_for_running`.
+        let lifecycle_lock = self.engine.plugin_lifecycle_lock(&req.plugin_id);
+        let _guard = lifecycle_lock.lock().await;
         let installed = self
             .engine
             .installed_plugins()
@@ -623,6 +628,11 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
     ) -> ServiceResult<impl Encodable<UninstallPluginResponse> + Send + use<'a>> {
         require_scope_connect(&ctx, PLUGINS_UNINSTALL)?;
         let req = request.to_owned_message();
+        // Follow-up review H3: serialize with concurrent start
+        // for the same plugin_id. Held across the running-check
+        // + uninstall.
+        let lifecycle_lock = self.engine.plugin_lifecycle_lock(&req.plugin_id);
+        let _guard = lifecycle_lock.lock().await;
         // Refuse if any instance of the plugin is running. Same
         // fail-closed shape the JSON handler enforces — operator
         // stops first. FAILED_PRECONDITION is the Connect-side

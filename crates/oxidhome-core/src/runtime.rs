@@ -70,7 +70,26 @@ pub struct Engine {
     instances: Arc<InstanceRegistry>,
     auth_tokens: Arc<crate::state::TokenStore>,
     installed_plugins: Arc<InstalledPluginRegistry>,
+    /// Follow-up review H3: per-`plugin_id` async mutex used to
+    /// serialize `install` / `start_instance` / `uninstall` from
+    /// the API layer. Without it, `uninstall_plugin` and
+    /// `start_plugin_instance` for the same `plugin_id` could
+    /// race: uninstall passes its running-instances check, then
+    /// start registers a fresh instance + supervisor, then
+    /// uninstall yanks the FS dir — leaving a running instance
+    /// whose backing has been deleted. `Arc<TokioMutex<()>>` per
+    /// id, entries created lazily on first lock acquisition.
+    plugin_lifecycle_locks: PluginLifecycleLocks,
 }
+
+/// Follow-up review H3: shared, lazily-populated map of per-
+/// `plugin_id` async mutexes. Held under an outer sync `Mutex`
+/// for the map itself; the inner `tokio::sync::Mutex` is what
+/// callers actually acquire across `await`. Extracted to a
+/// type alias so the clippy `very_complex_type` lint stops
+/// firing on every field-access site.
+type PluginLifecycleLocks =
+    Arc<std::sync::Mutex<std::collections::HashMap<Arc<str>, Arc<tokio::sync::Mutex<()>>>>>;
 
 impl Engine {
     /// Build the default engine with an in-memory `SQLite` database.
@@ -165,6 +184,9 @@ impl Engine {
             instances: Arc::new(InstanceRegistry::new()),
             db,
             installed_plugins: Arc::new(installed_plugins),
+            plugin_lifecycle_locks: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -295,6 +317,27 @@ impl Engine {
         Arc::clone(&self.installed_plugins)
     }
 
+    /// Follow-up review H3: per-`plugin_id` async mutex used by
+    /// the API layer to serialize `install` / `start` / `uninstall`
+    /// against the same id. Returned as an `Arc<tokio::sync::Mutex>`
+    /// so both the JSON and Connect handlers can hold the same
+    /// lock across their respective async supervisor / SQL calls.
+    /// The map entry is created lazily on first request.
+    #[must_use]
+    pub fn plugin_lifecycle_lock(&self, plugin_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        use std::sync::PoisonError;
+        let mut map = self
+            .plugin_lifecycle_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(lock) = map.get(plugin_id) {
+            return Arc::clone(lock);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        map.insert(Arc::from(plugin_id), Arc::clone(&lock));
+        lock
+    }
+
     /// Start a supervised plugin instance under this engine. Reads
     /// the manifest at `<plugin_dir>/manifest.toml` first to enforce
     /// the singleton and duplicate-id checks, then spawns a
@@ -403,5 +446,51 @@ impl Engine {
     #[must_use]
     pub fn instance(&self, instance_id: &str) -> Option<InstanceHandle> {
         self.instances.get(instance_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Follow-up review H3: repeated calls to
+    /// `plugin_lifecycle_lock(id)` return the same `Arc<Mutex>`
+    /// so `start` and `uninstall` for the same `plugin_id`
+    /// serialize via a shared lock. Different ids get different
+    /// locks (no false-sharing).
+    #[tokio::test]
+    async fn plugin_lifecycle_locks_are_stable_per_id() {
+        let engine = Engine::new().expect("engine");
+        let a1 = engine.plugin_lifecycle_lock("example.plugin.a");
+        let a2 = engine.plugin_lifecycle_lock("example.plugin.a");
+        let b1 = engine.plugin_lifecycle_lock("example.plugin.b");
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "same plugin_id must yield same lock Arc",
+        );
+        assert!(
+            !Arc::ptr_eq(&a1, &b1),
+            "different plugin_ids must yield different locks",
+        );
+        // Concurrent locks against the same id serialize.
+        let held = a1.lock().await;
+        let a3 = engine.plugin_lifecycle_lock("example.plugin.a");
+        let contender = tokio::spawn(async move {
+            let _g = a3.lock().await;
+            "contender acquired"
+        });
+        // The contender is now waiting; give it a tick to prove
+        // it hasn't acquired yet.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !contender.is_finished(),
+            "contender must block until we release the lock",
+        );
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), contender)
+            .await
+            .expect("contender must acquire once we release")
+            .expect("contender task panicked");
+        assert_eq!(result, "contender acquired");
     }
 }
