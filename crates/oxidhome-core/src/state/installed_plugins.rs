@@ -66,6 +66,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use oxidhome_manifest::{CapabilitiesSection, PluginManifest};
 use rand::TryRng;
 use rusqlite::OptionalExtension;
+use sha2::{Digest, Sha256};
 
 use crate::state::Db;
 
@@ -105,10 +106,126 @@ pub struct InstalledPlugin {
     ///
     /// The split establishes the request/grant boundary; v1
     /// intentionally has no operator-override endpoint, so
-    /// grant == request for every fresh install. Backfilled
-    /// pre-C5 rows fall back to the loader's manifest at load
-    /// time.
+    /// grant == request for every fresh install. Pre-C5 rows
+    /// (NULL grant JSON) and rows whose grant JSON refuses to
+    /// deserialize are **quarantined** by scan — they never
+    /// surface through the registry — so an operator's reinstall
+    /// re-issues the boundary. C5 review F1 (fail-closed).
     pub granted_capabilities: Arc<CapabilitiesSection>,
+    /// C5 review F3: SHA-256 hex of the installed plugin's
+    /// contents (manifest + wasm + assets). Computed at install
+    /// time and stored in `plugin_installation.content_digest`;
+    /// the loader recomputes and refuses to apply
+    /// [`Self::granted_capabilities`] to a load whose bytes
+    /// disagree with the stored digest.
+    pub content_digest: Arc<str>,
+}
+
+/// C5 review F3: compute a stable content digest for an
+/// installed-plugin directory. Walks the tree, sorts files by
+/// relative path, and feeds each `(rel_path, contents)` pair
+/// into a single SHA-256 with a domain-separation tag + `u32`
+/// length prefixes. Symlinks are refused — the install path
+/// already rejects source trees containing symlinks, so a
+/// symlink under a live plugin dir is either operator tampering
+/// or filesystem corruption; either way, refuse to hash rather
+/// than silently follow.
+///
+/// Returns a 64-char lowercase hex string, or wraps the failing
+/// `io` operation.
+///
+/// # Errors
+///
+/// Any `std::io::Error` from directory walk or file read.
+pub fn content_digest(dir: &Path) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let tag = b"oxidhome:plugin-content:v1";
+    #[allow(clippy::cast_possible_truncation)]
+    hasher.update((tag.len() as u32).to_be_bytes());
+    hasher.update(tag);
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files(dir, dir, &mut files)?;
+    files.sort();
+
+    for rel in &files {
+        let full = dir.join(rel);
+        let rel_string = rel.to_string_lossy().into_owned();
+        let rel_bytes = rel_string.as_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        hasher.update((rel_bytes.len() as u32).to_be_bytes());
+        hasher.update(rel_bytes);
+        let contents = std::fs::read(&full)?;
+        #[allow(clippy::cast_possible_truncation)]
+        hasher.update((contents.len() as u32).to_be_bytes());
+        hasher.update(&contents);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in &digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let full = entry.path();
+        if ty.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "content_digest refuses to follow a symlink at {}",
+                    full.display()
+                ),
+            ));
+        }
+        if ty.is_dir() {
+            collect_files(root, &full, out)?;
+        } else if ty.is_file() {
+            let rel = full
+                .strip_prefix(root)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or(full);
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+/// C5 review F2: compute the **effective** capability set at
+/// load time. A stale grant broader than the current manifest's
+/// request must not authorize permissions the manifest no longer
+/// asks for — a plugin author removing a capability shouldn't
+/// leave the operator holding a broader grant on a package that
+/// no longer needs it.
+///
+/// Set-shaped fields (`network`, `declares_devices`,
+/// `declares_services`) intersect on equality; quotas take the
+/// minimum; `subscribes_events` is a boolean AND.
+#[must_use]
+pub fn effective_capabilities(
+    requested: &CapabilitiesSection,
+    granted: &CapabilitiesSection,
+) -> CapabilitiesSection {
+    CapabilitiesSection {
+        network: intersect_by_eq(&requested.network, &granted.network),
+        storage_quota_kb: requested.storage_quota_kb.min(granted.storage_quota_kb),
+        blob_quota_mb: requested.blob_quota_mb.min(granted.blob_quota_mb),
+        declares_devices: intersect_by_eq(&requested.declares_devices, &granted.declares_devices),
+        declares_services: intersect_by_eq(
+            &requested.declares_services,
+            &granted.declares_services,
+        ),
+        subscribes_events: requested.subscribes_events && granted.subscribes_events,
+    }
+}
+
+fn intersect_by_eq<T: Clone + PartialEq>(a: &[T], b: &[T]) -> Vec<T> {
+    a.iter().filter(|x| b.contains(x)).cloned().collect()
 }
 
 /// Mint a fresh installation UUID. Format: `inst-<32 lowercase hex>`
@@ -233,6 +350,15 @@ pub struct InstalledPluginRegistry {
     plugins_root: Option<PathBuf>,
     db: Option<Arc<Db>>,
     entries: RwLock<HashMap<Arc<str>, InstalledPlugin>>,
+    /// C5 review F1/F3 codex-fixup: `plugin_id`s of live SQL
+    /// rows that scan quarantined (NULL / malformed grant, NULL
+    /// digest). These installations don't appear in `entries` —
+    /// but the loader must also refuse to serve them via the
+    /// direct-start / argv path where an entry-miss would
+    /// otherwise fall through to dev-load semantics (synthetic
+    /// UUID + manifest-requested capabilities). Consulted by
+    /// [`Self::is_quarantined`].
+    quarantined: std::collections::HashSet<Arc<str>>,
 }
 
 impl InstalledPluginRegistry {
@@ -248,7 +374,20 @@ impl InstalledPluginRegistry {
             plugins_root: None,
             db: None,
             entries: RwLock::new(HashMap::new()),
+            quarantined: std::collections::HashSet::new(),
         }
+    }
+
+    /// C5 review F1/F3 codex-fixup: true if `plugin_id` matches a
+    /// live installation row that scan quarantined. The runtime
+    /// loader consults this before falling back to dev-load
+    /// semantics — direct-start (argv or `Engine::start_instance`
+    /// with a raw path) whose loaded manifest declares a
+    /// quarantined `plugin_id` must refuse to run, not shadow the
+    /// quarantine with a manifest-derived grant.
+    #[must_use]
+    pub fn is_quarantined(&self, plugin_id: &str) -> bool {
+        self.quarantined.contains(plugin_id)
     }
 
     // Poison-tolerant accessors. Critical sections here only do
@@ -303,14 +442,8 @@ impl InstalledPluginRegistry {
         // and the persisted granted-capabilities blob (C5).
         let LiveInstallationLoad {
             live: live_rows,
-            malformed_plugin_ids,
+            quarantined_plugin_ids,
         } = load_live_installations(&db)?;
-        // C5 review F2: NULL-grant rows we resolve via the current
-        // manifest also need a write-back UPDATE so the boundary is
-        // pinned. Accumulate them here (uuid, manifest capabilities)
-        // and issue the UPDATEs after the scan loop, matching the
-        // backfill-inserts pattern used for pre-C1b UUIDs.
-        let mut grant_backfills: Vec<(Arc<str>, CapabilitiesSection)> = Vec::new();
 
         let mut entries: HashMap<Arc<str>, InstalledPlugin> = HashMap::new();
         let mut backfills: Vec<InstalledPlugin> = Vec::new();
@@ -436,72 +569,68 @@ impl InstalledPluginRegistry {
             // intact, operator repairs, next scan indexes normally).
             // Adding to `observed_manifest_ids` above already
             // protects the row from the orphan-live-row sweep.
-            if malformed_plugin_ids.contains(&manifest_id) {
+            // C5 review F1/F3 (fail-closed): a live row that
+            // failed the SQL-read validation (NULL / malformed
+            // grant, or NULL digest) is quarantined. Skip
+            // indexing so `start_instance` can't launch the
+            // plugin under a broken grant; don't tombstone —
+            // the row stays live and the plugin_id is in
+            // `observed_manifest_ids` above, so the orphan
+            // sweep doesn't tombstone it either. Operator
+            // repairs via `uninstall` + `install` cycle.
+            if quarantined_plugin_ids.contains(&manifest_id) {
                 tracing::warn!(
                     plugin_id = %manifest_id,
                     path = %path.display(),
-                    "skipping installation with malformed grant JSON — repair the row and restart",
+                    "skipping quarantined installation (malformed grant or missing digest) — reinstall to re-issue",
                 );
                 continue;
             }
             let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
-            let manifest_capabilities = manifest.capabilities.clone();
-            let (installation_uuid, granted_capabilities) =
-                if let Some(live) = live_rows.get(&*id_arc) {
-                    let grant = if let Some(grant) = &live.granted_capabilities {
-                        Arc::clone(grant)
-                    } else {
-                        // C5 review F2: pre-C5 NULL grant.
-                        // Resolve to the manifest's current
-                        // request AND queue a backfill UPDATE
-                        // so subsequent boots pin the grant
-                        // in SQL instead of re-resolving
-                        // from a potentially-mutated manifest.
-                        grant_backfills.push((
-                            Arc::clone(&live.installation_uuid),
-                            manifest_capabilities.clone(),
-                        ));
-                        Arc::new(manifest_capabilities.clone())
-                    };
-                    (Arc::clone(&live.installation_uuid), grant)
-                } else {
-                    // FS entry with no live SQL row — mint one.
-                    //
-                    // Fixup review F3: the previous cut of this branch
-                    // tried to distinguish "interrupted uninstall"
-                    // (retry FS remove) from "hand-placed / restored
-                    // package" (backfill new UUID) by looking at
-                    // whether a tombstoned row existed for this
-                    // `plugin_id`. That heuristic destroys legitimate
-                    // hand-placed packages installed after a prior
-                    // uninstall — tombstone presence can't establish
-                    // that the current directory pre-dates the
-                    // tombstone.
-                    //
-                    // Under the FS-first uninstall order (see
-                    // `uninstall` body), an interrupted uninstall
-                    // whose `remove_dir_all` failed leaves the
-                    // **live** SQL row in place (tombstone step never
-                    // ran), so this branch is unreachable for that
-                    // shape. Any FS entry with no live row is either a
-                    // legit pre-C1b install (backfill new UUID) or a
-                    // legit post-uninstall restoration (also backfill
-                    // — a "reinstall by hand" should mint fresh
-                    // device ids, matching what the API's `install`
-                    // would have done). Both paths converge on the
-                    // same right answer: backfill. C5: the backfilled
-                    // row's grant defaults to the manifest's request.
-                    let uuid = mint_installation_uuid();
-                    let grant_arc = Arc::new(manifest_capabilities);
-                    backfills.push(InstalledPlugin {
-                        plugin_id: Arc::clone(&id_arc),
-                        installation_uuid: Arc::clone(&uuid),
-                        version: manifest.plugin.version.to_string(),
-                        path: path.clone(),
-                        granted_capabilities: Arc::clone(&grant_arc),
-                    });
-                    (uuid, grant_arc)
+            let (installation_uuid, granted_capabilities, content_digest_arc) = if let Some(live) =
+                live_rows.get(&*id_arc)
+            {
+                (
+                    Arc::clone(&live.installation_uuid),
+                    Arc::clone(&live.granted_capabilities),
+                    Arc::clone(&live.content_digest),
+                )
+            } else {
+                // FS entry with no live SQL row — mint one.
+                // Under the FS-first uninstall order, an
+                // interrupted uninstall whose `remove_dir_all`
+                // failed leaves the **live** SQL row in place
+                // (tombstone step never ran), so this branch
+                // isn't reachable for that shape. FS entries
+                // with no live row are legit pre-C1b installs
+                // or hand-placed / restored packages —
+                // backfill mints a fresh UUID + computes a
+                // fresh content digest, matching what the
+                // API's `install` would have done.
+                let uuid = mint_installation_uuid();
+                let digest = match content_digest(&path) {
+                    Ok(d) => Arc::<str>::from(d),
+                    Err(err) => {
+                        tracing::error!(
+                            plugin_id = %manifest_id,
+                            path = %path.display(),
+                            %err,
+                            "content_digest computation failed during backfill; skipping this directory",
+                        );
+                        continue;
+                    }
                 };
+                let grant_arc = Arc::new(manifest.capabilities.clone());
+                backfills.push(InstalledPlugin {
+                    plugin_id: Arc::clone(&id_arc),
+                    installation_uuid: Arc::clone(&uuid),
+                    version: manifest.plugin.version.to_string(),
+                    path: path.clone(),
+                    granted_capabilities: Arc::clone(&grant_arc),
+                    content_digest: Arc::clone(&digest),
+                });
+                (uuid, grant_arc, digest)
+            };
             entries.insert(
                 Arc::clone(&id_arc),
                 InstalledPlugin {
@@ -510,6 +639,7 @@ impl InstalledPluginRegistry {
                     version: manifest.plugin.version.to_string(),
                     path,
                     granted_capabilities,
+                    content_digest: content_digest_arc,
                 },
             );
         }
@@ -578,22 +708,14 @@ impl InstalledPluginRegistry {
             );
         }
 
-        // C5 review F2: pin grants for pre-C5 rows that had NULL
-        // `granted_capabilities_json`. Same fail-fast policy as
-        // the UUID backfill — a half-persisted grant would leave
-        // the identity boundary ambiguous.
-        for (uuid, grant) in &grant_backfills {
-            set_installation_grant(&db, uuid, grant)?;
-            tracing::info!(
-                installation_uuid = %uuid,
-                "backfilled granted_capabilities_json from manifest for pre-C5 row (pinned)",
-            );
-        }
-
         Ok(Self {
             plugins_root: Some(plugins_root),
             db: Some(db),
             entries: RwLock::new(entries),
+            quarantined: quarantined_plugin_ids
+                .into_iter()
+                .map(Arc::<str>::from)
+                .collect(),
         })
     }
 
@@ -680,6 +802,15 @@ impl InstalledPluginRegistry {
         // SQL row without a dir) and scan warns — never rotates
         // identity for the FS side.
         let id_arc: Arc<str> = Arc::from(plugin_id.as_str());
+        // Mint the installation UUID up-front so we can key the
+        // staging directory on it. C5-fixup codex review F1:
+        // deterministic `.staging-<plugin_id>` let two concurrent
+        // installs for the same plugin_id race on the same tree;
+        // per-request `.staging-<uuid>` makes each install's
+        // staging area private, so only the SQL unique-live-index
+        // decides which one wins.
+        let installation_uuid = mint_installation_uuid();
+        let staging = plugins_root.join(format!(".staging-{installation_uuid}"));
 
         // C5 review F3: copy + validate the staged manifest
         // **before** the SQL INSERT so the row's grant reflects
@@ -691,9 +822,8 @@ impl InstalledPluginRegistry {
         // request be persisted while the on-disk manifest
         // advertises a narrow one. Staging is transient — a
         // crash between the copy and the INSERT leaves a
-        // `.staging-<id>` dir that scan's staging-cleanup path
+        // `.staging-<uuid>` dir that scan's staging-cleanup path
         // removes, so no ghost identity or FS residue survives.
-        let staging = plugins_root.join(format!(".staging-{plugin_id}"));
         if staging.exists() {
             std::fs::remove_dir_all(&staging)?;
         }
@@ -735,14 +865,27 @@ impl InstalledPluginRegistry {
             });
         }
 
+        // C5 review F3: compute the content digest over the
+        // staged package (post-copy, before rename). The loader
+        // recomputes at load time and refuses to apply the
+        // stored grant if the bytes disagree.
+        let staged_digest = match content_digest(&staging) {
+            Ok(d) => d,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(InstallError::Io(err));
+            }
+        };
+
         let row = InstalledPlugin {
             plugin_id: Arc::clone(&id_arc),
-            installation_uuid: mint_installation_uuid(),
+            installation_uuid,
             version: staged_manifest.plugin.version.to_string(),
             path: dest.clone(),
-            // C5 review F3: grant is derived from the **staged**
-            // manifest, not the source.
+            // C5 review F3: grant + digest derived from the
+            // **staged** manifest / staged bytes, not the source.
             granted_capabilities: Arc::new(staged_manifest.capabilities.clone()),
+            content_digest: Arc::from(staged_digest),
         };
         if let Some(db) = &self.db
             && let Err(err) = insert_installation_row(db, &row)
@@ -880,46 +1023,50 @@ impl InstalledPluginRegistry {
 #[derive(Debug, Clone)]
 struct LiveInstallation {
     installation_uuid: Arc<str>,
-    /// C5: `None` if the SQL row is pre-C5 (NULL
-    /// `granted_capabilities_json`). Malformed grants are handled
-    /// separately — scan quarantines those via
-    /// [`LiveInstallationLoad::malformed_plugin_ids`]. The
-    /// backfill path materializes the current manifest's request
-    /// on first successful scan and UPDATEs the row so subsequent
-    /// boots pin the grant.
-    granted_capabilities: Option<Arc<CapabilitiesSection>>,
+    /// C5: successfully-parsed grant. NULL / malformed grants
+    /// are quarantined at the SQL-read layer under the C5
+    /// review F1 fail-closed policy — they never surface as a
+    /// [`LiveInstallation`].
+    granted_capabilities: Arc<CapabilitiesSection>,
+    /// C5 review F3: content digest captured at install time.
+    /// The loader recomputes and refuses to apply the grant to
+    /// a load whose bytes disagree with this value.
+    content_digest: Arc<str>,
 }
 
-/// Result of scanning `plugin_installation`. `live` holds rows that
-/// deserialized cleanly (or had a NULL grant); `malformed_plugin_ids`
-/// holds `plugin_id`s of live rows whose non-NULL grant JSON refused
-/// to parse — those installations are quarantined (not indexed, but
-/// not tombstoned either). C5 review F1.
+/// Result of scanning `plugin_installation`. `live` holds rows
+/// with a well-formed grant AND a non-NULL content digest;
+/// `quarantined_plugin_ids` holds `plugin_id`s whose row is
+/// unusable (NULL / malformed grant JSON, or NULL digest — the
+/// C5 fail-closed policy). Quarantined installations aren't
+/// indexed (so `start_instance` can't launch them) but their
+/// rows stay live so an operator's `uninstall` + `install` cycle
+/// re-issues both fields together. C5 review F1 (NULL grant
+/// fail-closed) + F3 (missing digest fail-closed).
 struct LiveInstallationLoad {
     live: HashMap<String, LiveInstallation>,
-    malformed_plugin_ids: std::collections::HashSet<String>,
+    quarantined_plugin_ids: std::collections::HashSet<String>,
 }
 
 /// Load every live `plugin_installation` row (i.e. `uninstalled_ms IS
 /// NULL`). Used by [`InstalledPluginRegistry::scan`] to reconcile
-/// FS entries against stored identity + grant.
+/// FS entries against stored identity + grant + digest.
 ///
-/// C5 review F1: a live row whose `granted_capabilities_json` is
-/// non-NULL but refuses to deserialize (corruption, manual repair
-/// typo, forward-compat schema change) is **not** silently
-/// downgraded to the manifest's request — that would let a
-/// previously-narrowed grant regain permissions after any restart
-/// that tripped a parse failure. Instead the `plugin_id` lands in
-/// `malformed_plugin_ids` and scan quarantines it: the entry isn't
-/// indexed (so `start_instance` fails cleanly) but its row stays
-/// live (identity isn't rotated) and the `plugin_id` is treated as
-/// "observed" for the orphan-sweep so the row isn't tombstoned.
-/// An operator repairs the grant JSON and the next scan indexes
-/// normally.
+/// C5 review F1 + F3 (fail-closed): a live row is quarantined if
+/// its `granted_capabilities_json` is NULL / refuses to
+/// deserialize, or if its `content_digest` is NULL. Falling back
+/// to the manifest for either field would let a previously-
+/// narrowed grant regain permissions after any parse failure /
+/// migration boot; a NULL digest would let arbitrary on-disk
+/// bytes run under a stored grant. Quarantined installations are
+/// not indexed (so `start_instance` fails cleanly) but their
+/// rows stay live (identity isn't rotated) — the scan protects
+/// them from the orphan sweep too. An operator's `uninstall` +
+/// `install` re-issues both fields together.
 fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Error> {
     db.read(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT plugin_id, installation_uuid, granted_capabilities_json
+            "SELECT plugin_id, installation_uuid, granted_capabilities_json, content_digest
              FROM plugin_installation
              WHERE uninstalled_ms IS NULL",
         )?;
@@ -927,82 +1074,71 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
             let plugin_id: String = row.get(0)?;
             let uuid: String = row.get(1)?;
             let grant_json: Option<String> = row.get(2)?;
-            Ok((plugin_id, uuid, grant_json))
+            let digest: Option<String> = row.get(3)?;
+            Ok((plugin_id, uuid, grant_json, digest))
         })?;
         let mut live = HashMap::new();
-        let mut malformed_plugin_ids = std::collections::HashSet::new();
+        let mut quarantined_plugin_ids = std::collections::HashSet::new();
         for row in rows {
-            let (plugin_id, uuid, grant_json) = row?;
-            match grant_json {
-                None => {
+            let (plugin_id, uuid, grant_json, digest) = row?;
+            let Some(digest) = digest else {
+                tracing::error!(
+                    plugin_id = %plugin_id,
+                    installation_uuid = %uuid,
+                    "content_digest is NULL (pre-C5 install or corrupt row); \
+                     quarantining — reinstall to re-issue the grant + digest \
+                     (C5 review F3 fail-closed)",
+                );
+                quarantined_plugin_ids.insert(plugin_id);
+                continue;
+            };
+            let Some(json) = grant_json else {
+                tracing::error!(
+                    plugin_id = %plugin_id,
+                    installation_uuid = %uuid,
+                    "granted_capabilities_json is NULL (pre-C5 install or corrupt row); \
+                     quarantining — reinstall to re-issue the grant \
+                     (C5 review F1 fail-closed)",
+                );
+                quarantined_plugin_ids.insert(plugin_id);
+                continue;
+            };
+            match serde_json::from_str::<CapabilitiesSection>(&json) {
+                Ok(cap) => {
                     live.insert(
                         plugin_id,
                         LiveInstallation {
                             installation_uuid: Arc::<str>::from(uuid),
-                            granted_capabilities: None,
+                            granted_capabilities: Arc::new(cap),
+                            content_digest: Arc::<str>::from(digest),
                         },
                     );
                 }
-                Some(json) => match serde_json::from_str::<CapabilitiesSection>(&json) {
-                    Ok(cap) => {
-                        live.insert(
-                            plugin_id,
-                            LiveInstallation {
-                                installation_uuid: Arc::<str>::from(uuid),
-                                granted_capabilities: Some(Arc::new(cap)),
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            plugin_id = %plugin_id,
-                            installation_uuid = %uuid,
-                            %err,
-                            "granted_capabilities_json failed to deserialize; \
-                             quarantining installation — plugin cannot start until \
-                             an operator repairs the row (fail-closed vs. silently \
-                             restoring the manifest's requested capabilities, C5 review F1)",
-                        );
-                        malformed_plugin_ids.insert(plugin_id);
-                    }
-                },
+                Err(err) => {
+                    tracing::error!(
+                        plugin_id = %plugin_id,
+                        installation_uuid = %uuid,
+                        %err,
+                        "granted_capabilities_json failed to deserialize; \
+                         quarantining — reinstall or hand-repair the JSON \
+                         (C5 review F1 fail-closed)",
+                    );
+                    quarantined_plugin_ids.insert(plugin_id);
+                }
             }
         }
         Ok(LiveInstallationLoad {
             live,
-            malformed_plugin_ids,
+            quarantined_plugin_ids,
         })
-    })
-}
-
-/// UPDATE the `granted_capabilities_json` of a live installation row.
-/// C5 review F2: used by scan to backfill pre-C5 rows (NULL grant)
-/// with a JSON copy of the current manifest's requested
-/// capabilities, so subsequent boots pin the grant instead of
-/// re-resolving from a potentially-mutated manifest.
-fn set_installation_grant(
-    db: &Db,
-    installation_uuid: &str,
-    grant: &CapabilitiesSection,
-) -> Result<(), rusqlite::Error> {
-    let grant_json = serde_json::to_string(grant)
-        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-    db.write(|conn| {
-        conn.execute(
-            "UPDATE plugin_installation
-                SET granted_capabilities_json = ?2
-              WHERE installation_uuid = ?1
-                AND uninstalled_ms IS NULL",
-            rusqlite::params![installation_uuid, &grant_json],
-        )?;
-        Ok(())
     })
 }
 
 /// INSERT a fresh installation row. Fails with a unique-constraint
 /// error if a live row already exists for `row.plugin_id` — callers
 /// (both `install` and the scan backfill) must have ruled out that
-/// case beforehand. C5: also persists the granted capabilities JSON.
+/// case beforehand. C5: also persists the granted capabilities
+/// JSON + content digest.
 fn insert_installation_row(db: &Db, row: &InstalledPlugin) -> Result<(), rusqlite::Error> {
     let grant_json = serde_json::to_string(row.granted_capabilities.as_ref()).map_err(|err| {
         // Should never happen — CapabilitiesSection is a plain
@@ -1015,14 +1151,15 @@ fn insert_installation_row(db: &Db, row: &InstalledPlugin) -> Result<(), rusqlit
         conn.execute(
             "INSERT INTO plugin_installation
                  (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms,
-                  granted_capabilities_json)
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                  granted_capabilities_json, content_digest)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
             rusqlite::params![
                 &*row.installation_uuid,
                 &*row.plugin_id,
                 &row.version,
                 now_ms(),
                 &grant_json,
+                &*row.content_digest,
             ],
         )?;
         Ok(())
@@ -1529,32 +1666,31 @@ wasm = "plugin.wasm"
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// C5: a pre-C5 row (backfilled by C1b's scan for a
-    /// hand-placed dir) has no `granted_capabilities_json`. The
-    /// scan falls back to the manifest's request without failing.
+    /// C5 review F1 (fail-closed): a pre-C5 row (NULL grant JSON,
+    /// NULL digest) must be quarantined by scan — not silently
+    /// resolved from the manifest. The registry doesn't index it
+    /// and `is_quarantined(plugin_id)` returns `true` so the
+    /// direct-start / argv loader path refuses to shadow the
+    /// quarantine with dev-load semantics.
     #[test]
-    fn scan_falls_back_to_manifest_when_grant_json_is_null() {
+    fn scan_quarantines_pre_c5_row_with_null_grant() {
         let root = tempdir("pre-c5-null-grant");
         let plugins_root = root.join("plugins");
         let db = fresh_db();
 
-        // Hand-INSERT a row with NULL granted_capabilities_json —
-        // the shape a pre-C5 install left behind.
         let plugin_id = "example.legacy";
         let uuid = mint_installation_uuid();
         db.write(|conn| {
             conn.execute(
                 "INSERT INTO plugin_installation
                      (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms,
-                      granted_capabilities_json)
-                 VALUES (?1, ?2, '0.1.0', 1, NULL, NULL)",
+                      granted_capabilities_json, content_digest)
+                 VALUES (?1, ?2, '0.1.0', 1, NULL, NULL, NULL)",
                 rusqlite::params![&*uuid, plugin_id],
             )?;
             Ok::<_, rusqlite::Error>(())
         })
         .unwrap();
-
-        // Also put the matching FS entry so the scan indexes it.
         let plugin_dir = plugins_root.join(plugin_id);
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(
@@ -1576,12 +1712,13 @@ wasm = "plugin.wasm"
         std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
 
         let reg = InstalledPluginRegistry::scan(plugins_root, db).unwrap();
-        let listed = reg.list();
-        assert_eq!(listed.len(), 1);
-        // Fallback grant equals the manifest's request.
-        assert_eq!(
-            *listed[0].granted_capabilities,
-            CapabilitiesSection::default()
+        assert!(
+            reg.list().is_empty(),
+            "pre-C5 NULL grant must be quarantined, not resolved from manifest",
+        );
+        assert!(
+            reg.is_quarantined(plugin_id),
+            "quarantined installations must be flagged so direct-start refuses to load them",
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -1645,70 +1782,46 @@ wasm = "plugin.wasm"
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// C5 review F2: a scan that falls back to the manifest for a
-    /// NULL-grant row must **persist** that resolved grant via
-    /// UPDATE, so subsequent boots pin the boundary rather than
-    /// re-resolving from a potentially-mutated manifest.
+    /// C5 review F2: `effective_capabilities` = requested ∩
+    /// granted. A stale grant broader than the current
+    /// manifest's request must not authorize the extra
+    /// permissions.
     #[test]
-    fn scan_backfills_null_grant_from_manifest_and_persists_it() {
-        let root = tempdir("null-grant-persist");
-        let plugins_root = root.join("plugins");
-        let db = fresh_db();
+    fn effective_capabilities_intersects_requested_and_granted() {
+        use oxidhome_manifest::CapabilitiesSection;
+        let requested = CapabilitiesSection {
+            declares_devices: vec!["dimmer".into()],
+            declares_services: vec![],
+            storage_quota_kb: 100,
+            blob_quota_mb: 50,
+            subscribes_events: true,
+            ..CapabilitiesSection::default()
+        };
+        let granted = CapabilitiesSection {
+            declares_devices: vec!["switch".into(), "dimmer".into()],
+            declares_services: vec!["automation".into()],
+            storage_quota_kb: 1_000,
+            blob_quota_mb: 10,
+            subscribes_events: true,
+            ..CapabilitiesSection::default()
+        };
+        let effective = effective_capabilities(&requested, &granted);
+        // Set-shaped fields intersect on equality.
+        assert_eq!(effective.declares_devices, vec!["dimmer".to_string()]);
+        assert!(effective.declares_services.is_empty());
+        // Quotas take the minimum.
+        assert_eq!(effective.storage_quota_kb, 100);
+        assert_eq!(effective.blob_quota_mb, 10);
+        // Boolean fields AND.
+        assert!(effective.subscribes_events);
 
-        // Hand-INSERT a pre-C5 row (NULL grant) + matching FS.
-        let plugin_id = "example.legacy";
-        let uuid = mint_installation_uuid();
-        db.write(|conn| {
-            conn.execute(
-                "INSERT INTO plugin_installation
-                     (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms,
-                      granted_capabilities_json)
-                 VALUES (?1, ?2, '0.1.0', 1, NULL, NULL)",
-                rusqlite::params![&*uuid, plugin_id],
-            )?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .unwrap();
-        let plugin_dir = plugins_root.join(plugin_id);
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        std::fs::write(
-            plugin_dir.join("manifest.toml"),
-            format!(
-                r#"manifest_version = 1
-[plugin]
-id = "{plugin_id}"
-name = "Legacy"
-version = "0.1.0"
-world = "plugin"
-sdk_version = "0.1.0"
-[runtime]
-wasm = "plugin.wasm"
-"#,
-            ),
-        )
-        .unwrap();
-        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
-
-        // First scan: falls back to manifest AND writes the grant back.
-        let _reg = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
-
-        // Row must now have a non-NULL grant JSON matching the
-        // manifest's default.
-        let grant_json: Option<String> = db
-            .read(|conn| {
-                conn.query_row(
-                    "SELECT granted_capabilities_json FROM plugin_installation
-                     WHERE installation_uuid = ?1",
-                    [&*uuid],
-                    |r| r.get(0),
-                )
-            })
-            .unwrap();
-        let grant_json = grant_json.expect("scan must persist a grant for pre-C5 rows");
-        let decoded: CapabilitiesSection = serde_json::from_str(&grant_json).unwrap();
-        assert_eq!(decoded, CapabilitiesSection::default());
-
-        std::fs::remove_dir_all(&root).unwrap();
+        // A granted-false wins over requested-true.
+        let narrow = CapabilitiesSection {
+            subscribes_events: false,
+            ..granted.clone()
+        };
+        let effective = effective_capabilities(&requested, &narrow);
+        assert!(!effective.subscribes_events);
     }
 
     /// C5 review F3: install must derive the grant from the
@@ -1964,6 +2077,7 @@ wasm = "plugin.wasm"
             version: "0.1.0".to_string(),
             path: plugins_root.join("example.ghost"),
             granted_capabilities: Arc::new(CapabilitiesSection::default()),
+            content_digest: Arc::from("0".repeat(64)),
         };
         insert_installation_row(&db, &ghost).unwrap();
         let ghost_uuid = Arc::clone(&ghost.installation_uuid);
@@ -2054,6 +2168,7 @@ wasm = "plugin.wasm"
             version: "0.1.0".to_string(),
             path: plugins_root.join("example.ghost"),
             granted_capabilities: Arc::new(CapabilitiesSection::default()),
+            content_digest: Arc::from("0".repeat(64)),
         };
         insert_installation_row(&db, &ghost).unwrap();
 

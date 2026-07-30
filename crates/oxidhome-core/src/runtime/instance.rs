@@ -300,6 +300,14 @@ impl PluginInstance {
 
     /// Shared tail: build the Linker, construct `PluginState`, load
     /// the component, instantiate.
+    // C1b + C5: the loader body is intentionally long — one path
+    // handles the installation-UUID lookup, path/digest guards,
+    // quarantine refusal, effective-capabilities computation,
+    // per-instance quota registration, and component
+    // instantiation. Splitting them would fragment the "resolve
+    // grant boundary → apply" contract that the C5 review fixes
+    // depend on.
+    #[allow(clippy::too_many_lines)]
     async fn instantiate(
         engine: &Engine,
         wasm_path: &Path,
@@ -350,15 +358,65 @@ impl PluginInstance {
         // ids — exactly the identity-inheritance the C1b change
         // exists to prevent.
         //
-        // C5: alongside the UUID, resolve the **granted**
-        // capabilities from the same registry row. Falls back to
-        // the manifest's requested capabilities when the load
-        // path bypasses the registry (dev / test) or the
-        // registry entry doesn't match this on-disk directory.
-        let (installation_uuid, granted_capabilities) =
+        // C5 review F1/F3 codex-fixup: quarantined installations
+        // must not fall through to dev-load semantics. The direct
+        // `Engine::start_instance(path, ...)` path (argv / test
+        // harness) reaches here with `installed_plugins().get()`
+        // returning `None`, which would otherwise apply the
+        // manifest's requested capabilities + a synthetic UUID —
+        // shadowing the operator's quarantine decision. Refuse.
+        if engine
+            .installed_plugins()
+            .is_quarantined(&manifest.plugin.id)
+        {
+            return Err(anyhow!(
+                "plugin {} is quarantined (malformed grant or missing content digest); \
+                 reinstall via the API to re-issue the boundary",
+                manifest.plugin.id
+            ));
+        }
+
+        // C5: resolve the **granted** capabilities from the same
+        // registry row that gave us the UUID. Falls back to the
+        // manifest's requested capabilities when the load path
+        // bypasses the registry (dev / test) or the registry
+        // entry doesn't match this on-disk directory.
+        //
+        // C5 review F2: compute the **effective** set —
+        // requested ∩ granted — so a stale grant broader than
+        // the current manifest can't authorize permissions the
+        // manifest no longer asks for.
+        //
+        // C5 review F3: verify the on-disk content digest
+        // matches the registered value before applying the
+        // grant. A mismatch means the plugin.wasm / manifest /
+        // assets were replaced in place since install; refuse
+        // to run the modified bytes under the pre-modification
+        // grant. Dev-time loads (no registry row, or mismatched
+        // registry path) inherently have no digest to check.
+        let requested = &manifest.capabilities;
+        let (installation_uuid, effective_grant) =
             match engine.installed_plugins().get(&manifest.plugin.id) {
                 Some(row) if loaded_dir_matches_registry(wasm_path, &row.path) => {
-                    (row.installation_uuid, row.granted_capabilities)
+                    let on_disk = crate::state::content_digest(&row.path).map_err(|err| {
+                        anyhow!(
+                            "computing content digest of installed plugin {}: {err}",
+                            row.path.display()
+                        )
+                    })?;
+                    if on_disk != *row.content_digest {
+                        return Err(anyhow!(
+                            "content digest mismatch for plugin {} (installed contents \
+                             have been modified since install); reinstall via the API \
+                             to re-issue the grant + digest",
+                            manifest.plugin.id
+                        ));
+                    }
+                    let effective = crate::state::effective_capabilities(
+                        requested,
+                        row.granted_capabilities.as_ref(),
+                    );
+                    (row.installation_uuid, Arc::new(effective))
                 }
                 Some(row) => {
                     tracing::warn!(
@@ -372,14 +430,15 @@ impl PluginInstance {
                     );
                     (
                         Arc::<str>::from(manifest.plugin.id.as_str()),
-                        Arc::new(manifest.capabilities.clone()),
+                        Arc::new(requested.clone()),
                     )
                 }
                 None => (
                     Arc::<str>::from(manifest.plugin.id.as_str()),
-                    Arc::new(manifest.capabilities.clone()),
+                    Arc::new(requested.clone()),
                 ),
             };
+        let granted_capabilities = effective_grant;
 
         // Reserve a `kv_usage` row for this instance with the
         // **granted** quota (C5). `register_instance` is
