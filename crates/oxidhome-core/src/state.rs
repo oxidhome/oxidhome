@@ -36,7 +36,7 @@ pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicM
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
     InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, content_digest,
-    effective_capabilities,
+    effective_capabilities, read_installed_bytes,
 };
 pub use kv::{KvError, KvStore};
 pub use log_store::{

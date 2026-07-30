@@ -133,6 +133,13 @@ rand.workspace = true
 sha2.workspace = true
 tower.workspace = true
 
+# `O_NOFOLLOW` constant for `read_no_follow_within` — closes the
+# check-then-open TOCTOU window on install-time / scan-time reads
+# of manifest.toml + plugin.wasm. Unix-only; the Windows fallback
+# in that helper doesn't need libc.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Connect RPC. `oxidhome-proto` holds the generated service traits;
 # `connectrpc` provides the Router that mounts onto axum via
 # `into_axum_service()`.

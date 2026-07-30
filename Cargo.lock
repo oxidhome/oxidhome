@@ -1240,6 +1240,7 @@ dependencies = [
  "connectrpc",
  "futures-util",
  "http-body-util",
+ "libc",
  "oxidhome-manifest",
  "oxidhome-proto",
  "rand 0.10.2",

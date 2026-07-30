@@ -185,15 +185,21 @@ impl PluginInstance {
         );
         async move {
             let manifest_path = plugin_dir.join("manifest.toml");
-            let manifest_text = tokio::fs::read_to_string(&manifest_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "reading manifest from {} (does the plugin dir contain manifest.toml?)",
-                        manifest_path.display(),
-                    )
-                })?;
-            let manifest: PluginManifest = toml::from_str(&manifest_text)
+            // C5 review F3 round-4 F2: read the manifest as
+            // **raw bytes** so the same buffer feeds both parse
+            // and the load-time digest check further down.
+            // Reading as `String` and then re-reading for the
+            // hash would reintroduce the TOCTOU window this fix
+            // exists to close.
+            let manifest_bytes = tokio::fs::read(&manifest_path).await.with_context(|| {
+                format!(
+                    "reading manifest from {} (does the plugin dir contain manifest.toml?)",
+                    manifest_path.display(),
+                )
+            })?;
+            let manifest_text = std::str::from_utf8(&manifest_bytes)
+                .with_context(|| format!("manifest {} is not UTF-8", manifest_path.display()))?;
+            let manifest: PluginManifest = toml::from_str(manifest_text)
                 .with_context(|| format!("parsing {}", manifest_path.display()))?;
             // Record the plugin id onto the active span as soon as
             // it's known. Validation, compatibility-check, and
@@ -249,8 +255,28 @@ impl PluginInstance {
             })?;
 
             let wasm_path = resolve_wasm_path(&plugin_dir, &manifest.runtime.wasm)?;
+            // C5 review F3 round-4 F2: read wasm bytes into
+            // memory once, then feed those same bytes to BOTH
+            // the digest verification and wasmtime's
+            // `Component::from_binary`. That closes the TOCTOU
+            // window where an on-disk rewrite between the
+            // digest walk and `Component::from_file` could sneak
+            // modified code past the check.
+            let wasm_bytes = tokio::fs::read(&wasm_path)
+                .await
+                .with_context(|| format!("reading wasm component from {}", wasm_path.display()))?;
             let manifest = Arc::new(manifest);
-            Self::instantiate(engine, &wasm_path, instance_id, manifest, config).await
+            Self::instantiate(
+                engine,
+                &plugin_dir,
+                &wasm_path,
+                &manifest_bytes,
+                &wasm_bytes,
+                instance_id,
+                manifest,
+                config,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -295,7 +321,24 @@ impl PluginInstance {
             )
         })?;
 
-        Self::instantiate(engine, wasm_path, instance_id, Arc::new(manifest), config).await
+        // Test path: no registry entry, so no digest check runs;
+        // pass empty manifest bytes so `instantiate` treats this
+        // as a dev-time load.
+        let wasm_bytes = tokio::fs::read(wasm_path)
+            .await
+            .with_context(|| format!("reading wasm from {}", wasm_path.display()))?;
+        let plugin_dir = wasm_path.parent().unwrap_or(wasm_path).to_path_buf();
+        Self::instantiate(
+            engine,
+            &plugin_dir,
+            wasm_path,
+            &[],
+            &wasm_bytes,
+            instance_id,
+            Arc::new(manifest),
+            config,
+        )
+        .await
     }
 
     /// Shared tail: build the Linker, construct `PluginState`, load
@@ -307,15 +350,24 @@ impl PluginInstance {
     // instantiation. Splitting them would fragment the "resolve
     // grant boundary → apply" contract that the C5 review fixes
     // depend on.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn instantiate(
         engine: &Engine,
+        plugin_dir: &Path,
         wasm_path: &Path,
+        manifest_bytes: &[u8],
+        wasm_bytes: &[u8],
         instance_id: impl Into<String>,
         manifest: Arc<PluginManifest>,
         config: InstanceConfig,
     ) -> anyhow::Result<Self> {
-        let component = Component::from_file(engine.raw(), wasm_path)
+        // C5 review F3 round-4 F2: instantiate from the same
+        // in-memory wasm bytes the digest check will read, not
+        // from the on-disk file. That closes the TOCTOU window
+        // where an attacker with FS write access could swap
+        // `plugin.wasm` between the digest walk and
+        // `Component::from_file`.
+        let component = Component::from_binary(engine.raw(), wasm_bytes)
             .map_err(anyhow::Error::from)
             .with_context(|| format!("loading component from {}", wasm_path.display()))?;
 
@@ -395,15 +447,19 @@ impl PluginInstance {
         // grant. Dev-time loads (no registry row, or mismatched
         // registry path) inherently have no digest to check.
         let requested = &manifest.capabilities;
+        let _ = plugin_dir; // retained for future callsites; the
+        // digest below already binds to the exact bytes we
+        // parsed + will compile.
         let (installation_uuid, effective_grant) =
             match engine.installed_plugins().get(&manifest.plugin.id) {
                 Some(row) if loaded_dir_matches_registry(wasm_path, &row.path) => {
-                    let on_disk = crate::state::content_digest(&row.path).map_err(|err| {
-                        anyhow!(
-                            "computing content digest of installed plugin {}: {err}",
-                            row.path.display()
-                        )
-                    })?;
+                    // C5 review F3 round-4 F2: hash the SAME
+                    // in-memory manifest + wasm buffers that
+                    // `Component::from_binary` will compile
+                    // from. Reading files again here would
+                    // reintroduce the TOCTOU window this fix
+                    // exists to close.
+                    let on_disk = crate::state::content_digest(manifest_bytes, wasm_bytes);
                     if on_disk != *row.content_digest {
                         return Err(anyhow!(
                             "content digest mismatch for plugin {} (installed contents \
