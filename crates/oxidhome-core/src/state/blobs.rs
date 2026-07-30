@@ -62,6 +62,17 @@ pub enum BlobError {
     #[error("instance `{instance_id}` is not registered with the blob store")]
     UnregisteredInstance { instance_id: String },
 
+    /// Follow-up review H1: the caller supplied an `instance_id`
+    /// that isn't safe to use as a filesystem segment (path
+    /// traversal, absolute path, empty). The API's
+    /// `start_plugin_instance` handler rejects these at the edge
+    /// with a 400; this variant is the belt-and-suspenders check
+    /// at the blob-store call site so a direct caller (host-side
+    /// test harness bypassing the API) can't induce path escape
+    /// either.
+    #[error("blob instance_id {instance_id:?} is unsafe for use as a filesystem segment")]
+    UnsafeInstanceId { instance_id: String },
+
     /// Completing the write would push past the manifest-declared
     /// `blob_quota_mb`. Refused before any rename / commit.
     #[error(
@@ -106,6 +117,50 @@ pub enum BlobError {
         #[source]
         source: rusqlite::Error,
     },
+}
+
+/// Follow-up review H1: reject `instance_id`s that aren't safe as
+/// filesystem segments. Absolute paths would replace `blobs_root`
+/// under `Path::join`; `..` escapes it; empty / leading-dot names
+/// clobber the `.tmp` staging convention. Mirrors
+/// `is_safe_plugin_id` in the installed-plugin registry — same
+/// FS-segment rules apply everywhere the identity crosses the
+/// filesystem boundary. Called by every blob-store entry point AND
+/// at the API layer so a bad id is rejected before it ever reaches
+/// path construction.
+#[must_use]
+pub fn is_safe_instance_id(instance_id: &str) -> bool {
+    !instance_id.is_empty()
+        && !instance_id.contains('/')
+        && !instance_id.contains('\\')
+        && !instance_id.contains("..")
+        && !instance_id.starts_with('.')
+        && !instance_id.contains('\0')
+}
+
+fn check_instance_id(instance_id: &str) -> Result<(), BlobError> {
+    if is_safe_instance_id(instance_id) {
+        Ok(())
+    } else {
+        Err(BlobError::UnsafeInstanceId {
+            instance_id: instance_id.to_owned(),
+        })
+    }
+}
+
+/// H1 defense-in-depth: the resolved path for any blob operation
+/// MUST live under `blobs_root`. `is_safe_instance_id` above
+/// guards the segment shape, but this containment check is the
+/// last line: even if a future refactor bypasses the shape check,
+/// nothing writes / reads outside the blob root.
+fn ensure_contained(blobs_root: &Path, path: &Path) -> Result<(), BlobError> {
+    if path.starts_with(blobs_root) {
+        Ok(())
+    } else {
+        Err(BlobError::UnsafeInstanceId {
+            instance_id: path.display().to_string(),
+        })
+    }
 }
 
 /// Outcome from a successful `write` transaction. Carries the path
@@ -168,6 +223,7 @@ impl BlobStore {
     ///
     /// ``SQLite`` errors surface as [`BlobError::Sql`].
     pub fn register_instance(&self, instance_id: &str, quota_bytes: u64) -> Result<(), BlobError> {
+        check_instance_id(instance_id)?;
         let quota_i64 = i64::try_from(quota_bytes).unwrap_or(i64::MAX);
         self.db.write(|conn| -> Result<(), BlobError> {
             conn.execute(
@@ -187,6 +243,7 @@ impl BlobStore {
     ///
     /// Forwards SQL errors.
     pub fn usage(&self, instance_id: &str) -> Result<Option<(u64, u64)>, BlobError> {
+        check_instance_id(instance_id)?;
         let row = self.db.read(|conn| -> Result<_, BlobError> {
             Ok(conn
                 .query_row(
@@ -224,8 +281,10 @@ impl BlobStore {
         data: &[u8],
         mime: Option<&str>,
     ) -> Result<String, BlobError> {
+        check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
         let instance_dir = blobs_root.join(instance_id);
+        ensure_contained(blobs_root, &instance_dir)?;
         let tmp_dir = instance_dir.join(".tmp");
         let id = self.mint_id();
         let tmp_path = tmp_dir.join(&id);
@@ -378,6 +437,7 @@ impl BlobStore {
     ///   instance.
     /// - [`BlobError::Io`] for filesystem failures.
     pub fn read(&self, instance_id: &str, id: &str) -> Result<Vec<u8>, BlobError> {
+        check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
         // Confirm the row exists for this instance — otherwise a
         // plugin could read another instance's blob by guessing the
@@ -399,6 +459,7 @@ impl BlobStore {
             });
         }
         let path = blobs_root.join(instance_id).join(id);
+        ensure_contained(blobs_root, &path)?;
         std::fs::read(&path).map_err(|source| BlobError::Io { path, source })
     }
 
@@ -408,6 +469,7 @@ impl BlobStore {
     ///
     /// Same as [`Self::read`].
     pub fn read_by_name(&self, instance_id: &str, name: &str) -> Result<Vec<u8>, BlobError> {
+        check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
         let id: String = self
             .db
@@ -424,6 +486,7 @@ impl BlobStore {
                 what: format!("name `{name}` for instance `{instance_id}`"),
             })?;
         let path = blobs_root.join(instance_id).join(&id);
+        ensure_contained(blobs_root, &path)?;
         std::fs::read(&path).map_err(|source| BlobError::Io { path, source })
     }
 
@@ -434,6 +497,7 @@ impl BlobStore {
     /// - [`BlobError::NotFound`] if no blob with that name.
     /// - [`BlobError::Sql`] for SQL errors.
     pub fn get_info(&self, instance_id: &str, name: &str) -> Result<BlobInfo, BlobError> {
+        check_instance_id(instance_id)?;
         self.db
             .read(|conn| -> Result<_, BlobError> {
                 conn.query_row(
@@ -460,6 +524,7 @@ impl BlobStore {
     ///   actual file is being removed).
     /// - [`BlobError::Sql`] for index transaction failures.
     pub fn delete(&self, instance_id: &str, name: &str) -> Result<(), BlobError> {
+        check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
         let instance_id_owned = instance_id.to_owned();
         let name_owned = name.to_owned();
@@ -484,6 +549,7 @@ impl BlobStore {
         })?;
         if let Some(id) = id {
             let instance_dir = blobs_root.join(instance_id);
+            ensure_contained(blobs_root, &instance_dir)?;
             let path = instance_dir.join(&id);
             // Best-effort: row already gone, FS orphan would be
             // cleaned by Phase-12 sweep. `fsync_dir` after the
@@ -504,6 +570,7 @@ impl BlobStore {
     ///
     /// Forwards SQL errors.
     pub fn list_blobs(&self, instance_id: &str, prefix: &str) -> Result<Vec<BlobInfo>, BlobError> {
+        check_instance_id(instance_id)?;
         self.db.read(|conn| -> Result<_, BlobError> {
             let mut stmt = conn.prepare(
                 "SELECT name, id, size_bytes, created_ms, mime FROM blob \
@@ -932,5 +999,80 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("mk tempdir");
         TempDir { path }
+    }
+
+    /// Follow-up review H1: every blob-store entry point must
+    /// refuse an unsafe `instance_id` — path traversal, absolute
+    /// path, empty, leading dot, NUL byte. The check runs before
+    /// any path construction so the FS never sees the malicious
+    /// segment.
+    #[test]
+    fn all_entry_points_refuse_unsafe_instance_id() {
+        let dir = tempdir();
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        let blobs = BlobStore::new(db, Some(dir.path.clone()));
+        let unsafe_ids = [
+            "",
+            "..",
+            "../etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            "/absolute",
+            ".hidden",
+            "with\0nul",
+        ];
+        for id in unsafe_ids {
+            assert!(
+                matches!(
+                    blobs.register_instance(id, 4096),
+                    Err(BlobError::UnsafeInstanceId { .. })
+                ),
+                "register_instance({id:?}) must refuse"
+            );
+            assert!(matches!(
+                blobs.write(id, "name", b"data", None),
+                Err(BlobError::UnsafeInstanceId { .. })
+            ));
+            assert!(matches!(
+                blobs.read(id, "any-id"),
+                Err(BlobError::UnsafeInstanceId { .. })
+            ));
+            assert!(matches!(
+                blobs.read_by_name(id, "name"),
+                Err(BlobError::UnsafeInstanceId { .. })
+            ));
+            assert!(matches!(
+                blobs.get_info(id, "name"),
+                Err(BlobError::UnsafeInstanceId { .. })
+            ));
+            assert!(matches!(
+                blobs.delete(id, "name"),
+                Err(BlobError::UnsafeInstanceId { .. })
+            ));
+            assert!(matches!(
+                blobs.list_blobs(id, ""),
+                Err(BlobError::UnsafeInstanceId { .. })
+            ));
+            assert!(matches!(
+                blobs.usage(id),
+                Err(BlobError::UnsafeInstanceId { .. })
+            ));
+        }
+    }
+
+    /// Positive control: safe ids continue to work.
+    #[test]
+    fn safe_instance_id_write_read_roundtrips() {
+        let dir = tempdir();
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        let blobs = BlobStore::new(db, Some(dir.path.clone()));
+        blobs
+            .register_instance("example.inst-1", 4096)
+            .expect("register");
+        let id = blobs
+            .write("example.inst-1", "readme.txt", b"hello", Some("text/plain"))
+            .expect("write");
+        let bytes = blobs.read("example.inst-1", &id).expect("read");
+        assert_eq!(bytes, b"hello");
     }
 }
