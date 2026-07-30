@@ -969,8 +969,18 @@ async fn tail_events(
 
 async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
     use axum::extract::ws::Message;
-    use tokio::sync::broadcast::error::RecvError;
-    let mut sub = engine.events().subscribe_all();
+    // C2e: per-subscriber mpsc queue. `recv()` returns `None` when
+    // the bus drops (engine shutdown) or the subscription's
+    // `SubscriberToken` is dropped. Drops due to a slow WebSocket
+    // now happen *for this subscriber only* — the pre-C2e shared
+    // ring evicted events for every subscriber on lag.
+    let mut sub = engine.events().subscribe_labeled(
+        crate::host_impl::plugin::oxidhome::plugin::events::EventFilter {
+            device: None,
+            topic: None,
+        },
+        "http-tail",
+    );
     loop {
         // Select between the bus (events to push) and the socket
         // (client frames + disconnects). Polling `socket.recv()`
@@ -981,7 +991,7 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
         // a dead send target.
         tokio::select! {
             ev = sub.receiver.recv() => match ev {
-                Ok(event) => {
+                Some(event) => {
                     let wire = WireEvent::from_host(&event);
                     let Ok(text) = serde_json::to_string(&wire) else {
                         continue;
@@ -990,12 +1000,7 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
                         break;
                     }
                 }
-                Err(RecvError::Lagged(n)) => {
-                    let _ = socket
-                        .send(Message::Text(format!("{{\"lagged\":{n}}}").into()))
-                        .await;
-                }
-                Err(RecvError::Closed) => break,
+                None => break,
             },
             client = socket.recv() => match client {
                 // Client gone (None) or socket error → exit. Close

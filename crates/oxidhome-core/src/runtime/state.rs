@@ -1746,12 +1746,16 @@ mod tests {
             .unwrap();
 
         let sub = state.subscriptions.iter_mut().find(|s| s.id == id).unwrap();
+        // C2e: publish filters at delivery time (per-subscriber
+        // mpsc queue). Only the matching event reaches this
+        // subscriber; the non-matching event is dropped at
+        // enqueue rather than filtered on receive.
         let ev1 = sub.receiver.try_recv().unwrap();
         assert!(sub.matches(&ev1));
-        let ev2 = sub.receiver.try_recv().unwrap();
-        assert!(!sub.matches(&ev2));
-        // Both arrive on the wire (broadcast is unfiltered); the
-        // per-subscription filter is what `matches` checks.
+        assert!(
+            sub.receiver.try_recv().is_err(),
+            "non-matching event must not reach the subscriber queue under C2e",
+        );
     }
 
     // ── host-config / storage / logging ───────────────────────────

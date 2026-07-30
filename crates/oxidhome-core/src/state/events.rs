@@ -1,32 +1,38 @@
 //! Per-engine event bus.
 //!
-//! A tokio [`broadcast`] channel fans every `publish-event` call out
-//! to every subscriber that's awaiting on the shared receiver:
+//! Fans every `publish-event` call out to every subscriber:
 //! plugin instances (via their [`PluginState`] subscription list),
 //! host-side integration tests, and — since 12-API-c — the JSON
 //! `GET /api/v1/events/tail` WebSocket + the Connect
 //! `Events.TailEvents` stream.
 //!
-//! Two architecture-review C2d additions on top of the broadcast
-//! primitive:
+//! ## Architecture-review C2d + C2e
 //!
-//! 1. **Per-instance publish rate limit.** `try_publish(instance_id,
-//!    event)` consults a token bucket keyed by the publisher's
+//! 1. **C2d — per-instance publish rate limit.** `admit_publish(
+//!    instance_id)` consults a token bucket keyed by the publisher's
 //!    instance id and refuses over-quota bursts with
 //!    [`PublishDenied::RateLimited`]. Defaults chosen so a well-
 //!    behaved plugin never trips the limit but a rogue publisher
-//!    can't monopolize the shared broadcast ring's 256-slot
-//!    capacity.
-//! 2. **Filtered wake registration.** Subscribers whose consumer is
-//!    a tokio task that needs to be *woken* on delivery (the plugin
-//!    supervisor is the concrete case) register an
+//!    can't flood the delivery loop.
+//! 2. **C2d — filtered wake registration.** Subscribers whose
+//!    consumer is a tokio task that needs to be *woken* on delivery
+//!    (the plugin supervisor is the concrete case) register an
 //!    [`Arc<Notify>`](tokio::sync::Notify) alongside a filter. Each
 //!    published event signals only the wakes whose filter matches,
 //!    so a plugin whose instance has zero subscriptions is quiet
-//!    under any flood — the pre-C2d supervisor's unconditional
-//!    `subscribe_all()` wake receiver had the opposite property
-//!    ("every publish wakes every instance") which is exactly the
-//!    fan-out amplification the C2 review flagged.
+//!    under any flood.
+//! 3. **C2e — per-subscriber `mpsc` queues.** Delivery uses one
+//!    [`mpsc::channel`](tokio::sync::mpsc::channel) per subscriber
+//!    instead of a shared [`broadcast`](tokio::sync::broadcast)
+//!    ring. Each subscriber owns [`SUBSCRIBER_CAPACITY`] slots; a
+//!    slow subscriber whose queue fills drops events **for itself
+//!    only** (`tracing::warn` + a per-subscriber drop counter). The
+//!    pre-C2e broadcast ring shared its 256-slot capacity across
+//!    every subscriber, so a single lagging tail client evicted
+//!    events for the plugin supervisor and every other tail —
+//!    C2d's arrival rate limit bounded the flow into the ring;
+//!    C2e's per-subscriber queues bound the retention per
+//!    subscriber so one slow reader can't degrade the others.
 //!
 //! [`broadcast`]: tokio::sync::broadcast
 //! [`PluginState`]: crate::runtime::PluginState
@@ -36,19 +42,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, mpsc};
 
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventFilter};
 use crate::host_impl::plugin::oxidhome::plugin::types::SubscriptionId;
 
-/// How many events the broadcast channel buffers per subscriber. Slow
-/// subscribers that miss this many events get a
-/// [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged)
-/// reporting how many events were skipped; the receiver itself stays
-/// usable (tokio's broadcast channel doesn't invalidate it). Phase 5d's
-/// durable history is what makes catching up cheap if a subscriber
-/// drops far behind.
-const BUS_CAPACITY: usize = 256;
+/// C2e — per-subscriber queue depth. A subscriber whose consumer
+/// is slower than the publisher(s) drops events past this many
+/// unread slots; a `tracing::warn` fires with the subscription id
+/// and cumulative drop count. Sized generously (256) — the C2d
+/// per-instance publish rate limit already bounds the arrival
+/// rate, so this depth is about tolerating brief consumer stalls
+/// (GC pause, WebSocket flush blip) without dropping.
+const SUBSCRIBER_CAPACITY: usize = 256;
 
 /// Default per-instance publish rate ceiling (events/second). A
 /// well-behaved plugin publishing at natural device cadences
@@ -56,43 +62,52 @@ const BUS_CAPACITY: usize = 256;
 /// nowhere near this — 100/sec is one event every 10 ms sustained,
 /// which is faster than any real home-automation device fires.
 ///
-/// PR #82 review, F3 — the first cut of C2d permitted a 500-event
-/// burst against a 256-slot broadcast ring, so one instance's
-/// burst alone could evict every subscriber's un-drained events.
-/// Bringing the burst well below the ring's per-slot capacity
-/// bounds the worst-case cross-subscriber eviction to whatever
-/// slack the slowest subscriber has, not the ring's total.
-///
-/// Not a full fix — per-subscriber queues (filed as a follow-up)
-/// are still what closes cross-subscriber eviction properly. The
-/// rate limit here bounds the *arrival* rate; per-subscriber
-/// queues bound the *retention*.
+/// PR #82 review, F3 (pre-C2e) — the first cut of C2d permitted a
+/// 500-event burst against a 256-slot broadcast ring, so one
+/// instance's burst alone could evict every subscriber's un-drained
+/// events. Bringing the burst below the ring's per-slot capacity
+/// bounded worst-case cross-subscriber eviction. C2e's per-subscriber
+/// queues make that eviction-across-subscribers impossible in the
+/// first place, but the arrival rate limit still matters:
+/// it bounds how much a rogue plugin can spend on the delivery
+/// loop (per-subscriber `try_send` + filter check) per second.
 const DEFAULT_PUBLISH_RATE_PER_SEC: f64 = 100.0;
-/// Max burst — how many tokens the bucket can hold. Sized well
-/// below [`BUS_CAPACITY`] so a single instance's full burst plus
-/// a modest amount of already-buffered events from other
-/// publishers fits in the ring without evicting anything.
+/// Max burst — how many tokens the bucket can hold. Sized
+/// generously enough that a well-behaved plugin's natural bursts
+/// (device online, batch state refresh at startup) go through
+/// without being throttled, but low enough that a rogue publisher
+/// can't monopolize the delivery loop.
 const DEFAULT_PUBLISH_BURST: f64 = 64.0;
 
 /// Live pub/sub for plugin-published events.
 ///
-/// Cheap to clone via `Arc<EventBus>` (the broadcast channel + the
-/// wake/rate-limit maps all share their internal state through
-/// `Arc` slots). Single global instance per
+/// Cheap to clone via `Arc<EventBus>` (all internal state lives
+/// behind `Arc` slots). Single global instance per
 /// [`Engine`](crate::Engine).
 #[derive(Debug)]
 pub struct EventBus {
-    sender: broadcast::Sender<Event>,
+    // C2e: per-subscriber `mpsc::Sender`s keyed by subscription id.
+    // Held behind `Arc<RwLock>` so both `publish` (read-lock,
+    // snapshot Arcs, drop) and subscribe/unsubscribe (write-lock)
+    // scale sanely. Inner `Arc<Subscriber>` so the snapshot in
+    // `publish` is cheap and the `SubscriberToken` drop can
+    // reference the same map through its own `Arc`.
+    subscribers: Arc<RwLock<HashMap<SubscriptionId, Arc<Subscriber>>>>,
     next_subscription: AtomicU64,
-    // C2d wake registrations: subscription_id → (filter, notify).
-    // Each entry is one plugin-side subscription that wants its
-    // supervisor woken when a matching event fires. External
-    // subscribers (JSON tail, Connect tail) poll the broadcast
-    // receiver directly and don't register a wake.
+    // C2d wake registrations: wake_id → (filter, notify). Each
+    // entry is one plugin-side subscription that wants its
+    // supervisor woken when a matching event fires. Kept separate
+    // from `subscribers` because wake and delivery are decoupled
+    // by design — external subscribers (JSON tail, Connect tail)
+    // don't register a wake; the supervisor's wake registration
+    // has a different lifetime scope than the mpsc receiver it
+    // pairs with (a plugin instance can drop-and-recreate its
+    // receiver across a restart while its supervisor's Notify
+    // persists).
     wakes: Arc<WakeRegistry>,
     next_wake: AtomicU64,
     // C2d per-instance publish rate limiter — one token bucket per
-    // instance-id, lazily created on first `try_publish` call.
+    // instance-id, lazily created on first `admit_publish` call.
     // `Mutex<HashMap<...>>` over `RwLock` on the outer lookup to
     // keep the fast path (existing entry) single-lock. Inner
     // buckets carry their own mutex because they're mutated on
@@ -100,6 +115,26 @@ pub struct EventBus {
     rate_limiters: Mutex<HashMap<String, Arc<RateLimiter>>>,
     rate_capacity: f64,
     rate_refill_per_sec: f64,
+}
+
+/// One subscription's delivery slot. Owned via `Arc` by the
+/// `EventBus.subscribers` map so `publish` can snapshot cheaply.
+#[derive(Debug)]
+struct Subscriber {
+    id: SubscriptionId,
+    filter: EventFilter,
+    sender: mpsc::Sender<Event>,
+    /// Per-subscriber cumulative drop counter — incremented every
+    /// time `publish` sees `TrySendError::Full` for this
+    /// subscription. Exposed via [`EventBus::dropped_for`] for
+    /// tests + future operator surfaces; the primary consumer is
+    /// the `tracing::warn` emitted on each drop.
+    dropped: AtomicU64,
+    /// Human-readable subscriber label included in the drop-warn
+    /// log so an operator can identify which reader is falling
+    /// behind ("plugin `example.foo/instance-1`", "http tail
+    /// `client-abc`", …).
+    label: String,
 }
 
 /// Shared wake-registration storage. Held behind `Arc` by both
@@ -190,9 +225,8 @@ pub enum PublishDenied {
 impl EventBus {
     #[must_use]
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(BUS_CAPACITY);
         Self {
-            sender,
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
             next_subscription: AtomicU64::new(1),
             wakes: Arc::new(WakeRegistry::default()),
             next_wake: AtomicU64::new(1),
@@ -202,29 +236,76 @@ impl EventBus {
         }
     }
 
-    /// Push an event onto the bus without rate-limiting or
-    /// per-instance attribution. Used by host-side injectors
-    /// (integration tests, JSON `/events/tail` handshakes that
-    /// synthesize events) that don't have a plugin instance
-    /// identity. Returns the number of broadcast subscribers that
-    /// received it (0 = no listeners — fine).
+    /// Push an event onto the bus. Each subscriber whose filter
+    /// matches gets the event delivered to its private
+    /// [`SUBSCRIBER_CAPACITY`]-slot mpsc queue via
+    /// [`mpsc::Sender::try_send`]; a subscriber whose queue is
+    /// full drops the event **for itself** (per-subscriber drop
+    /// counter incremented, `tracing::warn` emitted) without
+    /// affecting delivery to the other subscribers. Returns the
+    /// number of subscribers the event was successfully delivered
+    /// to (0 = no matching listeners *or* every match was full).
+    ///
+    /// Ordering: enqueue-then-signal-wakes (PR #82 review F1).
+    /// A subscriber woken by `notify_one` in another task might
+    /// otherwise poll its receiver before the `try_send` has
+    /// enqueued, drain nothing, and go back to sleep. Signalling
+    /// after `try_send` closes the race.
     #[allow(clippy::needless_pass_by_value)]
     pub fn publish(&self, event: Event) -> usize {
-        // Ordering matters (PR #82 review, F1). The event MUST be
-        // on the broadcast ring *before* the wake fires — otherwise
-        // a subscriber woken by `notify_one` in another task can
-        // drain its receiver, find nothing, and go back to sleep
-        // before the send() call actually enqueues the event. Under
-        // a multi-thread runtime, that races the supervisor into
-        // dropping events on the floor.
-        //
-        // Cost: one clone of `event` (broadcast::send already clones
-        // internally per subscriber, so this is one *extra* clone
-        // for the wake-side filter check). Correctness > perf; event
-        // payloads are small structs.
-        let n = self.sender.send(event.clone()).unwrap_or(0);
+        // Snapshot the Arc<Subscriber>s under the read lock, then
+        // drop the lock before doing per-subscriber `try_send`.
+        // `try_send` is non-blocking but the lock scope stays tight,
+        // and a slow subscriber's queue-full log can't hold the
+        // registry lock (would gate concurrent subscribe /
+        // unsubscribe).
+        let snapshot: Vec<Arc<Subscriber>> = {
+            let subs = self
+                .subscribers
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            subs.values().cloned().collect()
+        };
+        let mut delivered = 0;
+        for sub in &snapshot {
+            if !filter_matches(&sub.filter, &event) {
+                continue;
+            }
+            match sub.sender.try_send(event.clone()) {
+                Ok(()) => delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let count = sub.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        subscription_id = sub.id,
+                        subscriber = %sub.label,
+                        dropped_total = count,
+                        capacity = SUBSCRIBER_CAPACITY,
+                        "event dropped: subscriber queue full (C2e per-subscriber isolation)",
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Receiver was dropped without its
+                    // `SubscriberToken` (should be rare — the
+                    // token is what owns deregistration). Skip
+                    // and let the token's Drop clean the entry.
+                }
+            }
+        }
         self.signal_wakes(&event);
-        n
+        delivered
+    }
+
+    /// Per-subscriber cumulative drop counter. `None` if the
+    /// subscription id is unknown (dropped or never existed).
+    /// Test / observability accessor.
+    #[must_use]
+    pub fn dropped_for(&self, subscription_id: SubscriptionId) -> Option<u64> {
+        let subs = self
+            .subscribers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subs.get(&subscription_id)
+            .map(|s| s.dropped.load(Ordering::Relaxed))
     }
 
     /// Consume one publish token from `instance_id`'s bucket. This
@@ -290,27 +371,59 @@ impl EventBus {
     /// on the receiver directly — no supervisor-wake integration.
     /// Used by external tailers (JSON `/events/tail`, Connect
     /// `Events.TailEvents`) and by integration tests.
+    ///
+    /// C2e — each call opens a **private** [`SUBSCRIBER_CAPACITY`]-
+    /// slot mpsc queue; the receiver's back-pressure isolates it
+    /// from every other subscriber.
     pub fn subscribe_all(&self) -> EventSubscription {
-        EventSubscription {
-            id: self.mint_subscription_id(),
-            filter: EventFilter {
+        self.subscribe_labeled(
+            EventFilter {
                 device: None,
                 topic: None,
             },
-            receiver: self.sender.subscribe(),
-            wake_token: None,
-        }
+            "subscribe_all",
+        )
     }
 
     /// Subscribe with a filter, without a supervisor-wake
     /// registration. Same shape as [`Self::subscribe_all`] but
-    /// carries the filter for consumer-side `.matches()`.
+    /// carries the filter so `publish` can skip non-matching
+    /// events before enqueue (cheaper than filtering on receive).
     pub fn subscribe(&self, filter: EventFilter) -> EventSubscription {
+        self.subscribe_labeled(filter, "subscribe")
+    }
+
+    /// Subscribe with a caller-supplied label included in the
+    /// C2e drop-warn log. Prefer this over [`Self::subscribe`]
+    /// for external subscribers whose identity would otherwise be
+    /// opaque in the log ("plugin `example.foo/inst-1`",
+    /// "http tail `client-abc`").
+    pub fn subscribe_labeled(&self, filter: EventFilter, label: &str) -> EventSubscription {
+        let (sender, receiver) = mpsc::channel(SUBSCRIBER_CAPACITY);
+        let id = self.mint_subscription_id();
+        let subscriber = Arc::new(Subscriber {
+            id,
+            filter: filter.clone(),
+            sender,
+            dropped: AtomicU64::new(0),
+            label: label.to_owned(),
+        });
+        {
+            let mut subs = self
+                .subscribers
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            subs.insert(id, subscriber);
+        }
         EventSubscription {
-            id: self.mint_subscription_id(),
+            id,
             filter,
-            receiver: self.sender.subscribe(),
+            receiver,
             wake_token: None,
+            _slot_token: SubscriberToken {
+                id,
+                subscribers: Arc::clone(&self.subscribers),
+            },
         }
     }
 
@@ -320,10 +433,10 @@ impl EventBus {
     /// awaits `notify.notified()` and calls `drain_events()` after.
     /// C2d wake-isolation entry point.
     ///
-    /// The returned subscription owns a
-    /// [`WakeToken`] whose `Drop` deregisters the wake from the
-    /// bus, so the subscription's lifetime bounds the wake
-    /// registration exactly.
+    /// The returned subscription owns both a [`WakeToken`] (drops
+    /// the wake registration) and a [`SubscriberToken`] (drops the
+    /// per-subscriber queue slot). The subscription's lifetime
+    /// bounds both.
     pub fn subscribe_with_wake(
         &self,
         filter: EventFilter,
@@ -344,19 +457,36 @@ impl EventBus {
                 },
             );
         }
-        EventSubscription {
-            id: self.mint_subscription_id(),
-            filter,
-            receiver: self.sender.subscribe(),
-            wake_token: Some(WakeToken {
-                wake_id,
-                registry: Arc::clone(&self.wakes),
-            }),
-        }
+        let mut sub = self.subscribe_labeled(filter, "subscribe_with_wake");
+        sub.wake_token = Some(WakeToken {
+            wake_id,
+            registry: Arc::clone(&self.wakes),
+        });
+        sub
     }
 
     fn mint_subscription_id(&self) -> SubscriptionId {
         self.next_subscription.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// RAII slot-holder for [`EventBus::subscribers`]. Dropping the
+/// enclosing [`EventSubscription`] runs this Drop, which removes
+/// the subscriber's `mpsc::Sender` from the bus so `publish` stops
+/// walking a dead entry.
+#[derive(Debug)]
+struct SubscriberToken {
+    id: SubscriptionId,
+    subscribers: Arc<RwLock<HashMap<SubscriptionId, Arc<Subscriber>>>>,
+}
+
+impl Drop for SubscriberToken {
+    fn drop(&mut self) {
+        let mut subs = self
+            .subscribers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subs.remove(&self.id);
     }
 }
 
@@ -380,25 +510,32 @@ impl Drop for WakeToken {
     }
 }
 
-/// One subscriber's receiver + the filter the host promised to apply.
+/// One subscriber's receiver + the filter the host promised to
+/// apply. C2e: the receiver is a private
+/// [`SUBSCRIBER_CAPACITY`]-slot [`mpsc::Receiver`]; back-pressure
+/// on this subscriber can't evict events from other subscribers.
 ///
-/// Owns its `broadcast::Receiver`; dropping the subscription drops
-/// the receiver and frees the slot. Also owns an optional
-/// [`WakeToken`] — set by [`EventBus::subscribe_with_wake`] for
-/// plugin-side subscriptions that need their supervisor woken on
-/// delivery. Dropping the subscription drops the token which
-/// deregisters the wake.
+/// Owns an optional [`WakeToken`] — set by
+/// [`EventBus::subscribe_with_wake`] for plugin-side subscriptions
+/// that need their supervisor woken on delivery. Owns a
+/// [`SubscriberToken`] that removes this subscription's slot from
+/// the bus on Drop.
 #[derive(Debug)]
 pub struct EventSubscription {
     pub id: SubscriptionId,
     pub filter: EventFilter,
-    pub receiver: broadcast::Receiver<Event>,
+    pub receiver: mpsc::Receiver<Event>,
     /// C2d — Some for supervisor-wake-integrated subscriptions,
     /// None for external subscribers that poll `.receiver`
-    /// directly. The field is private because callers never touch
-    /// it; its only observable effect is the Drop.
+    /// directly. Private because callers never touch it; its
+    /// only observable effect is the Drop.
     #[allow(dead_code)]
     wake_token: Option<WakeToken>,
+    /// C2e — RAII deregister of the subscriber's mpsc slot on
+    /// `EventBus`. Field is prefixed with `_` because it's never
+    /// read directly; Rust would otherwise warn about it.
+    #[allow(dead_code)]
+    _slot_token: SubscriberToken,
 }
 
 impl EventSubscription {
@@ -580,17 +717,18 @@ mod tests {
 
     #[test]
     fn default_burst_stays_below_ring_capacity() {
-        // PR #82 review, F3 — burst must be sized well below the
-        // shared broadcast ring so one instance's full burst can't
-        // evict every subscriber's un-drained events. This
-        // constant guard fires if someone bumps the burst back
-        // above the ring without also fixing the shared-ring
-        // isolation story (per-subscriber queues — see C2e).
+        // Historical PR #82 F3 invariant: burst must stay well
+        // below the per-subscriber queue depth so a single
+        // instance's full burst can't fill a subscriber's private
+        // queue in one shot. Under C2e the "worst affected"
+        // subscriber only drops for itself, but keeping the burst
+        // under the per-subscriber capacity means a well-behaved
+        // subscriber still won't see drops during natural bursts.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let burst = DEFAULT_PUBLISH_BURST as usize;
         assert!(
-            burst < BUS_CAPACITY,
-            "burst {DEFAULT_PUBLISH_BURST} must be < BUS_CAPACITY {BUS_CAPACITY}",
+            burst < SUBSCRIBER_CAPACITY,
+            "burst {DEFAULT_PUBLISH_BURST} must be < SUBSCRIBER_CAPACITY {SUBSCRIBER_CAPACITY}",
         );
     }
 
@@ -724,5 +862,77 @@ mod tests {
             0,
             "plain subscribe must not touch the wake map",
         );
+    }
+
+    /// C2e: a subscriber whose queue is full must not evict events
+    /// for OTHER subscribers. Fill one subscriber's mpsc queue by
+    /// never reading it, publish more than the capacity, then
+    /// verify a second subscriber received every event (up to the
+    /// same capacity — its own queue would fill if we published
+    /// more, but each subscriber independently).
+    #[test]
+    fn slow_subscriber_does_not_evict_from_other_subscribers() {
+        let bus = EventBus::new();
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let slow = bus.subscribe_labeled(filter.clone(), "slow");
+        let mut fast = bus.subscribe_labeled(filter.clone(), "fast");
+
+        // Publish more than the per-subscriber capacity. The slow
+        // subscriber's queue will fill after SUBSCRIBER_CAPACITY
+        // enqueues; the fast subscriber's queue also gets one
+        // event per publish and could fill in principle, but we
+        // drain it after each publish so it stays empty.
+        let overflow: usize = 32;
+        let total: usize = SUBSCRIBER_CAPACITY + overflow;
+        let mut fast_received: usize = 0;
+        for i in 0..total {
+            bus.publish(custom(None, &format!("evt-{i}")));
+            while fast.receiver.try_recv().is_ok() {
+                fast_received += 1;
+            }
+        }
+
+        // Fast subscriber saw every publish.
+        assert_eq!(
+            fast_received, total,
+            "fast subscriber must receive every publish under C2e",
+        );
+
+        // Slow subscriber dropped everything past its capacity —
+        // the drop counter reflects that, and the pre-C2e shared
+        // ring would have evicted from the fast subscriber too.
+        let slow_dropped = bus.dropped_for(slow.id).unwrap();
+        assert_eq!(
+            slow_dropped, overflow as u64,
+            "slow subscriber must have dropped exactly the overflow past its capacity",
+        );
+    }
+
+    /// C2e: dropping an `EventSubscription` deregisters its slot
+    /// on the bus. A subsequent publish sees only remaining
+    /// subscribers.
+    #[test]
+    fn dropping_subscription_deregisters_bus_slot() {
+        let bus = EventBus::new();
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let sub_a = bus.subscribe_labeled(filter.clone(), "a");
+        let sub_b = bus.subscribe_labeled(filter, "b");
+        assert_eq!(bus.subscribers.read().unwrap().len(), 2);
+
+        drop(sub_a);
+        assert_eq!(bus.subscribers.read().unwrap().len(), 1);
+
+        // Publish still lands on B — SubscriberToken Drop only
+        // touched A's slot.
+        let n = bus.publish(custom(None, "solo"));
+        assert_eq!(n, 1);
+        drop(sub_b);
+        assert_eq!(bus.subscribers.read().unwrap().len(), 0);
     }
 }

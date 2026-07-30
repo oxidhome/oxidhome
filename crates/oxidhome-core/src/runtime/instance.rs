@@ -14,8 +14,6 @@ use tracing::{Instrument, info_span};
 use wasmtime::Store;
 use wasmtime::component::{Component, HasSelf, Linker};
 
-use tokio::sync::broadcast::error::TryRecvError;
-
 use crate::auth::Actor;
 use crate::host_impl::plugin::Plugin as PluginBindings;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
@@ -657,20 +655,13 @@ impl PluginInstance {
         let mut events = Vec::new();
         let state = self.store.data_mut();
         for sub in &mut state.subscriptions {
-            loop {
-                match sub.receiver.try_recv() {
-                    Ok(ev) => {
-                        if sub.matches(&ev) {
-                            events.push(ev);
-                        }
-                    }
-                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-                    // `Lagged(n)` means we missed `n` events; the
-                    // receiver itself stays usable and the loop falls
-                    // through to the next `try_recv`. Phase 5d's
-                    // durable history will let a real driver catch
-                    // back up; we just keep draining.
-                    Err(TryRecvError::Lagged(_)) => {}
+            // C2e: publish filters before enqueue, so every event
+            // that reaches `try_recv` already matches. The
+            // defensive `matches` check stays in case a future
+            // filter shape ends up mutable.
+            while let Ok(ev) = sub.receiver.try_recv() {
+                if sub.matches(&ev) {
+                    events.push(ev);
                 }
             }
         }
