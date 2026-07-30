@@ -33,7 +33,7 @@ pub use blobs::{BlobError, BlobInfo, BlobStore};
 pub use db::Db;
 pub use devices::{DeviceMeta, DeviceRegistry};
 pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicMatch};
-pub use events::{EventBus, EventSubscription, PublishDenied};
+pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
     InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError,
 };

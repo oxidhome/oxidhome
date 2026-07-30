@@ -14,8 +14,6 @@ use tracing::{Instrument, info_span};
 use wasmtime::Store;
 use wasmtime::component::{Component, HasSelf, Linker};
 
-use tokio::sync::broadcast::error::TryRecvError;
-
 use crate::auth::Actor;
 use crate::host_impl::plugin::Plugin as PluginBindings;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
@@ -654,23 +652,40 @@ impl PluginInstance {
     /// `tokio::sync::broadcast::error::RecvError::Lagged` is the
     /// signal a real driver should surface; here we just continue.
     fn collect_pending_events(&mut self) -> Vec<Event> {
+        use crate::state::SubscriberMessage;
         let mut events = Vec::new();
         let state = self.store.data_mut();
         for sub in &mut state.subscriptions {
-            loop {
-                match sub.receiver.try_recv() {
-                    Ok(ev) => {
+            // C2e: publish filters before enqueue, so every event
+            // that reaches `try_recv` already matches. The
+            // defensive `matches` check stays in case a future
+            // filter shape ends up mutable. Lagged notices are
+            // logged and skipped — the supervisor can't do
+            // anything useful with them at this layer; if the
+            // plugin cares it can subscribe again with more
+            // slack, or reconcile via `Logs.Query` / the durable
+            // event history.
+            while let Ok(msg) = sub.receiver.try_recv() {
+                match msg {
+                    SubscriberMessage::Event(ev) => {
+                        // `Arc::try_unwrap` avoids a clone if we
+                        // hold the last reference (common case
+                        // for a single subscriber); otherwise
+                        // fall back to `Arc::unwrap_or_clone`
+                        // (Rust 1.76) — clone-on-write per
+                        // subscription.
+                        let ev = Arc::unwrap_or_clone(ev);
                         if sub.matches(&ev) {
                             events.push(ev);
                         }
                     }
-                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-                    // `Lagged(n)` means we missed `n` events; the
-                    // receiver itself stays usable and the loop falls
-                    // through to the next `try_recv`. Phase 5d's
-                    // durable history will let a real driver catch
-                    // back up; we just keep draining.
-                    Err(TryRecvError::Lagged(_)) => {}
+                    SubscriberMessage::Lagged { skipped } => {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            skipped,
+                            "plugin subscription dropped events (C2e per-subscriber queue overflow)",
+                        );
+                    }
                 }
             }
         }

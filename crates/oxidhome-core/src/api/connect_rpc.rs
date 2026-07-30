@@ -892,33 +892,53 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         // Subscribe *before* returning the stream so the caller
         // doesn't miss an event that fires between `stream_ok`
         // returning and the future being polled for the first
-        // time. The broadcast receiver buffers up to the channel
-        // capacity independently of when the subscriber first
-        // reads.
-        let subscription = self.engine.events().subscribe_all();
+        // time.
+        //
+        // C2e: per-subscriber mpsc queue with SUBSCRIBER_CAPACITY
+        // slots. A slow gRPC / Connect client whose queue fills
+        // drops events *for itself only* (the bus emits a
+        // per-subscriber warn log). The wire protocol no longer
+        // needs a Lagged body variant because there's no shared
+        // ring for other subscribers to be evicted from — but the
+        // variant stays in the proto for backwards compat.
+        let subscription = self.engine.events().subscribe_labeled(
+            crate::host_impl::plugin::oxidhome::plugin::events::EventFilter {
+                device: None,
+                topic: None,
+            },
+            "connect-tail",
+        );
+        // Keep the whole `EventSubscription` (not just its
+        // receiver) alive in the unfold state, so its
+        // `SubscriberToken` drops when the stream ends and the
+        // subscription slot on the bus is freed.
         let response_stream =
-            futures_util::stream::unfold(subscription.receiver, |mut receiver| async move {
-                use tokio::sync::broadcast::error::RecvError;
-                let body = match receiver.recv().await {
-                    Ok(event) => {
-                        tail_events_response::Body::Event(Box::new(wit_event_to_proto(event)))
-                    }
-                    Err(RecvError::Lagged(n)) => {
+            futures_util::stream::unfold(subscription, |mut subscription| async move {
+                use crate::state::SubscriberMessage;
+                let body = match subscription.receiver.recv().await {
+                    Some(SubscriberMessage::Event(event)) => tail_events_response::Body::Event(
+                        Box::new(wit_event_to_proto(std::sync::Arc::unwrap_or_clone(event))),
+                    ),
+                    // C2e review F2: subscriber-side overflow —
+                    // restore the pre-C2e Lagged body so clients
+                    // can detect the gap and reconcile via the
+                    // durable event history.
+                    Some(SubscriberMessage::Lagged { skipped }) => {
                         tail_events_response::Body::Lagged(Box::new(ProtoLagged {
-                            skipped: n,
+                            skipped,
                             ..Default::default()
                         }))
                     }
                     // Channel closed — publisher gone (engine
                     // shutting down). End the stream cleanly.
-                    Err(RecvError::Closed) => return None,
+                    None => return None,
                 };
                 Some((
                     Ok(TailEventsResponse {
                         body: Some(body),
                         ..Default::default()
                     }),
-                    receiver,
+                    subscription,
                 ))
             });
         Response::stream_ok(response_stream)

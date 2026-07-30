@@ -1272,7 +1272,8 @@ async fn device_command_end_to_end_through_simulated_switch() {
         tokio::time::timeout(std::time::Duration::from_secs(2), events.receiver.recv())
             .await
             .expect("toggle event delivered within 2s")
-            .expect("event recv");
+            .expect("event recv")
+            .expect_event();
     assert_eq!(post_toggle.device.as_deref(), Some(device_id.as_str()));
 
     handle.stop().await.expect("stop");
