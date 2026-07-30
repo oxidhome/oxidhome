@@ -655,10 +655,14 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
                 )),
             ));
         }
-        let registry = self.engine.installed_plugins();
+        // H2: `Engine::uninstall_plugin` composes registry
+        // tombstone + per-install KV/blob purge so a reinstall of
+        // the same `plugin_id` doesn't inherit the previous
+        // install's state.
+        let engine = self.engine.clone();
         let id_for_blocking = req.plugin_id.clone();
         let result =
-            tokio::task::spawn_blocking(move || registry.uninstall(&id_for_blocking))
+            tokio::task::spawn_blocking(move || engine.uninstall_plugin(&id_for_blocking))
                 .await
                 .map_err(|err| {
                     tracing::error!(target: "api.plugins", error = %err, "uninstall spawn_blocking failed");

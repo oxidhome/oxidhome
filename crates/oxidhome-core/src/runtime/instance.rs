@@ -504,10 +504,11 @@ impl PluginInstance {
         // without wiping data.
         let quota_bytes = granted_capabilities.storage_quota_kb.saturating_mul(1024);
         let kv = engine.kv();
-        kv.register_instance(&instance_id, quota_bytes)
+        kv.register_instance(&installation_uuid, &instance_id, quota_bytes)
             .with_context(|| {
                 format!(
-                    "registering KV usage row for instance {instance_id} (quota {quota_bytes} bytes)",
+                    "registering KV usage row for instance {instance_id} \
+                     (install {installation_uuid}, quota {quota_bytes} bytes)",
                 )
             })?;
 
@@ -520,10 +521,11 @@ impl PluginInstance {
             .saturating_mul(1024 * 1024);
         let blobs = engine.blobs();
         blobs
-            .register_instance(&instance_id, blob_quota_bytes)
+            .register_instance(&installation_uuid, &instance_id, blob_quota_bytes)
             .with_context(|| {
                 format!(
-                    "registering blob usage row for instance {instance_id} (quota {blob_quota_bytes} bytes)",
+                    "registering blob usage row for instance {instance_id} \
+                     (install {installation_uuid}, quota {blob_quota_bytes} bytes)",
                 )
             })?;
 

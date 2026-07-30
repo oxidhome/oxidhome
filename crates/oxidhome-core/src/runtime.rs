@@ -284,15 +284,59 @@ impl Engine {
 
     /// Installed-plugin registry — Phase 12-API-f. Tracks plugin
     /// packages copied into `<state_dir>/plugins/<plugin_id>/`. The
-    /// API's `POST /api/v1/plugins` (install),
-    /// `DELETE /api/v1/plugins/{id}` (uninstall) endpoints, and the
-    /// daemon's boot scan reach the registry through this accessor.
-    /// In-memory engines (`Engine::new`) carry an empty registry;
-    /// install / uninstall return `NoPluginsRoot` until an FS root
-    /// is configured.
+    /// API's `POST /api/v1/plugins` (install) endpoint,
+    /// `DELETE /api/v1/plugins/{id}` (see
+    /// [`Self::uninstall_plugin`]), and the daemon's boot scan
+    /// reach the registry through this accessor. In-memory engines
+    /// (`Engine::new`) carry an empty registry; install / uninstall
+    /// return `NoPluginsRoot` until an FS root is configured.
     #[must_use]
     pub fn installed_plugins(&self) -> Arc<InstalledPluginRegistry> {
         Arc::clone(&self.installed_plugins)
+    }
+
+    /// H2: uninstall a plugin and purge every per-install state row
+    /// (`kv`, `kv_usage`, `blob`, `blob_usage`) plus the on-disk
+    /// blob dir tree for that `installation_uuid`. The registry
+    /// tombstones the ledger row and yanks the plugin dir, then we
+    /// wipe the per-install stores so a subsequent `install` of the
+    /// same `plugin_id` (which mints a fresh uuid) starts with an
+    /// empty keyspace.
+    ///
+    /// Purge is best-effort *for the state stores*: the registry
+    /// tombstone is the source of truth for "is this plugin
+    /// installed?", so a downstream purge failure is logged (visible
+    /// to operators) but not returned — the alternative would be
+    /// leaving the ledger row live after the FS is gone, which is
+    /// the worse state. A retry of `uninstall_plugin` re-tombstones
+    /// no-op and re-attempts the purge (both purges are idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Only registry-level failures ([`crate::state::UninstallError`]) —
+    /// the FS tree removal + SQL row tombstone. State-store purge
+    /// failures surface as `tracing::error` and are not returned so
+    /// the ledger-level uninstall completes atomically for the
+    /// caller.
+    pub fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), crate::state::UninstallError> {
+        let installation_uuid = self.installed_plugins.uninstall(plugin_id)?;
+        if let Err(err) = self.kv.purge_installation(&installation_uuid) {
+            tracing::error!(
+                plugin_id = %plugin_id,
+                installation_uuid = %installation_uuid,
+                error = %err,
+                "H2: KV purge failed after uninstall; retry uninstall to re-attempt",
+            );
+        }
+        if let Err(err) = self.blobs.purge_installation(&installation_uuid) {
+            tracing::error!(
+                plugin_id = %plugin_id,
+                installation_uuid = %installation_uuid,
+                error = %err,
+                "H2: blob purge failed after uninstall; retry uninstall to re-attempt",
+            );
+        }
+        Ok(())
     }
 
     /// Start a supervised plugin instance under this engine. Reads
@@ -403,5 +447,115 @@ impl Engine {
     #[must_use]
     pub fn instance(&self, instance_id: &str) -> Option<InstanceHandle> {
         self.instances.get(instance_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H2: `Engine::uninstall_plugin` composes registry tombstone +
+    /// per-install KV purge + per-install blob purge. This test
+    /// stands in for the API-layer integration test: it installs a
+    /// stub plugin package, writes to KV + blobs under the freshly
+    /// minted `installation_uuid`, calls `uninstall_plugin`, and
+    /// verifies both stores are wiped for that uuid. Unit-level
+    /// KV / blob purge behaviour is covered in
+    /// `state::kv::tests::purge_installation_*` and
+    /// `state::blobs::tests::purge_installation_*`.
+    #[test]
+    fn uninstall_plugin_purges_kv_and_blobs_for_installation_uuid() {
+        use crate::host_impl::plugin::oxidhome::plugin::types::Value as WitValue;
+
+        // Set up a state dir + an installed plugin package.
+        let base = std::env::temp_dir().join(format!(
+            "oxidhome-h2-uninstall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let state_dir = base.join("state");
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.h2"
+name = "H2 Test"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+
+        let engine = Engine::with_state_dir(&state_dir).expect("engine");
+        let installed = engine
+            .installed_plugins()
+            .install(&source)
+            .expect("install");
+        let uuid = Arc::clone(&installed.installation_uuid);
+
+        // Simulate the state a running instance would produce:
+        // one KV row and one blob under the installed uuid.
+        engine
+            .kv()
+            .register_instance(&uuid, "inst-a", 4096)
+            .expect("register kv");
+        engine
+            .kv()
+            .set(&uuid, "inst-a", "k", WitValue::IntVal(1))
+            .expect("kv set");
+        engine
+            .blobs()
+            .register_instance(&uuid, "inst-a", 4096)
+            .expect("register blobs");
+        engine
+            .blobs()
+            .write(&uuid, "inst-a", "n", b"payload", None)
+            .expect("blob write");
+        let blob_dir = state_dir.join("blobs").join(&*uuid);
+        assert!(blob_dir.is_dir(), "blob dir should exist post-write");
+
+        // Uninstall composes registry tombstone + kv purge + blob purge.
+        engine.uninstall_plugin("example.h2").expect("uninstall");
+
+        // KV and blob usage rows are gone for the uninstalled uuid.
+        assert!(
+            engine
+                .kv()
+                .usage(&uuid, "inst-a")
+                .expect("kv usage")
+                .is_none(),
+            "KV usage row must be purged after uninstall",
+        );
+        assert!(
+            engine
+                .blobs()
+                .usage(&uuid, "inst-a")
+                .expect("blob usage")
+                .is_none(),
+            "blob usage row must be purged after uninstall",
+        );
+        assert!(
+            engine
+                .kv()
+                .get(&uuid, "inst-a", "k")
+                .expect("kv get")
+                .is_none(),
+            "KV value must be purged after uninstall",
+        );
+        assert!(
+            !blob_dir.exists(),
+            "blob dir tree must be removed after uninstall",
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

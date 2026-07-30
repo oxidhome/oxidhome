@@ -32,6 +32,10 @@ use oxidhome_core::{Engine, PluginInstance};
 
 const INIT_PAYLOAD: &[u8] = b"snapshot:init";
 const RUNTIME_PAYLOAD: &[u8] = b"snapshot:runtime-bytes";
+/// `PluginInstance::load` uses `manifest.plugin.id` as the
+/// `installation_uuid` fallback when the plugin isn't installed via
+/// the registry (see `runtime/instance.rs`).
+const INSTALLATION_UUID: &str = "example.snapshot-saver";
 
 #[tokio::test(flavor = "current_thread")]
 async fn blobs_survive_host_restart() {
@@ -89,24 +93,29 @@ async fn blobs_survive_host_restart() {
     let blobs = engine.blobs();
 
     let init_bytes = blobs
-        .read_by_name(&instance_id, "snapshot-init")
+        .read_by_name(INSTALLATION_UUID, &instance_id, "snapshot-init")
         .expect("read snapshot-init");
     assert_eq!(init_bytes, INIT_PAYLOAD);
 
     let runtime_bytes = blobs
-        .read_by_name(&instance_id, "snapshot-runtime")
+        .read_by_name(INSTALLATION_UUID, &instance_id, "snapshot-runtime")
         .expect("read snapshot-runtime");
     assert_eq!(runtime_bytes, RUNTIME_PAYLOAD);
 
     // List should hit both, in lexicographic order.
-    let listed = blobs.list_blobs(&instance_id, "snapshot-").expect("list");
+    let listed = blobs
+        .list_blobs(INSTALLATION_UUID, &instance_id, "snapshot-")
+        .expect("list");
     let names: Vec<&str> = listed.iter().map(|b| b.name.as_str()).collect();
     assert_eq!(names, vec!["snapshot-init", "snapshot-runtime"]);
 
     // Usage accounting matches the total payload bytes — quota
     // accounting is the load-bearing-for-overwrites bit, and the
     // restart proved the triggers ran on insert.
-    let (used, quota) = blobs.usage(&instance_id).expect("usage").expect("present");
+    let (used, quota) = blobs
+        .usage(INSTALLATION_UUID, &instance_id)
+        .expect("usage")
+        .expect("present");
     let total_payload =
         u64::try_from(INIT_PAYLOAD.len() + RUNTIME_PAYLOAD.len()).expect("payload sums fit in u64");
     assert_eq!(

@@ -1072,10 +1072,17 @@ impl InstalledPluginRegistry {
     /// responsible for ensuring no instances of this plugin are
     /// running — this method unconditionally yanks the dir.
     ///
+    /// Returns the `installation_uuid` of the tombstoned row so the
+    /// caller can drive H2's per-install state purge
+    /// (`KvStore::purge_installation` / `BlobStore::purge_installation`).
+    /// Wired in [`crate::runtime::Engine`]'s uninstall path, not
+    /// here, so this module stays focused on the ledger + FS side of
+    /// uninstall and doesn't need to import the state stores.
+    ///
     /// # Errors
     ///
     /// See [`UninstallError`].
-    pub fn uninstall(&self, plugin_id: &str) -> Result<(), UninstallError> {
+    pub fn uninstall(&self, plugin_id: &str) -> Result<Arc<str>, UninstallError> {
         let plugins_root = self
             .plugins_root
             .as_ref()
@@ -1179,7 +1186,7 @@ impl InstalledPluginRegistry {
             was_quarantined,
             "plugin uninstalled",
         );
-        Ok(())
+        Ok(installation_uuid)
     }
 }
 

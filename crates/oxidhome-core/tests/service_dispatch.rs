@@ -82,9 +82,12 @@ async fn cross_plugin_call_service_round_trips() {
     caller.wait_for_running().await.expect("caller Running");
 
     // 3. The caller's KV has the final value the counter returned.
+    // `PluginInstance::load` uses `manifest.plugin.id` as the
+    // installation_uuid fallback for engine-loaded (non-installed)
+    // plugins — see `runtime/instance.rs`.
     let stored = engine
         .kv()
-        .get("caller", "final_value")
+        .get("example.service-caller", "caller", "final_value")
         .expect("read final_value");
     assert!(
         matches!(stored, Some(Value::IntVal(3))),
@@ -173,12 +176,24 @@ async fn cross_task_cycle_is_rejected_promptly() {
         .clone();
 
     // Wire the cycle through each plugin's per-instance KV. The
-    // bouncer reads `bounce_to` on every kick.
+    // bouncer reads `bounce_to` on every kick. Both bouncer
+    // instances share the same plugin_id, which is the fallback
+    // installation_uuid used by `PluginInstance::load`.
     let kv = engine.kv();
-    kv.set("alpha", "bounce_to", Value::StringVal(svc_b.clone()))
-        .expect("set alpha.bounce_to");
-    kv.set("beta", "bounce_to", Value::StringVal(svc_a.clone()))
-        .expect("set beta.bounce_to");
+    kv.set(
+        "example.service-bouncer",
+        "alpha",
+        "bounce_to",
+        Value::StringVal(svc_b.clone()),
+    )
+    .expect("set alpha.bounce_to");
+    kv.set(
+        "example.service-bouncer",
+        "beta",
+        "bounce_to",
+        Value::StringVal(svc_a.clone()),
+    )
+    .expect("set beta.bounce_to");
 
     // Drive A.kick from the host. Should round-trip *quickly* —
     // before the 30s DISPATCH_TIMEOUT — with the cycle error

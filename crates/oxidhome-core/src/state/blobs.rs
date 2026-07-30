@@ -1,10 +1,22 @@
 //! Per-instance blob store — Phase 5b.
 //!
-//! Filesystem-backed bytes (`<state_dir>/blobs/<instance_id>/<id>`)
-//! plus a `SQLite` index in the same DB file as `kv` / `event_log` /
-//! `log_event` (`blob` + `blob_usage` tables, migration 6). Splitting
-//! bytes from index keeps multi-MB writes off the `SQLite` `BLOB` path
-//! while keeping `(name → id)` lookup atomic with the quota check.
+//! Filesystem-backed bytes
+//! (`<state_dir>/blobs/<installation_uuid>/<instance_id>/<id>`) plus a
+//! `SQLite` index in the same DB file as `kv` / `event_log` /
+//! `log_event`. Splitting bytes from index keeps multi-MB writes off
+//! the `SQLite` `BLOB` path while keeping `(name → id)` lookup atomic
+//! with the quota check.
+//!
+//! ## H2 keying
+//!
+//! Every table row and every filesystem path is qualified by the
+//! host-minted `installation_uuid` (see
+//! [`crate::state::InstalledPluginRegistry`]). An uninstall + reinstall
+//! of the same `plugin_id` mints a fresh uuid, so the reinstalled
+//! plugin sees an empty blob namespace instead of inheriting the
+//! previous install's data. `purge_installation` (called from
+//! `uninstall`) wipes both the SQL rows and the on-disk directory tree
+//! for a tombstoned install.
 //!
 //! ## Write atomicity
 //!
@@ -59,27 +71,38 @@ pub enum BlobError {
 
     /// Instance has no `blob_usage` row — host's loader didn't call
     /// `register_instance`. Host bug, never a plugin bug.
-    #[error("instance `{instance_id}` is not registered with the blob store")]
-    UnregisteredInstance { instance_id: String },
+    #[error(
+        "instance `{instance_id}` (installation `{installation_uuid}`) \
+         is not registered with the blob store"
+    )]
+    UnregisteredInstance {
+        installation_uuid: String,
+        instance_id: String,
+    },
 
     /// Follow-up review H1: the caller supplied an `instance_id`
-    /// that isn't safe to use as a filesystem segment (path
-    /// traversal, absolute path, empty). The API's
-    /// `start_plugin_instance` handler rejects these at the edge
-    /// with a 400; this variant is the belt-and-suspenders check
-    /// at the blob-store call site so a direct caller (host-side
-    /// test harness bypassing the API) can't induce path escape
-    /// either.
-    #[error("blob instance_id {instance_id:?} is unsafe for use as a filesystem segment")]
-    UnsafeInstanceId { instance_id: String },
+    /// (or `installation_uuid`) that isn't safe to use as a
+    /// filesystem segment (path traversal, absolute path, empty).
+    /// The API's `start_plugin_instance` handler rejects unsafe
+    /// `instance_id`s at the edge with a 400; this variant is the
+    /// belt-and-suspenders check at the blob-store call site so a
+    /// direct caller (host-side test harness bypassing the API)
+    /// can't induce path escape either. The host mints
+    /// `installation_uuid`, so it should never arrive malformed —
+    /// the same check applies as defense-in-depth against a future
+    /// refactor.
+    #[error("blob path segment {segment:?} is unsafe for use as a filesystem segment")]
+    UnsafeInstanceId { segment: String },
 
     /// Completing the write would push past the manifest-declared
     /// `blob_quota_mb`. Refused before any rename / commit.
     #[error(
-        "blob quota exceeded for instance `{instance_id}`: \
+        "blob quota exceeded for instance `{instance_id}` \
+         (installation `{installation_uuid}`): \
          {would_use} bytes would be used / {allowed} allowed"
     )]
     QuotaExceeded {
+        installation_uuid: String,
         instance_id: String,
         would_use: u64,
         allowed: u64,
@@ -155,7 +178,23 @@ fn check_instance_id(instance_id: &str) -> Result<(), BlobError> {
         Ok(())
     } else {
         Err(BlobError::UnsafeInstanceId {
-            instance_id: instance_id.to_owned(),
+            segment: instance_id.to_owned(),
+        })
+    }
+}
+
+/// H2 defense-in-depth: mirror the `instance_id` shape check on the
+/// host-minted `installation_uuid` too. The minter (`state::
+/// installed_plugins::mint_installation_uuid`) always emits
+/// `inst-<32 hex chars>`, so under normal wiring this can never fail
+/// — but a future refactor that pipes a raw string through this API
+/// shouldn't silently escape the blob root either.
+fn check_installation_uuid(installation_uuid: &str) -> Result<(), BlobError> {
+    if is_safe_instance_id(installation_uuid) {
+        Ok(())
+    } else {
+        Err(BlobError::UnsafeInstanceId {
+            segment: installation_uuid.to_owned(),
         })
     }
 }
@@ -170,9 +209,17 @@ fn ensure_contained(blobs_root: &Path, path: &Path) -> Result<(), BlobError> {
         Ok(())
     } else {
         Err(BlobError::UnsafeInstanceId {
-            instance_id: path.display().to_string(),
+            segment: path.display().to_string(),
         })
     }
+}
+
+/// Compute the on-disk directory for one instance under one
+/// installation. Encapsulates the H2 layout
+/// (`<blobs_root>/<installation_uuid>/<instance_id>/`) so every
+/// entry point shares the same shape.
+fn instance_dir_for(blobs_root: &Path, installation_uuid: &str, instance_id: &str) -> PathBuf {
+    blobs_root.join(installation_uuid).join(instance_id)
 }
 
 /// Outcome from a successful `write` transaction. Carries the path
@@ -212,10 +259,10 @@ impl BlobStore {
         // Seed the counter from pid + the construction-instant nanos
         // so two processes opening the same DB in the same wall-clock
         // millisecond don't both start at 0 and collide on `mint_id`.
-        // The new `(instance_id, id)` UNIQUE constraint (migration 7)
-        // catches any residual collision loudly inside the writing
-        // transaction, but seeding makes the collision rate vanish
-        // in practice.
+        // The `(installation_uuid, instance_id, id)` UNIQUE constraint
+        // (migration 14) catches any residual collision loudly inside
+        // the writing transaction, but seeding makes the collision rate
+        // vanish in practice.
         Self {
             db,
             blobs_root,
@@ -234,15 +281,22 @@ impl BlobStore {
     /// # Errors
     ///
     /// ``SQLite`` errors surface as [`BlobError::Sql`].
-    pub fn register_instance(&self, instance_id: &str, quota_bytes: u64) -> Result<(), BlobError> {
+    pub fn register_instance(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        quota_bytes: u64,
+    ) -> Result<(), BlobError> {
+        check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let quota_i64 = i64::try_from(quota_bytes).unwrap_or(i64::MAX);
         self.db.write(|conn| -> Result<(), BlobError> {
             conn.execute(
-                "INSERT INTO blob_usage(instance_id, bytes_used, bytes_quota) \
-                 VALUES (?1, 0, ?2) \
-                 ON CONFLICT(instance_id) DO UPDATE SET bytes_quota = excluded.bytes_quota",
-                params![instance_id, quota_i64],
+                "INSERT INTO blob_usage(installation_uuid, instance_id, bytes_used, bytes_quota) \
+                 VALUES (?1, ?2, 0, ?3) \
+                 ON CONFLICT(installation_uuid, instance_id) DO UPDATE \
+                    SET bytes_quota = excluded.bytes_quota",
+                params![installation_uuid, instance_id, quota_i64],
             )?;
             Ok(())
         })
@@ -254,13 +308,19 @@ impl BlobStore {
     /// # Errors
     ///
     /// Forwards SQL errors.
-    pub fn usage(&self, instance_id: &str) -> Result<Option<(u64, u64)>, BlobError> {
+    pub fn usage(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+    ) -> Result<Option<(u64, u64)>, BlobError> {
+        check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let row = self.db.read(|conn| -> Result<_, BlobError> {
             Ok(conn
                 .query_row(
-                    "SELECT bytes_used, bytes_quota FROM blob_usage WHERE instance_id = ?1",
-                    params![instance_id],
+                    "SELECT bytes_used, bytes_quota FROM blob_usage \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2",
+                    params![installation_uuid, instance_id],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?)
@@ -286,34 +346,49 @@ impl BlobStore {
     /// past 8 EiB would have already broken every other accounting
     /// path; the cast is essentially an assertion against
     /// `usize::MAX` on 128-bit hypothetical targets.
+    // Length allow: H2's two-level directory layout added a second
+    // fsync-guard pair on top of the pre-existing quota / rename /
+    // commit dance. Splitting the transaction body out of the write
+    // path would obscure the intra-transaction ordering invariants
+    // (see the "3-5" comment inside) that the function's atomicity
+    // contract depends on.
+    #[allow(clippy::too_many_lines)]
     pub fn write(
         &self,
+        installation_uuid: &str,
         instance_id: &str,
         name: &str,
         data: &[u8],
         mime: Option<&str>,
     ) -> Result<String, BlobError> {
+        check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
-        let instance_dir = blobs_root.join(instance_id);
+        let install_dir = blobs_root.join(installation_uuid);
+        let instance_dir = instance_dir_for(blobs_root, installation_uuid, instance_id);
         ensure_contained(blobs_root, &instance_dir)?;
         let tmp_dir = instance_dir.join(".tmp");
         let id = self.mint_id();
         let tmp_path = tmp_dir.join(&id);
         let final_path = instance_dir.join(&id);
 
-        // 1. Make directories. Track whether `instance_dir` is new so
-        // we can fsync `blobs_root` and make the new dir entry durable
-        // — without that, a crash during the first write to a fresh
-        // instance can lose the instance dir itself (and the file
-        // inside it) even after the SQLite commit is durable.
+        // 1. Make directories. Track whether `install_dir` /
+        // `instance_dir` are new so we can fsync the *parent* of a
+        // newly-created directory and make the entry durable —
+        // without that, a crash after write can lose the directory
+        // (and everything inside it) even after the SQLite commit is
+        // durable.
+        let install_dir_is_new = !install_dir.exists();
         let instance_dir_is_new = !instance_dir.exists();
         std::fs::create_dir_all(&tmp_dir).map_err(|source| BlobError::Io {
             path: tmp_dir.clone(),
             source,
         })?;
-        if instance_dir_is_new {
+        if install_dir_is_new {
             fsync_dir(blobs_root)?;
+        }
+        if instance_dir_is_new {
+            fsync_dir(&install_dir)?;
         }
 
         // 2. Stage write + fsync.
@@ -321,6 +396,7 @@ impl BlobStore {
 
         let new_size = i64::try_from(data.len()).expect("blob size fits in i64");
         let created_ms = i64::try_from(now_unix_ms()).unwrap_or(i64::MAX);
+        let installation_uuid_owned = installation_uuid.to_owned();
         let instance_id_owned = instance_id.to_owned();
         let name_owned = name.to_owned();
         let mime_owned = mime.map(str::to_owned);
@@ -349,13 +425,15 @@ impl BlobStore {
 
                 let Some((bytes_used, bytes_quota)) = tx
                     .query_row(
-                        "SELECT bytes_used, bytes_quota FROM blob_usage WHERE instance_id = ?1",
-                        params![instance_id_owned],
+                        "SELECT bytes_used, bytes_quota FROM blob_usage \
+                         WHERE installation_uuid = ?1 AND instance_id = ?2",
+                        params![installation_uuid_owned, instance_id_owned],
                         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                     )
                     .optional()?
                 else {
                     return Err(BlobError::UnregisteredInstance {
+                        installation_uuid: installation_uuid_owned,
                         instance_id: instance_id_owned,
                     });
                 };
@@ -366,8 +444,8 @@ impl BlobStore {
                 let old: Option<(String, i64)> = tx
                     .query_row(
                         "SELECT id, size_bytes FROM blob \
-                         WHERE instance_id = ?1 AND name = ?2",
-                        params![instance_id_owned, name_owned],
+                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                        params![installation_uuid_owned, instance_id_owned, name_owned],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
@@ -376,6 +454,7 @@ impl BlobStore {
                 let projected = bytes_used - old_size + new_size;
                 if projected > bytes_quota {
                     return Err(BlobError::QuotaExceeded {
+                        installation_uuid: installation_uuid_owned,
                         instance_id: instance_id_owned,
                         would_use: projected.try_into().unwrap_or(u64::MAX),
                         allowed: bytes_quota.try_into().unwrap_or(0),
@@ -385,18 +464,21 @@ impl BlobStore {
                 // INSERT-OR-REPLACE via DELETE+INSERT so the triggers
                 // fire on both legs and `bytes_used` stays correct
                 // (the UPDATE trigger only handles `size_bytes`
-                // changes, not `id` / `name` changes). Migration 7's
-                // UNIQUE `(instance_id, id)` index makes a residual
-                // id collision fail the transaction loudly here
-                // rather than silently overwriting the FS file.
+                // changes, not `id` / `name` changes). Migration 14's
+                // UNIQUE `(installation_uuid, instance_id, id)` index
+                // makes a residual id collision fail the transaction
+                // loudly here rather than silently overwriting the FS
+                // file.
                 tx.execute(
-                    "DELETE FROM blob WHERE instance_id = ?1 AND name = ?2",
-                    params![instance_id_owned, name_owned],
+                    "DELETE FROM blob \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    params![installation_uuid_owned, instance_id_owned, name_owned],
                 )?;
                 tx.execute(
-                    "INSERT INTO blob(instance_id, name, id, size_bytes, created_ms, mime) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO blob(installation_uuid, instance_id, name, id, size_bytes, created_ms, mime) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
+                        installation_uuid_owned,
                         instance_id_owned,
                         name_owned,
                         id_owned,
@@ -432,8 +514,10 @@ impl BlobStore {
                     });
                 }
                 Ok(WriteOutcome {
-                    old_file: old
-                        .map(|(old_id, _)| blobs_root_owned.join(&instance_id_owned).join(old_id)),
+                    old_file: old.map(|(old_id, _)| {
+                        instance_dir_for(&blobs_root_owned, &installation_uuid_owned, &instance_id_owned)
+                            .join(old_id)
+                    }),
                 })
             });
 
@@ -448,7 +532,13 @@ impl BlobStore {
     /// - [`BlobError::NotFound`] if the id doesn't exist in this
     ///   instance.
     /// - [`BlobError::Io`] for filesystem failures.
-    pub fn read(&self, instance_id: &str, id: &str) -> Result<Vec<u8>, BlobError> {
+    pub fn read(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        id: &str,
+    ) -> Result<Vec<u8>, BlobError> {
+        check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
         // Confirm the row exists for this instance — otherwise a
@@ -458,8 +548,9 @@ impl BlobStore {
         let exists: bool = self.db.read(|conn| -> Result<_, BlobError> {
             Ok(conn
                 .query_row(
-                    "SELECT 1 FROM blob WHERE instance_id = ?1 AND id = ?2",
-                    params![instance_id, id],
+                    "SELECT 1 FROM blob \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND id = ?3",
+                    params![installation_uuid, instance_id, id],
                     |_| Ok(true),
                 )
                 .optional()?
@@ -467,10 +558,13 @@ impl BlobStore {
         })?;
         if !exists {
             return Err(BlobError::NotFound {
-                what: format!("id `{id}` for instance `{instance_id}`"),
+                what: format!(
+                    "id `{id}` for instance `{instance_id}` \
+                     (installation `{installation_uuid}`)"
+                ),
             });
         }
-        let path = blobs_root.join(instance_id).join(id);
+        let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(id);
         ensure_contained(blobs_root, &path)?;
         std::fs::read(&path).map_err(|source| BlobError::Io { path, source })
     }
@@ -480,7 +574,13 @@ impl BlobStore {
     /// # Errors
     ///
     /// Same as [`Self::read`].
-    pub fn read_by_name(&self, instance_id: &str, name: &str) -> Result<Vec<u8>, BlobError> {
+    pub fn read_by_name(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        name: &str,
+    ) -> Result<Vec<u8>, BlobError> {
+        check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
         let id: String = self
@@ -488,16 +588,20 @@ impl BlobStore {
             .read(|conn| -> Result<_, BlobError> {
                 Ok(conn
                     .query_row(
-                        "SELECT id FROM blob WHERE instance_id = ?1 AND name = ?2",
-                        params![instance_id, name],
+                        "SELECT id FROM blob \
+                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                        params![installation_uuid, instance_id, name],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?)
             })?
             .ok_or_else(|| BlobError::NotFound {
-                what: format!("name `{name}` for instance `{instance_id}`"),
+                what: format!(
+                    "name `{name}` for instance `{instance_id}` \
+                     (installation `{installation_uuid}`)"
+                ),
             })?;
-        let path = blobs_root.join(instance_id).join(&id);
+        let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&id);
         ensure_contained(blobs_root, &path)?;
         std::fs::read(&path).map_err(|source| BlobError::Io { path, source })
     }
@@ -508,21 +612,30 @@ impl BlobStore {
     ///
     /// - [`BlobError::NotFound`] if no blob with that name.
     /// - [`BlobError::Sql`] for SQL errors.
-    pub fn get_info(&self, instance_id: &str, name: &str) -> Result<BlobInfo, BlobError> {
+    pub fn get_info(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        name: &str,
+    ) -> Result<BlobInfo, BlobError> {
+        check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         self.db
             .read(|conn| -> Result<_, BlobError> {
                 conn.query_row(
                     "SELECT name, id, size_bytes, created_ms, mime FROM blob \
-                     WHERE instance_id = ?1 AND name = ?2",
-                    params![instance_id, name],
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    params![installation_uuid, instance_id, name],
                     decode_blob_info,
                 )
                 .optional()
                 .map_err(BlobError::from)
             })?
             .ok_or_else(|| BlobError::NotFound {
-                what: format!("name `{name}` for instance `{instance_id}`"),
+                what: format!(
+                    "name `{name}` for instance `{instance_id}` \
+                     (installation `{installation_uuid}`)"
+                ),
             })
     }
 
@@ -535,9 +648,16 @@ impl BlobStore {
     /// - [`BlobError::Io`] for filesystem failures (only when an
     ///   actual file is being removed).
     /// - [`BlobError::Sql`] for index transaction failures.
-    pub fn delete(&self, instance_id: &str, name: &str) -> Result<(), BlobError> {
+    pub fn delete(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        name: &str,
+    ) -> Result<(), BlobError> {
+        check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
+        let installation_uuid_owned = installation_uuid.to_owned();
         let instance_id_owned = instance_id.to_owned();
         let name_owned = name.to_owned();
         // Get id first so we can rm the file, then drop the row.
@@ -545,22 +665,24 @@ impl BlobStore {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let id: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM blob WHERE instance_id = ?1 AND name = ?2",
-                    params![instance_id_owned, name_owned],
+                    "SELECT id FROM blob \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    params![installation_uuid_owned, instance_id_owned, name_owned],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
             if id.is_some() {
                 tx.execute(
-                    "DELETE FROM blob WHERE instance_id = ?1 AND name = ?2",
-                    params![instance_id_owned, name_owned],
+                    "DELETE FROM blob \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    params![installation_uuid_owned, instance_id_owned, name_owned],
                 )?;
             }
             tx.commit()?;
             Ok(id)
         })?;
         if let Some(id) = id {
-            let instance_dir = blobs_root.join(instance_id);
+            let instance_dir = instance_dir_for(blobs_root, installation_uuid, instance_id);
             ensure_contained(blobs_root, &instance_dir)?;
             let path = instance_dir.join(&id);
             // Best-effort: row already gone, FS orphan would be
@@ -581,27 +703,100 @@ impl BlobStore {
     /// # Errors
     ///
     /// Forwards SQL errors.
-    pub fn list_blobs(&self, instance_id: &str, prefix: &str) -> Result<Vec<BlobInfo>, BlobError> {
+    pub fn list_blobs(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        prefix: &str,
+    ) -> Result<Vec<BlobInfo>, BlobError> {
+        check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         self.db.read(|conn| -> Result<_, BlobError> {
             let mut stmt = conn.prepare(
                 "SELECT name, id, size_bytes, created_ms, mime FROM blob \
-                 WHERE instance_id = ?1 AND substr(name, 1, length(?2)) = ?2 \
+                 WHERE installation_uuid = ?1 AND instance_id = ?2 \
+                   AND substr(name, 1, length(?3)) = ?3 \
                  ORDER BY name",
             )?;
             let rows = stmt
-                .query_map(params![instance_id, prefix], decode_blob_info)?
+                .query_map(
+                    params![installation_uuid, instance_id, prefix],
+                    decode_blob_info,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
+    }
+
+    /// Wipe every SQL row (`blob` + `blob_usage`) AND the on-disk
+    /// directory tree for the installation tombstoned at
+    /// `installation_uuid`. Called from
+    /// [`crate::state::InstalledPluginRegistry::uninstall`] so a
+    /// subsequent reinstall of the same `plugin_id` sees an empty
+    /// blob namespace — H2's central invariant.
+    ///
+    /// Order: SQL first, then FS. If the FS teardown fails partway,
+    /// the DB is already consistent (no rows point at whatever is
+    /// left) and the remaining files are orphans a Phase-12 sweep
+    /// can reclaim. The reverse order would risk leaving DB rows
+    /// pointing at deleted files, which is more disruptive to
+    /// observability.
+    ///
+    /// Idempotent: purging an install that had no rows / no files
+    /// is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// - [`BlobError::Sql`] for SQL failures (nothing has been
+    ///   touched on disk when this fires).
+    /// - [`BlobError::Io`] wrapping any filesystem failure during
+    ///   the directory removal. The SQL delete has already
+    ///   committed at that point — retrying `purge_installation`
+    ///   is safe and will just re-attempt the FS half.
+    pub fn purge_installation(&self, installation_uuid: &str) -> Result<usize, BlobError> {
+        check_installation_uuid(installation_uuid)?;
+        let uuid_owned = installation_uuid.to_owned();
+        let deleted = self.db.write(move |conn| -> Result<usize, BlobError> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let usage_rows = tx.execute(
+                "DELETE FROM blob_usage WHERE installation_uuid = ?1",
+                params![uuid_owned],
+            )?;
+            let blob_rows = tx.execute(
+                "DELETE FROM blob WHERE installation_uuid = ?1",
+                params![uuid_owned],
+            )?;
+            tx.commit()?;
+            Ok(usage_rows + blob_rows)
+        })?;
+
+        if let Some(blobs_root) = self.blobs_root.as_deref() {
+            let install_dir = blobs_root.join(installation_uuid);
+            ensure_contained(blobs_root, &install_dir)?;
+            if install_dir.exists() {
+                std::fs::remove_dir_all(&install_dir).map_err(|source| BlobError::Io {
+                    path: install_dir.clone(),
+                    source,
+                })?;
+                // Fsync the blobs root so the removal of the
+                // installation dir is durable — otherwise a crash
+                // after the SQL commit but before the directory
+                // entry's removal is on disk would leave orphan
+                // bytes behind that a subsequent (uuid-differing)
+                // reinstall wouldn't touch.
+                fsync_dir(blobs_root)?;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Mint a new blob id. Format:
     /// `<unix_ms_13hex>-<counter_8hex>-<nanos_8hex>` — host-minted,
     /// filesystem-safe, sortable by creation time. The counter is
     /// seeded per-`BlobStore` (see [`Self::new`]) so two processes
-    /// don't both start at 0; migration 7's `UNIQUE (instance_id,
-    /// id)` index is the load-bearing collision check.
+    /// don't both start at 0; migration 14's
+    /// `UNIQUE (installation_uuid, instance_id, id)` index is the
+    /// load-bearing collision check.
     fn mint_id(&self) -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -622,9 +817,10 @@ impl BlobStore {
 /// stays width-stable. `subsec_nanos()` only varies within a single
 /// second — two processes starting in the same wall-clock second
 /// share that range and only `pid` differentiates them (container
-/// pid recycling shrinks that further). That's fine: migration 7's
-/// `UNIQUE (instance_id, id)` index is the load-bearing collision
-/// check; the seed just keeps the practical collision rate at zero.
+/// pid recycling shrinks that further). That's fine: migration 14's
+/// `UNIQUE (installation_uuid, instance_id, id)` index is the
+/// load-bearing collision check; the seed just keeps the practical
+/// collision rate at zero.
 fn id_counter_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let pid = std::process::id();
@@ -747,6 +943,12 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// Standing installation uuid used by every test that doesn't
+    /// exercise multi-install isolation. Real code always passes the
+    /// per-install uuid the registry minted.
+    const INST_A: &str = "inst-test-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const INST_B: &str = "inst-test-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn store_with_root() -> (BlobStore, TempDir) {
         let dir = tempdir();
         let db = Arc::new(Db::open_in_memory().expect("db"));
@@ -758,22 +960,30 @@ mod tests {
     fn write_then_read_round_trip() {
         let (store, _dir) = store_with_root();
         store
-            .register_instance("alpha", 64 * 1024)
+            .register_instance(INST_A, "alpha", 64 * 1024)
             .expect("register");
         let id = store
-            .write("alpha", "snap.jpg", b"hello blob", Some("image/jpeg"))
+            .write(
+                INST_A,
+                "alpha",
+                "snap.jpg",
+                b"hello blob",
+                Some("image/jpeg"),
+            )
             .expect("write");
         assert!(!id.is_empty());
 
-        let by_id = store.read("alpha", &id).expect("read by id");
+        let by_id = store.read(INST_A, "alpha", &id).expect("read by id");
         assert_eq!(by_id, b"hello blob");
 
         let by_name = store
-            .read_by_name("alpha", "snap.jpg")
+            .read_by_name(INST_A, "alpha", "snap.jpg")
             .expect("read by name");
         assert_eq!(by_name, b"hello blob");
 
-        let info = store.get_info("alpha", "snap.jpg").expect("get_info");
+        let info = store
+            .get_info(INST_A, "alpha", "snap.jpg")
+            .expect("get_info");
         assert_eq!(info.name, "snap.jpg");
         assert_eq!(info.size_bytes, 10);
         assert_eq!(info.mime.as_deref(), Some("image/jpeg"));
@@ -783,23 +993,29 @@ mod tests {
     fn overwrite_replaces_blob_and_accounts_correctly() {
         let (store, dir) = store_with_root();
         store
-            .register_instance("alpha", 64 * 1024)
+            .register_instance(INST_A, "alpha", 64 * 1024)
             .expect("register");
         let first_id = store
-            .write("alpha", "k", b"original-bytes", None)
+            .write(INST_A, "alpha", "k", b"original-bytes", None)
             .expect("first");
-        let first_path = dir.path.join("alpha").join(&first_id);
+        let first_path = dir.path.join(INST_A).join("alpha").join(&first_id);
         assert!(first_path.is_file(), "first write should land on disk");
-        let (used1, _) = store.usage("alpha").expect("usage").expect("present");
+        let (used1, _) = store
+            .usage(INST_A, "alpha")
+            .expect("usage")
+            .expect("present");
         let second_id = store
-            .write("alpha", "k", b"replaced-with-longer-bytes", None)
+            .write(INST_A, "alpha", "k", b"replaced-with-longer-bytes", None)
             .expect("second");
         assert_ne!(first_id, second_id, "overwrite should mint a fresh id");
-        let (used2, _) = store.usage("alpha").expect("usage").expect("present");
+        let (used2, _) = store
+            .usage(INST_A, "alpha")
+            .expect("usage")
+            .expect("present");
         assert_eq!(used2, "replaced-with-longer-bytes".len() as u64);
         assert!(used2 > used1);
 
-        let payload = store.read_by_name("alpha", "k").expect("read");
+        let payload = store.read_by_name(INST_A, "alpha", "k").expect("read");
         assert_eq!(payload, b"replaced-with-longer-bytes");
         assert!(
             !first_path.exists(),
@@ -817,7 +1033,7 @@ mod tests {
         // invariant (one row, no orphans).
         let (store, dir) = store_with_root();
         store
-            .register_instance("alpha", 64 * 1024)
+            .register_instance(INST_A, "alpha", 64 * 1024)
             .expect("register");
 
         let store = Arc::new(store);
@@ -826,7 +1042,7 @@ mod tests {
             let s = Arc::clone(&store);
             handles.push(std::thread::spawn(move || {
                 let payload = format!("payload-from-{n}");
-                s.write("alpha", "k", payload.as_bytes(), None)
+                s.write(INST_A, "alpha", "k", payload.as_bytes(), None)
                     .expect("concurrent write")
             }));
         }
@@ -842,13 +1058,13 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "id collision: {ids:?}");
 
         // Index has exactly one row for name "k".
-        let rows = store.list_blobs("alpha", "k").expect("list");
+        let rows = store.list_blobs(INST_A, "alpha", "k").expect("list");
         assert_eq!(rows.len(), 1, "expected single row, got {rows:?}");
         let winner_id = rows[0].id.clone();
 
         // On disk: only the winner's file remains; every other staged
         // id is gone (no orphans).
-        let instance_dir = dir.path.join("alpha");
+        let instance_dir = dir.path.join(INST_A).join("alpha");
         let mut files: Vec<String> = std::fs::read_dir(&instance_dir)
             .expect("read instance dir")
             .filter_map(|e| {
@@ -871,12 +1087,14 @@ mod tests {
     #[test]
     fn quota_exceeded_refuses_write_and_keeps_old_value() {
         let (store, _dir) = store_with_root();
-        store.register_instance("alpha", 32).expect("register");
         store
-            .write("alpha", "a", b"first-bytes", None)
+            .register_instance(INST_A, "alpha", 32)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "a", b"first-bytes", None)
             .expect("write 1");
         let err = store
-            .write("alpha", "b", &[0u8; 64], None)
+            .write(INST_A, "alpha", "b", &[0u8; 64], None)
             .expect_err("over quota");
         assert!(
             matches!(err, BlobError::QuotaExceeded { allowed: 32, .. }),
@@ -884,7 +1102,7 @@ mod tests {
         );
         // Original still readable.
         assert_eq!(
-            store.read_by_name("alpha", "a").expect("read"),
+            store.read_by_name(INST_A, "alpha", "a").expect("read"),
             b"first-bytes"
         );
     }
@@ -892,58 +1110,77 @@ mod tests {
     #[test]
     fn delete_refunds_usage_and_removes_file() {
         let (store, dir) = store_with_root();
-        store.register_instance("alpha", 4096).expect("register");
-        let id = store.write("alpha", "snap", b"bytes", None).expect("write");
-        let path = dir.path.join("alpha").join(&id);
+        store
+            .register_instance(INST_A, "alpha", 4096)
+            .expect("register");
+        let id = store
+            .write(INST_A, "alpha", "snap", b"bytes", None)
+            .expect("write");
+        let path = dir.path.join(INST_A).join("alpha").join(&id);
         assert!(path.is_file());
 
-        store.delete("alpha", "snap").expect("delete");
-        let (used, _) = store.usage("alpha").expect("usage").expect("present");
+        store.delete(INST_A, "alpha", "snap").expect("delete");
+        let (used, _) = store
+            .usage(INST_A, "alpha")
+            .expect("usage")
+            .expect("present");
         assert_eq!(used, 0);
         assert!(!path.exists(), "blob file should be gone after delete");
 
         // Reading after delete is NotFound.
-        let err = store.read_by_name("alpha", "snap").expect_err("not found");
+        let err = store
+            .read_by_name(INST_A, "alpha", "snap")
+            .expect_err("not found");
         assert!(matches!(err, BlobError::NotFound { .. }), "got {err:?}");
     }
 
     #[test]
     fn list_blobs_returns_matching_prefix_in_order() {
         let (store, _dir) = store_with_root();
-        store.register_instance("alpha", 4096).expect("register");
+        store
+            .register_instance(INST_A, "alpha", 4096)
+            .expect("register");
         for name in ["aa", "ab", "ba", "bb"] {
             store
-                .write("alpha", name, name.as_bytes(), None)
+                .write(INST_A, "alpha", name, name.as_bytes(), None)
                 .expect("write");
         }
-        let a = store.list_blobs("alpha", "a").expect("list");
+        let a = store.list_blobs(INST_A, "alpha", "a").expect("list");
         let names: Vec<_> = a.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["aa", "ab"]);
 
-        let none = store.list_blobs("alpha", "z").expect("list");
+        let none = store.list_blobs(INST_A, "alpha", "z").expect("list");
         assert!(none.is_empty());
     }
 
     #[test]
     fn instances_isolated_from_each_other() {
         let (store, _dir) = store_with_root();
-        store.register_instance("alpha", 4096).expect("register a");
-        store.register_instance("beta", 4096).expect("register b");
-        let id_a = store.write("alpha", "k", b"alpha-bytes", None).expect("a");
-        let id_b = store.write("beta", "k", b"beta-bytes", None).expect("b");
+        store
+            .register_instance(INST_A, "alpha", 4096)
+            .expect("register a");
+        store
+            .register_instance(INST_A, "beta", 4096)
+            .expect("register b");
+        let id_a = store
+            .write(INST_A, "alpha", "k", b"alpha-bytes", None)
+            .expect("a");
+        let id_b = store
+            .write(INST_A, "beta", "k", b"beta-bytes", None)
+            .expect("b");
         assert_ne!(id_a, id_b);
 
         assert_eq!(
-            store.read_by_name("alpha", "k").expect("read a"),
+            store.read_by_name(INST_A, "alpha", "k").expect("read a"),
             b"alpha-bytes",
         );
         assert_eq!(
-            store.read_by_name("beta", "k").expect("read b"),
+            store.read_by_name(INST_A, "beta", "k").expect("read b"),
             b"beta-bytes",
         );
         // Cross-instance id read returns NotFound (the id is
         // namespaced to its instance — see `read`).
-        let err = store.read("alpha", &id_b).expect_err("cross-id");
+        let err = store.read(INST_A, "alpha", &id_b).expect_err("cross-id");
         assert!(matches!(err, BlobError::NotFound { .. }), "got {err:?}");
     }
 
@@ -951,9 +1188,11 @@ mod tests {
     fn in_memory_engine_blob_writes_return_unavailable() {
         let db = Arc::new(Db::open_in_memory().expect("db"));
         let store = BlobStore::new(db, None);
-        store.register_instance("alpha", 4096).expect("register");
+        store
+            .register_instance(INST_A, "alpha", 4096)
+            .expect("register");
         let err = store
-            .write("alpha", "k", b"bytes", None)
+            .write(INST_A, "alpha", "k", b"bytes", None)
             .expect_err("no fs");
         assert!(matches!(err, BlobError::Unavailable), "got {err:?}");
     }
@@ -962,10 +1201,13 @@ mod tests {
     fn unregistered_instance_write_returns_unregistered() {
         let (store, _dir) = store_with_root();
         let err = store
-            .write("ghost", "k", b"bytes", None)
+            .write(INST_A, "ghost", "k", b"bytes", None)
             .expect_err("ghost");
         assert!(
-            matches!(err, BlobError::UnregisteredInstance { ref instance_id } if instance_id == "ghost"),
+            matches!(
+                err,
+                BlobError::UnregisteredInstance { ref instance_id, .. } if instance_id == "ghost"
+            ),
             "got {err:?}",
         );
     }
@@ -979,16 +1221,106 @@ mod tests {
         {
             let db = Arc::new(Db::open_file(&path).expect("open"));
             let store = BlobStore::new(db, Some(dir_blobs.path.clone()));
-            store.register_instance("alpha", 4096).expect("register");
+            store
+                .register_instance(INST_A, "alpha", 4096)
+                .expect("register");
             id = store
-                .write("alpha", "persistent", b"survive", None)
+                .write(INST_A, "alpha", "persistent", b"survive", None)
                 .expect("write");
         }
         let db = Arc::new(Db::open_file(&path).expect("reopen"));
         let store = BlobStore::new(db, Some(dir_blobs.path.clone()));
-        assert_eq!(store.read("alpha", &id).expect("read"), b"survive");
-        let info = store.get_info("alpha", "persistent").expect("get_info");
+        assert_eq!(store.read(INST_A, "alpha", &id).expect("read"), b"survive");
+        let info = store
+            .get_info(INST_A, "alpha", "persistent")
+            .expect("get_info");
         assert_eq!(info.size_bytes, 7);
+    }
+
+    /// H2: two installations of the same `plugin_id` (same `instance_id`
+    /// string, different `installation_uuid`) must not share blob
+    /// state or FS bytes. Writes under one uuid are invisible to
+    /// the other, and each has its own directory tree under
+    /// `<blobs_root>/<installation_uuid>/`.
+    #[test]
+    fn installation_uuid_isolates_state_from_same_instance_id() {
+        let (store, dir) = store_with_root();
+        store
+            .register_instance(INST_A, "shared-id", 4096)
+            .expect("register a");
+        store
+            .register_instance(INST_B, "shared-id", 4096)
+            .expect("register b");
+        let _id_a = store
+            .write(INST_A, "shared-id", "name", b"payload-a", None)
+            .expect("write a");
+        let id_b = store
+            .write(INST_B, "shared-id", "name", b"payload-b", None)
+            .expect("write b");
+
+        assert_eq!(
+            store
+                .read_by_name(INST_A, "shared-id", "name")
+                .expect("read a"),
+            b"payload-a"
+        );
+        assert_eq!(
+            store
+                .read_by_name(INST_B, "shared-id", "name")
+                .expect("read b"),
+            b"payload-b"
+        );
+        // Cross-uuid id read is NotFound — filenames don't collide
+        // because the two uuids live in disjoint directory subtrees.
+        assert!(matches!(
+            store.read(INST_A, "shared-id", &id_b),
+            Err(BlobError::NotFound { .. })
+        ));
+        assert!(dir.path.join(INST_A).join("shared-id").is_dir());
+        assert!(dir.path.join(INST_B).join("shared-id").is_dir());
+    }
+
+    /// H2: `purge_installation` wipes SQL rows + on-disk directory
+    /// tree for the tombstoned install and leaves other installs
+    /// intact.
+    #[test]
+    fn purge_installation_wipes_sql_and_fs_for_only_that_install() {
+        let (store, dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 4096)
+            .expect("register a");
+        store
+            .register_instance(INST_B, "alpha", 4096)
+            .expect("register b");
+        store
+            .write(INST_A, "alpha", "x", b"aaa", None)
+            .expect("write a");
+        store
+            .write(INST_B, "alpha", "x", b"bbb", None)
+            .expect("write b");
+        let a_dir = dir.path.join(INST_A);
+        let b_dir = dir.path.join(INST_B);
+        assert!(a_dir.is_dir());
+        assert!(b_dir.is_dir());
+
+        let removed = store.purge_installation(INST_A).expect("purge");
+        assert!(removed >= 2, "expected ≥ 2 rows removed, got {removed}");
+        assert!(!a_dir.exists(), "install A dir should be gone");
+        assert!(b_dir.is_dir(), "install B dir must survive purge of A");
+        assert!(store.usage(INST_A, "alpha").expect("usage a").is_none());
+        assert_eq!(
+            store.read_by_name(INST_B, "alpha", "x").expect("read b"),
+            b"bbb"
+        );
+    }
+
+    /// `purge_installation` on an install that never wrote is a
+    /// no-op — safe to call from the uninstall path unconditionally.
+    #[test]
+    fn purge_installation_is_idempotent() {
+        let (store, _dir) = store_with_root();
+        assert_eq!(store.purge_installation(INST_A).expect("first"), 0);
+        assert_eq!(store.purge_installation(INST_A).expect("second"), 0);
     }
 
     // Tiny tempdir helper.
@@ -1046,37 +1378,37 @@ mod tests {
         for id in unsafe_ids {
             assert!(
                 matches!(
-                    blobs.register_instance(id, 4096),
+                    blobs.register_instance(INST_A, id, 4096),
                     Err(BlobError::UnsafeInstanceId { .. })
                 ),
                 "register_instance({id:?}) must refuse"
             );
             assert!(matches!(
-                blobs.write(id, "name", b"data", None),
+                blobs.write(INST_A, id, "name", b"data", None),
                 Err(BlobError::UnsafeInstanceId { .. })
             ));
             assert!(matches!(
-                blobs.read(id, "any-id"),
+                blobs.read(INST_A, id, "any-id"),
                 Err(BlobError::UnsafeInstanceId { .. })
             ));
             assert!(matches!(
-                blobs.read_by_name(id, "name"),
+                blobs.read_by_name(INST_A, id, "name"),
                 Err(BlobError::UnsafeInstanceId { .. })
             ));
             assert!(matches!(
-                blobs.get_info(id, "name"),
+                blobs.get_info(INST_A, id, "name"),
                 Err(BlobError::UnsafeInstanceId { .. })
             ));
             assert!(matches!(
-                blobs.delete(id, "name"),
+                blobs.delete(INST_A, id, "name"),
                 Err(BlobError::UnsafeInstanceId { .. })
             ));
             assert!(matches!(
-                blobs.list_blobs(id, ""),
+                blobs.list_blobs(INST_A, id, ""),
                 Err(BlobError::UnsafeInstanceId { .. })
             ));
             assert!(matches!(
-                blobs.usage(id),
+                blobs.usage(INST_A, id),
                 Err(BlobError::UnsafeInstanceId { .. })
             ));
         }
@@ -1089,12 +1421,18 @@ mod tests {
         let db = Arc::new(Db::open_in_memory().expect("db"));
         let blobs = BlobStore::new(db, Some(dir.path.clone()));
         blobs
-            .register_instance("example.inst-1", 4096)
+            .register_instance(INST_A, "example.inst-1", 4096)
             .expect("register");
         let id = blobs
-            .write("example.inst-1", "readme.txt", b"hello", Some("text/plain"))
+            .write(
+                INST_A,
+                "example.inst-1",
+                "readme.txt",
+                b"hello",
+                Some("text/plain"),
+            )
             .expect("write");
-        let bytes = blobs.read("example.inst-1", &id).expect("read");
+        let bytes = blobs.read(INST_A, "example.inst-1", &id).expect("read");
         assert_eq!(bytes, b"hello");
     }
 

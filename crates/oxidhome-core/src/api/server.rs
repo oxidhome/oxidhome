@@ -820,9 +820,13 @@ async fn uninstall_plugin(
     if !running.is_empty() {
         return Err(PluginLifecycleError::InstancesRunning(running));
     }
-    let registry = state.engine.installed_plugins();
+    // H2: `Engine::uninstall_plugin` composes the registry
+    // tombstone + per-install KV/blob purge so a subsequent
+    // reinstall of the same `plugin_id` starts with an empty
+    // per-instance keyspace.
+    let engine = state.engine.clone();
     let id_for_blocking = plugin_id.clone();
-    let result = tokio::task::spawn_blocking(move || registry.uninstall(&id_for_blocking))
+    let result = tokio::task::spawn_blocking(move || engine.uninstall_plugin(&id_for_blocking))
         .await
         .map_err(|err| PluginLifecycleError::Internal(err.into()))?;
     result?;
