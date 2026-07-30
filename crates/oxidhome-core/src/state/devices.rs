@@ -19,24 +19,30 @@
 //! to clone `info` once to hand off ownership at the WIT boundary,
 //! but the outer fields and per-entry list copies are gone.
 //!
-//! ## Stable ids (architecture-review C1)
+//! ## Stable ids (architecture-review C1 / C1b)
 //!
 //! Host-minted device ids are **deterministic** from the tuple
-//! `(plugin_id, instance_id, local_id)` — SHA-256 truncated to 8
-//! bytes, rendered as `dev-<16 hex chars>`. Pre-C1 the registry
+//! `(installation_uuid, instance_id, local_id)` — SHA-256 truncated
+//! to 8 bytes, rendered as `dev-<16 hex chars>`. Pre-C1 the registry
 //! minted `dev-<n>` from an atomic counter, so every restart (and
 //! every fresh engine) renumbered every device and broke any
 //! external reference — audit rows citing a device id, API paths
 //! like `POST /api/v1/devices/{id}/command`, `logs query
-//! --field device_id=…`, and so on.
+//! --field device_id=…`, and so on. C1 fixed restart aliasing;
+//! C1b closes the uninstall-reinstall aliasing that a reusable
+//! `plugin_id` still left open by minting a fresh installation UUID
+//! per install and threading it through the derivation.
 //!
 //! With the deterministic shape, a plugin that re-registers the
 //! same `local_id` from the same `instance_id` gets the same
 //! `device_id` back — across restart, across engine re-open,
-//! across process. Callers that provide stable instance ids
-//! (which the daemon already does) inherit stable device ids
-//! automatically; no on-disk registry table needed. Full `SQLite`
-//! persistence stays a follow-up if a use case surfaces (a
+//! across process. Uninstalling and reinstalling the same plugin
+//! mints a fresh installation UUID and therefore fresh device ids,
+//! so the new install can't inherit the old install's audit / API
+//! surface. Callers that provide stable instance ids (which the
+//! daemon already does) inherit stable device ids automatically;
+//! no on-disk device table needed. Full `SQLite` persistence for
+//! device metadata stays a follow-up if a use case surfaces (a
 //! plugin that wants to *observe* previously-registered devices
 //! without re-registering).
 
@@ -67,7 +73,8 @@ pub struct DeviceMeta {
 /// In-memory device registry, one per [`Engine`](crate::Engine).
 ///
 /// IDs are deterministic — `dev-<16 hex chars>` from
-/// `SHA-256(plugin_id || "::" || instance_id || "::" || local_id)`.
+/// `SHA-256(installation_uuid || instance_id || local_id)` with a
+/// version tag and length-prefixed fields (see [`stable_device_id`]).
 /// Same tuple → same id, across restarts, across engine re-opens,
 /// across processes. See the module doc for the C1 rationale.
 #[derive(Default, Debug)]
@@ -75,11 +82,11 @@ pub struct DeviceRegistry {
     inner: RwLock<HashMap<DeviceId, Arc<DeviceMeta>>>,
 }
 
-/// Compute the deterministic host-side device id for a `(plugin_id,
-/// instance_id, local_id)` tuple. Public inside the crate so the
-/// pending-migration follow-up (a SQLite-backed device table) can
-/// use the same key material to correlate stored rows with fresh
-/// registrations.
+/// Compute the deterministic host-side device id for an
+/// `(installation_uuid, instance_id, local_id)` tuple. Public inside
+/// the crate so the pending-migration follow-up (a SQLite-backed
+/// device table) can use the same key material to correlate stored
+/// rows with fresh registrations.
 ///
 /// **Encoding.** Each field is preceded by its byte length as a
 /// big-endian `u32` — unambiguous tuple encoding. A plain
@@ -90,10 +97,24 @@ pub struct DeviceRegistry {
 /// the same device id. Length-prefix framing is the standard
 /// fix — the digest byte stream now describes the tuple bijectively.
 ///
+/// **Why `installation_uuid` and not `plugin_id`.** C1b:
+/// the manifest's `plugin.id` is a reusable name. Uninstall +
+/// reinstall (or a replacement plugin sharing the id) inherits every
+/// audit / API / history reference from the previous installation.
+/// Threading a fresh installation UUID minted per-install through
+/// this hash means a reinstall gets a different UUID and therefore
+/// different device ids — the reviewer's identity-reuse concern
+/// from PR #84 is closed. The `instance_id` argument stays a name
+/// for now (C1c may swap it for an instance UUID once the instance
+/// registry gets its own persistence table).
+///
 /// A leading domain-separation tag pins this hash to
-/// `oxidhome:device-id:v1` so a future format change (widening the
-/// truncation, moving to a different digest, etc.) doesn't collide
-/// with the current shape.
+/// `oxidhome:device-id:v2` — bumped from v1 in C1b because the tuple
+/// shape changed (first field is now the installation UUID, not the
+/// plugin id). Ids from a pre-C1b install would collide with the new
+/// derivation otherwise. Pre-1.0 upgrade behaviour: existing device
+/// ids are re-minted at the first registration after upgrade; no
+/// external references outlive the upgrade window in practice yet.
 ///
 /// SHA-256 truncated to 8 bytes = 64 bits of collision space. On a
 /// single host with ≤10^6 devices the birthday collision risk is
@@ -101,15 +122,16 @@ pub struct DeviceRegistry {
 /// truncation would bump the version tag so old and new ids don't
 /// alias.
 #[must_use]
-pub fn stable_device_id(plugin_id: &str, instance_id: &str, local_id: &str) -> DeviceId {
+pub fn stable_device_id(installation_uuid: &str, instance_id: &str, local_id: &str) -> DeviceId {
     let mut h = Sha256::new();
     // Domain-separation tag — locks this digest to the current
-    // encoding version.
-    let tag = b"oxidhome:device-id:v1";
+    // encoding version. Bumped to v2 in C1b when the first field
+    // changed from `plugin_id` to `installation_uuid`.
+    let tag = b"oxidhome:device-id:v2";
     #[allow(clippy::cast_possible_truncation)]
     h.update((tag.len() as u32).to_be_bytes());
     h.update(tag);
-    for field in [plugin_id, instance_id, local_id] {
+    for field in [installation_uuid, instance_id, local_id] {
         let bytes = field.as_bytes();
         // `u32` big-endian length prefix is enough for any real
         // identifier (max 4 GiB); a name that overflows a `u32`
@@ -145,11 +167,21 @@ impl DeviceRegistry {
     }
 
     /// Register a device on behalf of `owner_instance`. Returns the
-    /// deterministic host-assigned id — same `(plugin_id,
+    /// deterministic host-assigned id — same `(installation_uuid,
     /// owner_instance, info.local_id)` tuple always maps to the
     /// same id, so a plugin's re-registration on restart resurrects
     /// the previous id and every external reference (audit rows,
     /// API paths, log queries) keeps working.
+    ///
+    /// C1b note: `installation_uuid` is the host-minted UUID from
+    /// [`crate::state::InstalledPluginRegistry`] — one per install of
+    /// the plugin. Uninstall + reinstall picks up a fresh UUID, so
+    /// devices minted by the old install don't collide with the new
+    /// one. Callers that don't go through the installed-plugin
+    /// registry (in-memory dev / test loads) may pass the
+    /// `manifest.plugin.id` as a synthetic UUID — see
+    /// [`PluginState`](crate::runtime::state::PluginState) for the
+    /// fallback used by [`PluginInstance::load`](crate::PluginInstance::load).
     ///
     /// C1 note: a repeat registration of the same tuple overwrites
     /// the previous entry's `info`. That matches the pre-C1
@@ -160,8 +192,13 @@ impl DeviceRegistry {
     /// preserve the old entry should `update` explicitly; callers
     /// that intend a fresh registration should change the
     /// `local_id`.
-    pub fn register(&self, plugin_id: &str, owner_instance: String, info: DeviceInfo) -> DeviceId {
-        let id = stable_device_id(plugin_id, &owner_instance, &info.local_id);
+    pub fn register(
+        &self,
+        installation_uuid: &str,
+        owner_instance: String,
+        info: DeviceInfo,
+    ) -> DeviceId {
+        let id = stable_device_id(installation_uuid, &owner_instance, &info.local_id);
         let meta = Arc::new(DeviceMeta {
             id: id.clone(),
             owner_instance,
@@ -366,15 +403,15 @@ mod tests {
     /// each of its three inputs.
     #[test]
     fn stable_device_id_is_deterministic_and_injective() {
-        let base = stable_device_id("plugin.a", "alpha", "front-door");
+        let base = stable_device_id("inst-a", "alpha", "front-door");
         // Same inputs → same id.
-        assert_eq!(base, stable_device_id("plugin.a", "alpha", "front-door"));
-        // Different plugin_id → different id.
-        assert_ne!(base, stable_device_id("plugin.b", "alpha", "front-door"));
+        assert_eq!(base, stable_device_id("inst-a", "alpha", "front-door"));
+        // Different installation_uuid → different id.
+        assert_ne!(base, stable_device_id("inst-b", "alpha", "front-door"));
         // Different instance_id → different id.
-        assert_ne!(base, stable_device_id("plugin.a", "beta", "front-door"));
+        assert_ne!(base, stable_device_id("inst-a", "beta", "front-door"));
         // Different local_id → different id.
-        assert_ne!(base, stable_device_id("plugin.a", "alpha", "back-door"));
+        assert_ne!(base, stable_device_id("inst-a", "alpha", "back-door"));
         // Format guard: `dev-` prefix + 16 hex chars.
         assert!(base.starts_with("dev-"));
         let hex = &base["dev-".len()..];
@@ -412,11 +449,26 @@ mod tests {
     /// stream bijective; distinct tuples get distinct ids.
     #[test]
     fn delimiter_ambiguity_no_longer_collides() {
-        // Both would have hashed `plugin.a::alpha::beta::front-door`
+        // Both would have hashed `inst-a::alpha::beta::front-door`
         // under the pre-fix encoding.
-        let a = stable_device_id("plugin.a", "alpha::beta", "front-door");
-        let b = stable_device_id("plugin.a", "alpha", "beta::front-door");
+        let a = stable_device_id("inst-a", "alpha::beta", "front-door");
+        let b = stable_device_id("inst-a", "alpha", "beta::front-door");
         assert_ne!(a, b, "length-prefix encoding must disambiguate `::`");
+    }
+
+    /// C1b: a fresh installation UUID yields a fresh device id for
+    /// the same `(instance_id, local_id)`. This is the whole point
+    /// of the C1b remediation — uninstall + reinstall cannot alias
+    /// onto the previous install's audit / API surface.
+    #[test]
+    fn different_installation_uuid_yields_different_device_id() {
+        let old = stable_device_id("inst-old-uuid", "kitchen", "light-1");
+        let new = stable_device_id("inst-new-uuid", "kitchen", "light-1");
+        assert_ne!(
+            old, new,
+            "reinstall must produce a distinct device id even when \
+             (instance_id, local_id) match the pre-uninstall pair",
+        );
     }
 
     /// PR #84 review, F2 regression — `update-device` must refuse a

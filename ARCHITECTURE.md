@@ -92,8 +92,8 @@ This is intentionally a small starting set. Expect it to grow as real devices ar
 
 The host (Rust core) owns:
 
-1. **Plugin lifecycle** — loading components, spawning instances, enforcing capabilities, restarting on crash
-2. **Device registry** — canonical list of devices, IDs, names, current state
+1. **Plugin lifecycle** — loading components, spawning instances, enforcing capabilities, restarting on crash. Each install of a plugin is stamped with a per-install `installation_uuid` persisted in the `plugin_installation` SQL table; the UUID feeds device-id derivation so that uninstalling and reinstalling the same plugin id produces distinct device ids. Uninstalled rows are tombstoned rather than deleted so operators can audit when identity rotated for a given `plugin_id`; **the tombstone table does not carry a device-id back-reference** — audit rows written against a retired install's device ids cannot be resolved back through this table (adding a `plugin_device` mapping is a C1c follow-up if that lookup becomes load-bearing)
+2. **Device registry** — canonical list of devices, IDs, names, current state. Host-minted device ids are deterministic: `dev-<hex(SHA-256(installation_uuid, instance_id, local_id))>`. A plugin's re-registration on restart resurrects the same id; a reinstall (fresh `installation_uuid`) mints a new one
 3. **Event bus** — pub/sub for state changes, button events, plugin-defined custom events
 4. **Storage** — small KV per plugin instance (with quotas), plus a separate blob-store interface for larger data (out of 0.1 scope)
 5. **Configuration** — plugin instance configs, user preferences
