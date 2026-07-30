@@ -72,6 +72,17 @@ pub struct PluginState {
     /// `manifest.plugin.id` itself — cheap synthetic UUID; identity
     /// still stable per-run but doesn't survive a fresh process.
     pub installation_uuid: Arc<str>,
+    /// C5 — the host-owned **granted** capabilities for this
+    /// install. Runtime gates (`register-device`,
+    /// `host-events::subscribe`, storage/blob quota checks)
+    /// consult this rather than `manifest.capabilities` so a
+    /// future operator override at install / modify time takes
+    /// effect without editing the plugin's manifest. Pinned at
+    /// load time to what [`crate::state::InstalledPluginRegistry`]
+    /// remembers for the loaded install; falls back to the
+    /// manifest's requested capabilities for dev-time loads that
+    /// don't go through `install`.
+    pub granted_capabilities: Arc<oxidhome_manifest::CapabilitiesSection>,
     /// Resource handles owned by this store. Required by Wasmtime's
     /// component model; populated when Phase 5 introduces blob/model
     /// resource handling.
@@ -164,9 +175,18 @@ impl PluginState {
     ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdio();
+        // C5: `PluginState::new` doesn't know about
+        // `InstalledPluginRegistry` (it's the low-level
+        // constructor used by tests + the loader). Default the
+        // grant to the manifest's request — the loader
+        // (`PluginInstance::instantiate`) overrides via
+        // `Self::with_granted_capabilities` when a live install
+        // row is present.
+        let granted_capabilities = Arc::new(manifest.capabilities.clone());
         Self {
             instance_id: instance_id.into(),
             installation_uuid: installation_uuid.into(),
+            granted_capabilities,
             table: ResourceTable::new(),
             wasi: wasi.build(),
             devices,
@@ -182,6 +202,22 @@ impl PluginState {
             config,
             wake: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// C5: override the granted capabilities set by
+    /// [`Self::new`]'s manifest-default. The loader
+    /// [`PluginInstance::instantiate`](crate::PluginInstance) calls
+    /// this after looking the installation up in
+    /// [`InstalledPluginRegistry`](crate::state::InstalledPluginRegistry)
+    /// so the runtime gates consult the persisted grant, not the
+    /// manifest.
+    #[must_use]
+    pub fn with_granted_capabilities(
+        mut self,
+        granted: Arc<oxidhome_manifest::CapabilitiesSection>,
+    ) -> Self {
+        self.granted_capabilities = granted;
+        self
     }
 }
 
@@ -299,7 +335,7 @@ impl host_devices::Host for PluginState {
         // `initial_state` entry that doesn't have a matching spec on
         // the same device (otherwise a plugin could smuggle in state
         // for an undeclared sensor / switch / etc. via the state list).
-        if let Err(err) = authorize_device_info(&self.manifest.capabilities.declares_devices, &info)
+        if let Err(err) = authorize_device_info(&self.granted_capabilities.declares_devices, &info)
         {
             tracing::warn!(
                 instance_id = %self.instance_id,
@@ -330,7 +366,7 @@ impl host_devices::Host for PluginState {
         // applies. Log denials symmetrically with register-device so
         // the Phase-5c log/trace store captures both paths through the
         // same `warn`.
-        if let Err(err) = authorize_device_info(&self.manifest.capabilities.declares_devices, &info)
+        if let Err(err) = authorize_device_info(&self.granted_capabilities.declares_devices, &info)
         {
             tracing::warn!(
                 instance_id = %self.instance_id,
@@ -387,7 +423,7 @@ fn service_name_declared(declared: &[String], name: &str) -> bool {
 
 impl host_services::Host for PluginState {
     async fn register_service(&mut self, info: ServiceInfo) -> Result<ServiceId, WitError> {
-        if !service_name_declared(&self.manifest.capabilities.declares_services, &info.name) {
+        if !service_name_declared(&self.granted_capabilities.declares_services, &info.name) {
             let err = WitError::PermissionDenied(format!(
                 "service name `{}` is not declared in this plugin's manifest \
                  (capabilities.declares_services)",
@@ -413,7 +449,7 @@ impl host_services::Host for PluginState {
     async fn update_service(&mut self, id: ServiceId, info: ServiceInfo) -> Result<(), WitError> {
         // Same capability gate as register — a plugin can't update a
         // service into a name it wasn't allowed to declare.
-        if !service_name_declared(&self.manifest.capabilities.declares_services, &info.name) {
+        if !service_name_declared(&self.granted_capabilities.declares_services, &info.name) {
             let err = WitError::PermissionDenied(format!(
                 "service name `{}` is not declared in this plugin's manifest \
                  (capabilities.declares_services)",
@@ -664,7 +700,7 @@ impl host_events::Host for PluginState {
         // decision, not a default. `unsubscribe` is deliberately
         // uncapped — cleaning up a subscription that shouldn't
         // exist is fine.
-        if !self.manifest.capabilities.subscribes_events {
+        if !self.granted_capabilities.subscribes_events {
             tracing::warn!(
                 target: "host.events",
                 instance_id = %self.instance_id,
@@ -797,7 +833,7 @@ fn config_value_to_wit(v: &ConfigValue) -> Option<WitValue> {
 /// Refuse the call with a clear message when the manifest didn't
 /// grant any KV quota. Returns `Ok(())` when storage is enabled.
 fn require_storage_enabled(state: &PluginState) -> Result<(), WitError> {
-    if state.manifest.capabilities.storage_quota_kb == 0 {
+    if state.granted_capabilities.storage_quota_kb == 0 {
         return Err(WitError::PermissionDenied(
             "storage disabled: capabilities.storage_quota_kb is 0 (set a positive value in manifest.toml)".into(),
         ));
@@ -886,7 +922,7 @@ impl storage::Host for PluginState {
 // off the tokio worker.
 
 fn require_blobs_enabled(state: &PluginState) -> Result<(), WitError> {
-    if state.manifest.capabilities.blob_quota_mb == 0 {
+    if state.granted_capabilities.blob_quota_mb == 0 {
         return Err(WitError::PermissionDenied(
             "blob store disabled: capabilities.blob_quota_mb is 0 (set a positive value in manifest.toml)".into(),
         ));
@@ -2023,6 +2059,88 @@ mod tests {
             matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("sensor")),
             "got {err:?}",
         );
+    }
+
+    /// C5: runtime gates must consult `granted_capabilities`, not
+    /// `manifest.capabilities`. A `register-device` for a
+    /// manifest-declared capability that has been REMOVED from
+    /// the grant must be refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_register_denied_when_grant_narrows_manifest() {
+        use oxidhome_manifest::CapabilitiesSection;
+
+        // Manifest declares `switch`; grant is narrower (empty).
+        let mut manifest = (*fixture_manifest("test.grant-narrow")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            declares_devices: vec!["switch".into()],
+            ..CapabilitiesSection::default()
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            "test.grant-narrow",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
+            fresh_event_log(),
+            fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
+        )
+        .with_granted_capabilities(Arc::new(CapabilitiesSection::default()));
+
+        let mut info = empty_device("d-1");
+        info.capabilities = vec![capabilities::CapabilitySpec::Switch];
+        let err = host_devices::Host::register_device(&mut state, info)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("switch")),
+            "grant narrower than manifest must deny: got {err:?}",
+        );
+    }
+
+    /// C5: symmetric — a `subscribes_events` grant that's `false`
+    /// while the manifest requested `true` must refuse
+    /// `host-events::subscribe`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_subscribe_denied_when_grant_revokes_subscribes() {
+        use oxidhome_manifest::CapabilitiesSection;
+
+        let mut manifest = (*fixture_manifest("test.grant-revoke-sub")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            subscribes_events: true,
+            ..CapabilitiesSection::default()
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            "test.grant-revoke-sub",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
+            fresh_event_log(),
+            fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
+        )
+        .with_granted_capabilities(Arc::new(CapabilitiesSection {
+            subscribes_events: false,
+            ..CapabilitiesSection::default()
+        }));
+
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let err = host_events::Host::subscribe(&mut state, filter)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
     }
 
     /// `capabilities.storage_quota_kb = 0` (the manifest default)

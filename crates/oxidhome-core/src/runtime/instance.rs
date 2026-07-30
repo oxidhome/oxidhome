@@ -300,6 +300,14 @@ impl PluginInstance {
 
     /// Shared tail: build the Linker, construct `PluginState`, load
     /// the component, instantiate.
+    // C1b + C5: the loader body is intentionally long — one path
+    // handles the installation-UUID lookup, path/digest guards,
+    // quarantine refusal, effective-capabilities computation,
+    // per-instance quota registration, and component
+    // instantiation. Splitting them would fragment the "resolve
+    // grant boundary → apply" contract that the C5 review fixes
+    // depend on.
+    #[allow(clippy::too_many_lines)]
     async fn instantiate(
         engine: &Engine,
         wasm_path: &Path,
@@ -337,37 +345,6 @@ impl PluginInstance {
         let instance_id = instance_id.into();
         let actor = Actor::plugin(instance_id.clone());
 
-        // Reserve a `kv_usage` row for this instance with the quota
-        // declared in the manifest. `register_instance` is idempotent
-        // — repeat loads of the same instance id preserve `bytes_used`
-        // and only refresh the quota, so a manifest edit + reload
-        // picks up the new value without wiping data.
-        let quota_bytes = manifest.capabilities.storage_quota_kb.saturating_mul(1024);
-        let kv = engine.kv();
-        kv.register_instance(&instance_id, quota_bytes)
-            .with_context(|| {
-                format!(
-                    "registering KV usage row for instance {instance_id} (quota {quota_bytes} bytes)",
-                )
-            })?;
-
-        // Phase 5b: reserve a `blob_usage` row for this instance
-        // with the manifest's `blob_quota_mb`. Idempotent like the
-        // KV register; positive quota lets calls through, zero
-        // gates them off at the host call site.
-        let blob_quota_bytes = manifest
-            .capabilities
-            .blob_quota_mb
-            .saturating_mul(1024 * 1024);
-        let blobs = engine.blobs();
-        blobs
-            .register_instance(&instance_id, blob_quota_bytes)
-            .with_context(|| {
-                format!(
-                    "registering blob usage row for instance {instance_id} (quota {blob_quota_bytes} bytes)",
-                )
-            })?;
-
         // C1b: pin the installation UUID at load time. If the plugin
         // was installed through the API (`InstalledPluginRegistry`)
         // AND the loaded directory matches the registry row, use
@@ -380,22 +357,119 @@ impl PluginInstance {
         // the installed package's UUID and minting the same device
         // ids — exactly the identity-inheritance the C1b change
         // exists to prevent.
-        let installation_uuid: Arc<str> = match engine.installed_plugins().get(&manifest.plugin.id)
+        //
+        // C5 review F1/F3 codex-fixup: quarantined installations
+        // must not fall through to dev-load semantics. The direct
+        // `Engine::start_instance(path, ...)` path (argv / test
+        // harness) reaches here with `installed_plugins().get()`
+        // returning `None`, which would otherwise apply the
+        // manifest's requested capabilities + a synthetic UUID —
+        // shadowing the operator's quarantine decision. Refuse.
+        if engine
+            .installed_plugins()
+            .is_quarantined(&manifest.plugin.id)
         {
-            Some(row) if loaded_dir_matches_registry(wasm_path, &row.path) => row.installation_uuid,
-            Some(row) => {
-                tracing::warn!(
-                    plugin_id = %manifest.plugin.id,
-                    wasm_path = %wasm_path.display(),
-                    registry_path = %row.path.display(),
-                    "loaded plugin dir does not match InstalledPluginRegistry entry; \
-                     using synthetic UUID — device ids will NOT inherit the installed \
-                     plugin's identity (dev-time load, or replacement component)"
-                );
-                Arc::from(manifest.plugin.id.as_str())
-            }
-            None => Arc::from(manifest.plugin.id.as_str()),
-        };
+            return Err(anyhow!(
+                "plugin {} is quarantined (malformed grant or missing content digest); \
+                 reinstall via the API to re-issue the boundary",
+                manifest.plugin.id
+            ));
+        }
+
+        // C5: resolve the **granted** capabilities from the same
+        // registry row that gave us the UUID. Falls back to the
+        // manifest's requested capabilities when the load path
+        // bypasses the registry (dev / test) or the registry
+        // entry doesn't match this on-disk directory.
+        //
+        // C5 review F2: compute the **effective** set —
+        // requested ∩ granted — so a stale grant broader than
+        // the current manifest can't authorize permissions the
+        // manifest no longer asks for.
+        //
+        // C5 review F3: verify the on-disk content digest
+        // matches the registered value before applying the
+        // grant. A mismatch means the plugin.wasm / manifest /
+        // assets were replaced in place since install; refuse
+        // to run the modified bytes under the pre-modification
+        // grant. Dev-time loads (no registry row, or mismatched
+        // registry path) inherently have no digest to check.
+        let requested = &manifest.capabilities;
+        let (installation_uuid, effective_grant) =
+            match engine.installed_plugins().get(&manifest.plugin.id) {
+                Some(row) if loaded_dir_matches_registry(wasm_path, &row.path) => {
+                    let on_disk = crate::state::content_digest(&row.path).map_err(|err| {
+                        anyhow!(
+                            "computing content digest of installed plugin {}: {err}",
+                            row.path.display()
+                        )
+                    })?;
+                    if on_disk != *row.content_digest {
+                        return Err(anyhow!(
+                            "content digest mismatch for plugin {} (installed contents \
+                             have been modified since install); reinstall via the API \
+                             to re-issue the grant + digest",
+                            manifest.plugin.id
+                        ));
+                    }
+                    let effective = crate::state::effective_capabilities(
+                        requested,
+                        row.granted_capabilities.as_ref(),
+                    );
+                    (row.installation_uuid, Arc::new(effective))
+                }
+                Some(row) => {
+                    tracing::warn!(
+                        plugin_id = %manifest.plugin.id,
+                        wasm_path = %wasm_path.display(),
+                        registry_path = %row.path.display(),
+                        "loaded plugin dir does not match InstalledPluginRegistry entry; \
+                         using synthetic UUID + manifest-requested capabilities — device ids \
+                         will NOT inherit the installed plugin's identity (dev-time load, or \
+                         replacement component)"
+                    );
+                    (
+                        Arc::<str>::from(manifest.plugin.id.as_str()),
+                        Arc::new(requested.clone()),
+                    )
+                }
+                None => (
+                    Arc::<str>::from(manifest.plugin.id.as_str()),
+                    Arc::new(requested.clone()),
+                ),
+            };
+        let granted_capabilities = effective_grant;
+
+        // Reserve a `kv_usage` row for this instance with the
+        // **granted** quota (C5). `register_instance` is
+        // idempotent — repeat loads of the same instance id
+        // preserve `bytes_used` and only refresh the quota, so
+        // an operator-modified grant picks up the new value
+        // without wiping data.
+        let quota_bytes = granted_capabilities.storage_quota_kb.saturating_mul(1024);
+        let kv = engine.kv();
+        kv.register_instance(&instance_id, quota_bytes)
+            .with_context(|| {
+                format!(
+                    "registering KV usage row for instance {instance_id} (quota {quota_bytes} bytes)",
+                )
+            })?;
+
+        // Phase 5b: reserve a `blob_usage` row for this instance
+        // with the **granted** `blob_quota_mb` (C5). Idempotent
+        // like the KV register; positive quota lets calls through,
+        // zero gates them off at the host call site.
+        let blob_quota_bytes = granted_capabilities
+            .blob_quota_mb
+            .saturating_mul(1024 * 1024);
+        let blobs = engine.blobs();
+        blobs
+            .register_instance(&instance_id, blob_quota_bytes)
+            .with_context(|| {
+                format!(
+                    "registering blob usage row for instance {instance_id} (quota {blob_quota_bytes} bytes)",
+                )
+            })?;
 
         let state = PluginState::new(
             instance_id,
@@ -410,7 +484,8 @@ impl PluginInstance {
             blobs,
             engine.services(),
             engine.instances(),
-        );
+        )
+        .with_granted_capabilities(granted_capabilities);
         let mut store = Store::new(engine.raw(), state);
         // Phase 7a — `epoch_interruption(true)` starts every store at
         // deadline 0 (already elapsed), which would trap any wasm the

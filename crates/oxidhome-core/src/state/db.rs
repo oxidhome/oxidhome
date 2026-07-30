@@ -496,6 +496,43 @@ const MIGRATIONS: &[&str] = &[
       ON plugin_installation(plugin_id)
       WHERE uninstalled_ms IS NULL;
     ",
+    // Migration 12 — architecture-review C5: split requested
+    // capabilities (what the plugin declared in its manifest)
+    // from granted capabilities (what the host approved for this
+    // install). Runtime gates consult the grant, not the manifest
+    // — so an operator can, in a future PR, narrow the grant
+    // (or fail the install altogether) without editing the
+    // plugin's manifest.
+    //
+    // v1: `granted_capabilities_json` is set at install time to
+    // a verbatim JSON serialization of the manifest's
+    // `[capabilities]` block. That preserves current behavior
+    // while establishing the split so a follow-up can add an
+    // operator override endpoint without a schema change or a
+    // second migration wave. `NULL` (backfilled pre-C5 rows or
+    // deserialization failure) means "fall back to the
+    // manifest's requested capabilities" — see
+    // `InstalledPluginRegistry::install` and `scan`.
+    "
+    ALTER TABLE plugin_installation ADD COLUMN granted_capabilities_json TEXT;
+    ",
+    // Migration 13 — architecture-review C5 review F3:
+    // content-bound grants.
+    //
+    // Persist a SHA-256 digest over the installed plugin's
+    // manifest + wasm + assets at install time. Load-time
+    // verification compares the stored digest against a fresh
+    // recompute so an in-place `plugin.wasm` swap runs under a
+    // NULL grant (dev fallback) rather than the previously-issued
+    // one. Combined with C5's grant column and the C5 review F1
+    // quarantine, that means every production load either matches
+    // an issued grant against an unchanged package or refuses to
+    // apply the grant at all. NULL for pre-C5 rows — those are
+    // quarantined by scan alongside NULL-grant rows, so an
+    // operator's reinstall re-issues both fields together.
+    "
+    ALTER TABLE plugin_installation ADD COLUMN content_digest TEXT;
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.
