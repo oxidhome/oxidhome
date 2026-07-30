@@ -490,19 +490,30 @@ impl PluginInstance {
                     (row.installation_uuid, Arc::new(effective))
                 }
                 Some(row) => {
-                    tracing::warn!(
-                        plugin_id = %manifest.plugin.id,
-                        wasm_path = %wasm_path.display(),
-                        registry_path = %row.path.display(),
-                        "loaded plugin dir does not match InstalledPluginRegistry entry; \
-                         using synthetic UUID + manifest-requested capabilities — device ids \
-                         will NOT inherit the installed plugin's identity (dev-time load, or \
-                         replacement component)"
-                    );
-                    (
-                        Arc::<str>::from(manifest.plugin.id.as_str()),
-                        Arc::new(requested.clone()),
-                    )
+                    // Follow-up review H11: `Some(row) with a
+                    // mismatched loaded path` was previously the
+                    // dev-time fallback (synthetic UUID +
+                    // manifest-requested capabilities). That path
+                    // let a raw-path load whose manifest declared
+                    // an installed `plugin_id` execute under the
+                    // manifest's request instead of the operator's
+                    // grant. Production loads MUST match the
+                    // installed ledger row; refuse.
+                    //
+                    // The `None` branch below preserves the dev
+                    // workflow — a raw-path load whose `plugin_id`
+                    // isn't installed at all is unambiguous
+                    // (nothing to shadow) and inherits synthetic
+                    // identity as before.
+                    return Err(anyhow!(
+                        "plugin {} is installed at {}, but the loader was pointed at {} — \
+                         production loads must match the installed ledger row (H11). \
+                         To exercise this ID in a dev workflow, uninstall the installation \
+                         first (or use a different plugin_id in the manifest under test).",
+                        manifest.plugin.id,
+                        row.path.display(),
+                        wasm_path.display(),
+                    ));
                 }
                 None if load_is_from_installed_root => {
                     return Err(anyhow!(

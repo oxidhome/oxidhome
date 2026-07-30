@@ -172,6 +172,86 @@ wasm = "simulated_switch.wasm"
     );
 }
 
+/// Follow-up review H11: a raw-path load whose manifest declares
+/// a `plugin_id` that IS installed but is loaded from a
+/// **different** directory must be refused. Pre-fix the loader
+/// fell back to synthetic identity + manifest-requested
+/// capabilities — which is the exact security hole (a
+/// replacement component running under manifest-requested caps,
+/// shadowing the operator's grant boundary). Verified via an
+/// engine that has one plugin installed under `<state>/plugins/`
+/// and a raw-path load from an unrelated tempdir declaring the
+/// same `plugin_id`.
+#[tokio::test(flavor = "current_thread")]
+async fn raw_path_load_refused_when_plugin_id_matches_installed_but_path_differs() {
+    let wasm_src = support::build_example("simulated-switch", "simulated_switch.wasm");
+    assert!(wasm_src.is_file(), "missing build artifact: {wasm_src:?}");
+
+    // Stage a source dir + install it into the engine's plugins root.
+    let state_dir = tempdir();
+    let source = tempdir();
+    let wasm_in_source = source.path().join("simulated_switch.wasm");
+    std::fs::copy(&wasm_src, &wasm_in_source).expect("copy wasm to source");
+    std::fs::write(
+        source.path().join("manifest.toml"),
+        r#"manifest_version = 1
+[plugin]
+id = "example.installed-switch"
+name = "Installed Switch"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "simulated_switch.wasm"
+[capabilities]
+declares_devices = ["switch"]
+"#,
+    )
+    .expect("write source manifest");
+
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    engine
+        .installed_plugins()
+        .install(source.path())
+        .expect("install");
+
+    // Now stage a DIFFERENT dir with the same plugin_id.
+    let attacker = tempdir();
+    let wasm_in_attacker = attacker.path().join("simulated_switch.wasm");
+    std::fs::copy(&wasm_src, &wasm_in_attacker).expect("copy wasm to attacker");
+    std::fs::write(
+        attacker.path().join("manifest.toml"),
+        // Attacker declares no capabilities in the manifest but
+        // the pre-fix loader would apply the manifest's request
+        // (empty) instead of the operator's grant (switch). The
+        // security concern is different-bytes-running-under-known-
+        // id; refusing to load is the correct outcome regardless.
+        r#"manifest_version = 1
+[plugin]
+id = "example.installed-switch"
+name = "Attacker"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "simulated_switch.wasm"
+[capabilities]
+"#,
+    )
+    .expect("write attacker manifest");
+
+    let Err(err) =
+        PluginInstance::load(&engine, attacker.path(), "installed-switch-attacker").await
+    else {
+        panic!("raw-path load for an installed plugin_id must be refused (H11)");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("H11") || msg.contains("installed at"),
+        "error should mention the H11 refusal; got: {msg}",
+    );
+}
+
 /// Tiny tempdir helper. The integration tests already use
 /// `tokio::fs` indirectly via the loader; using std `tempfile`-style
 /// scratch here keeps the dep surface small.
