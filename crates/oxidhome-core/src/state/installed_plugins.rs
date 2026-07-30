@@ -121,79 +121,143 @@ pub struct InstalledPlugin {
     pub content_digest: Arc<str>,
 }
 
-/// C5 review F3: compute a stable content digest for an
-/// installed-plugin directory. Walks the tree, sorts files by
-/// relative path, and feeds each `(rel_path, contents)` pair
-/// into a single SHA-256 with a domain-separation tag + `u32`
-/// length prefixes. Symlinks are refused — the install path
-/// already rejects source trees containing symlinks, so a
-/// symlink under a live plugin dir is either operator tampering
-/// or filesystem corruption; either way, refuse to hash rather
-/// than silently follow.
+/// C5 review F3 + round-4 F2: compute a stable content digest
+/// binding a plugin's `manifest.toml` bytes and the component's
+/// wasm bytes. Install captures this over the staged package
+/// (in-memory bytes); the loader recomputes it from the exact
+/// bytes it reads into memory for parse + instantiate, so there
+/// is no TOCTOU window between the digest walk and the bytes
+/// wasmtime actually executes.
 ///
-/// Returns a 64-char lowercase hex string, or wraps the failing
-/// `io` operation.
-///
-/// # Errors
-///
-/// Any `std::io::Error` from directory walk or file read.
-pub fn content_digest(dir: &Path) -> std::io::Result<String> {
+/// Format: SHA-256 with a domain-separation tag + `u32`
+/// length-prefix framing over `(manifest_bytes, wasm_bytes)`.
+/// Assets under the plugin dir are intentionally excluded — they
+/// aren't executed and can drift without affecting the grant
+/// boundary; only manifest + component determine what runs.
+#[must_use]
+pub fn content_digest(manifest_bytes: &[u8], wasm_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    let tag = b"oxidhome:plugin-content:v1";
+    let tag = b"oxidhome:plugin-content:v2";
     #[allow(clippy::cast_possible_truncation)]
     hasher.update((tag.len() as u32).to_be_bytes());
     hasher.update(tag);
-
-    let mut files: Vec<PathBuf> = Vec::new();
-    collect_files(dir, dir, &mut files)?;
-    files.sort();
-
-    for rel in &files {
-        let full = dir.join(rel);
-        let rel_string = rel.to_string_lossy().into_owned();
-        let rel_bytes = rel_string.as_bytes();
-        #[allow(clippy::cast_possible_truncation)]
-        hasher.update((rel_bytes.len() as u32).to_be_bytes());
-        hasher.update(rel_bytes);
-        let contents = std::fs::read(&full)?;
-        #[allow(clippy::cast_possible_truncation)]
-        hasher.update((contents.len() as u32).to_be_bytes());
-        hasher.update(&contents);
-    }
+    #[allow(clippy::cast_possible_truncation)]
+    hasher.update((manifest_bytes.len() as u32).to_be_bytes());
+    hasher.update(manifest_bytes);
+    #[allow(clippy::cast_possible_truncation)]
+    hasher.update((wasm_bytes.len() as u32).to_be_bytes());
+    hasher.update(wasm_bytes);
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for byte in &digest {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }
-    Ok(hex)
+    hex
 }
 
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let full = entry.path();
-        if ty.is_symlink() {
+/// Read the manifest.toml and referenced wasm bytes from an
+/// installed plugin dir into memory, returning them alongside the
+/// computed digest. The caller controls what happens with the
+/// bytes — the loader uses them to instantiate wasmtime directly
+/// so hash + parse + compile are all bound to the same in-memory
+/// snapshot (C5 review F3 codex round-4 F2 TOCTOU fix).
+///
+/// `runtime_wasm_rel` is the manifest's `[runtime].wasm` relative
+/// path (already validated to live under `plugin_dir` by
+/// `resolve_wasm_path` at load time; scan re-does the join).
+///
+/// # Errors
+///
+/// Any `std::io::Error` from the two file reads.
+pub fn read_installed_bytes(
+    plugin_dir: &Path,
+    runtime_wasm_rel: &Path,
+) -> std::io::Result<(String, Vec<u8>, Vec<u8>)> {
+    let manifest_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join("manifest.toml"))?;
+    let wasm_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join(runtime_wasm_rel))?;
+    let digest = content_digest(&manifest_bytes, &wasm_bytes);
+    Ok((digest, manifest_bytes, wasm_bytes))
+}
+
+/// Read `path` into a `Vec<u8>` after refusing to follow a
+/// symlink AND after verifying the canonicalized path lives
+/// under `root`. Used by [`read_installed_bytes`] so a
+/// hand-placed plugin dir can't smuggle in an out-of-tree wasm
+/// via a symlink (which `std::fs::read` would silently follow),
+/// nor point at `/dev/zero` or a fifo that would hang / OOM the
+/// scan.
+///
+/// C5 round-6 review F1 refinement: on Unix, opens with
+/// `O_NOFOLLOW` so the symlink refusal happens **atomically at
+/// open time**, and reads via the returned file handle (not a
+/// second pathname lookup) so a check-then-open race can't slip
+/// a symlink or FIFO in after the check. On Windows (no
+/// `O_NOFOLLOW`), falls back to the `symlink_metadata` + `open`
+/// pattern; Windows symlinks require admin/dev-mode to create,
+/// so the race is a lower-priority concern.
+fn read_no_follow_within(root: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        // `O_NOFOLLOW` returns `ELOOP` on Linux if the last
+        // path component is a symlink. On macOS, POSIX-compliant.
+        // Reading via the returned fd (not re-resolving `path`)
+        // is what closes the TOCTOU on the file bytes themselves.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "content_digest refuses to follow a symlink at {}",
-                    full.display()
-                ),
+                format!("refusing to follow symlink at {}", path.display()),
             ));
         }
-        if ty.is_dir() {
-            collect_files(root, &full, out)?;
-        } else if ty.is_file() {
-            let rel = full
-                .strip_prefix(root)
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or(full);
-            out.push(rel);
-        }
+        std::fs::File::open(path)?
+    };
+    // Verify what we actually opened is a regular file. On Unix
+    // with `O_NOFOLLOW`, symlinks would have failed at open; this
+    // catches FIFOs, sockets, block/char devices whose paths can
+    // still resolve to something openable. `metadata()` here
+    // queries via the fd (`fstat`), not via a fresh path lookup.
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to read non-file entry at {} (type: {:?})",
+                path.display(),
+                meta.file_type()
+            ),
+        ));
     }
-    Ok(())
+    // Canonical-containment guards against a plugin dir whose
+    // contents include a hardlink or mount point that resolves
+    // elsewhere. The main TOCTOU protection is `O_NOFOLLOW` +
+    // reading via the fd; this containment check is a static
+    // "did the operator legitimately install us here" guard.
+    let canonical_path = std::fs::canonicalize(path)?;
+    let canonical_root = std::fs::canonicalize(root)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to read {} (canonical path {} escapes plugin root {})",
+                path.display(),
+                canonical_path.display(),
+                canonical_root.display()
+            ),
+        ));
+    }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// C5 review F2: compute the **effective** capability set at
@@ -350,15 +414,31 @@ pub struct InstalledPluginRegistry {
     plugins_root: Option<PathBuf>,
     db: Option<Arc<Db>>,
     entries: RwLock<HashMap<Arc<str>, InstalledPlugin>>,
-    /// C5 review F1/F3 codex-fixup: `plugin_id`s of live SQL
-    /// rows that scan quarantined (NULL / malformed grant, NULL
-    /// digest). These installations don't appear in `entries` —
-    /// but the loader must also refuse to serve them via the
-    /// direct-start / argv path where an entry-miss would
-    /// otherwise fall through to dev-load semantics (synthetic
-    /// UUID + manifest-requested capabilities). Consulted by
-    /// [`Self::is_quarantined`].
-    quarantined: std::collections::HashSet<Arc<str>>,
+    /// C5 review F1/F3 codex-fixup + round-6 F1: `plugin_id` →
+    /// `(installation_uuid, path)` for live SQL rows that scan
+    /// quarantined (NULL / malformed grant, NULL digest). Held
+    /// in a separate map from `entries` because runtime callers
+    /// must NOT resolve them as live installations, but the
+    /// API's `uninstall` needs a way to address them so an
+    /// operator's upgrade-then-reinstall recovery path works
+    /// without hand-editing `SQLite`. `path` is `Option<PathBuf>`
+    /// so a quarantined row whose FS dir went missing (or is
+    /// unreadable / has an unsafe id) still appears in
+    /// [`Self::is_quarantined`] and is uninstallable — with the
+    /// SQL-tombstone-only branch of [`Self::uninstall`].
+    quarantined: RwLock<std::collections::HashMap<Arc<str>, QuarantineEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct QuarantineEntry {
+    installation_uuid: Arc<str>,
+    /// C5 round-5 review F1: the FS path is `Some` when scan
+    /// found a matching directory during the tree walk, `None`
+    /// when the SQL row is quarantined but its directory is
+    /// missing / unreadable / has an unsafe id. `uninstall`
+    /// still needs to tombstone the SQL row in the None case
+    /// (identity boundary) so an operator can reinstall.
+    path: Option<PathBuf>,
 }
 
 impl InstalledPluginRegistry {
@@ -374,7 +454,7 @@ impl InstalledPluginRegistry {
             plugins_root: None,
             db: None,
             entries: RwLock::new(HashMap::new()),
-            quarantined: std::collections::HashSet::new(),
+            quarantined: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -387,7 +467,10 @@ impl InstalledPluginRegistry {
     /// quarantine with a manifest-derived grant.
     #[must_use]
     pub fn is_quarantined(&self, plugin_id: &str) -> bool {
-        self.quarantined.contains(plugin_id)
+        self.quarantined
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(plugin_id)
     }
 
     // Poison-tolerant accessors. Critical sections here only do
@@ -442,8 +525,29 @@ impl InstalledPluginRegistry {
         // and the persisted granted-capabilities blob (C5).
         let LiveInstallationLoad {
             live: live_rows,
-            quarantined_plugin_ids,
+            quarantined_uuids,
         } = load_live_installations(&db)?;
+        // C5 round-6 F1: pre-populate the quarantined registry
+        // map from every SQL-side quarantined row (path = None
+        // for now). The FS walk below fills in `path` when a
+        // matching dir is found. Doing this up-front means a
+        // quarantined row whose FS dir is missing / unreadable
+        // still shows up in `is_quarantined()` — closes the
+        // raw-path bypass where a CLI load with the same
+        // plugin_id would fall through to dev-load semantics.
+        let mut quarantined_registry: std::collections::HashMap<Arc<str>, QuarantineEntry> =
+            quarantined_uuids
+                .iter()
+                .map(|(plugin_id, uuid)| {
+                    (
+                        Arc::<str>::from(plugin_id.as_str()),
+                        QuarantineEntry {
+                            installation_uuid: Arc::clone(uuid),
+                            path: None,
+                        },
+                    )
+                })
+                .collect();
 
         let mut entries: HashMap<Arc<str>, InstalledPlugin> = HashMap::new();
         let mut backfills: Vec<InstalledPlugin> = Vec::new();
@@ -506,6 +610,24 @@ impl InstalledPluginRegistry {
                     ),
                 }
                 continue;
+            }
+            // C5 round-6 review F2: if the dir NAME matches a
+            // quarantined `plugin_id`, record its path now — even
+            // if the manifest read below fails or declares an
+            // unsafe id. Otherwise the pre-populated `path: None`
+            // would let `uninstall` succeed without removing the
+            // FS dir, and the leftover would block a subsequent
+            // `install` with `AlreadyInstalled`. Uses the raw dir
+            // name (not the manifest id) as the match key because
+            // the manifest may be unreadable — the only stable
+            // observation for a broken manifest is the on-disk
+            // name matching the install convention
+            // `<plugins_root>/<plugin_id>/`.
+            if !dir_name.is_empty()
+                && let Some(entry) = quarantined_registry.get_mut(dir_name)
+                && entry.path.is_none()
+            {
+                entry.path = Some(path.clone());
             }
             let manifest_path = path.join("manifest.toml");
             let manifest = match read_manifest_sync(&manifest_path) {
@@ -578,11 +700,22 @@ impl InstalledPluginRegistry {
             // `observed_manifest_ids` above, so the orphan
             // sweep doesn't tombstone it either. Operator
             // repairs via `uninstall` + `install` cycle.
-            if quarantined_plugin_ids.contains(&manifest_id) {
+            if let Some(uuid) = quarantined_uuids.get(&manifest_id) {
                 tracing::warn!(
                     plugin_id = %manifest_id,
                     path = %path.display(),
-                    "skipping quarantined installation (malformed grant or missing digest) — reinstall to re-issue",
+                    "skipping quarantined installation (malformed grant or missing digest) — uninstall + reinstall via the API to re-issue",
+                );
+                // Set/overwrite the pre-populated entry with the
+                // actual manifest_id key (may differ from dir_name
+                // if the manifest renamed the plugin) and a valid
+                // FS path so `uninstall` can remove the dir.
+                quarantined_registry.insert(
+                    Arc::from(manifest_id.as_str()),
+                    QuarantineEntry {
+                        installation_uuid: Arc::clone(uuid),
+                        path: Some(path.clone()),
+                    },
                 );
                 continue;
             }
@@ -608,8 +741,8 @@ impl InstalledPluginRegistry {
                 // fresh content digest, matching what the
                 // API's `install` would have done.
                 let uuid = mint_installation_uuid();
-                let digest = match content_digest(&path) {
-                    Ok(d) => Arc::<str>::from(d),
+                let digest = match read_installed_bytes(&path, &manifest.runtime.wasm) {
+                    Ok((d, _, _)) => Arc::<str>::from(d),
                     Err(err) => {
                         tracing::error!(
                             plugin_id = %manifest_id,
@@ -712,10 +845,7 @@ impl InstalledPluginRegistry {
             plugins_root: Some(plugins_root),
             db: Some(db),
             entries: RwLock::new(entries),
-            quarantined: quarantined_plugin_ids
-                .into_iter()
-                .map(Arc::<str>::from)
-                .collect(),
+            quarantined: RwLock::new(quarantined_registry),
         })
     }
 
@@ -865,12 +995,14 @@ impl InstalledPluginRegistry {
             });
         }
 
-        // C5 review F3: compute the content digest over the
-        // staged package (post-copy, before rename). The loader
-        // recomputes at load time and refuses to apply the
-        // stored grant if the bytes disagree.
-        let staged_digest = match content_digest(&staging) {
-            Ok(d) => d,
+        // C5 review F3 + round-4 F2: compute the content digest
+        // over the staged package's `manifest.toml` + wasm bytes
+        // (post-copy, before rename). The loader recomputes from
+        // the SAME in-memory bytes it uses to instantiate
+        // wasmtime, so a mid-load rewrite of the on-disk files
+        // can't slip past the digest check.
+        let staged_digest = match read_installed_bytes(&staging, &staged_manifest.runtime.wasm) {
+            Ok((d, _, _)) => d,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&staging);
                 return Err(InstallError::Io(err));
@@ -954,7 +1086,28 @@ impl InstalledPluginRegistry {
         // don't want a parallel `install` for the same id slipping
         // in between the `remove_dir_all` and the index drop.
         let mut entries = self.write_entries();
-        let Some(entry) = entries.get(plugin_id) else {
+        // C5 review F1/F3 codex round-4: quarantined installations
+        // are absent from `entries` on purpose (the runtime must
+        // refuse them), but must still be uninstallable via the
+        // API — otherwise an operator upgrading a database into
+        // C5-with-digest can't recover an existing installation
+        // without hand-editing `SQLite`. Resolve via the
+        // quarantined map when entries misses.
+        let (installation_uuid, dest, was_quarantined) = if let Some(entry) = entries.get(plugin_id)
+        {
+            (
+                Arc::clone(&entry.installation_uuid),
+                Some(entry.path.clone()),
+                false,
+            )
+        } else if let Some(q) = self
+            .quarantined
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(plugin_id)
+        {
+            (Arc::clone(&q.installation_uuid), q.path.clone(), true)
+        } else {
             return Err(UninstallError::NotInstalled(plugin_id.to_string()));
         };
         // **Path safety: use the stored path, not a recomputed
@@ -967,8 +1120,15 @@ impl InstalledPluginRegistry {
         // safe id's stored path is always under `plugins_root`;
         // any divergence is a sign of registry corruption and
         // we'd rather refuse than `remove_dir_all` outside it.
-        let dest = entry.path.clone();
-        if !dest.starts_with(plugins_root) {
+        //
+        // C5 round-5 F1: `dest` is `None` when the caller is
+        // uninstalling a quarantined row whose FS dir went
+        // missing between install and this call. Tombstone the
+        // SQL row anyway so the identity boundary is cleared;
+        // no FS operation runs.
+        if let Some(dest) = &dest
+            && !dest.starts_with(plugins_root)
+        {
             tracing::error!(
                 plugin_id = %plugin_id,
                 path = %dest.display(),
@@ -997,17 +1157,26 @@ impl InstalledPluginRegistry {
         // SQL row without a dir) — scan warns; a maintenance tool
         // can hard-tombstone. Identity still does not rotate on
         // the historical audit trail.
-        let installation_uuid = Arc::clone(&entry.installation_uuid);
-        if dest.exists() {
-            std::fs::remove_dir_all(&dest)?;
+        if let Some(dest) = &dest
+            && dest.exists()
+        {
+            std::fs::remove_dir_all(dest)?;
         }
         if let Some(db) = &self.db {
             tombstone_installation_row(db, &installation_uuid)?;
         }
-        entries.remove(plugin_id);
+        if was_quarantined {
+            self.quarantined
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(plugin_id);
+        } else {
+            entries.remove(plugin_id);
+        }
         tracing::info!(
             plugin_id = %plugin_id,
-            path = %dest.display(),
+            path = ?dest,
+            was_quarantined,
             "plugin uninstalled",
         );
         Ok(())
@@ -1045,7 +1214,13 @@ struct LiveInstallation {
 /// fail-closed) + F3 (missing digest fail-closed).
 struct LiveInstallationLoad {
     live: HashMap<String, LiveInstallation>,
-    quarantined_plugin_ids: std::collections::HashSet<String>,
+    /// `plugin_id → installation_uuid` for rows the SQL-read
+    /// layer refused to accept. Scan pairs each with the matching
+    /// on-disk path (if any) to populate
+    /// [`InstalledPluginRegistry::quarantined`], so the API's
+    /// `uninstall` can address quarantined installations without
+    /// hand-editing `SQLite`. C5 review F1/F3 codex-fixup.
+    quarantined_uuids: HashMap<String, Arc<str>>,
 }
 
 /// Load every live `plugin_installation` row (i.e. `uninstalled_ms IS
@@ -1078,9 +1253,10 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
             Ok((plugin_id, uuid, grant_json, digest))
         })?;
         let mut live = HashMap::new();
-        let mut quarantined_plugin_ids = std::collections::HashSet::new();
+        let mut quarantined_uuids: HashMap<String, Arc<str>> = HashMap::new();
         for row in rows {
             let (plugin_id, uuid, grant_json, digest) = row?;
+            let uuid_arc = Arc::<str>::from(uuid.clone());
             let Some(digest) = digest else {
                 tracing::error!(
                     plugin_id = %plugin_id,
@@ -1089,7 +1265,7 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
                      quarantining — reinstall to re-issue the grant + digest \
                      (C5 review F3 fail-closed)",
                 );
-                quarantined_plugin_ids.insert(plugin_id);
+                quarantined_uuids.insert(plugin_id, uuid_arc);
                 continue;
             };
             let Some(json) = grant_json else {
@@ -1100,7 +1276,7 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
                      quarantining — reinstall to re-issue the grant \
                      (C5 review F1 fail-closed)",
                 );
-                quarantined_plugin_ids.insert(plugin_id);
+                quarantined_uuids.insert(plugin_id, uuid_arc);
                 continue;
             };
             match serde_json::from_str::<CapabilitiesSection>(&json) {
@@ -1108,7 +1284,7 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
                     live.insert(
                         plugin_id,
                         LiveInstallation {
-                            installation_uuid: Arc::<str>::from(uuid),
+                            installation_uuid: uuid_arc,
                             granted_capabilities: Arc::new(cap),
                             content_digest: Arc::<str>::from(digest),
                         },
@@ -1123,13 +1299,13 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
                          quarantining — reinstall or hand-repair the JSON \
                          (C5 review F1 fail-closed)",
                     );
-                    quarantined_plugin_ids.insert(plugin_id);
+                    quarantined_uuids.insert(plugin_id, uuid_arc);
                 }
             }
         }
         Ok(LiveInstallationLoad {
             live,
-            quarantined_plugin_ids,
+            quarantined_uuids,
         })
     })
 }
@@ -1720,6 +1896,98 @@ wasm = "plugin.wasm"
             reg.is_quarantined(plugin_id),
             "quarantined installations must be flagged so direct-start refuses to load them",
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C5 round-6 review F1: a quarantined SQL row whose FS dir
+    /// went missing (or has no FS entry at all) must still show
+    /// up in `is_quarantined()` — otherwise a raw-path CLI load
+    /// declaring that `plugin_id` would fall through to dev-load
+    /// semantics + synthetic identity. `uninstall` also has to
+    /// still work; only the FS-remove step is a no-op.
+    #[test]
+    fn quarantined_row_without_fs_still_appears_in_is_quarantined() {
+        let root = tempdir("quarantined-no-fs");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+        let db = fresh_db();
+
+        let plugin_id = "example.no-fs";
+        let uuid = mint_installation_uuid();
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO plugin_installation
+                     (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms,
+                      granted_capabilities_json, content_digest)
+                 VALUES (?1, ?2, '0.1.0', 1, NULL, NULL, NULL)",
+                rusqlite::params![&*uuid, plugin_id],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
+        assert!(
+            reg.is_quarantined(plugin_id),
+            "quarantined row must appear in is_quarantined even when FS dir is missing",
+        );
+        reg.uninstall(plugin_id)
+            .expect("quarantined uninstall without FS must succeed");
+        assert!(!reg.is_quarantined(plugin_id));
+        let uninstalled_ms: Option<i64> = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT uninstalled_ms FROM plugin_installation
+                     WHERE installation_uuid = ?1",
+                    [&*uuid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(uninstalled_ms.is_some());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// C5 round-6 review F2: scan-time backfill must refuse to
+    /// follow a symlink for the wasm file — a hand-placed plugin
+    /// dir whose `plugin.wasm` symlinks to `/dev/zero` would hang
+    /// or exhaust memory. `read_no_follow_within` (via `O_NOFOLLOW`
+    /// on Unix) returns `InvalidInput`, `read_installed_bytes`
+    /// propagates.
+    #[cfg(unix)]
+    #[test]
+    fn read_installed_bytes_refuses_symlinked_wasm() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir("symlinked-wasm");
+        let plugin_dir = root.join("example.symlinked");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.symlinked"
+name = "Sym"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+        )
+        .unwrap();
+        let outside = root.join("outside.wasm");
+        std::fs::write(&outside, b"\0asm\x01\x00\x00\x00").unwrap();
+        symlink(&outside, plugin_dir.join("plugin.wasm")).unwrap();
+
+        let err =
+            read_installed_bytes(&plugin_dir, std::path::Path::new("plugin.wasm")).unwrap_err();
+        // On Linux, O_NOFOLLOW yields ELOOP (which surfaces as
+        // FilesystemLoop); the wrapping err kind can differ per
+        // OS. Assert the error is present rather than pinning
+        // the exact kind.
+        assert!(!err.to_string().is_empty(), "symlinked wasm must fail");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
