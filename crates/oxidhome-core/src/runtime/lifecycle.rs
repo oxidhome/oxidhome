@@ -408,6 +408,10 @@ impl InstanceHandle {
 /// then runs the instance until `shutdown` or a crash; the handle's
 /// `watch` channel reports progress (starts at
 /// [`InstanceState::Loading`]).
+/// Spawn a supervisor task for a dev-time load. Test / harness
+/// entrypoint; the daemon reaches this indirectly via
+/// [`crate::Engine::start_instance`] (dev) or
+/// [`crate::Engine::start_installed_instance`] (production).
 #[must_use]
 pub fn supervise(
     engine: Engine,
@@ -439,6 +443,34 @@ pub fn supervise_with_tuning(
     overrides: Option<toml::Value>,
     tuning: SupervisorTuning,
 ) -> InstanceHandle {
+    supervise_with_tuning_and_mode(
+        engine,
+        plugin_dir,
+        instance_id,
+        plugin_id,
+        overrides,
+        crate::runtime::LoadMode::Dev,
+        tuning,
+    )
+}
+
+/// H11 round-2 F1: full-fidelity supervisor spawn with explicit
+/// `LoadMode` and tuning. Used by
+/// [`crate::Engine::start_instance_with_tuning`] (which the API
+/// paths and dev-load path both route through with their chosen
+/// mode). `supervise` / `supervise_with_tuning` above are the
+/// `LoadMode::Dev` sugar for tests.
+#[doc(hidden)]
+#[must_use]
+pub fn supervise_with_tuning_and_mode(
+    engine: Engine,
+    plugin_dir: PathBuf,
+    instance_id: impl Into<String>,
+    plugin_id: impl Into<String>,
+    overrides: Option<toml::Value>,
+    mode: crate::runtime::LoadMode,
+    tuning: SupervisorTuning,
+) -> InstanceHandle {
     let instance_id: Arc<str> = Arc::from(instance_id.into());
     let plugin_id: Arc<str> = Arc::from(plugin_id.into());
     let (control_tx, control_rx) = mpsc::channel(16);
@@ -455,6 +487,7 @@ pub fn supervise_with_tuning(
         instance_id,
         overrides,
         tuning,
+        mode,
         control_rx,
         state_tx,
     ));
@@ -592,12 +625,14 @@ enum BackoffOutcome {
 /// The supervisor task body: run the instance, and on a crash apply
 /// the manifest's `restart` policy with exponential backoff until a
 /// clean stop, an unrecoverable failure, or the restart cap.
+#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     engine: Engine,
     plugin_dir: PathBuf,
     instance_id: Arc<str>,
     overrides: Option<toml::Value>,
     tuning: SupervisorTuning,
+    mode: crate::runtime::LoadMode,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     state_tx: watch::Sender<InstanceState>,
 ) {
@@ -623,6 +658,7 @@ async fn run_supervisor(
             overrides.as_ref(),
             tuning.healthy_reset,
             tuning.watchdog,
+            &mode,
             &mut control_rx,
             &state_tx,
         )
@@ -706,6 +742,7 @@ async fn run_one_lifecycle(
     overrides: Option<&toml::Value>,
     healthy_reset: Duration,
     watchdog: Duration,
+    mode: &crate::runtime::LoadMode,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     state_tx: &watch::Sender<InstanceState>,
 ) -> LifecycleOutcome {
@@ -719,11 +756,12 @@ async fn run_one_lifecycle(
 
     transition(state_tx, instance_id, InstanceState::Loading);
 
-    let mut instance = match PluginInstance::load_with_overrides(
+    let mut instance = match PluginInstance::load_with_mode(
         engine,
         plugin_dir,
         instance_id.to_string(),
         overrides,
+        mode.clone(),
     )
     .await
     {

@@ -702,12 +702,21 @@ async fn start_plugin_instance(
         .installed_plugins()
         .get(&plugin_id)
         .ok_or(PluginLifecycleError::NotFound)?;
-    // `start_instance` is itself async and supervises in the
-    // background; we await its initial Running transition so the
-    // API response reflects the reach-Running outcome.
+    // H11 round-2 F1: `start_installed_instance` pins the
+    // load-time identity to the `installation_uuid` observed under
+    // the lifecycle lock. The loader fails closed if the registry
+    // row named by that uuid disappears between now and the
+    // supervisor's re-read (concurrent uninstall race) — never
+    // falls back to synthetic identity + manifest-requested
+    // capabilities.
     let handle = state
         .engine
-        .start_instance(installed.path.clone(), &instance_id, body.config_overrides)
+        .start_installed_instance(
+            installed.path.clone(),
+            &instance_id,
+            body.config_overrides,
+            std::sync::Arc::clone(&installed.installation_uuid),
+        )
         .await
         .map_err(PluginLifecycleError::Start)?;
     handle
@@ -819,13 +828,22 @@ async fn uninstall_plugin(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<UninstalledRow>, PluginLifecycleError> {
     require_scope(&actor, PLUGINS_UNINSTALL)?;
-    // H2 round-2 F1: hold the per-plugin_id lifecycle lock
-    // across the running-instances check + the compose
-    // uninstall. Serializes against a concurrent
-    // `start_plugin_instance` for the same id — see the F1
-    // comment on that handler for the race.
+    // H2 round-2 F1 + H3 round-2 F1: hold the per-plugin_id
+    // lifecycle lock across the running-instances check + the
+    // compose uninstall, and — crucially — MOVE the guard into
+    // the `spawn_blocking` closure so the uninstall task itself
+    // owns the reservation until every FS + SQL step finishes.
+    //
+    // A borrowed guard on the handler frame would be dropped if
+    // the HTTP handler was cancelled mid-uninstall (client
+    // disconnect, axum shutdown); the `spawn_blocking` task
+    // keeps running detached and can still be racing a
+    // concurrent `start_plugin_instance` that has since
+    // re-acquired the mutex. Owning the guard for the whole
+    // blocking closure keeps the reservation alive until the
+    // real work completes, cancellation or not.
     let lifecycle_lock = state.engine.plugin_lifecycle_lock(&plugin_id);
-    let _guard = lifecycle_lock.lock().await;
+    let guard = lifecycle_lock.lock_owned().await;
     let running: Vec<String> = state
         .engine
         .instances()
@@ -843,9 +861,12 @@ async fn uninstall_plugin(
     // `plugin_id` starts with an empty per-instance keyspace.
     let engine = state.engine.clone();
     let id_for_blocking = plugin_id.clone();
-    let result = tokio::task::spawn_blocking(move || engine.uninstall_plugin(&id_for_blocking))
-        .await
-        .map_err(|err| PluginLifecycleError::Internal(err.into()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        engine.uninstall_plugin(&id_for_blocking)
+    })
+    .await
+    .map_err(|err| PluginLifecycleError::Internal(err.into()))?;
     result?;
     Ok(Json(UninstalledRow { plugin_id }))
 }
