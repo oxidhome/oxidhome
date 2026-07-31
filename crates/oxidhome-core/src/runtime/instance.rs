@@ -796,27 +796,30 @@ impl PluginInstance {
             // plugin cares it can subscribe again with more
             // slack, or reconcile via `Logs.Query` / the durable
             // event history.
-            while let Ok(msg) = sub.receiver.try_recv() {
-                match msg {
-                    SubscriberMessage::Event(ev) => {
-                        // `Arc::try_unwrap` avoids a clone if we
-                        // hold the last reference (common case
-                        // for a single subscriber); otherwise
-                        // fall back to `Arc::unwrap_or_clone`
-                        // (Rust 1.76) — clone-on-write per
-                        // subscription.
-                        let ev = Arc::unwrap_or_clone(ev);
-                        if sub.matches(&ev) {
-                            events.push(ev);
-                        }
-                    }
-                    SubscriberMessage::Lagged { skipped } => {
-                        tracing::warn!(
-                            subscription_id = sub.id,
-                            skipped,
-                            "plugin subscription dropped events (C2e per-subscriber queue overflow)",
-                        );
-                    }
+            while let Ok(SubscriberMessage::Event {
+                event: ev,
+                skipped_before,
+            }) = sub.receiver.try_recv()
+            {
+                // Follow-up review H4 round-2 F1: lag count now
+                // travels with the event; log it (best-effort
+                // observability, same shape the pre-fix bare
+                // `Lagged` variant produced) then dispatch.
+                if skipped_before > 0 {
+                    tracing::warn!(
+                        subscription_id = sub.id,
+                        skipped = skipped_before,
+                        "plugin subscription dropped events (C2e per-subscriber queue overflow)",
+                    );
+                }
+                // `Arc::try_unwrap` avoids a clone if we hold the
+                // last reference (common case for a single
+                // subscriber); otherwise fall back to
+                // `Arc::unwrap_or_clone` (Rust 1.76) — clone-on-
+                // write per subscription.
+                let ev = Arc::unwrap_or_clone(ev);
+                if sub.matches(&ev) {
+                    events.push(ev);
                 }
             }
         }

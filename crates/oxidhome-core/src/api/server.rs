@@ -991,23 +991,29 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
         // a dead send target.
         tokio::select! {
             msg = sub.receiver.recv() => match msg {
-                Some(crate::state::SubscriberMessage::Event(event)) => {
+                // Follow-up review H4 round-2 F1: the mpsc slot
+                // now carries `Event { event, skipped_before }`.
+                // When `skipped_before > 0` emit the
+                // `{"lagged": N}` reconcile frame FIRST, then
+                // the event — clients still see the pre-C2e
+                // "Lagged then Event" ordering on the wire
+                // without the two-slot mpsc pressure that
+                // could starve fresh events.
+                Some(crate::state::SubscriberMessage::Event {
+                    event,
+                    skipped_before,
+                }) => {
+                    if skipped_before > 0 {
+                        let notice = format!("{{\"lagged\":{skipped_before}}}");
+                        if socket.send(Message::Text(notice.into())).await.is_err() {
+                            break;
+                        }
+                    }
                     let wire = WireEvent::from_host(&event);
                     let Ok(text) = serde_json::to_string(&wire) else {
                         continue;
                     };
                     if socket.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
-                }
-                // C2e review F2: per-subscriber queue overflowed;
-                // surface the gap to the WebSocket client so it
-                // can reconcile via the durable event history
-                // (`GET /api/v1/events`) — same shape the
-                // pre-C2e broadcast RecvError::Lagged used.
-                Some(crate::state::SubscriberMessage::Lagged { skipped }) => {
-                    let notice = format!("{{\"lagged\":{skipped}}}");
-                    if socket.send(Message::Text(notice.into())).await.is_err() {
                         break;
                     }
                 }

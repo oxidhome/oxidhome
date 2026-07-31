@@ -912,35 +912,70 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         // receiver) alive in the unfold state, so its
         // `SubscriberToken` drops when the stream ends and the
         // subscription slot on the bus is freed.
-        let response_stream =
-            futures_util::stream::unfold(subscription, |mut subscription| async move {
+        //
+        // Follow-up review H4 round-2 F1: the mpsc now delivers
+        // `Event { event, skipped_before }` in one slot. When
+        // `skipped_before > 0` we yield the `Lagged` wire frame
+        // first, then buffer the event for the next iteration —
+        // clients still see the pre-C2e "Lagged then Event"
+        // ordering on the wire without the two-slot mpsc pressure
+        // that starved fresh events under a tight consumer.
+        let response_stream = futures_util::stream::unfold(
+            (subscription, None::<std::sync::Arc<WitEvent>>),
+            |(mut subscription, buffered_event)| async move {
                 use crate::state::SubscriberMessage;
-                let body = match subscription.receiver.recv().await {
-                    Some(SubscriberMessage::Event(event)) => tail_events_response::Body::Event(
-                        Box::new(wit_event_to_proto(std::sync::Arc::unwrap_or_clone(event))),
-                    ),
-                    // C2e review F2: subscriber-side overflow —
-                    // restore the pre-C2e Lagged body so clients
-                    // can detect the gap and reconcile via the
-                    // durable event history.
-                    Some(SubscriberMessage::Lagged { skipped }) => {
-                        tail_events_response::Body::Lagged(Box::new(ProtoLagged {
-                            skipped,
+                if let Some(event) = buffered_event {
+                    let body = tail_events_response::Body::Event(Box::new(wit_event_to_proto(
+                        std::sync::Arc::unwrap_or_clone(event),
+                    )));
+                    return Some((
+                        Ok(TailEventsResponse {
+                            body: Some(body),
                             ..Default::default()
-                        }))
+                        }),
+                        (subscription, None),
+                    ));
+                }
+                match subscription.receiver.recv().await {
+                    Some(SubscriberMessage::Event {
+                        event,
+                        skipped_before: 0,
+                    }) => {
+                        let body = tail_events_response::Body::Event(Box::new(wit_event_to_proto(
+                            std::sync::Arc::unwrap_or_clone(event),
+                        )));
+                        Some((
+                            Ok(TailEventsResponse {
+                                body: Some(body),
+                                ..Default::default()
+                            }),
+                            (subscription, None),
+                        ))
+                    }
+                    Some(SubscriberMessage::Event {
+                        event,
+                        skipped_before,
+                    }) => {
+                        // Yield the Lagged wire frame now; hold
+                        // the event for the next tick.
+                        let body = tail_events_response::Body::Lagged(Box::new(ProtoLagged {
+                            skipped: skipped_before,
+                            ..Default::default()
+                        }));
+                        Some((
+                            Ok(TailEventsResponse {
+                                body: Some(body),
+                                ..Default::default()
+                            }),
+                            (subscription, Some(event)),
+                        ))
                     }
                     // Channel closed — publisher gone (engine
                     // shutting down). End the stream cleanly.
-                    None => return None,
-                };
-                Some((
-                    Ok(TailEventsResponse {
-                        body: Some(body),
-                        ..Default::default()
-                    }),
-                    subscription,
-                ))
-            });
+                    None => None,
+                }
+            },
+        );
         Response::stream_ok(response_stream)
     }
 }
