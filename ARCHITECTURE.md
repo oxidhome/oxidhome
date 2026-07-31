@@ -284,6 +284,52 @@ Settled engineering choices that shape the codebase, captured here so they survi
 - **`bindgen!` async syntax** is `imports: { default: async }` (modern wasmtime), not the deprecated `async: true`.
 - **Resource-path syntax** in `with:` mappings uses `interface.type` (dot), not `interface/type` (slash): e.g. `oxidhome:plugin/media.pipeline-handle`.
 
+## Current safety invariants
+
+Load-bearing invariants the codebase depends on today. Each corresponds to a shipped review fix or Phase decision — they are what the runtime, API, and storage layers assume when routing untrusted plugin work.
+
+### Identity and grants
+
+- **`installation_uuid` is the source of identity.** Every `install` mints an opaque `inst-<32 hex>` UUID and persists it on the `plugin_installation` SQL row. Uninstall tombstones the row; a subsequent reinstall mints a fresh UUID. Device IDs derive from the UUID (not from `plugin_id`), so an uninstall + reinstall cannot inherit device identity or audit lineage from the previous installation. **C1 / C1b.**
+- **Granted capabilities are authoritative; requested capabilities are not.** `plugin_installation.granted_capabilities_json` is what the runtime consults at every capability gate. The manifest's `[capabilities]` block is a *request* — the loader computes `effective = requested ∩ granted` so a stale grant that is broader than the current manifest cannot authorize newly-requested permissions. **C5.**
+- **Grants are content-bound.** `plugin_installation.content_digest` is a domain-tagged SHA-256 over `(manifest bytes, wasm bytes)`. The loader recomputes and refuses to apply the grant when the on-disk bytes drift, so a `plugin.wasm` swap after install runs under a NULL grant (quarantine) rather than the previously-issued one. **C5 review F3.**
+- **Quarantine is fail-closed.** A live `plugin_installation` row with a NULL / malformed `granted_capabilities_json` or NULL `content_digest` is quarantined at scan: absent from `entries` so `start_instance` cannot launch it, but still `is_quarantined()` so raw-path CLI loads whose manifest declares the same `plugin_id` refuse rather than shadow the persisted grant. An operator's `uninstall` + `install` cycle re-issues both fields together. **C5 review F1.**
+
+### Lifecycle serialization
+
+- **`plugin_id` load provenance is explicit.** `Engine::start_installed_instance` (API path) carries the observed `installation_uuid` into the loader as `LoadMode::Installed`; `Engine::start_instance` (dev / argv) uses `LoadMode::Dev`. The loader fails closed under `Installed` if the registry row named by the expected UUID is missing, its path changed, or the UUID rotated — no silent fallback to a synthetic identity. **H11 review F1.**
+- **Start and uninstall of the same `plugin_id` serialize.** `Engine::plugin_lifecycle_lock(plugin_id)` returns an `Arc<tokio::sync::Mutex<()>>`; both JSON and Connect handlers hold it across the running-instances check + the compose work. `uninstall` moves an owned guard into its `spawn_blocking` closure so a cancelled handler cannot release the reservation while the detached FS + SQL work is still running. Map entries are `Weak` so nonexistent-id requests don't grow the map without bound. **H3 + H3 review F1/F2.**
+- **Uninstall is retryable and cannot orphan state.** `Engine::uninstall_plugin` purges per-install KV rows + blob dirs *before* tombstoning the registry row. On any purge error the row stays live and the API returns the error, so the operator can retry — no silent stranding of blob bytes. **H2 review F2.**
+
+### Per-instance state
+
+- **KV, blob-index, and blob directories key on `(installation_uuid, instance_id)`.** Migration 14 rekeyed the four state tables (`kv`, `kv_usage`, `blob`, `blob_usage`) with a composite PK; the FS layout is `<state_dir>/blobs/<installation_uuid>/<instance_id>/`. An uninstall + reinstall of the same `plugin_id` mints a fresh UUID and therefore an empty per-instance keyspace. `purge_installation` on both stores handles the wipe. **H2.**
+- **Instance IDs are FS-segment safe.** `is_safe_instance_id` — 1..=128 bytes, no `/`, `\`, `..`, leading `.`, or `\0` — is enforced at the API edge (`start_plugin_instance` returns 400) and again in the blob store as belt-and-suspenders. All KV / blob entry points refuse an unsafe id before any path construction. **H1 + H1 review F1.**
+- **Duplicate manifest IDs quarantine every path.** A scan that sees two directories declaring the same `plugin_id` stores ALL paths on the `QuarantineEntry`; a single `uninstall` removes every path in one call so no leftover directory survives to be backfilled on the next scan. **H8 + H8 review F1.**
+- **Legacy blob directories are reclaimed once.** `Engine::with_state_dir` runs a one-shot sweep of `<state_dir>/blobs/` when `Db::pre_open_user_version() < 14`, so the pre-migration-14 flat layout doesn't leak bytes forever. Post-14 boots skip the sweep so dev-load blob dirs survive. **H2 review F3.**
+
+### Event delivery
+
+- **Per-subscriber `mpsc` queues.** Each subscriber owns a 256-slot `tokio::sync::mpsc` channel; back-pressure on one subscriber drops events **for itself only** (per-subscriber `dropped` counter + rate-limited warn). No shared broadcast ring where a slow tail client can evict events from the plugin supervisor. **C2e.**
+- **Wake registration is filter-scoped.** `EventBus::subscribe_with_wake` pairs a `Notify` with the subscription filter; publishes signal only wakes whose filter matches, so a supervisor whose plugin has no subscriptions is quiet under any flood. **C2d.**
+- **Per-instance publish rate limit.** `admit_publish(instance_id)` throttles at a bounded arrival rate (`DEFAULT_PUBLISH_RATE_PER_SEC` / `DEFAULT_PUBLISH_BURST`) *before* the durable log write, so a flooder can't spend disk + threads freely. **C2d.**
+- **Lag is folded into the event slot.** `SubscriberMessage::Event { event, skipped_before }` — one slot per publish. A freed slot always delivers a real event; a separate `Lagged` marker slot could steal that free slot and starve fresh events indefinitely under a chronic tight-capacity workload. Wire receivers translate `skipped_before > 0` into the Connect `Lagged` body / JSON `{"lagged": N}` frame ahead of the event. **H4 + H4 review F1.**
+- **`pending_lag` accounting is race-free.** The counter claim uses an `AcqRel` `swap(0)`; on send failure the closure re-injects `claimed + 1` so the next successful send still surfaces the complete gap. The pre-fix load-then-`fetch_sub` shape let two publishers each load the same count and each subtract it, wrapping the counter near `u64::MAX`. **H4.**
+
+### Audit and access
+
+- **API requests hit a dedicated audit ledger.** `audit_event` is separate from the diagnostic `log_event` stream so a burst of debug logs can't evict audit rows. Writes are two-phase: `record_intent` before the handler runs, `finalize` after — a client disconnect mid-handler leaves the pending row behind as evidence of the attempted action. **C3.**
+- **Authorization outcome and execution outcome are separate audit fields.** `decision` carries the auth outcome (`allow` / `deny` / `error` / `pending`), `status` carries the wire HTTP status, `execution_outcome` + `domain_error` carry the plugin's `CommandResult::Err` kind. A plugin returning an error on an authorized request no longer shows up in `WHERE decision = 'deny'` searches. **C3 review F4.**
+- **Tokens are hashed at rest.** 256-bit CSPRNG bearer tokens, SHA-256 at rest — plain SHA is correct for a uniformly-random 256-bit secret; a slow KDF only pays off against low-entropy passwords. `revoked_ms` is a tombstone; rows aren't deleted so audit lineage stays intact. **12-API tokens.**
+
+### Path safety
+
+- **Uninstall works on the recorded path, not a recomputed one.** `install` validates `plugin_id` shape before it enters the registry; `uninstall` deletes only the path the registry observed, with a `starts_with(plugins_root)` containment re-check before any `remove_dir_all`. A registry-corruption divergence refuses rather than escapes the plugins root.
+- **Blob paths never escape `blobs_root`.** `check_instance_id` + `check_installation_uuid` refuse unsafe segments; `ensure_contained` re-verifies the resolved path lives under the root. Both checks fire at every blob-store entry point. **H1.**
+- **Installed reads defeat symlinks.** `read_installed_bytes` opens the plugin dir with `O_NOFOLLOW`, walks with fd-relative I/O, and refuses to follow a symlink out. The C5 digest verification hashes the same in-memory buffers the loader will compile from, closing the TOCTOU window a file-path re-read would reopen. **C5 review round-4.**
+
+Design notes that don't yet correspond to a shipped invariant (Phase 6+ items in flight: `Engine::start_installed_instance` grant-scope refresh on manifest edit, `Engine::start_dev_instance` audit-log attribution, service dispatcher call-stack chain guarantees) live in the per-phase task-list rather than here — they promote up as they ship.
+
 ## North-star principles
 
 These are the architectural tiebreakers:
