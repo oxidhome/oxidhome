@@ -863,6 +863,17 @@ impl InstalledPluginRegistry {
         self.read_entries().get(plugin_id).cloned()
     }
 
+    /// The root under which installed plugin dirs live
+    /// (`<state_dir>/plugins/`). `None` for in-memory registries
+    /// (`Self::empty()`). Callers use this to decide whether a
+    /// caller-supplied `wasm_path` was pointing at an installed
+    /// plugin — the H2 round-2 F1 loader belt refuses to fall
+    /// back to dev semantics for paths that live here.
+    #[must_use]
+    pub fn plugins_root(&self) -> Option<&Path> {
+        self.plugins_root.as_deref()
+    }
+
     /// Copy `source_dir` to `<plugins_root>/<plugin_id>/`, where
     /// `<plugin_id>` is read from `<source_dir>/manifest.toml`.
     ///
@@ -1072,10 +1083,17 @@ impl InstalledPluginRegistry {
     /// responsible for ensuring no instances of this plugin are
     /// running — this method unconditionally yanks the dir.
     ///
+    /// Returns the `installation_uuid` of the tombstoned row so the
+    /// caller can drive H2's per-install state purge
+    /// (`KvStore::purge_installation` / `BlobStore::purge_installation`).
+    /// Wired in [`crate::runtime::Engine`]'s uninstall path, not
+    /// here, so this module stays focused on the ledger + FS side of
+    /// uninstall and doesn't need to import the state stores.
+    ///
     /// # Errors
     ///
     /// See [`UninstallError`].
-    pub fn uninstall(&self, plugin_id: &str) -> Result<(), UninstallError> {
+    pub fn uninstall(&self, plugin_id: &str) -> Result<Arc<str>, UninstallError> {
         let plugins_root = self
             .plugins_root
             .as_ref()
@@ -1179,7 +1197,7 @@ impl InstalledPluginRegistry {
             was_quarantined,
             "plugin uninstalled",
         );
-        Ok(())
+        Ok(installation_uuid)
     }
 }
 

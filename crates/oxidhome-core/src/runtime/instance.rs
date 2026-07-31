@@ -450,6 +450,21 @@ impl PluginInstance {
         let _ = plugin_dir; // retained for future callsites; the
         // digest below already binds to the exact bytes we
         // parsed + will compile.
+        // H2 round-2 F1 belt: if the caller was pointing at a
+        // path *inside* `<state_dir>/plugins/`, this is an
+        // installed load — the registry MUST have a matching
+        // live row. The pre-fix `None` arm below silently fell
+        // back to a synthetic UUID + manifest-requested
+        // capabilities, which under the concurrent-uninstall
+        // race the reviewer flagged let a fresh instance keep
+        // running with capabilities broader than any persisted
+        // grant. Refuse the load instead so the API surfaces
+        // "install disappeared" cleanly and the operator sees
+        // the race.
+        let load_is_from_installed_root = engine
+            .installed_plugins()
+            .plugins_root()
+            .is_some_and(|root| wasm_path.starts_with(root));
         let (installation_uuid, effective_grant) =
             match engine.installed_plugins().get(&manifest.plugin.id) {
                 Some(row) if loaded_dir_matches_registry(wasm_path, &row.path) => {
@@ -489,6 +504,14 @@ impl PluginInstance {
                         Arc::new(requested.clone()),
                     )
                 }
+                None if load_is_from_installed_root => {
+                    return Err(anyhow!(
+                        "installed plugin {} disappeared from the registry between start and \
+                         load (concurrent uninstall race); refusing to fall back to dev \
+                         semantics (H2 round-2 F1)",
+                        manifest.plugin.id
+                    ));
+                }
                 None => (
                     Arc::<str>::from(manifest.plugin.id.as_str()),
                     Arc::new(requested.clone()),
@@ -504,10 +527,11 @@ impl PluginInstance {
         // without wiping data.
         let quota_bytes = granted_capabilities.storage_quota_kb.saturating_mul(1024);
         let kv = engine.kv();
-        kv.register_instance(&instance_id, quota_bytes)
+        kv.register_instance(&installation_uuid, &instance_id, quota_bytes)
             .with_context(|| {
                 format!(
-                    "registering KV usage row for instance {instance_id} (quota {quota_bytes} bytes)",
+                    "registering KV usage row for instance {instance_id} \
+                     (install {installation_uuid}, quota {quota_bytes} bytes)",
                 )
             })?;
 
@@ -520,10 +544,11 @@ impl PluginInstance {
             .saturating_mul(1024 * 1024);
         let blobs = engine.blobs();
         blobs
-            .register_instance(&instance_id, blob_quota_bytes)
+            .register_instance(&installation_uuid, &instance_id, blob_quota_bytes)
             .with_context(|| {
                 format!(
-                    "registering blob usage row for instance {instance_id} (quota {blob_quota_bytes} bytes)",
+                    "registering blob usage row for instance {instance_id} \
+                     (install {installation_uuid}, quota {blob_quota_bytes} bytes)",
                 )
             })?;
 

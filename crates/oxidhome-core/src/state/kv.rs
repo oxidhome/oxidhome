@@ -3,10 +3,17 @@
 //! [`KvStore`] owns the read/write logic for the `kv` and `kv_usage`
 //! tables defined in [`super::db`]. Each [`crate::Engine`] holds one
 //! `Arc<KvStore>`; when a plugin loads, the host calls
-//! [`KvStore::register_instance`] with the instance id and its quota
-//! (translated from `manifest.capabilities.storage_quota_kb`). The
-//! host's `storage::Host` impl then routes per-instance get / set /
-//! delete / `list_keys` calls through this store.
+//! [`KvStore::register_instance`] with the installation's
+//! `installation_uuid` (host-minted at install time — see
+//! [`crate::state::InstalledPluginRegistry`]), the caller-supplied
+//! `instance_id`, and the manifest-declared quota. Every subsequent
+//! host call routes through the same `(installation_uuid, instance_id)`
+//! tuple, so per-instance state is scoped to the *live* install: an
+//! uninstall + reinstall of the same `plugin_id` gets a fresh uuid
+//! and therefore a fresh keyspace, and [`KvStore::purge_installation`]
+//! wipes every row for a tombstoned install so orphan data doesn't
+//! survive on disk. See migration 14 in `state/db.rs` for the schema
+//! shape.
 //!
 //! Encoding: WIT `value` variants are wrapped in a small typed
 //! enum and serialized to bytes via `serde_json` so the store carries
@@ -40,15 +47,23 @@ pub enum KvError {
     /// through but didn't pre-register the instance — that's a host
     /// bug, never a plugin bug, so this is `Internal` from the WIT
     /// side.
-    #[error("instance `{instance_id}` is not registered with the KV store")]
-    UnregisteredInstance { instance_id: String },
+    #[error(
+        "instance `{instance_id}` (installation `{installation_uuid}`) \
+         is not registered with the KV store"
+    )]
+    UnregisteredInstance {
+        installation_uuid: String,
+        instance_id: String,
+    },
     /// A `set` was refused because completing it would push the
     /// instance over its quota.
     #[error(
-        "quota exceeded for instance `{instance_id}`: \
+        "quota exceeded for instance `{instance_id}` \
+         (installation `{installation_uuid}`): \
          {would_use} bytes would be used / {allowed} allowed"
     )]
     QuotaExceeded {
+        installation_uuid: String,
         instance_id: String,
         would_use: u64,
         allowed: u64,
@@ -78,11 +93,11 @@ impl KvStore {
         Self { db }
     }
 
-    /// Reserve a `kv_usage` slot for `instance_id` with the given
-    /// quota. Idempotent — re-registering an existing instance updates
-    /// its quota in place (so a manifest edit + reload picks up the
-    /// new value without wiping the data). A quota of `0` is the
-    /// manifest-default "storage gated off" signal — the host's
+    /// Reserve a `kv_usage` slot for `(installation_uuid, instance_id)`
+    /// with the given quota. Idempotent — re-registering an existing
+    /// tuple updates its quota in place (so a manifest edit + reload
+    /// picks up the new value without wiping the data). A quota of `0`
+    /// is the manifest-default "storage gated off" signal — the host's
     /// `storage::Host` impl refuses every call before we ever see one,
     /// but the row still gets written so subsequent code that joins
     /// against `kv_usage` doesn't trip on a missing entry.
@@ -90,17 +105,23 @@ impl KvStore {
     /// # Errors
     ///
     /// `SQLite` errors surface as [`KvError::Sql`].
-    pub fn register_instance(&self, instance_id: &str, quota_bytes: u64) -> Result<(), KvError> {
+    pub fn register_instance(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        quota_bytes: u64,
+    ) -> Result<(), KvError> {
         // `INSERT ... ON CONFLICT` keeps existing `bytes_used` and
         // only refreshes the quota. Quota stored as i64 (rusqlite has
         // no native u64 bind for INTEGER columns); cap to i64::MAX.
         let quota_i64 = i64::try_from(quota_bytes).unwrap_or(i64::MAX);
         self.db.write(|conn| -> Result<(), KvError> {
             conn.execute(
-                "INSERT INTO kv_usage(instance_id, bytes_used, bytes_quota) \
-                 VALUES (?1, 0, ?2) \
-                 ON CONFLICT(instance_id) DO UPDATE SET bytes_quota = excluded.bytes_quota",
-                params![instance_id, quota_i64],
+                "INSERT INTO kv_usage(installation_uuid, instance_id, bytes_used, bytes_quota) \
+                 VALUES (?1, ?2, 0, ?3) \
+                 ON CONFLICT(installation_uuid, instance_id) DO UPDATE \
+                    SET bytes_quota = excluded.bytes_quota",
+                params![installation_uuid, instance_id, quota_i64],
             )?;
             Ok(())
         })
@@ -113,12 +134,18 @@ impl KvStore {
     ///
     /// SQL errors as [`KvError::Sql`]; encoding-decode failures (which
     /// would mean stored data corrupted) as [`KvError::Encode`].
-    pub fn get(&self, instance_id: &str, key: &str) -> Result<Option<WitValue>, KvError> {
+    pub fn get(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        key: &str,
+    ) -> Result<Option<WitValue>, KvError> {
         let bytes: Option<Vec<u8>> = self.db.read(|conn| -> Result<_, KvError> {
             Ok(conn
                 .query_row(
-                    "SELECT value FROM kv WHERE instance_id = ?1 AND key = ?2",
-                    params![instance_id, key],
+                    "SELECT value FROM kv \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND key = ?3",
+                    params![installation_uuid, instance_id, key],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()?)
@@ -142,7 +169,7 @@ impl KvStore {
     ///
     /// # Errors
     ///
-    /// - [`KvError::UnregisteredInstance`] if the instance never
+    /// - [`KvError::UnregisteredInstance`] if the tuple never
     ///   called `register_instance`.
     /// - [`KvError::QuotaExceeded`] when the write would push past
     ///   the quota.
@@ -157,7 +184,13 @@ impl KvStore {
     /// so a value pushing past that ceiling can't be accounted for
     /// anyway — and any plugin attempting an exabyte-scale write is
     /// already past the per-instance quota.
-    pub fn set(&self, instance_id: &str, key: &str, value: WitValue) -> Result<(), KvError> {
+    pub fn set(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        key: &str,
+        value: WitValue,
+    ) -> Result<(), KvError> {
         let stored = StoredValue::from_wit(value);
         let payload = serde_json::to_vec(&stored).map_err(|source| KvError::Encode {
             key: key.to_owned(),
@@ -171,6 +204,7 @@ impl KvStore {
         let new_entry_bytes =
             i64::try_from(key.len() + payload.len()).expect("key + value size fits in i64");
 
+        let installation_uuid_owned = installation_uuid.to_owned();
         let instance_id_owned = instance_id.to_owned();
         let key_owned = key.to_owned();
         self.db.write(move |conn| -> Result<(), KvError> {
@@ -180,13 +214,15 @@ impl KvStore {
             // do the math in one query before committing.
             let Some((bytes_used, bytes_quota)) = tx
                 .query_row(
-                    "SELECT bytes_used, bytes_quota FROM kv_usage WHERE instance_id = ?1",
-                    params![instance_id_owned],
+                    "SELECT bytes_used, bytes_quota FROM kv_usage \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2",
+                    params![installation_uuid_owned, instance_id_owned],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?
             else {
                 return Err(KvError::UnregisteredInstance {
+                    installation_uuid: installation_uuid_owned,
                     instance_id: instance_id_owned,
                 });
             };
@@ -194,14 +230,14 @@ impl KvStore {
             // `length(key)` on a TEXT column counts characters, not
             // bytes — cast to BLOB so we get the same byte total the
             // Rust-side `key.len()` math used to project
-            // `new_entry_bytes`. The triggers (migration 2) use the
-            // same shape so the persisted `kv_usage.bytes_used` stays
-            // in sync.
+            // `new_entry_bytes`. Migration 14's triggers use the same
+            // shape so the persisted `kv_usage.bytes_used` stays in
+            // sync.
             let old_size: Option<i64> = tx
                 .query_row(
                     "SELECT length(CAST(key AS BLOB)) + length(value) FROM kv \
-                     WHERE instance_id = ?1 AND key = ?2",
-                    params![instance_id_owned, key_owned],
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND key = ?3",
+                    params![installation_uuid_owned, instance_id_owned, key_owned],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -209,6 +245,7 @@ impl KvStore {
             let projected = bytes_used - old_size.unwrap_or(0) + new_entry_bytes;
             if projected > bytes_quota {
                 return Err(KvError::QuotaExceeded {
+                    installation_uuid: installation_uuid_owned,
                     instance_id: instance_id_owned,
                     would_use: projected.try_into().unwrap_or(u64::MAX),
                     allowed: bytes_quota.try_into().unwrap_or(0),
@@ -217,11 +254,17 @@ impl KvStore {
 
             let updated_ms = now_unix_ms();
             tx.execute(
-                "INSERT INTO kv(instance_id, key, value, updated_ms) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(instance_id, key) DO UPDATE \
+                "INSERT INTO kv(installation_uuid, instance_id, key, value, updated_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(installation_uuid, instance_id, key) DO UPDATE \
                     SET value = excluded.value, updated_ms = excluded.updated_ms",
-                params![instance_id_owned, key_owned, payload, updated_ms],
+                params![
+                    installation_uuid_owned,
+                    instance_id_owned,
+                    key_owned,
+                    payload,
+                    updated_ms
+                ],
             )?;
 
             tx.commit()?;
@@ -236,11 +279,17 @@ impl KvStore {
     /// # Errors
     ///
     /// Forwards any SQL error.
-    pub fn delete(&self, instance_id: &str, key: &str) -> Result<(), KvError> {
+    pub fn delete(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        key: &str,
+    ) -> Result<(), KvError> {
         self.db.write(|conn| -> Result<(), KvError> {
             conn.execute(
-                "DELETE FROM kv WHERE instance_id = ?1 AND key = ?2",
-                params![instance_id, key],
+                "DELETE FROM kv \
+                 WHERE installation_uuid = ?1 AND instance_id = ?2 AND key = ?3",
+                params![installation_uuid, instance_id, key],
             )?;
             Ok(())
         })
@@ -252,36 +301,35 @@ impl KvStore {
     /// # Errors
     ///
     /// Forwards any SQL error.
-    pub fn list_keys(&self, instance_id: &str, prefix: &str) -> Result<Vec<String>, KvError> {
-        // `substr(key, 1, length(?2)) = ?2` is the simplest correct
+    pub fn list_keys(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, KvError> {
+        // `substr(key, 1, length(?)) = ?` is the simplest correct
         // shape: on TEXT, SQLite's `length`/`substr` both work in
         // *characters* (UTF-8 codepoints), so this is a literal
-        // character-prefix equality test. Both `key` and `?2` are
-        // TEXT, so the units match on both sides of the `=` — any
-        // `&str` prefix matches keys whose first `chars().count()`
-        // characters equal the prefix's characters, without the
-        // escaping hazards of `LIKE` or the codepoint-bound
+        // character-prefix equality test. Both `key` and the
+        // parameter are TEXT, so the units match on both sides of
+        // the `=` — any `&str` prefix matches keys whose first
+        // `chars().count()` characters equal the prefix's characters,
+        // without the escaping hazards of `LIKE` or the codepoint-bound
         // arithmetic an open-coded range would need.
         //
         // (Quota accounting is the *byte* count, computed separately
-        // via `length(CAST(key AS BLOB))` in migration 2's triggers
+        // via `length(CAST(key AS BLOB))` in migration 14's triggers
         // — that's correctness for "bytes used"; the listing here
         // is character-level prefix matching, which is what callers
         // want.)
-        //
-        // The trade-off is loss of the `(instance_id, key)` primary
-        // key as a range index: the planner walks every row in the
-        // instance's slice and applies the substr filter. For
-        // Phase-5a quotas (KiB-scale per-instance keyspaces) that's
-        // fine; if a future plugin pushes into the MiB / 100k-key
-        // regime we'd revisit with a codepoint-correct upper bound.
         self.db.read(|conn| -> Result<Vec<String>, KvError> {
             let mut stmt = conn.prepare(
                 "SELECT key FROM kv \
-                 WHERE instance_id = ?1 AND substr(key, 1, length(?2)) = ?2 \
+                 WHERE installation_uuid = ?1 AND instance_id = ?2 \
+                   AND substr(key, 1, length(?3)) = ?3 \
                  ORDER BY key",
             )?;
-            let mut rows = stmt.query(params![instance_id, prefix])?;
+            let mut rows = stmt.query(params![installation_uuid, instance_id, prefix])?;
             let mut keys = Vec::new();
             while let Some(row) = rows.next()? {
                 keys.push(row.get::<_, String>(0)?);
@@ -296,17 +344,56 @@ impl KvStore {
     /// # Errors
     ///
     /// SQL error from the usage lookup.
-    pub fn usage(&self, instance_id: &str) -> Result<Option<(u64, u64)>, KvError> {
+    pub fn usage(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+    ) -> Result<Option<(u64, u64)>, KvError> {
         let row = self.db.read(|conn| -> Result<_, KvError> {
             Ok(conn
                 .query_row(
-                    "SELECT bytes_used, bytes_quota FROM kv_usage WHERE instance_id = ?1",
-                    params![instance_id],
+                    "SELECT bytes_used, bytes_quota FROM kv_usage \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2",
+                    params![installation_uuid, instance_id],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?)
         })?;
         Ok(row.map(|(used, quota)| (used.try_into().unwrap_or(0), quota.try_into().unwrap_or(0))))
+    }
+
+    /// Wipe every KV row (and its usage-accounting row) for the
+    /// installation tombstoned at `installation_uuid`. Called from
+    /// [`crate::state::InstalledPluginRegistry::uninstall`] so a
+    /// subsequent reinstall of the same `plugin_id` sees an empty
+    /// keyspace — H2's central invariant.
+    ///
+    /// Idempotent: purging an install that had no rows is a no-op
+    /// (returns 0). Runs in a single write transaction so partial
+    /// failure leaves the store consistent (both tables purged or
+    /// neither).
+    ///
+    /// # Errors
+    ///
+    /// Forwards any `SQLite` error verbatim.
+    pub fn purge_installation(&self, installation_uuid: &str) -> Result<usize, KvError> {
+        let uuid_owned = installation_uuid.to_owned();
+        self.db.write(move |conn| -> Result<usize, KvError> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // Drop `kv_usage` first so the `kv_usage_delete` triggers
+            // firing on the `kv` DELETE don't do wasted work updating
+            // rows that are about to disappear anyway.
+            let usage_rows = tx.execute(
+                "DELETE FROM kv_usage WHERE installation_uuid = ?1",
+                params![uuid_owned],
+            )?;
+            let kv_rows = tx.execute(
+                "DELETE FROM kv WHERE installation_uuid = ?1",
+                params![uuid_owned],
+            )?;
+            tx.commit()?;
+            Ok(usage_rows + kv_rows)
+        })
     }
 }
 
@@ -359,6 +446,12 @@ impl StoredValue {
 mod tests {
     use super::*;
 
+    /// Standing installation uuid for tests that don't care about
+    /// isolation between installs. Real code always passes the
+    /// per-install uuid the `InstalledPluginRegistry` minted.
+    const INST_A: &str = "inst-test-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const INST_B: &str = "inst-test-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn store() -> KvStore {
         KvStore::new(Arc::new(Db::open_in_memory().expect("db")))
     }
@@ -366,14 +459,16 @@ mod tests {
     #[test]
     fn register_then_get_returns_none_for_missing_key() {
         let kv = store();
-        kv.register_instance("alpha", 1024).expect("register");
-        assert!(kv.get("alpha", "k").expect("get").is_none());
+        kv.register_instance(INST_A, "alpha", 1024)
+            .expect("register");
+        assert!(kv.get(INST_A, "alpha", "k").expect("get").is_none());
     }
 
     #[test]
     fn set_then_get_round_trips_each_variant() {
         let kv = store();
-        kv.register_instance("alpha", 8 * 1024).expect("register");
+        kv.register_instance(INST_A, "alpha", 8 * 1024)
+            .expect("register");
         let cases = vec![
             ("b", WitValue::BoolVal(true)),
             ("i", WitValue::IntVal(-42)),
@@ -383,10 +478,10 @@ mod tests {
             ("j", WitValue::JsonVal("{\"k\":1}".into())),
         ];
         for (key, val) in &cases {
-            kv.set("alpha", key, val.clone()).expect("set");
+            kv.set(INST_A, "alpha", key, val.clone()).expect("set");
         }
         for (key, want) in &cases {
-            let got = kv.get("alpha", key).expect("get").expect("present");
+            let got = kv.get(INST_A, "alpha", key).expect("get").expect("present");
             assert!(
                 values_match(&got, want),
                 "key {key}: got {got:?} want {want:?}",
@@ -397,12 +492,19 @@ mod tests {
     #[test]
     fn overwrite_keeps_one_row_and_accounts_correctly() {
         let kv = store();
-        kv.register_instance("alpha", 1024).expect("register");
-        kv.set("alpha", "n", WitValue::IntVal(1)).expect("set 1");
-        let (used1, _) = kv.usage("alpha").expect("usage").expect("present");
-        kv.set("alpha", "n", WitValue::StringVal("ten-character".into()))
-            .expect("set 2");
-        let (used2, _) = kv.usage("alpha").expect("usage").expect("present");
+        kv.register_instance(INST_A, "alpha", 1024)
+            .expect("register");
+        kv.set(INST_A, "alpha", "n", WitValue::IntVal(1))
+            .expect("set 1");
+        let (used1, _) = kv.usage(INST_A, "alpha").expect("usage").expect("present");
+        kv.set(
+            INST_A,
+            "alpha",
+            "n",
+            WitValue::StringVal("ten-character".into()),
+        )
+        .expect("set 2");
+        let (used2, _) = kv.usage(INST_A, "alpha").expect("usage").expect("present");
         assert!(
             used2 > used1,
             "overwrite with bigger value should grow bytes_used: {used1} -> {used2}",
@@ -412,14 +514,15 @@ mod tests {
     #[test]
     fn delete_removes_key_and_refunds_usage() {
         let kv = store();
-        kv.register_instance("alpha", 1024).expect("register");
-        kv.set("alpha", "k", WitValue::StringVal("v".into()))
+        kv.register_instance(INST_A, "alpha", 1024)
+            .expect("register");
+        kv.set(INST_A, "alpha", "k", WitValue::StringVal("v".into()))
             .expect("set");
-        let (before, _) = kv.usage("alpha").expect("usage").expect("present");
-        kv.delete("alpha", "k").expect("delete");
-        let (after, _) = kv.usage("alpha").expect("usage").expect("present");
+        let (before, _) = kv.usage(INST_A, "alpha").expect("usage").expect("present");
+        kv.delete(INST_A, "alpha", "k").expect("delete");
+        let (after, _) = kv.usage(INST_A, "alpha").expect("usage").expect("present");
         assert_eq!(after, 0, "delete should refund bytes (was {before})");
-        assert!(kv.get("alpha", "k").expect("get").is_none());
+        assert!(kv.get(INST_A, "alpha", "k").expect("get").is_none());
     }
 
     #[test]
@@ -427,11 +530,11 @@ mod tests {
         let kv = store();
         // 32-byte quota — small enough that one moderate string write
         // blows past it.
-        kv.register_instance("alpha", 32).expect("register");
-        kv.set("alpha", "k", WitValue::IntVal(1))
+        kv.register_instance(INST_A, "alpha", 32).expect("register");
+        kv.set(INST_A, "alpha", "k", WitValue::IntVal(1))
             .expect("first set");
         let err = kv
-            .set("alpha", "k2", WitValue::StringVal("x".repeat(64)))
+            .set(INST_A, "alpha", "k2", WitValue::StringVal("x".repeat(64)))
             .unwrap_err();
         match err {
             KvError::QuotaExceeded {
@@ -443,7 +546,7 @@ mod tests {
             other => panic!("expected QuotaExceeded, got {other:?}"),
         }
         // First write must still be readable.
-        let got = kv.get("alpha", "k").expect("get").expect("present");
+        let got = kv.get(INST_A, "alpha", "k").expect("get").expect("present");
         assert!(values_match(&got, &WitValue::IntVal(1)));
     }
 
@@ -454,17 +557,17 @@ mod tests {
     /// pre-migration-2 triggers a 100-byte quota would accept many
     /// more `"αβγ"`-keyed writes than the byte budget allowed.
     /// Migration 2's `length(CAST(key AS BLOB))` brings both sides
-    /// onto bytes.
+    /// onto bytes; migration 14 keeps that shape.
     #[test]
     fn quota_uses_byte_count_for_non_ascii_keys() {
         let kv = store();
-        kv.register_instance("alpha", 64).expect("register");
+        kv.register_instance(INST_A, "alpha", 64).expect("register");
         // "αβγ" = 3 chars / 6 bytes. The empty-tagged
         // StoredValue::Int(0) payload is ~10 bytes of JSON.
         // First write: 6 + 10 ≈ 16 bytes ≤ 64 quota.
-        kv.set("alpha", "αβγ", WitValue::IntVal(0))
+        kv.set(INST_A, "alpha", "αβγ", WitValue::IntVal(0))
             .expect("first non-ascii write");
-        let (used_1, _) = kv.usage("alpha").expect("usage").expect("present");
+        let (used_1, _) = kv.usage(INST_A, "alpha").expect("usage").expect("present");
         // `bytes_used` must reflect the 6-byte key, not 3.
         assert!(
             used_1 > 6,
@@ -478,7 +581,7 @@ mod tests {
         let mut over = false;
         for i in 1..10 {
             let k = format!("αβγ-{i}");
-            match kv.set("alpha", &k, WitValue::IntVal(0)) {
+            match kv.set(INST_A, "alpha", &k, WitValue::IntVal(0)) {
                 Ok(()) => {}
                 Err(KvError::QuotaExceeded { .. }) => {
                     over = true;
@@ -495,7 +598,7 @@ mod tests {
         // Final `bytes_used` must stay under the byte quota — the
         // pre-fix accounting could have let it pass while the
         // triggers undercounted.
-        let (used_final, quota) = kv.usage("alpha").expect("usage").expect("present");
+        let (used_final, quota) = kv.usage(INST_A, "alpha").expect("usage").expect("present");
         assert_eq!(quota, 64);
         assert!(
             used_final <= quota,
@@ -506,43 +609,34 @@ mod tests {
     #[test]
     fn list_keys_returns_matching_prefix_in_order() {
         let kv = store();
-        kv.register_instance("alpha", 4096).expect("register");
+        kv.register_instance(INST_A, "alpha", 4096)
+            .expect("register");
         for k in ["aa", "ab", "ba", "bb"] {
-            kv.set("alpha", k, WitValue::BoolVal(true)).expect("set");
+            kv.set(INST_A, "alpha", k, WitValue::BoolVal(true))
+                .expect("set");
         }
-        let mut keys = kv.list_keys("alpha", "a").expect("list");
+        let mut keys = kv.list_keys(INST_A, "alpha", "a").expect("list");
         keys.sort();
         assert_eq!(keys, vec!["aa".to_string(), "ab".to_string()]);
-        let bs = kv.list_keys("alpha", "b").expect("list");
+        let bs = kv.list_keys(INST_A, "alpha", "b").expect("list");
         assert_eq!(bs, vec!["ba".to_string(), "bb".to_string()]);
-        let none = kv.list_keys("alpha", "z").expect("list");
+        let none = kv.list_keys(INST_A, "alpha", "z").expect("list");
         assert!(none.is_empty());
     }
 
     /// Regression for the byte-level `prefix_upper_bound` shape we
-    /// replaced with `substr(key, 1, length(?2)) = ?2`. The old
-    /// implementation incremented the last byte of `"ÿ"` (`0xC3 0xBF`)
-    /// to `0xC3 0xC0`, decoded that with `from_utf8_lossy` to
-    /// something like `"Ã�"`, and ran a `key < ?upper` range that
-    /// included keys *past* `"ÿ"` in the codepoint order — e.g. `"Ā"`
-    /// at U+0100, which a `"ÿ"`-prefix list must not match. The
-    /// `substr` filter handles every UTF-8 key exactly.
+    /// replaced with `substr(key, 1, length(?)) = ?`. See the
+    /// pre-H2 revision of this file for the analysis.
     #[test]
     fn list_keys_non_ascii_prefix_does_not_overmatch() {
         let kv = store();
-        kv.register_instance("alpha", 4096).expect("register");
-        // `"ÿ-keep"` is the one key that genuinely starts with `"ÿ"`.
-        // The other keys span the byte boundary cases that an
-        // incorrect upper-bound calculation would mis-match.
-        for k in [
-            "ÿ-keep",    // U+00FF, must match
-            "Ā-drop",    // U+0100, the codepoint right after "ÿ"
-            "z-drop",    // ASCII below "ÿ"
-            "ÿabc-keep", // longer prefix
-        ] {
-            kv.set("alpha", k, WitValue::BoolVal(true)).expect("set");
+        kv.register_instance(INST_A, "alpha", 4096)
+            .expect("register");
+        for k in ["ÿ-keep", "Ā-drop", "z-drop", "ÿabc-keep"] {
+            kv.set(INST_A, "alpha", k, WitValue::BoolVal(true))
+                .expect("set");
         }
-        let mut keys = kv.list_keys("alpha", "ÿ").expect("list");
+        let mut keys = kv.list_keys(INST_A, "alpha", "ÿ").expect("list");
         keys.sort();
         assert_eq!(
             keys,
@@ -554,17 +648,26 @@ mod tests {
     #[test]
     fn list_keys_isolated_per_instance() {
         let kv = store();
-        kv.register_instance("alpha", 4096).expect("register a");
-        kv.register_instance("beta", 4096).expect("register b");
-        kv.set("alpha", "x", WitValue::IntVal(1)).expect("alpha");
-        kv.set("beta", "x", WitValue::IntVal(2)).expect("beta");
-        let a_keys = kv.list_keys("alpha", "").expect("list a");
-        let b_keys = kv.list_keys("beta", "").expect("list b");
+        kv.register_instance(INST_A, "alpha", 4096)
+            .expect("register a");
+        kv.register_instance(INST_A, "beta", 4096)
+            .expect("register b");
+        kv.set(INST_A, "alpha", "x", WitValue::IntVal(1))
+            .expect("alpha");
+        kv.set(INST_A, "beta", "x", WitValue::IntVal(2))
+            .expect("beta");
+        let a_keys = kv.list_keys(INST_A, "alpha", "").expect("list a");
+        let b_keys = kv.list_keys(INST_A, "beta", "").expect("list b");
         assert_eq!(a_keys, vec!["x".to_string()]);
         assert_eq!(b_keys, vec!["x".to_string()]);
-        // And values are independent.
-        let a_val = kv.get("alpha", "x").expect("get a").expect("present");
-        let b_val = kv.get("beta", "x").expect("get b").expect("present");
+        let a_val = kv
+            .get(INST_A, "alpha", "x")
+            .expect("get a")
+            .expect("present");
+        let b_val = kv
+            .get(INST_A, "beta", "x")
+            .expect("get b")
+            .expect("present");
         assert!(values_match(&a_val, &WitValue::IntVal(1)));
         assert!(values_match(&b_val, &WitValue::IntVal(2)));
     }
@@ -572,9 +675,14 @@ mod tests {
     #[test]
     fn unregistered_instance_set_returns_unregistered() {
         let kv = store();
-        let err = kv.set("ghost", "k", WitValue::BoolVal(false)).unwrap_err();
+        let err = kv
+            .set(INST_A, "ghost", "k", WitValue::BoolVal(false))
+            .unwrap_err();
         assert!(
-            matches!(err, KvError::UnregisteredInstance { ref instance_id } if instance_id == "ghost"),
+            matches!(
+                err,
+                KvError::UnregisteredInstance { ref instance_id, .. } if instance_id == "ghost"
+            ),
             "got {err:?}",
         );
     }
@@ -582,13 +690,89 @@ mod tests {
     #[test]
     fn re_register_updates_quota_in_place() {
         let kv = store();
-        kv.register_instance("alpha", 32).expect("register 32");
-        kv.set("alpha", "k", WitValue::IntVal(1)).expect("set");
-        kv.register_instance("alpha", 4096)
+        kv.register_instance(INST_A, "alpha", 32)
+            .expect("register 32");
+        kv.set(INST_A, "alpha", "k", WitValue::IntVal(1))
+            .expect("set");
+        kv.register_instance(INST_A, "alpha", 4096)
             .expect("re-register 4096");
-        let (used, quota) = kv.usage("alpha").expect("usage").expect("present");
+        let (used, quota) = kv.usage(INST_A, "alpha").expect("usage").expect("present");
         assert_eq!(quota, 4096);
         assert!(used > 0, "re-register should preserve bytes_used");
+    }
+
+    /// H2: two installations of the same `plugin_id` (same `instance_id`
+    /// string, different `installation_uuid`) must not share KV
+    /// state. A `set` under one uuid is invisible to the other.
+    #[test]
+    fn installation_uuid_isolates_state_from_same_instance_id() {
+        let kv = store();
+        kv.register_instance(INST_A, "shared-id", 4096)
+            .expect("register a");
+        kv.register_instance(INST_B, "shared-id", 4096)
+            .expect("register b");
+        kv.set(INST_A, "shared-id", "k", WitValue::IntVal(1))
+            .expect("set a");
+        kv.set(INST_B, "shared-id", "k", WitValue::IntVal(2))
+            .expect("set b");
+
+        let a = kv
+            .get(INST_A, "shared-id", "k")
+            .expect("get a")
+            .expect("present");
+        let b = kv
+            .get(INST_B, "shared-id", "k")
+            .expect("get b")
+            .expect("present");
+        assert!(values_match(&a, &WitValue::IntVal(1)));
+        assert!(values_match(&b, &WitValue::IntVal(2)));
+
+        // `list_keys` respects the isolation too.
+        let a_keys = kv.list_keys(INST_A, "shared-id", "").expect("list a");
+        let b_keys = kv.list_keys(INST_B, "shared-id", "").expect("list b");
+        assert_eq!(a_keys, vec!["k".to_string()]);
+        assert_eq!(b_keys, vec!["k".to_string()]);
+    }
+
+    /// H2: `purge_installation` wipes every row (kv + `kv_usage`) for
+    /// the tombstoned install. Other installs' rows are left intact.
+    #[test]
+    fn purge_installation_wipes_only_that_installations_rows() {
+        let kv = store();
+        kv.register_instance(INST_A, "alpha", 4096)
+            .expect("register a");
+        kv.register_instance(INST_B, "alpha", 4096)
+            .expect("register b");
+        kv.set(INST_A, "alpha", "k", WitValue::IntVal(1))
+            .expect("set a");
+        kv.set(INST_A, "alpha", "j", WitValue::IntVal(2))
+            .expect("set a2");
+        kv.set(INST_B, "alpha", "k", WitValue::IntVal(3))
+            .expect("set b");
+
+        let removed = kv.purge_installation(INST_A).expect("purge");
+        assert!(
+            removed >= 3,
+            "purge should remove kv rows + usage row (got {removed})",
+        );
+        assert!(kv.usage(INST_A, "alpha").expect("usage a").is_none());
+        assert!(kv.get(INST_A, "alpha", "k").expect("get a").is_none());
+        // Untouched install still has its data.
+        let b = kv
+            .get(INST_B, "alpha", "k")
+            .expect("get b")
+            .expect("present");
+        assert!(values_match(&b, &WitValue::IntVal(3)));
+    }
+
+    /// `purge_installation` on an install that never registered is
+    /// a no-op — the DELETE hits zero rows, and callers relying on
+    /// idempotence (uninstall retries) don't have to special-case it.
+    #[test]
+    fn purge_installation_is_idempotent() {
+        let kv = store();
+        assert_eq!(kv.purge_installation(INST_A).expect("purge"), 0);
+        assert_eq!(kv.purge_installation(INST_A).expect("purge"), 0);
     }
 
     fn values_match(a: &WitValue, b: &WitValue) -> bool {

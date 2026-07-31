@@ -533,6 +533,14 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
     ) -> ServiceResult<impl Encodable<StartPluginResponse> + Send + use<'a>> {
         require_scope_connect(&ctx, PLUGINS_START)?;
         let req = request.to_owned_message();
+        // H2 round-2 F1: serialize against a concurrent uninstall
+        // for the same plugin_id. Held for the full start-through-
+        // reach-Running window so no uninstall can slip in between
+        // the registry lookup below and the supervisor's registry
+        // read at instantiate time. See F1 comment in
+        // `server.rs::start_plugin_instance`.
+        let lifecycle_lock = self.engine.plugin_lifecycle_lock(&req.plugin_id);
+        let _guard = lifecycle_lock.lock().await;
         let installed = self
             .engine
             .installed_plugins()
@@ -635,6 +643,14 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
     ) -> ServiceResult<impl Encodable<UninstallPluginResponse> + Send + use<'a>> {
         require_scope_connect(&ctx, PLUGINS_UNINSTALL)?;
         let req = request.to_owned_message();
+        // H2 round-2 F1: hold the per-plugin_id lifecycle lock
+        // across the running-instances check + the compose
+        // uninstall. Mirrors `server.rs::uninstall_plugin`'s
+        // JSON path. Without it, a concurrent start could
+        // register a fresh supervisor between the check and the
+        // tombstone.
+        let lifecycle_lock = self.engine.plugin_lifecycle_lock(&req.plugin_id);
+        let _guard = lifecycle_lock.lock().await;
         // Refuse if any instance of the plugin is running. Same
         // fail-closed shape the JSON handler enforces — operator
         // stops first. FAILED_PRECONDITION is the Connect-side
@@ -655,10 +671,15 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
                 )),
             ));
         }
-        let registry = self.engine.installed_plugins();
+        // H2: `Engine::uninstall_plugin` composes per-install
+        // KV/blob purge + registry tombstone (in that order —
+        // see H2 round-2 F2) so a reinstall of the same
+        // `plugin_id` doesn't inherit the previous install's
+        // state.
+        let engine = self.engine.clone();
         let id_for_blocking = req.plugin_id.clone();
         let result =
-            tokio::task::spawn_blocking(move || registry.uninstall(&id_for_blocking))
+            tokio::task::spawn_blocking(move || engine.uninstall_plugin(&id_for_blocking))
                 .await
                 .map_err(|err| {
                     tracing::error!(target: "api.plugins", error = %err, "uninstall spawn_blocking failed");

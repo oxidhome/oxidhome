@@ -850,14 +850,16 @@ fn kv_error_to_wit(err: crate::state::KvError) -> WitError {
     use crate::state::KvError;
     match err {
         KvError::QuotaExceeded {
-            instance_id: _,
-            would_use,
-            allowed,
+            would_use, allowed, ..
         } => WitError::PermissionDenied(format!(
             "quota exceeded: {would_use} bytes used / {allowed} allowed",
         )),
-        KvError::UnregisteredInstance { ref instance_id } => WitError::Internal(format!(
-            "kv: instance `{instance_id}` not registered (host bug)",
+        KvError::UnregisteredInstance {
+            installation_uuid,
+            instance_id,
+        } => WitError::Internal(format!(
+            "kv: instance `{instance_id}` (install `{installation_uuid}`) \
+             not registered (host bug)",
         )),
         KvError::Encode { key, source } => {
             WitError::Internal(format!("kv: encoding `{key}`: {source}"))
@@ -888,29 +890,33 @@ impl storage::Host for PluginState {
     async fn get(&mut self, key: String) -> Result<Option<WitValue>, WitError> {
         require_storage_enabled(self)?;
         let kv = Arc::clone(&self.kv);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        kv_op(move || kv.get(&instance_id, &key)).await
+        kv_op(move || kv.get(&installation_uuid, &instance_id, &key)).await
     }
 
     async fn set(&mut self, key: String, val: WitValue) -> Result<(), WitError> {
         require_storage_enabled(self)?;
         let kv = Arc::clone(&self.kv);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        kv_op(move || kv.set(&instance_id, &key, val)).await
+        kv_op(move || kv.set(&installation_uuid, &instance_id, &key, val)).await
     }
 
     async fn delete(&mut self, key: String) -> Result<(), WitError> {
         require_storage_enabled(self)?;
         let kv = Arc::clone(&self.kv);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        kv_op(move || kv.delete(&instance_id, &key)).await
+        kv_op(move || kv.delete(&installation_uuid, &instance_id, &key)).await
     }
 
     async fn list_keys(&mut self, prefix: String) -> Result<Vec<String>, WitError> {
         require_storage_enabled(self)?;
         let kv = Arc::clone(&self.kv);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        kv_op(move || kv.list_keys(&instance_id, &prefix)).await
+        kv_op(move || kv.list_keys(&installation_uuid, &instance_id, &prefix)).await
     }
 }
 
@@ -941,16 +947,20 @@ fn blob_error_to_wit(err: crate::state::BlobError) -> WitError {
         BlobError::Unavailable => WitError::Unavailable(
             "blob store unavailable: engine has no state directory configured".into(),
         ),
-        BlobError::UnregisteredInstance { ref instance_id } => WitError::Internal(format!(
-            "blob_store: instance `{instance_id}` not registered (host bug)"
+        BlobError::UnregisteredInstance {
+            installation_uuid,
+            instance_id,
+        } => WitError::Internal(format!(
+            "blob_store: instance `{instance_id}` (install `{installation_uuid}`) \
+             not registered (host bug)"
         )),
-        // Follow-up review H1: unsafe instance_id caught at the
+        // Follow-up review H1: unsafe segment caught at the
         // blob-store boundary. The API layer already refuses these
         // with 400 before they reach the store, so a leak here
         // implies a direct-caller path (test harness) with a bad
         // id — treat as host bug.
-        BlobError::UnsafeInstanceId { ref instance_id } => WitError::Internal(format!(
-            "blob_store: instance_id {instance_id:?} unsafe for use as a filesystem segment (host bug)"
+        BlobError::UnsafeInstanceId { ref segment } => WitError::Internal(format!(
+            "blob_store: path segment {segment:?} unsafe for use as a filesystem segment (host bug)"
         )),
         BlobError::QuotaExceeded {
             would_use, allowed, ..
@@ -1010,29 +1020,42 @@ impl blob_store::Host for PluginState {
     ) -> Result<String, WitError> {
         require_blobs_enabled(self)?;
         let blobs = Arc::clone(&self.blobs);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.write(&instance_id, &name, &data, mime.as_deref())).await
+        blob_op(move || {
+            blobs.write(
+                &installation_uuid,
+                &instance_id,
+                &name,
+                &data,
+                mime.as_deref(),
+            )
+        })
+        .await
     }
 
     async fn read(&mut self, id: String) -> Result<Vec<u8>, WitError> {
         require_blobs_enabled(self)?;
         let blobs = Arc::clone(&self.blobs);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.read(&instance_id, &id)).await
+        blob_op(move || blobs.read(&installation_uuid, &instance_id, &id)).await
     }
 
     async fn read_by_name(&mut self, name: String) -> Result<Vec<u8>, WitError> {
         require_blobs_enabled(self)?;
         let blobs = Arc::clone(&self.blobs);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.read_by_name(&instance_id, &name)).await
+        blob_op(move || blobs.read_by_name(&installation_uuid, &instance_id, &name)).await
     }
 
     async fn get_info(&mut self, name: String) -> Result<WitBlobInfo, WitError> {
         require_blobs_enabled(self)?;
         let blobs = Arc::clone(&self.blobs);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.get_info(&instance_id, &name))
+        blob_op(move || blobs.get_info(&installation_uuid, &instance_id, &name))
             .await
             .map(blob_info_to_wit)
     }
@@ -1040,15 +1063,18 @@ impl blob_store::Host for PluginState {
     async fn delete(&mut self, name: String) -> Result<(), WitError> {
         require_blobs_enabled(self)?;
         let blobs = Arc::clone(&self.blobs);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.delete(&instance_id, &name)).await
+        blob_op(move || blobs.delete(&installation_uuid, &instance_id, &name)).await
     }
 
     async fn list_blobs(&mut self, prefix: String) -> Result<Vec<WitBlobInfo>, WitError> {
         require_blobs_enabled(self)?;
         let blobs = Arc::clone(&self.blobs);
+        let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        let rows = blob_op(move || blobs.list_blobs(&instance_id, &prefix)).await?;
+        let rows =
+            blob_op(move || blobs.list_blobs(&installation_uuid, &instance_id, &prefix)).await?;
         Ok(rows.into_iter().map(blob_info_to_wit).collect())
     }
 }
@@ -1155,6 +1181,13 @@ mod tests {
         })
     }
 
+    /// Standing synthetic installation uuid for tests that don't go
+    /// through [`crate::state::InstalledPluginRegistry`]. Real loads
+    /// pass the per-install uuid the registry minted; tests that pin
+    /// this constant only care about the fixture's *shape*, not the
+    /// specific hex.
+    const TEST_INSTALLATION_UUID: &str = "test.fixture";
+
     /// Build a fresh KV store backed by an in-memory database and
     /// register the instance with `quota_kb` KiB of quota. Returns
     /// the `Arc<KvStore>` so individual tests can vary the quota
@@ -1162,7 +1195,7 @@ mod tests {
     fn fresh_kv(instance_id: &str, quota_kb: u64) -> Arc<crate::state::KvStore> {
         let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
         let kv = Arc::new(crate::state::KvStore::new(db));
-        kv.register_instance(instance_id, quota_kb * 1024)
+        kv.register_instance(TEST_INSTALLATION_UUID, instance_id, quota_kb * 1024)
             .expect("register kv");
         kv
     }

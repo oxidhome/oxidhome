@@ -687,6 +687,16 @@ async fn start_plugin_instance(
     if !crate::state::is_safe_instance_id(&instance_id) {
         return Err(PluginLifecycleError::BadInstanceId(instance_id));
     }
+    // H2 round-2 F1: serialize against a concurrent uninstall
+    // for the same plugin_id. Without this lock, uninstall's
+    // running-instances check could pass while start is
+    // mid-supervisor-registration, and uninstall could then
+    // yank the registry row + FS from under the fresh instance
+    // — leaving it running on a synthetic uuid + manifest-
+    // requested capabilities (loader dev fallback) instead of
+    // the persisted grant.
+    let lifecycle_lock = state.engine.plugin_lifecycle_lock(&plugin_id);
+    let _guard = lifecycle_lock.lock().await;
     let installed = state
         .engine
         .installed_plugins()
@@ -809,6 +819,13 @@ async fn uninstall_plugin(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<UninstalledRow>, PluginLifecycleError> {
     require_scope(&actor, PLUGINS_UNINSTALL)?;
+    // H2 round-2 F1: hold the per-plugin_id lifecycle lock
+    // across the running-instances check + the compose
+    // uninstall. Serializes against a concurrent
+    // `start_plugin_instance` for the same id — see the F1
+    // comment on that handler for the race.
+    let lifecycle_lock = state.engine.plugin_lifecycle_lock(&plugin_id);
+    let _guard = lifecycle_lock.lock().await;
     let running: Vec<String> = state
         .engine
         .instances()
@@ -820,9 +837,13 @@ async fn uninstall_plugin(
     if !running.is_empty() {
         return Err(PluginLifecycleError::InstancesRunning(running));
     }
-    let registry = state.engine.installed_plugins();
+    // H2: `Engine::uninstall_plugin` composes per-install
+    // KV/blob purge + registry tombstone (in that order — see
+    // H2 round-2 F2) so a subsequent reinstall of the same
+    // `plugin_id` starts with an empty per-instance keyspace.
+    let engine = state.engine.clone();
     let id_for_blocking = plugin_id.clone();
-    let result = tokio::task::spawn_blocking(move || registry.uninstall(&id_for_blocking))
+    let result = tokio::task::spawn_blocking(move || engine.uninstall_plugin(&id_for_blocking))
         .await
         .map_err(|err| PluginLifecycleError::Internal(err.into()))?;
     result?;

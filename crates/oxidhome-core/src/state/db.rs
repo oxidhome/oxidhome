@@ -533,6 +533,145 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE plugin_installation ADD COLUMN content_digest TEXT;
     ",
+    // Migration 14 — architecture-review H2: rekey per-instance state
+    // on the host-minted installation identity.
+    //
+    // Before this migration `kv`, `kv_usage`, `blob`, and `blob_usage`
+    // all keyed on the caller-supplied `instance_id` alone. That
+    // string is a plugin-author-chosen identifier — an uninstall
+    // followed by a fresh `install` of the same (or a colliding)
+    // `plugin_id` inherited every stored value from the previous
+    // installation, sidestepping the fresh grant that C1b / C5 mint
+    // at install time. H2 closes the hole by qualifying every row
+    // with the host-minted `installation_uuid`.
+    //
+    // Uninstall now calls `purge_installation` on each store, which
+    // deletes every row (KV + blob index + FS bytes) that carries
+    // the tombstoned installation's uuid — so a subsequent reinstall
+    // starts with an empty per-instance keyspace and no orphan blob
+    // files.
+    //
+    // Legacy rows written under migrations 1–7 don't carry an
+    // installation_uuid we could truthfully backfill. Pre-1.0 the
+    // acceptable path is to DROP those rows so the invariant
+    // ("every state row is tied to a live install") holds from this
+    // migration onward. Operators upgrading with existing plugin
+    // KV/blob data will need to reinstall to repopulate; the audit
+    // trail (`audit_event`, `event_log`, `log_event`) is untouched.
+    //
+    // Table shape:
+    // - `kv (installation_uuid, instance_id, key)` composite PK.
+    // - `kv_usage (installation_uuid, instance_id)` composite PK.
+    // - `blob (installation_uuid, instance_id, name)` composite PK,
+    //   UNIQUE index on `(installation_uuid, instance_id, id)`.
+    // - `blob_usage (installation_uuid, instance_id)` composite PK.
+    //
+    // Triggers are rewritten to match the composite key on both
+    // sides of the `UPDATE ... WHERE` so accounting stays per-tuple.
+    "
+    DROP TRIGGER kv_usage_insert;
+    DROP TRIGGER kv_usage_delete;
+    DROP TRIGGER kv_usage_update;
+    DROP TRIGGER blob_usage_insert;
+    DROP TRIGGER blob_usage_delete;
+    DROP TRIGGER blob_usage_update;
+
+    -- Pre-H2 rows can't be truthfully attributed to any installation_uuid,
+    -- so drop them and recreate the tables with the new key shape. See
+    -- the migration header for the rationale.
+    DROP TABLE kv;
+    DROP TABLE kv_usage;
+    DROP INDEX blob_by_id;
+    DROP TABLE blob;
+    DROP TABLE blob_usage;
+
+    CREATE TABLE kv (
+        installation_uuid TEXT NOT NULL,
+        instance_id       TEXT NOT NULL,
+        key               TEXT NOT NULL,
+        value             BLOB NOT NULL,
+        updated_ms        INTEGER NOT NULL,
+        PRIMARY KEY (installation_uuid, instance_id, key)
+    ) WITHOUT ROWID;
+
+    CREATE TABLE kv_usage (
+        installation_uuid TEXT NOT NULL,
+        instance_id       TEXT NOT NULL,
+        bytes_used        INTEGER NOT NULL DEFAULT 0,
+        bytes_quota       INTEGER NOT NULL,
+        PRIMARY KEY (installation_uuid, instance_id)
+    ) WITHOUT ROWID;
+
+    CREATE TRIGGER kv_usage_insert AFTER INSERT ON kv
+    BEGIN
+        UPDATE kv_usage
+           SET bytes_used = bytes_used + length(CAST(NEW.key AS BLOB)) + length(NEW.value)
+         WHERE installation_uuid = NEW.installation_uuid
+           AND instance_id       = NEW.instance_id;
+    END;
+
+    CREATE TRIGGER kv_usage_delete AFTER DELETE ON kv
+    BEGIN
+        UPDATE kv_usage
+           SET bytes_used = bytes_used - length(CAST(OLD.key AS BLOB)) - length(OLD.value)
+         WHERE installation_uuid = OLD.installation_uuid
+           AND instance_id       = OLD.instance_id;
+    END;
+
+    CREATE TRIGGER kv_usage_update AFTER UPDATE OF value ON kv
+    BEGIN
+        UPDATE kv_usage
+           SET bytes_used = bytes_used + length(NEW.value) - length(OLD.value)
+         WHERE installation_uuid = NEW.installation_uuid
+           AND instance_id       = NEW.instance_id;
+    END;
+
+    CREATE TABLE blob (
+        installation_uuid TEXT NOT NULL,
+        instance_id       TEXT NOT NULL,
+        name              TEXT NOT NULL,
+        id                TEXT NOT NULL,
+        size_bytes        INTEGER NOT NULL,
+        created_ms        INTEGER NOT NULL,
+        mime              TEXT,
+        PRIMARY KEY (installation_uuid, instance_id, name)
+    ) WITHOUT ROWID;
+
+    CREATE UNIQUE INDEX blob_by_id
+        ON blob(installation_uuid, instance_id, id);
+
+    CREATE TABLE blob_usage (
+        installation_uuid TEXT NOT NULL,
+        instance_id       TEXT NOT NULL,
+        bytes_used        INTEGER NOT NULL DEFAULT 0,
+        bytes_quota       INTEGER NOT NULL,
+        PRIMARY KEY (installation_uuid, instance_id)
+    ) WITHOUT ROWID;
+
+    CREATE TRIGGER blob_usage_insert AFTER INSERT ON blob
+    BEGIN
+        UPDATE blob_usage
+           SET bytes_used = bytes_used + NEW.size_bytes
+         WHERE installation_uuid = NEW.installation_uuid
+           AND instance_id       = NEW.instance_id;
+    END;
+
+    CREATE TRIGGER blob_usage_delete AFTER DELETE ON blob
+    BEGIN
+        UPDATE blob_usage
+           SET bytes_used = bytes_used - OLD.size_bytes
+         WHERE installation_uuid = OLD.installation_uuid
+           AND instance_id       = OLD.instance_id;
+    END;
+
+    CREATE TRIGGER blob_usage_update AFTER UPDATE OF size_bytes ON blob
+    BEGIN
+        UPDATE blob_usage
+           SET bytes_used = bytes_used + NEW.size_bytes - OLD.size_bytes
+         WHERE installation_uuid = NEW.installation_uuid
+           AND instance_id       = NEW.instance_id;
+    END;
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.
@@ -548,6 +687,13 @@ pub struct Db {
     /// error messages); `Some(path)` for file-backed instances.
     path: Option<PathBuf>,
     conn: Mutex<Connection>,
+    /// `user_version` observed *before* this process open ran any
+    /// migrations. Callers use this to detect "did migration N just
+    /// run this boot" — the H2 round-2 F3 one-shot blob-root sweep
+    /// checks `pre_open_user_version < 14` to decide whether to
+    /// reclaim legacy pre-migration-14 blob trees. `0` for a fresh
+    /// (empty) database.
+    pre_open_user_version: i64,
 }
 
 impl Db {
@@ -600,12 +746,33 @@ impl Db {
     }
 
     fn initialize(path: Option<PathBuf>, conn: Connection) -> anyhow::Result<Self> {
+        // Read the on-file `user_version` before touching the
+        // schema, so callers can distinguish "we just applied
+        // migration N this open" from "N had already been applied
+        // in a prior process." The H2 round-2 F3 blob-root sweep
+        // uses this to run its one-shot cleanup exactly once, on
+        // the first boot after the migration-14 upgrade.
+        let pre_open_user_version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .context("reading user_version pre-migration")?;
         let db = Self {
             path,
             conn: Mutex::new(conn),
+            pre_open_user_version,
         };
         db.apply_migrations()?;
         Ok(db)
+    }
+
+    /// H2 round-2 F3: the `user_version` this process observed
+    /// *before* running any migrations. Zero for a fresh DB.
+    /// Called by [`crate::Engine::with_state_dir`] to decide
+    /// whether the one-shot blob-root sweep should run (only
+    /// when `pre_open_user_version < 14` — i.e., migration 14
+    /// just applied this boot).
+    #[must_use]
+    pub fn pre_open_user_version(&self) -> i64 {
+        self.pre_open_user_version
     }
 
     fn apply_migrations(&self) -> anyhow::Result<()> {
@@ -717,6 +884,7 @@ impl std::fmt::Debug for Db {
         f.debug_struct("Db")
             .field("path", &self.path)
             .field("conn", &"<rusqlite::Connection>")
+            .field("pre_open_user_version", &self.pre_open_user_version)
             .finish()
     }
 }
@@ -783,56 +951,69 @@ mod tests {
 
     /// Migration 2 has to fix up `kv_usage.bytes_used` for any
     /// instances that already accumulated character-counted totals
-    /// under migration 1. Simulate that by:
+    /// under migration 1. Simulate that (on top of the current
+    /// migration-14 schema — H2 rekeyed the `kv` / `kv_usage`
+    /// tables to `(installation_uuid, instance_id)`) by:
     ///
-    /// 1. Open a fresh file DB (runs both migrations on empty tables
-    ///    — nothing to re-baseline).
+    /// 1. Open a fresh file DB (runs every migration on empty
+    ///    tables — nothing to re-baseline).
     /// 2. Hand-craft a drifted row: insert a non-ASCII key and
     ///    manually overwrite `bytes_used` with the character count
     ///    migration 1's triggers would have produced.
-    /// 3. Run the migration-2 body again as a one-shot UPDATE and
-    ///    confirm `bytes_used` jumps to the byte total.
+    /// 3. Run the migration-2 rebaseline body, rewritten against
+    ///    the migration-14 shape (composite PK), and confirm
+    ///    `bytes_used` jumps to the byte total.
     ///
-    /// Step 3 is the same SQL the actual migration runs; this gives
-    /// us a deterministic check without needing to roll back
-    /// `user_version` and replay the upgrade.
+    /// The invariant under test — "`bytes_used = SUM(length_of_key_in_bytes + length_of_value)`" —
+    /// is the load-bearing bit of migration 2, and it still holds
+    /// post-14. The column list changed but the math is the same.
     #[test]
     fn migration_2_rebaseline_corrects_drifted_bytes_used() {
         let dir = tempdir_for_test();
         let db = Db::open_file(dir.path()).expect("open");
         db.write(|conn| -> rusqlite::Result<()> {
             conn.execute(
-                "INSERT INTO kv_usage(instance_id, bytes_used, bytes_quota) VALUES (?1, 0, ?2)",
-                rusqlite::params!["alpha", 4096_i64],
+                "INSERT INTO kv_usage(installation_uuid, instance_id, bytes_used, bytes_quota) \
+                 VALUES (?1, ?2, 0, ?3)",
+                rusqlite::params!["inst-test-0", "alpha", 4096_i64],
             )?;
-            // The triggers (now migration-2-shape) account this
+            // The triggers (now migration-14-shape) account this
             // correctly on insert, so explicitly set `bytes_used` to
             // the character total a migration-1 trigger would have
             // produced: "αβγ" = 3 chars, value JSON = ~10 bytes.
             conn.execute(
-                "INSERT INTO kv(instance_id, key, value, updated_ms) VALUES (?1, ?2, ?3, 0)",
-                rusqlite::params!["alpha", "αβγ", &b"{\"t\":\"Int\",\"v\":0}"[..]],
+                "INSERT INTO kv(installation_uuid, instance_id, key, value, updated_ms) \
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                rusqlite::params![
+                    "inst-test-0",
+                    "alpha",
+                    "αβγ",
+                    &b"{\"t\":\"Int\",\"v\":0}"[..]
+                ],
             )?;
             // Force the drift: pretend the row was inserted under
             // migration 1's character-counting triggers. 3 (chars) +
             // 17 (payload bytes) = 20, where the byte-correct total
             // is 6 + 17 = 23.
             conn.execute(
-                "UPDATE kv_usage SET bytes_used = 20 WHERE instance_id = 'alpha'",
+                "UPDATE kv_usage SET bytes_used = 20 \
+                 WHERE installation_uuid = 'inst-test-0' AND instance_id = 'alpha'",
                 (),
             )?;
             Ok(())
         })
         .expect("seed drift");
 
-        // Re-run migration 2's rebaseline body. Same SQL as in
-        // `MIGRATIONS[1]`.
+        // Migration 2's rebaseline body, rewritten against the
+        // composite `(installation_uuid, instance_id)` PK migration
+        // 14 established for the `kv` / `kv_usage` tables.
         db.write(|conn| -> rusqlite::Result<()> {
             conn.execute_batch(
                 "UPDATE kv_usage SET bytes_used = COALESCE((
                     SELECT SUM(length(CAST(key AS BLOB)) + length(value))
                       FROM kv
-                     WHERE kv.instance_id = kv_usage.instance_id
+                     WHERE kv.installation_uuid = kv_usage.installation_uuid
+                       AND kv.instance_id       = kv_usage.instance_id
                 ), 0);",
             )?;
             Ok(())
@@ -842,7 +1023,8 @@ mod tests {
         let used: i64 = db
             .read(|conn| {
                 conn.query_row(
-                    "SELECT bytes_used FROM kv_usage WHERE instance_id = 'alpha'",
+                    "SELECT bytes_used FROM kv_usage \
+                     WHERE installation_uuid = 'inst-test-0' AND instance_id = 'alpha'",
                     (),
                     |row| row.get(0),
                 )
