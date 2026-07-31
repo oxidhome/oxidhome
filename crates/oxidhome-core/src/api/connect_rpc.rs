@@ -643,14 +643,16 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
     ) -> ServiceResult<impl Encodable<UninstallPluginResponse> + Send + use<'a>> {
         require_scope_connect(&ctx, PLUGINS_UNINSTALL)?;
         let req = request.to_owned_message();
-        // H2 round-2 F1: hold the per-plugin_id lifecycle lock
-        // across the running-instances check + the compose
-        // uninstall. Mirrors `server.rs::uninstall_plugin`'s
-        // JSON path. Without it, a concurrent start could
-        // register a fresh supervisor between the check and the
-        // tombstone.
+        // H2 round-2 F1 + H3 round-2 F1: hold the per-plugin_id
+        // lifecycle lock across the running-instances check +
+        // the compose uninstall, and MOVE the guard into the
+        // `spawn_blocking` closure so a cancelled Connect
+        // handler can't drop the guard while the detached
+        // uninstall task is still running. See F1 comment in
+        // `server.rs::uninstall_plugin` for the race that shape
+        // closes.
         let lifecycle_lock = self.engine.plugin_lifecycle_lock(&req.plugin_id);
-        let _guard = lifecycle_lock.lock().await;
+        let guard = lifecycle_lock.lock_owned().await;
         // Refuse if any instance of the plugin is running. Same
         // fail-closed shape the JSON handler enforces — operator
         // stops first. FAILED_PRECONDITION is the Connect-side
@@ -678,13 +680,15 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         // state.
         let engine = self.engine.clone();
         let id_for_blocking = req.plugin_id.clone();
-        let result =
-            tokio::task::spawn_blocking(move || engine.uninstall_plugin(&id_for_blocking))
-                .await
-                .map_err(|err| {
-                    tracing::error!(target: "api.plugins", error = %err, "uninstall spawn_blocking failed");
-                    rpc_err(&ctx, ConnectError::internal("uninstall task join failed"))
-                })?;
+        let result = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            engine.uninstall_plugin(&id_for_blocking)
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!(target: "api.plugins", error = %err, "uninstall spawn_blocking failed");
+            rpc_err(&ctx, ConnectError::internal("uninstall task join failed"))
+        })?;
         result.map_err(|err| rpc_err(&ctx, uninstall_error_to_connect(err)))?;
         Response::ok(UninstallPluginResponse {
             plugin_id: req.plugin_id,

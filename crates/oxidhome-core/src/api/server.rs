@@ -819,13 +819,22 @@ async fn uninstall_plugin(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<UninstalledRow>, PluginLifecycleError> {
     require_scope(&actor, PLUGINS_UNINSTALL)?;
-    // H2 round-2 F1: hold the per-plugin_id lifecycle lock
-    // across the running-instances check + the compose
-    // uninstall. Serializes against a concurrent
-    // `start_plugin_instance` for the same id — see the F1
-    // comment on that handler for the race.
+    // H2 round-2 F1 + H3 round-2 F1: hold the per-plugin_id
+    // lifecycle lock across the running-instances check + the
+    // compose uninstall, and — crucially — MOVE the guard into
+    // the `spawn_blocking` closure so the uninstall task itself
+    // owns the reservation until every FS + SQL step finishes.
+    //
+    // A borrowed guard on the handler frame would be dropped if
+    // the HTTP handler was cancelled mid-uninstall (client
+    // disconnect, axum shutdown); the `spawn_blocking` task
+    // keeps running detached and can still be racing a
+    // concurrent `start_plugin_instance` that has since
+    // re-acquired the mutex. Owning the guard for the whole
+    // blocking closure keeps the reservation alive until the
+    // real work completes, cancellation or not.
     let lifecycle_lock = state.engine.plugin_lifecycle_lock(&plugin_id);
-    let _guard = lifecycle_lock.lock().await;
+    let guard = lifecycle_lock.lock_owned().await;
     let running: Vec<String> = state
         .engine
         .instances()
@@ -843,9 +852,12 @@ async fn uninstall_plugin(
     // `plugin_id` starts with an empty per-instance keyspace.
     let engine = state.engine.clone();
     let id_for_blocking = plugin_id.clone();
-    let result = tokio::task::spawn_blocking(move || engine.uninstall_plugin(&id_for_blocking))
-        .await
-        .map_err(|err| PluginLifecycleError::Internal(err.into()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        engine.uninstall_plugin(&id_for_blocking)
+    })
+    .await
+    .map_err(|err| PluginLifecycleError::Internal(err.into()))?;
     result?;
     Ok(Json(UninstalledRow { plugin_id }))
 }
