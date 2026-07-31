@@ -687,6 +687,13 @@ pub struct Db {
     /// error messages); `Some(path)` for file-backed instances.
     path: Option<PathBuf>,
     conn: Mutex<Connection>,
+    /// `user_version` observed *before* this process open ran any
+    /// migrations. Callers use this to detect "did migration N just
+    /// run this boot" — the H2 round-2 F3 one-shot blob-root sweep
+    /// checks `pre_open_user_version < 14` to decide whether to
+    /// reclaim legacy pre-migration-14 blob trees. `0` for a fresh
+    /// (empty) database.
+    pre_open_user_version: i64,
 }
 
 impl Db {
@@ -739,12 +746,33 @@ impl Db {
     }
 
     fn initialize(path: Option<PathBuf>, conn: Connection) -> anyhow::Result<Self> {
+        // Read the on-file `user_version` before touching the
+        // schema, so callers can distinguish "we just applied
+        // migration N this open" from "N had already been applied
+        // in a prior process." The H2 round-2 F3 blob-root sweep
+        // uses this to run its one-shot cleanup exactly once, on
+        // the first boot after the migration-14 upgrade.
+        let pre_open_user_version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .context("reading user_version pre-migration")?;
         let db = Self {
             path,
             conn: Mutex::new(conn),
+            pre_open_user_version,
         };
         db.apply_migrations()?;
         Ok(db)
+    }
+
+    /// H2 round-2 F3: the `user_version` this process observed
+    /// *before* running any migrations. Zero for a fresh DB.
+    /// Called by [`crate::Engine::with_state_dir`] to decide
+    /// whether the one-shot blob-root sweep should run (only
+    /// when `pre_open_user_version < 14` — i.e., migration 14
+    /// just applied this boot).
+    #[must_use]
+    pub fn pre_open_user_version(&self) -> i64 {
+        self.pre_open_user_version
     }
 
     fn apply_migrations(&self) -> anyhow::Result<()> {
@@ -856,6 +884,7 @@ impl std::fmt::Debug for Db {
         f.debug_struct("Db")
             .field("path", &self.path)
             .field("conn", &"<rusqlite::Connection>")
+            .field("pre_open_user_version", &self.pre_open_user_version)
             .finish()
     }
 }

@@ -863,6 +863,17 @@ impl InstalledPluginRegistry {
         self.read_entries().get(plugin_id).cloned()
     }
 
+    /// The root under which installed plugin dirs live
+    /// (`<state_dir>/plugins/`). `None` for in-memory registries
+    /// (`Self::empty()`). Callers use this to decide whether a
+    /// caller-supplied `wasm_path` was pointing at an installed
+    /// plugin — the H2 round-2 F1 loader belt refuses to fall
+    /// back to dev semantics for paths that live here.
+    #[must_use]
+    pub fn plugins_root(&self) -> Option<&Path> {
+        self.plugins_root.as_deref()
+    }
+
     /// Copy `source_dir` to `<plugins_root>/<plugin_id>/`, where
     /// `<plugin_id>` is read from `<source_dir>/manifest.toml`.
     ///
