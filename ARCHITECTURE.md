@@ -41,7 +41,7 @@ The `oxidhome.wit` file is the *real product* in a sense. Once plugins exist in 
 ### Plugin vs. plugin instance
 
 - A **plugin** is a `.wasm` component package — the code (e.g. "onvif-camera", "zigbee2mqtt-bridge")
-- A **plugin instance** is a configured, running copy of that plugin (one per camera, one per Zigbee bridge, etc.)
+- A **plugin instadsance** is a configured, running copy of that plugin (one per camera, one per Zigbee bridge, etc.)
 
 A user installs the "ONVIF camera" plugin once. They configure three cameras through the UI. The host spins up three component instances of that plugin, each with its own config, capabilities, and lifecycle. Crash isolation, per-instance supervision, and independent updates fall out naturally.
 
