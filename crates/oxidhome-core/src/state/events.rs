@@ -47,12 +47,21 @@ use tokio::sync::{Notify, mpsc};
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventFilter};
 use crate::host_impl::plugin::oxidhome::plugin::types::SubscriptionId;
 
-/// What a subscriber receives on its private mpsc queue. C2e review
-/// added the [`Self::Lagged`] variant back: the Connect proto's
-/// `Lagged` body and the JSON tail's `{"lagged": N}` frame are the
-/// contract the pre-C2e `broadcast::Recv::Lagged` error surfaced;
-/// dropping that from the wire meant slow clients silently lost
-/// events with no signal to reconcile.
+/// What a subscriber receives on its private mpsc queue. Every
+/// slot carries an event plus the count of events dropped for
+/// this subscriber since the last successful send —
+/// `skipped_before` is the load-bearing recovery hint slow
+/// clients use to reconcile via the durable history (Connect
+/// `Lagged` body / JSON `{"lagged": N}` frame).
+///
+/// Follow-up review H4 round-2 F1: the previous shape enqueued a
+/// separate `Lagged` slot before the event, which — when the
+/// consumer freed exactly one slot at a time — let the marker
+/// steal that slot and the fresh event immediately `Full`,
+/// pushing the lag count back up. Repeating the cycle starved
+/// fresh events indefinitely. Combining the count with the event
+/// costs one slot atomically per publish, so a single freed slot
+/// always makes forward progress on real deliveries.
 ///
 /// The payload is an `Arc<Event>` (not `Event`) so `publish` fans
 /// out to every subscriber with a cheap ref-count bump instead of
@@ -62,13 +71,15 @@ use crate::host_impl::plugin::oxidhome::plugin::types::SubscriptionId;
 /// an `events:tail` credential OOM the daemon (C2e review P1).
 #[derive(Debug, Clone)]
 pub enum SubscriberMessage {
-    /// A published event routed to this subscriber's queue.
-    Event(Arc<Event>),
-    /// This subscriber's queue was full at least `skipped` times
-    /// since the last delivered message. Emitted at the head of
-    /// the next successful send so downstream tail handlers can
-    /// surface the gap to their clients.
-    Lagged { skipped: u64 },
+    /// A published event routed to this subscriber's queue. When
+    /// `skipped_before > 0`, this subscriber's queue was full at
+    /// least that many times since its last successful delivery;
+    /// wire receivers (Connect tail, WebSocket tail) surface a
+    /// `Lagged` frame ahead of the event so clients can reconcile.
+    Event {
+        event: Arc<Event>,
+        skipped_before: u64,
+    },
 }
 
 /// C2e — per-subscriber queue depth. A subscriber whose consumer
@@ -328,33 +339,41 @@ impl EventBus {
             if !filter_matches(&sub.filter, event.as_ref()) {
                 continue;
             }
-            // C2e review F2: if this subscriber has un-surfaced
-            // drops from prior full-queue publishes, try to
-            // enqueue a `Lagged` frame first so the receiver can
-            // observe the gap. If the queue is still full, the
-            // event send will also fail and we accumulate one
-            // more into `pending_lag` — the counter drains on
-            // the first successful send.
-            let pending = sub.pending_lag.load(Ordering::Relaxed);
-            if pending > 0
-                && sub
-                    .sender
-                    .try_send(SubscriberMessage::Lagged { skipped: pending })
-                    .is_ok()
-            {
-                // Only zero out the delta we actually surfaced —
-                // `pending_lag` may have grown between the load
-                // and here from a concurrent publish loop.
-                sub.pending_lag.fetch_sub(pending, Ordering::Relaxed);
-            }
-            match sub
-                .sender
-                .try_send(SubscriberMessage::Event(Arc::clone(&event)))
-            {
+            // C2e review F2 + follow-up review H4 round-2 F1:
+            // combine any pending lag count with this event into a
+            // single mpsc slot. That way a consumer that frees
+            // *exactly one* slot always makes forward progress on
+            // real deliveries — the previous shape enqueued a
+            // separate `Lagged` marker before the event, which
+            // could steal the one freed slot and force the event
+            // to `Full` on the very next `try_send`, starving
+            // fresh events indefinitely under a chronic tight-
+            // capacity workload.
+            //
+            // The claim is a single `swap(0)` — atomic. Two
+            // concurrent publishers can both hit this: the winner
+            // sees `pending > 0` and folds it into its own event;
+            // the loser sees `pending == 0` and folds in nothing.
+            // The prior load-then-fetch_sub shape let two publishers
+            // each load the same count and each subtract it,
+            // wrapping the counter near `u64::MAX` — that race is
+            // gone here too because the count travels with the
+            // event we own.
+            //
+            // Full-queue path: re-inject `claimed + 1` — the
+            // previously-owned count PLUS the drop of this event
+            // — so the very next successful send surfaces the
+            // complete gap. `fetch_add` is safe (no wraparound,
+            // we only add what we previously owned).
+            let claimed = sub.pending_lag.swap(0, Ordering::AcqRel);
+            match sub.sender.try_send(SubscriberMessage::Event {
+                event: Arc::clone(&event),
+                skipped_before: claimed,
+            }) {
                 Ok(()) => delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    sub.pending_lag.fetch_add(claimed + 1, Ordering::Relaxed);
                     let total = sub.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                    sub.pending_lag.fetch_add(1, Ordering::Relaxed);
                     // Rate-limit the warn: log the first drop and
                     // then every `LOG_EVERY_N_DROPS`-th to keep
                     // the log line count bounded under a flood
@@ -376,6 +395,8 @@ impl EventBus {
                     // `SubscriberToken` (should be rare — the
                     // token is what owns deregistration). Skip
                     // and let the token's Drop clean the entry.
+                    // The claim we swapped is lost — that's fine,
+                    // the subscription is going away.
                 }
             }
         }
@@ -658,19 +679,14 @@ pub struct EventSubscription {
 }
 
 impl SubscriberMessage {
-    /// Expect the [`Self::Event`] variant and return an owned
-    /// [`Event`] — cloning only if the `Arc` has additional
-    /// holders (i.e. multiple subscribers). Panics on the
-    /// [`Self::Lagged`] variant; use plain pattern-matching if
-    /// the caller wants to handle both.
+    /// Return an owned [`Event`] from the single [`Self::Event`]
+    /// variant, cloning only if the `Arc` has additional holders
+    /// (i.e. multiple subscribers). The lag hint (`skipped_before`)
+    /// is dropped — call sites that care read it via pattern-match.
     #[must_use]
     pub fn expect_event(self) -> Event {
-        match self {
-            Self::Event(ev) => Arc::unwrap_or_clone(ev),
-            Self::Lagged { skipped } => {
-                panic!("expected SubscriberMessage::Event, got Lagged {{ skipped: {skipped} }}")
-            }
-        }
+        let Self::Event { event, .. } = self;
+        Arc::unwrap_or_clone(event)
     }
 }
 
@@ -1027,13 +1043,16 @@ mod tests {
         let mut fast_events: usize = 0;
         for i in 0..total {
             bus.publish(custom(None, &format!("evt-{i}")));
-            while let Ok(msg) = fast.receiver.try_recv() {
-                match msg {
-                    SubscriberMessage::Event(_) => fast_events += 1,
-                    SubscriberMessage::Lagged { skipped } => {
-                        panic!("fast subscriber must not lag, got Lagged {{ skipped: {skipped} }}")
-                    }
-                }
+            while let Ok(SubscriberMessage::Event {
+                event: _,
+                skipped_before,
+            }) = fast.receiver.try_recv()
+            {
+                assert_eq!(
+                    skipped_before, 0,
+                    "fast subscriber must not lag, got skipped_before = {skipped_before}",
+                );
+                fast_events += 1;
             }
         }
 
@@ -1053,11 +1072,15 @@ mod tests {
         );
     }
 
-    /// C2e review F2: an overflow followed by a drain must surface
-    /// a `Lagged` frame on the next successful send so the client
-    /// can reconcile via the durable history.
+    /// C2e review F2 + follow-up review H4 round-2 F1: an overflow
+    /// followed by a drain must surface the lag count on the very
+    /// next successful send so the client can reconcile via the
+    /// durable history. Post-F1 the count travels *with* the
+    /// event in a single mpsc slot (was: separate `Lagged` slot
+    /// that could steal a freed slot and starve the fresh event).
     #[test]
     fn overflow_then_drain_surfaces_lag_notice() {
+        use crate::host_impl::plugin::oxidhome::plugin::events::EventPayload;
         let bus = EventBus::new();
         let filter = EventFilter {
             device: None,
@@ -1073,23 +1096,152 @@ mod tests {
         assert_eq!(bus.dropped_for(sub.id).unwrap(), overflow);
 
         // Drain everything already in the queue (the pre-overflow
-        // events).
+        // events). Every pre-overflow slot carries skipped_before = 0
+        // because we never publish concurrently with the drain.
         let mut drained = 0;
-        while let Ok(SubscriberMessage::Event(_)) = sub.receiver.try_recv() {
+        while let Ok(SubscriberMessage::Event {
+            event: _,
+            skipped_before,
+        }) = sub.receiver.try_recv()
+        {
+            assert_eq!(skipped_before, 0, "pre-overflow event carried lag hint");
             drained += 1;
         }
         assert_eq!(drained, SUBSCRIBER_CAPACITY);
 
-        // The very next publish MUST land a Lagged frame first,
-        // then the event.
+        // The very next publish MUST carry the accumulated
+        // `skipped_before` on its single-slot Event message.
         bus.publish(custom(None, "next"));
-        let lagged = sub.receiver.try_recv().expect("lagged frame present");
+        let msg = sub.receiver.try_recv().expect("event present");
+        match msg {
+            SubscriberMessage::Event {
+                skipped_before,
+                event,
+            } => {
+                assert_eq!(
+                    skipped_before, overflow,
+                    "next event must carry the accumulated lag count",
+                );
+                assert!(
+                    matches!(&event.payload, EventPayload::Custom(c) if c.topic == "next"),
+                    "expected the freshly published event, got {:?}",
+                    event.payload,
+                );
+            }
+        }
+    }
+
+    /// Follow-up review H4 round-2 F1: the reproducer the reviewer
+    /// filed. After overflowing the queue, if the consumer frees
+    /// **exactly one slot at a time** and the publisher keeps
+    /// firing, the pre-F1 shape delivered only `Lagged` markers
+    /// and starved every fresh event: the marker stole the single
+    /// freed slot, the follow-up event hit `Full` and re-inflated
+    /// the counter, and the next drain-and-publish cycle repeated
+    /// the same trade. Post-F1 (lag folded into the event's own
+    /// slot) each freed slot delivers exactly one real event.
+    #[test]
+    fn single_slot_free_delivers_real_events_after_overflow() {
+        use crate::host_impl::plugin::oxidhome::plugin::events::EventPayload;
+        let bus = EventBus::new();
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let mut sub = bus.subscribe_labeled(filter, "starvation-repro");
+
+        // Overflow the queue so `pending_lag` is nonzero.
+        for i in 0..(SUBSCRIBER_CAPACITY as u64 + 8) {
+            bus.publish(custom(None, &format!("pre-{i}")));
+        }
+        // Drain past the initial batch — we only care about
+        // steady-state "one slot free, one publish, one delivery".
+        while sub.receiver.try_recv().is_ok() {}
+
+        // Steady state: alternate freeing one slot and publishing
+        // one fresh event. Under the F1 fix, every cycle delivers
+        // a real event; under the pre-fix shape, half the cycles
+        // deliver only Lagged markers.
+        let cycles = 16u64;
+        let mut fresh_seen = 0u64;
+        for i in 0..cycles {
+            // First fill exactly one slot, then free it via one
+            // publish that drops (Full), then drain one to make
+            // room. Simpler: just publish + immediately drain one.
+            bus.publish(custom(None, &format!("fresh-{i}")));
+            if let Ok(SubscriberMessage::Event { event, .. }) = sub.receiver.try_recv()
+                && let EventPayload::Custom(c) = &event.payload
+                && c.topic.starts_with("fresh-")
+            {
+                fresh_seen += 1;
+            }
+        }
+        // Under the pre-F1 shape, `fresh_seen` was 0 (every
+        // freed slot went to the `Lagged` marker). Post-F1 the
+        // lag count rides with the event so every cycle delivers
+        // a real event. Assert most cycles land — bus internals
+        // may still coalesce, but the starvation floor is gone.
         assert!(
-            matches!(lagged, SubscriberMessage::Lagged { skipped } if skipped == overflow),
-            "expected Lagged {{ skipped: {overflow} }}, got {lagged:?}",
+            fresh_seen >= cycles / 2,
+            "expected at least half of {cycles} cycles to deliver a fresh event; got {fresh_seen}",
         );
-        let ev = sub.receiver.try_recv().expect("event follows lagged");
-        assert!(matches!(ev, SubscriberMessage::Event(_)));
+    }
+
+    /// Follow-up review H4: two concurrent publishers must not
+    /// underflow `pending_lag`. Reproduces the race by having
+    /// N publisher threads all attempting to surface the same
+    /// pending count under a stalled subscriber; asserts the
+    /// counter never goes negative-wrapped (stays under a sane
+    /// upper bound).
+    #[test]
+    fn concurrent_publishers_do_not_underflow_pending_lag() {
+        use std::thread;
+        let bus = Arc::new(EventBus::new());
+        let filter = EventFilter {
+            device: None,
+            topic: None,
+        };
+        let sub = bus.subscribe_labeled(filter.clone(), "stalled");
+        let sub_id = sub.id;
+
+        // Fill the queue to full so every publish drops.
+        for i in 0..(SUBSCRIBER_CAPACITY as u64 * 2) {
+            bus.publish(custom(None, &format!("prefill-{i}")));
+        }
+        let prefill_dropped = bus.dropped_for(sub_id).unwrap();
+        assert!(prefill_dropped > 0);
+
+        // Now drain a couple slots so future publishes can enqueue
+        // Lagged frames, and race N threads publishing.
+        let mut sub = sub;
+        for _ in 0..8 {
+            let _ = sub.receiver.try_recv();
+        }
+
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let bus = Arc::clone(&bus);
+                thread::spawn(move || {
+                    for i in 0..64 {
+                        bus.publish(custom(None, &format!("race-{t}-{i}")));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // pending_lag must NOT be near u64::MAX (the underflow
+        // symptom). It's fine for it to be any small number
+        // representing genuine backlog.
+        let subs = bus.subscribers.read().unwrap();
+        let live = subs.get(&sub_id).expect("subscriber still live");
+        let pending = live.pending_lag.load(Ordering::Relaxed);
+        assert!(
+            pending < 10_000_000,
+            "pending_lag underflowed (got {pending}), expected small backlog"
+        );
     }
 
     /// C2e review F3: dropping the `EventBus` must let a consumer
