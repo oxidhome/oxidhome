@@ -252,6 +252,82 @@ wasm = "simulated_switch.wasm"
     );
 }
 
+/// H11 round-2 F1: an `Installed` load whose expected
+/// `installation_uuid` no longer matches the live registry row
+/// (uninstall + reinstall between the API's row read and the
+/// loader's) must fail closed rather than apply the fresh grant
+/// under the stale identity. The reviewer's original scenario
+/// (registry row gone entirely) exercises the same code path but
+/// also needs the FS dir to exist — after uninstall the dir is
+/// gone too, which the loader hits *before* the identity check.
+/// The "identity rotated" case is the fully deterministic
+/// end-to-end variant.
+#[tokio::test(flavor = "current_thread")]
+async fn installed_load_refused_when_installation_uuid_rotated() {
+    use oxidhome_core::runtime::{LoadMode, PluginInstance};
+
+    let wasm_src = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let state_dir = tempdir();
+    let source = tempdir();
+    let wasm_in_source = source.path().join("simulated_switch.wasm");
+    std::fs::copy(&wasm_src, &wasm_in_source).expect("copy wasm to source");
+    std::fs::write(
+        source.path().join("manifest.toml"),
+        r#"manifest_version = 1
+[plugin]
+id = "example.race"
+name = "Race"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "simulated_switch.wasm"
+[capabilities]
+declares_devices = ["switch"]
+"#,
+    )
+    .expect("write source manifest");
+
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let first = engine
+        .installed_plugins()
+        .install(source.path())
+        .expect("first install");
+    let stale_uuid = std::sync::Arc::clone(&first.installation_uuid);
+
+    // Simulate the race: uninstall + reinstall between the API's
+    // registry read (which captured `stale_uuid`) and the
+    // loader's own registry read (which will see the fresh uuid).
+    engine.uninstall_plugin("example.race").expect("uninstall");
+    let second = engine
+        .installed_plugins()
+        .install(source.path())
+        .expect("second install");
+    assert_ne!(
+        &*second.installation_uuid, &*stale_uuid,
+        "reinstall should mint a fresh uuid",
+    );
+
+    let Err(err) = PluginInstance::load_with_mode(
+        &engine,
+        &second.path,
+        "race-instance",
+        None,
+        LoadMode::Installed {
+            expected: stale_uuid,
+        },
+    )
+    .await
+    else {
+        panic!("Installed-mode load whose expected uuid rotated must be refused (H11 round-2 F1)");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("identity changed") || msg.contains("H11"),
+        "error should surface the identity rotation; got: {msg}",
+    );
+}
+
 /// Tiny tempdir helper. The integration tests already use
 /// `tokio::fs` indirectly via the loader; using std `tempfile`-style
 /// scratch here keeps the dep surface small.
