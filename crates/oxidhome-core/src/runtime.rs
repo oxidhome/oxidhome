@@ -91,11 +91,17 @@ pub struct Engine {
 /// H2 round-2 F1: shared, lazily-populated map of per-`plugin_id`
 /// async mutexes. Held under an outer sync `Mutex` for the map
 /// itself; the inner `tokio::sync::Mutex` is what callers actually
-/// acquire across `await`. Extracted to a type alias so the
-/// clippy `very_complex_type` lint stops firing on every field-
-/// access site.
-type PluginLifecycleLocks =
-    Arc<std::sync::Mutex<std::collections::HashMap<Arc<str>, Arc<tokio::sync::Mutex<()>>>>>;
+/// acquire across `await`.
+///
+/// H3 round-2 F2: entries are `Weak` so the map doesn't grow
+/// unbounded — every completed lifecycle op drops its `Arc` and
+/// the entry becomes reclaimable. `plugin_lifecycle_lock` prunes
+/// stale entries opportunistically on every call. Bounded growth
+/// even under an attacker pounding start/uninstall for
+/// nonexistent plugin ids.
+type PluginLifecycleLocks = Arc<
+    std::sync::Mutex<std::collections::HashMap<Arc<str>, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+>;
 
 impl Engine {
     /// Build the default engine with an in-memory `SQLite` database.
@@ -371,11 +377,25 @@ impl Engine {
             .plugin_lifecycle_locks
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(lock) = map.get(plugin_id) {
-            return Arc::clone(lock);
+        // Fast path: an in-flight lifecycle op is still holding a
+        // strong reference — hand out another clone of that same
+        // mutex. Weak upgrade returns None if every strong ref has
+        // been dropped, which is the H3 round-2 F2 cue that the
+        // entry is stale and can be replaced.
+        if let Some(weak) = map.get(plugin_id)
+            && let Some(strong) = weak.upgrade()
+        {
+            return strong;
         }
+        // H3 round-2 F2: sweep every dead entry each time we would
+        // otherwise insert. Bounded growth even if callers pound
+        // start/uninstall for nonexistent ids (each finishes,
+        // drops its `Arc`, and the entry becomes reclaimable).
+        // Retain is O(N) in map size; N stays small in practice
+        // because in-flight lifecycle ops are per-plugin and few.
+        map.retain(|_, weak| weak.strong_count() > 0);
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        map.insert(Arc::from(plugin_id), Arc::clone(&lock));
+        map.insert(Arc::from(plugin_id), Arc::downgrade(&lock));
         lock
     }
 
@@ -731,11 +751,12 @@ wasm = "plugin.wasm"
     }
 
     /// H2 round-2 F1: `plugin_lifecycle_lock` returns the same
-    /// `Arc<Mutex>` on repeated calls for the same id, and
-    /// distinct locks for different ids. That's what makes the
-    /// serialization guarantee across the two API paths (JSON +
-    /// Connect) hold: both handlers see the *same* mutex when
-    /// they pass the same `plugin_id`.
+    /// `Arc<Mutex>` on repeated calls for the same id **while a
+    /// strong reference is live**, and distinct locks for
+    /// different ids. That's what makes the serialization
+    /// guarantee across the two API paths (JSON + Connect) hold:
+    /// both handlers see the *same* mutex when they pass the
+    /// same `plugin_id`.
     #[tokio::test(flavor = "current_thread")]
     async fn plugin_lifecycle_locks_are_stable_per_id() {
         let engine = Engine::new().expect("engine");
@@ -744,11 +765,118 @@ wasm = "plugin.wasm"
         let b1 = engine.plugin_lifecycle_lock("example.h2.b");
         assert!(
             Arc::ptr_eq(&a1, &a2),
-            "same plugin_id must return the same mutex",
+            "same plugin_id must return the same mutex \
+             while a strong reference is live",
         );
         assert!(
             !Arc::ptr_eq(&a1, &b1),
             "different plugin_ids must return distinct mutexes",
+        );
+    }
+
+    /// H3 round-2 F2: repeated requests for nonexistent
+    /// `plugin_id`s must NOT grow the lifecycle-lock map without
+    /// bound. Every dropped `Arc` makes its map entry a dead
+    /// `Weak` that the next `plugin_lifecycle_lock` call prunes.
+    /// Under the pre-fix map (strong entries) 10 000 requests
+    /// would retain 10 000 map entries indefinitely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn plugin_lifecycle_lock_map_prunes_dead_entries() {
+        use std::sync::PoisonError;
+        let engine = Engine::new().expect("engine");
+        // Distinct id per call, dropped immediately — no strong
+        // reference lingers. Each subsequent call's prune sees a
+        // dead weak from the previous insertion and clears it.
+        for i in 0..10_000 {
+            let _ = engine.plugin_lifecycle_lock(&format!("example.h3.{i}"));
+        }
+        let map = engine
+            .plugin_lifecycle_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // After the last insert, the map holds exactly one weak
+        // that hasn't been dropped yet (its `Arc` is inside the
+        // `.lock()`'s critical section boundary). Post-sweep,
+        // that one entry is what remains.
+        assert!(
+            map.len() <= 1,
+            "H3 F2 unbounded growth regression: {} map entries after 10k requests",
+            map.len(),
+        );
+    }
+
+    /// H3 round-2 F1: dropping the handler's future (cancellation
+    /// via `AbortHandle`, client disconnect, axum shutdown)
+    /// **must not** release the lifecycle mutex if the actual
+    /// uninstall work is still running on `spawn_blocking`.
+    /// The fix moves an `OwnedMutexGuard` into the blocking
+    /// closure so the guard's Drop lands only when the closure
+    /// returns — cancellation-safe.
+    ///
+    /// This test models the pattern generically without driving
+    /// a full uninstall: a handler-shaped task acquires the
+    /// per-id lock, spawns a blocking task that owns the guard
+    /// and blocks on an mpsc, then the outer task is aborted.
+    /// A concurrent `try_lock` on the same id must still see
+    /// the lock held; releasing the blocking task then makes
+    /// it available.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_handler_owned_guard_still_reserves_lock_across_spawn_blocking() {
+        let engine = Engine::new().expect("engine");
+        let plugin_id = "example.h3.cancel";
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+
+        // Simulate the handler: acquire owned guard, hand it to
+        // spawn_blocking, await the spawn_blocking JoinHandle.
+        let engine_clone = engine.clone();
+        let handler = tokio::spawn(async move {
+            let lock = engine_clone.plugin_lifecycle_lock(plugin_id);
+            let guard = lock.lock_owned().await;
+            let handle = tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            let _ = handle.await;
+        });
+
+        started_rx.await.expect("blocking task started");
+        // Simulate handler cancellation — client disconnect,
+        // server shutdown, etc. `abort()` cancels the outer
+        // future; the detached spawn_blocking closure continues
+        // holding the OwnedMutexGuard until it returns.
+        handler.abort();
+
+        // Give the abort a moment to land + drop the handler's
+        // frame. Absent the F1 fix (borrowed guard), the guard
+        // would drop with the handler and the lock would be free
+        // immediately — the assertion below would fail.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let lock_probe = engine.plugin_lifecycle_lock(plugin_id);
+        assert!(
+            lock_probe.try_lock().is_err(),
+            "H3 F1 cancellation regression: lock was released while \
+             spawn_blocking was still holding the owned guard",
+        );
+
+        // Release the blocking task; the guard drops when the
+        // closure returns and the lock becomes acquirable.
+        release_tx.send(()).expect("send release");
+        // Poll for release rather than sleep-and-hope.
+        let acquired = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if lock_probe.try_lock().is_ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            acquired.is_ok(),
+            "lock must be released once the blocking task's guard drops",
         );
     }
 
