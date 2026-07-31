@@ -26,7 +26,81 @@ use std::sync::Arc;
 
 use oxidhome_manifest::{ConfigValue, InstanceConfig, PluginManifest};
 use wasmtime::component::ResourceTable;
+use wasmtime::{StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+/// C4: per-`Store` wasmtime resource ceilings applied to every plugin
+/// instance. Enforces the "no compute limits equals host-wide `DoS`" fix from
+/// the architecture review by capping what a single plugin's `Store`
+/// can allocate.
+///
+/// Sized generously enough that legitimate plugins (device drivers,
+/// automations, small ML pipelines) run untouched, but low enough
+/// that a runaway allocation is refused at the wasmtime layer with a
+/// trap the supervisor catches, rather than growing the host process
+/// until the OOM killer intervenes. All values are per-plugin-instance
+/// (each `PluginInstance` gets its own `Store` and its own limits
+/// state). No per-manifest override yet — a future extension can
+/// derive these from the granted-capabilities row when operators need
+/// to widen or tighten specific installs.
+///
+/// Linear-memory cap (128 MiB per instance): well above the ~few-MB
+/// working set a typical device driver needs, but small enough that
+/// a hundred concurrent instances stay within the ~few-GB envelope a
+/// hub-class host can sustain.
+pub(crate) const STORE_MAX_MEMORY_BYTES: usize = 128 * 1024 * 1024;
+/// Cap on table entries (indirect-call table for the component's
+/// core modules). 100k is 10× a big libstd program's callsite count;
+/// preserves component tooling headroom while refusing pathological
+/// growth.
+pub(crate) const STORE_MAX_TABLE_ELEMENTS: usize = 100_000;
+/// Max linear memories per store. A component-model instance usually
+/// materializes one linear memory per core module; a plugin declaring
+/// 8 core modules is already an outlier. Anything past this refuses
+/// at instantiate time.
+pub(crate) const STORE_MAX_MEMORIES: usize = 8;
+/// Max tables per store. Same logic as [`STORE_MAX_MEMORIES`] — one
+/// per core module is typical; the cap catches pathological compositions.
+pub(crate) const STORE_MAX_TABLES: usize = 16;
+/// Max sub-instances per store. Component-model instantiation can
+/// create nested instances; this caps the fan-out so a hostile
+/// component can't drive wasmtime into unbounded allocation before
+/// its `start` function even runs.
+pub(crate) const STORE_MAX_INSTANCES: usize = 128;
+
+/// C4: per-instance host-side payload + fan-out ceilings applied
+/// beyond the wasmtime `Store` limits above. Enforce DoS-relevant
+/// caps on things wasmtime doesn't know about (blob writes, event
+/// payload sizes, active subscription count). Refusals surface as
+/// [`WitError::PermissionDenied`] so the plugin sees a clean
+/// capability-shaped error rather than a trap.
+///
+/// `MAX_KV_VALUE_BYTES` — largest value payload the KV `storage::set`
+/// import will accept, on top of the manifest's byte quota. The
+/// per-instance byte quota bounds *total* KV bytes; this cap bounds
+/// a *single* write so a plugin can't spend its entire quota on one
+/// enormous value.
+pub(crate) const MAX_KV_VALUE_BYTES: usize = 64 * 1024;
+/// `MAX_BLOB_WRITE_BYTES` — largest single blob write. Beyond this,
+/// use of the streaming blob API (Phase 8+) is the intended path.
+/// 16 MiB comfortably covers snapshot images and short audio clips
+/// while refusing a single-call attempt to fill the disk.
+pub(crate) const MAX_BLOB_WRITE_BYTES: usize = 16 * 1024 * 1024;
+/// `MAX_EVENT_PAYLOAD_BYTES` — largest serialized `publish-event`
+/// payload. Bounds the per-event copy fanned out to every subscriber
+/// (already `Arc`'d after C2e P1, but the byte total still gates
+/// per-subscriber slot occupancy). 64 KiB covers state deltas and
+/// button events by orders of magnitude.
+pub(crate) const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
+/// `MAX_SUBSCRIPTIONS_PER_INSTANCE` — hard cap on live subscriptions
+/// one plugin instance can hold at once. Distinct from the bus-side
+/// `SOFT_SUBSCRIBER_CAP` (soft, warn-only, across all subscribers)
+/// because a *per-instance* cap is what stops one buggy plugin from
+/// registering thousands of overlapping filters and pinning the
+/// filter-eval loop in `EventBus::publish`. Sized to comfortably
+/// exceed a real driver's needs — a few dozen device-scoped filters,
+/// plus a handful of topic filters.
+pub(crate) const MAX_SUBSCRIPTIONS_PER_INSTANCE: usize = 64;
 
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::{
@@ -151,6 +225,14 @@ pub struct PluginState {
     /// serve loop (retrieved through
     /// [`crate::PluginInstance::wake`]).
     pub wake: Arc<tokio::sync::Notify>,
+    /// C4 — wasmtime resource ceilings for this instance's `Store`.
+    /// Populated in [`Self::new`] from the module-level `STORE_MAX_*`
+    /// constants and installed via `store.limiter(|s| &mut s.limits)`
+    /// in the loader. A plugin whose linear-memory / table / instance
+    /// growth would breach a cap traps at wasmtime's allocation path;
+    /// the supervisor catches the trap and applies the manifest's
+    /// restart policy.
+    pub limits: StoreLimits,
 }
 
 impl PluginState {
@@ -183,6 +265,17 @@ impl PluginState {
         // `Self::with_granted_capabilities` when a live install
         // row is present.
         let granted_capabilities = Arc::new(manifest.capabilities.clone());
+        // C4: build the wasmtime `StoreLimits` from the module-level
+        // ceilings. Every plugin instance gets the same shape today;
+        // per-manifest overrides can layer on later without changing
+        // the wiring here.
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(STORE_MAX_MEMORY_BYTES)
+            .table_elements(STORE_MAX_TABLE_ELEMENTS)
+            .memories(STORE_MAX_MEMORIES)
+            .tables(STORE_MAX_TABLES)
+            .instances(STORE_MAX_INSTANCES)
+            .build();
         Self {
             instance_id: instance_id.into(),
             installation_uuid: installation_uuid.into(),
@@ -201,6 +294,7 @@ impl PluginState {
             actor,
             config,
             wake: Arc::new(tokio::sync::Notify::new()),
+            limits,
         }
     }
 
@@ -587,6 +681,26 @@ fn require_publish_authorized(
 
 impl host_events::Host for PluginState {
     async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
+        // C4: refuse over-sized payloads before any capability /
+        // ownership work runs. Bounds the per-event copy fanned out
+        // to every subscriber (each an `Arc` after C2e P1, but the
+        // byte total still gates per-subscriber slot occupancy) and
+        // the durable log-write.
+        let payload_bytes = event_payload_size(&ev);
+        if payload_bytes > MAX_EVENT_PAYLOAD_BYTES {
+            tracing::warn!(
+                target: "host.events",
+                instance_id = %self.instance_id,
+                payload_bytes,
+                max = MAX_EVENT_PAYLOAD_BYTES,
+                "publish-event refused: payload exceeds C4 per-event byte cap",
+            );
+            return Err(WitError::PermissionDenied(format!(
+                "publish-event payload {payload_bytes} bytes exceeds per-event cap \
+                 ({MAX_EVENT_PAYLOAD_BYTES} bytes)"
+            )));
+        }
+
         // Architecture-review C2 — three gates before the event
         // reaches the bus:
         //
@@ -711,6 +825,26 @@ impl host_events::Host for PluginState {
                     .into(),
             ));
         }
+        // C4: per-instance subscription cap. Complements the bus-side
+        // `SOFT_SUBSCRIBER_CAP` (soft, cross-subscriber): this is the
+        // *hard* per-instance cap that stops one buggy plugin from
+        // registering thousands of overlapping filters and pinning
+        // the filter-eval loop in `EventBus::publish`.
+        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_INSTANCE {
+            tracing::warn!(
+                target: "host.events",
+                instance_id = %self.instance_id,
+                held = self.subscriptions.len(),
+                max = MAX_SUBSCRIPTIONS_PER_INSTANCE,
+                "subscribe refused: per-instance C4 subscription cap reached",
+            );
+            return Err(WitError::PermissionDenied(format!(
+                "subscribe refused: plugin instance already holds \
+                 {} subscriptions (cap {MAX_SUBSCRIPTIONS_PER_INSTANCE}); \
+                 unsubscribe unused filters or narrow existing ones",
+                self.subscriptions.len(),
+            )));
+        }
         // C2d: register this subscription's filter on the bus with
         // our per-instance wake `Notify`. Publishes whose payload
         // matches the filter signal the notify — the supervisor's
@@ -815,6 +949,55 @@ fn config_value_to_wit(v: &ConfigValue) -> Option<WitValue> {
     }
 }
 
+// ── C4 payload sizing helpers ───────────────────────────────────────
+//
+// Cheap conservative byte counts used by the per-call payload caps
+// above. The intent is "reject obviously oversized calls before we
+// spend a `spawn_blocking` thread or a SQLite write on them" — a
+// precise on-wire size isn't necessary; a lower bound that grows
+// linearly with the payload is enough. For structured variants we
+// use the biggest fixed-width representation (`i64` → 8, `f64` → 8,
+// `bool` → 1). For dynamically-sized variants (`string`, `bytes`,
+// `json`) we count the payload bytes directly.
+
+fn wit_value_size(v: &WitValue) -> usize {
+    match v {
+        WitValue::BoolVal(_) => 1,
+        WitValue::IntVal(_) | WitValue::FloatVal(_) => 8,
+        WitValue::StringVal(s) | WitValue::JsonVal(s) => s.len(),
+        WitValue::BytesVal(b) => b.len(),
+    }
+}
+
+/// Conservative lower bound on the serialized event size. Counts the
+/// device id (if present), the origin identifiers (host-stamped, so
+/// bounded but still real bytes), and the payload variant. Precise
+/// on-wire size would require a serialize pass; this is enough to
+/// reject obviously-oversized events before we hit
+/// [`EventLog::record`] or `EventBus::publish`.
+fn event_payload_size(ev: &Event) -> usize {
+    let mut bytes = ev.origin_instance_id.len()
+        + ev.origin_plugin_id.len()
+        + ev.device.as_ref().map_or(0, String::len)
+        + 24; // fixed overhead: timestamps + variant tag.
+    match &ev.payload {
+        EventPayload::StateChanged(sc) => {
+            bytes += sc.capability.len();
+            for kv in &sc.fields {
+                bytes += kv.key.len() + wit_value_size(&kv.value);
+            }
+        }
+        EventPayload::Button(_) => bytes += 16,
+        EventPayload::Inference(inf) => {
+            bytes += inf.model.len() + inf.payload.len();
+        }
+        EventPayload::Custom(c) => {
+            bytes += c.topic.len() + c.payload.len();
+        }
+    }
+    bytes
+}
+
 // ── Storage ─────────────────────────────────────────────────────────
 //
 // Phase 5a backs the WIT `storage` interface with the SQLite-based
@@ -897,6 +1080,24 @@ impl storage::Host for PluginState {
 
     async fn set(&mut self, key: String, val: WitValue) -> Result<(), WitError> {
         require_storage_enabled(self)?;
+        // C4: per-write value size cap. The KV byte quota bounds
+        // *total* storage; this cap bounds a *single* write so a
+        // plugin can't spend its entire quota on one enormous value.
+        let value_bytes = wit_value_size(&val);
+        if value_bytes > MAX_KV_VALUE_BYTES {
+            tracing::warn!(
+                target: "host.storage",
+                instance_id = %self.instance_id,
+                key = %key,
+                value_bytes,
+                max = MAX_KV_VALUE_BYTES,
+                "storage.set refused: value exceeds C4 per-write byte cap",
+            );
+            return Err(WitError::PermissionDenied(format!(
+                "storage.set value ({value_bytes} bytes) exceeds per-write cap \
+                 ({MAX_KV_VALUE_BYTES} bytes); split into smaller values or use blob-store"
+            )));
+        }
         let kv = Arc::clone(&self.kv);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
@@ -1019,6 +1220,28 @@ impl blob_store::Host for PluginState {
         mime: Option<String>,
     ) -> Result<String, WitError> {
         require_blobs_enabled(self)?;
+        // C4: per-call blob write cap. The manifest's `blob_quota_mb`
+        // still bounds cumulative storage; this cap bounds a single
+        // write so a plugin can't consume its whole quota — or a
+        // whole free-disk slice — with one call. Streaming blob
+        // uploads (Phase 8+) are the intended path for anything
+        // larger.
+        if data.len() > MAX_BLOB_WRITE_BYTES {
+            tracing::warn!(
+                target: "host.blob_store",
+                instance_id = %self.instance_id,
+                name = %name,
+                bytes = data.len(),
+                max = MAX_BLOB_WRITE_BYTES,
+                "blob_store.write refused: payload exceeds C4 per-call byte cap",
+            );
+            return Err(WitError::PermissionDenied(format!(
+                "blob_store.write payload ({} bytes) exceeds per-call cap \
+                 ({MAX_BLOB_WRITE_BYTES} bytes); split the write or use \
+                 the streaming blob API when it lands",
+                data.len(),
+            )));
+        }
         let blobs = Arc::clone(&self.blobs);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
@@ -2274,5 +2497,116 @@ mod tests {
         ] {
             logging::Host::log(&mut state, level, format!("msg-{level:?}")).await;
         }
+    }
+
+    // ─── C4 ceilings ─────────────────────────────────────────────
+
+    /// C4: `storage.set` refuses a single value larger than
+    /// `MAX_KV_VALUE_BYTES` with `PermissionDenied`, regardless of
+    /// remaining quota. Protects against a plugin spending its
+    /// whole KV budget on one enormous entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn c4_storage_set_refuses_oversized_value() {
+        // Plenty of quota so the refusal is the per-write cap,
+        // not the manifest byte quota.
+        let mut state = fresh_state_with_storage("alpha", 1024);
+        let oversized = "x".repeat(MAX_KV_VALUE_BYTES + 1);
+        let err = storage::Host::set(&mut state, "k".into(), WitValue::StringVal(oversized))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref m) if m.contains("per-write cap")),
+            "expected PermissionDenied with per-write cap message, got {err:?}",
+        );
+        // Below-cap write still succeeds.
+        storage::Host::set(&mut state, "k".into(), WitValue::StringVal("small".into()))
+            .await
+            .expect("under-cap set");
+    }
+
+    /// C4: `host-events.subscribe` refuses past
+    /// `MAX_SUBSCRIPTIONS_PER_INSTANCE`. Complements the bus-side
+    /// soft cap — this is the *hard* per-instance limit that stops
+    /// one buggy plugin from pinning the filter-eval loop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn c4_subscribe_refuses_past_per_instance_cap() {
+        use oxidhome_manifest::CapabilitiesSection;
+        let mut manifest = (*fixture_manifest("test.fixture")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            subscribes_events: true,
+            ..manifest.capabilities
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            "test.fixture",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
+            fresh_event_log(),
+            fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
+        );
+        // Explicitly grant subscribes_events (default `new` copies
+        // manifest.capabilities, so this already carries the flag).
+        for _ in 0..MAX_SUBSCRIPTIONS_PER_INSTANCE {
+            host_events::Host::subscribe(
+                &mut state,
+                EventFilter {
+                    device: None,
+                    topic: None,
+                },
+            )
+            .await
+            .expect("under-cap subscribe");
+        }
+        // The next subscribe is at the cap.
+        let err = host_events::Host::subscribe(
+            &mut state,
+            EventFilter {
+                device: None,
+                topic: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref m) if m.contains("subscribe refused")),
+            "expected PermissionDenied with per-instance cap refusal, got {err:?}",
+        );
+    }
+
+    /// C4: `host-events.publish-event` refuses an event whose
+    /// serialized payload exceeds `MAX_EVENT_PAYLOAD_BYTES`. The
+    /// refusal fires *before* the durable-log write or the bus
+    /// fan-out, so a flooder can't spend disk/broadcast budget on
+    /// oversized payloads.
+    #[tokio::test(flavor = "current_thread")]
+    async fn c4_publish_event_refuses_oversized_payload() {
+        let mut state = fresh_state("alpha");
+        // A custom-event with a giant JSON payload string.
+        let big = "y".repeat(MAX_EVENT_PAYLOAD_BYTES + 1);
+        let ev = Event {
+            device: None,
+            timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
+            payload: EventPayload::Custom(
+                crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
+                    topic: "test".into(),
+                    payload: big,
+                },
+            ),
+        };
+        let err = host_events::Host::publish_event(&mut state, ev)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref m) if m.contains("per-event cap")),
+            "expected PermissionDenied with per-event cap message, got {err:?}",
+        );
     }
 }

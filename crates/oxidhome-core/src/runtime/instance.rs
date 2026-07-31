@@ -676,6 +676,13 @@ impl PluginInstance {
         )
         .with_granted_capabilities(granted_capabilities);
         let mut store = Store::new(engine.raw(), state);
+        // C4: install the wasmtime resource limiter so linear-memory
+        // grows / table extensions / additional instance/memory/table
+        // allocations past the module-level ceilings trap at
+        // wasmtime's allocation path. The trap surfaces through the
+        // supervisor's normal on-trap policy; a `Failed` state is
+        // strictly better than an OOM-killed host process.
+        store.limiter(|s| &mut s.limits);
         // Phase 7a — `epoch_interruption(true)` starts every store at
         // deadline 0 (already elapsed), which would trap any wasm the
         // component instantiator runs (core-module `start` / component
