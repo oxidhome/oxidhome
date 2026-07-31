@@ -104,6 +104,12 @@ async fn main() -> anyhow::Result<()> {
     // 12-API-f install endpoints. The handle is held in scope so
     // the supervised task isn't dropped; we don't otherwise act
     // on it from main.
+    //
+    // H11 round-2 F1: argv-driven start is an explicit dev-time
+    // load. `LoadMode::Dev` makes that intent visible at the API
+    // boundary; the loader will fail hard if the caller-supplied
+    // dir happens to shadow an installed `plugin_id` at a
+    // different path.
     let _plugin_handle = if let Some(plugin_dir) = std::env::args_os().nth(1) {
         let plugin_dir = PathBuf::from(plugin_dir);
         let instance_id = plugin_dir

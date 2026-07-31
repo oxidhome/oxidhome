@@ -20,7 +20,7 @@ mod registry;
 mod state;
 pub(crate) mod watchdog;
 
-pub use instance::{InitError, PluginInstance};
+pub use instance::{InitError, LoadMode, PluginInstance};
 pub use lifecycle::{
     InstanceHandle, InstanceState, SupervisorTuning, supervise, supervise_with_tuning,
 };
@@ -487,6 +487,41 @@ impl Engine {
             plugin_dir,
             instance_id,
             overrides,
+            LoadMode::Dev,
+            SupervisorTuning::default(),
+        )
+        .await
+    }
+
+    /// H11 round-2 F1: production start under a specific installed
+    /// package's identity. The API's `POST /api/v1/plugins/{id}/start`
+    /// handler (both JSON and Connect) resolves the
+    /// [`InstalledPluginRegistry`] row under the lifecycle lock and
+    /// passes its `installation_uuid` here; the loader fails
+    /// closed if the registry row named by that uuid isn't live
+    /// anymore (concurrent uninstall race). Never falls back to
+    /// synthetic identity + manifest-requested capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Self::start_instance`]; additionally the
+    /// loader returns `anyhow::Error` when the registry row doesn't
+    /// match the expected uuid or its stored path doesn't cover
+    /// the loaded wasm.
+    pub async fn start_installed_instance(
+        &self,
+        plugin_dir: impl Into<PathBuf>,
+        instance_id: impl Into<String>,
+        overrides: Option<toml::Value>,
+        expected_installation_uuid: Arc<str>,
+    ) -> anyhow::Result<InstanceHandle> {
+        self.start_instance_with_tuning(
+            plugin_dir,
+            instance_id,
+            overrides,
+            LoadMode::Installed {
+                expected: expected_installation_uuid,
+            },
             SupervisorTuning::default(),
         )
         .await
@@ -501,6 +536,7 @@ impl Engine {
         plugin_dir: impl Into<PathBuf>,
         instance_id: impl Into<String>,
         overrides: Option<toml::Value>,
+        mode: LoadMode,
         tuning: SupervisorTuning,
     ) -> anyhow::Result<InstanceHandle> {
         let plugin_dir = plugin_dir.into();
@@ -530,12 +566,13 @@ impl Engine {
         let instance_id_for_reaper = instance_id.clone();
         self.instances
             .register(instance_id, plugin_id, singleton, || {
-                let handle = supervise_with_tuning(
+                let handle = crate::runtime::lifecycle::supervise_with_tuning_and_mode(
                     engine_for_spawn,
                     plugin_dir_for_spawn,
                     instance_id_for_spawn,
                     plugin_id_for_spawn,
                     overrides,
+                    mode,
                     tuning,
                 );
                 let reaper_handle = handle.clone();

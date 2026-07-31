@@ -702,12 +702,21 @@ async fn start_plugin_instance(
         .installed_plugins()
         .get(&plugin_id)
         .ok_or(PluginLifecycleError::NotFound)?;
-    // `start_instance` is itself async and supervises in the
-    // background; we await its initial Running transition so the
-    // API response reflects the reach-Running outcome.
+    // H11 round-2 F1: `start_installed_instance` pins the
+    // load-time identity to the `installation_uuid` observed under
+    // the lifecycle lock. The loader fails closed if the registry
+    // row named by that uuid disappears between now and the
+    // supervisor's re-read (concurrent uninstall race) — never
+    // falls back to synthetic identity + manifest-requested
+    // capabilities.
     let handle = state
         .engine
-        .start_instance(installed.path.clone(), &instance_id, body.config_overrides)
+        .start_installed_instance(
+            installed.path.clone(),
+            &instance_id,
+            body.config_overrides,
+            std::sync::Arc::clone(&installed.installation_uuid),
+        )
         .await
         .map_err(PluginLifecycleError::Start)?;
     handle

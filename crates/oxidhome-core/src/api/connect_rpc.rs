@@ -573,15 +573,26 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
                 }
             },
         };
+        // H11 round-2 F1: `start_installed_instance` pins the
+        // load-time identity to the `installation_uuid` observed
+        // under the lifecycle lock so the loader refuses to fall
+        // back to synthetic-identity + manifest-requested caps
+        // if the registry row disappears between here and the
+        // supervisor's re-read.
         let handle = self
             .engine
-            .start_instance(installed.path.clone(), &instance_id, overrides)
+            .start_installed_instance(
+                installed.path.clone(),
+                &instance_id,
+                overrides,
+                std::sync::Arc::clone(&installed.installation_uuid),
+            )
             .await
             .map_err(|err| {
-                tracing::error!(target: "api.plugins", error = %err, "start_instance failed");
+                tracing::error!(target: "api.plugins", error = %err, "start_installed_instance failed");
                 rpc_err(
                     &ctx,
-                    ConnectError::internal(format!("start_instance failed: {err}")),
+                    ConnectError::internal(format!("start_installed_instance failed: {err}")),
                 )
             })?;
         handle.wait_for_running().await.map_err(|err| {

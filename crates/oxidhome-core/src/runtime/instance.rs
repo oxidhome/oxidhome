@@ -35,12 +35,14 @@ use super::watchdog;
 /// via `[runtime].wasm`. Canonicalizing defeats `..`, symlinks,
 /// and non-normalized relative segments.
 ///
-/// A mismatch means the caller loaded a different .wasm whose
-/// manifest just happens to declare the installed plugin id
-/// (dev-time argv load, replacement component, test fixture). In
-/// that case the loader falls back to a synthetic UUID, so device
-/// ids for the loaded component can't collide with the installed
-/// package's device ids.
+/// Follow-up review H11 hardened the mismatch handling: production
+/// (`LoadMode::Installed`) loads whose registry row's path doesn't
+/// cover the loaded wasm are refused outright — no synthetic-UUID
+/// fallback, because that path silently let a rogue .wasm run under
+/// the same `plugin_id` as an installed package. Dev loads
+/// (`LoadMode::Dev`) whose registry-row path mismatches are refused
+/// too (H11 first cut), so a dev-time argv load can't shadow an
+/// installed package's identity either.
 fn loaded_dir_matches_registry(wasm_path: &Path, registry_path: &Path) -> bool {
     let Ok(loaded) = std::fs::canonicalize(wasm_path) else {
         return false;
@@ -104,6 +106,44 @@ pub struct PluginInstance {
     watchdog: std::time::Duration,
 }
 
+/// H11 round-2 F1: caller-declared load provenance. Passed through
+/// [`Engine::start_instance`] / [`PluginInstance::load`] all the way
+/// to `instantiate`, so the loader can distinguish an API-driven
+/// production start (which MUST match a live installation ledger
+/// row) from an explicit dev-time load (which may inherit a
+/// synthetic identity + manifest-requested capabilities).
+///
+/// Registry absence was previously treated as authorization for a
+/// dev load — under a concurrent uninstall race the reviewer
+/// flagged, that let a fresh instance run with manifest-requested
+/// caps instead of the persisted grant. The mode makes the choice
+/// explicit at every entry point; the loader fails closed for
+/// `Installed` if the ledger row it names disappears.
+#[derive(Debug, Clone)]
+pub enum LoadMode {
+    /// API-driven production load. Loader MUST find a live
+    /// [`crate::state::InstalledPluginRegistry`] row whose
+    /// `installation_uuid` matches `expected` **and** whose
+    /// `path` covers the loaded `wasm_path`. Any deviation
+    /// (registry cleared mid-flight, path renamed, uuid rotated
+    /// by a reinstall) fails the load closed — no silent
+    /// synthetic-identity fallback.
+    Installed { expected: Arc<str> },
+    /// Explicit dev-time load. Loader will:
+    ///
+    /// - Use the installed grant when the registry has a matching
+    ///   row for this `plugin_id` **and** the loaded path covers
+    ///   the registry row's path.
+    /// - Refuse when the registry row exists but the path
+    ///   doesn't match (H11 same-id / different-path).
+    /// - Fall back to synthetic UUID + manifest-requested
+    ///   capabilities when no row exists at all (nothing to
+    ///   shadow). Callers pick this mode by conscious choice —
+    ///   argv-loaded plugins in `main.rs`, integration tests,
+    ///   the `Engine::new()` in-memory harness.
+    Dev,
+}
+
 /// Why a [`PluginInstance::init`] call failed. The supervisor's
 /// `on-trap` restart policy restarts every variant *except*
 /// [`InitError::Plugin`] — a clean plugin-`Err` is a deterministic
@@ -152,8 +192,12 @@ impl PluginInstance {
     }
 
     /// Same as [`Self::load`], but the caller supplies the user
-    /// config-override blob. The host's per-instance config layer
-    /// uses this; tests pass `None` to take all defaults.
+    /// config-override blob. Uses `LoadMode::Dev` — the loader may
+    /// fall back to synthetic identity + manifest-requested caps
+    /// when no installed ledger row claims `manifest.plugin.id`.
+    /// Production (API-driven) loads must go through
+    /// [`Self::load_with_mode`] with `LoadMode::Installed` so
+    /// the loader fails closed on a concurrent uninstall race.
     ///
     /// # Panics
     /// Panics only if the host's `OXIDHOME_SDK_VERSION` /
@@ -165,6 +209,22 @@ impl PluginInstance {
         plugin_dir: &Path,
         instance_id: impl Into<String>,
         overrides: Option<&toml::Value>,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_mode(engine, plugin_dir, instance_id, overrides, LoadMode::Dev).await
+    }
+
+    /// H11 round-2 F1: full-fidelity load with explicit
+    /// [`LoadMode`]. The supervisor routes through this so an
+    /// API-driven start carries `LoadMode::Installed { expected }`
+    /// and the loader refuses to fall back to synthetic identity
+    /// when the ledger row disappears mid-flight.
+    #[doc(hidden)]
+    pub async fn load_with_mode(
+        engine: &Engine,
+        plugin_dir: &Path,
+        instance_id: impl Into<String>,
+        overrides: Option<&toml::Value>,
+        mode: LoadMode,
     ) -> anyhow::Result<Self> {
         let plugin_dir = plugin_dir.to_path_buf();
         let instance_id = instance_id.into();
@@ -275,6 +335,7 @@ impl PluginInstance {
                 instance_id,
                 manifest,
                 config,
+                mode,
             )
             .await
         }
@@ -337,6 +398,7 @@ impl PluginInstance {
             instance_id,
             Arc::new(manifest),
             config,
+            LoadMode::Dev,
         )
         .await
     }
@@ -360,6 +422,7 @@ impl PluginInstance {
         instance_id: impl Into<String>,
         manifest: Arc<PluginManifest>,
         config: InstanceConfig,
+        mode: LoadMode,
     ) -> anyhow::Result<Self> {
         // C5 review F3 round-4 F2: instantiate from the same
         // in-memory wasm bytes the digest check will read, not
@@ -450,73 +513,118 @@ impl PluginInstance {
         let _ = plugin_dir; // retained for future callsites; the
         // digest below already binds to the exact bytes we
         // parsed + will compile.
-        // H2 round-2 F1 belt: if the caller was pointing at a
-        // path *inside* `<state_dir>/plugins/`, this is an
-        // installed load — the registry MUST have a matching
-        // live row. The pre-fix `None` arm below silently fell
-        // back to a synthetic UUID + manifest-requested
-        // capabilities, which under the concurrent-uninstall
-        // race the reviewer flagged let a fresh instance keep
-        // running with capabilities broader than any persisted
-        // grant. Refuse the load instead so the API surfaces
-        // "install disappeared" cleanly and the operator sees
-        // the race.
-        let load_is_from_installed_root = engine
-            .installed_plugins()
-            .plugins_root()
-            .is_some_and(|root| wasm_path.starts_with(root));
-        let (installation_uuid, effective_grant) =
-            match engine.installed_plugins().get(&manifest.plugin.id) {
-                Some(row) if loaded_dir_matches_registry(wasm_path, &row.path) => {
-                    // C5 review F3 round-4 F2: hash the SAME
-                    // in-memory manifest + wasm buffers that
-                    // `Component::from_binary` will compile
-                    // from. Reading files again here would
-                    // reintroduce the TOCTOU window this fix
-                    // exists to close.
-                    let on_disk = crate::state::content_digest(manifest_bytes, wasm_bytes);
-                    if on_disk != *row.content_digest {
-                        return Err(anyhow!(
-                            "content digest mismatch for plugin {} (installed contents \
-                             have been modified since install); reinstall via the API \
-                             to re-issue the grant + digest",
-                            manifest.plugin.id
-                        ));
-                    }
-                    let effective = crate::state::effective_capabilities(
-                        requested,
-                        row.granted_capabilities.as_ref(),
-                    );
-                    (row.installation_uuid, Arc::new(effective))
-                }
-                Some(row) => {
-                    tracing::warn!(
-                        plugin_id = %manifest.plugin.id,
-                        wasm_path = %wasm_path.display(),
-                        registry_path = %row.path.display(),
-                        "loaded plugin dir does not match InstalledPluginRegistry entry; \
-                         using synthetic UUID + manifest-requested capabilities — device ids \
-                         will NOT inherit the installed plugin's identity (dev-time load, or \
-                         replacement component)"
-                    );
-                    (
-                        Arc::<str>::from(manifest.plugin.id.as_str()),
-                        Arc::new(requested.clone()),
-                    )
-                }
-                None if load_is_from_installed_root => {
+        // H11 round-2 F1: pick the identity + grant based on the
+        // caller-declared `LoadMode`. `Installed { expected }` is
+        // API-driven production; the registry row named by
+        // `expected` MUST be live and cover this wasm path.
+        // `Dev` is explicit dev-time load; may fall back to
+        // synthetic identity when no row exists (nothing to
+        // shadow), but still refuses when a row exists at a
+        // different path (H11 first cut).
+        let registry_row = engine.installed_plugins().get(&manifest.plugin.id);
+        let (installation_uuid, effective_grant) = match (&mode, registry_row) {
+            (LoadMode::Installed { expected }, Some(row))
+                if row.installation_uuid == *expected
+                    && loaded_dir_matches_registry(wasm_path, &row.path) =>
+            {
+                // C5 review F3 round-4 F2: hash the SAME
+                // in-memory manifest + wasm buffers that
+                // `Component::from_binary` will compile
+                // from. Reading files again here would
+                // reintroduce the TOCTOU window this fix
+                // exists to close.
+                let on_disk = crate::state::content_digest(manifest_bytes, wasm_bytes);
+                if on_disk != *row.content_digest {
                     return Err(anyhow!(
-                        "installed plugin {} disappeared from the registry between start and \
-                         load (concurrent uninstall race); refusing to fall back to dev \
-                         semantics (H2 round-2 F1)",
+                        "content digest mismatch for plugin {} (installed contents \
+                         have been modified since install); reinstall via the API \
+                         to re-issue the grant + digest",
                         manifest.plugin.id
                     ));
                 }
-                None => (
+                let effective = crate::state::effective_capabilities(
+                    requested,
+                    row.granted_capabilities.as_ref(),
+                );
+                (row.installation_uuid, Arc::new(effective))
+            }
+            (LoadMode::Installed { expected }, Some(row)) => {
+                // A live row exists but doesn't match — either
+                // the uuid rotated (concurrent uninstall +
+                // reinstall between the API's `get()` and this
+                // load) or the on-disk path drifted from the
+                // recorded one. Either way, refuse rather than
+                // silently apply a fresh install's grant to what
+                // the operator started as install `expected`.
+                return Err(anyhow!(
+                    "installed plugin {} identity changed between start and load \
+                     (expected installation `{expected}`, registry now has \
+                     `{live}` at {live_path}); refusing (H11 round-2 F1)",
+                    manifest.plugin.id,
+                    live = row.installation_uuid,
+                    live_path = row.path.display(),
+                ));
+            }
+            (LoadMode::Installed { expected }, None) => {
+                // Registry cleared between the API's `get()` and
+                // the loader's — concurrent uninstall race.
+                // Refuse fail-closed rather than fall back to
+                // synthetic identity + manifest-requested caps.
+                return Err(anyhow!(
+                    "installed plugin {} (installation `{expected}`) disappeared from \
+                     the registry between start and load (concurrent uninstall race); \
+                     refusing to fall back to dev semantics (H11 round-2 F1)",
+                    manifest.plugin.id
+                ));
+            }
+            (LoadMode::Dev, Some(row)) if loaded_dir_matches_registry(wasm_path, &row.path) => {
+                let on_disk = crate::state::content_digest(manifest_bytes, wasm_bytes);
+                if on_disk != *row.content_digest {
+                    return Err(anyhow!(
+                        "content digest mismatch for plugin {} (installed contents \
+                         have been modified since install); reinstall via the API \
+                         to re-issue the grant + digest",
+                        manifest.plugin.id
+                    ));
+                }
+                let effective = crate::state::effective_capabilities(
+                    requested,
+                    row.granted_capabilities.as_ref(),
+                );
+                (row.installation_uuid, Arc::new(effective))
+            }
+            (LoadMode::Dev, Some(row)) => {
+                // Follow-up review H11: dev-time load whose
+                // manifest declares a `plugin_id` that IS
+                // installed but at a different path. Was
+                // previously fallback-to-synthetic; that shadow
+                // let a raw-path load run under manifest-
+                // requested capabilities alongside the installed
+                // package's identity. Refuse. Dev workflows can
+                // uninstall the installation first, or bump the
+                // manifest's `plugin_id` for the load under test.
+                return Err(anyhow!(
+                    "plugin {} is installed at {}, but the loader was pointed at {} — \
+                     dev-time loads must not shadow an installed package (H11). \
+                     Uninstall the installation first (or use a different plugin_id \
+                     in the manifest under test).",
+                    manifest.plugin.id,
+                    row.path.display(),
+                    wasm_path.display(),
+                ));
+            }
+            (LoadMode::Dev, None) => {
+                // Genuine dev load: no installed row claims this
+                // plugin_id. Synthetic identity + manifest-
+                // requested caps. Explicitly opted into via
+                // `LoadMode::Dev` — never inferred from registry
+                // absence.
+                (
                     Arc::<str>::from(manifest.plugin.id.as_str()),
                     Arc::new(requested.clone()),
-                ),
-            };
+                )
+            }
+        };
         let granted_capabilities = effective_grant;
 
         // Reserve a `kv_usage` row for this instance with the
