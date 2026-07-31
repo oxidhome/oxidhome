@@ -432,13 +432,24 @@ pub struct InstalledPluginRegistry {
 #[derive(Debug, Clone)]
 struct QuarantineEntry {
     installation_uuid: Arc<str>,
-    /// C5 round-5 review F1: the FS path is `Some` when scan
-    /// found a matching directory during the tree walk, `None`
-    /// when the SQL row is quarantined but its directory is
-    /// missing / unreadable / has an unsafe id. `uninstall`
-    /// still needs to tombstone the SQL row in the None case
-    /// (identity boundary) so an operator can reinstall.
-    path: Option<PathBuf>,
+    /// C5 round-5 review F1 + H8 review F1: every filesystem
+    /// path scan found for this quarantined `plugin_id`.
+    ///
+    /// - Empty vec = the SQL row is quarantined but no matching
+    ///   directory exists on disk (missing / unreadable / unsafe
+    ///   id). `uninstall` still tombstones the SQL row so the
+    ///   identity boundary clears.
+    /// - One path = ordinary quarantine (single dir, broken
+    ///   grant/digest).
+    /// - Multiple paths = H8 duplicate manifest ids across
+    ///   sibling dirs. Follow-up review flagged that storing
+    ///   only the last-seen path let the OTHER duplicate
+    ///   directory survive uninstall + get backfilled with a
+    ///   fresh UUID on the next scan — the exact H8 reactivation
+    ///   the first cut of this fix was meant to close. Storing
+    ///   every path means `uninstall` yanks all of them in one
+    ///   call, deterministically.
+    paths: Vec<PathBuf>,
 }
 
 impl InstalledPluginRegistry {
@@ -543,7 +554,7 @@ impl InstalledPluginRegistry {
                         Arc::<str>::from(plugin_id.as_str()),
                         QuarantineEntry {
                             installation_uuid: Arc::clone(uuid),
-                            path: None,
+                            paths: Vec::new(),
                         },
                     )
                 })
@@ -559,7 +570,22 @@ impl InstalledPluginRegistry {
         // rows for renamed manifests) or misidentify (a broken
         // manifest gets misattributed to the dir name). See fixup2
         // review F1 / F2.
-        let mut observed_manifest_ids: std::collections::HashSet<String> =
+        // Follow-up review H8: track the first-seen FS path per
+        // manifest id so a second dir declaring the same id can
+        // evict + quarantine both. Without this the second
+        // insertion into `entries` silently overwrites the first;
+        // uninstall then removes only the winning path, and the
+        // loser's leftover dir gets backfilled with a fresh UUID
+        // on restart, silently reactivating an install the
+        // operator thought was gone.
+        let mut observed_manifest_ids: std::collections::HashMap<String, PathBuf> =
+            std::collections::HashMap::new();
+        // Manifest ids seen more than once during this scan.
+        // Every current + future sighting joins the quarantine
+        // instead of being indexed. Cleared by the operator via
+        // an explicit uninstall (or by removing the duplicate
+        // dirs on disk).
+        let mut duplicate_manifest_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         // If any non-staging directory has a manifest we can't
         // parse or that declares an unsafe id, we can't know its
@@ -614,20 +640,20 @@ impl InstalledPluginRegistry {
             // C5 round-6 review F2: if the dir NAME matches a
             // quarantined `plugin_id`, record its path now — even
             // if the manifest read below fails or declares an
-            // unsafe id. Otherwise the pre-populated `path: None`
-            // would let `uninstall` succeed without removing the
-            // FS dir, and the leftover would block a subsequent
-            // `install` with `AlreadyInstalled`. Uses the raw dir
-            // name (not the manifest id) as the match key because
-            // the manifest may be unreadable — the only stable
-            // observation for a broken manifest is the on-disk
-            // name matching the install convention
+            // unsafe id. Otherwise the pre-populated empty
+            // `paths` would let `uninstall` succeed without
+            // removing the FS dir, and the leftover would block a
+            // subsequent `install` with `AlreadyInstalled`. Uses
+            // the raw dir name (not the manifest id) as the match
+            // key because the manifest may be unreadable — the
+            // only stable observation for a broken manifest is
+            // the on-disk name matching the install convention
             // `<plugins_root>/<plugin_id>/`.
             if !dir_name.is_empty()
                 && let Some(entry) = quarantined_registry.get_mut(dir_name)
-                && entry.path.is_none()
+                && !entry.paths.contains(&path)
             {
-                entry.path = Some(path.clone());
+                entry.paths.push(path.clone());
             }
             let manifest_path = path.join("manifest.toml");
             let manifest = match read_manifest_sync(&manifest_path) {
@@ -678,12 +704,95 @@ impl InstalledPluginRegistry {
                     "installed dir name disagrees with manifest plugin.id; indexing by manifest id",
                 );
             }
-            // Record the authoritative manifest id (not the dir
-            // name — they can legitimately differ; see the warn
-            // above). The orphan-live-row sweep uses this set to
-            // decide which live SQL rows still have a matching
-            // dir on disk.
-            observed_manifest_ids.insert(manifest_id.clone());
+            // Follow-up review H8: reject/quarantine duplicate
+            // manifest ids. If we've already seen a dir declaring
+            // this `plugin_id`, both dirs are ambiguous — the
+            // pre-fix behavior silently overwrote the first with
+            // the second in `entries`, so uninstall removed only
+            // the winning path and the loser's leftover dir got
+            // backfilled with a fresh UUID on the next scan.
+            // Neither dir is safe to index; quarantine both
+            // (evict any prior entry, add both to
+            // `quarantined_registry`), remember the id so any
+            // third+ sighting also quarantines.
+            //
+            // We reuse the existing quarantine slot even though
+            // there's no live SQL row per se — `is_quarantined`
+            // + the API's `uninstall` handle the path-only case
+            // fine, and the API's `install` still refuses via
+            // `dest.exists()`. Operator resolves by removing the
+            // duplicate dir(s) via `uninstall` (each call yanks
+            // one path).
+            if duplicate_manifest_ids.contains(&manifest_id)
+                || observed_manifest_ids.contains_key(&manifest_id)
+            {
+                // First time we see the second-sighting: evict
+                // the winner from `entries` if we've already
+                // indexed one, add the winner's path to
+                // quarantined.
+                if !duplicate_manifest_ids.contains(&manifest_id) {
+                    duplicate_manifest_ids.insert(manifest_id.clone());
+                    let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
+                    let prior_uuid = entries
+                        .remove(&id_arc)
+                        .map(|e| e.installation_uuid)
+                        .or_else(|| {
+                            live_rows
+                                .get(&manifest_id)
+                                .map(|l| Arc::clone(&l.installation_uuid))
+                        })
+                        .unwrap_or_else(|| Arc::from("dup-unknown"));
+                    if let Some(prior_path) = observed_manifest_ids.get(&manifest_id) {
+                        tracing::error!(
+                            plugin_id = %manifest_id,
+                            first_path = %prior_path.display(),
+                            "duplicate manifest.plugin.id on scan — quarantining first-seen dir",
+                        );
+                        quarantined_registry.insert(
+                            Arc::clone(&id_arc),
+                            QuarantineEntry {
+                                installation_uuid: Arc::clone(&prior_uuid),
+                                paths: vec![prior_path.clone()],
+                            },
+                        );
+                    }
+                }
+                tracing::error!(
+                    plugin_id = %manifest_id,
+                    path = %path.display(),
+                    "duplicate manifest.plugin.id on scan — quarantining this dir too (operator must resolve)",
+                );
+                // H8 round-2 F1: APPEND (not overwrite) so
+                // `uninstall` yanks every duplicate dir in one
+                // call. The pre-fix shape overwrote `path`, which
+                // left the first dir on disk after uninstall —
+                // next scan then saw it as unique + backfilled a
+                // fresh UUID, reactivating the exact H8 scenario.
+                let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
+                match quarantined_registry.get_mut(&id_arc) {
+                    Some(entry) => {
+                        if !entry.paths.contains(&path) {
+                            entry.paths.push(path.clone());
+                        }
+                    }
+                    None => {
+                        quarantined_registry.insert(
+                            id_arc,
+                            QuarantineEntry {
+                                installation_uuid: Arc::from("dup-unknown"),
+                                paths: vec![path.clone()],
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+            // Record the authoritative manifest id AND its FS
+            // path — the path enables the duplicate-detection
+            // eviction above. The orphan-live-row sweep uses
+            // just the id set (via `.keys()`) to decide which
+            // live SQL rows still have a matching dir on disk.
+            observed_manifest_ids.insert(manifest_id.clone(), path.clone());
             // C5 review F1: quarantine any installation whose
             // grant JSON is malformed. Skip indexing so
             // `start_instance` can't launch the plugin under an
@@ -714,7 +823,7 @@ impl InstalledPluginRegistry {
                     Arc::from(manifest_id.as_str()),
                     QuarantineEntry {
                         installation_uuid: Arc::clone(uuid),
-                        path: Some(path.clone()),
+                        paths: vec![path.clone()],
                     },
                 );
                 continue;
@@ -809,7 +918,12 @@ impl InstalledPluginRegistry {
             );
         } else {
             for (plugin_id, live) in &live_rows {
-                if !observed_manifest_ids.contains(plugin_id.as_str()) {
+                // A quarantined-as-duplicate id is still
+                // "observed on disk" for the orphan sweep —
+                // we don't want to also tombstone its live row.
+                if !observed_manifest_ids.contains_key(plugin_id.as_str())
+                    && !duplicate_manifest_ids.contains(plugin_id.as_str())
+                {
                     let uuid = &live.installation_uuid;
                     match tombstone_installation_row(&db, uuid) {
                         Ok(()) => tracing::warn!(
@@ -1111,52 +1225,59 @@ impl InstalledPluginRegistry {
         // C5-with-digest can't recover an existing installation
         // without hand-editing `SQLite`. Resolve via the
         // quarantined map when entries misses.
-        let (installation_uuid, dest, was_quarantined) = if let Some(entry) = entries.get(plugin_id)
-        {
-            (
-                Arc::clone(&entry.installation_uuid),
-                Some(entry.path.clone()),
-                false,
-            )
-        } else if let Some(q) = self
-            .quarantined
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(plugin_id)
-        {
-            (Arc::clone(&q.installation_uuid), q.path.clone(), true)
-        } else {
-            return Err(UninstallError::NotInstalled(plugin_id.to_string()));
-        };
-        // **Path safety: use the stored path, not a recomputed
+        let (installation_uuid, dests, was_quarantined) =
+            if let Some(entry) = entries.get(plugin_id) {
+                (
+                    Arc::clone(&entry.installation_uuid),
+                    vec![entry.path.clone()],
+                    false,
+                )
+            } else if let Some(q) = self
+                .quarantined
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(plugin_id)
+            {
+                (Arc::clone(&q.installation_uuid), q.paths.clone(), true)
+            } else {
+                return Err(UninstallError::NotInstalled(plugin_id.to_string()));
+            };
+        // **Path safety: use the stored paths, not a recomputed
         // `plugins_root.join(plugin_id)`.** `install` validates ids
         // before they enter the registry, and `scan` skips
-        // unsafe ones — but defense in depth, deleting the path
+        // unsafe ones — but defense in depth, deleting only paths
         // we observed and recorded keeps the destructive operation
         // safe-by-construction. Belt + suspenders: re-verify
-        // containment against `plugins_root` before yanking. A
-        // safe id's stored path is always under `plugins_root`;
-        // any divergence is a sign of registry corruption and
-        // we'd rather refuse than `remove_dir_all` outside it.
+        // containment against `plugins_root` for every entry
+        // before yanking any. A safe id's stored path is always
+        // under `plugins_root`; any divergence is a sign of
+        // registry corruption and we'd rather refuse than
+        // `remove_dir_all` outside it.
         //
-        // C5 round-5 F1: `dest` is `None` when the caller is
+        // C5 round-5 F1: empty `dests` when the caller is
         // uninstalling a quarantined row whose FS dir went
         // missing between install and this call. Tombstone the
         // SQL row anyway so the identity boundary is cleared;
         // no FS operation runs.
-        if let Some(dest) = &dest
-            && !dest.starts_with(plugins_root)
-        {
-            tracing::error!(
-                plugin_id = %plugin_id,
-                path = %dest.display(),
-                root = %plugins_root.display(),
-                "uninstall refused: registry path escapes plugins root",
-            );
-            // Treat as "not installed" from the caller's POV —
-            // the on-disk state is inconsistent and we won't act
-            // on it. Operator must clean up manually.
-            return Err(UninstallError::NotInstalled(plugin_id.to_string()));
+        //
+        // H8 round-2 F1: `dests` carries every duplicate dir for
+        // a quarantined id — the loop below yanks all of them in
+        // one call, so the reviewer's "second uninstall returns
+        // NotInstalled" reactivation is closed.
+        for dest in &dests {
+            if !dest.starts_with(plugins_root) {
+                tracing::error!(
+                    plugin_id = %plugin_id,
+                    path = %dest.display(),
+                    root = %plugins_root.display(),
+                    "uninstall refused: registry path escapes plugins root",
+                );
+                // Treat as "not installed" from the caller's POV
+                // — the on-disk state is inconsistent and we
+                // won't act on it. Operator must clean up
+                // manually.
+                return Err(UninstallError::NotInstalled(plugin_id.to_string()));
+            }
         }
         // C1b review F2: FS remove first, SQL tombstone second.
         //
@@ -1175,10 +1296,10 @@ impl InstalledPluginRegistry {
         // SQL row without a dir) — scan warns; a maintenance tool
         // can hard-tombstone. Identity still does not rotate on
         // the historical audit trail.
-        if let Some(dest) = &dest
-            && dest.exists()
-        {
-            std::fs::remove_dir_all(dest)?;
+        for dest in &dests {
+            if dest.exists() {
+                std::fs::remove_dir_all(dest)?;
+            }
         }
         if let Some(db) = &self.db {
             tombstone_installation_row(db, &installation_uuid)?;
@@ -1193,7 +1314,7 @@ impl InstalledPluginRegistry {
         }
         tracing::info!(
             plugin_id = %plugin_id,
-            path = ?dest,
+            paths = ?dests,
             was_quarantined,
             "plugin uninstalled",
         );
@@ -1919,6 +2040,92 @@ wasm = "plugin.wasm"
     }
 
     /// C5 round-6 review F1: a quarantined SQL row whose FS dir
+    /// went missing (or has no FS entry at all) must still show
+    /// up in `is_quarantined()` — otherwise a raw-path CLI load
+    /// Follow-up review H8: two dirs whose manifests declare the
+    /// same `plugin_id` must both be quarantined. Pre-fix the
+    /// second insertion into `entries` silently overwrote the
+    /// first, uninstall removed only the winning path, and the
+    /// loser's leftover dir got backfilled with a fresh UUID on
+    /// the next scan — silently reactivating an install the
+    /// operator saw removed.
+    #[test]
+    fn scan_quarantines_duplicate_manifest_ids() {
+        let root = tempdir("duplicate-manifest-ids");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+
+        // Two dirs, each with manifest.plugin.id = "example.dup".
+        // The second dir's name differs from its manifest id —
+        // scan tolerates that (see `dir_name != manifest_id`
+        // warn), and pre-H8 the two would silently collide in
+        // `entries`.
+        for dir_name in ["example.dup", "aliased-dir"] {
+            let d = plugins_root.join(dir_name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("manifest.toml"),
+                r#"manifest_version = 1
+[plugin]
+id = "example.dup"
+name = "Dup"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+            )
+            .unwrap();
+            std::fs::write(d.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        }
+
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+        assert!(
+            reg.list().is_empty(),
+            "duplicate manifest ids must NOT be indexed as installs",
+        );
+        assert!(
+            reg.is_quarantined("example.dup"),
+            "duplicate manifest ids must be quarantined so raw-path loads refuse",
+        );
+
+        // H8 round-2 F1: a single `uninstall` must yank **every**
+        // duplicate dir, tombstone the SQL row, and clear the
+        // quarantine entry — so a subsequent scan finds no
+        // matching dir at all and can't backfill a fresh UUID
+        // (which was the pre-fix reactivation).
+        reg.uninstall("example.dup").expect("uninstall");
+        for dir_name in ["example.dup", "aliased-dir"] {
+            assert!(
+                !plugins_root.join(dir_name).exists(),
+                "H8 F1 regression: {dir_name} must be removed by a single uninstall",
+            );
+        }
+        assert!(
+            !reg.is_quarantined("example.dup"),
+            "quarantine entry must clear after uninstall of all duplicate paths",
+        );
+
+        // Simulate a restart: fresh scan on the empty plugins
+        // root must NOT resurrect the plugin. Pre-fix, one dir
+        // would have survived the uninstall, appeared as unique,
+        // and gotten backfilled with a fresh UUID.
+        let reg2 = InstalledPluginRegistry::scan(plugins_root.clone(), db).unwrap();
+        assert!(
+            reg2.list().is_empty(),
+            "no dir survived uninstall, so scan must produce no entries",
+        );
+        assert!(
+            !reg2.is_quarantined("example.dup"),
+            "no dir survived uninstall, so quarantine must be clear",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Follow-up review H1: a quarantined SQL row whose FS dir
     /// went missing (or has no FS entry at all) must still show
     /// up in `is_quarantined()` — otherwise a raw-path CLI load
     /// declaring that `plugin_id` would fall through to dev-load
