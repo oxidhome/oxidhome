@@ -426,14 +426,16 @@ impl Engine {
     ///   as `UninstallError::Io` when purge fails — retry is safe
     ///   and idempotent.
     pub fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), crate::state::UninstallError> {
-        // Look up the uuid without tombstoning so we know what to
-        // purge. If the plugin isn't installed (or was previously
-        // uninstalled), `get` returns None and `installed_plugins.
-        // uninstall` produces the correct `NotInstalled` error.
-        let installation_uuid = self
-            .installed_plugins
-            .get(plugin_id)
-            .map(|row| Arc::clone(&row.installation_uuid));
+        // H12 review F1: look up the uuid across *both* live
+        // (`entries`) and quarantined maps. The pre-fix shape
+        // used `get()` which is intentionally None for
+        // quarantined rows so the runtime refuses to launch
+        // them — but `installed_plugins.uninstall(...)` below
+        // still tombstones them, so skipping the purges left
+        // the KV rows + blob dirs permanently stranded under
+        // the tombstoned uuid. `installation_uuid_for` returns
+        // the uuid from either map so the purges always run.
+        let installation_uuid = self.installed_plugins.installation_uuid_for(plugin_id);
         if let Some(uuid) = &installation_uuid {
             self.kv.purge_installation(uuid).map_err(|err| {
                 crate::state::UninstallError::Io(std::io::Error::other(format!(
@@ -1049,6 +1051,107 @@ wasm = "plugin.wasm"
         assert!(
             blobs_root.join("example.dev-load.instance").is_dir(),
             "post-upgrade boots must NOT clobber dev-load blob dirs",
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// H12 review P1: uninstall of a quarantined install must
+    /// still purge KV rows + blob dirs. The reviewer flagged
+    /// that `Engine::uninstall_plugin` used `installed_plugins.
+    /// get()` — which returns None for quarantined rows on
+    /// purpose — so the purges silently skipped and state
+    /// stayed on disk after the tombstone.
+    ///
+    /// The reproducer: install a plugin, seed KV + a blob under
+    /// its uuid, corrupt the SQL row's grant to trip the C5
+    /// fail-closed quarantine on next scan, reopen the engine,
+    /// then uninstall. Post-fix, the KV row + blob dir are
+    /// gone.
+    #[test]
+    fn uninstall_purges_state_even_for_quarantined_install() {
+        use crate::host_impl::plugin::oxidhome::plugin::types::Value as WitValue;
+
+        let base = std::env::temp_dir().join(format!(
+            "oxidhome-h12-quarantine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let state_dir = base.join("state");
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.h12q"
+name = "H12 Quarantine"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+
+        let uuid: Arc<str>;
+        {
+            let engine = Engine::with_state_dir(&state_dir).expect("engine");
+            let installed = engine
+                .installed_plugins()
+                .install(&source)
+                .expect("install");
+            uuid = Arc::clone(&installed.installation_uuid);
+            engine
+                .kv()
+                .register_instance(&uuid, "inst-a", 4096)
+                .expect("register kv");
+            engine
+                .kv()
+                .set(&uuid, "inst-a", "k", WitValue::IntVal(1))
+                .expect("kv set");
+            engine
+                .blobs()
+                .register_instance(&uuid, "inst-a", 4096)
+                .expect("register blobs");
+            engine
+                .blobs()
+                .write(&uuid, "inst-a", "n", b"payload", None)
+                .expect("blob write");
+            // Corrupt the C5 grant JSON so the next scan trips
+            // the fail-closed quarantine path.
+            let db_path = state_dir.join("oxidhome.db");
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE plugin_installation SET granted_capabilities_json = NULL \
+                 WHERE installation_uuid = ?1",
+                rusqlite::params![&*uuid],
+            )
+            .unwrap();
+        }
+
+        // Reopen — scan now quarantines the install (get()
+        // returns None but is_quarantined() returns true).
+        let engine = Engine::with_state_dir(&state_dir).expect("reopen");
+        assert!(engine.installed_plugins().get("example.h12q").is_none());
+        assert!(engine.installed_plugins().is_quarantined("example.h12q"));
+
+        // Pre-fix, this uninstall skipped both purges silently.
+        engine.uninstall_plugin("example.h12q").expect("uninstall");
+
+        assert!(
+            engine.kv().usage(&uuid, "inst-a").expect("usage").is_none(),
+            "H12 F1 regression: KV must be purged for quarantined installs",
+        );
+        let blob_dir = state_dir.join("blobs").join(&*uuid);
+        assert!(
+            !blob_dir.exists(),
+            "H12 F1 regression: blob dir must be purged for quarantined installs",
         );
 
         std::fs::remove_dir_all(&base).ok();
