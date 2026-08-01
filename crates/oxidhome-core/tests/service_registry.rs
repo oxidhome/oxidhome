@@ -138,9 +138,17 @@ async fn remove_by_owner_scopes_to_one_instance() {
         metadata: Vec::new(),
         commands: Vec::new(),
     };
-    let _a1 = reg.register("alpha".into(), info("counter-a1"));
-    let _a2 = reg.register("alpha".into(), info("counter-a2"));
-    let _b1 = reg.register("beta".into(), info("counter-b1"));
+    let _a1 = reg.register(
+        "alpha".into(),
+        "com.example.alpha".into(),
+        info("counter-a1"),
+    );
+    let _a2 = reg.register(
+        "alpha".into(),
+        "com.example.alpha".into(),
+        info("counter-a2"),
+    );
+    let _b1 = reg.register("beta".into(), "com.example.beta".into(), info("counter-b1"));
     assert_eq!(reg.list().len(), 3);
 
     let removed = reg.remove_by_owner("alpha");
@@ -155,4 +163,53 @@ async fn remove_by_owner_scopes_to_one_instance() {
 
     // Idempotent — a second sweep finds nothing.
     assert_eq!(reg.remove_by_owner("alpha"), 0);
+}
+
+/// H10: `ServiceRegistry::resolve_by_name` surfaces the current
+/// `svc-N` for a stable `(plugin_id, name)` pair, and the entry
+/// tracks live `plugin.id` — not `owner_instance`. Verifies the
+/// end-to-end wiring from `register-service` → registry so a
+/// caller can persist `(plugin_id, name)` across restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_by_name_returns_registered_service_id() {
+    let _wasm = support::build_example("service-counter", "service_counter.wasm");
+    let plugin_dir = support::workspace_root()
+        .join("examples")
+        .join("service-counter");
+    let engine = Engine::new().expect("engine");
+
+    let mut instance = PluginInstance::load(&engine, &plugin_dir, "service_counter")
+        .await
+        .expect("load");
+    instance.init().await.expect("init registers the service");
+
+    // The counter's manifest declares plugin.id = "example.service-counter"
+    // (per `examples/service-counter/manifest.toml`) and service name
+    // "counter".
+    let resolved = engine
+        .services()
+        .resolve_by_name("example.service-counter", "counter")
+        .expect("resolve_by_name should find the registered service");
+    let listed = engine.services().list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        resolved, listed[0].id,
+        "resolve_by_name must return the current svc-N",
+    );
+
+    // Wrong plugin_id / wrong name → None.
+    assert_eq!(
+        engine
+            .services()
+            .resolve_by_name("example.does-not-exist", "counter"),
+        None,
+    );
+    assert_eq!(
+        engine
+            .services()
+            .resolve_by_name("example.service-counter", "nope"),
+        None,
+    );
+
+    instance.shutdown().await.expect("shutdown");
 }

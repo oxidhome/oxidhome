@@ -50,10 +50,15 @@
 //!    channel close).
 //!
 //! **Instance granularity, not service**: same-instance peer services
-//! (e.g. two scripts inside a scripting plugin) must use the plugin's
-//! *internal* dispatch — going through the host's `call-service`
-//! would queue an `ExecuteService` to the supervisor that's already
-//! parked on us, i.e. deadlock-by-construction.
+//! (e.g. two scripts inside a scripting plugin) are not supported by
+//! `host-services::call-service` — dispatching to a supervisor
+//! already parked on the same call chain is deadlock-by-construction.
+//! Plugins colocating services in one instance dispatch between them
+//! in plugin-local code. H10 upgraded the caller==target case from a
+//! generic "recursion detected" to a documented `same-instance
+//! dispatch is not supported` error so operators and plugin authors
+//! can tell the constraint apart from a multi-hop A→B→…→A cycle
+//! (which keeps its own `cycle detected` message).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -174,18 +179,29 @@ pub(crate) async fn call_service(
     //    would queue an `ExecuteService` to a supervisor that can't
     //    process it ⇒ 30s timeout deadlock. Reject up-front instead.
     //
-    //    This also catches the first-hop self-call A→A (empty chain
-    //    + caller == target).
+    //    H10: the first-hop self-call (caller == target) is a
+    //    documented "not supported" contract at the WIT surface —
+    //    return a clear message naming that constraint. The
+    //    multi-hop cycle case (A→B→…→A) is a genuine cycle and
+    //    keeps its own message so operators can tell the two apart
+    //    in logs.
     let parent_chain: Vec<CallFrame> = CALL_STACK.try_with(Clone::clone).unwrap_or_default();
-    let blocked = caller_instance == target_instance
-        || parent_chain
-            .iter()
-            .any(|f| f.caller_instance == target_instance);
-    if blocked {
+    if caller_instance == target_instance {
         return Err(WitError::InvalidArgument(format!(
-            "recursion detected: instance `{target_instance}` is already on the \
-             call chain (target service `{target}`); same-instance peer services \
-             must use the plugin's internal dispatch, not host-services::call-service"
+            "same-instance dispatch is not supported: target service `{target}` is \
+             owned by the calling instance `{caller_instance}`; dispatch between \
+             services colocated in one instance in plugin-local code instead of \
+             going through host-services::call-service"
+        )));
+    }
+    if parent_chain
+        .iter()
+        .any(|f| f.caller_instance == target_instance)
+    {
+        return Err(WitError::InvalidArgument(format!(
+            "cycle detected: instance `{target_instance}` is already on the \
+             call chain (target service `{target}`); calling back into a \
+             supervisor already parked on a reply would deadlock"
         )));
     }
 
@@ -271,22 +287,28 @@ mod tests {
         }
     }
 
-    fn assert_recursion(err: &WitError) {
+    fn assert_msg_contains(err: &WitError, needle: &str) {
         assert!(
             matches!(err, WitError::InvalidArgument(_)),
             "expected InvalidArgument, got {err:?}",
         );
         let msg = format!("{err:?}").to_ascii_lowercase();
-        assert!(msg.contains("recursion"), "expected `recursion` in: {msg}");
+        assert!(msg.contains(needle), "expected `{needle}` in: {msg}");
     }
 
-    /// Outermost (empty chain) A→A self-call is rejected — the
-    /// predicate compares `caller_instance == target_instance` for
-    /// the *current* call before consulting the chain.
+    /// H10: outermost (empty chain) A→A self-call is rejected with a
+    /// documented same-instance error — not "recursion". The
+    /// contract at the WIT surface is that same-instance dispatch
+    /// isn't supported; plugins colocating services dispatch in
+    /// plugin-local code.
     #[tokio::test(flavor = "current_thread")]
-    async fn rejects_outermost_self_call() {
+    async fn rejects_outermost_self_call_as_same_instance() {
         let services = Arc::new(ServiceRegistry::new());
-        let svc = services.register("alpha".into(), fixture_info("ring"));
+        let svc = services.register(
+            "alpha".into(),
+            "com.example.alpha".into(),
+            fixture_info("ring"),
+        );
         let instances = Arc::new(InstanceRegistry::new());
 
         let err = call_service(
@@ -300,7 +322,7 @@ mod tests {
         .await
         .expect_err("self-call must be rejected");
 
-        assert_recursion(&err);
+        assert_msg_contains(&err, "same-instance dispatch is not supported");
         // Refcount stays 0 — the bail happens before `acquire_call`.
         assert_eq!(services.active_call_count(&svc), 0);
     }
@@ -314,8 +336,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_blocked_caller_cycle() {
         let services = Arc::new(ServiceRegistry::new());
-        let a_svc = services.register("alpha".into(), fixture_info("ring"));
-        let _b_svc = services.register("beta".into(), fixture_info("ring"));
+        let a_svc = services.register(
+            "alpha".into(),
+            "com.example.alpha".into(),
+            fixture_info("ring"),
+        );
+        let _b_svc = services.register(
+            "beta".into(),
+            "com.example.beta".into(),
+            fixture_info("ring"),
+        );
         let instances = Arc::new(InstanceRegistry::new());
 
         let chain = vec![CallFrame {
@@ -342,7 +372,7 @@ mod tests {
             .await
             .expect_err("cycle must be rejected");
 
-        assert_recursion(&err);
+        assert_msg_contains(&err, "cycle detected");
         assert_eq!(services.active_call_count(&a_svc), 0);
     }
 
@@ -355,7 +385,11 @@ mod tests {
     async fn permits_non_cyclic_chain() {
         let services = Arc::new(ServiceRegistry::new());
         let instances = Arc::new(InstanceRegistry::new());
-        let delta_svc = services.register("delta".into(), fixture_info("ring"));
+        let delta_svc = services.register(
+            "delta".into(),
+            "com.example.delta".into(),
+            fixture_info("ring"),
+        );
 
         // Chain represents A→B→C in flight on gamma's task — gamma is
         // the current caller. The new target is delta, which is not

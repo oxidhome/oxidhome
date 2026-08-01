@@ -731,7 +731,11 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
-        let id = self.services.register(self.instance_id.clone(), info);
+        let id = self.services.register(
+            self.instance_id.clone(),
+            self.manifest.plugin.id.clone(),
+            info,
+        );
         tracing::debug!(
             instance_id = %self.instance_id,
             service_id = %id,
@@ -778,6 +782,25 @@ impl host_services::Host for PluginState {
         self.services
             .get(&self.instance_id, &id)
             .map(|meta| meta.info.clone())
+    }
+
+    async fn resolve_service(
+        &mut self,
+        plugin_id: String,
+        service_name: String,
+    ) -> Result<ServiceId, WitError> {
+        // H10: stable `(plugin_id, service_name)` → `service_id`
+        // lookup. Not owner-scoped by design — a caller resolves
+        // services on other plugins routinely. Downstream permission
+        // / same-instance / cycle checks run on the returned id
+        // when it hits `call-service`.
+        self.services
+            .resolve_by_name(&plugin_id, &service_name)
+            .ok_or_else(|| {
+                WitError::NotFound(format!(
+                    "no running service named `{service_name}` owned by plugin `{plugin_id}`"
+                ))
+            })
     }
 
     async fn call_service(

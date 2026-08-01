@@ -715,18 +715,49 @@ interface host-services {
   /// `error::not-found(...)` if the id is unknown to this plugin.
   get-service:      func(id: service-id) -> result<service-info, error>;
 
-  /// Synchronously call another plugin's (or this plugin's own) service
-  /// command. The host routes `target` → owning instance, races its
-  /// `execute-service-command` export against a timeout, and returns the
-  /// result.
+  /// H10: stable resolution by logical address `(plugin-id,
+  /// service-name)`. `service-id` values are per-run — the host
+  /// mints a fresh `svc-N` on every register, so a caller cannot
+  /// persist a `service-id` and expect it to resolve across a
+  /// restart. The (plugin-id, name) pair *is* stable: the callee's
+  /// manifest fixes `plugin-id`, and `service-name` is the
+  /// capability key the callee's manifest declared under
+  /// `[capabilities] declares_services`. Callers persist that pair
+  /// and re-resolve on demand.
+  ///
+  /// Not owner-scoped — a caller resolves services on other
+  /// plugins by design. The dispatcher's own permission /
+  /// same-instance / cycle checks run on the returned id when it
+  /// is passed to `call-service`, so exposing the id here does
+  /// not weaken any downstream contract.
+  ///
+  /// Errors: `not-found` if no running service owned by
+  /// `plugin-id` currently registers as `service-name` (either
+  /// the plugin isn't running or hasn't called `register-service`
+  /// with that name yet).
+  resolve-service: func(
+    plugin-id: string,
+    service-name: string,
+  ) -> result<service-id, error>;
+
+  /// Synchronously call another plugin's service command. The host
+  /// routes `target` → owning instance, races its
+  /// `execute-service-command` export against a timeout, and returns
+  /// the result.
+  ///
+  /// **Same-instance dispatch is not supported.** A supervisor task
+  /// drives exactly one wasm store; routing back through the host
+  /// to a service the caller's own instance owns would queue an
+  /// `ExecuteService` message to a supervisor already parked on the
+  /// caller — deadlock by construction. The host rejects such calls
+  /// up-front with `invalid-argument`. Plugins that colocate
+  /// multiple services in one instance dispatch between them in
+  /// plugin-local code, without going through this call.
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
-  /// (call not allowed); `invalid-argument` (recursion `A→…→A`, or the
-  /// command/args were rejected); `unavailable` (owner not running, or
-  /// the call timed out).
-  ///
-  /// NOTE: Phase 7b ships this signature with a stub host impl that
-  /// returns `unavailable`; the routing dispatcher lands in 7c.
+  /// (call not allowed); `invalid-argument` (same-instance target,
+  /// A→…→A cycle, or the command/args were rejected); `unavailable`
+  /// (owner not running, or the call timed out).
   call-service: func(
     target: service-id,
     command: string,

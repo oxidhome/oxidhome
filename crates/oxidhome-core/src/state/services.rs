@@ -48,6 +48,11 @@ pub struct ServiceMeta {
     pub id: ServiceId,
     /// The plugin-instance that registered (and owns) this service.
     pub owner_instance: String,
+    /// H10: `plugin.id` of the owning instance's manifest. Stable
+    /// across restarts (unlike `owner_instance`, which is per-run
+    /// unique), so `resolve_by_name` can offer stable
+    /// `(plugin_id, service_name)` → `service_id` lookup.
+    pub owner_plugin_id: String,
     /// Plugin-supplied registration data — name, metadata, commands.
     pub info: ServiceInfo,
 }
@@ -99,12 +104,20 @@ impl ServiceRegistry {
     }
 
     /// Register a service on behalf of `owner_instance`. Returns the
-    /// fresh host-assigned id.
-    pub fn register(&self, owner_instance: String, info: ServiceInfo) -> ServiceId {
+    /// fresh host-assigned id. `owner_plugin_id` is the manifest's
+    /// `plugin.id`; stable across restarts and used by
+    /// [`Self::resolve_by_name`] for logical-address lookups.
+    pub fn register(
+        &self,
+        owner_instance: String,
+        owner_plugin_id: String,
+        info: ServiceInfo,
+    ) -> ServiceId {
         let id = self.mint_id();
         let meta = Arc::new(ServiceMeta {
             id: id.clone(),
             owner_instance,
+            owner_plugin_id,
             info,
         });
         self.services_write().insert(id.clone(), meta);
@@ -130,6 +143,7 @@ impl ServiceRegistry {
                 let new = Arc::new(ServiceMeta {
                     id: meta.id.clone(),
                     owner_instance: meta.owner_instance.clone(),
+                    owner_plugin_id: meta.owner_plugin_id.clone(),
                     info,
                 });
                 guard.insert(id.clone(), new);
@@ -194,6 +208,20 @@ impl ServiceRegistry {
         self.services_read()
             .get(id)
             .map(|m| m.owner_instance.clone())
+    }
+
+    /// H10: resolve a stable `(plugin_id, service_name)` address to
+    /// the currently-registered `service_id`. Returns the first
+    /// match — the register-time `service_name_declared` gate
+    /// prevents a plugin from registering two services under the
+    /// same name (the capability key is unique per manifest), so
+    /// the "first match" is the only match. Cross-plugin by
+    /// design: callers routinely resolve services on other plugins.
+    #[must_use]
+    pub fn resolve_by_name(&self, plugin_id: &str, service_name: &str) -> Option<ServiceId> {
+        self.services_read().values().find_map(|m| {
+            (m.owner_plugin_id == plugin_id && m.info.name == service_name).then(|| m.id.clone())
+        })
     }
 
     /// Bump the in-flight refcount for `id`; the returned [`CallGuard`]
@@ -333,8 +361,12 @@ mod tests {
     #[test]
     fn register_mints_distinct_svc_ids() {
         let reg = ServiceRegistry::new();
-        let a = reg.register("alpha".into(), info("house-mode"));
-        let b = reg.register("alpha".into(), info("evening"));
+        let a = reg.register(
+            "alpha".into(),
+            "com.example.alpha".into(),
+            info("house-mode"),
+        );
+        let b = reg.register("alpha".into(), "com.example.alpha".into(), info("evening"));
         assert!(a.starts_with("svc-"));
         assert_ne!(a, b);
         assert_eq!(reg.list().len(), 2);
@@ -345,7 +377,11 @@ mod tests {
     #[test]
     fn cross_instance_access_is_rejected() {
         let reg = ServiceRegistry::new();
-        let id = reg.register("alpha".into(), info("house-mode"));
+        let id = reg.register(
+            "alpha".into(),
+            "com.example.alpha".into(),
+            info("house-mode"),
+        );
 
         reg.get("alpha", &id).expect("owner can get");
         reg.update("alpha", &id, info("house-mode"))
@@ -371,13 +407,74 @@ mod tests {
         reg.get("alpha", &id).expect_err("gone after remove");
     }
 
+    /// H10: `resolve_by_name` returns the current `svc-N` for a
+    /// `(plugin_id, name)` pair. Not owner-scoped — any caller can
+    /// resolve any registered service, matching the WIT contract.
+    #[test]
+    fn resolve_by_name_returns_current_svc_id_across_plugins() {
+        let reg = ServiceRegistry::new();
+        let a = reg.register(
+            "alpha-run-1".into(),
+            "com.example.alpha".into(),
+            info("house-mode"),
+        );
+        let b = reg.register("beta-run-1".into(), "com.example.beta".into(), info("ring"));
+
+        // Cross-plugin resolution works by design.
+        assert_eq!(
+            reg.resolve_by_name("com.example.alpha", "house-mode"),
+            Some(a.clone()),
+        );
+        assert_eq!(
+            reg.resolve_by_name("com.example.beta", "ring"),
+            Some(b.clone()),
+        );
+
+        // Unknown pair → None (the WIT surface maps this to NotFound).
+        assert_eq!(reg.resolve_by_name("com.example.alpha", "ring"), None);
+        assert_eq!(reg.resolve_by_name("com.example.other", "house-mode"), None);
+    }
+
+    /// H10: `resolve_by_name` uses the stable `owner_plugin_id`, so
+    /// a restart that mints a fresh `owner_instance` still resolves
+    /// to the current live `svc-N`. Persisting a `(plugin_id, name)`
+    /// pair survives restart; persisting `svc-N` doesn't.
+    #[test]
+    fn resolve_by_name_survives_owner_instance_churn() {
+        let reg = ServiceRegistry::new();
+        let old = reg.register(
+            "alpha-run-1".into(),
+            "com.example.alpha".into(),
+            info("house-mode"),
+        );
+        // Simulate restart: drop the old instance's services, register
+        // fresh under a new instance id but the same plugin id.
+        reg.remove_by_owner("alpha-run-1");
+        assert_eq!(reg.resolve_by_name("com.example.alpha", "house-mode"), None);
+
+        let new = reg.register(
+            "alpha-run-2".into(),
+            "com.example.alpha".into(),
+            info("house-mode"),
+        );
+        assert_ne!(old, new, "restart mints a fresh svc-N");
+        assert_eq!(
+            reg.resolve_by_name("com.example.alpha", "house-mode"),
+            Some(new),
+        );
+    }
+
     /// `get_owner` lets the dispatcher route without pulling the
     /// full `ServiceMeta` (and its `Vec<CommandSpec>`) through the
     /// lock.
     #[test]
     fn get_owner_returns_just_the_owner() {
         let reg = ServiceRegistry::new();
-        let id = reg.register("alpha".into(), info("house-mode"));
+        let id = reg.register(
+            "alpha".into(),
+            "com.example.alpha".into(),
+            info("house-mode"),
+        );
         assert_eq!(reg.get_owner(&id).as_deref(), Some("alpha"));
         assert_eq!(reg.get_owner(&"svc-nonexistent".to_string()), None);
     }
@@ -388,7 +485,7 @@ mod tests {
     #[test]
     fn update_swaps_arc_without_disturbing_outstanding_snapshots() {
         let reg = ServiceRegistry::new();
-        let id = reg.register("alpha".into(), info("v1"));
+        let id = reg.register("alpha".into(), "com.example.alpha".into(), info("v1"));
         let before = reg.get("alpha", &id).expect("get");
         assert_eq!(before.info.name, "v1");
 
@@ -405,7 +502,11 @@ mod tests {
     #[test]
     fn remove_refuses_while_call_in_flight() {
         let reg = Arc::new(ServiceRegistry::new());
-        let id = reg.register("alpha".into(), info("house-mode"));
+        let id = reg.register(
+            "alpha".into(),
+            "com.example.alpha".into(),
+            info("house-mode"),
+        );
 
         let guard = reg.acquire_call(&id).expect("acquire");
         assert_eq!(reg.active_call_count(&id), 1);
@@ -432,7 +533,7 @@ mod tests {
     #[test]
     fn call_guard_drop_works_without_active_runtime() {
         let reg = Arc::new(ServiceRegistry::new());
-        let id = reg.register("alpha".into(), info("ring"));
+        let id = reg.register("alpha".into(), "com.example.alpha".into(), info("ring"));
 
         let guard = reg.acquire_call(&id).expect("acquire");
         assert_eq!(reg.active_call_count(&id), 1);
@@ -448,9 +549,9 @@ mod tests {
     #[test]
     fn remove_by_owner_clears_active_calls_for_owner() {
         let reg = Arc::new(ServiceRegistry::new());
-        let a1 = reg.register("alpha".into(), info("svc1"));
-        let _a2 = reg.register("alpha".into(), info("svc2"));
-        let b1 = reg.register("beta".into(), info("ring"));
+        let a1 = reg.register("alpha".into(), "com.example.alpha".into(), info("svc1"));
+        let _a2 = reg.register("alpha".into(), "com.example.alpha".into(), info("svc2"));
+        let b1 = reg.register("beta".into(), "com.example.beta".into(), info("ring"));
 
         // Force a stale `active_calls` entry for an alpha service by
         // forgetting the guard (simulating a worst-case where the

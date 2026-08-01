@@ -225,13 +225,16 @@ async fn cross_task_cycle_is_rejected_promptly() {
     // — the dispatcher itself sees A's wasm finishing normally.
     match outcome {
         Ok(CommandResult::Err(WitError::InvalidArgument(msg))) => {
+            // H10: the multi-hop case surfaces as "cycle detected"
+            // (was "recursion detected" before the same-instance
+            // rename split them into distinct messages).
             assert!(
-                msg.to_ascii_lowercase().contains("recursion"),
-                "expected `recursion` in: {msg}",
+                msg.to_ascii_lowercase().contains("cycle detected"),
+                "expected `cycle detected` in: {msg}",
             );
         }
         other => panic!(
-            "expected the cycle to surface as Ok(CommandResult::Err(InvalidArgument(\"recursion ...\"))), got {other:?}",
+            "expected the cycle to surface as Ok(CommandResult::Err(InvalidArgument(\"cycle detected ...\"))), got {other:?}",
         ),
     }
 

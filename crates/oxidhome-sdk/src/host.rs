@@ -149,9 +149,23 @@ pub fn get_service(id: &ServiceId) -> Result<ServiceInfo, Error> {
     host_services::get_service(id)
 }
 
-/// Synchronously call a service command — on another plugin or on this
-/// one. The host routes `target` to its owning instance and returns the
-/// result.
+/// H10: resolve a stable `(plugin_id, service_name)` address to the
+/// currently-registered `service-id`. `service-id` values are per-run
+/// — the host mints a fresh `svc-N` on every register — so callers
+/// that need to reach a service across restarts persist the
+/// `(plugin_id, name)` pair and re-resolve on demand.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if no running service owned by `plugin_id`
+/// currently registers under `service_name` (either the plugin isn't
+/// running or hasn't called `register_service` with that name yet).
+pub fn resolve_service(plugin_id: &str, service_name: &str) -> Result<ServiceId, Error> {
+    host_services::resolve_service(plugin_id, service_name)
+}
+
+/// Synchronously call another plugin's service command. The host routes
+/// `target` to its owning instance and returns the result.
 ///
 /// **Same-instance peer services must use the plugin's internal
 /// dispatch** — going through `call_service` to a service the
