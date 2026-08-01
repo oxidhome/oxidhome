@@ -629,6 +629,22 @@ pub struct Event {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub origin_instance_id: ::buffa::alloc::string::String,
+    /// H5: durable `event_log` row id assigned when this event was
+    /// persisted. `0` (proto3 default) when the event was published
+    /// via a code path that doesn't hit the durable log (host-side
+    /// simulators, in-process tests). A tail client saves the
+    /// highest observed `row_id` and passes it as
+    /// `EventsService.QueryEvents.after_id` (once landed) to
+    /// reconcile across a reconnect without gaps or duplicates.
+    ///
+    /// Field 9: `row_id`
+    #[serde(
+        rename = "rowId",
+        alias = "row_id",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub row_id: u64,
     #[serde(flatten)]
     pub payload: ::core::option::Option<__buffa::oneof::event::Payload>,
     #[serde(skip)]
@@ -642,6 +658,7 @@ impl ::core::fmt::Debug for Event {
             .field("timestamp_ms", &self.timestamp_ms)
             .field("origin_plugin_id", &self.origin_plugin_id)
             .field("origin_instance_id", &self.origin_instance_id)
+            .field("row_id", &self.row_id)
             .field("payload", &self.payload)
             .finish()
     }
@@ -736,6 +753,9 @@ impl ::buffa::Message for Event {
                     + ::buffa::types::string_encoded_len(&self.origin_instance_id)
                         as u32;
         }
+        if self.row_id != 0u64 {
+            size += 1u32 + ::buffa::types::uint64_encoded_len(self.row_id) as u32;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u32;
         size
     }
@@ -793,6 +813,9 @@ impl ::buffa::Message for Event {
         }
         if !self.origin_instance_id.is_empty() {
             ::buffa::types::put_string_field(8u32, &self.origin_instance_id, buf);
+        }
+        if self.row_id != 0u64 {
+            ::buffa::types::put_uint64_field(9u32, self.row_id, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -920,6 +943,13 @@ impl ::buffa::Message for Event {
                 )?;
                 ::buffa::types::merge_string(&mut self.origin_instance_id, buf)?;
             }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.row_id = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -933,6 +963,7 @@ impl ::buffa::Message for Event {
         self.payload = ::core::option::Option::None;
         self.origin_plugin_id.clear();
         self.origin_instance_id.clear();
+        self.row_id = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -970,6 +1001,7 @@ impl<'de> serde::Deserialize<'de> for Event {
                 let mut __f_origin_instance_id: ::core::option::Option<
                     ::buffa::alloc::string::String,
                 > = None;
+                let mut __f_row_id: ::core::option::Option<u64> = None;
                 let mut __oneof_payload: ::core::option::Option<
                     __buffa::oneof::event::Payload,
                 > = None;
@@ -1029,6 +1061,21 @@ impl<'de> serde::Deserialize<'de> for Event {
                                         D::Error,
                                     > {
                                         ::buffa::json_helpers::proto_string::deserialize(d)
+                                    }
+                                }
+                                map.next_value_seed(_S)?
+                            });
+                        }
+                        "rowId" | "row_id" => {
+                            __f_row_id = Some({
+                                struct _S;
+                                impl<'de> serde::de::DeserializeSeed<'de> for _S {
+                                    type Value = u64;
+                                    fn deserialize<D: serde::Deserializer<'de>>(
+                                        self,
+                                        d: D,
+                                    ) -> ::core::result::Result<u64, D::Error> {
+                                        ::buffa::json_helpers::uint64::deserialize(d)
                                     }
                                 }
                                 map.next_value_seed(_S)?
@@ -1147,6 +1194,9 @@ impl<'de> serde::Deserialize<'de> for Event {
                 }
                 if let ::core::option::Option::Some(v) = __f_origin_instance_id {
                     __r.origin_instance_id = v;
+                }
+                if let ::core::option::Option::Some(v) = __f_row_id {
+                    __r.row_id = v;
                 }
                 __r.payload = __oneof_payload;
                 Ok(__r)

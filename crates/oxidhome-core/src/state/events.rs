@@ -77,18 +77,16 @@ pub enum SubscriberMessage {
     /// wire receivers (Connect tail, WebSocket tail) surface a
     /// `Lagged` frame ahead of the event so clients can reconcile.
     ///
-    /// H5: `event_id` carries the `event_log` row id assigned when
-    /// the event was durably persisted. Wire receivers include it
-    /// on tail messages so a client can reconcile a live tail
-    /// against a later `GET /api/v1/events` history query without
-    /// double-counting or missing rows across the reconnect
-    /// boundary. `None` for events published via a code path that
-    /// doesn't hit `event_log` (in-process tests, direct
-    /// `EventBus::publish` from a host-side simulator).
+    /// H5: the durable `event_log` row id is on the WIT `Event`
+    /// record itself (`event.row_id`), stamped by
+    /// [`EventBus::publish_with_id`] before fan-out. Wire receivers
+    /// (Connect tail, JSON tail, plugin `on-event`) read it directly
+    /// from the event. `None` when the event was published via
+    /// [`EventBus::publish`] (host-side simulators, in-process
+    /// tests) — that path skips the durable log.
     Event {
         event: Arc<Event>,
         skipped_before: u64,
-        event_id: Option<u64>,
     },
 }
 
@@ -179,6 +177,25 @@ pub struct EventBus {
     rate_limiters: Mutex<HashMap<String, Arc<RateLimiter>>>,
     rate_capacity: f64,
     rate_refill_per_sec: f64,
+    /// H5 review round-2 P2 F1: publisher-order sequencer. The
+    /// host's `publish_event` awaits `event_log.record` on a
+    /// blocking task and then calls `publish_with_id` — two
+    /// concurrent publishers could commit rows in one order
+    /// (A: rowid 1, B: rowid 2) but fan out in the opposite
+    /// order (B first because A was still parked on the join).
+    /// Consequence: the `event.row_id` values stamped by
+    /// `publish_with_id` arrive out of order, and a client using
+    /// "last seen id" as a high-water mark for cursor
+    /// reconciliation misses rows.
+    ///
+    /// Hold this async mutex across the persist + publish pair
+    /// so a second publisher can't observe an intermediate
+    /// state. The gate itself is cheap — the critical section
+    /// is one `spawn_blocking` join + one `publish_with_id` — and
+    /// publishes are already per-instance rate-limited (C2d),
+    /// so contention stays bounded. `Arc` so `EventBus` stays
+    /// `Clone`-friendly.
+    publish_sequence: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// One subscription's delivery slot. Owned via `Arc` by the
@@ -303,7 +320,19 @@ impl EventBus {
             rate_limiters: Mutex::new(HashMap::new()),
             rate_capacity: DEFAULT_PUBLISH_BURST,
             rate_refill_per_sec: DEFAULT_PUBLISH_RATE_PER_SEC,
+            publish_sequence: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// H5 review round-2 P2 F1: `Arc<tokio::sync::Mutex>` gate
+    /// callers hold across the persist + publish pair so two
+    /// concurrent publishers can't commit rows in one order and
+    /// fan out in the opposite order. See the field's docstring
+    /// for the full race description. Returned as an owned `Arc`
+    /// so callers can move it into async blocks.
+    #[must_use]
+    pub fn publish_sequence(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.publish_sequence)
     }
 
     /// Push an event onto the bus. Each subscriber whose filter
@@ -333,7 +362,15 @@ impl EventBus {
     /// when it was persisted. Wire receivers forward the id on
     /// their tail frames so clients can reconcile a live tail
     /// against a later `GET /api/v1/events` history query.
-    pub fn publish_with_id(&self, event: Event, event_id: Option<u64>) -> usize {
+    pub fn publish_with_id(&self, mut event: Event, event_id: Option<u64>) -> usize {
+        // H5 round-2 F2: stamp the durable row id onto the WIT
+        // event record itself so every downstream surface —
+        // Connect `TailEvents`, plugin `on-event`, JSON tail —
+        // reads the id directly from the event, no side-channel
+        // needed. The WIT record's field is `option<u64>`; the
+        // in-process `EventBus::publish` fast path leaves it
+        // `None` (host-side simulators, tests).
+        event.row_id = event_id;
         // C2e review F1: wrap the event once in an `Arc` so
         // per-subscriber fan-out is a ref-count bump, not a full
         // clone per queue slot. With unbounded custom-event
@@ -390,7 +427,6 @@ impl EventBus {
             match sub.sender.try_send(SubscriberMessage::Event {
                 event: Arc::clone(&event),
                 skipped_before: claimed,
-                event_id,
             }) {
                 Ok(()) => delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -779,6 +815,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: capability.into(),
                 fields: Vec::new(),
@@ -792,6 +829,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),
@@ -1068,7 +1106,6 @@ mod tests {
             while let Ok(SubscriberMessage::Event {
                 event: _,
                 skipped_before,
-                event_id: _,
             }) = fast.receiver.try_recv()
             {
                 assert_eq!(
@@ -1125,7 +1162,6 @@ mod tests {
         while let Ok(SubscriberMessage::Event {
             event: _,
             skipped_before,
-            event_id: _,
         }) = sub.receiver.try_recv()
         {
             assert_eq!(skipped_before, 0, "pre-overflow event carried lag hint");
@@ -1141,7 +1177,6 @@ mod tests {
             SubscriberMessage::Event {
                 skipped_before,
                 event,
-                event_id: _,
             } => {
                 assert_eq!(
                     skipped_before, overflow,

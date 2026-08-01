@@ -97,6 +97,20 @@ pub struct EventQuery {
     pub instance_id: Option<String>,
     pub plugin_id: Option<String>,
     pub topic: Option<(String, TopicMatch)>,
+    /// H5 review round-2 P1 F2: cursor-based recovery. When
+    /// `Some(id)`, return only rows with `id > after_id`. Pairs
+    /// with the last-seen id a tail client saved so a
+    /// reconnecting client can resume without gaps or duplicates
+    /// no matter how many rows share a millisecond. Combined
+    /// with `SELECT ... ORDER BY id DESC LIMIT N`, a client
+    /// paginates by taking the *lowest* returned id as the next
+    /// call's `before_id`.
+    pub after_id: Option<u64>,
+    /// Complements `after_id`: return only rows with `id <
+    /// before_id`. Used for descending pagination — after a
+    /// batch, the caller passes the lowest returned id to
+    /// walk backwards through history.
+    pub before_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +261,30 @@ impl EventLog {
                     let _ = write!(sql, " AND substr(topic, 1, length(?{n_left})) = ?{n_right}");
                 }
             }
+        }
+        // H5 review round-2 P1 F2: cursor filters. `after_id` is
+        // the "give me rows I haven't seen yet" cursor a tail
+        // client uses after a reconnect; `before_id` walks
+        // backwards through history for pagination. Both compare
+        // against the `INTEGER PRIMARY KEY` (monotonic across
+        // successful inserts), so a client that saved the last
+        // seen id can resume without gaps or duplicates even when
+        // more than one event lands in the same millisecond.
+        if let Some(after) = filter.after_id {
+            push(
+                &mut binds,
+                &mut sql,
+                "id >",
+                i64::try_from(after).unwrap_or(i64::MAX).into(),
+            );
+        }
+        if let Some(before) = filter.before_id {
+            push(
+                &mut binds,
+                &mut sql,
+                "id <",
+                i64::try_from(before).unwrap_or(i64::MAX).into(),
+            );
         }
 
         binds.push(rusqlite::types::Value::Integer(
@@ -535,6 +573,7 @@ mod tests {
             timestamp: ts,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: vec![KeyValue {
@@ -551,6 +590,7 @@ mod tests {
             timestamp: payload_ms,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: "{}".into(),
@@ -606,6 +646,7 @@ mod tests {
                     timestamp: 2,
                     origin_plugin_id: String::new(),
                     origin_instance_id: String::new(),
+                    row_id: None,
                     payload: EventPayload::Button(ButtonEvent::DoublePress),
                 },
             ),
@@ -616,6 +657,7 @@ mod tests {
                     timestamp: 3,
                     origin_plugin_id: String::new(),
                     origin_instance_id: String::new(),
+                    row_id: None,
                     payload: EventPayload::Inference(InferenceResult {
                         model: "yolov8n".into(),
                         payload: r#"{"hits":[]}"#.into(),

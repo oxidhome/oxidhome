@@ -303,8 +303,12 @@ struct CommandBody {
 }
 
 /// JSON wire mirror of the WIT `key-value` record. The on-wire
-/// `value` is the tagged-JSON [`WireValue`] below.
-#[derive(Deserialize)]
+/// `value` is the tagged-JSON [`WireValue`] below. `Serialize` is
+/// derived alongside `Deserialize` so the same shape can round-
+/// trip in both directions — the H5 review round-2 P1 F3 fix
+/// reuses this in `WireEventPayload::StateChanged.fields` for
+/// history + tail wire projection.
+#[derive(Debug, Serialize, Deserialize)]
 struct WireKeyValue {
     key: String,
     value: WireValue,
@@ -1029,24 +1033,34 @@ async fn tail_events(
     upgrade: WebSocketUpgrade,
 ) -> Result<axum::response::Response, ScopeDenied> {
     require_scope(&actor, EVENTS_TAIL)?;
-    let engine = state.engine.clone();
-    Ok(upgrade.on_upgrade(move |socket| tail_events_loop(socket, engine)))
-}
-
-async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
-    use axum::extract::ws::Message;
-    // C2e: per-subscriber mpsc queue. `recv()` returns `None` when
-    // the bus drops (engine shutdown) or the subscription's
-    // `SubscriberToken` is dropped. Drops due to a slow WebSocket
-    // now happen *for this subscriber only* — the pre-C2e shared
-    // ring evicted events for every subscriber on lag.
-    let mut sub = engine.events().subscribe_labeled(
+    // H5 review P1 F1: subscribe to the bus BEFORE the 101 upgrade
+    // response goes back to the client. The pre-fix shape created
+    // the subscription inside `tail_events_loop` — i.e. AFTER the
+    // upgrade completed — so a client that saw 101, then queried
+    // `GET /api/v1/events` for its cursor, could lose any event
+    // that landed on the bus in the window between the 101 and the
+    // (still async) subscribe. Moving the `subscribe_labeled` call
+    // out here closes that window: any event that lands on the
+    // bus after the handler returned but before the loop runs is
+    // buffered in this subscriber's `mpsc` queue and drained on
+    // the loop's first `recv()`.
+    let subscription = state.engine.events().subscribe_labeled(
         crate::host_impl::plugin::oxidhome::plugin::events::EventFilter {
             device: None,
             topic: None,
         },
         "http-tail",
     );
+    Ok(upgrade.on_upgrade(move |socket| tail_events_loop(socket, subscription)))
+}
+
+async fn tail_events_loop(mut socket: WebSocket, mut sub: crate::state::EventSubscription) {
+    use axum::extract::ws::Message;
+    // C2e: per-subscriber mpsc queue. `recv()` returns `None` when
+    // the bus drops (engine shutdown) or the subscription's
+    // `SubscriberToken` is dropped. Drops due to a slow WebSocket
+    // now happen *for this subscriber only* — the pre-C2e shared
+    // ring evicted events for every subscriber on lag.
     loop {
         // Select between the bus (events to push) and the socket
         // (client frames + disconnects). Polling `socket.recv()`
@@ -1068,7 +1082,6 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
                 Some(crate::state::SubscriberMessage::Event {
                     event,
                     skipped_before,
-                    event_id,
                 }) => {
                     if skipped_before > 0 {
                         let notice = format!("{{\"lagged\":{skipped_before}}}");
@@ -1076,12 +1089,13 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
                             break;
                         }
                     }
-                    // H5: `event_id` is `Some(rowid)` on any event
-                    // that hit `event_log`; tail clients use it to
-                    // reconcile against a later `GET /api/v1/events`
-                    // history query without double-counting or
-                    // missing rows across a reconnect boundary.
-                    let wire = WireEvent::from_host(&event, event_id);
+                    // H5: the durable `event_log` row id rides on
+                    // the WIT event itself (`event.row_id`); tail
+                    // clients use it to reconcile against a later
+                    // `GET /api/v1/events` history query without
+                    // double-counting or missing rows across a
+                    // reconnect boundary.
+                    let wire = WireEvent::from_host(&event);
                     let Ok(text) = serde_json::to_string(&wire) else {
                         continue;
                     };
@@ -1141,11 +1155,26 @@ struct WireEvent {
     payload: WireEventPayload,
 }
 
+/// H5 review round-2 P1 F3: wire projection has parity with the
+/// WIT `event-payload` record — `StateChanged` carries the
+/// changed `fields` (not just the capability tag) so a client
+/// tailing / replaying history can actually observe brightness /
+/// switch-state / temperature changes; `Inference` carries the
+/// `frame_timestamp` when present. The pre-fix projection kept
+/// only the capability tag and the raw `Inference.model` /
+/// `Inference.payload`, so history reads of state-change events
+/// were effectively empty and tail readers couldn't distinguish
+/// two `StateChanged("switch")` publishes with different values.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireEventPayload {
     StateChanged {
         capability: String,
+        /// Partial-state key/value pairs the plugin supplied
+        /// with the change. Mirrors WIT `state-change.fields`.
+        /// Empty when the plugin published a capability-only
+        /// change (rare, but legal).
+        fields: Vec<WireKeyValue>,
     },
     Button {
         /// One of `"pressed"` / `"released"` / `"single_press"`
@@ -1162,6 +1191,13 @@ enum WireEventPayload {
     Inference {
         model: String,
         payload: String,
+        /// H5 review round-2 P1 F3: source-frame timestamp the
+        /// inference tap saw (matches WIT
+        /// `inference-result.frame-timestamp`). `None` when
+        /// the plugin published without one — some inference
+        /// pipelines don't have a well-defined frame time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        frame_timestamp_ms: Option<u64>,
     },
     Custom {
         topic: String,
@@ -1169,13 +1205,33 @@ enum WireEventPayload {
     },
 }
 
+impl WireKeyValue {
+    /// H5 review round-2 P1 F3: build a wire `KeyValue` from the
+    /// WIT record — reuses the existing `Value → WireValue`
+    /// conversion so a single value decoder covers both storage
+    /// and event surfaces.
+    fn from_wit(kv: KeyValue) -> Self {
+        Self {
+            key: kv.key,
+            value: WireValue::from(kv.value),
+        }
+    }
+}
+
 impl WireEvent {
-    fn from_host(event: &Event, id: Option<u64>) -> Self {
+    fn from_host(event: &Event) -> Self {
+        let id = event.row_id;
         let (topic, payload) = match &event.payload {
             EventPayload::StateChanged(sc) => (
                 sc.capability.clone(),
                 WireEventPayload::StateChanged {
                     capability: sc.capability.clone(),
+                    fields: sc
+                        .fields
+                        .iter()
+                        .cloned()
+                        .map(WireKeyValue::from_wit)
+                        .collect(),
                 },
             ),
             EventPayload::Button(b) => {
@@ -1197,6 +1253,7 @@ impl WireEvent {
                 WireEventPayload::Inference {
                     model: i.model.clone(),
                     payload: i.payload.clone(),
+                    frame_timestamp_ms: i.frame_timestamp,
                 },
             ),
             EventPayload::Custom(c) => (
@@ -1376,6 +1433,17 @@ struct EventsParams {
     plugin_id: Option<String>,
     topic: Option<String>,
     topic_prefix: Option<String>,
+    /// H5 review round-2 P1 F2: durable-id cursor. Return only
+    /// rows with `id > after_id`. A tail client that saved the
+    /// last seen event id resumes from here — the id is a
+    /// monotonic `INTEGER PRIMARY KEY`, so this is safe even
+    /// when many events land in the same millisecond.
+    after_id: Option<u64>,
+    /// Complements `after_id`: return only rows with
+    /// `id < before_id`. Used to walk backwards through history
+    /// for pagination — the caller passes the lowest id
+    /// returned by the previous batch.
+    before_id: Option<u64>,
     limit: Option<u32>,
 }
 
@@ -1426,6 +1494,8 @@ async fn query_events(
         instance_id: params.instance_id,
         plugin_id: params.plugin_id,
         topic,
+        after_id: params.after_id,
+        before_id: params.before_id,
     };
     let rows =
         run_events_query(&state.engine.event_log(), &query, limit).map_err(EventsError::Storage)?;
@@ -1499,11 +1569,12 @@ impl WireHistoricalEvent {
             timestamp: row.payload_ms,
             origin_plugin_id: row.plugin_id.clone(),
             origin_instance_id: row.instance_id.clone(),
+            row_id: Some(row.id),
             payload: row.payload,
         };
         // Reuse the tail-side payload projection so a single
         // client codec handles both live tail + history reads.
-        let wire = WireEvent::from_host(&ev, Some(row.id));
+        let wire = WireEvent::from_host(&ev);
         Self {
             id: row.id,
             received_ms: row.received_ms,
@@ -1779,9 +1850,10 @@ mod tests {
                 timestamp: 0,
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
+                row_id: None,
                 payload: EventPayload::Button(input),
             };
-            let wire = WireEvent::from_host(&event, None);
+            let wire = WireEvent::from_host(&event);
             match wire.payload {
                 WireEventPayload::Button { variant, delta } => {
                     assert_eq!(variant, expected_variant, "variant mismatch for {input:?}");
@@ -1805,6 +1877,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: "com.example.publisher".into(),
             origin_instance_id: "publisher-42".into(),
+            row_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "automation.morning".into(),
@@ -1812,7 +1885,7 @@ mod tests {
                 },
             ),
         };
-        let wire = WireEvent::from_host(&event, None);
+        let wire = WireEvent::from_host(&event);
         assert_eq!(wire.origin_plugin_id, "com.example.publisher");
         assert_eq!(wire.origin_instance_id, "publisher-42");
         // The origin fields serialize into the wire JSON so a
