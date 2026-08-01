@@ -2882,6 +2882,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "test".into(),
@@ -3046,6 +3047,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "escape-test".into(),
@@ -3078,6 +3080,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: "x".repeat(MAX_EVENT_PAYLOAD_BYTES),
             origin_instance_id: "y".repeat(MAX_EVENT_PAYLOAD_BYTES),
+            row_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "tiny".into(),
