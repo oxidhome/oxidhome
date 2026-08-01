@@ -212,11 +212,23 @@ struct Subscriber {
     /// the `tracing::warn` emitted on each drop.
     dropped: AtomicU64,
     /// Count of pending lag notices — increments on each `Full`,
-    /// drains to zero when the next `try_send` of a
-    /// [`SubscriberMessage::Lagged`] frame succeeds. Kept separate
-    /// from `dropped` so the cumulative counter (for observability)
-    /// isn't reset when we surface a batch to the receiver.
+    /// drains to zero when the next `try_send` succeeds and folds
+    /// the count into the event's `skipped_before` field. Kept
+    /// separate from `dropped` so the cumulative counter (for
+    /// observability) isn't reset when we surface a batch to the
+    /// receiver.
     pending_lag: AtomicU64,
+    /// H4 review round-3 P2 (H12 review): serializes the
+    /// `claim + try_send + reinject` sequence in
+    /// [`EventBus::publish_with_id`] so two concurrent publishers
+    /// can't interleave and stamp a fresh event with
+    /// `skipped_before = 0` while an older publisher's claimed
+    /// count is still waiting to be surfaced. The critical
+    /// section is O(1) (one atomic swap + one `try_send` + one
+    /// atomic `fetch_add`) so contention stays cheap even under
+    /// heavy fan-out. Held on a `std::sync::Mutex` — the
+    /// section is fully synchronous, never crosses an `await`.
+    send_gate: std::sync::Mutex<()>,
     /// Human-readable subscriber label included in the drop-warn
     /// log so an operator can identify which reader is falling
     /// behind ("plugin `example.foo/instance-1`", "http tail
@@ -423,6 +435,35 @@ impl EventBus {
             // — so the very next successful send surfaces the
             // complete gap. `fetch_add` is safe (no wraparound,
             // we only add what we previously owned).
+            // H12 review P2: hold the per-subscriber `send_gate`
+            // across the claim / try_send / reinject triple so
+            // two concurrent publishers can't interleave and let
+            // a fresh event ship with `skipped_before = 0` while
+            // an older publisher's claimed count still sits in
+            // `pending_lag` waiting to be surfaced. Under the
+            // pre-fix shape:
+            //
+            //   1. Publisher A: `swap(0)` claims N, is preempted.
+            //   2. Consumer frees one slot.
+            //   3. Publisher B: `swap(0)` claims 0, sends with
+            //      `skipped_before = 0`. Slot consumed.
+            //   4. A resumes, `try_send` fails Full, re-injects
+            //      `N + 1`. The old gap of N surfaces only on
+            //      whatever event lands *after* B's — a reader
+            //      that reconciled to B's rowid sees an
+            //      unexpected lag on the following event.
+            //
+            // Serializing the triple means either A completes
+            // first (its event carries N) or B completes first
+            // (fresh event, `skipped_before = 0`), never a
+            // partial-A / full-B interleave. Critical section is
+            // O(1) — one atomic swap + one non-blocking
+            // `try_send` + at most one atomic `fetch_add` — so
+            // contention stays negligible even on a hot bus.
+            let _gate = sub
+                .send_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let claimed = sub.pending_lag.swap(0, Ordering::AcqRel);
             match sub.sender.try_send(SubscriberMessage::Event {
                 event: Arc::clone(&event),
@@ -574,6 +615,7 @@ impl EventBus {
             sender,
             dropped: AtomicU64::new(0),
             pending_lag: AtomicU64::new(0),
+            send_gate: std::sync::Mutex::new(()),
             label: label.to_owned(),
         });
         {

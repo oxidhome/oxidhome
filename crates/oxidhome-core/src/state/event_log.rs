@@ -153,11 +153,35 @@ impl EventLog {
         plugin_id: &str,
     ) -> Result<u64, EventLogError> {
         let topic = topic_of(event).to_owned();
-        let stored = StoredEventPayload::from_wit(&event.payload);
-        let payload_blob = serde_json::to_vec(&stored).map_err(|source| EventLogError::Encode {
-            topic: topic.clone(),
-            source,
-        })?;
+        let payload_blob = serialize_payload(&event.payload, &topic)?;
+        self.record_prepared(received_ms, event, instance_id, plugin_id, payload_blob)
+    }
+
+    /// C4 review P2 F2: same as [`Self::record`], but takes an
+    /// already-serialized `payload_blob` so the host's
+    /// admission-time size check + persistence share one
+    /// serialization pass. `publish_event` in the host runs the
+    /// event through [`serialize_payload`] once before checking
+    /// against the byte cap; passing that same buffer here avoids
+    /// re-encoding the payload in the durable-write path.
+    ///
+    /// The caller is responsible for having stamped host-owned
+    /// origin fields on `event` before serializing (the size cap
+    /// only makes sense against the exact bytes that hit disk).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::record`] minus [`EventLogError::Encode`]
+    /// (the caller already handled serialization).
+    pub(crate) fn record_prepared(
+        &self,
+        received_ms: i64,
+        event: &Event,
+        instance_id: &str,
+        plugin_id: &str,
+        payload_blob: Vec<u8>,
+    ) -> Result<u64, EventLogError> {
+        let topic = topic_of(event).to_owned();
         let device_id = event.device.clone();
         // WIT `unix-ms` is `u64`; `SQLite` INTEGER is `i64`. Clamp the
         // upper end so a plugin that claims `u64::MAX` lands as
@@ -343,6 +367,11 @@ impl EventLog {
     /// # Errors
     ///
     /// Forwards any SQL error.
+    /// H5-adjacent: cheap accessor for the fully-serialized shape a
+    /// caller can hand to [`Self::record_prepared`]. Kept off
+    /// [`EventPayload`]'s public surface so the storage-encoding
+    /// choice (JSON today, `postcard` tomorrow) doesn't leak past
+    /// the `state` module.
     pub fn trim_older_than(&self, cutoff_ms: i64) -> Result<usize, EventLogError> {
         self.db.write(|conn| -> Result<_, EventLogError> {
             Ok(conn.execute(
@@ -535,10 +564,33 @@ impl StoredValue {
     }
 }
 
+/// C4 review P2 F2: serialize a WIT [`EventPayload`] into the
+/// exact bytes the durable log will persist. Callers (host-side
+/// `publish_event`) run this once before checking against the
+/// per-event byte cap, then pass the same `Vec<u8>` to
+/// [`EventLog::record_prepared`] so the durable-write path
+/// doesn't re-encode. `topic` is looked up as a hint on
+/// [`EventLogError::Encode`] (unchanged from the pre-fix shape).
+///
+/// # Errors
+///
+/// [`EventLogError::Encode`] if the payload can't be JSON-encoded
+/// (should never happen for the standard WIT variants).
+pub(crate) fn serialize_payload(
+    payload: &EventPayload,
+    topic: &str,
+) -> Result<Vec<u8>, EventLogError> {
+    let stored = StoredEventPayload::from_wit(payload);
+    serde_json::to_vec(&stored).map_err(|source| EventLogError::Encode {
+        topic: topic.to_owned(),
+        source,
+    })
+}
+
 /// Normalized topic for an [`Event`]. Mirrors the `topic_of` helper
 /// in `state::events` (live-bus side) so subscribe-by-topic and
 /// query-by-topic look at the same string.
-fn topic_of(event: &Event) -> &str {
+pub(crate) fn topic_of(event: &Event) -> &str {
     match &event.payload {
         EventPayload::StateChanged(sc) => &sc.capability,
         EventPayload::Button(_) => "button",

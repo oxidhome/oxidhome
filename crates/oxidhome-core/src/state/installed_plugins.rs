@@ -977,6 +977,26 @@ impl InstalledPluginRegistry {
         self.read_entries().get(plugin_id).cloned()
     }
 
+    /// H12 review F1: return the `installation_uuid` for either a
+    /// live *or* a quarantined install. `get()` returns None for
+    /// quarantined rows on purpose (the runtime must refuse to
+    /// launch them), but the API's uninstall path still needs to
+    /// know the uuid so it can purge per-install KV / blob state
+    /// under the tombstone. Without this, `Engine::uninstall_plugin`
+    /// on a quarantined install silently skipped both purges and
+    /// stranded the state.
+    #[must_use]
+    pub fn installation_uuid_for(&self, plugin_id: &str) -> Option<Arc<str>> {
+        if let Some(entry) = self.read_entries().get(plugin_id) {
+            return Some(Arc::clone(&entry.installation_uuid));
+        }
+        self.quarantined
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(plugin_id)
+            .map(|q| Arc::clone(&q.installation_uuid))
+    }
+
     /// The root under which installed plugin dirs live
     /// (`<state_dir>/plugins/`). `None` for in-memory registries
     /// (`Self::empty()`). Callers use this to decide whether a
