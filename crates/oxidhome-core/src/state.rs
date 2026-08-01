@@ -38,6 +38,7 @@ pub use installed_plugins::{
     InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, content_digest,
     effective_capabilities, read_installed_bytes,
 };
+pub(crate) use kv::stored_value_size;
 pub use kv::{KvError, KvStore};
 pub use log_store::{
     HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogStoreError, LogValue, SqliteLayer,
