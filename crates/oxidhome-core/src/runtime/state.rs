@@ -923,29 +923,30 @@ impl host_events::Host for PluginState {
         // failure here means an unexpected variant, not a client
         // input problem.
         let topic = crate::state::event_log::topic_of(&ev).to_owned();
-        let payload_blob = crate::state::serialize_payload(&ev.payload, &topic)
+        let payload_blob = crate::state::event_log::serialize_payload(&ev.payload, &topic)
             .map_err(|e| WitError::Internal(format!("publish-event: serialize failed: {e}")))?;
-        // Total durable-row byte cost: payload_blob + the
-        // fixed-width columns (rowid + two timestamps ≈ 24 bytes)
-        // + the identity strings we actually store. Origin
-        // strings are host-stamped above, so a rogue plugin
-        // can't inflate the count by padding them.
-        let stored_bytes = payload_blob.len()
-            + ev.device.as_ref().map_or(0, String::len)
-            + ev.origin_instance_id.len()
-            + ev.origin_plugin_id.len()
-            + topic.len()
-            + 24;
-        if stored_bytes > MAX_EVENT_PAYLOAD_BYTES {
+        // C4 review round-2: the cap is named `MAX_EVENT_PAYLOAD_BYTES`
+        // and the error message says "serialized payload", so measure
+        // exactly that — the serialized payload blob alone. The
+        // durable row also stores the topic + host-stamped identity
+        // strings + fixed-width columns, but those are bounded by
+        // construction (`plugin_id` / `instance_id` are host-validated,
+        // topic is host-derived from the payload variant) and the
+        // cap intent is about the plugin-controlled payload bytes.
+        // The pre-fix shape mixed payload + wrapper into `stored_bytes`
+        // and compared it to the payload constant, so the effective
+        // payload budget shrank silently as identifiers got longer.
+        let payload_bytes = payload_blob.len();
+        if payload_bytes > MAX_EVENT_PAYLOAD_BYTES {
             tracing::warn!(
                 target: "host.events",
                 instance_id = %self.instance_id,
-                stored_bytes,
+                payload_bytes,
                 max = MAX_EVENT_PAYLOAD_BYTES,
                 "publish-event refused: serialized payload exceeds C4 per-event byte cap",
             );
             return Err(WitError::PermissionDenied(format!(
-                "publish-event serialized payload ({stored_bytes} bytes) exceeds \
+                "publish-event serialized payload ({payload_bytes} bytes) exceeds \
                  per-event cap ({MAX_EVENT_PAYLOAD_BYTES} bytes)"
             )));
         }
@@ -1172,24 +1173,6 @@ fn config_value_to_wit(v: &ConfigValue) -> Option<WitValue> {
 
 // ── C4 payload sizing helpers ───────────────────────────────────────
 //
-// Cheap conservative byte counts used by the per-call payload caps
-// above. The intent is "reject obviously oversized calls before we
-// spend a `spawn_blocking` thread or a SQLite write on them" — a
-// precise on-wire size isn't necessary; a lower bound that grows
-// linearly with the payload is enough. For structured variants we
-// use the biggest fixed-width representation (`i64` → 8, `f64` → 8,
-// `bool` → 1). For dynamically-sized variants (`string`, `bytes`,
-// `json`) we count the payload bytes directly.
-
-fn wit_value_size(v: &WitValue) -> usize {
-    match v {
-        WitValue::BoolVal(_) => 1,
-        WitValue::IntVal(_) | WitValue::FloatVal(_) => 8,
-        WitValue::StringVal(s) | WitValue::JsonVal(s) => s.len(),
-        WitValue::BytesVal(b) => b.len(),
-    }
-}
-
 // ── Storage ─────────────────────────────────────────────────────────
 //
 // Phase 5a backs the WIT `storage` interface with the SQLite-based
@@ -1272,10 +1255,17 @@ impl storage::Host for PluginState {
 
     async fn set(&mut self, key: String, val: WitValue) -> Result<(), WitError> {
         require_storage_enabled(self)?;
-        // C4: per-write value size cap. The KV byte quota bounds
-        // *total* storage; this cap bounds a *single* write so a
-        // plugin can't spend its entire quota on one enormous value.
-        let value_bytes = wit_value_size(&val);
+        // C4 + C4 review P1 F1 (kv): per-write value size cap. The
+        // KV byte quota bounds *total* storage; this cap bounds a
+        // *single* write so a plugin can't spend its entire quota
+        // on one enormous value. Uses `stored_value_size` — the
+        // exact byte count the KV row will hold — so a `bytes`
+        // value can't slip past by picking a variant whose JSON
+        // encoding expands significantly (a byte array serializes
+        // as `[255,255,…]`, ~4-6× the raw byte count). The pre-fix
+        // shape used raw `.len()` and let 20 KiB byte payloads
+        // through even though they persisted as ~100 KiB rows.
+        let value_bytes = crate::state::stored_value_size(&val);
         if value_bytes > MAX_KV_VALUE_BYTES {
             tracing::warn!(
                 target: "host.storage",
@@ -1286,8 +1276,9 @@ impl storage::Host for PluginState {
                 "storage.set refused: value exceeds C4 per-write byte cap",
             );
             return Err(WitError::PermissionDenied(format!(
-                "storage.set value ({value_bytes} bytes) exceeds per-write cap \
-                 ({MAX_KV_VALUE_BYTES} bytes); split into smaller values or use blob-store"
+                "storage.set serialized value ({value_bytes} bytes) exceeds \
+                 per-write cap ({MAX_KV_VALUE_BYTES} bytes); split into smaller \
+                 values or use blob-store"
             )));
         }
         let kv = Arc::clone(&self.kv);
@@ -2762,6 +2753,38 @@ mod tests {
             .expect("under-cap set");
     }
 
+    /// C4 review round-2 P1 F1 (kv): the cap must measure the
+    /// **serialized** value size, not raw payload bytes. A
+    /// `BytesVal` payload serializes as a JSON array of decimal
+    /// ints (`[255,255,…]`) — ~4-6× the raw byte count. The
+    /// pre-fix `wit_value_size` returned raw `.len()` and let
+    /// ~20 KiB byte payloads slip past the 64 KiB cap even
+    /// though they'd persist as ~100 KiB rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn c4_review_p1f1_kv_cap_measures_serialized_bytes() {
+        let mut state = fresh_state_with_storage("alpha", 1024);
+        // Bytes payload sized so raw len is well under the cap
+        // but the JSON-array serialization blows past it. Each
+        // byte serializes as ≈ 4 chars (`255,`); take MAX / 4
+        // raw bytes plus slack (the outer `{"t":"Bytes","v":[…]}`
+        // wrapper adds ~18 chars) to guarantee the encoded form
+        // exceeds the cap.
+        let raw = vec![0xFFu8; MAX_KV_VALUE_BYTES / 4 + 1024];
+        assert!(
+            raw.len() < MAX_KV_VALUE_BYTES,
+            "raw payload should look under-cap; got {} B (cap {})",
+            raw.len(),
+            MAX_KV_VALUE_BYTES,
+        );
+        let err = storage::Host::set(&mut state, "b".into(), WitValue::BytesVal(raw))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref m) if m.contains("serialized value")),
+            "expected PermissionDenied with serialized-value message, got {err:?}",
+        );
+    }
+
     /// C4: `host-events.subscribe` refuses past
     /// `MAX_SUBSCRIPTIONS_PER_INSTANCE`. Complements the bus-side
     /// soft cap — this is the *hard* per-instance limit that stops
@@ -2904,13 +2927,13 @@ mod tests {
     /// per-instance rate. Consuming a full burst then attempting
     /// another call silently drops (no observable side effect
     /// from the plugin's POV, no `tracing::warn` amplification).
-    /// The assertion here is negative — a rate-limited log
-    /// mustn't hit `tracing`, so we check the bucket state
-    /// directly after driving it dry.
+    /// The bucket's `tokens` field is what advances / rolls back
+    /// as consume/refuse decisions land, so we inspect it before
+    /// and after a post-burst call to prove the refusal path
+    /// doesn't consume.
     #[tokio::test(flavor = "current_thread")]
     async fn c4_review_p1f2_log_rate_limit_admission() {
         let mut state = fresh_state("alpha");
-        // Burst is `LOG_RATE_BURST` — drive one call past that.
         // `LOG_RATE_BURST` is a small non-negative f64 constant
         // used purely as a loop bound; truncation is intentional.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -2918,20 +2941,31 @@ mod tests {
         for _ in 0..burst {
             logging::Host::log(&mut state, WitLevel::Info, "hello".into()).await;
         }
-        // Bucket should now be near-empty; the next call should
+        // Bucket should now be near-empty; the next call must
         // find < 1 token and drop.
-        let bucket_before = state
+        let tokens_after_burst = state
             .log_rate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .tokens;
-        // Drive one more call — if refused, tokens shouldn't
-        // change (no consume). A gap between drives allows
-        // some refill; the point is that the bucket enforces
-        // an admission gate.
         assert!(
-            bucket_before < 1.5,
-            "bucket should be near-empty after burst; got {bucket_before}",
+            tokens_after_burst < 1.0,
+            "bucket should be sub-token after burst; got {tokens_after_burst}",
+        );
+        // Drive the extra call the pre-fix test claimed but
+        // didn't actually perform. Post-fix: no consume happens,
+        // so `tokens` is monotonically non-decreasing (may go up
+        // slightly from refill during the elapsed wall-clock).
+        logging::Host::log(&mut state, WitLevel::Info, "dropped".into()).await;
+        let tokens_after_drop = state
+            .log_rate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tokens;
+        assert!(
+            tokens_after_drop >= tokens_after_burst,
+            "over-burst call must not consume a token; \
+             tokens went {tokens_after_burst} → {tokens_after_drop}",
         );
     }
 

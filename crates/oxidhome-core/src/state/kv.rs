@@ -418,6 +418,31 @@ enum StoredValue {
     Json(String),
 }
 
+/// C4 review P1 F1 (kv): compute the byte length of the *stored*
+/// serialization for `v` — i.e. the exact number of bytes the KV
+/// row's `value` blob will hold. Used by the runtime's
+/// `storage::set` cap so a caller can't slip a value past the
+/// nominal `MAX_KV_VALUE_BYTES` ceiling by picking a variant
+/// whose JSON encoding expands significantly (a `bytes` value
+/// serializes as a JSON array of decimal ints — ~4-6× the raw
+/// byte count).
+///
+/// Cloning inputs into `StoredValue` is unavoidable — the encoder
+/// takes owned values. The set path itself already clones for
+/// the same reason, so the extra cost is one serialize + one
+/// discard on the check path; for the max 64 KiB payload that's
+/// well under a millisecond.
+///
+/// Falls back to a conservative upper-bound of `usize::MAX` on
+/// the (unreachable) encode failure path — the callers refuse
+/// oversized values, so an unencodable value is a hard error
+/// downstream anyway.
+#[must_use]
+pub(crate) fn stored_value_size(v: &WitValue) -> usize {
+    let stored = StoredValue::from_wit(v.clone());
+    serde_json::to_vec(&stored).map_or(usize::MAX, |b| b.len())
+}
+
 impl StoredValue {
     fn from_wit(v: WitValue) -> Self {
         match v {

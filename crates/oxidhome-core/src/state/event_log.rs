@@ -159,7 +159,7 @@ impl EventLog {
     ///
     /// Same as [`Self::record`] minus [`EventLogError::Encode`]
     /// (the caller already handled serialization).
-    pub fn record_prepared(
+    pub(crate) fn record_prepared(
         &self,
         received_ms: i64,
         event: &Event,
@@ -538,7 +538,10 @@ impl StoredValue {
 ///
 /// [`EventLogError::Encode`] if the payload can't be JSON-encoded
 /// (should never happen for the standard WIT variants).
-pub fn serialize_payload(payload: &EventPayload, topic: &str) -> Result<Vec<u8>, EventLogError> {
+pub(crate) fn serialize_payload(
+    payload: &EventPayload,
+    topic: &str,
+) -> Result<Vec<u8>, EventLogError> {
     let stored = StoredEventPayload::from_wit(payload);
     serde_json::to_vec(&stored).map_err(|source| EventLogError::Encode {
         topic: topic.to_owned(),
