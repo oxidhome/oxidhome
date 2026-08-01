@@ -1399,10 +1399,23 @@ async fn query_events(
         .unwrap_or(EVENTS_QUERY_DEFAULT_LIMIT)
         .clamp(1, EVENTS_QUERY_MAX_LIMIT);
     // `topic` (exact) and `topic_prefix` are mutually exclusive —
-    // if both are set, prefer prefix (broader) and log the
-    // ambiguity for the operator to notice.
+    // if both are set, prefer prefix (broader) and emit a
+    // `tracing::warn` so an operator watching the log can spot
+    // the ambiguous client. The comment used to claim the
+    // ambiguity was logged; PR #103 review noted the log was
+    // missing.
     let topic = match (params.topic, params.topic_prefix) {
-        (_, Some(p)) => Some((p, TopicMatch::Prefix)),
+        (topic_exact, Some(p)) => {
+            if let Some(exact) = &topic_exact {
+                tracing::warn!(
+                    target: "api.events",
+                    topic_exact = %exact,
+                    topic_prefix = %p,
+                    "GET /api/v1/events: both `topic` and `topic_prefix` supplied — using `topic_prefix`",
+                );
+            }
+            Some((p, TopicMatch::Prefix))
+        }
         (Some(t), None) => Some((t, TopicMatch::Exact)),
         (None, None) => None,
     };
@@ -1474,10 +1487,13 @@ struct WireHistoricalEvent {
 
 impl WireHistoricalEvent {
     fn from_row(row: HistoricalEvent) -> Self {
-        // Build a scratch Event so `WireEvent::from_host`'s
-        // payload-projection logic can be reused. `origin_*` and
-        // `timestamp` are re-populated from `row` fields the
-        // scratch struct doesn't carry.
+        // Build a scratch `Event` so `WireEvent::from_host`'s
+        // payload-projection logic can be reused. The event's
+        // `origin_*` / `timestamp` fields are populated from
+        // the corresponding host-attributed columns on `row`
+        // (`plugin_id`, `instance_id`, `payload_ms`) so the
+        // wire projection sees the same identity + timestamp
+        // shape it would for a live tail event.
         let ev = Event {
             device: row.device_id.clone(),
             timestamp: row.payload_ms,
