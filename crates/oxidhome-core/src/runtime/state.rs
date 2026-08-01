@@ -988,6 +988,23 @@ impl host_events::Host for PluginState {
         let instance_id = self.instance_id.clone();
         let plugin_id = self.manifest.plugin.id.clone();
         let to_record = ev.clone();
+        // H5 review round-2 P2 F1: hold the bus's
+        // `publish_sequence` gate across the record + publish
+        // pair so two concurrent publishers can't commit rows in
+        // one order (A: rowid 1, B: rowid 2) and fan out in the
+        // opposite order (B's publish runs first because A is
+        // still parked on the `spawn_blocking` join). Without
+        // this gate, the `event.row_id` values stamped by
+        // `publish_with_id` would arrive out of order and clients
+        // using "last seen id" as a cursor high-water mark would
+        // miss rows.
+        //
+        // The critical section is one spawn_blocking join + one
+        // synchronous `publish_with_id`. Publishes are already
+        // per-instance rate-limited (C2d) upstream, so
+        // contention on this gate is bounded.
+        let sequence_gate = self.events.publish_sequence();
+        let _sequence_guard = sequence_gate.lock().await;
         // rusqlite is sync — hop to a blocking thread for the write
         // so we don't park the tokio worker on disk I/O. Panics in
         // the spawn_blocking body surface as `Error::Internal`,
@@ -1004,8 +1021,8 @@ impl host_events::Host for PluginState {
             )
         })
         .await;
-        match recorded {
-            Ok(Ok(_id)) => {}
+        let row_id = match recorded {
+            Ok(Ok(id)) => Some(id),
             Ok(Err(e)) => {
                 return Err(WitError::Internal(format!("event_log: write failed: {e}")));
             }
@@ -1014,14 +1031,20 @@ impl host_events::Host for PluginState {
                     "event_log: blocking task panicked: {join}",
                 )));
             }
-        }
+        };
 
         // Admission already consumed above (pre-persistence). The
-        // bus's `publish` sends the event onto the broadcast ring
-        // and signals matching wakes — see `EventBus::publish` for
-        // the send-before-signal ordering that keeps waking
-        // supervisors from racing an empty receiver.
-        let _delivered = self.events.publish(ev);
+        // bus's `publish_with_id` sends the event onto every
+        // subscriber's mpsc queue and signals matching wakes — see
+        // `EventBus::publish_with_id` for the send-before-signal
+        // ordering that keeps waking supervisors from racing an
+        // empty receiver. H5: the row id captured from
+        // `event_log.record` above rides with the fanout so tail
+        // clients can reconcile against `GET /api/v1/events`. The
+        // `_sequence_guard` from `publish_sequence` above is still
+        // held here — dropped when this function returns — so no
+        // other publisher runs between the record and this publish.
+        let _delivered = self.events.publish_with_id(ev, row_id);
         Ok(())
     }
 
@@ -1836,6 +1859,7 @@ mod tests {
             // empty strings and rely on `publish_event` overwriting.
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: Vec::new(),
@@ -1849,6 +1873,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: capability.into(),
                 fields: Vec::new(),
@@ -1863,6 +1888,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Button(ButtonEvent::Pressed),
         }
     }
@@ -1873,6 +1899,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),
@@ -2855,6 +2882,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "test".into(),
@@ -3019,6 +3047,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "escape-test".into(),
@@ -3051,6 +3080,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: "x".repeat(MAX_EVENT_PAYLOAD_BYTES),
             origin_instance_id: "y".repeat(MAX_EVENT_PAYLOAD_BYTES),
+            row_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "tiny".into(),

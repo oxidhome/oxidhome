@@ -100,6 +100,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: Vec::new(),

@@ -80,6 +80,14 @@ message Event {
   // uniquely identify the publisher. Mirror of WIT
   // `event.origin-instance-id`.
   string origin_instance_id = 8;
+  // H5: durable `event_log` row id assigned when this event was
+  // persisted. `0` (proto3 default) when the event was published
+  // via a code path that doesn't hit the durable log (host-side
+  // simulators, in-process tests). A tail client saves the
+  // highest observed `row_id` and passes it as
+  // `EventsService.QueryEvents.after_id` (once landed) to
+  // reconcile across a reconnect without gaps or duplicates.
+  uint64 row_id = 9;
 }
 
 // Wire mirror of WIT `state-change` — the full record, not just

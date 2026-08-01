@@ -134,6 +134,7 @@ async fn supervisor_delivers_bus_events() {
             // reflect that the row wasn't produced by a real plugin.
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
+            row_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),

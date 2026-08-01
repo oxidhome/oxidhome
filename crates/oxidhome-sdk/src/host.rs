@@ -221,6 +221,10 @@ pub fn publish_state_change(
         // empty strings from the plugin-side helpers.
         origin_plugin_id: String::new(),
         origin_instance_id: String::new(),
+        // H5: `row-id` is host-populated on publish — the host
+        // overwrites `None` with the durable `event_log` id
+        // before broadcasting.
+        row_id: None,
         payload: EventPayload::StateChanged(StateChange {
             capability: capability.into(),
             fields,
@@ -244,6 +248,7 @@ pub fn publish_custom_event(
         // Host-populated on publish — see `publish_state_change`.
         origin_plugin_id: String::new(),
         origin_instance_id: String::new(),
+        row_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: topic.into(),
             payload: payload.into(),

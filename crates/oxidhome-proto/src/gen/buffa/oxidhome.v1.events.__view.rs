@@ -643,6 +643,16 @@ pub struct EventView<'a> {
     ///
     /// Field 8: `origin_instance_id`
     pub origin_instance_id: &'a str,
+    /// H5: durable `event_log` row id assigned when this event was
+    /// persisted. `0` (proto3 default) when the event was published
+    /// via a code path that doesn't hit the durable log (host-side
+    /// simulators, in-process tests). A tail client saves the
+    /// highest observed `row_id` and passes it as
+    /// `EventsService.QueryEvents.after_id` (once landed) to
+    /// reconcile across a reconnect without gaps or duplicates.
+    ///
+    /// Field 9: `row_id`
+    pub row_id: u64,
     pub payload: ::core::option::Option<
         super::super::__buffa::view::oneof::event::Payload<'a>,
     >,
@@ -702,6 +712,13 @@ impl<'a> ::buffa::MessageView<'a> for EventView<'a> {
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
                 view.origin_instance_id = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.row_id = ::buffa::types::decode_uint64(&mut cur)?;
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -853,6 +870,7 @@ impl<'a> ::buffa::MessageView<'a> for EventView<'a> {
             timestamp_ms: self.timestamp_ms,
             origin_plugin_id: self.origin_plugin_id.to_string(),
             origin_instance_id: self.origin_instance_id.to_string(),
+            row_id: self.row_id,
             payload: match self.payload.as_ref() {
                 ::core::option::Option::Some(v) => {
                     ::core::option::Option::Some(
@@ -962,6 +980,9 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
                     + ::buffa::types::string_encoded_len(&self.origin_instance_id)
                         as u32;
         }
+        if self.row_id != 0u64 {
+            size += 1u32 + ::buffa::types::uint64_encoded_len(self.row_id) as u32;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u32;
         size
     }
@@ -1021,6 +1042,9 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
         if !self.origin_instance_id.is_empty() {
             ::buffa::types::put_string_field(8u32, &self.origin_instance_id, buf);
         }
+        if self.row_id != 0u64 {
+            ::buffa::types::put_uint64_field(9u32, self.row_id, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -1057,6 +1081,13 @@ impl<'__a> ::serde::Serialize for EventView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.origin_instance_id) {
             __map.serialize_entry("originInstanceId", self.origin_instance_id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.row_id) {
+            __map
+                .serialize_entry(
+                    "rowId",
+                    &::buffa::json_helpers::ProtoJson(&self.row_id),
+                )?;
         }
         if let ::core::option::Option::Some(ref __ov) = self.payload {
             match __ov {
@@ -1197,6 +1228,19 @@ impl EventOwnedView {
     #[must_use]
     pub fn origin_instance_id(&self) -> &'_ str {
         self.0.reborrow().origin_instance_id
+    }
+    /// H5: durable `event_log` row id assigned when this event was
+    /// persisted. `0` (proto3 default) when the event was published
+    /// via a code path that doesn't hit the durable log (host-side
+    /// simulators, in-process tests). A tail client saves the
+    /// highest observed `row_id` and passes it as
+    /// `EventsService.QueryEvents.after_id` (once landed) to
+    /// reconcile across a reconnect without gaps or duplicates.
+    ///
+    /// Field 9: `row_id`
+    #[must_use]
+    pub fn row_id(&self) -> u64 {
+        self.0.reborrow().row_id
     }
     /// Oneof `payload`.
     #[must_use]

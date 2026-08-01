@@ -27,13 +27,13 @@ use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
 use crate::state::{
-    AuditQuery, HistoricalLogEvent, InstallError, LogLevel, LogQuery, LogStore, LogValue,
-    UninstallError,
+    AuditQuery, EventLog, EventLogError, EventQuery, HistoricalEvent, HistoricalLogEvent,
+    InstallError, LogLevel, LogQuery, LogStore, LogValue, TopicMatch, UninstallError,
 };
 
 use super::auth::{AuthState, require_token};
 use super::scopes::{
-    AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
+    AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
     PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, ScopeDenied,
     require_scope,
 };
@@ -91,6 +91,7 @@ pub fn build_router(engine: Engine) -> Router {
             post(stop_plugin_instances),
         )
         .route("/api/v1/events/tail", get(tail_events))
+        .route("/api/v1/events", get(query_events))
         .route("/api/v1/logs", get(query_logs))
         .route("/api/v1/audit", get(query_audit))
         .layer(from_fn_with_state(auth_state.clone(), require_token));
@@ -302,8 +303,12 @@ struct CommandBody {
 }
 
 /// JSON wire mirror of the WIT `key-value` record. The on-wire
-/// `value` is the tagged-JSON [`WireValue`] below.
-#[derive(Deserialize)]
+/// `value` is the tagged-JSON [`WireValue`] below. `Serialize` is
+/// derived alongside `Deserialize` so the same shape can round-
+/// trip in both directions — the H5 review round-2 P1 F3 fix
+/// reuses this in `WireEventPayload::StateChanged.fields` for
+/// history + tail wire projection.
+#[derive(Debug, Serialize, Deserialize)]
 struct WireKeyValue {
     key: String,
     value: WireValue,
@@ -1028,24 +1033,34 @@ async fn tail_events(
     upgrade: WebSocketUpgrade,
 ) -> Result<axum::response::Response, ScopeDenied> {
     require_scope(&actor, EVENTS_TAIL)?;
-    let engine = state.engine.clone();
-    Ok(upgrade.on_upgrade(move |socket| tail_events_loop(socket, engine)))
-}
-
-async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
-    use axum::extract::ws::Message;
-    // C2e: per-subscriber mpsc queue. `recv()` returns `None` when
-    // the bus drops (engine shutdown) or the subscription's
-    // `SubscriberToken` is dropped. Drops due to a slow WebSocket
-    // now happen *for this subscriber only* — the pre-C2e shared
-    // ring evicted events for every subscriber on lag.
-    let mut sub = engine.events().subscribe_labeled(
+    // H5 review P1 F1: subscribe to the bus BEFORE the 101 upgrade
+    // response goes back to the client. The pre-fix shape created
+    // the subscription inside `tail_events_loop` — i.e. AFTER the
+    // upgrade completed — so a client that saw 101, then queried
+    // `GET /api/v1/events` for its cursor, could lose any event
+    // that landed on the bus in the window between the 101 and the
+    // (still async) subscribe. Moving the `subscribe_labeled` call
+    // out here closes that window: any event that lands on the
+    // bus after the handler returned but before the loop runs is
+    // buffered in this subscriber's `mpsc` queue and drained on
+    // the loop's first `recv()`.
+    let subscription = state.engine.events().subscribe_labeled(
         crate::host_impl::plugin::oxidhome::plugin::events::EventFilter {
             device: None,
             topic: None,
         },
         "http-tail",
     );
+    Ok(upgrade.on_upgrade(move |socket| tail_events_loop(socket, subscription)))
+}
+
+async fn tail_events_loop(mut socket: WebSocket, mut sub: crate::state::EventSubscription) {
+    use axum::extract::ws::Message;
+    // C2e: per-subscriber mpsc queue. `recv()` returns `None` when
+    // the bus drops (engine shutdown) or the subscription's
+    // `SubscriberToken` is dropped. Drops due to a slow WebSocket
+    // now happen *for this subscriber only* — the pre-C2e shared
+    // ring evicted events for every subscriber on lag.
     loop {
         // Select between the bus (events to push) and the socket
         // (client frames + disconnects). Polling `socket.recv()`
@@ -1074,6 +1089,12 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
                             break;
                         }
                     }
+                    // H5: the durable `event_log` row id rides on
+                    // the WIT event itself (`event.row_id`); tail
+                    // clients use it to reconcile against a later
+                    // `GET /api/v1/events` history query without
+                    // double-counting or missing rows across a
+                    // reconnect boundary.
                     let wire = WireEvent::from_host(&event);
                     let Ok(text) = serde_json::to_string(&wire) else {
                         continue;
@@ -1106,6 +1127,14 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
 /// `event_log` storage shape (which is private to that module).
 #[derive(Serialize)]
 struct WireEvent {
+    /// H5: the durable `event_log` row id assigned when this event
+    /// was persisted. `None` for events published via a code path
+    /// that doesn't hit `event_log` (host-side simulators,
+    /// in-process test harnesses). Tail clients use this to
+    /// reconcile against a later `GET /api/v1/events` history
+    /// query across a reconnect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
     device_id: Option<String>,
     /// Plugin-claimed `unix-ms`. The host's receive-time isn't
     /// available on the live bus (only the durable `event_log`
@@ -1126,11 +1155,26 @@ struct WireEvent {
     payload: WireEventPayload,
 }
 
+/// H5 review round-2 P1 F3: wire projection has parity with the
+/// WIT `event-payload` record — `StateChanged` carries the
+/// changed `fields` (not just the capability tag) so a client
+/// tailing / replaying history can actually observe brightness /
+/// switch-state / temperature changes; `Inference` carries the
+/// `frame_timestamp` when present. The pre-fix projection kept
+/// only the capability tag and the raw `Inference.model` /
+/// `Inference.payload`, so history reads of state-change events
+/// were effectively empty and tail readers couldn't distinguish
+/// two `StateChanged("switch")` publishes with different values.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireEventPayload {
     StateChanged {
         capability: String,
+        /// Partial-state key/value pairs the plugin supplied
+        /// with the change. Mirrors WIT `state-change.fields`.
+        /// Empty when the plugin published a capability-only
+        /// change (rare, but legal).
+        fields: Vec<WireKeyValue>,
     },
     Button {
         /// One of `"pressed"` / `"released"` / `"single_press"`
@@ -1147,6 +1191,13 @@ enum WireEventPayload {
     Inference {
         model: String,
         payload: String,
+        /// H5 review round-2 P1 F3: source-frame timestamp the
+        /// inference tap saw (matches WIT
+        /// `inference-result.frame-timestamp`). `None` when
+        /// the plugin published without one — some inference
+        /// pipelines don't have a well-defined frame time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        frame_timestamp_ms: Option<u64>,
     },
     Custom {
         topic: String,
@@ -1154,13 +1205,33 @@ enum WireEventPayload {
     },
 }
 
+impl WireKeyValue {
+    /// H5 review round-2 P1 F3: build a wire `KeyValue` from the
+    /// WIT record — reuses the existing `Value → WireValue`
+    /// conversion so a single value decoder covers both storage
+    /// and event surfaces.
+    fn from_wit(kv: KeyValue) -> Self {
+        Self {
+            key: kv.key,
+            value: WireValue::from(kv.value),
+        }
+    }
+}
+
 impl WireEvent {
     fn from_host(event: &Event) -> Self {
+        let id = event.row_id;
         let (topic, payload) = match &event.payload {
             EventPayload::StateChanged(sc) => (
                 sc.capability.clone(),
                 WireEventPayload::StateChanged {
                     capability: sc.capability.clone(),
+                    fields: sc
+                        .fields
+                        .iter()
+                        .cloned()
+                        .map(WireKeyValue::from_wit)
+                        .collect(),
                 },
             ),
             EventPayload::Button(b) => {
@@ -1182,6 +1253,7 @@ impl WireEvent {
                 WireEventPayload::Inference {
                     model: i.model.clone(),
                     payload: i.payload.clone(),
+                    frame_timestamp_ms: i.frame_timestamp,
                 },
             ),
             EventPayload::Custom(c) => (
@@ -1193,6 +1265,7 @@ impl WireEvent {
             ),
         };
         Self {
+            id,
             device_id: event.device.clone(),
             timestamp_ms: event.timestamp,
             topic,
@@ -1334,6 +1407,183 @@ impl WireLogEvent {
             span_path: row.span_path,
             message: row.message,
             fields: row.fields,
+        }
+    }
+}
+
+// ── Events query (H5) ────────────────────────────────────────────
+//
+// Historical query against the durable `event_log` table. Pairs
+// with the `GET /api/v1/events/tail` live stream: a client can
+// reconcile a live tail's `id` field (H5 addition) against a bounded
+// historical query without gaps across a reconnect.
+
+/// Query-string parameters for `GET /api/v1/events`. Every field is
+/// optional and AND-combined (same semantics as
+/// [`crate::state::EventQuery`]). `limit` defaults to 100, clamped
+/// to [`EVENTS_QUERY_MAX_LIMIT`]. `topic` uses exact match; use
+/// `topic_prefix` for custom-event prefix scans (e.g.
+/// `automation.` → every `automation.morning`, `automation.evening`).
+#[derive(Deserialize, Default)]
+struct EventsParams {
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    device_id: Option<String>,
+    instance_id: Option<String>,
+    plugin_id: Option<String>,
+    topic: Option<String>,
+    topic_prefix: Option<String>,
+    /// H5 review round-2 P1 F2: durable-id cursor. Return only
+    /// rows with `id > after_id`. A tail client that saved the
+    /// last seen event id resumes from here — the id is a
+    /// monotonic `INTEGER PRIMARY KEY`, so this is safe even
+    /// when many events land in the same millisecond.
+    after_id: Option<u64>,
+    /// Complements `after_id`: return only rows with
+    /// `id < before_id`. Used to walk backwards through history
+    /// for pagination — the caller passes the lowest id
+    /// returned by the previous batch.
+    before_id: Option<u64>,
+    limit: Option<u32>,
+}
+
+const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
+const EVENTS_QUERY_MAX_LIMIT: u32 = 1_000;
+
+/// `GET /api/v1/events?…` — historical event query against the
+/// `EventLog` `SQLite` table. Gated on `events:read`. Returns rows
+/// newest-first (the store's native `received_ms DESC, id DESC`
+/// order). Each row carries the same `id` a live tail message
+/// includes, so a client that saved the last-seen tail id can
+/// resume from `since_ms` or reconcile against `id`.
+async fn query_events(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Query(params): Query<EventsParams>,
+) -> Result<Json<EventsBody>, EventsError> {
+    require_scope(&actor, EVENTS_READ).map_err(EventsError::Scope)?;
+    let limit = params
+        .limit
+        .unwrap_or(EVENTS_QUERY_DEFAULT_LIMIT)
+        .clamp(1, EVENTS_QUERY_MAX_LIMIT);
+    // `topic` (exact) and `topic_prefix` are mutually exclusive —
+    // if both are set, prefer prefix (broader) and emit a
+    // `tracing::warn` so an operator watching the log can spot
+    // the ambiguous client. The comment used to claim the
+    // ambiguity was logged; PR #103 review noted the log was
+    // missing.
+    let topic = match (params.topic, params.topic_prefix) {
+        (topic_exact, Some(p)) => {
+            if let Some(exact) = &topic_exact {
+                tracing::warn!(
+                    target: "api.events",
+                    topic_exact = %exact,
+                    topic_prefix = %p,
+                    "GET /api/v1/events: both `topic` and `topic_prefix` supplied — using `topic_prefix`",
+                );
+            }
+            Some((p, TopicMatch::Prefix))
+        }
+        (Some(t), None) => Some((t, TopicMatch::Exact)),
+        (None, None) => None,
+    };
+    let query = EventQuery {
+        since_ms: params.since_ms,
+        until_ms: params.until_ms,
+        device_id: params.device_id,
+        instance_id: params.instance_id,
+        plugin_id: params.plugin_id,
+        topic,
+        after_id: params.after_id,
+        before_id: params.before_id,
+    };
+    let rows =
+        run_events_query(&state.engine.event_log(), &query, limit).map_err(EventsError::Storage)?;
+    let events = rows
+        .into_iter()
+        .map(WireHistoricalEvent::from_row)
+        .collect();
+    Ok(Json(EventsBody { events }))
+}
+
+fn run_events_query(
+    store: &EventLog,
+    query: &EventQuery,
+    limit: u32,
+) -> Result<Vec<HistoricalEvent>, EventLogError> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    store.query(query, limit)
+}
+
+enum EventsError {
+    Scope(ScopeDenied),
+    Storage(EventLogError),
+}
+
+impl IntoResponse for EventsError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            EventsError::Scope(s) => s.into_response(),
+            EventsError::Storage(err) => {
+                tracing::error!(target: "api.events", error = %err, "events query failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct EventsBody {
+    events: Vec<WireHistoricalEvent>,
+}
+
+/// JSON wire shape for a historical event row. Carries the same
+/// payload variant tags [`WireEvent`] uses so a client can decode
+/// tail messages + history rows with one code path — the extra
+/// fields (`received_ms`, `payload_ms`, `instance_id`, `plugin_id`)
+/// are the host-owned metadata the durable log tracks that the
+/// live wire shape doesn't.
+#[derive(Serialize)]
+struct WireHistoricalEvent {
+    id: u64,
+    received_ms: i64,
+    payload_ms: u64,
+    device_id: Option<String>,
+    instance_id: String,
+    plugin_id: String,
+    topic: String,
+    payload: WireEventPayload,
+}
+
+impl WireHistoricalEvent {
+    fn from_row(row: HistoricalEvent) -> Self {
+        // Build a scratch `Event` so `WireEvent::from_host`'s
+        // payload-projection logic can be reused. The event's
+        // `origin_*` / `timestamp` fields are populated from
+        // the corresponding host-attributed columns on `row`
+        // (`plugin_id`, `instance_id`, `payload_ms`) so the
+        // wire projection sees the same identity + timestamp
+        // shape it would for a live tail event.
+        let ev = Event {
+            device: row.device_id.clone(),
+            timestamp: row.payload_ms,
+            origin_plugin_id: row.plugin_id.clone(),
+            origin_instance_id: row.instance_id.clone(),
+            row_id: Some(row.id),
+            payload: row.payload,
+        };
+        // Reuse the tail-side payload projection so a single
+        // client codec handles both live tail + history reads.
+        let wire = WireEvent::from_host(&ev);
+        Self {
+            id: row.id,
+            received_ms: row.received_ms,
+            payload_ms: row.payload_ms,
+            device_id: wire.device_id,
+            instance_id: row.instance_id,
+            plugin_id: row.plugin_id,
+            topic: row.topic,
+            payload: wire.payload,
         }
     }
 }
@@ -1600,6 +1850,7 @@ mod tests {
                 timestamp: 0,
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
+                row_id: None,
                 payload: EventPayload::Button(input),
             };
             let wire = WireEvent::from_host(&event);
@@ -1626,6 +1877,7 @@ mod tests {
             timestamp: 0,
             origin_plugin_id: "com.example.publisher".into(),
             origin_instance_id: "publisher-42".into(),
+            row_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "automation.morning".into(),

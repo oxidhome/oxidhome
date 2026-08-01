@@ -331,6 +331,16 @@ interface events {
     /// Together they identify the exact publisher, so a subscriber can
     /// distinguish two instances of the same plugin without ambiguity.
     origin-instance-id: string,
+    /// H5: durable `event_log` row id assigned when the host persisted
+    /// this event. **Host-populated on publish** — plugins can leave
+    /// it `none` when calling `publish-event`; the host overwrites it
+    /// before broadcasting. Subscribers use it as a monotonic cursor
+    /// to reconcile after a dropped connection: save the highest
+    /// observed `row-id`, resume by asking the host's history query
+    /// for rows after it. `none` on events published via code paths
+    /// that don't hit the durable log (unusual in production; can
+    /// happen in host-side test fixtures).
+    row-id: option<u64>,
     payload: event-payload,
   }
 

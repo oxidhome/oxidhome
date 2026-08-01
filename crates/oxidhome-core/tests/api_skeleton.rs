@@ -1496,6 +1496,7 @@ async fn events_tail_ws_round_trip_with_real_listener() {
                 timestamp: 0,
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
+                row_id: None,
                 payload: EventPayload::Custom(CustomEvent {
                     topic: "api-e2e.toggle".into(),
                     payload: String::new(),
@@ -3341,6 +3342,7 @@ async fn connect_events_tail_streams_a_custom_event() {
                 timestamp: 0,
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
+                row_id: None,
                 payload: EventPayload::Custom(CustomEvent {
                     topic: "connect-e2e.toggle".into(),
                     payload: String::new(),
@@ -3457,6 +3459,7 @@ async fn connect_events_tail_state_changed_preserves_fields_and_unsigned_timesta
                 timestamp: BIG_TS,
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
+                row_id: None,
                 payload: EventPayload::StateChanged(StateChange {
                     capability: "switch".into(),
                     fields: vec![KeyValue {
@@ -3535,4 +3538,296 @@ async fn connect_events_tail_state_changed_preserves_fields_and_unsigned_timesta
     // for 64-bit integers; the important assertion is that the
     // value equals BIG_TS, not that it's a negative number.
     assert_eq!(event["timestampMs"], BIG_TS.to_string());
+}
+
+/// H5: `GET /api/v1/events` returns rows from the durable
+/// `event_log` table, ordered newest-first, with the `id` field
+/// each row carries — the same id a live tail message would ride.
+/// Verifies the end-to-end wiring: record → query → JSON response
+/// with the durable id in place.
+#[tokio::test(flavor = "current_thread")]
+async fn events_query_returns_recorded_rows_with_durable_ids() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload,
+    };
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"events:read\"]")
+        .unwrap();
+
+    // Record two events directly through the store so the test
+    // doesn't need a live plugin.
+    let event_log = engine.event_log();
+    let ev1 = Event {
+        device: None,
+        timestamp: 100,
+        origin_plugin_id: "com.example.recorder".into(),
+        origin_instance_id: "recorder-a".into(),
+        row_id: None,
+        payload: EventPayload::Custom(CustomEvent {
+            topic: "history.first".into(),
+            payload: "{}".into(),
+        }),
+    };
+    let ev2 = Event {
+        device: None,
+        timestamp: 200,
+        origin_plugin_id: "com.example.recorder".into(),
+        origin_instance_id: "recorder-a".into(),
+        row_id: None,
+        payload: EventPayload::Custom(CustomEvent {
+            topic: "history.second".into(),
+            payload: "{}".into(),
+        }),
+    };
+    let id1 = event_log
+        .record(1_000, &ev1, "recorder-a", "com.example.recorder")
+        .expect("record 1");
+    let id2 = event_log
+        .record(2_000, &ev2, "recorder-a", "com.example.recorder")
+        .expect("record 2");
+    assert!(id2 > id1, "second row must have a greater id");
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events?topic_prefix=history.&limit=10")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let events = body["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 2, "expected 2 rows, got {body:?}");
+    // Newest first — id2 leads.
+    assert_eq!(events[0]["id"], id2);
+    assert_eq!(events[0]["topic"], "history.second");
+    assert_eq!(events[1]["id"], id1);
+    assert_eq!(events[1]["topic"], "history.first");
+    // Instance + plugin metadata surfaces the durable log's
+    // host-attributed identity (not the plugin-set origin fields).
+    assert_eq!(events[0]["instance_id"], "recorder-a");
+    assert_eq!(events[0]["plugin_id"], "com.example.recorder");
+}
+
+/// H5: `GET /api/v1/events` refuses without the `events:read`
+/// scope. A token that only carries `events:tail` (live-stream
+/// scope) can't drop into history — same shape as logs:read vs
+/// logs:tail (which doesn't exist yet, but the discipline lines
+/// up).
+#[tokio::test(flavor = "current_thread")]
+async fn events_query_refuses_without_events_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let tail_only = engine
+        .auth_tokens()
+        .create("tail_only", b"[\"events:tail\"]")
+        .unwrap();
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", tail_only.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// H5 round-2 P1 F2: `after_id` cursor. A tail reader that
+/// records the last-seen row id can resume history without
+/// duplicates: the returned rows must be strictly `id > cursor`.
+/// The endpoint contract now supports this so a client can
+/// bridge a reconnect gap deterministically.
+#[tokio::test(flavor = "current_thread")]
+async fn events_query_after_id_returns_only_newer_rows() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload,
+    };
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"events:read\"]")
+        .unwrap();
+    let event_log = engine.event_log();
+    let mut ids = Vec::new();
+    for i in 0..4i64 {
+        let ev = Event {
+            device: None,
+            #[allow(clippy::cast_sign_loss)]
+            timestamp: (1_000 + i) as u64,
+            origin_plugin_id: "com.example.cursor".into(),
+            origin_instance_id: "cur-a".into(),
+            row_id: None,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: format!("cursor.{i}"),
+                payload: "{}".into(),
+            }),
+        };
+        ids.push(
+            event_log
+                .record(2_000 + i, &ev, "cur-a", "com.example.cursor")
+                .expect("record"),
+        );
+    }
+    let cursor = ids[1];
+    let uri = format!("/api/v1/events?topic_prefix=cursor.&after_id={cursor}");
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let events = body["events"].as_array().expect("events array");
+    assert_eq!(
+        events.len(),
+        2,
+        "expected 2 rows after cursor, got {body:?}"
+    );
+    assert_eq!(events[0]["id"], ids[3]);
+    assert_eq!(events[1]["id"], ids[2]);
+    for e in events {
+        assert!(
+            e["id"].as_u64().unwrap() > cursor,
+            "row id {} not strictly greater than cursor {cursor}",
+            e["id"],
+        );
+    }
+}
+
+/// H5 round-2 P1 F3: `StateChanged` history rows include the
+/// changed `fields`. Pre-fix wire projection kept only the
+/// capability tag, so two `StateChanged("switch")` rows with
+/// different values looked identical to a history reader.
+#[tokio::test(flavor = "current_thread")]
+async fn events_query_state_changed_exposes_fields() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        Event, EventPayload, StateChange,
+    };
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value as WitValue};
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"events:read\"]")
+        .unwrap();
+    let event_log = engine.event_log();
+    let ev = Event {
+        device: Some("switch-7".into()),
+        timestamp: 42,
+        origin_plugin_id: "com.example.switch".into(),
+        origin_instance_id: "sw-a".into(),
+        row_id: None,
+        payload: EventPayload::StateChanged(StateChange {
+            capability: "switch".into(),
+            fields: vec![KeyValue {
+                key: "state".into(),
+                value: WitValue::BoolVal(true),
+            }],
+        }),
+    };
+    event_log
+        .record(100, &ev, "sw-a", "com.example.switch")
+        .expect("record");
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events?topic=switch")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let events = body["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    let payload = &events[0]["payload"];
+    assert_eq!(payload["kind"], "state_changed");
+    assert_eq!(payload["capability"], "switch");
+    let fields = payload["fields"].as_array().expect("fields array");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["key"], "state");
+    // Tagged JSON via serde `#[serde(tag = "t", content = "v")]`.
+    assert_eq!(fields[0]["value"]["t"], "Bool");
+    assert_eq!(fields[0]["value"]["v"], true);
+}
+
+/// H5 round-2 P2 F1: publisher-order sequencer. Sequenced
+/// publishes must never deliver events out of `event_log` id
+/// order to a subscriber — a client using row id as a monotonic
+/// cursor relies on the bus keeping delivery aligned with the
+/// row-id sequence stamped on the durable log.
+#[tokio::test(flavor = "current_thread")]
+async fn publisher_order_sequencer_preserves_row_id_order() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventFilter, EventPayload,
+    };
+    use oxidhome_core::state::EventBus;
+    use std::sync::Arc;
+
+    let bus = Arc::new(EventBus::new());
+    let mut sub = bus.subscribe(EventFilter {
+        device: None,
+        topic: None,
+    });
+
+    let expected: Vec<u64> = (1..=8).collect();
+    for id in &expected {
+        let gate = bus.publish_sequence();
+        let _g = gate.lock().await;
+        let ev = Event {
+            device: None,
+            timestamp: 0,
+            origin_plugin_id: "com.example.seq".into(),
+            origin_instance_id: "seq-a".into(),
+            row_id: None,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: format!("seq.{id}"),
+                payload: String::new(),
+            }),
+        };
+        bus.publish_with_id(ev, Some(*id));
+    }
+
+    let mut observed = Vec::new();
+    while let Some(msg) = sub.receiver.recv().await {
+        let ev = msg.expect_event();
+        observed.push(ev.row_id.expect("row_id stamped"));
+        if observed.len() == expected.len() {
+            break;
+        }
+    }
+    assert_eq!(
+        observed, expected,
+        "publisher-order gate must preserve row-id ordering",
+    );
 }

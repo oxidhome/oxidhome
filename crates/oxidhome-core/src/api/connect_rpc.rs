@@ -1089,6 +1089,12 @@ fn wit_event_to_proto(event: WitEvent) -> ProtoEvent {
         // as the immutable event source.
         origin_plugin_id: event.origin_plugin_id,
         origin_instance_id: event.origin_instance_id,
+        // H5 round-2: durable `event_log` row id stamped on the
+        // WIT event at publish time. Proto3 `uint64` has no
+        // "absent" state, so we send `0` for events published via
+        // code paths that don't hit the durable log — matches the
+        // proto3 default and the field's docstring.
+        row_id: event.row_id.unwrap_or(0),
         payload,
         ..Default::default()
     }
