@@ -27,13 +27,13 @@ use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
 use crate::state::{
-    AuditQuery, HistoricalLogEvent, InstallError, LogLevel, LogQuery, LogStore, LogValue,
-    UninstallError,
+    AuditQuery, EventLog, EventLogError, EventQuery, HistoricalEvent, HistoricalLogEvent,
+    InstallError, LogLevel, LogQuery, LogStore, LogValue, TopicMatch, UninstallError,
 };
 
 use super::auth::{AuthState, require_token};
 use super::scopes::{
-    AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
+    AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
     PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, ScopeDenied,
     require_scope,
 };
@@ -91,6 +91,7 @@ pub fn build_router(engine: Engine) -> Router {
             post(stop_plugin_instances),
         )
         .route("/api/v1/events/tail", get(tail_events))
+        .route("/api/v1/events", get(query_events))
         .route("/api/v1/logs", get(query_logs))
         .route("/api/v1/audit", get(query_audit))
         .layer(from_fn_with_state(auth_state.clone(), require_token));
@@ -1067,6 +1068,7 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
                 Some(crate::state::SubscriberMessage::Event {
                     event,
                     skipped_before,
+                    event_id,
                 }) => {
                     if skipped_before > 0 {
                         let notice = format!("{{\"lagged\":{skipped_before}}}");
@@ -1074,7 +1076,12 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
                             break;
                         }
                     }
-                    let wire = WireEvent::from_host(&event);
+                    // H5: `event_id` is `Some(rowid)` on any event
+                    // that hit `event_log`; tail clients use it to
+                    // reconcile against a later `GET /api/v1/events`
+                    // history query without double-counting or
+                    // missing rows across a reconnect boundary.
+                    let wire = WireEvent::from_host(&event, event_id);
                     let Ok(text) = serde_json::to_string(&wire) else {
                         continue;
                     };
@@ -1106,6 +1113,14 @@ async fn tail_events_loop(mut socket: WebSocket, engine: Engine) {
 /// `event_log` storage shape (which is private to that module).
 #[derive(Serialize)]
 struct WireEvent {
+    /// H5: the durable `event_log` row id assigned when this event
+    /// was persisted. `None` for events published via a code path
+    /// that doesn't hit `event_log` (host-side simulators,
+    /// in-process test harnesses). Tail clients use this to
+    /// reconcile against a later `GET /api/v1/events` history
+    /// query across a reconnect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
     device_id: Option<String>,
     /// Plugin-claimed `unix-ms`. The host's receive-time isn't
     /// available on the live bus (only the durable `event_log`
@@ -1155,7 +1170,7 @@ enum WireEventPayload {
 }
 
 impl WireEvent {
-    fn from_host(event: &Event) -> Self {
+    fn from_host(event: &Event, id: Option<u64>) -> Self {
         let (topic, payload) = match &event.payload {
             EventPayload::StateChanged(sc) => (
                 sc.capability.clone(),
@@ -1193,6 +1208,7 @@ impl WireEvent {
             ),
         };
         Self {
+            id,
             device_id: event.device.clone(),
             timestamp_ms: event.timestamp,
             topic,
@@ -1334,6 +1350,153 @@ impl WireLogEvent {
             span_path: row.span_path,
             message: row.message,
             fields: row.fields,
+        }
+    }
+}
+
+// ── Events query (H5) ────────────────────────────────────────────
+//
+// Historical query against the durable `event_log` table. Pairs
+// with the `GET /api/v1/events/tail` live stream: a client can
+// reconcile a live tail's `id` field (H5 addition) against a bounded
+// historical query without gaps across a reconnect.
+
+/// Query-string parameters for `GET /api/v1/events`. Every field is
+/// optional and AND-combined (same semantics as
+/// [`crate::state::EventQuery`]). `limit` defaults to 100, clamped
+/// to [`EVENTS_QUERY_MAX_LIMIT`]. `topic` uses exact match; use
+/// `topic_prefix` for custom-event prefix scans (e.g.
+/// `automation.` → every `automation.morning`, `automation.evening`).
+#[derive(Deserialize, Default)]
+struct EventsParams {
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    device_id: Option<String>,
+    instance_id: Option<String>,
+    plugin_id: Option<String>,
+    topic: Option<String>,
+    topic_prefix: Option<String>,
+    limit: Option<u32>,
+}
+
+const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
+const EVENTS_QUERY_MAX_LIMIT: u32 = 1_000;
+
+/// `GET /api/v1/events?…` — historical event query against the
+/// `EventLog` `SQLite` table. Gated on `events:read`. Returns rows
+/// newest-first (the store's native `received_ms DESC, id DESC`
+/// order). Each row carries the same `id` a live tail message
+/// includes, so a client that saved the last-seen tail id can
+/// resume from `since_ms` or reconcile against `id`.
+async fn query_events(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Query(params): Query<EventsParams>,
+) -> Result<Json<EventsBody>, EventsError> {
+    require_scope(&actor, EVENTS_READ).map_err(EventsError::Scope)?;
+    let limit = params
+        .limit
+        .unwrap_or(EVENTS_QUERY_DEFAULT_LIMIT)
+        .clamp(1, EVENTS_QUERY_MAX_LIMIT);
+    // `topic` (exact) and `topic_prefix` are mutually exclusive —
+    // if both are set, prefer prefix (broader) and log the
+    // ambiguity for the operator to notice.
+    let topic = match (params.topic, params.topic_prefix) {
+        (_, Some(p)) => Some((p, TopicMatch::Prefix)),
+        (Some(t), None) => Some((t, TopicMatch::Exact)),
+        (None, None) => None,
+    };
+    let query = EventQuery {
+        since_ms: params.since_ms,
+        until_ms: params.until_ms,
+        device_id: params.device_id,
+        instance_id: params.instance_id,
+        plugin_id: params.plugin_id,
+        topic,
+    };
+    let rows =
+        run_events_query(&state.engine.event_log(), &query, limit).map_err(EventsError::Storage)?;
+    let events = rows
+        .into_iter()
+        .map(WireHistoricalEvent::from_row)
+        .collect();
+    Ok(Json(EventsBody { events }))
+}
+
+fn run_events_query(
+    store: &EventLog,
+    query: &EventQuery,
+    limit: u32,
+) -> Result<Vec<HistoricalEvent>, EventLogError> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    store.query(query, limit)
+}
+
+enum EventsError {
+    Scope(ScopeDenied),
+    Storage(EventLogError),
+}
+
+impl IntoResponse for EventsError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            EventsError::Scope(s) => s.into_response(),
+            EventsError::Storage(err) => {
+                tracing::error!(target: "api.events", error = %err, "events query failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct EventsBody {
+    events: Vec<WireHistoricalEvent>,
+}
+
+/// JSON wire shape for a historical event row. Carries the same
+/// payload variant tags [`WireEvent`] uses so a client can decode
+/// tail messages + history rows with one code path — the extra
+/// fields (`received_ms`, `payload_ms`, `instance_id`, `plugin_id`)
+/// are the host-owned metadata the durable log tracks that the
+/// live wire shape doesn't.
+#[derive(Serialize)]
+struct WireHistoricalEvent {
+    id: u64,
+    received_ms: i64,
+    payload_ms: u64,
+    device_id: Option<String>,
+    instance_id: String,
+    plugin_id: String,
+    topic: String,
+    payload: WireEventPayload,
+}
+
+impl WireHistoricalEvent {
+    fn from_row(row: HistoricalEvent) -> Self {
+        // Build a scratch Event so `WireEvent::from_host`'s
+        // payload-projection logic can be reused. `origin_*` and
+        // `timestamp` are re-populated from `row` fields the
+        // scratch struct doesn't carry.
+        let ev = Event {
+            device: row.device_id.clone(),
+            timestamp: row.payload_ms,
+            origin_plugin_id: row.plugin_id.clone(),
+            origin_instance_id: row.instance_id.clone(),
+            payload: row.payload,
+        };
+        // Reuse the tail-side payload projection so a single
+        // client codec handles both live tail + history reads.
+        let wire = WireEvent::from_host(&ev, Some(row.id));
+        Self {
+            id: row.id,
+            received_ms: row.received_ms,
+            payload_ms: row.payload_ms,
+            device_id: wire.device_id,
+            instance_id: row.instance_id,
+            plugin_id: row.plugin_id,
+            topic: row.topic,
+            payload: wire.payload,
         }
     }
 }
@@ -1602,7 +1765,7 @@ mod tests {
                 origin_instance_id: String::new(),
                 payload: EventPayload::Button(input),
             };
-            let wire = WireEvent::from_host(&event);
+            let wire = WireEvent::from_host(&event, None);
             match wire.payload {
                 WireEventPayload::Button { variant, delta } => {
                     assert_eq!(variant, expected_variant, "variant mismatch for {input:?}");
@@ -1633,7 +1796,7 @@ mod tests {
                 },
             ),
         };
-        let wire = WireEvent::from_host(&event);
+        let wire = WireEvent::from_host(&event, None);
         assert_eq!(wire.origin_plugin_id, "com.example.publisher");
         assert_eq!(wire.origin_instance_id, "publisher-42");
         // The origin fields serialize into the wire JSON so a

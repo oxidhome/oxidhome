@@ -76,9 +76,19 @@ pub enum SubscriberMessage {
     /// least that many times since its last successful delivery;
     /// wire receivers (Connect tail, WebSocket tail) surface a
     /// `Lagged` frame ahead of the event so clients can reconcile.
+    ///
+    /// H5: `event_id` carries the `event_log` row id assigned when
+    /// the event was durably persisted. Wire receivers include it
+    /// on tail messages so a client can reconcile a live tail
+    /// against a later `GET /api/v1/events` history query without
+    /// double-counting or missing rows across the reconnect
+    /// boundary. `None` for events published via a code path that
+    /// doesn't hit `event_log` (in-process tests, direct
+    /// `EventBus::publish` from a host-side simulator).
     Event {
         event: Arc<Event>,
         skipped_before: u64,
+        event_id: Option<u64>,
     },
 }
 
@@ -312,7 +322,18 @@ impl EventBus {
     /// enqueued, drain nothing, and go back to sleep. Signalling
     /// after `try_send` closes the race.
     #[allow(clippy::needless_pass_by_value)]
+    /// Publish an event without a durable row id (test harnesses,
+    /// host-side simulators). Prefer [`Self::publish_with_id`] from
+    /// call sites that persist the event first.
     pub fn publish(&self, event: Event) -> usize {
+        self.publish_with_id(event, None)
+    }
+
+    /// H5: publish an event carrying the `event_log` row id assigned
+    /// when it was persisted. Wire receivers forward the id on
+    /// their tail frames so clients can reconcile a live tail
+    /// against a later `GET /api/v1/events` history query.
+    pub fn publish_with_id(&self, event: Event, event_id: Option<u64>) -> usize {
         // C2e review F1: wrap the event once in an `Arc` so
         // per-subscriber fan-out is a ref-count bump, not a full
         // clone per queue slot. With unbounded custom-event
@@ -369,6 +390,7 @@ impl EventBus {
             match sub.sender.try_send(SubscriberMessage::Event {
                 event: Arc::clone(&event),
                 skipped_before: claimed,
+                event_id,
             }) {
                 Ok(()) => delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1046,6 +1068,7 @@ mod tests {
             while let Ok(SubscriberMessage::Event {
                 event: _,
                 skipped_before,
+                event_id: _,
             }) = fast.receiver.try_recv()
             {
                 assert_eq!(
@@ -1102,6 +1125,7 @@ mod tests {
         while let Ok(SubscriberMessage::Event {
             event: _,
             skipped_before,
+            event_id: _,
         }) = sub.receiver.try_recv()
         {
             assert_eq!(skipped_before, 0, "pre-overflow event carried lag hint");
@@ -1117,6 +1141,7 @@ mod tests {
             SubscriberMessage::Event {
                 skipped_before,
                 event,
+                event_id: _,
             } => {
                 assert_eq!(
                     skipped_before, overflow,

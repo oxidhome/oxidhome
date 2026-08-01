@@ -668,8 +668,8 @@ impl host_events::Host for PluginState {
             )
         })
         .await;
-        match recorded {
-            Ok(Ok(_id)) => {}
+        let row_id = match recorded {
+            Ok(Ok(id)) => Some(id),
             Ok(Err(e)) => {
                 return Err(WitError::Internal(format!("event_log: write failed: {e}")));
             }
@@ -678,14 +678,17 @@ impl host_events::Host for PluginState {
                     "event_log: blocking task panicked: {join}",
                 )));
             }
-        }
+        };
 
         // Admission already consumed above (pre-persistence). The
-        // bus's `publish` sends the event onto the broadcast ring
-        // and signals matching wakes — see `EventBus::publish` for
-        // the send-before-signal ordering that keeps waking
-        // supervisors from racing an empty receiver.
-        let _delivered = self.events.publish(ev);
+        // bus's `publish_with_id` sends the event onto every
+        // subscriber's mpsc queue and signals matching wakes — see
+        // `EventBus::publish_with_id` for the send-before-signal
+        // ordering that keeps waking supervisors from racing an
+        // empty receiver. H5: the row id captured from
+        // `event_log.record` above rides with the fanout so tail
+        // clients can reconcile against `GET /api/v1/events`.
+        let _delivered = self.events.publish_with_id(ev, row_id);
         Ok(())
     }
 

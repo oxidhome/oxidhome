@@ -3536,3 +3536,108 @@ async fn connect_events_tail_state_changed_preserves_fields_and_unsigned_timesta
     // value equals BIG_TS, not that it's a negative number.
     assert_eq!(event["timestampMs"], BIG_TS.to_string());
 }
+
+/// H5: `GET /api/v1/events` returns rows from the durable
+/// `event_log` table, ordered newest-first, with the `id` field
+/// each row carries — the same id a live tail message would ride.
+/// Verifies the end-to-end wiring: record → query → JSON response
+/// with the durable id in place.
+#[tokio::test(flavor = "current_thread")]
+async fn events_query_returns_recorded_rows_with_durable_ids() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload,
+    };
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"events:read\"]")
+        .unwrap();
+
+    // Record two events directly through the store so the test
+    // doesn't need a live plugin.
+    let event_log = engine.event_log();
+    let ev1 = Event {
+        device: None,
+        timestamp: 100,
+        origin_plugin_id: "com.example.recorder".into(),
+        origin_instance_id: "recorder-a".into(),
+        payload: EventPayload::Custom(CustomEvent {
+            topic: "history.first".into(),
+            payload: "{}".into(),
+        }),
+    };
+    let ev2 = Event {
+        device: None,
+        timestamp: 200,
+        origin_plugin_id: "com.example.recorder".into(),
+        origin_instance_id: "recorder-a".into(),
+        payload: EventPayload::Custom(CustomEvent {
+            topic: "history.second".into(),
+            payload: "{}".into(),
+        }),
+    };
+    let id1 = event_log
+        .record(1_000, &ev1, "recorder-a", "com.example.recorder")
+        .expect("record 1");
+    let id2 = event_log
+        .record(2_000, &ev2, "recorder-a", "com.example.recorder")
+        .expect("record 2");
+    assert!(id2 > id1, "second row must have a greater id");
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events?topic_prefix=history.&limit=10")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let events = body["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 2, "expected 2 rows, got {body:?}");
+    // Newest first — id2 leads.
+    assert_eq!(events[0]["id"], id2);
+    assert_eq!(events[0]["topic"], "history.second");
+    assert_eq!(events[1]["id"], id1);
+    assert_eq!(events[1]["topic"], "history.first");
+    // Instance + plugin metadata surfaces the durable log's
+    // host-attributed identity (not the plugin-set origin fields).
+    assert_eq!(events[0]["instance_id"], "recorder-a");
+    assert_eq!(events[0]["plugin_id"], "com.example.recorder");
+}
+
+/// H5: `GET /api/v1/events` refuses without the `events:read`
+/// scope. A token that only carries `events:tail` (live-stream
+/// scope) can't drop into history — same shape as logs:read vs
+/// logs:tail (which doesn't exist yet, but the discipline lines
+/// up).
+#[tokio::test(flavor = "current_thread")]
+async fn events_query_refuses_without_events_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let tail_only = engine
+        .auth_tokens()
+        .create("tail_only", b"[\"events:tail\"]")
+        .unwrap();
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", tail_only.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}

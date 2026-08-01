@@ -130,6 +130,12 @@ pub(crate) const DEVICES_LIST: Scope = Scope::new("devices:list");
 /// `events:tail` — see `GET /api/v1/events/tail` (WebSocket).
 pub(crate) const EVENTS_TAIL: Scope = Scope::new("events:tail");
 
+/// `events:read` — see `GET /api/v1/events` (H5 historical query).
+/// Distinct from `events:tail`: tail is a live stream (typically
+/// held by a WebSocket client), read is a bounded historical query
+/// against the durable `event_log` table.
+pub(crate) const EVENTS_READ: Scope = Scope::new("events:read");
+
 /// `logs:read` — see `GET /api/v1/logs`.
 pub(crate) const LOGS_READ: Scope = Scope::new("logs:read");
 

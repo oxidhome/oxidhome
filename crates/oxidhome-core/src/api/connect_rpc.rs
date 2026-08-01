@@ -988,6 +988,13 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
                     Some(SubscriberMessage::Event {
                         event,
                         skipped_before: 0,
+                        // H5: the mpsc message carries the
+                        // event_log row id but the current
+                        // `oxidhome.v1.Event` proto has no field
+                        // for it; regen + wire it in a follow-up
+                        // once the proto is updated. JSON tail
+                        // already surfaces the id.
+                        event_id: _,
                     }) => {
                         let body = tail_events_response::Body::Event(Box::new(wit_event_to_proto(
                             std::sync::Arc::unwrap_or_clone(event),
@@ -1003,6 +1010,7 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
                     Some(SubscriberMessage::Event {
                         event,
                         skipped_before,
+                        event_id: _,
                     }) => {
                         // Yield the Lagged wire frame now; hold
                         // the event for the next tick.
