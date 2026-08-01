@@ -34,8 +34,8 @@ use crate::state::{
 use super::auth::{AuthState, require_token};
 use super::scopes::{
     AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
-    PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, ScopeDenied,
-    require_scope,
+    PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL,
+    ScopeDenied, require_scope,
 };
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
@@ -91,6 +91,16 @@ pub fn build_router(engine: Engine) -> Router {
             post(stop_plugin_instances),
         )
         .route("/api/v1/events/tail", get(tail_events))
+        // H7: plugin UI. `…/ui` returns an outer wrapper that
+        // renders the plugin's UI inside a sandboxed iframe; the
+        // iframe's `src` targets `…/ui/frame` which serves the
+        // plugin's actual assets (stubbed 501 until Phase 13
+        // ships content). The sandbox attribute forces an opaque
+        // origin per navigation, so a hostile plugin's inner
+        // frame can't reach into the daemon's origin OR another
+        // plugin's frame.
+        .route("/api/v1/plugins/{plugin_id}/ui", get(plugin_ui_wrapper))
+        .route("/api/v1/plugins/{plugin_id}/ui/frame", get(plugin_ui_frame))
         .route("/api/v1/logs", get(query_logs))
         .route("/api/v1/audit", get(query_audit))
         .layer(from_fn_with_state(auth_state.clone(), require_token));
@@ -988,6 +998,164 @@ impl IntoResponse for PluginLifecycleError {
                 .into_response(),
         }
     }
+}
+
+// ── Plugin UI (sandboxed iframe, opaque origin) ─────────────────
+//
+// H7: plugin UI is always served inside a sandboxed iframe on an
+// opaque origin — no exception. The `…/ui` endpoint returns a
+// wrapper HTML page; the wrapper embeds an `<iframe>` with the
+// `sandbox` attribute pointed at `…/ui/frame`. Because the
+// sandbox list does NOT include `allow-same-origin`, the browser
+// assigns the iframe a fresh opaque origin per navigation.
+// Consequence:
+//
+// - Plugin A's iframe and plugin B's iframe get DIFFERENT opaque
+//   origins, so neither can reach into the other via the DOM,
+//   `postMessage` targets, cookies, or storage.
+// - Neither iframe shares an origin with the daemon's own origin
+//   (where the wrapper page loads), so a hostile plugin's script
+//   can't access daemon-scope storage / cookies either.
+// - The wrapper page carries a strict Content-Security-Policy so
+//   nothing but the intended iframe can load — no third-party
+//   script pulls, no inline `<script>` before the iframe.
+//
+// The frame endpoint currently returns 501 Not Implemented
+// because Phase 13 hasn't wired plugin UI assets yet; when it
+// does, it must serve into this exact route so the sandbox +
+// origin guarantees are inherited.
+
+/// Wrapper page CSP. Strict enough that the wrapper can host
+/// nothing but the intended iframe: no inline scripts, no
+/// third-party origins, no styles beyond a minimal inline sheet
+/// (kept `'unsafe-inline'` only for the wrapper's own layout).
+const UI_WRAPPER_CSP: &str = "default-src 'none'; \
+    frame-src 'self'; \
+    style-src 'unsafe-inline'; \
+    base-uri 'none'; \
+    form-action 'none'";
+
+/// Frame endpoint CSP. The frame lives on an opaque origin
+/// courtesy of the wrapper's `sandbox` attribute; this CSP
+/// additionally restricts what code / assets the plugin's own
+/// content can request. Plugin UIs cannot dial third-party
+/// origins or embed cross-origin resources.
+const UI_FRAME_CSP: &str = "default-src 'self'; \
+    script-src 'self' 'unsafe-inline'; \
+    style-src 'self' 'unsafe-inline'; \
+    img-src 'self' data:; \
+    connect-src 'self'; \
+    base-uri 'none'; \
+    form-action 'self'";
+
+/// `GET /api/v1/plugins/{plugin_id}/ui` — sandboxed wrapper for a
+/// plugin's UI. Returns an HTML page whose only content is an
+/// `<iframe sandbox="allow-scripts allow-forms">` targeting
+/// `/api/v1/plugins/{plugin_id}/ui/frame`. The sandbox list
+/// deliberately OMITS `allow-same-origin` so the browser assigns
+/// the iframe a fresh opaque origin per navigation (H7).
+///
+/// Gated on `plugins:ui`. 404 if the plugin isn't installed.
+async fn plugin_ui_wrapper(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Response, PluginLifecycleError> {
+    require_scope(&actor, PLUGINS_UI)?;
+    if state.engine.installed_plugins().get(&plugin_id).is_none() {
+        return Err(PluginLifecycleError::NotFound);
+    }
+    // Escape `plugin_id` before it lands in HTML. `is_safe_plugin_id`
+    // (via the install path) already restricts the character set,
+    // but a defense-in-depth escape keeps a future looser id
+    // validator from turning this into an XSS sink.
+    let escaped = html_escape(&plugin_id);
+    let body = format!(
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{escaped}</title>
+<style>html,body,iframe{{margin:0;padding:0;border:0;width:100%;height:100vh;}}</style>
+</head>
+<body>
+<iframe
+    sandbox="allow-scripts allow-forms"
+    src="/api/v1/plugins/{escaped}/ui/frame"
+    referrerpolicy="no-referrer"
+    title="{escaped}"></iframe>
+</body>
+</html>"#,
+    );
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CONTENT_SECURITY_POLICY, UI_WRAPPER_CSP),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (axum::http::header::X_FRAME_OPTIONS, "DENY"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// `GET /api/v1/plugins/{plugin_id}/ui/frame` — where the plugin's
+/// actual UI assets will be served (Phase 13). For now returns 501
+/// Not Implemented; the wrapper still renders the iframe (with a
+/// blank error page inside), but the sandbox contract stays in
+/// place so a future implementation slotting into this exact route
+/// inherits the isolation shape.
+///
+/// Gated on `plugins:ui`. 404 if the plugin isn't installed.
+async fn plugin_ui_frame(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Response, PluginLifecycleError> {
+    require_scope(&actor, PLUGINS_UI)?;
+    if state.engine.installed_plugins().get(&plugin_id).is_none() {
+        return Err(PluginLifecycleError::NotFound);
+    }
+    Ok((
+        StatusCode::NOT_IMPLEMENTED,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            ),
+            (axum::http::header::CONTENT_SECURITY_POLICY, UI_FRAME_CSP),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            // The wrapper embeds this frame; `SAMEORIGIN` allows
+            // the daemon's own wrapper (same origin) but nothing
+            // else on the network.
+            (axum::http::header::X_FRAME_OPTIONS, "SAMEORIGIN"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+        ],
+        "plugin UI content not yet served (Phase 13)",
+    )
+        .into_response())
+}
+
+/// Minimal HTML entity escaper for the five characters that break
+/// interpolated attribute / text contexts. Not a general-purpose
+/// escaper — the caller has already narrowed the input via
+/// `is_safe_plugin_id`; this is the last-line defense against a
+/// future looser validator.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ── Events tail (WebSocket) ──────────────────────────────────────

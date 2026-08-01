@@ -3536,3 +3536,287 @@ async fn connect_events_tail_state_changed_preserves_fields_and_unsigned_timesta
     // value equals BIG_TS, not that it's a negative number.
     assert_eq!(event["timestampMs"], BIG_TS.to_string());
 }
+
+/// H7: the `…/ui` wrapper renders an `<iframe>` with a `sandbox`
+/// attribute that **does not** include `allow-same-origin`. Under
+/// the HTML spec the browser then assigns the iframe a fresh
+/// opaque origin per navigation, isolating one plugin's UI from
+/// every other plugin's UI and from the daemon's own origin.
+///
+/// Tests the wire shape here rather than a real browser: assert
+/// the returned HTML contains an `<iframe … sandbox="…">` where
+/// the sandbox list does NOT contain `allow-same-origin`, plus
+/// the strict `Content-Security-Policy` header on the wrapper.
+// The test threads two happy-path scenarios (404 without install,
+// then install → 200 + sandbox assertions) into a single async
+// function; splitting would duplicate the tempdir + install
+// scaffolding without adding coverage.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "current_thread")]
+async fn ui_wrapper_enforces_sandbox_and_opaque_origin() {
+    use axum::body::to_bytes;
+
+    let engine = Engine::new().expect("engine");
+    // `Engine::new()` uses `InstalledPluginRegistry::empty()`, so
+    // there's no installed plugin — first assert the 404 shape,
+    // then swap to `with_state_dir` for the happy path.
+    let ui_reader = engine
+        .auth_tokens()
+        .create("ui_reader", b"[\"plugins:ui\"]")
+        .unwrap();
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.nonexistent/ui")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", ui_reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Happy path: install a stub plugin so `…/ui` resolves.
+    let base = std::env::temp_dir().join(format!(
+        "oxidhome-h7-ui-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    let state_dir = base.join("state");
+    let source = base.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("manifest.toml"),
+        r#"manifest_version = 1
+[plugin]
+id = "example.h7"
+name = "H7 UI"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+    )
+    .unwrap();
+    std::fs::write(source.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+
+    let engine = Engine::with_state_dir(&state_dir).expect("engine");
+    engine
+        .installed_plugins()
+        .install(&source)
+        .expect("install");
+    let ui_reader = engine
+        .auth_tokens()
+        .create("ui_reader", b"[\"plugins:ui\"]")
+        .unwrap();
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.h7/ui")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", ui_reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let ct = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(ct.starts_with("text/html"), "wrong Content-Type: {ct}");
+    let csp = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        csp.contains("default-src 'none'") && csp.contains("frame-src 'self'"),
+        "wrapper CSP too loose: {csp}",
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    // The iframe must have a `sandbox` attribute whose value does
+    // NOT contain `allow-same-origin` — that omission is what
+    // gives the iframe an opaque origin per navigation.
+    assert!(html.contains("<iframe"), "no iframe in wrapper: {html}");
+    let sandbox_start = html.find("sandbox=\"").expect("sandbox= attribute");
+    let sandbox_end = html[sandbox_start + 9..]
+        .find('"')
+        .expect("closing quote on sandbox value");
+    let sandbox = &html[sandbox_start + 9..sandbox_start + 9 + sandbox_end];
+    assert!(
+        !sandbox.contains("allow-same-origin"),
+        "sandbox includes allow-same-origin — iframe would inherit \
+         daemon origin instead of getting an opaque origin: {sandbox:?}",
+    );
+    // Iframe points at the frame endpoint under the same
+    // plugin_id. Same-origin fetch, opaque-origin execution.
+    assert!(
+        html.contains("/api/v1/plugins/example.h7/ui/frame"),
+        "iframe src doesn't target the frame endpoint: {html}",
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// H7: `…/ui/frame` currently returns 501 (Phase 13 hasn't
+/// wired plugin UI assets), but carries a strict CSP + the
+/// isolation headers so a future implementation slotting into
+/// this route inherits the shape.
+#[tokio::test(flavor = "current_thread")]
+async fn ui_frame_returns_stub_with_strict_csp() {
+    let base = std::env::temp_dir().join(format!(
+        "oxidhome-h7-frame-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    let state_dir = base.join("state");
+    let source = base.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("manifest.toml"),
+        r#"manifest_version = 1
+[plugin]
+id = "example.h7f"
+name = "H7 Frame"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+    )
+    .unwrap();
+    std::fs::write(source.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+
+    let engine = Engine::with_state_dir(&state_dir).expect("engine");
+    engine
+        .installed_plugins()
+        .install(&source)
+        .expect("install");
+    let ui_reader = engine
+        .auth_tokens()
+        .create("ui_reader", b"[\"plugins:ui\"]")
+        .unwrap();
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.h7f/ui/frame")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", ui_reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let csp = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        csp.contains("default-src 'self'"),
+        "frame CSP missing default-src 'self': {csp}",
+    );
+    assert!(
+        response
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .is_some(),
+        "frame missing X-Content-Type-Options",
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// H7: both `…/ui` and `…/ui/frame` require the `plugins:ui`
+/// scope. A token holding `plugins:list` alone gets 403 on both.
+#[tokio::test(flavor = "current_thread")]
+async fn ui_endpoints_refuse_without_plugins_ui_scope() {
+    let base = std::env::temp_dir().join(format!(
+        "oxidhome-h7-scope-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    let state_dir = base.join("state");
+    let source = base.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("manifest.toml"),
+        r#"manifest_version = 1
+[plugin]
+id = "example.h7s"
+name = "H7 Scope"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+    )
+    .unwrap();
+    std::fs::write(source.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+
+    let engine = Engine::with_state_dir(&state_dir).expect("engine");
+    engine
+        .installed_plugins()
+        .install(&source)
+        .expect("install");
+    let lister = engine
+        .auth_tokens()
+        .create("lister", b"[\"plugins:list\"]")
+        .unwrap();
+
+    for path in [
+        "/api/v1/plugins/example.h7s/ui",
+        "/api/v1/plugins/example.h7s/ui/frame",
+    ] {
+        let response = build_router(engine.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", lister.plaintext),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{path} should refuse without plugins:ui scope",
+        );
+    }
+
+    std::fs::remove_dir_all(&base).ok();
+}

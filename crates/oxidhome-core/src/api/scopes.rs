@@ -150,6 +150,14 @@ pub(crate) const DEVICES_COMMAND: Scope = Scope::new("devices:command");
 /// `plugins:list` — see `GET /api/v1/plugins`.
 pub(crate) const PLUGINS_LIST: Scope = Scope::new("plugins:list");
 
+/// `plugins:ui` — see `GET /api/v1/plugins/{plugin_id}/ui`. Read
+/// scope for a plugin's custom UI (H7). The outer wrapper renders
+/// an `<iframe sandbox="allow-scripts">` targeting the inner
+/// asset endpoint, so the sandboxing shape is enforced at every
+/// authenticated fetch; the scope here gates *access* to the
+/// endpoints themselves.
+pub(crate) const PLUGINS_UI: Scope = Scope::new("plugins:ui");
+
 /// `plugins:install` — see `POST /api/v1/plugins`.
 /// **Sensitive**: installing a plugin stages new code into
 /// `<state_dir>/plugins/<plugin_id>/` and makes it ready to
