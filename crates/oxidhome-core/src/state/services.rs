@@ -47,8 +47,22 @@ pub struct ServiceMeta {
     /// Stable host-assigned id, the registry's key.
     pub id: ServiceId,
     /// The plugin-instance that registered (and owns) this service.
+    /// Operator-supplied to `Engine::start_instance`; stable across
+    /// supervisor restarts (same string across a stop/start cycle),
+    /// and already the key for per-instance KV / blob storage.
     pub owner_instance: String,
+    /// H10: `plugin.id` from the owning instance's manifest.
+    /// The dispatcher's `consumes_services` authorization check
+    /// reads this to decide whether the caller's grant covers the
+    /// target's owner plugin.
+    pub owner_plugin_id: String,
     /// Plugin-supplied registration data — name, metadata, commands.
+    /// H10: `info.local_id` is the immutable logical key for the
+    /// service. `register` refuses collisions on
+    /// `(owner_instance, info.local_id)`; `update` refuses any
+    /// change to it. Callers of `resolve_by_local_id` /
+    /// `call-service` address the service by this key, and
+    /// `consumes_services` grants are matched against it.
     pub info: ServiceInfo,
 }
 
@@ -98,22 +112,67 @@ impl ServiceRegistry {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Register a service on behalf of `owner_instance`. Returns the
-    /// fresh host-assigned id.
-    pub fn register(&self, owner_instance: String, info: ServiceInfo) -> ServiceId {
+    /// Register a service on behalf of `owner_instance`. `owner_plugin_id`
+    /// is the manifest's `plugin.id` — the dispatcher reads it to
+    /// authorize the caller's `consumes_services` grants at
+    /// `call-service` time.
+    ///
+    /// H10 registration invariant: refuses if any other live service
+    /// under the same `owner_instance` already carries the same
+    /// `info.local_id`. The uniqueness check and the insert run
+    /// under one write-lock so a concurrent `register` cannot slip
+    /// a duplicate in between them.
+    ///
+    /// # Errors
+    ///
+    /// [`WitError::InvalidArgument`] if `(owner_instance, info.local_id)`
+    /// already identifies a live service in the registry.
+    pub fn register(
+        &self,
+        owner_instance: String,
+        owner_plugin_id: String,
+        info: ServiceInfo,
+    ) -> Result<ServiceId, WitError> {
+        let mut guard = self.services_write();
+        if guard
+            .values()
+            .any(|m| m.owner_instance == owner_instance && m.info.local_id == info.local_id)
+        {
+            return Err(WitError::InvalidArgument(format!(
+                "service with local-id `{}` is already registered by instance `{}`; \
+                 local-id is the immutable logical key and must be unique per instance",
+                info.local_id, owner_instance,
+            )));
+        }
         let id = self.mint_id();
         let meta = Arc::new(ServiceMeta {
             id: id.clone(),
             owner_instance,
+            owner_plugin_id,
             info,
         });
-        self.services_write().insert(id.clone(), meta);
-        id
+        guard.insert(id.clone(), meta);
+        Ok(id)
     }
 
     /// Replace an already-registered service's info, scoped to the
     /// caller's instance. A mismatched (or missing) owner returns
     /// `NotFound` to avoid leaking existence.
+    ///
+    /// H10 immutability invariant: refuses any change to
+    /// `info.local_id`. `local-id` is documented as the plugin's
+    /// stable bookkeeping id and is the resolver / authorization
+    /// key; letting `update` rename it would silently invalidate
+    /// every persisted address and every `consumes_services` grant
+    /// that names the old key. Everything else on `info` (`name`,
+    /// `metadata`, `commands`) is freely mutable.
+    ///
+    /// # Errors
+    ///
+    /// - [`WitError::NotFound`] if `id` is missing or owned by
+    ///   another instance.
+    /// - [`WitError::InvalidArgument`] if `info.local_id` differs
+    ///   from the currently-registered value.
     pub fn update(
         &self,
         owner_instance: &str,
@@ -123,6 +182,12 @@ impl ServiceRegistry {
         let mut guard = self.services_write();
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
+                if meta.info.local_id != info.local_id {
+                    return Err(WitError::InvalidArgument(format!(
+                        "service {id}: local-id is immutable (was `{}`, update tried `{}`)",
+                        meta.info.local_id, info.local_id,
+                    )));
+                }
                 // Rebuild the Arc rather than mutating in place —
                 // outstanding `Arc<ServiceMeta>` clones from `get` /
                 // `list` are immutable snapshots; the new Arc takes
@@ -130,6 +195,7 @@ impl ServiceRegistry {
                 let new = Arc::new(ServiceMeta {
                     id: meta.id.clone(),
                     owner_instance: meta.owner_instance.clone(),
+                    owner_plugin_id: meta.owner_plugin_id.clone(),
                     info,
                 });
                 guard.insert(id.clone(), new);
@@ -194,6 +260,52 @@ impl ServiceRegistry {
         self.services_read()
             .get(id)
             .map(|m| m.owner_instance.clone())
+    }
+
+    /// H10 route + authorize primitive for the dispatcher. Returns
+    /// `(owner_instance, owner_plugin_id, local_id)` in one map
+    /// lookup so the hot path doesn't re-scan for the plugin-id or
+    /// local-id parts. The dispatcher's grant check runs on the
+    /// tuple.
+    #[must_use]
+    pub fn get_owner_plugin_and_local_id(
+        &self,
+        id: &ServiceId,
+    ) -> Option<(String, String, String)> {
+        self.services_read().get(id).map(|m| {
+            (
+                m.owner_instance.clone(),
+                m.owner_plugin_id.clone(),
+                m.info.local_id.clone(),
+            )
+        })
+    }
+
+    /// H10: resolve a stable `(plugin_id, instance_id, local_id)`
+    /// address to the currently-registered `service_id`. `local_id`
+    /// is the plugin's immutable per-registration bookkeeping id
+    /// (`ServiceInfo.local_id`) — the human-readable `name` is
+    /// mutable via `update` and deliberately not part of the
+    /// resolution key. Cross-plugin by design; the dispatcher's
+    /// structured `consumes_services` gate authorizes any
+    /// subsequent `call-service`.
+    ///
+    /// The three-tuple is unique — [`Self::register`] refuses
+    /// duplicates on `(owner_instance, local_id)`, so no more than
+    /// one entry can match.
+    #[must_use]
+    pub fn resolve_by_local_id(
+        &self,
+        plugin_id: &str,
+        instance_id: &str,
+        local_id: &str,
+    ) -> Option<ServiceId> {
+        self.services_read().values().find_map(|m| {
+            (m.owner_plugin_id == plugin_id
+                && m.owner_instance == instance_id
+                && m.info.local_id == local_id)
+                .then(|| m.id.clone())
+        })
     }
 
     /// Bump the in-flight refcount for `id`; the returned [`CallGuard`]
@@ -333,8 +445,16 @@ mod tests {
     #[test]
     fn register_mints_distinct_svc_ids() {
         let reg = ServiceRegistry::new();
-        let a = reg.register("alpha".into(), info("house-mode"));
-        let b = reg.register("alpha".into(), info("evening"));
+        let a = reg
+            .register(
+                "alpha".into(),
+                "com.example.alpha".into(),
+                info("house-mode"),
+            )
+            .expect("register");
+        let b = reg
+            .register("alpha".into(), "com.example.alpha".into(), info("evening"))
+            .expect("register");
         assert!(a.starts_with("svc-"));
         assert_ne!(a, b);
         assert_eq!(reg.list().len(), 2);
@@ -345,7 +465,13 @@ mod tests {
     #[test]
     fn cross_instance_access_is_rejected() {
         let reg = ServiceRegistry::new();
-        let id = reg.register("alpha".into(), info("house-mode"));
+        let id = reg
+            .register(
+                "alpha".into(),
+                "com.example.alpha".into(),
+                info("house-mode"),
+            )
+            .expect("register");
 
         reg.get("alpha", &id).expect("owner can get");
         reg.update("alpha", &id, info("house-mode"))
@@ -377,7 +503,13 @@ mod tests {
     #[test]
     fn get_owner_returns_just_the_owner() {
         let reg = ServiceRegistry::new();
-        let id = reg.register("alpha".into(), info("house-mode"));
+        let id = reg
+            .register(
+                "alpha".into(),
+                "com.example.alpha".into(),
+                info("house-mode"),
+            )
+            .expect("register");
         assert_eq!(reg.get_owner(&id).as_deref(), Some("alpha"));
         assert_eq!(reg.get_owner(&"svc-nonexistent".to_string()), None);
     }
@@ -385,18 +517,233 @@ mod tests {
     /// `update` rebuilds the Arc — outstanding `get` snapshots see
     /// the *old* info, the new snapshot sees the update. Guarantees
     /// reads-while-update don't observe a partially-written meta.
+    /// H10: `local_id` is immutable, so this test only renames
+    /// `name` (which is freely mutable).
     #[test]
     fn update_swaps_arc_without_disturbing_outstanding_snapshots() {
         let reg = ServiceRegistry::new();
-        let id = reg.register("alpha".into(), info("v1"));
+        let v1 = ServiceInfo {
+            local_id: "svc-1".into(),
+            name: "v1".into(),
+            metadata: Vec::new(),
+            commands: Vec::new(),
+        };
+        let v2 = ServiceInfo {
+            local_id: "svc-1".into(),
+            name: "v2".into(),
+            metadata: Vec::new(),
+            commands: Vec::new(),
+        };
+        let id = reg
+            .register("alpha".into(), "com.example.alpha".into(), v1)
+            .expect("register");
         let before = reg.get("alpha", &id).expect("get");
         assert_eq!(before.info.name, "v1");
+        assert_eq!(before.info.local_id, "svc-1");
 
-        reg.update("alpha", &id, info("v2")).expect("update");
+        reg.update("alpha", &id, v2).expect("update");
         let after = reg.get("alpha", &id).expect("get");
         assert_eq!(after.info.name, "v2");
+        assert_eq!(after.info.local_id, "svc-1"); // local_id unchanged
         // The pre-update snapshot still observes the original name.
         assert_eq!(before.info.name, "v1");
+    }
+
+    /// H10: `register` refuses a second registration whose
+    /// `(owner_instance, local_id)` collides with an existing entry.
+    /// The uniqueness invariant is what makes `resolve_by_local_id`
+    /// a real (single-match) address.
+    #[test]
+    fn register_refuses_duplicate_local_id_in_same_instance() {
+        let reg = ServiceRegistry::new();
+        let dup = ServiceInfo {
+            local_id: "counter".into(),
+            name: "Counter".into(),
+            metadata: Vec::new(),
+            commands: Vec::new(),
+        };
+        reg.register("alpha".into(), "com.example.alpha".into(), dup.clone())
+            .expect("first registration succeeds");
+
+        let err = reg
+            .register("alpha".into(), "com.example.alpha".into(), dup)
+            .expect_err("duplicate must be refused");
+        match err {
+            WitError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("counter") && msg.contains("alpha"),
+                    "expected message naming local-id + instance, got: {msg}",
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert_eq!(reg.list().len(), 1, "second registration must not land");
+
+        // Same local_id under a *different* instance IS allowed —
+        // the address includes instance, so no ambiguity arises.
+        reg.register(
+            "beta".into(),
+            "com.example.alpha".into(),
+            ServiceInfo {
+                local_id: "counter".into(),
+                name: "Counter".into(),
+                metadata: Vec::new(),
+                commands: Vec::new(),
+            },
+        )
+        .expect("different instance can reuse the local_id");
+        assert_eq!(reg.list().len(), 2);
+    }
+
+    /// H10: `update` refuses to change `info.local_id` — it's the
+    /// immutable logical key. Everything else on `info` (name,
+    /// metadata, commands) is freely mutable in the same call.
+    #[test]
+    fn update_refuses_local_id_change() {
+        let reg = ServiceRegistry::new();
+        let orig = ServiceInfo {
+            local_id: "svc-key".into(),
+            name: "Original".into(),
+            metadata: Vec::new(),
+            commands: Vec::new(),
+        };
+        let id = reg
+            .register("alpha".into(), "com.example.alpha".into(), orig)
+            .expect("register");
+
+        let renamed_key = ServiceInfo {
+            local_id: "different-key".into(),
+            name: "Original".into(),
+            metadata: Vec::new(),
+            commands: Vec::new(),
+        };
+        let err = reg
+            .update("alpha", &id, renamed_key)
+            .expect_err("local_id change must be refused");
+        match err {
+            WitError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("local-id") && msg.contains("svc-key"),
+                    "expected message naming the immutable key, got: {msg}",
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        // Registry state unchanged.
+        let after = reg.get("alpha", &id).expect("get");
+        assert_eq!(after.info.local_id, "svc-key");
+    }
+
+    /// H10: `resolve_by_local_id` uses the full three-tuple. Two
+    /// instances of the same plugin registering the same
+    /// service `local_id` — the H10-round-2 review's central
+    /// counter-example — resolve to distinct `svc-N` ids based on
+    /// `instance_id`.
+    #[test]
+    fn resolve_by_local_id_disambiguates_multi_instance_plugins() {
+        let reg = ServiceRegistry::new();
+        let bouncer_info = || ServiceInfo {
+            local_id: "bouncer".into(),
+            name: "Bouncer".into(),
+            metadata: Vec::new(),
+            commands: Vec::new(),
+        };
+        let alpha = reg
+            .register("alpha".into(), "com.example.bouncer".into(), bouncer_info())
+            .expect("register alpha");
+        let beta = reg
+            .register("beta".into(), "com.example.bouncer".into(), bouncer_info())
+            .expect("register beta");
+        assert_ne!(alpha, beta);
+
+        assert_eq!(
+            reg.resolve_by_local_id("com.example.bouncer", "alpha", "bouncer"),
+            Some(alpha),
+        );
+        assert_eq!(
+            reg.resolve_by_local_id("com.example.bouncer", "beta", "bouncer"),
+            Some(beta),
+        );
+
+        // Wrong on any axis → None.
+        assert_eq!(
+            reg.resolve_by_local_id("com.example.bouncer", "gamma", "bouncer"),
+            None,
+        );
+        assert_eq!(
+            reg.resolve_by_local_id("com.example.other", "alpha", "bouncer"),
+            None,
+        );
+        assert_eq!(
+            reg.resolve_by_local_id("com.example.bouncer", "alpha", "nope"),
+            None,
+        );
+    }
+
+    /// H10: `resolve_by_local_id` keys off `local_id`, not `name`.
+    /// A callee that renames a service via `update` (mutating
+    /// `name`) does not invalidate its persisted address.
+    #[test]
+    fn resolve_by_local_id_survives_name_rename() {
+        let reg = ServiceRegistry::new();
+        let orig = ServiceInfo {
+            local_id: "counter".into(),
+            name: "Counter v1".into(),
+            metadata: Vec::new(),
+            commands: Vec::new(),
+        };
+        let id = reg
+            .register("alpha".into(), "com.example.alpha".into(), orig)
+            .expect("register");
+
+        // Same local_id, new name.
+        reg.update(
+            "alpha",
+            &id,
+            ServiceInfo {
+                local_id: "counter".into(),
+                name: "Counter v2".into(),
+                metadata: Vec::new(),
+                commands: Vec::new(),
+            },
+        )
+        .expect("rename only");
+
+        assert_eq!(
+            reg.resolve_by_local_id("com.example.alpha", "alpha", "counter"),
+            Some(id),
+        );
+    }
+
+    /// H10: `get_owner_plugin_and_local_id` returns all three
+    /// fields the dispatcher needs in one lookup.
+    #[test]
+    fn get_owner_plugin_and_local_id_returns_all_fields() {
+        let reg = ServiceRegistry::new();
+        let id = reg
+            .register(
+                "alpha".into(),
+                "com.example.alpha".into(),
+                ServiceInfo {
+                    local_id: "svc-key".into(),
+                    name: "House Mode".into(),
+                    metadata: Vec::new(),
+                    commands: Vec::new(),
+                },
+            )
+            .expect("register");
+        assert_eq!(
+            reg.get_owner_plugin_and_local_id(&id),
+            Some((
+                "alpha".to_string(),
+                "com.example.alpha".to_string(),
+                "svc-key".to_string(),
+            )),
+        );
+        assert_eq!(
+            reg.get_owner_plugin_and_local_id(&"svc-nonexistent".to_string()),
+            None,
+        );
     }
 
     /// `acquire_call` bumps the refcount; `remove` then refuses with
@@ -405,7 +752,13 @@ mod tests {
     #[test]
     fn remove_refuses_while_call_in_flight() {
         let reg = Arc::new(ServiceRegistry::new());
-        let id = reg.register("alpha".into(), info("house-mode"));
+        let id = reg
+            .register(
+                "alpha".into(),
+                "com.example.alpha".into(),
+                info("house-mode"),
+            )
+            .expect("register");
 
         let guard = reg.acquire_call(&id).expect("acquire");
         assert_eq!(reg.active_call_count(&id), 1);
@@ -432,7 +785,9 @@ mod tests {
     #[test]
     fn call_guard_drop_works_without_active_runtime() {
         let reg = Arc::new(ServiceRegistry::new());
-        let id = reg.register("alpha".into(), info("ring"));
+        let id = reg
+            .register("alpha".into(), "com.example.alpha".into(), info("ring"))
+            .expect("register");
 
         let guard = reg.acquire_call(&id).expect("acquire");
         assert_eq!(reg.active_call_count(&id), 1);
@@ -448,9 +803,15 @@ mod tests {
     #[test]
     fn remove_by_owner_clears_active_calls_for_owner() {
         let reg = Arc::new(ServiceRegistry::new());
-        let a1 = reg.register("alpha".into(), info("svc1"));
-        let _a2 = reg.register("alpha".into(), info("svc2"));
-        let b1 = reg.register("beta".into(), info("ring"));
+        let a1 = reg
+            .register("alpha".into(), "com.example.alpha".into(), info("svc1"))
+            .expect("register");
+        let _a2 = reg
+            .register("alpha".into(), "com.example.alpha".into(), info("svc2"))
+            .expect("register");
+        let b1 = reg
+            .register("beta".into(), "com.example.beta".into(), info("ring"))
+            .expect("register");
 
         // Force a stale `active_calls` entry for an alpha service by
         // forgetting the guard (simulating a worst-case where the

@@ -199,11 +199,21 @@ async fn cross_task_cycle_is_rejected_promptly() {
     // before the 30s DISPATCH_TIMEOUT — with the cycle error
     // surfaced via B's wasm to A's CommandResult::Err.
     let started = std::time::Instant::now();
+    // H10: host-driven test grant — the wasm-to-wasm hops below
+    // use the bouncer's own manifest grant. This one only
+    // authorizes the outermost driver→A kick.
+    let driver_grants = [oxidhome_manifest::ServiceGrant {
+        plugin: "example.service-bouncer".into(),
+        instance: "*".into(),
+        service: "bouncer".into(),
+        commands: vec!["kick".into()],
+    }];
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
         dispatcher::call_service_from_host(
             &engine,
             "test-driver",
+            &driver_grants,
             svc_a.clone(),
             "kick",
             Vec::new(),
@@ -223,15 +233,16 @@ async fn cross_task_cycle_is_rejected_promptly() {
     // dispatcher's `InvalidArgument` from the cycle check. So the
     // outermost call returns `Ok(CommandResult::Err(InvalidArgument))`
     // — the dispatcher itself sees A's wasm finishing normally.
+    // H10: the multi-hop case surfaces as "cycle detected".
     match outcome {
         Ok(CommandResult::Err(WitError::InvalidArgument(msg))) => {
             assert!(
-                msg.to_ascii_lowercase().contains("recursion"),
-                "expected `recursion` in: {msg}",
+                msg.to_ascii_lowercase().contains("cycle detected"),
+                "expected `cycle detected` in: {msg}",
             );
         }
         other => panic!(
-            "expected the cycle to surface as Ok(CommandResult::Err(InvalidArgument(\"recursion ...\"))), got {other:?}",
+            "expected the cycle to surface as Ok(CommandResult::Err(InvalidArgument(\"cycle detected ...\"))), got {other:?}",
         ),
     }
 
@@ -241,4 +252,143 @@ async fn cross_task_cycle_is_rejected_promptly() {
 
     alpha.stop().await.expect("stop alpha");
     beta.stop().await.expect("stop beta");
+}
+
+/// H10: caller-side authorization. Runs the same round-trip as
+/// `cross_plugin_call_service_round_trips` but with the caller
+/// staged against a manifest that omits `consumes_services`. The
+/// dispatcher must refuse with `PermissionDenied` before the callee
+/// runs, and `active_call_count` must remain 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_service_without_consumes_services_grant_is_denied() {
+    let _counter_wasm = support::build_example("service-counter", "service_counter.wasm");
+    let caller_wasm = support::build_example("service-caller", "service_caller.wasm");
+    let state_dir = support::tempdir("dispatch-grant-state");
+    let engine = oxidhome_core::Engine::with_state_dir(state_dir.path()).expect("engine");
+
+    let counter_dir = support::workspace_root()
+        .join("examples")
+        .join("service-counter");
+    let counter = engine
+        .start_instance(counter_dir, "counter", None)
+        .await
+        .expect("start counter");
+    counter.wait_for_running().await.expect("counter Running");
+    let target_id = await_service_id(&engine).await;
+
+    // Stage the caller with NO consumes_services grant.
+    let staged = support::stage_plugin(
+        "svc-caller-no-grant",
+        &caller_wasm,
+        "service_caller.wasm",
+        r#"manifest_version = 1
+[plugin]
+id = "example.service-caller-no-grant"
+name = "Bare Service Caller"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "service_caller.wasm"
+[capabilities]
+storage_quota_kb = 4
+[config.target_service_id]
+type = "string"
+description = "Target"
+"#,
+    );
+
+    let overrides: toml::Value =
+        toml::from_str(&format!("target_service_id = \"{target_id}\"\n")).expect("overrides parse");
+    let caller = engine
+        .start_instance(staged.path().to_path_buf(), "caller", Some(overrides))
+        .await
+        .expect("start caller");
+
+    match caller.wait_terminal().await {
+        oxidhome_core::InstanceState::Failed { error } => {
+            let lower = error.to_ascii_lowercase();
+            assert!(
+                lower.contains("consumes_services") && lower.contains("counter"),
+                "expected permission-denied naming consumes_services + target, got: {error}",
+            );
+        }
+        other => panic!("expected Failed (grant denies the call), got {other:?}"),
+    }
+
+    // Grant check runs before `acquire_call` — refcount never bumped.
+    assert_eq!(engine.services().active_call_count(&target_id), 0);
+
+    counter.stop().await.expect("stop counter");
+}
+
+/// H10: a caller whose grant lists the target plugin but the wrong
+/// *command* is still refused. Uses a staged manifest with
+/// `commands = ["get"]` — the caller drives `increment` first, so
+/// the first call fails permission-denied.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_service_with_wrong_command_in_grant_is_denied() {
+    let _counter_wasm = support::build_example("service-counter", "service_counter.wasm");
+    let caller_wasm = support::build_example("service-caller", "service_caller.wasm");
+    let state_dir = support::tempdir("dispatch-wrong-cmd-state");
+    let engine = oxidhome_core::Engine::with_state_dir(state_dir.path()).expect("engine");
+
+    let counter_dir = support::workspace_root()
+        .join("examples")
+        .join("service-counter");
+    let counter = engine
+        .start_instance(counter_dir, "counter", None)
+        .await
+        .expect("start counter");
+    counter.wait_for_running().await.expect("counter Running");
+    let target_id = await_service_id(&engine).await;
+
+    let staged = support::stage_plugin(
+        "svc-caller-wrong-cmd",
+        &caller_wasm,
+        "service_caller.wasm",
+        r#"manifest_version = 1
+[plugin]
+id = "example.service-caller-wrong-cmd"
+name = "Wrong-Command Service Caller"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "service_caller.wasm"
+[capabilities]
+storage_quota_kb = 4
+# Grant covers `get` but not `increment` — the caller drives
+# `increment` first, so the first hop is refused.
+[[capabilities.consumes_services]]
+plugin   = "example.service-counter"
+instance = "*"
+service  = "counter"
+commands = ["get"]
+[config.target_service_id]
+type = "string"
+description = "Target"
+"#,
+    );
+
+    let overrides: toml::Value =
+        toml::from_str(&format!("target_service_id = \"{target_id}\"\n")).expect("overrides parse");
+    let caller = engine
+        .start_instance(staged.path().to_path_buf(), "caller", Some(overrides))
+        .await
+        .expect("start caller");
+
+    match caller.wait_terminal().await {
+        oxidhome_core::InstanceState::Failed { error } => {
+            let lower = error.to_ascii_lowercase();
+            assert!(
+                lower.contains("increment") && lower.contains("consumes_services"),
+                "expected permission-denied naming `increment` + grant, got: {error}",
+            );
+        }
+        other => panic!("expected Failed (wrong-command grant), got {other:?}"),
+    }
+
+    assert_eq!(engine.services().active_call_count(&target_id), 0);
+    counter.stop().await.expect("stop counter");
 }

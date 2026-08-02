@@ -268,8 +268,15 @@ fn read_no_follow_within(root: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
 /// no longer needs it.
 ///
 /// Set-shaped fields (`network`, `declares_devices`,
-/// `declares_services`) intersect on equality; quotas take the
-/// minimum; `subscribes_events` is a boolean AND.
+/// `declares_services`, `consumes_services`) intersect on equality;
+/// quotas take the minimum; `subscribes_events` is a boolean AND.
+/// `consumes_services` intersects on whole-record equality
+/// (`ServiceGrant` derives `PartialEq`) so an operator can drop a
+/// specific selector without silently widening any other. Making a
+/// grant *narrower* (e.g. dropping a command from `commands`) reads
+/// as a different record and therefore drops out of the intersection
+/// — operators write the exact intended selector into the granted
+/// copy rather than editing entries in place.
 #[must_use]
 pub fn effective_capabilities(
     requested: &CapabilitiesSection,
@@ -283,6 +290,10 @@ pub fn effective_capabilities(
         declares_services: intersect_by_eq(
             &requested.declares_services,
             &granted.declares_services,
+        ),
+        consumes_services: intersect_by_eq(
+            &requested.consumes_services,
+            &granted.consumes_services,
         ),
         subscribes_events: requested.subscribes_events && granted.subscribes_events,
     }

@@ -731,7 +731,14 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
-        let id = self.services.register(self.instance_id.clone(), info);
+        // H10: registry now enforces `(owner_instance, local_id)`
+        // uniqueness and surfaces the collision as
+        // `InvalidArgument` — pass it through.
+        let id = self.services.register(
+            self.instance_id.clone(),
+            self.manifest.plugin.id.clone(),
+            info,
+        )?;
         tracing::debug!(
             instance_id = %self.instance_id,
             service_id = %id,
@@ -742,7 +749,9 @@ impl host_services::Host for PluginState {
 
     async fn update_service(&mut self, id: ServiceId, info: ServiceInfo) -> Result<(), WitError> {
         // Same capability gate as register — a plugin can't update a
-        // service into a name it wasn't allowed to declare.
+        // service into a name it wasn't allowed to declare. H10:
+        // `local-id` is immutable; the registry rejects any attempt
+        // to change it with `InvalidArgument`.
         if !service_name_declared(&self.granted_capabilities.declares_services, &info.name) {
             let err = WitError::PermissionDenied(format!(
                 "service name `{}` is not declared in this plugin's manifest \
@@ -780,6 +789,30 @@ impl host_services::Host for PluginState {
             .map(|meta| meta.info.clone())
     }
 
+    async fn resolve_service(
+        &mut self,
+        plugin_id: String,
+        instance_id: String,
+        service_local_id: String,
+    ) -> Result<ServiceId, WitError> {
+        // H10: stable `(plugin_id, instance_id, local_id)` →
+        // `service_id` lookup. Not owner-scoped by design — a
+        // caller resolves services on other plugins routinely.
+        // Resolution returns the id even if the caller cannot
+        // then invoke it; the `consumes_services` authorization
+        // check runs later in the dispatcher on `call_service`
+        // and is finer-grained (matches on plugin, instance,
+        // local_id, and command).
+        self.services
+            .resolve_by_local_id(&plugin_id, &instance_id, &service_local_id)
+            .ok_or_else(|| {
+                WitError::NotFound(format!(
+                    "no service `{service_local_id}` owned by plugin \
+                     `{plugin_id}` instance `{instance_id}`"
+                ))
+            })
+    }
+
     async fn call_service(
         &mut self,
         target: ServiceId,
@@ -787,14 +820,18 @@ impl host_services::Host for PluginState {
         args: Vec<KeyValue>,
     ) -> Result<CommandResult, WitError> {
         // Phase 7c: route through the dispatcher. Resolves target →
-        // owner, rejects A→…→A cycles, races
-        // `execute-service-command` against the dispatcher timeout,
-        // and holds a `CallGuard` so `remove-service` refuses while
-        // the call is alive.
+        // `(owner_instance, owner_plugin_id, local_id)`, matches
+        // the caller's structured `consumes_services` grants
+        // against `(plugin, instance, local_id, command)`, rejects
+        // same-instance / A→…→A cycles, races
+        // `execute-service-command` against the dispatcher
+        // timeout, and holds a `CallGuard` so `remove-service`
+        // refuses while the call is alive.
         crate::runtime::dispatcher::call_service(
             &self.services,
             &self.instances,
             self.instance_id.clone(),
+            &self.granted_capabilities.consumes_services,
             target,
             command,
             args,

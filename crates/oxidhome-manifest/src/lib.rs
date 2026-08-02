@@ -33,7 +33,7 @@ pub use compatibility::{CompatError, check as check_compatibility};
 pub use config::{ConfigField, ConfigFieldType, ConfigValue, InstanceConfig, merge};
 pub use manifest::{
     CapabilitiesSection, PluginManifest, PluginSection, RestartPolicy, RuntimeSection,
-    UiPermissions, UiSection, World,
+    ServiceGrant, UiPermissions, UiSection, World,
 };
 pub use network::{HostMatch, NetworkRule, NetworkRuleParseError, PortMatch, Proto};
 pub use validate::{ValidationError, WasmPathProblem, validate};

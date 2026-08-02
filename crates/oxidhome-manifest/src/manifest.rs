@@ -138,6 +138,26 @@ pub struct CapabilitiesSection {
     /// ⇒ `register-service` returns `permission-denied`.
     #[serde(default)]
     pub declares_services: Vec<String>,
+    /// H10: structured grants describing which services this plugin
+    /// may invoke via `host-services::call-service`. Each entry is a
+    /// resource selector on `(plugin, instance, service, commands)`;
+    /// a call is authorized when *any* entry matches all four axes.
+    /// Empty / absent ⇒ every cross-plugin `call-service` returns
+    /// `permission-denied` before the callee's
+    /// `execute-service-command` runs.
+    ///
+    /// The dispatch check runs on the target service's
+    /// **immutable** `local-id` (not the human-readable `name`),
+    /// so a callee that renames its service in `update-service`
+    /// cannot silently bypass or shadow a grant.
+    ///
+    /// Same intersection semantics as `declares_devices` /
+    /// `declares_services`: the granted copy in
+    /// `plugin_installation.granted_capabilities_json` overrides
+    /// the manifest so a narrower operator-approved grant applies
+    /// without editing the plugin's manifest.
+    #[serde(default)]
+    pub consumes_services: Vec<ServiceGrant>,
     /// Whether the plugin is allowed to observe the host event bus
     /// via `host-events::subscribe`. `false` (or absent) ⇒ every
     /// `subscribe` call returns `permission-denied`.
@@ -149,6 +169,78 @@ pub struct CapabilitiesSection {
     /// declared in the manifest and reviewable at install time.
     #[serde(default)]
     pub subscribes_events: bool,
+}
+
+/// H10: one resource selector inside `[capabilities] consumes_services`.
+///
+/// Written as an array-of-tables in the manifest so a plugin can
+/// list several distinct grants — different services, different
+/// instances, or different command subsets — without collapsing
+/// them into one plugin-wide toggle:
+///
+/// ```toml
+/// [[capabilities.consumes_services]]
+/// plugin   = "example.service-counter"
+/// instance = "counter"          # or "*" for any live instance
+/// service  = "counter"          # immutable local-id of the target service
+/// commands = ["increment", "get"]  # or ["*"] for any command
+/// ```
+///
+/// The dispatcher authorizes a `call-service` when at least one
+/// grant entry matches all four axes — plugin (exact), instance
+/// (exact or `*`), service local-id (exact — must be immutable),
+/// and command (in the list, or the list contains `*`). Empty
+/// `commands` is *not* implicitly "any"; it means "no commands are
+/// authorized under this grant", so an operator can seed the grant
+/// structure without opening any call path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceGrant {
+    /// `plugin.id` of the target plugin. Exact-match, no wildcards.
+    /// A plugin listing its own id here (self-referential) authorizes
+    /// A→B calls between two instances of the same plugin.
+    pub plugin: String,
+    /// Target instance selector: an exact instance-id (as passed to
+    /// `Engine::start_instance`) or the string `"*"` to match any
+    /// live instance of `plugin`.
+    pub instance: String,
+    /// Target service's `local-id` — the immutable per-plugin key
+    /// the callee chose at `register-service` time. Not the
+    /// human-readable `name`, which `update-service` can change and
+    /// which the dispatcher deliberately does not authorize on.
+    pub service: String,
+    /// Command names this grant authorizes. Either a list of exact
+    /// command names, or a single-element `["*"]` to authorize
+    /// every command the target service exposes.
+    #[serde(default)]
+    pub commands: Vec<String>,
+}
+
+impl ServiceGrant {
+    /// Instance-selector wildcard sentinel.
+    pub const ANY_INSTANCE: &'static str = "*";
+    /// Commands wildcard sentinel — the element written into
+    /// `commands` to authorize every command.
+    pub const ANY_COMMAND: &'static str = "*";
+
+    /// Does this grant authorize a call on the target
+    /// `(plugin, instance, service_local_id, command)` tuple?
+    #[must_use]
+    pub fn matches(
+        &self,
+        plugin: &str,
+        instance: &str,
+        service_local_id: &str,
+        command: &str,
+    ) -> bool {
+        self.plugin == plugin
+            && (self.instance == Self::ANY_INSTANCE || self.instance == instance)
+            && self.service == service_local_id
+            && self
+                .commands
+                .iter()
+                .any(|c| c == Self::ANY_COMMAND || c == command)
+    }
 }
 
 /// What the Phase-6 instance supervisor does after a crash. A "crash"
@@ -418,5 +510,89 @@ wasm = "x.wasm"
     #[derive(Debug, Deserialize)]
     struct TestRestart {
         v: RestartPolicy,
+    }
+}
+
+#[cfg(test)]
+mod service_grant_tests {
+    use super::*;
+
+    fn g(plugin: &str, instance: &str, service: &str, commands: &[&str]) -> ServiceGrant {
+        ServiceGrant {
+            plugin: plugin.into(),
+            instance: instance.into(),
+            service: service.into(),
+            commands: commands.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    /// Exact tuple match: all four axes required.
+    #[test]
+    fn matches_exact_tuple() {
+        let grant = g("example.counter", "a", "counter", &["increment"]);
+        assert!(grant.matches("example.counter", "a", "counter", "increment"));
+        // Wrong on any single axis → no match.
+        assert!(!grant.matches("example.other", "a", "counter", "increment"));
+        assert!(!grant.matches("example.counter", "b", "counter", "increment"));
+        assert!(!grant.matches("example.counter", "a", "different", "increment"));
+        assert!(!grant.matches("example.counter", "a", "counter", "get"));
+    }
+
+    /// `instance = "*"` matches any instance-id.
+    #[test]
+    fn instance_wildcard_matches_any_instance() {
+        let grant = g("example.counter", "*", "counter", &["increment"]);
+        assert!(grant.matches("example.counter", "a", "counter", "increment"));
+        assert!(grant.matches("example.counter", "b", "counter", "increment"));
+        assert!(grant.matches("example.counter", "any-name-here", "counter", "increment"));
+        // Other axes still exact.
+        assert!(!grant.matches("example.other", "a", "counter", "increment"));
+    }
+
+    /// `commands = ["*"]` matches any command.
+    #[test]
+    fn command_wildcard_matches_any_command() {
+        let grant = g("example.counter", "a", "counter", &["*"]);
+        assert!(grant.matches("example.counter", "a", "counter", "increment"));
+        assert!(grant.matches("example.counter", "a", "counter", "get"));
+        assert!(grant.matches("example.counter", "a", "counter", "anything"));
+    }
+
+    /// Empty `commands` authorizes nothing — an operator can seed
+    /// the selector shape without opening any call path.
+    #[test]
+    fn empty_commands_matches_nothing() {
+        let grant = g("example.counter", "*", "counter", &[]);
+        assert!(!grant.matches("example.counter", "a", "counter", "increment"));
+        assert!(!grant.matches("example.counter", "a", "counter", "get"));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        grants: Vec<ServiceGrant>,
+    }
+
+    /// The array-of-tables shape parses from TOML.
+    #[test]
+    fn round_trips_from_array_of_tables() {
+        let toml_src = r#"
+[[grants]]
+plugin   = "example.counter"
+instance = "*"
+service  = "counter"
+commands = ["increment", "get"]
+
+[[grants]]
+plugin   = "example.other"
+instance = "specific"
+service  = "svc"
+commands = ["*"]
+"#;
+        let parsed: Wrapper = toml::from_str(toml_src).expect("parse");
+        assert_eq!(parsed.grants.len(), 2);
+        assert_eq!(parsed.grants[0].plugin, "example.counter");
+        assert_eq!(parsed.grants[0].instance, "*");
+        assert_eq!(parsed.grants[0].commands, vec!["increment", "get"]);
+        assert_eq!(parsed.grants[1].commands, vec!["*"]);
     }
 }

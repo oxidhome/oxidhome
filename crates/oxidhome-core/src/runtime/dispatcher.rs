@@ -50,14 +50,31 @@
 //!    channel close).
 //!
 //! **Instance granularity, not service**: same-instance peer services
-//! (e.g. two scripts inside a scripting plugin) must use the plugin's
-//! *internal* dispatch — going through the host's `call-service`
-//! would queue an `ExecuteService` to the supervisor that's already
-//! parked on us, i.e. deadlock-by-construction.
+//! (e.g. two scripts inside a scripting plugin) are not supported by
+//! `host-services::call-service` — dispatching to a supervisor
+//! already parked on the same call chain is deadlock-by-construction.
+//! Plugins colocating services in one instance dispatch between them
+//! in plugin-local code. H10 upgraded the caller==target case from a
+//! generic "recursion detected" to a documented `same-instance
+//! dispatch is not supported` error, distinct from the multi-hop
+//! A→B→…→A `cycle detected` message.
+//!
+//! **Caller-side capability gate (H10)**: before routing, the
+//! dispatcher checks the target service's
+//! `(owner_plugin_id, owner_instance, local_id)` and the requested
+//! command name against the caller's structured
+//! `[capabilities] consumes_services` grants. A call is authorized
+//! when at least one grant entry matches all four axes (with
+//! `instance` and `commands` supporting `"*"` wildcards). The check
+//! keys off the service's immutable `local-id` so a callee that
+//! renames its service via `update-service` cannot bypass or shadow
+//! a grant. The gate runs before `acquire_call`, so a refused call
+//! spends no refcount and cannot influence `remove-service` timing.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use oxidhome_manifest::ServiceGrant;
 use tokio::task_local;
 
 use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
@@ -122,6 +139,7 @@ pub(crate) const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn call_service_from_host(
     engine: &crate::Engine,
     caller_instance: impl Into<String>,
+    caller_grants: &[ServiceGrant],
     target: ServiceId,
     command: impl Into<String>,
     args: Vec<KeyValue>,
@@ -132,6 +150,7 @@ pub async fn call_service_from_host(
         &services,
         &instances,
         caller_instance.into(),
+        caller_grants,
         target,
         command.into(),
         args,
@@ -142,23 +161,30 @@ pub async fn call_service_from_host(
 /// Entry point for the `host-services::call-service` host impl.
 ///
 /// `caller_instance` identifies *this* instance (from `PluginState`).
-/// `target` is the host-minted `service-id` the caller passed; the
-/// dispatcher resolves it through `services` and hops to the owning
-/// instance's supervisor via `instances`.
+/// `caller_grants` is the caller's `[capabilities] consumes_services`
+/// list, each entry a resource selector on `(plugin, instance,
+/// service_local_id, commands)`. `target` is the host-minted
+/// `service-id` the caller passed; the dispatcher resolves it through
+/// `services`, checks the caller's grants against the target's
+/// `(owner_plugin_id, owner_instance, local_id, command)`, and hops
+/// to the owning instance's supervisor via `instances`.
 pub(crate) async fn call_service(
     services: &Arc<ServiceRegistry>,
     instances: &Arc<InstanceRegistry>,
     caller_instance: String,
+    caller_grants: &[ServiceGrant],
     target: ServiceId,
     command: String,
     args: Vec<KeyValue>,
 ) -> Result<CommandResult, WitError> {
-    // 1. Resolve the target service to its owning instance. The
-    //    dispatcher only needs the owner string to route, not the
-    //    full meta (its `Vec<CommandSpec>` etc.) — `get_owner` is
-    //    the cross-instance owner-only lookup.
-    let target_instance = services
-        .get_owner(&target)
+    // 1. Resolve the target to its full identity tuple:
+    //    `(owner_instance, owner_plugin_id, local_id)`. All three
+    //    are needed — owner_instance to route + cycle-check,
+    //    owner_plugin_id + local_id to authorize against the
+    //    caller's grants on the immutable logical key (not the
+    //    mutable `name`).
+    let (target_instance, target_plugin_id, target_local_id) = services
+        .get_owner_plugin_and_local_id(&target)
         .ok_or_else(|| WitError::NotFound(format!("service {target} not registered")))?;
 
     // 2. Cycle detection at instance granularity.
@@ -174,18 +200,51 @@ pub(crate) async fn call_service(
     //    would queue an `ExecuteService` to a supervisor that can't
     //    process it ⇒ 30s timeout deadlock. Reject up-front instead.
     //
-    //    This also catches the first-hop self-call A→A (empty chain
-    //    + caller == target).
+    //    H10: split the historical "recursion detected" message into
+    //    two — the caller==target case is a WIT-surface contract
+    //    ("same-instance dispatch is not supported"), the multi-hop
+    //    A→B→…→A case is a genuine cycle. Both stay
+    //    `InvalidArgument` on the wire; the distinct messages let
+    //    operators and plugin authors tell them apart.
     let parent_chain: Vec<CallFrame> = CALL_STACK.try_with(Clone::clone).unwrap_or_default();
-    let blocked = caller_instance == target_instance
-        || parent_chain
-            .iter()
-            .any(|f| f.caller_instance == target_instance);
-    if blocked {
+    if caller_instance == target_instance {
         return Err(WitError::InvalidArgument(format!(
-            "recursion detected: instance `{target_instance}` is already on the \
-             call chain (target service `{target}`); same-instance peer services \
-             must use the plugin's internal dispatch, not host-services::call-service"
+            "same-instance dispatch is not supported: target service `{target}` is \
+             owned by the calling instance `{caller_instance}`; dispatch between \
+             services colocated in one instance in plugin-local code instead of \
+             going through host-services::call-service"
+        )));
+    }
+    if parent_chain
+        .iter()
+        .any(|f| f.caller_instance == target_instance)
+    {
+        return Err(WitError::InvalidArgument(format!(
+            "cycle detected: instance `{target_instance}` is already on the \
+             call chain (target service `{target}`); calling back into a \
+             supervisor already parked on a reply would deadlock"
+        )));
+    }
+
+    // 3. H10 structured capability gate. Runs before `acquire_call`
+    //    so a refused call spends no refcount and cannot influence
+    //    `remove-service` timing. Matches on the immutable
+    //    `(plugin, instance, local_id, command)` tuple — a
+    //    callee's `update-service` can't shadow or bypass the
+    //    grant by renaming `name`.
+    if !caller_grants.iter().any(|g| {
+        g.matches(
+            &target_plugin_id,
+            &target_instance,
+            &target_local_id,
+            &command,
+        )
+    }) {
+        return Err(WitError::PermissionDenied(format!(
+            "caller `{caller_instance}` has no `consumes_services` grant \
+             matching target `{target_plugin_id}` instance `{target_instance}` \
+             service `{target_local_id}` command `{command}` — add a matching \
+             `[[capabilities.consumes_services]]` entry to the caller's manifest"
         )));
     }
 
@@ -271,28 +330,46 @@ mod tests {
         }
     }
 
-    fn assert_recursion(err: &WitError) {
-        assert!(
-            matches!(err, WitError::InvalidArgument(_)),
-            "expected InvalidArgument, got {err:?}",
-        );
+    fn assert_msg_contains(err: &WitError, needle: &str) {
         let msg = format!("{err:?}").to_ascii_lowercase();
-        assert!(msg.contains("recursion"), "expected `recursion` in: {msg}");
+        assert!(msg.contains(needle), "expected `{needle}` in: {msg}");
     }
 
-    /// Outermost (empty chain) A→A self-call is rejected — the
-    /// predicate compares `caller_instance == target_instance` for
-    /// the *current* call before consulting the chain.
+    /// Build a `ServiceGrant` that authorizes `command` on the
+    /// `(plugin, instance='*', service=local_id)` tuple — used by
+    /// the dispatcher tests that want to exercise the same-instance
+    /// / cycle checks *after* the auth gate passes.
+    fn grant_any(plugin: &str, local_id: &str, command: &str) -> ServiceGrant {
+        ServiceGrant {
+            plugin: plugin.into(),
+            instance: ServiceGrant::ANY_INSTANCE.into(),
+            service: local_id.into(),
+            commands: vec![command.into()],
+        }
+    }
+
+    /// H10: outermost (empty chain) A→A self-call is rejected with a
+    /// documented same-instance error, not "recursion". The caller's
+    /// grant authorizes the call so the same-instance check (which
+    /// runs *after* the grant check) is what fires.
     #[tokio::test(flavor = "current_thread")]
-    async fn rejects_outermost_self_call() {
+    async fn rejects_outermost_self_call_as_same_instance() {
         let services = Arc::new(ServiceRegistry::new());
-        let svc = services.register("alpha".into(), fixture_info("ring"));
+        let svc = services
+            .register(
+                "alpha".into(),
+                "com.example.alpha".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
         let instances = Arc::new(InstanceRegistry::new());
+        let grants = [grant_any("com.example.alpha", "ring", "kick")];
 
         let err = call_service(
             &services,
             &instances,
             "alpha".into(),
+            &grants,
             svc.clone(),
             "kick".into(),
             Vec::new(),
@@ -300,23 +377,35 @@ mod tests {
         .await
         .expect_err("self-call must be rejected");
 
-        assert_recursion(&err);
-        // Refcount stays 0 — the bail happens before `acquire_call`.
+        assert!(
+            matches!(err, WitError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}",
+        );
+        assert_msg_contains(&err, "same-instance dispatch is not supported");
         assert_eq!(services.active_call_count(&svc), 0);
     }
 
-    /// Cross-task cycle: A's supervisor is already parked awaiting
-    /// B's reply (frame `{caller:A, target:B}` on the stack). B's
-    /// wasm now tries to call back into A. The dispatcher must
-    /// reject because A is on the *blocked-callers* set — without
-    /// the fix, this would have queued an `ExecuteService` to A's
-    /// already-parked supervisor and deadlocked for 30 s.
+    /// Cross-task A→B→A cycle. Kept as `cycle detected` (distinct
+    /// from the same-instance case).
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_blocked_caller_cycle() {
         let services = Arc::new(ServiceRegistry::new());
-        let a_svc = services.register("alpha".into(), fixture_info("ring"));
-        let _b_svc = services.register("beta".into(), fixture_info("ring"));
+        let a_svc = services
+            .register(
+                "alpha".into(),
+                "com.example.alpha".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let _b_svc = services
+            .register(
+                "beta".into(),
+                "com.example.beta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
         let instances = Arc::new(InstanceRegistry::new());
+        let grants = [grant_any("com.example.alpha", "ring", "kick")];
 
         let chain = vec![CallFrame {
             caller_instance: "alpha".into(),
@@ -324,9 +413,6 @@ mod tests {
             target_service: "irrelevant".into(),
         }];
 
-        // B's wasm calls A's service. `CALL_STACK` is scoped — exactly
-        // what the callee's supervisor does in `handle_control`'s
-        // `ExecuteService` arm.
         let err = CALL_STACK
             .scope(
                 chain,
@@ -334,6 +420,7 @@ mod tests {
                     &services,
                     &instances,
                     "beta".into(),
+                    &grants,
                     a_svc.clone(),
                     "kick".into(),
                     Vec::new(),
@@ -342,24 +429,169 @@ mod tests {
             .await
             .expect_err("cycle must be rejected");
 
-        assert_recursion(&err);
+        assert!(
+            matches!(err, WitError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}",
+        );
+        assert_msg_contains(&err, "cycle detected");
         assert_eq!(services.active_call_count(&a_svc), 0);
     }
 
+    /// H10: structured capability gate. Absent grant → refused
+    /// before any routing / refcount work. Mismatched grant
+    /// (wrong plugin, wrong instance, wrong service, or wrong
+    /// command) → also refused. Refcount never bumped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_call_without_matching_grant() {
+        let services = Arc::new(ServiceRegistry::new());
+        let target = services
+            .register(
+                "beta".into(),
+                "com.example.beta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let instances = Arc::new(InstanceRegistry::new());
+
+        // Empty grants — every call is refused.
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            &[],
+            target.clone(),
+            "kick".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("empty grants must refuse");
+        assert!(matches!(err, WitError::PermissionDenied(_)));
+        assert_msg_contains(&err, "consumes_services");
+        assert_eq!(services.active_call_count(&target), 0);
+
+        // Right plugin, wrong command.
+        let wrong_command = [ServiceGrant {
+            plugin: "com.example.beta".into(),
+            instance: "*".into(),
+            service: "ring".into(),
+            commands: vec!["not-kick".into()],
+        }];
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            &wrong_command,
+            target.clone(),
+            "kick".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("mismatched command must refuse");
+        assert!(matches!(err, WitError::PermissionDenied(_)));
+        assert_eq!(services.active_call_count(&target), 0);
+
+        // Right plugin + command, but instance selector doesn't match.
+        let wrong_instance = [ServiceGrant {
+            plugin: "com.example.beta".into(),
+            instance: "not-beta".into(),
+            service: "ring".into(),
+            commands: vec!["kick".into()],
+        }];
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            &wrong_instance,
+            target.clone(),
+            "kick".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("mismatched instance must refuse");
+        assert!(matches!(err, WitError::PermissionDenied(_)));
+        assert_eq!(services.active_call_count(&target), 0);
+
+        // Right plugin + command + instance, but service local_id
+        // doesn't match.
+        let wrong_service = [ServiceGrant {
+            plugin: "com.example.beta".into(),
+            instance: "*".into(),
+            service: "other-service".into(),
+            commands: vec!["kick".into()],
+        }];
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            &wrong_service,
+            target.clone(),
+            "kick".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("mismatched service local_id must refuse");
+        assert!(matches!(err, WitError::PermissionDenied(_)));
+        assert_eq!(services.active_call_count(&target), 0);
+    }
+
+    /// H10: the `"*"` wildcard on `commands` authorizes every
+    /// command. The dispatcher then proceeds past the grant check
+    /// and hits the next stop (`Unavailable` — beta has no live
+    /// instance handle in this in-process test).
+    #[tokio::test(flavor = "current_thread")]
+    async fn wildcard_command_grant_authorizes_any_command() {
+        let services = Arc::new(ServiceRegistry::new());
+        let target = services
+            .register(
+                "beta".into(),
+                "com.example.beta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let instances = Arc::new(InstanceRegistry::new());
+        let grants = [ServiceGrant {
+            plugin: "com.example.beta".into(),
+            instance: "*".into(),
+            service: "ring".into(),
+            commands: vec!["*".into()],
+        }];
+
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            &grants,
+            target.clone(),
+            "anything".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("beta isn't running, so we get Unavailable past the grant check");
+
+        assert!(
+            matches!(err, WitError::Unavailable(_)),
+            "expected Unavailable, got {err:?}",
+        );
+    }
+
     /// Sanity: a linear, non-cyclic chain A→B→C→D — where D's owner
-    /// is *not* on the existing caller-set {A,B,C} — passes the cycle
-    /// check. The call then reaches `instances.get(...)` and fails
-    /// there with `Unavailable` (delta has no real handle in this
-    /// in-process test), which is the proof the check let it through.
+    /// is *not* on the existing caller-set {A,B,C} — passes both the
+    /// `consumes_services` check (grant lists delta's plugin) and the
+    /// cycle check. The call then reaches `instances.get(...)` and
+    /// fails there with `Unavailable`.
     #[tokio::test(flavor = "current_thread")]
     async fn permits_non_cyclic_chain() {
         let services = Arc::new(ServiceRegistry::new());
         let instances = Arc::new(InstanceRegistry::new());
-        let delta_svc = services.register("delta".into(), fixture_info("ring"));
+        let delta_svc = services
+            .register(
+                "delta".into(),
+                "com.example.delta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let grants = [grant_any("com.example.delta", "ring", "kick")];
 
-        // Chain represents A→B→C in flight on gamma's task — gamma is
-        // the current caller. The new target is delta, which is not
-        // on the caller-set {alpha, beta, gamma}.
         let chain = vec![
             CallFrame {
                 caller_instance: "alpha".into(),
@@ -379,6 +611,7 @@ mod tests {
                     &services,
                     &instances,
                     "gamma".into(),
+                    &grants,
                     delta_svc.clone(),
                     "kick".into(),
                     Vec::new(),
@@ -387,8 +620,6 @@ mod tests {
             .await
             .expect_err("delta isn't a real instance, so we get Unavailable");
 
-        // Reached the `instances.get(...)` step — proves the cycle
-        // check let it through.
         assert!(
             matches!(err, WitError::Unavailable(_)),
             "expected Unavailable (delta not running), got {err:?}",
