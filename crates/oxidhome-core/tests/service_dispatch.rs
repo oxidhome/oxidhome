@@ -204,6 +204,10 @@ async fn cross_task_cycle_is_rejected_promptly() {
         dispatcher::call_service_from_host(
             &engine,
             "test-driver",
+            // Host-driven test grant — the wasm-to-wasm hops below
+            // use the bouncer's own manifest grant. This one only
+            // authorizes the outermost driver→A call.
+            &["example.service-bouncer".to_string()],
             svc_a.clone(),
             "kick",
             Vec::new(),
@@ -223,15 +227,17 @@ async fn cross_task_cycle_is_rejected_promptly() {
     // dispatcher's `InvalidArgument` from the cycle check. So the
     // outermost call returns `Ok(CommandResult::Err(InvalidArgument))`
     // — the dispatcher itself sees A's wasm finishing normally.
+    // H10: the multi-hop case surfaces as "cycle detected" (was
+    // "recursion detected" before the same-instance rename).
     match outcome {
         Ok(CommandResult::Err(WitError::InvalidArgument(msg))) => {
             assert!(
-                msg.to_ascii_lowercase().contains("recursion"),
-                "expected `recursion` in: {msg}",
+                msg.to_ascii_lowercase().contains("cycle detected"),
+                "expected `cycle detected` in: {msg}",
             );
         }
         other => panic!(
-            "expected the cycle to surface as Ok(CommandResult::Err(InvalidArgument(\"recursion ...\"))), got {other:?}",
+            "expected the cycle to surface as Ok(CommandResult::Err(InvalidArgument(\"cycle detected ...\"))), got {other:?}",
         ),
     }
 
@@ -241,4 +247,80 @@ async fn cross_task_cycle_is_rejected_promptly() {
 
     alpha.stop().await.expect("stop alpha");
     beta.stop().await.expect("stop beta");
+}
+
+/// H10: caller-side authorization. Runs the same round-trip as
+/// `cross_plugin_call_service_round_trips` but with the caller
+/// staged against a manifest that omits `consumes_services`. The
+/// dispatcher must refuse with `PermissionDenied` before the callee
+/// runs, and the callee's `active_call_count` must remain 0 (grant
+/// gate runs before `acquire_call`).
+#[tokio::test(flavor = "multi_thread")]
+async fn call_service_without_consumes_services_grant_is_denied() {
+    let counter_wasm = support::build_example("service-counter", "service_counter.wasm");
+    let caller_wasm = support::build_example("service-caller", "service_caller.wasm");
+    let state_dir = support::tempdir("dispatch-grant-state");
+    let engine = oxidhome_core::Engine::with_state_dir(state_dir.path()).expect("engine");
+
+    // Start the counter from its real install dir.
+    let counter_dir = support::workspace_root()
+        .join("examples")
+        .join("service-counter");
+    let counter = engine
+        .start_instance(counter_dir, "counter", None)
+        .await
+        .expect("start counter");
+    counter.wait_for_running().await.expect("counter Running");
+    let target_id = await_service_id(&engine).await;
+
+    // Stage the caller against a manifest that has NO consumes_services
+    // grant. Same wasm, different install identity — the plugin.id
+    // differs so it doesn't shadow the real service-caller install.
+    let staged = support::stage_plugin(
+        "svc-caller-no-grant",
+        &caller_wasm,
+        "service_caller.wasm",
+        r#"manifest_version = 1
+[plugin]
+id = "example.service-caller-no-grant"
+name = "Bare Service Caller"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "service_caller.wasm"
+[capabilities]
+# No consumes_services — every call-service must return permission-denied.
+storage_quota_kb = 4
+[config.target_service_id]
+type = "string"
+description = "Target"
+"#,
+    );
+
+    let overrides: toml::Value =
+        toml::from_str(&format!("target_service_id = \"{target_id}\"\n")).expect("overrides parse");
+    let caller = engine
+        .start_instance(staged.path().to_path_buf(), "caller", Some(overrides))
+        .await
+        .expect("start caller");
+
+    match caller.wait_terminal().await {
+        oxidhome_core::InstanceState::Failed { error } => {
+            let lower = error.to_ascii_lowercase();
+            assert!(
+                lower.contains("permission")
+                    && lower.contains("consumes_services")
+                    && lower.contains("example.service-counter"),
+                "expected permission-denied naming consumes_services + target plugin, got: {error}",
+            );
+        }
+        other => panic!("expected Failed (grant denies the call), got {other:?}"),
+    }
+
+    // Grant check runs before `acquire_call` — refcount never bumped.
+    assert_eq!(engine.services().active_call_count(&target_id), 0);
+
+    counter.stop().await.expect("stop counter");
+    drop(counter_wasm);
 }

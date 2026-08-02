@@ -149,22 +149,53 @@ pub fn get_service(id: &ServiceId) -> Result<ServiceInfo, Error> {
     host_services::get_service(id)
 }
 
-/// Synchronously call a service command — on another plugin or on this
-/// one. The host routes `target` to its owning instance and returns the
-/// result.
+/// H10: resolve a stable `(plugin_id, instance_id, service_name)`
+/// address to the currently-registered `service-id`. `service-id`
+/// values are per-run — the host mints a fresh `svc-N` on every
+/// register — so callers persist the three-tuple and re-resolve on
+/// demand across restarts.
 ///
-/// **Same-instance peer services must use the plugin's internal
-/// dispatch** — going through `call_service` to a service the
-/// calling instance also owns is rejected up-front with
-/// [`Error::InvalidArgument`] (the host would otherwise have to
-/// re-enter the calling instance's single `Store` and deadlock).
+/// Resolution does not imply the caller may then invoke the service:
+/// the dispatcher's [`call_service`] authorization runs against the
+/// caller's `[capabilities] consumes_services` grant.
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] (no such service), [`Error::PermissionDenied`]
-/// (call not allowed), [`Error::InvalidArgument`] (cycle / same-
-/// instance call / bad args), [`Error::Unavailable`] (owner down or
-/// dispatch timed out).
+/// [`Error::NotFound`] if no running service owned by the given
+/// `(plugin_id, instance_id)` currently registers under `service_name`.
+pub fn resolve_service(
+    plugin_id: &str,
+    instance_id: &str,
+    service_name: &str,
+) -> Result<ServiceId, Error> {
+    host_services::resolve_service(plugin_id, instance_id, service_name)
+}
+
+/// Synchronously call another plugin's service command. The host
+/// routes `target` to its owning instance and returns the result.
+///
+/// **Caller-side capability gate.** The dispatcher checks that the
+/// target service's owning `plugin.id` appears in the *caller's*
+/// manifest under `[capabilities] consumes_services`. A call from a
+/// plugin whose grant doesn't cover the target's owner plugin
+/// returns [`Error::PermissionDenied`] before the callee's
+/// `execute-service-command` runs.
+///
+/// **Same-instance dispatch is not supported.** Going through
+/// `call_service` to a service the calling instance also owns
+/// returns [`Error::InvalidArgument`] with the message
+/// `same-instance dispatch is not supported`. Plugins colocating
+/// multiple services in one instance dispatch between them in
+/// plugin-local code.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] (no such service),
+/// [`Error::PermissionDenied`] (caller's `consumes_services` grant
+/// doesn't cover the target's owner plugin),
+/// [`Error::InvalidArgument`] (same-instance target, A→…→A cycle,
+/// or bad command/args), [`Error::Unavailable`] (owner not running
+/// or dispatch timed out).
 pub fn call_service(
     target: &ServiceId,
     command: &str,

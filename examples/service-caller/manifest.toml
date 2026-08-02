@@ -17,9 +17,12 @@ wasm = "target/wasm32-wasip2/debug/service_caller.wasm"
 
 [capabilities]
 # The caller only *invokes* services; it doesn't register any of its
-# own, so `declares_services` stays empty. (`call-service` isn't gated
-# by a manifest allowlist in Phase 7 — gating by target existence +
-# recursion check; see the Phase-7 plan.)
+# own, so `declares_services` stays empty. H10 added a caller-side
+# grant: `consumes_services` lists the plugin ids whose services this
+# plugin may call. Without it, `call-service` returns
+# `permission-denied` before the callee's `execute-service-command`
+# runs.
+consumes_services = ["example.service-counter"]
 storage_quota_kb = 4
 
 [config.target_service_id]

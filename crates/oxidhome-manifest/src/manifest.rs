@@ -138,6 +138,23 @@ pub struct CapabilitiesSection {
     /// ⇒ `register-service` returns `permission-denied`.
     #[serde(default)]
     pub declares_services: Vec<String>,
+    /// H10: plugin ids whose services this plugin may call via
+    /// `host-services::call-service`. Empty / absent ⇒ every
+    /// cross-plugin `call-service` returns `permission-denied`,
+    /// even after a successful `resolve-service`. Self-referential
+    /// entries are allowed (a plugin listing its own `plugin.id`
+    /// so instance A can call instance B of the same plugin —
+    /// two script instances, or the H10-round-2 review's
+    /// two-instance service-bouncer test).
+    ///
+    /// Same shape as `declares_devices` / `declares_services`:
+    /// simple list of strings that the operator reviews at install
+    /// time, and the granted copy in
+    /// `plugin_installation.granted_capabilities_json` overrides
+    /// the manifest so a narrower grant can be applied without
+    /// editing the plugin's manifest.
+    #[serde(default)]
+    pub consumes_services: Vec<String>,
     /// Whether the plugin is allowed to observe the host event bus
     /// via `host-events::subscribe`. `false` (or absent) ⇒ every
     /// `subscribe` call returns `permission-denied`.

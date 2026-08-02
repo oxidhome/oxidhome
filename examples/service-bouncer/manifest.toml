@@ -21,5 +21,10 @@ wasm = "target/wasm32-wasip2/debug/service_bouncer.wasm"
 
 [capabilities]
 declares_services = ["bouncer"]
+# H10: self-referential `consumes_services` grant so instance A can
+# call instance B of the same plugin. This is the H1-cycle test's
+# actual call shape (alpha → beta → alpha), which the dispatcher then
+# rejects on the second hop as a cycle.
+consumes_services = ["example.service-bouncer"]
 # Bouncer reads `bounce_to` from KV — give it a tiny per-instance quota.
 storage_quota_kb = 4

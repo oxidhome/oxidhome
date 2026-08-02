@@ -715,18 +715,70 @@ interface host-services {
   /// `error::not-found(...)` if the id is unknown to this plugin.
   get-service:      func(id: service-id) -> result<service-info, error>;
 
-  /// Synchronously call another plugin's (or this plugin's own) service
-  /// command. The host routes `target` → owning instance, races its
-  /// `execute-service-command` export against a timeout, and returns the
-  /// result.
+  /// H10: stable resolution by logical address `(plugin-id,
+  /// instance-id, service-name)`. `service-id` values are per-run
+  /// — the host mints a fresh `svc-N` on every register — so a
+  /// caller cannot persist a `service-id` and expect it to resolve
+  /// across a restart. All three components of the logical
+  /// address are stable across restarts:
+  ///
+  /// - `plugin-id` — fixed by the callee's `plugin.id` manifest field.
+  /// - `instance-id` — the operator-chosen instance name passed to
+  ///   `Engine::start_instance`; already keys per-instance KV /
+  ///   blob storage.
+  /// - `service-name` — a capability the callee declared under
+  ///   `[capabilities] declares_services`.
+  ///
+  /// The `(plugin-id, service-name)` pair alone is *not* unique —
+  /// multiple instances of one plugin can each register the same
+  /// service name (OxidHome supports multi-instance plugins by
+  /// design). `instance-id` disambiguates them; callers that don't
+  /// care which instance handles a call must still commit to one
+  /// at address time.
+  ///
+  /// **Resolution does not imply the caller may then invoke the
+  /// service.** The dispatcher's own authorization check on
+  /// `call-service` runs against the caller's `[capabilities]
+  /// consumes_services` grant, so exposing the id here is safe.
+  ///
+  /// Errors: `not-found` if no running service owned by the given
+  /// `(plugin-id, instance-id)` currently registers as
+  /// `service-name`.
+  resolve-service: func(
+    plugin-id: string,
+    instance-id: string,
+    service-name: string,
+  ) -> result<service-id, error>;
+
+  /// Synchronously call another plugin's service command. The host
+  /// routes `target` → owning instance, races its
+  /// `execute-service-command` export against a timeout, and returns
+  /// the result.
+  ///
+  /// **Caller-side capability gate (H10).** The dispatcher
+  /// authorizes the call by checking that the target service's
+  /// owning `plugin.id` appears in the *caller's* manifest under
+  /// `[capabilities] consumes_services`. A call from a plugin
+  /// whose grant doesn't cover the target's owner plugin returns
+  /// `permission-denied` before any `execute-service-command`
+  /// runs. Self-referential grants are allowed (a plugin listing
+  /// its own `plugin.id` so instance A can call instance B of
+  /// the same plugin).
+  ///
+  /// **Same-instance dispatch is not supported.** A supervisor task
+  /// drives exactly one wasm store; routing back through the host
+  /// to a service the caller's own instance owns would queue an
+  /// `ExecuteService` message to a supervisor already parked on the
+  /// caller — deadlock by construction. The host rejects such calls
+  /// up-front with `invalid-argument`. Plugins that colocate
+  /// multiple services in one instance dispatch between them in
+  /// plugin-local code, without going through this call.
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
-  /// (call not allowed); `invalid-argument` (recursion `A→…→A`, or the
-  /// command/args were rejected); `unavailable` (owner not running, or
-  /// the call timed out).
-  ///
-  /// NOTE: Phase 7b ships this signature with a stub host impl that
-  /// returns `unavailable`; the routing dispatcher lands in 7c.
+  /// (caller's `consumes_services` grant does not cover the
+  /// target's owner plugin); `invalid-argument` (same-instance
+  /// target, A→…→A cycle, or the command/args were rejected);
+  /// `unavailable` (owner not running, or the call timed out).
   call-service: func(
     target: service-id,
     command: string,

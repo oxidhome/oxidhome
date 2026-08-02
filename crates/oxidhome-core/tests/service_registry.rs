@@ -138,9 +138,17 @@ async fn remove_by_owner_scopes_to_one_instance() {
         metadata: Vec::new(),
         commands: Vec::new(),
     };
-    let _a1 = reg.register("alpha".into(), info("counter-a1"));
-    let _a2 = reg.register("alpha".into(), info("counter-a2"));
-    let _b1 = reg.register("beta".into(), info("counter-b1"));
+    let _a1 = reg.register(
+        "alpha".into(),
+        "com.example.alpha".into(),
+        info("counter-a1"),
+    );
+    let _a2 = reg.register(
+        "alpha".into(),
+        "com.example.alpha".into(),
+        info("counter-a2"),
+    );
+    let _b1 = reg.register("beta".into(), "com.example.beta".into(), info("counter-b1"));
     assert_eq!(reg.list().len(), 3);
 
     let removed = reg.remove_by_owner("alpha");
@@ -155,4 +163,64 @@ async fn remove_by_owner_scopes_to_one_instance() {
 
     // Idempotent — a second sweep finds nothing.
     assert_eq!(reg.remove_by_owner("alpha"), 0);
+}
+
+/// H10: `ServiceRegistry::resolve_by_name` requires all three
+/// components `(plugin_id, instance_id, service_name)` to disambiguate
+/// same-plugin multi-instance registrations. Verifies the end-to-end
+/// wiring so a caller can persist that three-tuple and re-resolve
+/// across restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_by_name_returns_registered_service_id() {
+    let _wasm = support::build_example("service-counter", "service_counter.wasm");
+    let plugin_dir = support::workspace_root()
+        .join("examples")
+        .join("service-counter");
+    let engine = Engine::new().expect("engine");
+
+    let mut instance = PluginInstance::load(&engine, &plugin_dir, "service_counter")
+        .await
+        .expect("load");
+    instance.init().await.expect("init registers the service");
+
+    // `examples/service-counter/manifest.toml` sets plugin.id to
+    // `example.service-counter`; `PluginInstance::load` passed
+    // `service_counter` as the instance_id above; the plugin's `init`
+    // registers a service named `counter`.
+    let resolved = engine
+        .services()
+        .resolve_by_name("example.service-counter", "service_counter", "counter")
+        .expect("resolve_by_name should find the registered service");
+    let listed = engine.services().list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        resolved, listed[0].id,
+        "resolve_by_name must return the current svc-N",
+    );
+
+    // Wrong instance_id → None (H10 core: (plugin_id, name) alone
+    // is not unique when multiple instances exist).
+    assert_eq!(
+        engine.services().resolve_by_name(
+            "example.service-counter",
+            "not-this-instance",
+            "counter"
+        ),
+        None,
+    );
+    // Wrong plugin_id / wrong name → None.
+    assert_eq!(
+        engine
+            .services()
+            .resolve_by_name("example.does-not-exist", "service_counter", "counter"),
+        None,
+    );
+    assert_eq!(
+        engine
+            .services()
+            .resolve_by_name("example.service-counter", "service_counter", "nope"),
+        None,
+    );
+
+    instance.shutdown().await.expect("shutdown");
 }
