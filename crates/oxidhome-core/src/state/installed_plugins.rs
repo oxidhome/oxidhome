@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use oxidhome_manifest::{CapabilitiesSection, PluginManifest};
+use oxidhome_manifest::{CapabilitiesSection, PluginManifest, ServiceGrant};
 use rand::TryRng;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
@@ -268,15 +268,13 @@ fn read_no_follow_within(root: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
 /// no longer needs it.
 ///
 /// Set-shaped fields (`network`, `declares_devices`,
-/// `declares_services`, `consumes_services`) intersect on equality;
-/// quotas take the minimum; `subscribes_events` is a boolean AND.
-/// `consumes_services` intersects on whole-record equality
-/// (`ServiceGrant` derives `PartialEq`) so an operator can drop a
-/// specific selector without silently widening any other. Making a
-/// grant *narrower* (e.g. dropping a command from `commands`) reads
-/// as a different record and therefore drops out of the intersection
-/// — operators write the exact intended selector into the granted
-/// copy rather than editing entries in place.
+/// `declares_services`) intersect on equality; quotas take the
+/// minimum; `subscribes_events` is a boolean AND;
+/// `consumes_services` intersects **semantically** per
+/// [`intersect_service_grants`] so a plugin that requests
+/// wildcards can be narrowed to a specific instance / command set
+/// by the operator without the entry dropping out of the
+/// intersection entirely (H10 round-3, finding 1).
 #[must_use]
 pub fn effective_capabilities(
     requested: &CapabilitiesSection,
@@ -291,7 +289,7 @@ pub fn effective_capabilities(
             &requested.declares_services,
             &granted.declares_services,
         ),
-        consumes_services: intersect_by_eq(
+        consumes_services: intersect_service_grants(
             &requested.consumes_services,
             &granted.consumes_services,
         ),
@@ -301,6 +299,90 @@ pub fn effective_capabilities(
 
 fn intersect_by_eq<T: Clone + PartialEq>(a: &[T], b: &[T]) -> Vec<T> {
     a.iter().filter(|x| b.contains(x)).cloned().collect()
+}
+
+/// H10 round-3 finding 1: semantic intersection of `ServiceGrant`
+/// lists. Whole-record equality broke wildcard-narrowing — a
+/// plugin requesting `{instance="*", commands=["*"]}` and an
+/// operator writing `{instance="foo", commands=["get"]}` produced
+/// an empty intersection instead of the intended
+/// `{instance="foo", commands=["get"]}`.
+///
+/// For every pair of requested × granted entries with matching
+/// `plugin` + `service` (both are exact-match fields):
+///
+/// - `instance` and `caller_instance` selectors intersect: `"*"`
+///   ∩ `X` = `X`; `X` ∩ `X` = `X`; `X` ∩ `Y` = no overlap.
+/// - `commands` intersect as sets, treating `"*"` as the
+///   universal set (`"*"` ∩ `["a","b"]` = `["a","b"]`; both `"*"`
+///   → `["*"]`).
+///
+/// Entries with no overlap on any axis are dropped; overlapping
+/// entries produce one narrowed output grant. Duplicate output
+/// grants (from the requested × granted product) are deduplicated
+/// on `PartialEq`.
+#[must_use]
+pub fn intersect_service_grants(
+    requested: &[ServiceGrant],
+    granted: &[ServiceGrant],
+) -> Vec<ServiceGrant> {
+    let mut out: Vec<ServiceGrant> = Vec::new();
+    for r in requested {
+        for g in granted {
+            if r.plugin != g.plugin || r.service != g.service {
+                continue;
+            }
+            let Some(instance) = intersect_selector(&r.instance, &g.instance) else {
+                continue;
+            };
+            let Some(caller_instance) = intersect_selector(&r.caller_instance, &g.caller_instance)
+            else {
+                continue;
+            };
+            let commands = intersect_commands(&r.commands, &g.commands);
+            if commands.is_empty() {
+                continue;
+            }
+            let narrowed = ServiceGrant {
+                plugin: r.plugin.clone(),
+                instance,
+                service: r.service.clone(),
+                commands,
+                caller_instance,
+            };
+            if !out.contains(&narrowed) {
+                out.push(narrowed);
+            }
+        }
+    }
+    out
+}
+
+fn intersect_selector(a: &str, b: &str) -> Option<String> {
+    match (a, b) {
+        (ServiceGrant::ANY, other) | (other, ServiceGrant::ANY) => Some(other.to_string()),
+        (a, b) if a == b => Some(a.to_string()),
+        _ => None,
+    }
+}
+
+fn intersect_commands(a: &[String], b: &[String]) -> Vec<String> {
+    let a_any = a.iter().any(|c| c == ServiceGrant::ANY_COMMAND);
+    let b_any = b.iter().any(|c| c == ServiceGrant::ANY_COMMAND);
+    match (a_any, b_any) {
+        (true, true) => vec![ServiceGrant::ANY_COMMAND.into()],
+        (true, false) => b
+            .iter()
+            .filter(|c| c.as_str() != ServiceGrant::ANY_COMMAND)
+            .cloned()
+            .collect(),
+        (false, true) => a
+            .iter()
+            .filter(|c| c.as_str() != ServiceGrant::ANY_COMMAND)
+            .cloned()
+            .collect(),
+        (false, false) => a.iter().filter(|c| b.contains(c)).cloned().collect(),
+    }
 }
 
 /// Mint a fresh installation UUID. Format: `inst-<32 lowercase hex>`
@@ -2346,6 +2428,117 @@ wasm = "plugin.wasm"
         };
         let effective = effective_capabilities(&requested, &narrow);
         assert!(!effective.subscribes_events);
+    }
+
+    /// H10 round-3 finding 1: semantic intersection for
+    /// `consumes_services`. A plugin requesting `{instance="*",
+    /// commands=["*"]}` narrowed by an operator's
+    /// `{instance="foo", commands=["get"]}` produces the
+    /// intersection `{instance="foo", commands=["get"]}`, not
+    /// empty. Whole-record equality would have dropped it.
+    #[test]
+    fn intersect_service_grants_narrows_wildcards() {
+        let requested = vec![ServiceGrant {
+            plugin: "example.counter".into(),
+            instance: "*".into(),
+            service: "counter".into(),
+            commands: vec!["*".into()],
+            caller_instance: "*".into(),
+        }];
+        let granted = vec![ServiceGrant {
+            plugin: "example.counter".into(),
+            instance: "foo".into(),
+            service: "counter".into(),
+            commands: vec!["get".into()],
+            caller_instance: "*".into(),
+        }];
+        let out = intersect_service_grants(&requested, &granted);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].instance, "foo");
+        assert_eq!(out[0].commands, vec!["get".to_string()]);
+    }
+
+    /// H10 round-3 finding 1: commands are set-intersected.
+    /// Requested `["increment", "get"]` ∩ granted `["get",
+    /// "reset"]` = `["get"]`.
+    #[test]
+    fn intersect_service_grants_commands_are_set_intersected() {
+        let requested = vec![ServiceGrant {
+            plugin: "example.counter".into(),
+            instance: "*".into(),
+            service: "counter".into(),
+            commands: vec!["increment".into(), "get".into()],
+            caller_instance: "*".into(),
+        }];
+        let granted = vec![ServiceGrant {
+            plugin: "example.counter".into(),
+            instance: "*".into(),
+            service: "counter".into(),
+            commands: vec!["get".into(), "reset".into()],
+            caller_instance: "*".into(),
+        }];
+        let out = intersect_service_grants(&requested, &granted);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].commands, vec!["get".to_string()]);
+    }
+
+    /// H10 round-3 finding 1: no overlap on the exact axes
+    /// (plugin, service) → the pair drops out of the intersection.
+    /// Mismatched instance selectors (both exact) also drop.
+    #[test]
+    fn intersect_service_grants_drops_disjoint_pairs() {
+        let requested = vec![
+            ServiceGrant {
+                plugin: "example.counter".into(),
+                instance: "foo".into(),
+                service: "counter".into(),
+                commands: vec!["get".into()],
+                caller_instance: "*".into(),
+            },
+            ServiceGrant {
+                plugin: "example.other".into(),
+                instance: "*".into(),
+                service: "svc".into(),
+                commands: vec!["ping".into()],
+                caller_instance: "*".into(),
+            },
+        ];
+        let granted = vec![ServiceGrant {
+            plugin: "example.counter".into(),
+            instance: "bar".into(), // exact and disjoint from "foo"
+            service: "counter".into(),
+            commands: vec!["get".into()],
+            caller_instance: "*".into(),
+        }];
+        let out = intersect_service_grants(&requested, &granted);
+        // requested[0] × granted[0]: instance foo ∩ bar = empty → drop.
+        // requested[1] × granted[0]: different plugin → drop.
+        assert!(out.is_empty(), "expected empty intersection, got {out:?}");
+    }
+
+    /// H10 round-3 finding 2: `caller_instance` narrowing.
+    /// Operator narrows a plugin's `caller_instance = "*"` down to
+    /// a specific caller, and the narrowed grant carries that
+    /// selector through the intersection.
+    #[test]
+    fn intersect_service_grants_narrows_caller_instance() {
+        let requested = vec![ServiceGrant {
+            plugin: "example.counter".into(),
+            instance: "*".into(),
+            service: "counter".into(),
+            commands: vec!["*".into()],
+            caller_instance: "*".into(),
+        }];
+        let granted = vec![ServiceGrant {
+            plugin: "example.counter".into(),
+            instance: "*".into(),
+            service: "counter".into(),
+            commands: vec!["*".into()],
+            caller_instance: "caller-a".into(),
+        }];
+        let out = intersect_service_grants(&requested, &granted);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].caller_instance, "caller-a");
     }
 
     /// C5 review F3: install must derive the grant from the

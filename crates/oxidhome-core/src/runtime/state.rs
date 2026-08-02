@@ -715,6 +715,26 @@ fn service_name_declared(declared: &[String], name: &str) -> bool {
     declared.iter().any(|d| d == name)
 }
 
+/// H10 round-3 finding 3: reject `"*"` command names on
+/// `register_service` / `update_service`. `"*"` is the reserved
+/// wildcard sentinel in `ServiceGrant.commands`; letting a
+/// service register a command literally named `"*"` would create
+/// a real command that no grant can name distinctly from
+/// "authorize every command".
+fn check_no_wildcard_command_names(info: &ServiceInfo) -> Result<(), WitError> {
+    for cmd in &info.commands {
+        if cmd.name == oxidhome_manifest::ServiceGrant::ANY_COMMAND {
+            return Err(WitError::InvalidArgument(format!(
+                "command name `{}` is reserved (wildcard sentinel in \
+                 `[[capabilities.consumes_services]]` grants); pick a \
+                 different name",
+                cmd.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl host_services::Host for PluginState {
     async fn register_service(&mut self, info: ServiceInfo) -> Result<ServiceId, WitError> {
         if !service_name_declared(&self.granted_capabilities.declares_services, &info.name) {
@@ -731,6 +751,7 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
+        check_no_wildcard_command_names(&info)?;
         // H10: registry now enforces `(owner_instance, local_id)`
         // uniqueness and surfaces the collision as
         // `InvalidArgument` — pass it through.
@@ -751,7 +772,8 @@ impl host_services::Host for PluginState {
         // Same capability gate as register — a plugin can't update a
         // service into a name it wasn't allowed to declare. H10:
         // `local-id` is immutable; the registry rejects any attempt
-        // to change it with `InvalidArgument`.
+        // to change it with `InvalidArgument`. `"*"` command names
+        // are refused on update too (see `register_service`).
         if !service_name_declared(&self.granted_capabilities.declares_services, &info.name) {
             let err = WitError::PermissionDenied(format!(
                 "service name `{}` is not declared in this plugin's manifest \
@@ -766,6 +788,7 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
+        check_no_wildcard_command_names(&info)?;
         self.services.update(&self.instance_id, &id, info)
     }
 

@@ -30,7 +30,7 @@ pub use state::PluginState;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
 use crate::state::{
@@ -543,6 +543,18 @@ impl Engine {
     ) -> anyhow::Result<InstanceHandle> {
         let plugin_dir = plugin_dir.into();
         let instance_id = instance_id.into();
+        // H10 round-3 finding 3 + H1: refuse structurally-unsafe
+        // instance-ids (including the reserved wildcard sentinel
+        // `"*"`) at the entry point, before spawning any state.
+        // Same shape as the KV / blob store's own check, unified so
+        // policy lookups against `consumes_services` grants can
+        // treat a real instance-id as distinct from the wildcard.
+        if !crate::state::is_safe_instance_id(&instance_id) {
+            return Err(anyhow!(
+                "instance-id `{instance_id}` is not permitted \
+                 (reserved wildcard, path separator, empty, or too long)"
+            ));
+        }
         // Pre-flight: parse + validate the manifest so we know the
         // plugin id + singleton flag before spawning. The supervisor's
         // load path re-reads + re-validates — small redundancy, but it

@@ -207,6 +207,7 @@ async fn cross_task_cycle_is_rejected_promptly() {
         instance: "*".into(),
         service: "bouncer".into(),
         commands: vec!["kick".into()],
+        caller_instance: "*".into(),
     }];
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),

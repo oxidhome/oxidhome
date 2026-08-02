@@ -180,19 +180,33 @@ pub struct CapabilitiesSection {
 ///
 /// ```toml
 /// [[capabilities.consumes_services]]
-/// plugin   = "example.service-counter"
-/// instance = "counter"          # or "*" for any live instance
-/// service  = "counter"          # immutable local-id of the target service
-/// commands = ["increment", "get"]  # or ["*"] for any command
+/// plugin          = "example.service-counter"
+/// instance        = "counter"          # or "*" for any live instance
+/// service         = "counter"          # immutable local-id of the target service
+/// commands        = ["increment", "get"]  # or ["*"] for any command
+/// caller_instance = "*"                # optional; narrows to specific caller instances
 /// ```
 ///
 /// The dispatcher authorizes a `call-service` when at least one
-/// grant entry matches all four axes — plugin (exact), instance
-/// (exact or `*`), service local-id (exact — must be immutable),
-/// and command (in the list, or the list contains `*`). Empty
-/// `commands` is *not* implicitly "any"; it means "no commands are
-/// authorized under this grant", so an operator can seed the grant
-/// structure without opening any call path.
+/// grant entry matches all five axes — plugin (exact), target
+/// instance (exact or `*`), service local-id (exact — must be
+/// immutable), command (in the list, or the list contains `*`),
+/// and caller instance (exact or `*`). Empty `commands` is *not*
+/// implicitly "any"; it means "no commands are authorized under
+/// this grant", so an operator can seed the grant structure
+/// without opening any call path.
+///
+/// **`caller_instance` scoping (H10 round-3).** Plugin-authored
+/// manifests typically leave this `"*"` (all instances of the
+/// caller may use the grant). Operator-narrowed granted copies
+/// (persisted in `plugin_installation.granted_capabilities_json`)
+/// can pin the grant to specific caller instances, so a
+/// multi-instance caller plugin doesn't get one instance's grant
+/// applied to every other instance. The wildcard `"*"` is a
+/// reserved sentinel: `Engine::start_instance` refuses `"*"` as
+/// an instance-id, and `register-service` refuses `"*"` as a
+/// command name, so a real identifier can never collide with the
+/// wildcard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceGrant {
@@ -210,36 +224,65 @@ pub struct ServiceGrant {
     /// which the dispatcher deliberately does not authorize on.
     pub service: String,
     /// Command names this grant authorizes. Either a list of exact
-    /// command names, or a single-element `["*"]` to authorize
-    /// every command the target service exposes.
+    /// command names, or a list containing `"*"` to authorize every
+    /// command the target service exposes.
     #[serde(default)]
     pub commands: Vec<String>,
+    /// **Caller** instance selector. Defaults to `"*"` (every
+    /// instance of the plugin declaring this grant may use it).
+    /// Narrowing this to an exact caller instance-id lets an
+    /// operator apply the grant to specific caller instances only
+    /// — the review-fixed shape for the multi-instance-caller
+    /// gap (H10 round-3, finding 2).
+    #[serde(default = "any_selector")]
+    pub caller_instance: String,
+}
+
+fn any_selector() -> String {
+    ServiceGrant::ANY.into()
 }
 
 impl ServiceGrant {
-    /// Instance-selector wildcard sentinel.
-    pub const ANY_INSTANCE: &'static str = "*";
+    /// Wildcard sentinel — reserved at instance-id and command-name
+    /// validation boundaries so a real identifier can never look
+    /// like the wildcard. See `Engine::start_instance` and
+    /// `register-service` for the enforcement points.
+    pub const ANY: &'static str = "*";
+    /// Instance-selector wildcard sentinel. Kept as a distinct alias
+    /// so grant call sites read as "any target instance" rather than
+    /// the raw string.
+    pub const ANY_INSTANCE: &'static str = Self::ANY;
     /// Commands wildcard sentinel — the element written into
     /// `commands` to authorize every command.
-    pub const ANY_COMMAND: &'static str = "*";
+    pub const ANY_COMMAND: &'static str = Self::ANY;
+    /// Caller-instance wildcard sentinel — grant applies to every
+    /// instance of the declaring plugin.
+    pub const ANY_CALLER_INSTANCE: &'static str = Self::ANY;
 
-    /// Does this grant authorize a call on the target
-    /// `(plugin, instance, service_local_id, command)` tuple?
+    /// Does this grant authorize a call on the tuple
+    /// `(caller_instance, target_plugin, target_instance,
+    /// service_local_id, command)`?
     #[must_use]
     pub fn matches(
         &self,
+        caller_instance: &str,
         plugin: &str,
-        instance: &str,
+        target_instance: &str,
         service_local_id: &str,
         command: &str,
     ) -> bool {
         self.plugin == plugin
-            && (self.instance == Self::ANY_INSTANCE || self.instance == instance)
             && self.service == service_local_id
+            && Self::selector_matches(&self.instance, target_instance)
+            && Self::selector_matches(&self.caller_instance, caller_instance)
             && self
                 .commands
                 .iter()
                 .any(|c| c == Self::ANY_COMMAND || c == command)
+    }
+
+    fn selector_matches(selector: &str, value: &str) -> bool {
+        selector == Self::ANY || selector == value
     }
 }
 
@@ -517,45 +560,57 @@ wasm = "x.wasm"
 mod service_grant_tests {
     use super::*;
 
+    /// Default-caller-instance helper: builds a grant that
+    /// applies to any caller instance (the plugin-authored
+    /// default).
     fn g(plugin: &str, instance: &str, service: &str, commands: &[&str]) -> ServiceGrant {
         ServiceGrant {
             plugin: plugin.into(),
             instance: instance.into(),
             service: service.into(),
             commands: commands.iter().map(|s| (*s).into()).collect(),
+            caller_instance: ServiceGrant::ANY_CALLER_INSTANCE.into(),
         }
     }
 
-    /// Exact tuple match: all four axes required.
+    /// Exact tuple match: all four axes required, caller wildcard
+    /// matches any caller.
     #[test]
     fn matches_exact_tuple() {
         let grant = g("example.counter", "a", "counter", &["increment"]);
-        assert!(grant.matches("example.counter", "a", "counter", "increment"));
+        // caller_instance="*" → matches any caller.
+        assert!(grant.matches("caller-x", "example.counter", "a", "counter", "increment"));
         // Wrong on any single axis → no match.
-        assert!(!grant.matches("example.other", "a", "counter", "increment"));
-        assert!(!grant.matches("example.counter", "b", "counter", "increment"));
-        assert!(!grant.matches("example.counter", "a", "different", "increment"));
-        assert!(!grant.matches("example.counter", "a", "counter", "get"));
+        assert!(!grant.matches("caller-x", "example.other", "a", "counter", "increment"));
+        assert!(!grant.matches("caller-x", "example.counter", "b", "counter", "increment"));
+        assert!(!grant.matches("caller-x", "example.counter", "a", "different", "increment"));
+        assert!(!grant.matches("caller-x", "example.counter", "a", "counter", "get"));
     }
 
-    /// `instance = "*"` matches any instance-id.
+    /// `instance = "*"` matches any target instance-id.
     #[test]
     fn instance_wildcard_matches_any_instance() {
         let grant = g("example.counter", "*", "counter", &["increment"]);
-        assert!(grant.matches("example.counter", "a", "counter", "increment"));
-        assert!(grant.matches("example.counter", "b", "counter", "increment"));
-        assert!(grant.matches("example.counter", "any-name-here", "counter", "increment"));
+        assert!(grant.matches("cx", "example.counter", "a", "counter", "increment"));
+        assert!(grant.matches("cx", "example.counter", "b", "counter", "increment"));
+        assert!(grant.matches(
+            "cx",
+            "example.counter",
+            "any-name-here",
+            "counter",
+            "increment"
+        ));
         // Other axes still exact.
-        assert!(!grant.matches("example.other", "a", "counter", "increment"));
+        assert!(!grant.matches("cx", "example.other", "a", "counter", "increment"));
     }
 
     /// `commands = ["*"]` matches any command.
     #[test]
     fn command_wildcard_matches_any_command() {
         let grant = g("example.counter", "a", "counter", &["*"]);
-        assert!(grant.matches("example.counter", "a", "counter", "increment"));
-        assert!(grant.matches("example.counter", "a", "counter", "get"));
-        assert!(grant.matches("example.counter", "a", "counter", "anything"));
+        assert!(grant.matches("cx", "example.counter", "a", "counter", "increment"));
+        assert!(grant.matches("cx", "example.counter", "a", "counter", "get"));
+        assert!(grant.matches("cx", "example.counter", "a", "counter", "anything"));
     }
 
     /// Empty `commands` authorizes nothing — an operator can seed
@@ -563,8 +618,38 @@ mod service_grant_tests {
     #[test]
     fn empty_commands_matches_nothing() {
         let grant = g("example.counter", "*", "counter", &[]);
-        assert!(!grant.matches("example.counter", "a", "counter", "increment"));
-        assert!(!grant.matches("example.counter", "a", "counter", "get"));
+        assert!(!grant.matches("cx", "example.counter", "a", "counter", "increment"));
+        assert!(!grant.matches("cx", "example.counter", "a", "counter", "get"));
+    }
+
+    /// H10 round-3 finding 2: `caller_instance` scoping. A grant
+    /// with an exact caller-instance-id matches only that caller;
+    /// the default (`"*"`) matches any.
+    #[test]
+    fn caller_instance_scoping() {
+        let scoped = ServiceGrant {
+            plugin: "example.counter".into(),
+            instance: "*".into(),
+            service: "counter".into(),
+            commands: vec!["increment".into()],
+            caller_instance: "caller-a".into(),
+        };
+        // Only the named caller passes.
+        assert!(scoped.matches("caller-a", "example.counter", "any", "counter", "increment"));
+        assert!(!scoped.matches("caller-b", "example.counter", "any", "counter", "increment"));
+        assert!(!scoped.matches(
+            "other-caller",
+            "example.counter",
+            "any",
+            "counter",
+            "increment"
+        ));
+
+        // The default plugin-authored grant (caller_instance="*")
+        // matches every caller.
+        let any_caller = g("example.counter", "*", "counter", &["increment"]);
+        assert!(any_caller.matches("caller-a", "example.counter", "any", "counter", "increment"));
+        assert!(any_caller.matches("caller-b", "example.counter", "any", "counter", "increment"));
     }
 
     #[derive(serde::Deserialize)]

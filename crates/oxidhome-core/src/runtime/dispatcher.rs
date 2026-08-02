@@ -229,11 +229,14 @@ pub(crate) async fn call_service(
     // 3. H10 structured capability gate. Runs before `acquire_call`
     //    so a refused call spends no refcount and cannot influence
     //    `remove-service` timing. Matches on the immutable
-    //    `(plugin, instance, local_id, command)` tuple — a
-    //    callee's `update-service` can't shadow or bypass the
-    //    grant by renaming `name`.
+    //    `(caller_instance, target_plugin, target_instance,
+    //    local_id, command)` 5-tuple — a callee's `update-service`
+    //    can't shadow or bypass the grant by renaming `name`, and
+    //    an operator can narrow a grant to specific caller
+    //    instances via `caller_instance` (H10 round-3 finding 2).
     if !caller_grants.iter().any(|g| {
         g.matches(
+            &caller_instance,
             &target_plugin_id,
             &target_instance,
             &target_local_id,
@@ -244,7 +247,8 @@ pub(crate) async fn call_service(
             "caller `{caller_instance}` has no `consumes_services` grant \
              matching target `{target_plugin_id}` instance `{target_instance}` \
              service `{target_local_id}` command `{command}` — add a matching \
-             `[[capabilities.consumes_services]]` entry to the caller's manifest"
+             `[[capabilities.consumes_services]]` entry to the caller's manifest \
+             (set `caller_instance = \"*\"` or `\"{caller_instance}\"`)"
         )));
     }
 
@@ -345,6 +349,7 @@ mod tests {
             instance: ServiceGrant::ANY_INSTANCE.into(),
             service: local_id.into(),
             commands: vec![command.into()],
+            caller_instance: ServiceGrant::ANY_CALLER_INSTANCE.into(),
         }
     }
 
@@ -475,6 +480,7 @@ mod tests {
             instance: "*".into(),
             service: "ring".into(),
             commands: vec!["not-kick".into()],
+            caller_instance: "*".into(),
         }];
         let err = call_service(
             &services,
@@ -496,6 +502,7 @@ mod tests {
             instance: "not-beta".into(),
             service: "ring".into(),
             commands: vec!["kick".into()],
+            caller_instance: "*".into(),
         }];
         let err = call_service(
             &services,
@@ -518,6 +525,7 @@ mod tests {
             instance: "*".into(),
             service: "other-service".into(),
             commands: vec!["kick".into()],
+            caller_instance: "*".into(),
         }];
         let err = call_service(
             &services,
@@ -554,6 +562,7 @@ mod tests {
             instance: "*".into(),
             service: "ring".into(),
             commands: vec!["*".into()],
+            caller_instance: "*".into(),
         }];
 
         let err = call_service(

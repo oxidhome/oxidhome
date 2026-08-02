@@ -167,6 +167,12 @@ pub fn is_safe_instance_id(instance_id: &str) -> bool {
         && !instance_id.contains("..")
         && !instance_id.starts_with('.')
         && !instance_id.contains('\0')
+        // H10 round-3 finding 3: `"*"` is the reserved wildcard
+        // sentinel in `ServiceGrant.instance` and
+        // `ServiceGrant.caller_instance`. Refusing it here means a
+        // real instance-id can never collide with the wildcard, so
+        // a grant naming a specific instance is unambiguous.
+        && instance_id != "*"
 }
 
 /// Maximum permitted byte length of an `instance_id` — see the
@@ -1455,5 +1461,25 @@ mod tests {
             is_safe_instance_id("日本語"),
             "short multibyte id must be accepted",
         );
+    }
+
+    /// H10 round-3 finding 3: `"*"` is reserved as the wildcard
+    /// sentinel in `ServiceGrant.instance` /
+    /// `ServiceGrant.caller_instance`, so a real instance-id must
+    /// never equal `"*"`. Otherwise a grant naming a specific
+    /// instance could not be distinguished from "any instance".
+    #[test]
+    fn wildcard_sentinel_instance_id_is_reserved() {
+        assert!(
+            !is_safe_instance_id("*"),
+            "`*` is the reserved wildcard sentinel and must be refused as an instance-id",
+        );
+        // Only the exact `"*"` string — a name containing `*` as
+        // one of several chars is fine.
+        assert!(
+            is_safe_instance_id("prod*"),
+            "`prod*` is a normal identifier (only exact `*` is reserved)",
+        );
+        assert!(is_safe_instance_id("a*b"), "`a*b` is a normal identifier");
     }
 }
