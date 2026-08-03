@@ -874,37 +874,36 @@ impl PluginInstance {
             let data = self.store.data();
             let devices = Arc::clone(&data.devices);
             let device_state = Arc::clone(&data.device_state);
-            let projection_ok = if let Ok(meta) =
-                devices.get(&owner_instance, &device_for_projection)
-            {
-                let capability_declared = meta
-                    .info
-                    .capabilities
-                    .iter()
-                    .any(|spec| super::state::capability_name(spec) == capability);
-                if !capability_declared {
+            let projection_ok =
+                if let Ok(meta) = devices.get(&owner_instance, &device_for_projection) {
+                    let capability_declared = meta
+                        .info
+                        .capabilities
+                        .iter()
+                        .any(|spec| super::state::capability_name(spec) == capability);
+                    if !capability_declared {
+                        tracing::warn!(
+                            instance_id = %owner_instance,
+                            device_id = %device_for_projection,
+                            capability = %capability,
+                            "execute-command returned OkWithState for a capability the device \
+                             doesn't declare; skipping state projection",
+                        );
+                    }
+                    capability_declared
+                } else {
+                    // Removed mid-call (or never registered to this
+                    // instance — the API layer's routing already
+                    // filtered to owner, so this is the
+                    // remove-during-execute case).
                     tracing::warn!(
                         instance_id = %owner_instance,
                         device_id = %device_for_projection,
-                        capability = %capability,
-                        "execute-command returned OkWithState for a capability the device \
-                         doesn't declare; skipping state projection",
+                        "execute-command returned OkWithState for a device this instance no \
+                         longer owns; skipping state projection",
                     );
-                }
-                capability_declared
-            } else {
-                // Removed mid-call (or never registered to this
-                // instance — the API layer's routing already
-                // filtered to owner, so this is the
-                // remove-during-execute case).
-                tracing::warn!(
-                    instance_id = %owner_instance,
-                    device_id = %device_for_projection,
-                    "execute-command returned OkWithState for a device this instance no \
-                     longer owns; skipping state projection",
-                );
-                false
-            };
+                    false
+                };
             if projection_ok {
                 let received_ms = crate::state::event_log::now_unix_ms();
                 device_state.replace_snapshot(

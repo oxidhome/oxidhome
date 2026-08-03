@@ -132,8 +132,16 @@ pub struct DeviceState {
     pub quality: StateQuality,
 }
 
-/// The map + the monotonic revision counter, jointly under one
-/// `RwLock` so allocation and insertion linearize with reads.
+/// The map + the monotonic revision counter + per-instance
+/// generation, **jointly under one `RwLock`** so every mutating
+/// operation linearizes.
+///
+/// Round-4 review fix: `generations` lived in a separate lock
+/// pre-fix, so `apply` could read a generation, drop the lock,
+/// and then have a concurrent lifecycle sweep bump the generation
+/// AND mark the entries stale — the delayed writer then inserted
+/// a `Fresh` entry stamped with the *old* generation, silently
+/// overwriting the just-marked-stale slot.
 #[derive(Debug, Default)]
 struct StoreInner {
     entries: HashMap<(DeviceId, String), Arc<DeviceState>>,
@@ -144,6 +152,12 @@ struct StoreInner {
     /// `current_revision()` sees every entry with
     /// `global_revision ≤ N` already in the map.
     global_revision: u64,
+    /// Current supervisor generation per `owner_instance`, bumped
+    /// by [`DeviceStateStore::bump_generation`] on each start.
+    /// Sharing the entries lock means read-gen-then-insert-entry
+    /// is one atomic operation, and mark-stale-then-bump-gen is
+    /// another.
+    generations: HashMap<String, u64>,
 }
 
 impl StoreInner {
@@ -160,13 +174,6 @@ impl StoreInner {
 #[derive(Debug, Default)]
 pub struct DeviceStateStore {
     inner: RwLock<StoreInner>,
-    /// Current supervisor generation per `owner_instance`, bumped
-    /// by [`Self::bump_generation`] on each start. Read at apply
-    /// time so a state event published just before the
-    /// stale-marker fires still lands as `Fresh` under the
-    /// *previous* generation and is transitioned to `Stale` on
-    /// the next `mark_instance_stale` sweep.
-    generations: RwLock<HashMap<String, u64>>,
 }
 
 impl DeviceStateStore {
@@ -180,11 +187,6 @@ impl DeviceStateStore {
     }
     fn inner_write(&self) -> RwLockWriteGuard<'_, StoreInner> {
         self.inner.write().unwrap_or_else(PoisonError::into_inner)
-    }
-    fn generations_write(&self) -> RwLockWriteGuard<'_, HashMap<String, u64>> {
-        self.generations
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Current store-wide monotonic revision. A snapshot taken at
@@ -200,26 +202,18 @@ impl DeviceStateStore {
 
     /// Bump the supervisor generation for `owner_instance`. Called
     /// from the supervisor at the top of every life (fresh start
-    /// or restart). Subsequent [`Self::apply`] calls from this
-    /// instance land under the bumped generation; a subsequent
-    /// [`Self::mark_instance_stale`] sweeps everything carrying
-    /// an earlier generation.
+    /// or restart). Subsequent `apply_delta` / `replace_snapshot`
+    /// calls from this instance land under the bumped generation;
+    /// a subsequent [`Self::mark_instance_stale`] sweeps everything
+    /// carrying an earlier generation. Round-4 review fix: takes
+    /// the entries write lock so a paired
+    /// `bump_generation` + `mark_instance_stale` transition sees
+    /// no writer stamp the old generation between them.
     pub fn bump_generation(&self, owner_instance: &str) -> u64 {
-        let mut gens = self.generations_write();
-        let next = gens.get(owner_instance).copied().unwrap_or(0) + 1;
-        gens.insert(owner_instance.to_string(), next);
+        let mut inner = self.inner_write();
+        let next = inner.generations.get(owner_instance).copied().unwrap_or(0) + 1;
+        inner.generations.insert(owner_instance.to_string(), next);
         next
-    }
-
-    /// Read the current generation for `owner_instance`, or `0` if
-    /// no `bump_generation` has fired yet (test harnesses).
-    fn current_generation(&self, owner_instance: &str) -> u64 {
-        self.generations
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(owner_instance)
-            .copied()
-            .unwrap_or(0)
     }
 
     /// H9 round-3 finding 1: **snapshot** operation — replaces
@@ -300,13 +294,32 @@ impl DeviceStateStore {
         received_ms: i64,
         merge: bool,
     ) {
-        let generation = self.current_generation(&owner_instance);
         let mut inner = self.inner_write();
+        // Round-4 review fix: read the generation under the same
+        // lock as the entries write, so a concurrent
+        // `mark_instance_stale` + `bump_generation` transition can't
+        // slip between the read and the insert and let a delayed
+        // writer stamp the pre-sweep generation onto a fresh entry.
+        let generation = inner.generations.get(&owner_instance).copied().unwrap_or(0);
         let global_revision = inner.next_revision();
         let key = (device_id.clone(), capability.clone());
+        // Round-4 finding 1: **never merge into a Stale entry, or
+        // into an entry from a prior generation**. A plugin
+        // publishing a partial `state-change` after a restart —
+        // reporting only `hue` — would otherwise inherit
+        // `saturation`/`value` from a stale entry left over from
+        // the previous supervisor life, then mark the whole thing
+        // `Fresh`, silently reviving the H9 problem the store is
+        // meant to fix. Only merge when the prior entry is `Fresh`
+        // and from the same live generation; otherwise treat the
+        // input as the initial state for this generation.
         let (final_fields, revision) = match (inner.entries.get(&key), merge) {
-            (Some(prev), true) => (merge_fields(&prev.fields, &fields), prev.revision + 1),
-            (Some(prev), false) => (fields, prev.revision + 1),
+            (Some(prev), true)
+                if prev.quality == StateQuality::Fresh && prev.source_generation == generation =>
+            {
+                (merge_fields(&prev.fields, &fields), prev.revision + 1)
+            }
+            (Some(prev), _) => (fields, prev.revision + 1),
             (None, _) => (fields, 1),
         };
         let entry = Arc::new(DeviceState {
@@ -427,28 +440,9 @@ impl DeviceStateStore {
     ///
     /// Returns the number of entries flipped (test / observability).
     pub fn mark_instance_stale(&self, owner_instance: &str) -> usize {
-        let mut inner = self.inner_write();
-        let keys_to_stale: Vec<(DeviceId, String)> = inner
-            .entries
-            .iter()
-            .filter(|(_, m)| m.owner_instance == owner_instance && m.quality == StateQuality::Fresh)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in &keys_to_stale {
-            let global_revision = inner.next_revision();
-            let prev = inner
-                .entries
-                .get(key)
-                .expect("just filtered on presence")
-                .clone();
-            let updated = Arc::new(DeviceState {
-                global_revision,
-                quality: StateQuality::Stale,
-                ..(*prev).clone()
-            });
-            inner.entries.insert(key.clone(), updated);
-        }
-        keys_to_stale.len()
+        self.stale_where(|_, entry| {
+            entry.owner_instance == owner_instance && entry.quality == StateQuality::Fresh
+        })
     }
 
     /// H9 round-2 finding 3: mark every entry for `device_id` as
@@ -461,28 +455,7 @@ impl DeviceStateStore {
     ///
     /// Returns the number of entries flipped.
     pub fn mark_device_stale(&self, device_id: &str) -> usize {
-        let mut inner = self.inner_write();
-        let keys_to_stale: Vec<(DeviceId, String)> = inner
-            .entries
-            .iter()
-            .filter(|((did, _), m)| did == device_id && m.quality == StateQuality::Fresh)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in &keys_to_stale {
-            let global_revision = inner.next_revision();
-            let prev = inner
-                .entries
-                .get(key)
-                .expect("just filtered on presence")
-                .clone();
-            let updated = Arc::new(DeviceState {
-                global_revision,
-                quality: StateQuality::Stale,
-                ..(*prev).clone()
-            });
-            inner.entries.insert(key.clone(), updated);
-        }
-        keys_to_stale.len()
+        self.stale_where(|(did, _), entry| did == device_id && entry.quality == StateQuality::Fresh)
     }
 
     /// H9 round-2 finding 3: reconcile the projection with a
@@ -495,15 +468,28 @@ impl DeviceStateStore {
     ///
     /// Returns the number of entries flipped.
     pub fn reconcile_capabilities(&self, device_id: &str, live_capabilities: &[String]) -> usize {
+        self.stale_where(|(did, cap), entry| {
+            did == device_id
+                && entry.quality == StateQuality::Fresh
+                && !live_capabilities.iter().any(|live| live == cap)
+        })
+    }
+
+    /// Round-4 finding 2 helper: flip every `Fresh` entry matching
+    /// `predicate` to `Stale`, and on each flip bump both
+    /// `revision` and `global_revision`, plus refresh
+    /// `received_ms` to the current host wall-clock. The pre-fix
+    /// shape inherited `revision` and `received_ms` through
+    /// struct-update syntax, contradicting the documented "counter
+    /// bumps on every slot change" + "`received_ms` is the time
+    /// the update was applied" contract.
+    fn stale_where(&self, predicate: impl Fn(&(DeviceId, String), &DeviceState) -> bool) -> usize {
         let mut inner = self.inner_write();
+        let received_ms = crate::state::event_log::now_unix_ms();
         let keys_to_stale: Vec<(DeviceId, String)> = inner
             .entries
             .iter()
-            .filter(|((did, cap), m)| {
-                did == device_id
-                    && m.quality == StateQuality::Fresh
-                    && !live_capabilities.iter().any(|live| live == cap)
-            })
+            .filter(|(k, m)| predicate(k, m.as_ref()))
             .map(|(k, _)| k.clone())
             .collect();
         for key in &keys_to_stale {
@@ -514,7 +500,9 @@ impl DeviceStateStore {
                 .expect("just filtered on presence")
                 .clone();
             let updated = Arc::new(DeviceState {
+                revision: prev.revision + 1,
                 global_revision,
+                received_ms,
                 quality: StateQuality::Stale,
                 ..(*prev).clone()
             });
@@ -933,9 +921,133 @@ mod tests {
         let alpha_entry = store.snapshot_capability("dev-alpha", "switch").unwrap();
         assert_eq!(alpha_entry.quality, StateQuality::Stale);
         assert_eq!(alpha_entry.global_revision, 3);
+        // Round-4 finding 2: `entry_revision` bumps on the
+        // transition (the slot changed), and `received_ms`
+        // refreshes to the transition time (not the original
+        // apply's timestamp).
+        assert_eq!(alpha_entry.revision, 2);
+        assert!(
+            alpha_entry.received_ms > 0,
+            "received_ms should refresh on stale transition, got {}",
+            alpha_entry.received_ms,
+        );
         let beta_entry = store.snapshot_capability("dev-beta", "switch").unwrap();
         assert_eq!(beta_entry.quality, StateQuality::Fresh);
         assert_eq!(store.mark_instance_stale("alpha"), 0);
+    }
+
+    /// Round-4 finding 1: after a supervisor restart, an
+    /// `apply_delta` that reports only one field must NOT inherit
+    /// stale fields from the pre-restart generation. The store
+    /// treats any delta whose prior slot is Stale (or from an
+    /// earlier generation) as the initial state for this
+    /// generation. Otherwise a plugin publishing `state-changed`
+    /// with just `hue` after restart would silently revive the
+    /// prior life's `saturation` / `value`.
+    #[test]
+    fn apply_delta_after_restart_does_not_inherit_stale_fields() {
+        let store = DeviceStateStore::new();
+        assert_eq!(store.bump_generation("alpha"), 1);
+        store.apply_delta(
+            "dev-1".into(),
+            "alpha".into(),
+            "color-light".into(),
+            vec![
+                kv("hue", Value::FloatVal(0.1)),
+                kv("saturation", Value::FloatVal(0.9)),
+                kv("value", Value::FloatVal(0.8)),
+            ],
+            0,
+            0,
+        );
+        // Simulate instance stop → restart.
+        store.mark_instance_stale("alpha");
+        assert_eq!(store.bump_generation("alpha"), 2);
+
+        // Plugin publishes a partial `state-changed` after restart.
+        store.apply_delta(
+            "dev-1".into(),
+            "alpha".into(),
+            "color-light".into(),
+            vec![kv("hue", Value::FloatVal(0.5))],
+            0,
+            0,
+        );
+        let entry = store.snapshot_capability("dev-1", "color-light").unwrap();
+        assert_eq!(entry.quality, StateQuality::Fresh);
+        assert_eq!(entry.source_generation, 2);
+        // Fields are the plugin's new snapshot — the pre-restart
+        // saturation / value are gone.
+        let has_key = |k: &str| entry.fields.iter().any(|f| f.key == k);
+        assert!(has_key("hue"));
+        assert!(
+            !has_key("saturation"),
+            "post-restart apply_delta must not inherit stale saturation; got {:?}",
+            entry.fields,
+        );
+        assert!(!has_key("value"));
+    }
+
+    /// Round-4 finding 3: generation reads share the entries lock
+    /// with entry writes. Fuzzed: while a background thread writes
+    /// `apply_delta` calls, drive `bump_generation` +
+    /// `mark_instance_stale` transitions from the main thread and
+    /// assert every entry's
+    /// `source_generation` matches the generation live at insert
+    /// time (equivalently: no Fresh entry has a generation older
+    /// than the current entry's own — the "stale-old-gen slip"
+    /// race would produce a Fresh entry stamped with the previous
+    /// generation *after* a stale sweep).
+    #[test]
+    fn generation_read_atomic_with_entry_write() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let store = StdArc::new(DeviceStateStore::new());
+        store.bump_generation("alpha");
+        let done = StdArc::new(AtomicBool::new(false));
+        let writer_store = StdArc::clone(&store);
+        let writer_done = StdArc::clone(&done);
+        let writer = thread::spawn(move || {
+            let mut i = 0u64;
+            while !writer_done.load(Ordering::Acquire) {
+                writer_store.apply_delta(
+                    format!("dev-{}", i % 4),
+                    "alpha".into(),
+                    "switch".into(),
+                    vec![],
+                    0,
+                    0,
+                );
+                i += 1;
+                if i > 20_000 {
+                    break;
+                }
+            }
+        });
+        // Drive lifecycle transitions: sweep then bump. If gen
+        // reads weren't linearized with entry writes, a delayed
+        // writer would insert a Fresh entry stamped with the
+        // pre-sweep generation *after* the sweep, so a Fresh
+        // entry's `source_generation` could lag the current
+        // generation for that instance.
+        for _ in 0..500 {
+            store.mark_instance_stale("alpha");
+            let current_gen = store.bump_generation("alpha");
+            for entry in store.snapshot_device("dev-0") {
+                if entry.quality == StateQuality::Fresh {
+                    assert!(
+                        entry.source_generation == current_gen,
+                        "Fresh entry has stale generation {} vs current {}",
+                        entry.source_generation,
+                        current_gen,
+                    );
+                }
+            }
+        }
+        done.store(true, Ordering::Release);
+        writer.join().unwrap();
     }
 
     /// Round-2 finding 3: `remove-device` (via `mark_device_stale`)
