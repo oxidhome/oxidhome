@@ -288,15 +288,20 @@ pub(crate) async fn call_service(
         // covers both. Which of `matches_requested` or
         // `matches_granted` fired is included so an operator (or
         // test harness) can localize the fix instead of guessing.
-        let failed = match (matches_requested, matches_granted) {
-            (false, false) => "neither the caller's requested nor the granted list",
-            (false, true) => "the caller's requested list",
-            (true, false) => "the operator's granted list",
+        // The verb rides with the failing-list phrase so the
+        // polarity is correct on every arm (round-6 review
+        // fix: prior wording said "the requested list contains a
+        // matching selector" when in fact it *didn't* — that arm
+        // was inverted).
+        let failed_clause = match (matches_requested, matches_granted) {
+            (false, false) => "neither the caller's requested nor the granted list contains",
+            (false, true) => "the caller's requested list does not contain",
+            (true, false) => "the operator's granted list does not contain",
             (true, true) => unreachable!("both matched but guard fired"),
         };
         return Err(WitError::PermissionDenied(format!(
-            "caller `{caller_instance}` refused: {failed} contains a \
-             `consumes_services` selector matching target \
+            "caller `{caller_instance}` refused: {failed_clause} a matching \
+             `consumes_services` selector for target \
              `{target_plugin_id}` instance `{target_instance}` service \
              `{target_local_id}` command `{command}` (caller_instance \
              `{caller_instance}` must match too). For plugin callers, add \
