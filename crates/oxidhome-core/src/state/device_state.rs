@@ -15,13 +15,39 @@
 //!   each carries its own field set. Storing per-capability instead
 //!   of a flat state-bag matches the WIT `state-change` shape.
 //!
-//! - **Per-entry revision + store-wide revision.** The store-wide
-//!   `global_revision` is a monotonic counter bumped on every apply;
-//!   entries record their `global_revision` at write time so a
-//!   caller can pass `since_revision=N` and receive every entry
-//!   with `global_revision > N`. The per-`(device, capability)`
-//!   `revision` field is a local counter that survives quality
-//!   transitions and lets consumers detect "same entry, updated".
+//! - **Single lock serializes revisions with insertions (round-2
+//!   review fix).** The store's `global_revision` counter lives
+//!   *inside* the same `RwLock` that guards the entries map, so
+//!   revision allocation and insertion are one atomic operation.
+//!   Snapshot / delta reads also take that lock, so a reader
+//!   observing `current_revision() = N` sees every entry with
+//!   `global_revision ≤ N` in the entries map. The previous shape
+//!   allocated the revision with a separate `AtomicU64::fetch_add`
+//!   before taking the write lock, which let writer A allocate rev
+//!   1 and pause while writer B committed rev 2 — a poller could
+//!   then advance to 2 and A's rev-1 entry became invisible to
+//!   every future `since_revision ≥ 2` request.
+//!
+//! - **Fields merge on `key`, not replace (round-2 review fix).**
+//!   `state-change.fields` is documented as the *changed* fields
+//!   only, not the full snapshot. Applying a color-light update
+//!   with only `{hue: 0.5}` used to blow away the previously
+//!   observed `saturation` / `value` / `color-temp-kelvin`. The
+//!   current [`Self::apply`] merges by key: unchanged keys survive,
+//!   changed keys take the new value. Explicit removal isn't
+//!   supported in this cut (WIT `state-change` has no delete
+//!   marker); a plugin that needs a field to go away
+//!   `remove-device` + `register-device` again, which also triggers
+//!   capability reconciliation.
+//!
+//! - **Lifecycle reconciliation (round-2 review fix).** Removing
+//!   a device — or shipping an `update-device` with a narrower
+//!   `capabilities` list — used to leave stale projection entries
+//!   `Fresh` indefinitely. [`Self::mark_device_stale`] and
+//!   [`Self::reconcile_capabilities`] now flip the affected
+//!   entries and bump the global revision so a delta poller
+//!   catches the transition. The host runtime wires these into
+//!   `register-device` / `update-device` / `remove-device`.
 //!
 //! - **Trust-separated timestamps.** `received_ms` is the host's
 //!   wall-clock; `observed_ms` is the plugin's self-reported
@@ -44,16 +70,16 @@
 //!   reconciliation without re-observing).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue};
 
 /// Freshness marker for a stored state entry. `Stale` isn't a value
 /// consumers can't read — it means "the plugin instance that
-/// published this value is no longer live". Callers that treat
-/// device state as safety-critical filter `Stale` out; callers that
-/// only need best-effort telemetry can still read it.
+/// published this value is no longer live, or the device / capability
+/// has been unregistered". Callers that treat device state as
+/// safety-critical filter `Stale` out; callers that only need
+/// best-effort telemetry can still read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateQuality {
@@ -69,8 +95,11 @@ pub struct DeviceState {
     pub device_id: DeviceId,
     /// Capability name (`"switch"`, `"dimmer"`, `"sensor"`, ...).
     pub capability: String,
-    /// Partial state fields most recently observed for this
-    /// capability. Same shape as `wit::state-change.fields`.
+    /// Merged partial-state fields observed to date for this
+    /// capability. Same shape as `wit::state-change.fields`, but
+    /// accumulates across updates — `state-change.fields` is
+    /// documented as *changes*, so merging by key preserves fields
+    /// the plugin isn't currently reporting.
     pub fields: Vec<KeyValue>,
     /// Per-`(device, capability)` monotonic counter — bumps on
     /// every applied change to *this* slot.
@@ -101,19 +130,37 @@ pub struct DeviceState {
     pub quality: StateQuality,
 }
 
+/// The map + the monotonic revision counter, jointly under one
+/// `RwLock` so allocation and insertion linearize with reads.
+#[derive(Debug, Default)]
+struct StoreInner {
+    entries: HashMap<(DeviceId, String), Arc<DeviceState>>,
+    /// Store-wide monotonic revision. Every mutating operation
+    /// increments this and stamps the value onto the entry being
+    /// written. Held under the same lock as `entries` so an
+    /// observer that reads `global_revision = N` from
+    /// `current_revision()` sees every entry with
+    /// `global_revision ≤ N` already in the map.
+    global_revision: u64,
+}
+
+impl StoreInner {
+    /// Allocate the next store-wide revision. **MUST** be called
+    /// under a write lock on `self`.
+    fn next_revision(&mut self) -> u64 {
+        self.global_revision += 1;
+        self.global_revision
+    }
+}
+
 /// H9 host-owned device-state projection. One per
 /// [`Engine`](crate::Engine); cheap to clone via `Arc`.
 #[derive(Debug, Default)]
 pub struct DeviceStateStore {
-    /// `(device_id, capability)` → current entry.
-    entries: RwLock<HashMap<(DeviceId, String), Arc<DeviceState>>>,
-    /// Monotonic counter — every apply bumps this and stamps the
-    /// new value on the entry. Callers use it to catch up via
-    /// [`Self::deltas_since`].
-    global_revision: AtomicU64,
+    inner: RwLock<StoreInner>,
     /// Current supervisor generation per `owner_instance`, bumped
-    /// by [`Self::bump_generation`] on each start. Reads here at
-    /// apply time so a state event published just before the
+    /// by [`Self::bump_generation`] on each start. Read at apply
+    /// time so a state event published just before the
     /// stale-marker fires still lands as `Fresh` under the
     /// *previous* generation and is transitioned to `Stale` on
     /// the next `mark_instance_stale` sweep.
@@ -126,16 +173,11 @@ impl DeviceStateStore {
         Self::default()
     }
 
-    fn entries_read(&self) -> RwLockReadGuard<'_, HashMap<(DeviceId, String), Arc<DeviceState>>> {
-        self.entries.read().unwrap_or_else(PoisonError::into_inner)
+    fn inner_read(&self) -> RwLockReadGuard<'_, StoreInner> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
     }
-    fn entries_write(&self) -> RwLockWriteGuard<'_, HashMap<(DeviceId, String), Arc<DeviceState>>> {
-        self.entries.write().unwrap_or_else(PoisonError::into_inner)
-    }
-    fn generations_read(&self) -> RwLockReadGuard<'_, HashMap<String, u64>> {
-        self.generations
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn inner_write(&self) -> RwLockWriteGuard<'_, StoreInner> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
     }
     fn generations_write(&self) -> RwLockWriteGuard<'_, HashMap<String, u64>> {
         self.generations
@@ -145,10 +187,13 @@ impl DeviceStateStore {
 
     /// Current store-wide monotonic revision. A snapshot taken at
     /// this value can be reconciled against `deltas_since(rev)` to
-    /// catch up on every subsequent change.
+    /// catch up on every subsequent change. Reads under the entries
+    /// lock so the value is guaranteed to reflect every committed
+    /// entry (round-2 review fix — the pre-fix shape allowed the
+    /// counter to advance ahead of the map).
     #[must_use]
     pub fn current_revision(&self) -> u64 {
-        self.global_revision.load(Ordering::Acquire)
+        self.inner_read().global_revision
     }
 
     /// Bump the supervisor generation for `owner_instance`. Called
@@ -167,7 +212,9 @@ impl DeviceStateStore {
     /// Read the current generation for `owner_instance`, or `0` if
     /// no `bump_generation` has fired yet (test harnesses).
     fn current_generation(&self, owner_instance: &str) -> u64 {
-        self.generations_read()
+        self.generations
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(owner_instance)
             .copied()
             .unwrap_or(0)
@@ -175,11 +222,10 @@ impl DeviceStateStore {
 
     /// Seed an initial state for a `(device_id, capability)` pair —
     /// called from `register_device` for each entry in
-    /// `DeviceInfo.initial_state`. Applies with the same
-    /// `Fresh`/`revision` machinery as [`Self::apply`], so a
-    /// consumer that reads immediately after `init` sees the
-    /// initial values, and a `state-changed` event minutes later
-    /// bumps the same slot.
+    /// `DeviceInfo.initial_state`. Merges into any existing slot,
+    /// same as [`Self::apply`], so the initial values compose
+    /// correctly with any state that had accumulated before a
+    /// re-registration.
     pub fn seed(
         &self,
         device_id: DeviceId,
@@ -199,15 +245,26 @@ impl DeviceStateStore {
         );
     }
 
-    /// Apply a state change. Bumps the store-wide `global_revision`
-    /// and the per-slot `revision`, records the trust-separated
-    /// timestamps, and stamps the current generation for the owner.
-    /// Overwrites any prior entry for the same
-    /// `(device_id, capability)`. If a stale entry lands under an
-    /// older generation than what's now current for the instance,
-    /// the new entry is stamped with the current generation and
-    /// marked `Fresh` — the freshness marker follows the *most
-    /// recent* write, not the entry's history.
+    /// Apply a partial state change. Merges the new `fields` into
+    /// the existing entry by key — unchanged keys survive, changed
+    /// keys take the new value, new keys are added. Bumps the
+    /// store-wide `global_revision` and the per-slot `revision`,
+    /// stamps the trust-separated timestamps + current generation,
+    /// and marks the entry `Fresh`.
+    ///
+    /// **Serialized (round-2 review fix)** — revision allocation
+    /// and insertion happen under one write lock, so a poller that
+    /// observes `current_revision() = N` sees every entry with
+    /// `global_revision ≤ N`. The pre-fix shape allocated with
+    /// `AtomicU64::fetch_add` before taking the lock, opening a
+    /// race where allocated-but-uncommitted revisions could be
+    /// permanently skipped by delta pollers.
+    ///
+    /// **Merge, not replace (round-2 review fix).** WIT
+    /// `state-change.fields` is documented as *changes only*. The
+    /// pre-fix shape blew away every prior field on each apply, so
+    /// a color-light update reporting only `hue` erased the last
+    /// known `saturation` / `value` / `color-temp-kelvin`.
     pub fn apply(
         &self,
         device_id: DeviceId,
@@ -218,14 +275,17 @@ impl DeviceStateStore {
         received_ms: i64,
     ) {
         let generation = self.current_generation(&owner_instance);
-        let global_revision = self.global_revision.fetch_add(1, Ordering::AcqRel) + 1;
-        let mut entries = self.entries_write();
+        let mut inner = self.inner_write();
+        let global_revision = inner.next_revision();
         let key = (device_id.clone(), capability.clone());
-        let revision = entries.get(&key).map_or(1, |prev| prev.revision + 1);
+        let (merged_fields, revision) = match inner.entries.get(&key) {
+            Some(prev) => (merge_fields(&prev.fields, &fields), prev.revision + 1),
+            None => (fields, 1),
+        };
         let entry = Arc::new(DeviceState {
             device_id,
             capability,
-            fields,
+            fields: merged_fields,
             revision,
             global_revision,
             received_ms,
@@ -234,7 +294,7 @@ impl DeviceStateStore {
             owner_instance,
             quality: StateQuality::Fresh,
         });
-        entries.insert(key, entry);
+        inner.entries.insert(key, entry);
     }
 
     /// Snapshot every capability entry currently known for
@@ -243,7 +303,8 @@ impl DeviceStateStore {
     /// and no subsequent `state-changed` publishes).
     #[must_use]
     pub fn snapshot_device(&self, device_id: &str) -> Vec<Arc<DeviceState>> {
-        self.entries_read()
+        self.inner_read()
+            .entries
             .iter()
             .filter(|((did, _), _)| did == device_id)
             .map(|(_, meta)| Arc::clone(meta))
@@ -257,7 +318,8 @@ impl DeviceStateStore {
         device_id: &str,
         capability: &str,
     ) -> Option<Arc<DeviceState>> {
-        self.entries_read()
+        self.inner_read()
+            .entries
             .get(&(device_id.to_string(), capability.to_string()))
             .map(Arc::clone)
     }
@@ -269,7 +331,8 @@ impl DeviceStateStore {
     #[must_use]
     pub fn deltas_since(&self, since_revision: u64, limit: usize) -> Vec<Arc<DeviceState>> {
         let mut out: Vec<Arc<DeviceState>> = self
-            .entries_read()
+            .inner_read()
+            .entries
             .values()
             .filter(|m| m.global_revision > since_revision)
             .map(Arc::clone)
@@ -288,19 +351,18 @@ impl DeviceStateStore {
     ///
     /// Returns the number of entries flipped (test / observability).
     pub fn mark_instance_stale(&self, owner_instance: &str) -> usize {
-        let mut entries = self.entries_write();
-        let keys_to_stale: Vec<(DeviceId, String)> = entries
+        let mut inner = self.inner_write();
+        let keys_to_stale: Vec<(DeviceId, String)> = inner
+            .entries
             .iter()
             .filter(|(_, m)| m.owner_instance == owner_instance && m.quality == StateQuality::Fresh)
             .map(|(k, _)| k.clone())
             .collect();
-        let n = keys_to_stale.len();
-        for key in keys_to_stale {
-            let global_revision = self.global_revision.fetch_add(1, Ordering::AcqRel) + 1;
-            // Rebuild the Arc — outstanding snapshots keep the old
-            // value; the map slot points at the new `Stale` entry.
-            let prev = entries
-                .get(&key)
+        for key in &keys_to_stale {
+            let global_revision = inner.next_revision();
+            let prev = inner
+                .entries
+                .get(key)
                 .expect("just filtered on presence")
                 .clone();
             let updated = Arc::new(DeviceState {
@@ -308,10 +370,98 @@ impl DeviceStateStore {
                 quality: StateQuality::Stale,
                 ..(*prev).clone()
             });
-            entries.insert(key, updated);
+            inner.entries.insert(key.clone(), updated);
         }
-        n
+        keys_to_stale.len()
     }
+
+    /// H9 round-2 finding 3: mark every entry for `device_id` as
+    /// `Stale`. Called from `remove-device` — the device is gone,
+    /// so its projection entries must not continue to advertise
+    /// as `Fresh`. Also called from `register-device` before
+    /// seeding, so any pre-existing entries from a prior life of
+    /// the same stable id start `Stale` and are re-initialized
+    /// only for the capabilities the current registration declares.
+    ///
+    /// Returns the number of entries flipped.
+    pub fn mark_device_stale(&self, device_id: &str) -> usize {
+        let mut inner = self.inner_write();
+        let keys_to_stale: Vec<(DeviceId, String)> = inner
+            .entries
+            .iter()
+            .filter(|((did, _), m)| did == device_id && m.quality == StateQuality::Fresh)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &keys_to_stale {
+            let global_revision = inner.next_revision();
+            let prev = inner
+                .entries
+                .get(key)
+                .expect("just filtered on presence")
+                .clone();
+            let updated = Arc::new(DeviceState {
+                global_revision,
+                quality: StateQuality::Stale,
+                ..(*prev).clone()
+            });
+            inner.entries.insert(key.clone(), updated);
+        }
+        keys_to_stale.len()
+    }
+
+    /// H9 round-2 finding 3: reconcile the projection with a
+    /// `DeviceInfo.capabilities` list — flip any entry whose
+    /// `capability` isn't in `live_capabilities` to `Stale`.
+    /// Called from `register-device` and `update-device` so a
+    /// device that dropped a capability (or re-registered with a
+    /// narrower spec list) doesn't leave the old entries
+    /// advertising as `Fresh` under the same stable id.
+    ///
+    /// Returns the number of entries flipped.
+    pub fn reconcile_capabilities(&self, device_id: &str, live_capabilities: &[String]) -> usize {
+        let mut inner = self.inner_write();
+        let keys_to_stale: Vec<(DeviceId, String)> = inner
+            .entries
+            .iter()
+            .filter(|((did, cap), m)| {
+                did == device_id
+                    && m.quality == StateQuality::Fresh
+                    && !live_capabilities.iter().any(|live| live == cap)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &keys_to_stale {
+            let global_revision = inner.next_revision();
+            let prev = inner
+                .entries
+                .get(key)
+                .expect("just filtered on presence")
+                .clone();
+            let updated = Arc::new(DeviceState {
+                global_revision,
+                quality: StateQuality::Stale,
+                ..(*prev).clone()
+            });
+            inner.entries.insert(key.clone(), updated);
+        }
+        keys_to_stale.len()
+    }
+}
+
+/// Merge `updates` into `prev` by `key` — new keys are appended,
+/// duplicated keys have their value replaced by the update. Preserves
+/// `prev`'s ordering for stable keys so a snapshot-diffing consumer
+/// sees minimal churn.
+fn merge_fields(prev: &[KeyValue], updates: &[KeyValue]) -> Vec<KeyValue> {
+    let mut out: Vec<KeyValue> = prev.to_vec();
+    for update in updates {
+        if let Some(existing) = out.iter_mut().find(|kv| kv.key == update.key) {
+            existing.value = update.value.clone();
+        } else {
+            out.push(update.clone());
+        }
+    }
+    out
 }
 
 /// Shared `Arc` alias, parallel to `SharedDeviceRegistry`.
@@ -346,7 +496,7 @@ mod tests {
         assert_eq!(entry.received_ms, 100);
         assert_eq!(entry.observed_ms, 10);
         assert_eq!(entry.quality, StateQuality::Fresh);
-        assert_eq!(entry.source_generation, 0); // no bump_generation yet
+        assert_eq!(entry.source_generation, 0);
         assert!(matches!(entry.fields[0].value, Value::BoolVal(true)));
     }
 
@@ -370,12 +520,107 @@ mod tests {
             200,
         );
         let entry = store.snapshot_capability("dev-1", "switch").unwrap();
-        // Per-slot revision counts local changes.
         assert_eq!(entry.revision, 2);
-        // Store-wide revision bumps on every apply.
         assert_eq!(entry.global_revision, 2);
         assert_eq!(store.current_revision(), 2);
         assert!(matches!(entry.fields[0].value, Value::BoolVal(false)));
+    }
+
+    /// Round-2 finding 2: `state-change.fields` is *changes only*.
+    /// Applying `{hue: 0.5}` onto a color-light entry with prior
+    /// `{hue, saturation, value, color_temp_kelvin}` must
+    /// preserve the untouched keys.
+    #[test]
+    fn apply_merges_by_key_preserving_untouched_fields() {
+        let store = DeviceStateStore::new();
+        store.apply(
+            "dev-1".into(),
+            "alpha".into(),
+            "color-light".into(),
+            vec![
+                kv("hue", Value::FloatVal(0.1)),
+                kv("saturation", Value::FloatVal(0.9)),
+                kv("value", Value::FloatVal(0.8)),
+                kv("color_temp_kelvin", Value::IntVal(4000)),
+            ],
+            0,
+            0,
+        );
+        // Second apply reports only `hue`. Saturation / value /
+        // color_temp_kelvin must survive.
+        store.apply(
+            "dev-1".into(),
+            "alpha".into(),
+            "color-light".into(),
+            vec![kv("hue", Value::FloatVal(0.5))],
+            0,
+            0,
+        );
+        let entry = store.snapshot_capability("dev-1", "color-light").unwrap();
+        let field = |k: &str| entry.fields.iter().find(|f| f.key == k).cloned();
+        assert!(matches!(
+            field("hue").unwrap().value,
+            Value::FloatVal(v) if (v - 0.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            field("saturation").unwrap().value,
+            Value::FloatVal(v) if (v - 0.9).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            field("value").unwrap().value,
+            Value::FloatVal(v) if (v - 0.8).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            field("color_temp_kelvin").unwrap().value,
+            Value::IntVal(4000)
+        ));
+    }
+
+    /// Round-2 finding 1: revision allocation + insertion must be
+    /// under one lock. Drive many threads through `apply` in
+    /// parallel and verify every revision from 1..=N is committed
+    /// and observable. Under the pre-fix shape (atomic allocate
+    /// then separate write-lock) some revisions could commit out
+    /// of order or be permanently skipped by delta pollers.
+    #[test]
+    fn concurrent_applies_commit_every_revision_contiguously() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let store = StdArc::new(DeviceStateStore::new());
+        let threads = 8;
+        let per_thread = 25;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let s = StdArc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for i in 0..per_thread {
+                    s.apply(
+                        format!("dev-{t}-{i}"),
+                        format!("owner-{t}"),
+                        "switch".into(),
+                        vec![],
+                        0,
+                        0,
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Every allocated revision must have committed an entry —
+        // deltas_since(0, large) must return exactly `threads *
+        // per_thread` entries and the global revisions must cover
+        // 1..=threads*per_thread exactly.
+        let total = threads * per_thread;
+        assert_eq!(store.current_revision(), total as u64);
+        let deltas = store.deltas_since(0, total * 2);
+        assert_eq!(deltas.len(), total);
+        let mut revs: Vec<u64> = deltas.iter().map(|m| m.global_revision).collect();
+        revs.sort_unstable();
+        let expected: Vec<u64> = (1..=total as u64).collect();
+        assert_eq!(revs, expected);
     }
 
     #[test]
@@ -427,15 +672,10 @@ mod tests {
                 0,
             );
         }
-        // Snapshot cursor at revision 2 → deltas returns entries
-        // with global_revision 3, 4, 5.
         let deltas = store.deltas_since(2, 10);
         assert_eq!(deltas.len(), 3);
         let revs: Vec<u64> = deltas.iter().map(|m| m.global_revision).collect();
         assert_eq!(revs, vec![3, 4, 5]);
-        // Limit truncates ascending — you get the *earliest*
-        // deltas so you can drive the cursor forward one page at a
-        // time without missing anything.
         let capped = store.deltas_since(0, 2);
         let capped_revs: Vec<u64> = capped.iter().map(|m| m.global_revision).collect();
         assert_eq!(capped_revs, vec![1, 2]);
@@ -466,13 +706,123 @@ mod tests {
         assert_eq!(flipped, 1);
         let alpha_entry = store.snapshot_capability("dev-alpha", "switch").unwrap();
         assert_eq!(alpha_entry.quality, StateQuality::Stale);
-        // Revision bumped so a delta poller catches the transition.
         assert_eq!(alpha_entry.global_revision, 3);
         let beta_entry = store.snapshot_capability("dev-beta", "switch").unwrap();
         assert_eq!(beta_entry.quality, StateQuality::Fresh);
-        // Second sweep is idempotent — alpha's entry is already
-        // Stale, so nothing to flip.
         assert_eq!(store.mark_instance_stale("alpha"), 0);
+    }
+
+    /// Round-2 finding 3: `remove-device` (via `mark_device_stale`)
+    /// flips every entry for `device_id` to `Stale`, bumps
+    /// revisions so a poller catches the transition.
+    #[test]
+    fn mark_device_stale_flips_all_capabilities_for_device() {
+        let store = DeviceStateStore::new();
+        store.apply(
+            "dev-1".into(),
+            "alpha".into(),
+            "switch".into(),
+            vec![],
+            0,
+            0,
+        );
+        store.apply(
+            "dev-1".into(),
+            "alpha".into(),
+            "dimmer".into(),
+            vec![],
+            0,
+            0,
+        );
+        store.apply(
+            "dev-other".into(),
+            "alpha".into(),
+            "switch".into(),
+            vec![],
+            0,
+            0,
+        );
+        assert_eq!(store.mark_device_stale("dev-1"), 2);
+        assert_eq!(
+            store
+                .snapshot_capability("dev-1", "switch")
+                .unwrap()
+                .quality,
+            StateQuality::Stale
+        );
+        assert_eq!(
+            store
+                .snapshot_capability("dev-1", "dimmer")
+                .unwrap()
+                .quality,
+            StateQuality::Stale
+        );
+        // Other device unaffected.
+        assert_eq!(
+            store
+                .snapshot_capability("dev-other", "switch")
+                .unwrap()
+                .quality,
+            StateQuality::Fresh
+        );
+    }
+
+    /// Round-2 finding 3: `update-device` with a narrower
+    /// capability list should flip the dropped capabilities'
+    /// entries. `reconcile_capabilities` keeps entries whose
+    /// capability is in the live list and stales the rest.
+    #[test]
+    fn reconcile_capabilities_flips_dropped_capabilities_only() {
+        let store = DeviceStateStore::new();
+        store.apply(
+            "dev-1".into(),
+            "alpha".into(),
+            "switch".into(),
+            vec![],
+            0,
+            0,
+        );
+        store.apply(
+            "dev-1".into(),
+            "alpha".into(),
+            "dimmer".into(),
+            vec![],
+            0,
+            0,
+        );
+        store.apply(
+            "dev-1".into(),
+            "alpha".into(),
+            "color-light".into(),
+            vec![],
+            0,
+            0,
+        );
+        // Live capability list drops `dimmer`.
+        let dropped = store
+            .reconcile_capabilities("dev-1", &["switch".to_string(), "color-light".to_string()]);
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            store
+                .snapshot_capability("dev-1", "dimmer")
+                .unwrap()
+                .quality,
+            StateQuality::Stale
+        );
+        assert_eq!(
+            store
+                .snapshot_capability("dev-1", "switch")
+                .unwrap()
+                .quality,
+            StateQuality::Fresh
+        );
+        assert_eq!(
+            store
+                .snapshot_capability("dev-1", "color-light")
+                .unwrap()
+                .quality,
+            StateQuality::Fresh
+        );
     }
 
     #[test]
@@ -512,9 +862,6 @@ mod tests {
         );
     }
 
-    /// A snapshot handed out by `snapshot_capability` is an `Arc`
-    /// — subsequent `apply` calls rebuild the Arc, and the old
-    /// snapshot keeps observing what it read.
     #[test]
     fn snapshot_is_immutable_after_read() {
         let store = DeviceStateStore::new();
@@ -537,7 +884,6 @@ mod tests {
             0,
             0,
         );
-        // Old snapshot unchanged.
         assert!(matches!(before.fields[0].value, Value::BoolVal(true)));
         let after = store.snapshot_capability("dev-1", "switch").unwrap();
         assert!(matches!(after.fields[0].value, Value::BoolVal(false)));

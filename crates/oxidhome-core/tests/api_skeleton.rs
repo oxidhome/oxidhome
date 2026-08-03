@@ -3980,3 +3980,174 @@ async fn devices_state_endpoints_require_devices_read_scope() {
         );
     }
 }
+
+/// H9 round-2 finding 2: partial state updates merge by key.
+/// Applies an initial color-light state, then a subsequent update
+/// with only `hue`, then asserts saturation / value survive.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_partial_updates_merge_untouched_fields() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    store.apply(
+        "dev-1".into(),
+        "alpha".into(),
+        "color-light".into(),
+        vec![
+            KeyValue {
+                key: "hue".into(),
+                value: Value::FloatVal(0.1),
+            },
+            KeyValue {
+                key: "saturation".into(),
+                value: Value::FloatVal(0.9),
+            },
+            KeyValue {
+                key: "value".into(),
+                value: Value::FloatVal(0.8),
+            },
+        ],
+        0,
+        0,
+    );
+    store.apply(
+        "dev-1".into(),
+        "alpha".into(),
+        "color-light".into(),
+        vec![KeyValue {
+            key: "hue".into(),
+            value: Value::FloatVal(0.5),
+        }],
+        0,
+        0,
+    );
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/dev-1/state")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let cap = &body["capabilities"][0];
+    assert_eq!(cap["capability"], "color-light");
+    let fields = cap["fields"].as_array().unwrap();
+    let get = |k: &str| -> serde_json::Value {
+        fields
+            .iter()
+            .find(|f| f["key"] == k)
+            .expect("field present")["value"]
+            .clone()
+    };
+    // hue updated to 0.5, saturation / value preserved.
+    assert_eq!(get("hue")["t"], "Float");
+    assert!((get("hue")["v"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    assert!((get("saturation")["v"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+    assert!((get("value")["v"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+}
+
+/// H9 round-2 finding 3: `mark_device_stale` flips every entry
+/// for a device to `Stale` and bumps the store revision so a
+/// delta poller catches the transition. Simulates a
+/// `remove-device` at the store level.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_mark_device_stale_bumps_revision_and_flips_all_caps() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    store.apply(
+        "dev-1".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    store.apply(
+        "dev-1".into(),
+        "alpha".into(),
+        "dimmer".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    assert_eq!(store.current_revision(), 2);
+    let flipped = store.mark_device_stale("dev-1");
+    assert_eq!(flipped, 2);
+    assert_eq!(store.current_revision(), 4);
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state/changes?since_revision=2&limit=10")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let changes = body["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2);
+    for change in changes {
+        assert_eq!(change["device_id"], "dev-1");
+        assert_eq!(change["quality"], "stale");
+    }
+}
+
+/// H9 round-2 finding 3: `reconcile_capabilities` flips entries
+/// whose capability was dropped, keeps entries whose capability
+/// is still declared.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_reconcile_capabilities_flips_only_dropped_caps() {
+    let engine = Engine::new().expect("engine");
+    let store = engine.device_state();
+    for cap in ["switch", "dimmer", "color-light"] {
+        store.apply(
+            "dev-1".into(),
+            "alpha".into(),
+            (*cap).into(),
+            Vec::new(),
+            0,
+            0,
+        );
+    }
+    // Drop `dimmer` from the live capability set.
+    let flipped =
+        store.reconcile_capabilities("dev-1", &["switch".to_string(), "color-light".to_string()]);
+    assert_eq!(flipped, 1);
+    assert_eq!(
+        store
+            .snapshot_capability("dev-1", "dimmer")
+            .unwrap()
+            .quality,
+        oxidhome_core::state::StateQuality::Stale
+    );
+    assert_eq!(
+        store
+            .snapshot_capability("dev-1", "switch")
+            .unwrap()
+            .quality,
+        oxidhome_core::state::StateQuality::Fresh
+    );
+}

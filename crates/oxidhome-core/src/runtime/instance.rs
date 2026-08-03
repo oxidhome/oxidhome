@@ -829,7 +829,16 @@ impl PluginInstance {
             capability = %cmd.capability,
             action = %cmd.action,
         );
-        async {
+        // Snapshot the identity + capability + owner before the
+        // move-into-`call_execute_command` so the H9 projection
+        // hook below can attribute an `OkWithState` return to the
+        // correct `(device, capability)` slot with the owning
+        // instance id.
+        let capability = cmd.capability.clone();
+        let device_for_projection = device.clone();
+        let owner_instance = data.instance_id.clone();
+        let device_state = Arc::clone(&data.device_state);
+        let result = async {
             self.arm_watchdog();
             self.bindings
                 .call_execute_command(&mut self.store, &device, &cmd)
@@ -838,7 +847,26 @@ impl PluginInstance {
                 .context("invoking plugin execute-command")
         }
         .instrument(span)
-        .await
+        .await?;
+        // H9 round-2 finding 4: `OkWithState` is authoritative
+        // state (per proto docs) — project it into the store so
+        // the snapshot / delta APIs reflect the post-command
+        // value. `Ok` and `Err` don't carry state; skip. Uses the
+        // same merge semantics as an event-driven apply, so a
+        // subsequent `state-changed` observing more fields
+        // composes correctly.
+        if let CommandResult::OkWithState(fields) = &result {
+            let received_ms = crate::state::event_log::now_unix_ms();
+            device_state.apply(
+                device_for_projection,
+                owner_instance,
+                capability,
+                fields.clone(),
+                0, // observed_ms — commands don't carry a plugin timestamp
+                received_ms,
+            );
+        }
+        Ok(result)
     }
 
     /// Call the plugin's exported `execute-service-command` for a

@@ -733,13 +733,25 @@ impl host_devices::Host for PluginState {
         // `authorize_device_info` gate above already refused any
         // `initial_state` entry that doesn't match a declared
         // capability, so what lands here is safe to project.
-        // Cloning `info.initial_state` before the move into
-        // `register` — need the state list for seeding, need the
-        // full `info` for the registry.
+        // Cloning `info.initial_state` + `capabilities` before the
+        // move into `register` — need them for state seeding /
+        // reconciliation.
         let seed_state = seed_state_from_initial(&info);
+        let live_capabilities: Vec<String> = info
+            .capabilities
+            .iter()
+            .map(capability_name)
+            .collect();
         let id = self
             .devices
             .register(&self.installation_uuid, self.instance_id.clone(), info);
+        // H9 round-2 finding 3: the stable device-id derivation
+        // can resurrect the same id from a prior life. Reconcile
+        // any pre-existing entries against the current
+        // capabilities list so an omitted capability doesn't
+        // linger as `Fresh`.
+        self.device_state
+            .reconcile_capabilities(&id, &live_capabilities);
         let received_ms = crate::state::event_log::now_unix_ms();
         for (capability, fields) in seed_state {
             self.device_state.seed(
@@ -776,12 +788,35 @@ impl host_devices::Host for PluginState {
             );
             return Err(err);
         }
-        self.devices.update(&self.instance_id, &id, info)
+        // H9 round-2 finding 3: reconcile the projection with the
+        // (possibly narrower) capabilities list before the update
+        // lands, so a dropped capability's entries flip to `Stale`
+        // instead of continuing to advertise as `Fresh` on a
+        // device that no longer declares them.
+        let live_capabilities: Vec<String> = info
+            .capabilities
+            .iter()
+            .map(capability_name)
+            .collect();
+        let outcome = self.devices.update(&self.instance_id, &id, info);
+        if outcome.is_ok() {
+            self.device_state
+                .reconcile_capabilities(&id, &live_capabilities);
+        }
+        outcome
     }
 
     async fn remove_device(&mut self, id: DeviceId) -> Result<(), WitError> {
         let outcome = self.devices.remove(&self.instance_id, &id);
         if outcome.is_ok() {
+            // H9 round-2 finding 3: the device is gone; flip every
+            // projection entry for it to `Stale` so consumers stop
+            // reading pre-remove values as `Fresh`. Runs only on
+            // successful remove — a `NotFound` / `Unavailable`
+            // return means the device wasn't ours (or is
+            // uninstall-locked) and its state is someone else's
+            // to sweep.
+            self.device_state.mark_device_stale(&id);
             tracing::debug!(
                 instance_id = %self.instance_id,
                 device_id = %id,
