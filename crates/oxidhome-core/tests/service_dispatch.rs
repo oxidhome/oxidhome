@@ -214,6 +214,10 @@ async fn cross_task_cycle_is_rejected_promptly() {
         dispatcher::call_service_from_host(
             &engine,
             "test-driver",
+            // Same list for requested + granted — the test driver
+            // isn't a real installed plugin, so there's no operator
+            // narrowing shape to model.
+            &driver_grants,
             &driver_grants,
             svc_a.clone(),
             "kick",

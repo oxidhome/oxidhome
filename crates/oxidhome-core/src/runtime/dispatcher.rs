@@ -61,15 +61,25 @@
 //!
 //! **Caller-side capability gate (H10)**: before routing, the
 //! dispatcher checks the target service's
-//! `(owner_plugin_id, owner_instance, local_id)` and the requested
-//! command name against the caller's structured
-//! `[capabilities] consumes_services` grants. A call is authorized
-//! when at least one grant entry matches all four axes (with
-//! `instance` and `commands` supporting `"*"` wildcards). The check
-//! keys off the service's immutable `local-id` so a callee that
-//! renames its service via `update-service` cannot bypass or shadow
-//! a grant. The gate runs before `acquire_call`, so a refused call
-//! spends no refcount and cannot influence `remove-service` timing.
+//! `(owner_plugin_id, owner_instance, local_id)`, the actual
+//! caller instance-id, and the requested command name against the
+//! caller's structured `[capabilities] consumes_services` grants.
+//! The check runs **twice** (H10 round-4): once against the
+//! caller's manifest-declared *requested* list, once against the
+//! operator's *granted* list from
+//! `plugin_installation.granted_capabilities_json`. Both lists
+//! must have at least one matching selector; a call is authorized
+//! iff that's true. Semantically equivalent to requested ∩ granted
+//! but with no materialized cross-product (the pre-fix
+//! materialization was O(N²) in narrowed output and O(N²) again in
+//! dedup work; this shape is O(|requested|+|granted|) per call,
+//! and both lists are bounded by manifest validation caps).
+//!
+//! The check keys off the service's immutable `local-id` so a
+//! callee that renames its service via `update-service` cannot
+//! bypass or shadow a grant. The gate runs before `acquire_call`,
+//! so a refused call spends no refcount and cannot influence
+//! `remove-service` timing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,7 +149,8 @@ pub(crate) const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn call_service_from_host(
     engine: &crate::Engine,
     caller_instance: impl Into<String>,
-    caller_grants: &[ServiceGrant],
+    caller_requested_grants: &[ServiceGrant],
+    caller_granted_grants: &[ServiceGrant],
     target: ServiceId,
     command: impl Into<String>,
     args: Vec<KeyValue>,
@@ -150,7 +161,8 @@ pub async fn call_service_from_host(
         &services,
         &instances,
         caller_instance.into(),
-        caller_grants,
+        caller_requested_grants,
+        caller_granted_grants,
         target,
         command.into(),
         args,
@@ -161,18 +173,30 @@ pub async fn call_service_from_host(
 /// Entry point for the `host-services::call-service` host impl.
 ///
 /// `caller_instance` identifies *this* instance (from `PluginState`).
-/// `caller_grants` is the caller's `[capabilities] consumes_services`
-/// list, each entry a resource selector on `(plugin, instance,
-/// service_local_id, commands)`. `target` is the host-minted
-/// `service-id` the caller passed; the dispatcher resolves it through
-/// `services`, checks the caller's grants against the target's
-/// `(owner_plugin_id, owner_instance, local_id, command)`, and hops
-/// to the owning instance's supervisor via `instances`.
+/// H10 round-4: authorization runs against **two** independent
+/// selector lists — the caller's `[capabilities] consumes_services`
+/// declared in the manifest (`caller_requested_grants`) and the
+/// operator-narrowed grant from
+/// `plugin_installation.granted_capabilities_json`
+/// (`caller_granted_grants`). A call is authorized iff at least
+/// one entry in each list matches the target-tuple, semantically
+/// equivalent to intersection but with no materialized
+/// cross-product (bounded O(N) per call in each list). Manifest
+/// validation caps each list's length + each entry's `commands`
+/// so this is bounded per-instance.
+///
+/// `target` is the host-minted `service-id` the caller passed;
+/// the dispatcher resolves it through `services`, checks both
+/// grant lists against the target's `(owner_plugin_id,
+/// owner_instance, local_id, command)`, and hops to the owning
+/// instance's supervisor via `instances`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_service(
     services: &Arc<ServiceRegistry>,
     instances: &Arc<InstanceRegistry>,
     caller_instance: String,
-    caller_grants: &[ServiceGrant],
+    caller_requested_grants: &[ServiceGrant],
+    caller_granted_grants: &[ServiceGrant],
     target: ServiceId,
     command: String,
     args: Vec<KeyValue>,
@@ -234,21 +258,37 @@ pub(crate) async fn call_service(
     //    can't shadow or bypass the grant by renaming `name`, and
     //    an operator can narrow a grant to specific caller
     //    instances via `caller_instance` (H10 round-3 finding 2).
-    if !caller_grants.iter().any(|g| {
-        g.matches(
-            &caller_instance,
-            &target_plugin_id,
-            &target_instance,
-            &target_local_id,
-            &command,
-        )
-    }) {
+    //
+    //    H10 round-4: both lists are checked independently. Fast
+    //    path — reject on the first list that has no match — so
+    //    the total cost is O(|first list|) when the manifest
+    //    doesn't declare a matching selector, and
+    //    O(|requested|+|granted|) otherwise. No materialized
+    //    cross-product.
+    let matches_requested = crate::state::any_grant_matches(
+        caller_requested_grants,
+        &caller_instance,
+        &target_plugin_id,
+        &target_instance,
+        &target_local_id,
+        &command,
+    );
+    let matches_granted = crate::state::any_grant_matches(
+        caller_granted_grants,
+        &caller_instance,
+        &target_plugin_id,
+        &target_instance,
+        &target_local_id,
+        &command,
+    );
+    if !(matches_requested && matches_granted) {
         return Err(WitError::PermissionDenied(format!(
             "caller `{caller_instance}` has no `consumes_services` grant \
              matching target `{target_plugin_id}` instance `{target_instance}` \
              service `{target_local_id}` command `{command}` — add a matching \
              `[[capabilities.consumes_services]]` entry to the caller's manifest \
-             (set `caller_instance = \"*\"` or `\"{caller_instance}\"`)"
+             (set `caller_instance = \"*\"` or `\"{caller_instance}\"`) and make \
+             sure the operator's granted copy authorizes the same selector"
         )));
     }
 
@@ -375,6 +415,7 @@ mod tests {
             &instances,
             "alpha".into(),
             &grants,
+            &grants,
             svc.clone(),
             "kick".into(),
             Vec::new(),
@@ -426,6 +467,7 @@ mod tests {
                     &instances,
                     "beta".into(),
                     &grants,
+                    &grants,
                     a_svc.clone(),
                     "kick".into(),
                     Vec::new(),
@@ -464,6 +506,7 @@ mod tests {
             &instances,
             "alpha".into(),
             &[],
+            &[],
             target.clone(),
             "kick".into(),
             Vec::new(),
@@ -487,6 +530,7 @@ mod tests {
             &instances,
             "alpha".into(),
             &wrong_command,
+            &wrong_command,
             target.clone(),
             "kick".into(),
             Vec::new(),
@@ -508,6 +552,7 @@ mod tests {
             &services,
             &instances,
             "alpha".into(),
+            &wrong_instance,
             &wrong_instance,
             target.clone(),
             "kick".into(),
@@ -531,6 +576,7 @@ mod tests {
             &services,
             &instances,
             "alpha".into(),
+            &wrong_service,
             &wrong_service,
             target.clone(),
             "kick".into(),
@@ -569,6 +615,7 @@ mod tests {
             &services,
             &instances,
             "alpha".into(),
+            &grants,
             &grants,
             target.clone(),
             "anything".into(),
@@ -621,6 +668,7 @@ mod tests {
                     &instances,
                     "gamma".into(),
                     &grants,
+                    &grants,
                     delta_svc.clone(),
                     "kick".into(),
                     Vec::new(),
@@ -634,5 +682,107 @@ mod tests {
             "expected Unavailable (delta not running), got {err:?}",
         );
         assert_eq!(services.active_call_count(&delta_svc), 0);
+    }
+
+    /// H10 round-4: authorization is `requested_matches ∧
+    /// granted_matches` per call. Verifies both directions:
+    ///
+    /// - Requested is wildcard, granted narrows to a specific
+    ///   command → the specific command authorizes, others don't.
+    /// - Requested lists only `["get"]`, granted has `["*"]` →
+    ///   only `get` authorizes (requested is a real ceiling too).
+    /// - Same request matched by both → passes the auth gate and
+    ///   proceeds (hits `Unavailable` because the target has no
+    ///   live handle in this in-process test).
+    #[tokio::test(flavor = "current_thread")]
+    async fn requested_and_granted_both_gate_the_call() {
+        let services = Arc::new(ServiceRegistry::new());
+        let target = services
+            .register(
+                "beta".into(),
+                "com.example.beta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let instances = Arc::new(InstanceRegistry::new());
+
+        // Case 1: requested = "*"-any-command; granted = only `get`.
+        // Call to `get` should pass; call to `set` should refuse.
+        let requested_wildcard = [ServiceGrant {
+            plugin: "com.example.beta".into(),
+            instance: "*".into(),
+            service: "ring".into(),
+            commands: vec!["*".into()],
+            caller_instance: "*".into(),
+        }];
+        let granted_get = [ServiceGrant {
+            plugin: "com.example.beta".into(),
+            instance: "*".into(),
+            service: "ring".into(),
+            commands: vec!["get".into()],
+            caller_instance: "*".into(),
+        }];
+        // `get` matches both lists → passes auth, then fails on
+        // Unavailable because beta isn't running.
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            &requested_wildcard,
+            &granted_get,
+            target.clone(),
+            "get".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("beta not running → Unavailable past the gate");
+        assert!(matches!(err, WitError::Unavailable(_)));
+        // `set` fails granted-list match → PermissionDenied.
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            &requested_wildcard,
+            &granted_get,
+            target.clone(),
+            "set".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("granted doesn't cover `set`");
+        assert!(matches!(err, WitError::PermissionDenied(_)));
+
+        // Case 2: requested narrower than granted. Requested only
+        // authorizes `get`; granted authorizes `*`. Call to `set`
+        // fails requested-list match, even though granted allows
+        // it (the manifest ceiling still applies).
+        let requested_get_only = [ServiceGrant {
+            plugin: "com.example.beta".into(),
+            instance: "*".into(),
+            service: "ring".into(),
+            commands: vec!["get".into()],
+            caller_instance: "*".into(),
+        }];
+        let granted_wildcard = [ServiceGrant {
+            plugin: "com.example.beta".into(),
+            instance: "*".into(),
+            service: "ring".into(),
+            commands: vec!["*".into()],
+            caller_instance: "*".into(),
+        }];
+        let err = call_service(
+            &services,
+            &instances,
+            "alpha".into(),
+            &requested_get_only,
+            &granted_wildcard,
+            target.clone(),
+            "set".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("requested is the ceiling; `set` isn't asked for");
+        assert!(matches!(err, WitError::PermissionDenied(_)));
+        assert_eq!(services.active_call_count(&target), 0);
     }
 }

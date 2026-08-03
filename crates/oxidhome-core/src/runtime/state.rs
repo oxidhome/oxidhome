@@ -351,6 +351,17 @@ pub struct PluginState {
     /// manifest's requested capabilities for dev-time loads that
     /// don't go through `install`.
     pub granted_capabilities: Arc<oxidhome_manifest::CapabilitiesSection>,
+    /// H10 round-4: `consumes_services` grants as declared in the
+    /// **manifest** (before operator narrowing). The dispatcher
+    /// authorizes a `call-service` iff at least one entry here
+    /// AND at least one entry in
+    /// `granted_capabilities.consumes_services` matches the call.
+    /// Held separately from `granted_capabilities` because the
+    /// requested-vs-granted intersection is applied at dispatch
+    /// time instead of being materialized at load time — a
+    /// materialized cross-product grows O(N²) in the count of
+    /// selectors and is DoS-able from the manifest side.
+    pub consumes_services_requested: Arc<Vec<oxidhome_manifest::ServiceGrant>>,
     /// Resource handles owned by this store. Required by Wasmtime's
     /// component model; populated when Phase 5 introduces blob/model
     /// resource handling.
@@ -467,6 +478,13 @@ impl PluginState {
         // `Self::with_granted_capabilities` when a live install
         // row is present.
         let granted_capabilities = Arc::new(manifest.capabilities.clone());
+        // H10 round-4: seed the "requested" list from the manifest
+        // directly, matching the granted default above. The loader
+        // (`PluginInstance::instantiate`) overrides only the
+        // granted side when a live install row is present; the
+        // requested side always reflects what the plugin author
+        // asked for.
+        let consumes_services_requested = Arc::new(manifest.capabilities.consumes_services.clone());
         // C4: aggregate-tracking wasmtime `ResourceLimiter`. Every
         // plugin instance gets the same shape today; per-manifest
         // overrides can layer on later without changing the wiring
@@ -479,6 +497,7 @@ impl PluginState {
             instance_id: instance_id.into(),
             installation_uuid: installation_uuid.into(),
             granted_capabilities,
+            consumes_services_requested,
             table: ResourceTable::new(),
             wasi: wasi.build(),
             devices,
@@ -843,17 +862,20 @@ impl host_services::Host for PluginState {
         args: Vec<KeyValue>,
     ) -> Result<CommandResult, WitError> {
         // Phase 7c: route through the dispatcher. Resolves target →
-        // `(owner_instance, owner_plugin_id, local_id)`, matches
-        // the caller's structured `consumes_services` grants
-        // against `(plugin, instance, local_id, command)`, rejects
+        // `(owner_instance, owner_plugin_id, local_id)`. H10
+        // round-4: authorizes by checking **both** the caller's
+        // requested `consumes_services` list AND the operator's
+        // granted list at call time — a call is authorized iff at
+        // least one entry in each matches the call tuple. Rejects
         // same-instance / A→…→A cycles, races
         // `execute-service-command` against the dispatcher
-        // timeout, and holds a `CallGuard` so `remove-service`
-        // refuses while the call is alive.
+        // timeout, holds a `CallGuard` so `remove-service` refuses
+        // while the call is alive.
         crate::runtime::dispatcher::call_service(
             &self.services,
             &self.instances,
             self.instance_id.clone(),
+            &self.consumes_services_requested,
             &self.granted_capabilities.consumes_services,
             target,
             command,
