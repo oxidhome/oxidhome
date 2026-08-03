@@ -1483,6 +1483,28 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
             };
             match serde_json::from_str::<CapabilitiesSection>(&json) {
                 Ok(cap) => {
+                    // H10 round-5: apply the same
+                    // capability-list size caps we enforce at
+                    // manifest-validation time to the *persisted*
+                    // grant. Without this, a hand-repaired or
+                    // future operator-modified row could push
+                    // `consumes_services` past
+                    // `MAX_CONSUMES_SERVICES_GRANTS` and re-open
+                    // the per-dispatch DoS surface — manifest
+                    // validation never sees the persisted grant
+                    // on the load path.
+                    if let Err(errs) = oxidhome_manifest::check_capability_limits_owned(&cap) {
+                        tracing::error!(
+                            plugin_id = %plugin_id,
+                            installation_uuid = %uuid,
+                            errors = ?errs,
+                            "granted_capabilities_json exceeds capability-list caps; \
+                             quarantining — reinstall or hand-repair the JSON \
+                             (H10 round-5)",
+                        );
+                        quarantined_uuids.insert(plugin_id, uuid_arc);
+                        continue;
+                    }
                     live.insert(
                         plugin_id,
                         LiveInstallation {
@@ -1518,6 +1540,23 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
 /// case beforehand. C5: also persists the granted capabilities
 /// JSON + content digest.
 fn insert_installation_row(db: &Db, row: &InstalledPlugin) -> Result<(), rusqlite::Error> {
+    // H10 round-5: defense-in-depth. Today `install` derives the
+    // granted capabilities from the (already-validated) manifest,
+    // so the check is redundant on the current path. But every
+    // write into `plugin_installation.granted_capabilities_json`
+    // funnels through here — a future operator-modify API can
+    // reuse this function and picks up the caps automatically,
+    // without a callsite forgetting to validate.
+    if let Err(errs) =
+        oxidhome_manifest::check_capability_limits_owned(row.granted_capabilities.as_ref())
+    {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("granted_capabilities exceed size caps: {errs:?}"),
+            ),
+        )));
+    }
     let grant_json = serde_json::to_string(row.granted_capabilities.as_ref()).map_err(|err| {
         // Should never happen — CapabilitiesSection is a plain
         // Serialize struct. Surface as a SqliteFailure with a
@@ -2473,6 +2512,90 @@ wasm = "plugin.wasm"
             "counter",
             "get",
         ));
+    }
+
+    /// H10 round-5: a persisted `granted_capabilities_json` that
+    /// exceeds `MAX_CONSUMES_SERVICES_GRANTS` is quarantined at
+    /// scan time — a hand-repaired row (or a future operator
+    /// tool that skips manifest validation) can't push per-call
+    /// authorization work back into the O(N) blowup region.
+    #[test]
+    fn scan_quarantines_persisted_grant_exceeding_capability_caps() {
+        use oxidhome_manifest::validate::MAX_CONSUMES_SERVICES_GRANTS;
+        let root = tempdir("h10r5-oversize-grant");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+        let db = fresh_db();
+
+        // Build an oversize grant JSON directly (bypassing
+        // insert_installation_row, which enforces the caps
+        // defense-in-depth) so we exercise the load-path check.
+        let mut oversized = Vec::new();
+        for i in 0..=MAX_CONSUMES_SERVICES_GRANTS {
+            oversized.push(oxidhome_manifest::ServiceGrant {
+                plugin: format!("example.p{i}"),
+                instance: "*".into(),
+                service: "svc".into(),
+                commands: vec!["*".into()],
+                caller_instance: "*".into(),
+            });
+        }
+        let caps = oxidhome_manifest::CapabilitiesSection {
+            consumes_services: oversized,
+            ..oxidhome_manifest::CapabilitiesSection::default()
+        };
+        let grant_json = serde_json::to_string(&caps).unwrap();
+
+        let plugin_id = "example.oversized";
+        let uuid = mint_installation_uuid();
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO plugin_installation
+                     (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms,
+                      granted_capabilities_json, content_digest)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+                rusqlite::params![
+                    &*uuid,
+                    plugin_id,
+                    "0.1.0",
+                    now_ms(),
+                    &grant_json,
+                    "digest-fake",
+                ],
+            )?;
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+
+        // Populate a matching install dir so the scan doesn't
+        // reject on missing FS.
+        let install_dir = plugins_root.join(&*uuid);
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(
+            install_dir.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.oversized"
+name = "Oversized"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "x.wasm"
+"#,
+        )
+        .unwrap();
+        std::fs::write(install_dir.join("x.wasm"), b"stub").unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
+        assert!(
+            reg.is_quarantined(plugin_id),
+            "oversized persisted grant must land in quarantine",
+        );
+        assert!(
+            reg.list().iter().all(|p| p.plugin_id.as_ref() != plugin_id),
+            "quarantined install must not appear in the live registry",
+        );
     }
 
     /// C5 review F3: install must derive the grant from the

@@ -282,13 +282,27 @@ pub(crate) async fn call_service(
         &command,
     );
     if !(matches_requested && matches_granted) {
+        // Wording notes: this error also flows through
+        // `call_service_from_host`, which passes explicit slices
+        // and has no "manifest" behind it — the guidance below
+        // covers both. Which of `matches_requested` or
+        // `matches_granted` fired is included so an operator (or
+        // test harness) can localize the fix instead of guessing.
+        let failed = match (matches_requested, matches_granted) {
+            (false, false) => "neither the caller's requested nor the granted list",
+            (false, true) => "the caller's requested list",
+            (true, false) => "the operator's granted list",
+            (true, true) => unreachable!("both matched but guard fired"),
+        };
         return Err(WitError::PermissionDenied(format!(
-            "caller `{caller_instance}` has no `consumes_services` grant \
-             matching target `{target_plugin_id}` instance `{target_instance}` \
-             service `{target_local_id}` command `{command}` — add a matching \
-             `[[capabilities.consumes_services]]` entry to the caller's manifest \
-             (set `caller_instance = \"*\"` or `\"{caller_instance}\"`) and make \
-             sure the operator's granted copy authorizes the same selector"
+            "caller `{caller_instance}` refused: {failed} contains a \
+             `consumes_services` selector matching target \
+             `{target_plugin_id}` instance `{target_instance}` service \
+             `{target_local_id}` command `{command}` (caller_instance \
+             `{caller_instance}` must match too). For plugin callers, add \
+             a matching `[[capabilities.consumes_services]]` entry to the \
+             caller's manifest and ensure the operator's granted copy \
+             authorizes the same selector"
         )));
     }
 
@@ -381,8 +395,13 @@ mod tests {
 
     /// Build a `ServiceGrant` that authorizes `command` on the
     /// `(plugin, instance='*', service=local_id)` tuple — used by
-    /// the dispatcher tests that want to exercise the same-instance
-    /// / cycle checks *after* the auth gate passes.
+    /// tests that want a grant broad enough to authorize an
+    /// arbitrary caller, so the assertion focuses on some other
+    /// check (same-instance, cycle, target-not-registered, …).
+    /// The dispatcher runs same-instance / cycle checks *before*
+    /// the grant check, so tests exercising those defenses would
+    /// hit their target even with an empty grant list — this
+    /// helper's role is documentary, not required for correctness.
     fn grant_any(plugin: &str, local_id: &str, command: &str) -> ServiceGrant {
         ServiceGrant {
             plugin: plugin.into(),
@@ -394,9 +413,11 @@ mod tests {
     }
 
     /// H10: outermost (empty chain) A→A self-call is rejected with a
-    /// documented same-instance error, not "recursion". The caller's
-    /// grant authorizes the call so the same-instance check (which
-    /// runs *after* the grant check) is what fires.
+    /// documented same-instance error, not "recursion". The
+    /// dispatcher runs the same-instance check *before* the grant
+    /// gate, so this test's rejection is unaffected by the grant
+    /// list (a matching grant is passed here so a reader can't
+    /// mis-attribute the rejection to a missing grant).
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_outermost_self_call_as_same_instance() {
         let services = Arc::new(ServiceRegistry::new());

@@ -292,6 +292,62 @@ impl std::fmt::Display for InvalidKeywordReason {
     }
 }
 
+/// H10 round-5: capability-list size limits, applicable to any
+/// [`crate::CapabilitiesSection`] regardless of provenance
+/// (manifest or persisted grant). [`validate`] calls this on the
+/// manifest's requested capabilities; the host also calls it on
+/// the operator's persisted `granted_capabilities_json` so a
+/// hand-repaired grant that skips manifest validation can't push
+/// per-dispatch authorization work back into the O(N) blowup
+/// region.
+///
+/// Pushes findings into `errors` rather than returning them, so
+/// callers that already collect a `Vec<ValidationError>` can
+/// combine limits with other checks in one pile. The
+/// convenience wrapper [`check_capability_limits_owned`] returns
+/// `Result<(), Vec<ValidationError>>` for callers that only care
+/// about capability limits.
+pub fn check_capability_limits(
+    caps: &crate::manifest::CapabilitiesSection,
+    errors: &mut Vec<ValidationError>,
+) {
+    if caps.consumes_services.len() > MAX_CONSUMES_SERVICES_GRANTS {
+        errors.push(ValidationError::TooManyConsumesServicesGrants {
+            count: caps.consumes_services.len(),
+            max: MAX_CONSUMES_SERVICES_GRANTS,
+        });
+    }
+    for (index, grant) in caps.consumes_services.iter().enumerate() {
+        if grant.commands.len() > MAX_COMMANDS_PER_GRANT {
+            errors.push(ValidationError::TooManyCommandsPerGrant {
+                index,
+                count: grant.commands.len(),
+                max: MAX_COMMANDS_PER_GRANT,
+            });
+        }
+    }
+}
+
+/// Standalone wrapper around [`check_capability_limits`] for
+/// callers that only need capability caps (persisted-grant load
+/// path in the host).
+///
+/// # Errors
+///
+/// Returns `Err(errors)` if any of the H10 round-4 capability
+/// count limits are exceeded.
+pub fn check_capability_limits_owned(
+    caps: &crate::manifest::CapabilitiesSection,
+) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    check_capability_limits(caps, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Run every check against `m` and collect all findings.
 ///
 /// # Errors
@@ -340,22 +396,13 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
     // H10 round-4: bound `consumes_services` size + per-grant
     // commands count so per-call authorization work is bounded and
     // a manifest can't consume excessive CPU/memory at load or
-    // dispatch time.
-    if m.capabilities.consumes_services.len() > MAX_CONSUMES_SERVICES_GRANTS {
-        errors.push(ValidationError::TooManyConsumesServicesGrants {
-            count: m.capabilities.consumes_services.len(),
-            max: MAX_CONSUMES_SERVICES_GRANTS,
-        });
-    }
-    for (index, grant) in m.capabilities.consumes_services.iter().enumerate() {
-        if grant.commands.len() > MAX_COMMANDS_PER_GRANT {
-            errors.push(ValidationError::TooManyCommandsPerGrant {
-                index,
-                count: grant.commands.len(),
-                max: MAX_COMMANDS_PER_GRANT,
-            });
-        }
-    }
+    // dispatch time. H10 round-5 (persisted-grant hardening):
+    // extracted to `check_capability_limits` so the host can apply
+    // the same caps when loading the *persisted* granted copy from
+    // `plugin_installation.granted_capabilities_json` — a
+    // hand-repaired or operator-modified grant that bypasses
+    // manifest validation would otherwise re-open the DoS surface.
+    check_capability_limits(&m.capabilities, &mut errors);
 
     validate_keywords(&m.plugin.keywords, &mut errors);
 

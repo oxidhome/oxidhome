@@ -188,11 +188,17 @@ pub fn resolve_service(
 /// routes `target` to its owning instance and returns the result.
 ///
 /// **Caller-side capability gate.** The dispatcher matches the
-/// target service's `(plugin, instance, local_id, command)` against
-/// the caller's `[capabilities] consumes_services` grants; each
-/// entry is a resource selector on those four axes (with `"*"`
-/// wildcards on `instance` and `commands`). A call without a
-/// matching grant returns [`Error::PermissionDenied`] before the
+/// target service's `(plugin, instance, local_id, command)` and
+/// the actual caller's instance-id against the caller's
+/// `[capabilities] consumes_services` grants; each entry is a
+/// resource selector `{plugin, instance, service, commands,
+/// caller_instance}` with `"*"` wildcards on `instance`,
+/// `commands`, and `caller_instance`. Authorization requires
+/// **both** an entry in the plugin-declared requested list AND an
+/// entry in the operator's granted copy to match — the granted
+/// copy does not simply override the requested list, so the
+/// manifest still acts as a ceiling. A call without matches in
+/// both lists returns [`Error::PermissionDenied`] before the
 /// callee's `execute-service-command` runs.
 ///
 /// **Same-instance dispatch is not supported.** Going through

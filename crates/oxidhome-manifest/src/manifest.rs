@@ -139,10 +139,10 @@ pub struct CapabilitiesSection {
     #[serde(default)]
     pub declares_services: Vec<String>,
     /// H10: structured grants describing which services this plugin
-    /// may invoke via `host-services::call-service`. Each entry is a
-    /// resource selector on `(plugin, instance, service, commands)`;
-    /// a call is authorized when *any* entry matches all four axes.
-    /// Empty / absent ⇒ every cross-plugin `call-service` returns
+    /// may invoke via `host-services::call-service`. Each entry is
+    /// a resource selector on `(plugin, instance, service,
+    /// commands, caller_instance)` — see [`ServiceGrant`]. Empty
+    /// / absent ⇒ every cross-plugin `call-service` returns
     /// `permission-denied` before the callee's
     /// `execute-service-command` runs.
     ///
@@ -151,11 +151,23 @@ pub struct CapabilitiesSection {
     /// so a callee that renames its service in `update-service`
     /// cannot silently bypass or shadow a grant.
     ///
-    /// Same intersection semantics as `declares_devices` /
-    /// `declares_services`: the granted copy in
-    /// `plugin_installation.granted_capabilities_json` overrides
-    /// the manifest so a narrower operator-approved grant applies
-    /// without editing the plugin's manifest.
+    /// **Authorization is requested ∧ granted, checked at
+    /// dispatch (H10 round-4).** The manifest-declared list here
+    /// is the plugin's *requested* set. The operator-approved
+    /// copy in `plugin_installation.granted_capabilities_json` is
+    /// the *granted* set. A call is authorized iff **at least one
+    /// entry in each list** matches the target-tuple. The granted
+    /// copy does **not** simply override the request — both are
+    /// consulted per call, so the plugin's manifest still acts as
+    /// a ceiling (a call the plugin didn't request cannot be
+    /// authorized just because the operator granted it). This
+    /// mirrors requested ∩ granted semantics without materializing
+    /// the intersection (which was O(N²) in a prior round). The
+    /// list length is capped at
+    /// [`crate::validate::MAX_CONSUMES_SERVICES_GRANTS`] and each
+    /// entry's `commands` at
+    /// [`crate::validate::MAX_COMMANDS_PER_GRANT`]; the host
+    /// applies the same caps when loading the persisted grant.
     #[serde(default)]
     pub consumes_services: Vec<ServiceGrant>,
     /// Whether the plugin is allowed to observe the host event bus

@@ -769,13 +769,26 @@ interface host-services {
   /// **Caller-side capability gate (H10).** The dispatcher
   /// authorizes the call against the caller's structured
   /// `[capabilities] consumes_services` grants. A grant entry is
-  /// `{plugin, instance (or "*"), service (local-id), commands}`;
-  /// the call is authorized when *any* entry matches the target's
-  /// `plugin`, `instance`, `service.local-id`, and the exact
-  /// `command` name (or the entry lists `"*"` in `commands`).
+  /// `{plugin, instance (or "*"), service (local-id), commands (or
+  /// ["*"]), caller_instance (or "*")}`. The call is authorized
+  /// when **at least one entry in the plugin-declared *requested*
+  /// list AND at least one entry in the operator's *granted* copy
+  /// each match** the target's `plugin`, `instance`,
+  /// `service.local-id`, the exact `command` name (or the entry
+  /// lists `"*"` in `commands`), and the caller's own instance-id
+  /// (or the entry's `caller_instance` is `"*"`). This is
+  /// requested ∧ granted, applied per call — the granted copy
+  /// does **not** override the requested list; both are
+  /// consulted, so the manifest still acts as a ceiling on what
+  /// the plugin can be authorized to invoke.
+  ///
   /// Because the authorization key is the service's immutable
   /// `local-id`, a callee that renames its service via
-  /// `update-service` cannot silently shadow a grant.
+  /// `update-service` cannot silently shadow a grant. The
+  /// `caller_instance` axis lets an operator scope a grant to
+  /// specific caller instances, so one instance of a
+  /// multi-instance caller plugin doesn't authorize every
+  /// instance.
   ///
   /// **Same-instance dispatch is not supported.** A supervisor
   /// task drives exactly one wasm store; routing back through the

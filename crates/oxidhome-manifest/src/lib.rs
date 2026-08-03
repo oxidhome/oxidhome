@@ -36,4 +36,7 @@ pub use manifest::{
     ServiceGrant, UiPermissions, UiSection, World,
 };
 pub use network::{HostMatch, NetworkRule, NetworkRuleParseError, PortMatch, Proto};
-pub use validate::{ValidationError, WasmPathProblem, validate};
+pub use validate::{
+    ValidationError, WasmPathProblem, check_capability_limits, check_capability_limits_owned,
+    validate,
+};
