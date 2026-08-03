@@ -351,6 +351,17 @@ pub struct PluginState {
     /// manifest's requested capabilities for dev-time loads that
     /// don't go through `install`.
     pub granted_capabilities: Arc<oxidhome_manifest::CapabilitiesSection>,
+    /// H10 round-4: `consumes_services` grants as declared in the
+    /// **manifest** (before operator narrowing). The dispatcher
+    /// authorizes a `call-service` iff at least one entry here
+    /// AND at least one entry in
+    /// `granted_capabilities.consumes_services` matches the call.
+    /// Held separately from `granted_capabilities` because the
+    /// requested-vs-granted intersection is applied at dispatch
+    /// time instead of being materialized at load time — a
+    /// materialized cross-product grows O(N²) in the count of
+    /// selectors and is DoS-able from the manifest side.
+    pub consumes_services_requested: Arc<Vec<oxidhome_manifest::ServiceGrant>>,
     /// Resource handles owned by this store. Required by Wasmtime's
     /// component model; populated when Phase 5 introduces blob/model
     /// resource handling.
@@ -467,6 +478,13 @@ impl PluginState {
         // `Self::with_granted_capabilities` when a live install
         // row is present.
         let granted_capabilities = Arc::new(manifest.capabilities.clone());
+        // H10 round-4: seed the "requested" list from the manifest
+        // directly, matching the granted default above. The loader
+        // (`PluginInstance::instantiate`) overrides only the
+        // granted side when a live install row is present; the
+        // requested side always reflects what the plugin author
+        // asked for.
+        let consumes_services_requested = Arc::new(manifest.capabilities.consumes_services.clone());
         // C4: aggregate-tracking wasmtime `ResourceLimiter`. Every
         // plugin instance gets the same shape today; per-manifest
         // overrides can layer on later without changing the wiring
@@ -479,6 +497,7 @@ impl PluginState {
             instance_id: instance_id.into(),
             installation_uuid: installation_uuid.into(),
             granted_capabilities,
+            consumes_services_requested,
             table: ResourceTable::new(),
             wasi: wasi.build(),
             devices,
@@ -715,6 +734,26 @@ fn service_name_declared(declared: &[String], name: &str) -> bool {
     declared.iter().any(|d| d == name)
 }
 
+/// H10 round-3 finding 3: reject `"*"` command names on
+/// `register_service` / `update_service`. `"*"` is the reserved
+/// wildcard sentinel in `ServiceGrant.commands`; letting a
+/// service register a command literally named `"*"` would create
+/// a real command that no grant can name distinctly from
+/// "authorize every command".
+fn check_no_wildcard_command_names(info: &ServiceInfo) -> Result<(), WitError> {
+    for cmd in &info.commands {
+        if cmd.name == oxidhome_manifest::ServiceGrant::ANY_COMMAND {
+            return Err(WitError::InvalidArgument(format!(
+                "command name `{}` is reserved (wildcard sentinel in \
+                 `[[capabilities.consumes_services]]` grants); pick a \
+                 different name",
+                cmd.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl host_services::Host for PluginState {
     async fn register_service(&mut self, info: ServiceInfo) -> Result<ServiceId, WitError> {
         if !service_name_declared(&self.granted_capabilities.declares_services, &info.name) {
@@ -731,7 +770,15 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
-        let id = self.services.register(self.instance_id.clone(), info);
+        check_no_wildcard_command_names(&info)?;
+        // H10: registry now enforces `(owner_instance, local_id)`
+        // uniqueness and surfaces the collision as
+        // `InvalidArgument` — pass it through.
+        let id = self.services.register(
+            self.instance_id.clone(),
+            self.manifest.plugin.id.clone(),
+            info,
+        )?;
         tracing::debug!(
             instance_id = %self.instance_id,
             service_id = %id,
@@ -742,7 +789,10 @@ impl host_services::Host for PluginState {
 
     async fn update_service(&mut self, id: ServiceId, info: ServiceInfo) -> Result<(), WitError> {
         // Same capability gate as register — a plugin can't update a
-        // service into a name it wasn't allowed to declare.
+        // service into a name it wasn't allowed to declare. H10:
+        // `local-id` is immutable; the registry rejects any attempt
+        // to change it with `InvalidArgument`. `"*"` command names
+        // are refused on update too (see `register_service`).
         if !service_name_declared(&self.granted_capabilities.declares_services, &info.name) {
             let err = WitError::PermissionDenied(format!(
                 "service name `{}` is not declared in this plugin's manifest \
@@ -757,6 +807,7 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
+        check_no_wildcard_command_names(&info)?;
         self.services.update(&self.instance_id, &id, info)
     }
 
@@ -780,6 +831,30 @@ impl host_services::Host for PluginState {
             .map(|meta| meta.info.clone())
     }
 
+    async fn resolve_service(
+        &mut self,
+        plugin_id: String,
+        instance_id: String,
+        service_local_id: String,
+    ) -> Result<ServiceId, WitError> {
+        // H10: stable `(plugin_id, instance_id, local_id)` →
+        // `service_id` lookup. Not owner-scoped by design — a
+        // caller resolves services on other plugins routinely.
+        // Resolution returns the id even if the caller cannot
+        // then invoke it; the `consumes_services` authorization
+        // check runs later in the dispatcher on `call_service`
+        // and is finer-grained (matches on plugin, instance,
+        // local_id, and command).
+        self.services
+            .resolve_by_local_id(&plugin_id, &instance_id, &service_local_id)
+            .ok_or_else(|| {
+                WitError::NotFound(format!(
+                    "no service `{service_local_id}` owned by plugin \
+                     `{plugin_id}` instance `{instance_id}`"
+                ))
+            })
+    }
+
     async fn call_service(
         &mut self,
         target: ServiceId,
@@ -787,14 +862,21 @@ impl host_services::Host for PluginState {
         args: Vec<KeyValue>,
     ) -> Result<CommandResult, WitError> {
         // Phase 7c: route through the dispatcher. Resolves target →
-        // owner, rejects A→…→A cycles, races
-        // `execute-service-command` against the dispatcher timeout,
-        // and holds a `CallGuard` so `remove-service` refuses while
-        // the call is alive.
+        // `(owner_instance, owner_plugin_id, local_id)`. H10
+        // round-4: authorizes by checking **both** the caller's
+        // requested `consumes_services` list AND the operator's
+        // granted list at call time — a call is authorized iff at
+        // least one entry in each matches the call tuple. Rejects
+        // same-instance / A→…→A cycles, races
+        // `execute-service-command` against the dispatcher
+        // timeout, holds a `CallGuard` so `remove-service` refuses
+        // while the call is alive.
         crate::runtime::dispatcher::call_service(
             &self.services,
             &self.instances,
             self.instance_id.clone(),
+            &self.consumes_services_requested,
+            &self.granted_capabilities.consumes_services,
             target,
             command,
             args,

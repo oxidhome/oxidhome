@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use oxidhome_manifest::{CapabilitiesSection, PluginManifest};
+use oxidhome_manifest::{CapabilitiesSection, PluginManifest, ServiceGrant};
 use rand::TryRng;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
@@ -270,6 +270,20 @@ fn read_no_follow_within(root: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
 /// Set-shaped fields (`network`, `declares_devices`,
 /// `declares_services`) intersect on equality; quotas take the
 /// minimum; `subscribes_events` is a boolean AND.
+///
+/// **`consumes_services` is NOT intersected here** (H10 round-4).
+/// The requested × granted cross-product grows O(N²) in narrowed
+/// selectors, and per-record dedup work on that N² output
+/// approaches quadratic. The dispatcher instead checks both lists
+/// **independently** at call time: a call is authorized iff at
+/// least one requested selector matches AND at least one granted
+/// selector matches. Semantically equivalent to intersection,
+/// bounded per-call at O(|requested|) + O(|granted|), and each
+/// list is bounded by the manifest-validation cap in
+/// `oxidhome-manifest`. `effective_capabilities` therefore leaves
+/// `consumes_services` set to the **granted** list only; the
+/// requested list rides separately on `PluginState` through
+/// `PluginInstance::instantiate`.
 #[must_use]
 pub fn effective_capabilities(
     requested: &CapabilitiesSection,
@@ -284,12 +298,41 @@ pub fn effective_capabilities(
             &requested.declares_services,
             &granted.declares_services,
         ),
+        // See doc comment — carry the granted list through, the
+        // requested list is applied separately at dispatch time.
+        consumes_services: granted.consumes_services.clone(),
         subscribes_events: requested.subscribes_events && granted.subscribes_events,
     }
 }
 
 fn intersect_by_eq<T: Clone + PartialEq>(a: &[T], b: &[T]) -> Vec<T> {
     a.iter().filter(|x| b.contains(x)).cloned().collect()
+}
+
+/// H10 round-4: dispatcher-side "any-selector matches" predicate.
+/// The service registry's authorization check runs this once
+/// against the caller's *requested* list and once against the
+/// operator's *granted* list; both must return true for the call
+/// to be authorized. This is the intersection semantics without
+/// materializing the intersection.
+#[must_use]
+pub fn any_grant_matches(
+    grants: &[ServiceGrant],
+    caller_instance: &str,
+    target_plugin: &str,
+    target_instance: &str,
+    target_service_local_id: &str,
+    command: &str,
+) -> bool {
+    grants.iter().any(|g| {
+        g.matches(
+            caller_instance,
+            target_plugin,
+            target_instance,
+            target_service_local_id,
+            command,
+        )
+    })
 }
 
 /// Mint a fresh installation UUID. Format: `inst-<32 lowercase hex>`
@@ -1440,6 +1483,28 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
             };
             match serde_json::from_str::<CapabilitiesSection>(&json) {
                 Ok(cap) => {
+                    // H10 round-5: apply the same
+                    // capability-list size caps we enforce at
+                    // manifest-validation time to the *persisted*
+                    // grant. Without this, a hand-repaired or
+                    // future operator-modified row could push
+                    // `consumes_services` past
+                    // `MAX_CONSUMES_SERVICES_GRANTS` and re-open
+                    // the per-dispatch DoS surface — manifest
+                    // validation never sees the persisted grant
+                    // on the load path.
+                    if let Err(errs) = oxidhome_manifest::check_capability_limits_owned(&cap) {
+                        tracing::error!(
+                            plugin_id = %plugin_id,
+                            installation_uuid = %uuid,
+                            errors = ?errs,
+                            "granted_capabilities_json exceeds capability-list caps; \
+                             quarantining — reinstall or hand-repair the JSON \
+                             (H10 round-5)",
+                        );
+                        quarantined_uuids.insert(plugin_id, uuid_arc);
+                        continue;
+                    }
                     live.insert(
                         plugin_id,
                         LiveInstallation {
@@ -1475,6 +1540,23 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
 /// case beforehand. C5: also persists the granted capabilities
 /// JSON + content digest.
 fn insert_installation_row(db: &Db, row: &InstalledPlugin) -> Result<(), rusqlite::Error> {
+    // H10 round-5: defense-in-depth. Today `install` derives the
+    // granted capabilities from the (already-validated) manifest,
+    // so the check is redundant on the current path. But every
+    // write into `plugin_installation.granted_capabilities_json`
+    // funnels through here — a future operator-modify API can
+    // reuse this function and picks up the caps automatically,
+    // without a callsite forgetting to validate.
+    if let Err(errs) =
+        oxidhome_manifest::check_capability_limits_owned(row.granted_capabilities.as_ref())
+    {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("granted_capabilities exceed size caps: {errs:?}"),
+            ),
+        )));
+    }
     let grant_json = serde_json::to_string(row.granted_capabilities.as_ref()).map_err(|err| {
         // Should never happen — CapabilitiesSection is a plain
         // Serialize struct. Surface as a SqliteFailure with a
@@ -2335,6 +2417,185 @@ wasm = "plugin.wasm"
         };
         let effective = effective_capabilities(&requested, &narrow);
         assert!(!effective.subscribes_events);
+    }
+
+    /// H10 round-4: `effective_capabilities` carries the granted
+    /// `consumes_services` list through unchanged. Intersection is
+    /// applied at dispatch time (via `any_grant_matches` on both
+    /// the requested and granted lists), not at install time —
+    /// see the round-4 rationale on the doc for
+    /// `effective_capabilities`.
+    #[test]
+    fn effective_capabilities_carries_granted_consumes_services_through() {
+        use oxidhome_manifest::CapabilitiesSection;
+        let requested = CapabilitiesSection {
+            consumes_services: vec![ServiceGrant {
+                plugin: "example.counter".into(),
+                instance: "*".into(),
+                service: "counter".into(),
+                commands: vec!["*".into()],
+                caller_instance: "*".into(),
+            }],
+            ..CapabilitiesSection::default()
+        };
+        let granted = CapabilitiesSection {
+            consumes_services: vec![ServiceGrant {
+                plugin: "example.counter".into(),
+                instance: "foo".into(),
+                service: "counter".into(),
+                commands: vec!["get".into()],
+                caller_instance: "caller-a".into(),
+            }],
+            ..CapabilitiesSection::default()
+        };
+        let effective = effective_capabilities(&requested, &granted);
+        assert_eq!(effective.consumes_services, granted.consumes_services);
+    }
+
+    /// H10 round-4: `any_grant_matches` is the dispatcher-side
+    /// authorization predicate. Runs once against the caller's
+    /// requested list and once against the operator's granted
+    /// list; both must return true. No cross-product, no
+    /// materialization.
+    #[test]
+    fn any_grant_matches_matches_against_the_call_tuple() {
+        let grants = vec![
+            ServiceGrant {
+                plugin: "example.counter".into(),
+                instance: "foo".into(),
+                service: "counter".into(),
+                commands: vec!["get".into()],
+                caller_instance: "caller-a".into(),
+            },
+            ServiceGrant {
+                plugin: "example.other".into(),
+                instance: "*".into(),
+                service: "svc".into(),
+                commands: vec!["*".into()],
+                caller_instance: "*".into(),
+            },
+        ];
+        // First entry matches.
+        assert!(any_grant_matches(
+            &grants,
+            "caller-a",
+            "example.counter",
+            "foo",
+            "counter",
+            "get",
+        ));
+        // Second entry (wildcard) matches for any target instance +
+        // command on `example.other`.
+        assert!(any_grant_matches(
+            &grants,
+            "any-caller",
+            "example.other",
+            "any-instance",
+            "svc",
+            "ping",
+        ));
+        // Wrong instance for `example.counter` → miss.
+        assert!(!any_grant_matches(
+            &grants,
+            "caller-a",
+            "example.counter",
+            "bar",
+            "counter",
+            "get",
+        ));
+        // Empty grants → always deny.
+        assert!(!any_grant_matches(
+            &[],
+            "caller-a",
+            "example.counter",
+            "foo",
+            "counter",
+            "get",
+        ));
+    }
+
+    /// H10 round-5: a persisted `granted_capabilities_json` that
+    /// exceeds `MAX_CONSUMES_SERVICES_GRANTS` is quarantined at
+    /// scan time — a hand-repaired row (or a future operator
+    /// tool that skips manifest validation) can't push per-call
+    /// authorization work back into the O(N) blowup region.
+    #[test]
+    fn scan_quarantines_persisted_grant_exceeding_capability_caps() {
+        use oxidhome_manifest::validate::MAX_CONSUMES_SERVICES_GRANTS;
+        let root = tempdir("h10r5-oversize-grant");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+        let db = fresh_db();
+
+        // Build an oversize grant JSON directly (bypassing
+        // insert_installation_row, which enforces the caps
+        // defense-in-depth) so we exercise the load-path check.
+        let mut oversized = Vec::new();
+        for i in 0..=MAX_CONSUMES_SERVICES_GRANTS {
+            oversized.push(oxidhome_manifest::ServiceGrant {
+                plugin: format!("example.p{i}"),
+                instance: "*".into(),
+                service: "svc".into(),
+                commands: vec!["*".into()],
+                caller_instance: "*".into(),
+            });
+        }
+        let caps = oxidhome_manifest::CapabilitiesSection {
+            consumes_services: oversized,
+            ..oxidhome_manifest::CapabilitiesSection::default()
+        };
+        let grant_json = serde_json::to_string(&caps).unwrap();
+
+        let plugin_id = "example.oversized";
+        let uuid = mint_installation_uuid();
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO plugin_installation
+                     (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms,
+                      granted_capabilities_json, content_digest)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+                rusqlite::params![
+                    &*uuid,
+                    plugin_id,
+                    "0.1.0",
+                    now_ms(),
+                    &grant_json,
+                    "digest-fake",
+                ],
+            )?;
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+
+        // Populate a matching install dir so the scan doesn't
+        // reject on missing FS.
+        let install_dir = plugins_root.join(&*uuid);
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(
+            install_dir.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.oversized"
+name = "Oversized"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "x.wasm"
+"#,
+        )
+        .unwrap();
+        std::fs::write(install_dir.join("x.wasm"), b"stub").unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db)).unwrap();
+        assert!(
+            reg.is_quarantined(plugin_id),
+            "oversized persisted grant must land in quarantine",
+        );
+        assert!(
+            reg.list().iter().all(|p| p.plugin_id.as_ref() != plugin_id),
+            "quarantined install must not appear in the live registry",
+        );
     }
 
     /// C5 review F3: install must derive the grant from the

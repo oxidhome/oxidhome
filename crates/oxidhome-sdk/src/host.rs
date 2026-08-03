@@ -112,20 +112,33 @@ pub fn get_device(id: &DeviceId) -> Result<DeviceInfo, Error> {
 /// [`Service`](crate::Service) builder (recommended) or a raw
 /// [`ServiceInfo`]. Returns the host-assigned `service-id`.
 ///
+/// H10: `service.local_id` is the immutable logical key. Two
+/// registrations from the same instance under the same `local_id`
+/// return [`Error::InvalidArgument`].
+///
 /// # Errors
 ///
-/// [`Error::PermissionDenied`] when the manifest's
-/// `[capabilities] declares_services` didn't authorize the service's
-/// `name`.
+/// - [`Error::PermissionDenied`] when the manifest's
+///   `[capabilities] declares_services` didn't authorize the
+///   service's `name`.
+/// - [`Error::InvalidArgument`] when `local_id` collides with
+///   another live service registered by this instance.
 pub fn register_service(service: impl Into<ServiceInfo>) -> Result<ServiceId, Error> {
     host_services::register_service(&service.into())
 }
 
 /// Update an already-registered service's metadata / commands.
 ///
+/// H10: `info.local_id` is immutable — an update whose `local_id`
+/// differs from the registration returns [`Error::InvalidArgument`]
+/// and does not mutate the registry. `name`, `metadata`, and
+/// `commands` remain freely mutable.
+///
 /// # Errors
 ///
-/// [`Error::NotFound`] if the id isn't registered to this instance.
+/// - [`Error::NotFound`] if the id isn't registered to this instance.
+/// - [`Error::InvalidArgument`] if `info.local_id` differs from the
+///   registered value.
 pub fn update_service(id: &ServiceId, info: &ServiceInfo) -> Result<(), Error> {
     host_services::update_service(id, info)
 }
@@ -149,22 +162,59 @@ pub fn get_service(id: &ServiceId) -> Result<ServiceInfo, Error> {
     host_services::get_service(id)
 }
 
-/// Synchronously call a service command — on another plugin or on this
-/// one. The host routes `target` to its owning instance and returns the
-/// result.
+/// H10: resolve the stable `(plugin_id, instance_id, local_id)`
+/// address to the currently-registered `service-id`. `service-id`
+/// values are per-run — callers persist the three-tuple (all
+/// components stable across restarts) and re-resolve on demand.
 ///
-/// **Same-instance peer services must use the plugin's internal
-/// dispatch** — going through `call_service` to a service the
-/// calling instance also owns is rejected up-front with
-/// [`Error::InvalidArgument`] (the host would otherwise have to
-/// re-enter the calling instance's single `Store` and deadlock).
+/// Uses the immutable `local-id`, not the human-readable `name`
+/// (which `update_service` can change). Resolution does not imply
+/// the caller may then invoke the service; [`call_service`]
+/// authorizes against the caller's structured
+/// `[capabilities] consumes_services` grants per-command.
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] (no such service), [`Error::PermissionDenied`]
-/// (call not allowed), [`Error::InvalidArgument`] (cycle / same-
-/// instance call / bad args), [`Error::Unavailable`] (owner down or
-/// dispatch timed out).
+/// [`Error::NotFound`] if no live service matches the three-tuple.
+pub fn resolve_service(
+    plugin_id: &str,
+    instance_id: &str,
+    service_local_id: &str,
+) -> Result<ServiceId, Error> {
+    host_services::resolve_service(plugin_id, instance_id, service_local_id)
+}
+
+/// Synchronously call another plugin's service command. The host
+/// routes `target` to its owning instance and returns the result.
+///
+/// **Caller-side capability gate.** The dispatcher matches the
+/// target service's `(plugin, instance, local_id, command)` and
+/// the actual caller's instance-id against the caller's
+/// `[capabilities] consumes_services` grants; each entry is a
+/// resource selector `{plugin, instance, service, commands,
+/// caller_instance}` with `"*"` wildcards on `instance`,
+/// `commands`, and `caller_instance`. Authorization requires
+/// **both** an entry in the plugin-declared requested list AND an
+/// entry in the operator's granted copy to match — the granted
+/// copy does not simply override the requested list, so the
+/// manifest still acts as a ceiling. A call without matches in
+/// both lists returns [`Error::PermissionDenied`] before the
+/// callee's `execute-service-command` runs.
+///
+/// **Same-instance dispatch is not supported.** Going through
+/// `call_service` to a service the calling instance also owns
+/// returns [`Error::InvalidArgument`] with the message
+/// `same-instance dispatch is not supported`. Plugins colocating
+/// multiple services in one instance dispatch between them in
+/// plugin-local code.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] (no such service),
+/// [`Error::PermissionDenied`] (no matching `consumes_services`
+/// grant), [`Error::InvalidArgument`] (same-instance target,
+/// A→…→A cycle, or bad command/args), [`Error::Unavailable`]
+/// (owner not running or dispatch timed out).
 pub fn call_service(
     target: &ServiceId,
     command: &str,

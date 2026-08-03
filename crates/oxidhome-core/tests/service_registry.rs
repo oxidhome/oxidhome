@@ -138,9 +138,23 @@ async fn remove_by_owner_scopes_to_one_instance() {
         metadata: Vec::new(),
         commands: Vec::new(),
     };
-    let _a1 = reg.register("alpha".into(), info("counter-a1"));
-    let _a2 = reg.register("alpha".into(), info("counter-a2"));
-    let _b1 = reg.register("beta".into(), info("counter-b1"));
+    let _a1 = reg
+        .register(
+            "alpha".into(),
+            "com.example.alpha".into(),
+            info("counter-a1"),
+        )
+        .expect("register");
+    let _a2 = reg
+        .register(
+            "alpha".into(),
+            "com.example.alpha".into(),
+            info("counter-a2"),
+        )
+        .expect("register");
+    let _b1 = reg
+        .register("beta".into(), "com.example.beta".into(), info("counter-b1"))
+        .expect("register");
     assert_eq!(reg.list().len(), 3);
 
     let removed = reg.remove_by_owner("alpha");

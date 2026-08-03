@@ -708,25 +708,102 @@ interface host-services {
   use services.{service-info};
   use devices.{command-result};
 
+  /// Register a new service. H10: `local-id` on `service-info` is
+  /// the **immutable logical key** for the service; the host
+  /// refuses a registration whose `(instance, local-id)` collides
+  /// with an already-registered service in the same instance
+  /// (`invalid-argument`). Callers of `resolve-service` /
+  /// `call-service` address the service by this key, and no
+  /// downstream call can mutate it.
   register-service: func(info: service-info) -> result<service-id, error>;
+  /// Replace an already-registered service's info. H10: `local-id`
+  /// is immutable — a call whose `info.local-id` differs from the
+  /// currently-registered value returns `invalid-argument` and the
+  /// registry is not mutated. Callers persist `local-id` as part
+  /// of their target address; changing it would silently invalidate
+  /// every persisted address.
   update-service:   func(id: service-id, info: service-info) -> result<_, error>;
   remove-service:   func(id: service-id) -> result<_, error>;
   /// Look up a service the plugin previously registered. Returns
   /// `error::not-found(...)` if the id is unknown to this plugin.
   get-service:      func(id: service-id) -> result<service-info, error>;
 
-  /// Synchronously call another plugin's (or this plugin's own) service
-  /// command. The host routes `target` → owning instance, races its
-  /// `execute-service-command` export against a timeout, and returns the
-  /// result.
+  /// H10: stable resolution by logical address
+  /// `(plugin-id, instance-id, service-local-id)`. `service-id`
+  /// values are per-run — the host mints a fresh `svc-N` on every
+  /// register — so a caller cannot persist a `service-id` and
+  /// expect it to resolve across a restart. All three parts of
+  /// the logical address are stable across restarts:
+  ///
+  /// - `plugin-id` — fixed by the callee's `plugin.id` manifest field.
+  /// - `instance-id` — the operator-chosen instance name passed to
+  ///   `Engine::start_instance`; already keys per-instance KV /
+  ///   blob storage.
+  /// - `service-local-id` — the plugin's own bookkeeping id
+  ///   (`service-info.local-id`), immutable per registration.
+  ///
+  /// **Uses `local-id`, not `name`.** `service-info.name` is
+  /// documented as human-readable and can change under
+  /// `update-service`; using it as a persistent address key would
+  /// silently break resolution after a rename. `local-id` cannot
+  /// change (see `register-service` / `update-service`).
+  ///
+  /// **Resolution does not imply the caller may then invoke the
+  /// service.** `call-service` runs its own authorization against
+  /// the caller's `[capabilities] consumes_services` grants, on
+  /// the immutable `local-id`, and per-command.
+  ///
+  /// Errors: `not-found` if no live service matches all three
+  /// components of the address.
+  resolve-service: func(
+    plugin-id: string,
+    instance-id: string,
+    service-local-id: string,
+  ) -> result<service-id, error>;
+
+  /// Synchronously call another plugin's service command. The host
+  /// routes `target` → owning instance, races its
+  /// `execute-service-command` export against a timeout, and
+  /// returns the result.
+  ///
+  /// **Caller-side capability gate (H10).** The dispatcher
+  /// authorizes the call against the caller's structured
+  /// `[capabilities] consumes_services` grants. A grant entry is
+  /// `{plugin, instance (or "*"), service (local-id), commands (or
+  /// ["*"]), caller_instance (or "*")}`. The call is authorized
+  /// when **at least one entry in the plugin-declared *requested*
+  /// list AND at least one entry in the operator's *granted* copy
+  /// each match** the target's `plugin`, `instance`,
+  /// `service.local-id`, the exact `command` name (or the entry
+  /// lists `"*"` in `commands`), and the caller's own instance-id
+  /// (or the entry's `caller_instance` is `"*"`). This is
+  /// requested ∧ granted, applied per call — the granted copy
+  /// does **not** override the requested list; both are
+  /// consulted, so the manifest still acts as a ceiling on what
+  /// the plugin can be authorized to invoke.
+  ///
+  /// Because the authorization key is the service's immutable
+  /// `local-id`, a callee that renames its service via
+  /// `update-service` cannot silently shadow a grant. The
+  /// `caller_instance` axis lets an operator scope a grant to
+  /// specific caller instances, so one instance of a
+  /// multi-instance caller plugin doesn't authorize every
+  /// instance.
+  ///
+  /// **Same-instance dispatch is not supported.** A supervisor
+  /// task drives exactly one wasm store; routing back through the
+  /// host to a service the caller's own instance owns would queue
+  /// an `ExecuteService` message to a supervisor already parked on
+  /// the caller — deadlock by construction. The host rejects such
+  /// calls up-front with `invalid-argument`. Plugins that colocate
+  /// multiple services in one instance dispatch between them in
+  /// plugin-local code.
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
-  /// (call not allowed); `invalid-argument` (recursion `A→…→A`, or the
-  /// command/args were rejected); `unavailable` (owner not running, or
-  /// the call timed out).
-  ///
-  /// NOTE: Phase 7b ships this signature with a stub host impl that
-  /// returns `unavailable`; the routing dispatcher lands in 7c.
+  /// (no matching entry in the caller's `consumes_services`
+  /// grants); `invalid-argument` (same-instance target, A→…→A
+  /// cycle, or bad command/args); `unavailable` (owner not
+  /// running, or the call timed out).
   call-service: func(
     target: service-id,
     command: string,

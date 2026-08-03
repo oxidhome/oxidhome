@@ -23,3 +23,13 @@ wasm = "target/wasm32-wasip2/debug/service_bouncer.wasm"
 declares_services = ["bouncer"]
 # Bouncer reads `bounce_to` from KV — give it a tiny per-instance quota.
 storage_quota_kb = 4
+
+# H10 grant: authorize `kick` on `bouncer` of any live instance of
+# this same plugin, so instance A can call instance B (the
+# multi-instance shape the cycle-detection test exercises). Cycle
+# is caught on the second hop; this grant does not weaken that.
+[[capabilities.consumes_services]]
+plugin   = "example.service-bouncer"
+instance = "*"
+service  = "bouncer"
+commands = ["kick"]

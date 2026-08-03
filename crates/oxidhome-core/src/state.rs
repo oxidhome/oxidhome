@@ -35,8 +35,8 @@ pub use devices::{DeviceMeta, DeviceRegistry};
 pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicMatch};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
-    InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, content_digest,
-    effective_capabilities, read_installed_bytes,
+    InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, any_grant_matches,
+    content_digest, effective_capabilities, read_installed_bytes,
 };
 pub(crate) use kv::stored_value_size;
 pub use kv::{KvError, KvStore};

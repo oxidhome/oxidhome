@@ -51,6 +51,25 @@ pub enum ValidationError {
     UnknownDeclaredDeviceCapability { got: String },
 
     #[error(
+        "capabilities.consumes_services has {count} entries; the cap is {max}. \
+         Each entry is checked on every call-service dispatch, so runaway lists \
+         would DoS instance loading — split unrelated services into a smaller \
+         set of selectors."
+    )]
+    TooManyConsumesServicesGrants { count: usize, max: usize },
+
+    #[error(
+        "capabilities.consumes_services[{index}].commands has {count} entries; \
+         the cap is {max}. Use `[\"*\"]` to authorize every command instead of \
+         enumerating them past the cap."
+    )]
+    TooManyCommandsPerGrant {
+        index: usize,
+        count: usize,
+        max: usize,
+    },
+
+    #[error(
         "plugin.keywords has {count} entries; the cap is {max}. Trim the list — \
          beyond that it's harder to skim than the plugin's name and description."
     )]
@@ -233,6 +252,18 @@ pub const MAX_KEYWORD_LEN: usize = 50;
 /// scheduling useful work.
 pub const MIN_TICK_INTERVAL_MS: u64 = 10;
 
+/// H10 round-4: hard cap on `[[capabilities.consumes_services]]`
+/// entries per manifest. Each entry is checked against the target
+/// tuple on every `call-service` — the cap keeps the per-call
+/// authorization work bounded, and the entry count itself
+/// non-DoS-able from the manifest side.
+pub const MAX_CONSUMES_SERVICES_GRANTS: usize = 128;
+
+/// H10 round-4: hard cap on a single grant's `commands` list.
+/// A grant that wants "every command" uses `["*"]` — the cap
+/// bounds enumerated lists.
+pub const MAX_COMMANDS_PER_GRANT: usize = 64;
+
 /// Why a `plugin.keywords` entry was rejected. Encoded as a typed
 /// enum (rather than a `&'static str` message) so the limit in
 /// `TooLong { max }` stays in sync with [`MAX_KEYWORD_LEN`] — change
@@ -258,6 +289,62 @@ impl std::fmt::Display for InvalidKeywordReason {
                 f.write_str("must be lowercase kebab-case (`[a-z0-9][a-z0-9-]*`)")
             }
         }
+    }
+}
+
+/// H10 round-5: capability-list size limits, applicable to any
+/// [`crate::CapabilitiesSection`] regardless of provenance
+/// (manifest or persisted grant). [`validate`] calls this on the
+/// manifest's requested capabilities; the host also calls it on
+/// the operator's persisted `granted_capabilities_json` so a
+/// hand-repaired grant that skips manifest validation can't push
+/// per-dispatch authorization work back into the O(N) blowup
+/// region.
+///
+/// Pushes findings into `errors` rather than returning them, so
+/// callers that already collect a `Vec<ValidationError>` can
+/// combine limits with other checks in one pile. The
+/// convenience wrapper [`check_capability_limits_owned`] returns
+/// `Result<(), Vec<ValidationError>>` for callers that only care
+/// about capability limits.
+pub fn check_capability_limits(
+    caps: &crate::manifest::CapabilitiesSection,
+    errors: &mut Vec<ValidationError>,
+) {
+    if caps.consumes_services.len() > MAX_CONSUMES_SERVICES_GRANTS {
+        errors.push(ValidationError::TooManyConsumesServicesGrants {
+            count: caps.consumes_services.len(),
+            max: MAX_CONSUMES_SERVICES_GRANTS,
+        });
+    }
+    for (index, grant) in caps.consumes_services.iter().enumerate() {
+        if grant.commands.len() > MAX_COMMANDS_PER_GRANT {
+            errors.push(ValidationError::TooManyCommandsPerGrant {
+                index,
+                count: grant.commands.len(),
+                max: MAX_COMMANDS_PER_GRANT,
+            });
+        }
+    }
+}
+
+/// Standalone wrapper around [`check_capability_limits`] for
+/// callers that only need capability caps (persisted-grant load
+/// path in the host).
+///
+/// # Errors
+///
+/// Returns `Err(errors)` if any of the H10 round-4 capability
+/// count limits are exceeded.
+pub fn check_capability_limits_owned(
+    caps: &crate::manifest::CapabilitiesSection,
+) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    check_capability_limits(caps, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 
@@ -305,6 +392,17 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
             errors.push(ValidationError::UnknownDeclaredDeviceCapability { got: cap.clone() });
         }
     }
+
+    // H10 round-4: bound `consumes_services` size + per-grant
+    // commands count so per-call authorization work is bounded and
+    // a manifest can't consume excessive CPU/memory at load or
+    // dispatch time. H10 round-5 (persisted-grant hardening):
+    // extracted to `check_capability_limits` so the host can apply
+    // the same caps when loading the *persisted* granted copy from
+    // `plugin_installation.granted_capabilities_json` — a
+    // hand-repaired or operator-modified grant that bypasses
+    // manifest validation would otherwise re-open the DoS surface.
+    check_capability_limits(&m.capabilities, &mut errors);
 
     validate_keywords(&m.plugin.keywords, &mut errors);
 
@@ -978,6 +1076,54 @@ mod tests {
         assert!(errs.iter().any(|e| matches!(
             e,
             ValidationError::TooManyKeywords { count, max } if *max == MAX_KEYWORDS && *count == MAX_KEYWORDS + 1
+        )));
+    }
+
+    /// H10 round-4: manifest with more than
+    /// [`MAX_CONSUMES_SERVICES_GRANTS`] `consumes_services`
+    /// entries is refused. Prevents a hostile manifest from
+    /// blowing up per-call authorization work.
+    #[test]
+    fn consumes_services_grants_reject_too_many() {
+        use crate::manifest::ServiceGrant;
+        let mut m = ok_manifest();
+        m.capabilities.consumes_services = (0..=MAX_CONSUMES_SERVICES_GRANTS)
+            .map(|i| ServiceGrant {
+                plugin: format!("example.p{i}"),
+                instance: "*".into(),
+                service: "svc".into(),
+                commands: vec!["*".into()],
+                caller_instance: "*".into(),
+            })
+            .collect();
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::TooManyConsumesServicesGrants { count, max }
+                if *max == MAX_CONSUMES_SERVICES_GRANTS && *count == MAX_CONSUMES_SERVICES_GRANTS + 1
+        )));
+    }
+
+    /// H10 round-4: manifest with a grant whose `commands` list
+    /// exceeds [`MAX_COMMANDS_PER_GRANT`] is refused.
+    #[test]
+    fn consumes_services_grants_reject_too_many_commands() {
+        use crate::manifest::ServiceGrant;
+        let mut m = ok_manifest();
+        m.capabilities.consumes_services = vec![ServiceGrant {
+            plugin: "example.other".into(),
+            instance: "*".into(),
+            service: "svc".into(),
+            commands: (0..=MAX_COMMANDS_PER_GRANT)
+                .map(|i| format!("c{i}"))
+                .collect(),
+            caller_instance: "*".into(),
+        }];
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::TooManyCommandsPerGrant { index: 0, count, max }
+                if *max == MAX_COMMANDS_PER_GRANT && *count == MAX_COMMANDS_PER_GRANT + 1
         )));
     }
 
