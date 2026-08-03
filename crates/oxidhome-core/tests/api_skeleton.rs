@@ -3850,7 +3850,7 @@ async fn devices_state_snapshot_reflects_applied_changes() {
         .unwrap();
 
     let store = engine.device_state();
-    store.apply(
+    store.apply_delta(
         "dev-42".into(),
         "alpha".into(),
         "switch".into(),
@@ -3896,9 +3896,11 @@ async fn devices_state_snapshot_reflects_applied_changes() {
 
 /// H9: `GET /api/v1/devices/state/changes` returns entries whose
 /// `global_revision > since_revision`, sorted ascending, capped at
-/// `limit`. Verifies the cursor semantics — a client that saw
-/// revision N pages forward through the changes without missing or
-/// duplicating anything.
+/// `limit`. This is a materialized-view read (latest value per
+/// slot), not an append-only stream — a slot updated multiple
+/// times between polls is coalesced. This test writes each slot
+/// exactly once so the coalescing doesn't apply and the cursor
+/// paging semantics are easy to observe.
 #[tokio::test(flavor = "current_thread")]
 async fn devices_state_changes_returns_cursor_deltas() {
     let engine = Engine::new().expect("engine");
@@ -3909,7 +3911,7 @@ async fn devices_state_changes_returns_cursor_deltas() {
 
     let store = engine.device_state();
     for i in 0..4 {
-        store.apply(
+        store.apply_delta(
             format!("dev-{i}"),
             "alpha".into(),
             "switch".into(),
@@ -3994,7 +3996,7 @@ async fn devices_state_partial_updates_merge_untouched_fields() {
         .create("reader", b"[\"devices:read\"]")
         .unwrap();
     let store = engine.device_state();
-    store.apply(
+    store.apply_delta(
         "dev-1".into(),
         "alpha".into(),
         "color-light".into(),
@@ -4015,7 +4017,7 @@ async fn devices_state_partial_updates_merge_untouched_fields() {
         0,
         0,
     );
-    store.apply(
+    store.apply_delta(
         "dev-1".into(),
         "alpha".into(),
         "color-light".into(),
@@ -4071,7 +4073,7 @@ async fn devices_state_mark_device_stale_bumps_revision_and_flips_all_caps() {
         .create("reader", b"[\"devices:read\"]")
         .unwrap();
     let store = engine.device_state();
-    store.apply(
+    store.apply_delta(
         "dev-1".into(),
         "alpha".into(),
         "switch".into(),
@@ -4079,7 +4081,7 @@ async fn devices_state_mark_device_stale_bumps_revision_and_flips_all_caps() {
         0,
         0,
     );
-    store.apply(
+    store.apply_delta(
         "dev-1".into(),
         "alpha".into(),
         "dimmer".into(),
@@ -4123,7 +4125,7 @@ async fn devices_state_reconcile_capabilities_flips_only_dropped_caps() {
     let engine = Engine::new().expect("engine");
     let store = engine.device_state();
     for cap in ["switch", "dimmer", "color-light"] {
-        store.apply(
+        store.apply_delta(
             "dev-1".into(),
             "alpha".into(),
             (*cap).into(),

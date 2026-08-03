@@ -293,10 +293,15 @@ async fn list_devices(
 
 /// JSON snapshot of one device's current per-capability state.
 /// Returned by `GET /api/v1/devices/{device_id}/state`. `revision`
-/// is the store-wide monotonic value at the moment of the read;
-/// callers pair `{revision, capabilities}` with a subsequent
+/// is the store-wide monotonic value at the moment of the read
+/// (read atomically with `capabilities` under one lock — no entry
+/// in the response has `global_revision > revision`). Callers pair
+/// `{revision, capabilities}` with a subsequent
 /// `GET /api/v1/devices/state/changes?since_revision=<revision>`
-/// call to catch up without gaps.
+/// call to observe the **latest per-slot value** for slots that
+/// changed after the snapshot. See the `state/changes` docs for
+/// the coalescing semantics — this is a materialized-state view,
+/// not an append-only event stream.
 #[derive(Serialize)]
 struct DeviceStateSnapshot {
     device_id: String,
@@ -378,9 +383,17 @@ async fn get_device_state(
     Path(device_id): Path<String>,
 ) -> Result<Json<DeviceStateSnapshot>, ScopeDenied> {
     require_scope(&actor, DEVICES_READ)?;
-    let store = state.engine.device_state();
-    let revision = store.current_revision();
-    let entries = store.snapshot_device(&device_id);
+    // H9 round-3 finding 3: read `revision` and `entries` **under
+    // one lock**. The pre-fix shape called `current_revision()`
+    // then `snapshot_device()` in two separate lock acquires, so
+    // a writer in between could commit an entry with
+    // `global_revision > revision` — the response then carried a
+    // per-entry revision above the top-level one, contradicting
+    // the documented `M ≤ N` invariant.
+    let (revision, entries) = state
+        .engine
+        .device_state()
+        .snapshot_device_with_revision(&device_id);
     let mut capabilities: Vec<DeviceStateEntry> = entries
         .iter()
         .map(|s| DeviceStateEntry::from_state(s))
@@ -396,6 +409,17 @@ async fn get_device_state(
 
 /// `GET /api/v1/devices/state/changes` query params. Cursor-based
 /// catch-up over the H9 state projection.
+///
+/// **Materialized view, not an append-only stream.** The projection
+/// stores one entry per `(device_id, capability)`; a slot that
+/// updates multiple times between polls is **coalesced** to the
+/// latest value at read time, and the intermediate `global_revision`
+/// values do not appear in any `state/changes` response. A caller
+/// that needs every historical transition reads the full event log
+/// (`GET /api/v1/events`) instead — the projection is the "current
+/// value per slot" view. Consequence: `current_revision` can exceed
+/// the highest `global_revision` in `changes` even when nothing has
+/// been dropped.
 #[derive(Deserialize)]
 struct StateChangesParams {
     /// Return only entries with `global_revision > since_revision`.
@@ -411,13 +435,16 @@ struct StateChangesParams {
     limit: Option<usize>,
 }
 
-/// JSON body for `GET /api/v1/devices/state/changes`. `current_revision`
-/// is the store-wide value at read time, so a client that saw
-/// `current_revision = N` and paged through `changes` up to some
-/// entry with `global_revision = M` (M ≤ N) knows there might be
-/// more to fetch from `M` to `N`. Empty `changes` with
-/// `current_revision > since_revision` means the trimmed window
-/// is beyond the current page — advance and re-poll.
+/// JSON body for `GET /api/v1/devices/state/changes`.
+/// `current_revision` is the store-wide value at read time (read
+/// atomically with `changes` under one lock — no entry in the
+/// response has `global_revision > current_revision`). Callers
+/// advance their cursor by taking the highest `global_revision` in
+/// `changes`; the response reflects each slot's coalesced latest
+/// value, not its history (see [`StateChangesParams`]). Empty
+/// `changes` with `current_revision > since_revision` just means
+/// every changed slot's latest value is within the current page —
+/// advance and re-poll.
 #[derive(Serialize)]
 struct StateChangesBody {
     current_revision: u64,
@@ -451,9 +478,13 @@ async fn query_device_state_changes(
         .unwrap_or(DEFAULT_STATE_CHANGES_LIMIT)
         .min(MAX_STATE_CHANGES_LIMIT);
     let since = params.since_revision.unwrap_or(0);
-    let store = state.engine.device_state();
-    let current_revision = store.current_revision();
-    let deltas = store.deltas_since(since, limit);
+    // H9 round-3 finding 3: read `current_revision` and `deltas`
+    // **under one lock** — see the sibling comment on
+    // `get_device_state` for the invariant.
+    let (current_revision, deltas) = state
+        .engine
+        .device_state()
+        .deltas_since_with_revision(since, limit);
     let changes: Vec<DeviceStateEntry> = deltas
         .iter()
         .map(|s| DeviceStateEntry::from_state(s))

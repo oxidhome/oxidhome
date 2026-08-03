@@ -577,7 +577,7 @@ impl services::Host for PluginState {}
 /// Stable string name for a `capability-spec` variant — what
 /// `manifest.capabilities.declares_devices` lists. Mirrors
 /// `capability-spec` in `wit/oxidhome.wit`.
-fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
+pub(crate) fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
     match spec {
         capabilities::CapabilitySpec::Switch => "switch".into(),
         capabilities::CapabilitySpec::Dimmer => "dimmer".into(),
@@ -737,11 +737,8 @@ impl host_devices::Host for PluginState {
         // move into `register` — need them for state seeding /
         // reconciliation.
         let seed_state = seed_state_from_initial(&info);
-        let live_capabilities: Vec<String> = info
-            .capabilities
-            .iter()
-            .map(capability_name)
-            .collect();
+        let live_capabilities: Vec<String> =
+            info.capabilities.iter().map(capability_name).collect();
         let id = self
             .devices
             .register(&self.installation_uuid, self.instance_id.clone(), info);
@@ -754,7 +751,14 @@ impl host_devices::Host for PluginState {
             .reconcile_capabilities(&id, &live_capabilities);
         let received_ms = crate::state::event_log::now_unix_ms();
         for (capability, fields) in seed_state {
-            self.device_state.seed(
+            // H9 round-3 finding 1: `initial_state` is a **snapshot**
+            // (the plugin's authoritative state at register time),
+            // not a partial delta. `replace_snapshot` overwrites the
+            // slot rather than merging so a re-registration that
+            // omits a field (e.g. `color_temp_kelvin`) actually
+            // clears the previously-observed value — the documented
+            // remove-and-re-register deletion procedure now works.
+            self.device_state.replace_snapshot(
                 id.clone(),
                 self.instance_id.clone(),
                 capability,
@@ -793,11 +797,8 @@ impl host_devices::Host for PluginState {
         // lands, so a dropped capability's entries flip to `Stale`
         // instead of continuing to advertise as `Fresh` on a
         // device that no longer declares them.
-        let live_capabilities: Vec<String> = info
-            .capabilities
-            .iter()
-            .map(capability_name)
-            .collect();
+        let live_capabilities: Vec<String> =
+            info.capabilities.iter().map(capability_name).collect();
         let outcome = self.devices.update(&self.instance_id, &id, info);
         if outcome.is_ok() {
             self.device_state
@@ -1244,13 +1245,17 @@ impl host_events::Host for PluginState {
         // no post-fanout callers can see a state update before
         // the projection has it. Only `state-changed` events
         // land here; other variants (button, inference, custom)
-        // aren't state-carrying by the WIT contract.
+        // aren't state-carrying by the WIT contract. H9 round-3:
+        // uses `apply_delta` (merge by key) because WIT
+        // `state-change.fields` is documented as *changes only*
+        // — the register-device / OkWithState paths use
+        // `replace_snapshot` instead.
         if let (
             Some(device_id),
             crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
         ) = (ev.device.clone(), &ev.payload)
         {
-            self.device_state.apply(
+            self.device_state.apply_delta(
                 device_id,
                 self.instance_id.clone(),
                 sc.capability.clone(),
