@@ -667,6 +667,7 @@ impl PluginInstance {
             actor,
             config,
             engine.devices(),
+            engine.device_state(),
             engine.events(),
             kv,
             engine.event_log(),

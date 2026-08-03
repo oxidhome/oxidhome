@@ -372,6 +372,10 @@ pub struct PluginState {
     pub wasi: WasiCtx,
     /// Shared device registry — Phase 3.
     pub devices: Arc<DeviceRegistry>,
+    /// H9 host-owned device-state projection. Seeded from
+    /// `register-device.initial_state` and updated on every
+    /// `publish-event` carrying a `state-changed` payload.
+    pub device_state: Arc<crate::state::DeviceStateStore>,
     /// Shared event bus — Phase 3.
     pub events: Arc<EventBus>,
     /// Per-instance subscriptions: filter + receiver per active
@@ -461,6 +465,7 @@ impl PluginState {
         actor: Actor,
         config: InstanceConfig,
         devices: Arc<DeviceRegistry>,
+        device_state: Arc<crate::state::DeviceStateStore>,
         events: Arc<EventBus>,
         kv: Arc<crate::state::KvStore>,
         event_log: Arc<crate::state::EventLog>,
@@ -501,6 +506,7 @@ impl PluginState {
             table: ResourceTable::new(),
             wasi: wasi.build(),
             devices,
+            device_state,
             events,
             kv,
             event_log,
@@ -599,6 +605,66 @@ fn capability_state_name(state: &capabilities::CapabilityState) -> &'static str 
     }
 }
 
+/// H9: project a `DeviceInfo.initial_state` list into the
+/// `(capability_name, Vec<KeyValue>)` shape that
+/// [`crate::state::DeviceStateStore::seed`] takes. Uses the same
+/// field names the plugin author would emit on a
+/// `state-changed(...)` event so seed and post-registration updates
+/// share a shape.
+fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
+    use crate::host_impl::plugin::oxidhome::plugin::types::Value;
+    info.initial_state
+        .iter()
+        .map(|state| {
+            let name = capability_state_name(state).to_string();
+            let fields = match state {
+                capabilities::CapabilityState::Switch(s) => vec![KeyValue {
+                    key: "state".into(),
+                    value: Value::BoolVal(s.state),
+                }],
+                capabilities::CapabilityState::Dimmer(d) => vec![KeyValue {
+                    key: "level".into(),
+                    value: Value::FloatVal(d.level),
+                }],
+                capabilities::CapabilityState::ColorLight(c) => {
+                    let mut fields = vec![
+                        KeyValue {
+                            key: "hue".into(),
+                            value: Value::FloatVal(c.hue),
+                        },
+                        KeyValue {
+                            key: "saturation".into(),
+                            value: Value::FloatVal(c.saturation),
+                        },
+                        KeyValue {
+                            key: "value".into(),
+                            value: Value::FloatVal(c.value),
+                        },
+                    ];
+                    if let Some(kelvin) = c.color_temp_kelvin {
+                        fields.push(KeyValue {
+                            key: "color_temp_kelvin".into(),
+                            value: Value::IntVal(i64::from(kelvin)),
+                        });
+                    }
+                    fields
+                }
+                capabilities::CapabilityState::Sensor(m) => vec![
+                    KeyValue {
+                        key: "value".into(),
+                        value: Value::FloatVal(m.value),
+                    },
+                    KeyValue {
+                        key: "unit".into(),
+                        value: Value::StringVal(m.unit.clone()),
+                    },
+                ],
+            };
+            (name, fields)
+        })
+        .collect()
+}
+
 /// Run both gates for a `register-device` / `update-device` call:
 ///
 /// 1. Every `initial_state` entry must have a matching
@@ -661,9 +727,30 @@ impl host_devices::Host for PluginState {
         // C1b: derive device_id from `installation_uuid` (host-minted
         // per-install) rather than `manifest.plugin.id` (reusable
         // name). Uninstall + reinstall produces different device ids.
+        //
+        // H9: also seed the host-owned state projection with any
+        // `initial_state` entries the plugin registered. The
+        // `authorize_device_info` gate above already refused any
+        // `initial_state` entry that doesn't match a declared
+        // capability, so what lands here is safe to project.
+        // Cloning `info.initial_state` before the move into
+        // `register` — need the state list for seeding, need the
+        // full `info` for the registry.
+        let seed_state = seed_state_from_initial(&info);
         let id = self
             .devices
             .register(&self.installation_uuid, self.instance_id.clone(), info);
+        let received_ms = crate::state::event_log::now_unix_ms();
+        for (capability, fields) in seed_state {
+            self.device_state.seed(
+                id.clone(),
+                self.instance_id.clone(),
+                capability,
+                fields,
+                0, // observed_ms — plugin didn't attach one for register-time state
+                received_ms,
+            );
+        }
         tracing::debug!(
             instance_id = %self.instance_id,
             device_id = %id,
@@ -1114,6 +1201,29 @@ impl host_events::Host for PluginState {
                 )));
             }
         };
+
+        // H9: update the host-owned state projection before the
+        // fanout. Runs under the same `publish_sequence` gate as
+        // `event_log.record` above, so a snapshot API call
+        // observes the same ordering the durable log records —
+        // no post-fanout callers can see a state update before
+        // the projection has it. Only `state-changed` events
+        // land here; other variants (button, inference, custom)
+        // aren't state-carrying by the WIT contract.
+        if let (
+            Some(device_id),
+            crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
+        ) = (ev.device.clone(), &ev.payload)
+        {
+            self.device_state.apply(
+                device_id,
+                self.instance_id.clone(),
+                sc.capability.clone(),
+                sc.fields.clone(),
+                ev.timestamp,
+                crate::state::event_log::now_unix_ms(),
+            );
+        }
 
         // Admission already consumed above (pre-persistence). The
         // bus's `publish_with_id` sends the event onto every
@@ -1792,6 +1902,7 @@ mod tests {
             Actor::plugin(instance_id),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv(instance_id, 0),
             fresh_event_log(),
@@ -1818,6 +1929,7 @@ mod tests {
             Actor::plugin(instance_id),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv(instance_id, quota_kb),
             fresh_event_log(),
@@ -1839,6 +1951,7 @@ mod tests {
             Actor::plugin(instance_id),
             InstanceConfig::new(),
             registry,
+            Arc::new(crate::state::DeviceStateStore::new()),
             bus,
             fresh_kv(instance_id, 0),
             fresh_event_log(),
@@ -2177,6 +2290,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2218,6 +2332,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2332,6 +2447,7 @@ mod tests {
             Actor::plugin("beta"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::clone(&events),
             fresh_kv("beta", 0),
             fresh_event_log(),
@@ -2501,6 +2617,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2547,6 +2664,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2631,6 +2749,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2684,6 +2803,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2723,6 +2843,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2913,6 +3034,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),

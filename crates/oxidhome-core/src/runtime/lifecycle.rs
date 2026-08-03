@@ -753,6 +753,15 @@ async fn run_one_lifecycle(
     // loops. Idempotent + cheap (one HashMap retain each).
     engine.devices().remove_by_owner(instance_id);
     engine.services().remove_by_owner(instance_id);
+    // H9: mark any device-state entries this instance previously
+    // published as `Stale`, then bump the supervisor generation so
+    // fresh entries applied under this life are distinguishable
+    // from anything left over. Consumers polling `deltas_since`
+    // observe the stale transition; consumers hitting the snapshot
+    // API see `quality: "stale"` on the pre-restart values until
+    // the plugin re-publishes.
+    engine.device_state().mark_instance_stale(instance_id);
+    engine.device_state().bump_generation(instance_id);
 
     transition(state_tx, instance_id, InstanceState::Loading);
 

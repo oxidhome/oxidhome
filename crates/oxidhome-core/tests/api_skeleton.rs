@@ -3831,3 +3831,152 @@ async fn publisher_order_sequencer_preserves_row_id_order() {
         "publisher-order gate must preserve row-id ordering",
     );
 }
+
+// ── H9: device-state projection ──────────────────────────────────
+
+/// H9: `GET /api/v1/devices/{id}/state` reflects state changes
+/// written through the host-owned projection. Uses the engine's
+/// `device_state()` handle directly (bypasses the WIT publish path)
+/// so the test doesn't need a live plugin — the runtime integration
+/// is covered separately.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_snapshot_reflects_applied_changes() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+
+    let store = engine.device_state();
+    store.apply(
+        "dev-42".into(),
+        "alpha".into(),
+        "switch".into(),
+        vec![KeyValue {
+            key: "state".into(),
+            value: Value::BoolVal(true),
+        }],
+        1234,
+        5678,
+    );
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/dev-42/state")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["device_id"], "dev-42");
+    assert_eq!(body["revision"].as_u64().unwrap(), 1);
+    let caps = body["capabilities"].as_array().expect("capabilities");
+    assert_eq!(caps.len(), 1);
+    assert_eq!(caps[0]["capability"], "switch");
+    assert_eq!(caps[0]["entry_revision"].as_u64().unwrap(), 1);
+    assert_eq!(caps[0]["global_revision"].as_u64().unwrap(), 1);
+    assert_eq!(caps[0]["quality"], "fresh");
+    assert_eq!(caps[0]["received_ms"].as_i64().unwrap(), 5678);
+    assert_eq!(caps[0]["observed_ms"].as_u64().unwrap(), 1234);
+    let fields = caps[0]["fields"].as_array().expect("fields array");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["key"], "state");
+    assert_eq!(fields[0]["value"]["t"], "Bool");
+    assert_eq!(fields[0]["value"]["v"], true);
+}
+
+/// H9: `GET /api/v1/devices/state/changes` returns entries whose
+/// `global_revision > since_revision`, sorted ascending, capped at
+/// `limit`. Verifies the cursor semantics — a client that saw
+/// revision N pages forward through the changes without missing or
+/// duplicating anything.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_changes_returns_cursor_deltas() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+
+    let store = engine.device_state();
+    for i in 0..4 {
+        store.apply(
+            format!("dev-{i}"),
+            "alpha".into(),
+            "switch".into(),
+            Vec::new(),
+            0,
+            0,
+        );
+    }
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state/changes?since_revision=2&limit=10")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["current_revision"].as_u64().unwrap(), 4);
+    let changes = body["changes"].as_array().expect("changes");
+    assert_eq!(changes.len(), 2);
+    // Ascending by global_revision so paging forward is well-defined.
+    assert_eq!(changes[0]["global_revision"].as_u64().unwrap(), 3);
+    assert_eq!(changes[1]["global_revision"].as_u64().unwrap(), 4);
+    assert_eq!(changes[0]["device_id"], "dev-2");
+    assert_eq!(changes[1]["device_id"], "dev-3");
+}
+
+/// H9: `GET /api/v1/devices/{id}/state` and
+/// `GET /api/v1/devices/state/changes` both require the
+/// `devices:read` scope. `devices:list` (registration snapshot)
+/// does not satisfy — this is a distinct capability.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_endpoints_require_devices_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let list_only = engine
+        .auth_tokens()
+        .create("list-only", b"[\"devices:list\"]")
+        .unwrap();
+
+    for path in [
+        "/api/v1/devices/dev-1/state",
+        "/api/v1/devices/state/changes",
+    ] {
+        let response = build_router(engine.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", list_only.plaintext),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{path} must require devices:read",
+        );
+    }
+}

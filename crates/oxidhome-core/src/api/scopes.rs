@@ -127,6 +127,14 @@ pub(crate) const INSTANCES_LIST: Scope = Scope::new("instances:list");
 /// `devices:list` — see `GET /api/v1/devices`.
 pub(crate) const DEVICES_LIST: Scope = Scope::new("devices:list");
 
+/// `devices:read` — see `GET /api/v1/devices/{id}/state` and
+/// `GET /api/v1/devices/state/changes` (H9). Read-only access to
+/// the host-owned device-state projection. Distinct from
+/// `devices:list` (registration snapshot) and `devices:command`
+/// (write path); this is the "what's the current value of every
+/// sensor / switch" surface.
+pub(crate) const DEVICES_READ: Scope = Scope::new("devices:read");
+
 /// `events:tail` — see `GET /api/v1/events/tail` (WebSocket).
 pub(crate) const EVENTS_TAIL: Scope = Scope::new("events:tail");
 
