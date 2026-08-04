@@ -329,18 +329,15 @@ struct DeviceStateEntry {
     device_id: String,
     capability: String,
     fields: Vec<WireKeyValue>,
-    /// Per-`(device, capability)` monotonic counter — **within
-    /// one `epoch`**. Independent of `global_revision`; bumps
-    /// only when *this* slot changes. Round-8 finding 1: the
-    /// per-key counter resets to 1 if the slot's `Stale` entry
-    /// was evicted (see `MAX_STALE_ENTRIES`) and the same key
-    /// is re-registered; the store rotates its `epoch` on any
-    /// eviction, so a client that persists both `epoch` and
-    /// `entry_revision` sees the epoch change and re-snapshots
-    /// before it can observe the counter decrease.
-    entry_revision: u64,
     /// Store-wide revision at write time. Compare with the
-    /// caller's cursor to decide which entries are new.
+    /// caller's cursor to decide which entries are new — this
+    /// is the **only** ordering axis. H9 round-9 finding 1
+    /// removed the per-key `entry_revision`: preserving it
+    /// across stale-cap eviction would either grow the store
+    /// unboundedly with tombstones or force a global epoch
+    /// rotation on every eviction — a `DoS` vector where one
+    /// plugin churning unique `local_id`s could trigger a
+    /// process-wide resync for every API client.
     global_revision: u64,
     /// Host wall-clock (ms since epoch) when the update was
     /// applied. Trusted for ordering; `observed_ms` isn't.
@@ -370,7 +367,6 @@ impl DeviceStateEntry {
                     value: kv.value.clone().into(),
                 })
                 .collect(),
-            entry_revision: state.revision,
             global_revision: state.global_revision,
             received_ms: state.received_ms,
             observed_ms: state.observed_ms,

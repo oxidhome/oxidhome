@@ -3885,7 +3885,7 @@ async fn devices_state_snapshot_reflects_applied_changes() {
     let caps = body["capabilities"].as_array().expect("capabilities");
     assert_eq!(caps.len(), 1);
     assert_eq!(caps[0]["capability"], "switch");
-    assert_eq!(caps[0]["entry_revision"].as_u64().unwrap(), 1);
+    assert!(caps[0].get("entry_revision").is_none());
     assert_eq!(caps[0]["global_revision"].as_u64().unwrap(), 1);
     assert_eq!(caps[0]["quality"], "fresh");
     assert_eq!(caps[0]["received_ms"].as_i64().unwrap(), 5678);
