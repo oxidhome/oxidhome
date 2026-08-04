@@ -211,9 +211,38 @@ impl DeviceStateStore {
     /// no writer stamp the old generation between them.
     pub fn bump_generation(&self, owner_instance: &str) -> u64 {
         let mut inner = self.inner_write();
+        Self::bump_generation_locked(&mut inner, owner_instance)
+    }
+
+    fn bump_generation_locked(inner: &mut StoreInner, owner_instance: &str) -> u64 {
         let next = inner.generations.get(owner_instance).copied().unwrap_or(0) + 1;
         inner.generations.insert(owner_instance.to_string(), next);
         next
+    }
+
+    /// **H9 round-5 finding 1**: mark every `Fresh` entry owned by
+    /// `owner_instance` as `Stale` **and** bump that instance's
+    /// generation, atomically under one write-lock acquisition. The
+    /// supervisor calls this on every restart / lifecycle transition
+    /// where a fresh generation starts. Splitting the two
+    /// operations (as the pre-fix supervisor did:
+    /// `mark_instance_stale(id); bump_generation(id);`) opened a
+    /// race — between the two calls, a delayed writer could take
+    /// the lock, read the pre-bump generation, and insert a
+    /// `Fresh` entry stamped with the old generation *after* the
+    /// stale sweep. The composite fixes it by holding the lock
+    /// across both steps.
+    ///
+    /// Returns `(entries_flipped_stale, new_generation)` for
+    /// observability / tests.
+    pub fn restart_generation(&self, owner_instance: &str) -> (usize, u64) {
+        let mut inner = self.inner_write();
+        let received_ms = crate::state::event_log::now_unix_ms();
+        let flipped = Self::stale_where_locked(&mut inner, received_ms, |_, entry| {
+            entry.owner_instance == owner_instance && entry.quality == StateQuality::Fresh
+        });
+        let generation = Self::bump_generation_locked(&mut inner, owner_instance);
+        (flipped, generation)
     }
 
     /// H9 round-3 finding 1: **snapshot** operation — replaces
@@ -486,6 +515,19 @@ impl DeviceStateStore {
     fn stale_where(&self, predicate: impl Fn(&(DeviceId, String), &DeviceState) -> bool) -> usize {
         let mut inner = self.inner_write();
         let received_ms = crate::state::event_log::now_unix_ms();
+        Self::stale_where_locked(&mut inner, received_ms, predicate)
+    }
+
+    /// Under an already-held write lock: flip every entry matching
+    /// `predicate` to `Stale`, bumping revisions and refreshing
+    /// `received_ms`. Extracted so [`Self::restart_generation`] can
+    /// hold the lock across a stale-sweep + generation-bump pair
+    /// without releasing it between (H9 round-5 finding 1).
+    fn stale_where_locked(
+        inner: &mut StoreInner,
+        received_ms: i64,
+        predicate: impl Fn(&(DeviceId, String), &DeviceState) -> bool,
+    ) -> usize {
         let keys_to_stale: Vec<(DeviceId, String)> = inner
             .entries
             .iter()
@@ -1026,15 +1068,16 @@ mod tests {
                 }
             }
         });
-        // Drive lifecycle transitions: sweep then bump. If gen
-        // reads weren't linearized with entry writes, a delayed
-        // writer would insert a Fresh entry stamped with the
-        // pre-sweep generation *after* the sweep, so a Fresh
-        // entry's `source_generation` could lag the current
-        // generation for that instance.
+        // Drive lifecycle transitions via the composite
+        // `restart_generation` (round-5 fix): mark stale + bump
+        // under one lock. The pre-fix supervisor called
+        // `mark_instance_stale` then `bump_generation` separately,
+        // which let a delayed writer slip in between the two
+        // methods (both individually locked correctly), read the
+        // pre-bump generation, and insert a Fresh entry stamped
+        // with the previous generation *after* the sweep.
         for _ in 0..500 {
-            store.mark_instance_stale("alpha");
-            let current_gen = store.bump_generation("alpha");
+            let (_, current_gen) = store.restart_generation("alpha");
             for entry in store.snapshot_device("dev-0") {
                 if entry.quality == StateQuality::Fresh {
                     assert!(
@@ -1048,6 +1091,62 @@ mod tests {
         }
         done.store(true, Ordering::Release);
         writer.join().unwrap();
+    }
+
+    /// Round-5 finding 1: the composite `restart_generation`
+    /// method exposes the atomic invariant contractually.
+    /// After the composite returns, every Fresh entry owned by
+    /// that instance carries the newly-bumped generation
+    /// (equivalently: no Stale entry from the sweep can be
+    /// followed by a Fresh entry from the pre-bump generation).
+    /// This is a deterministic check; the fuzz test above catches
+    /// the interleaving under load.
+    #[test]
+    fn restart_generation_marks_stale_and_bumps_atomically() {
+        let store = DeviceStateStore::new();
+        assert_eq!(store.bump_generation("alpha"), 1);
+        // Pre-restart: seed some Fresh entries under gen 1.
+        for i in 0..3 {
+            store.apply_delta(
+                format!("dev-{i}"),
+                "alpha".into(),
+                "switch".into(),
+                vec![kv("state", Value::BoolVal(true))],
+                0,
+                0,
+            );
+        }
+        let (flipped, new_gen) = store.restart_generation("alpha");
+        assert_eq!(flipped, 3, "should flip all three pre-restart entries");
+        assert_eq!(new_gen, 2);
+        // Everything is Stale now — nothing Fresh under either
+        // generation, so a hypothetical delayed writer would have
+        // had to already commit before the sweep.
+        for i in 0..3 {
+            let e = store
+                .snapshot_capability(&format!("dev-{i}"), "switch")
+                .unwrap();
+            assert_eq!(e.quality, StateQuality::Stale);
+            // The composite touched every prior entry — none can
+            // still carry the old Fresh state under gen 1.
+        }
+        // A subsequent apply_delta lands under gen 2 and does not
+        // merge into the Stale gen-1 entries (round-4 finding 1).
+        store.apply_delta(
+            "dev-0".into(),
+            "alpha".into(),
+            "switch".into(),
+            vec![kv("brightness", Value::IntVal(50))],
+            0,
+            0,
+        );
+        let entry = store.snapshot_capability("dev-0", "switch").unwrap();
+        assert_eq!(entry.quality, StateQuality::Fresh);
+        assert_eq!(entry.source_generation, 2);
+        // Fresh entry has ONLY the post-restart field — the pre-
+        // restart `state` didn't survive the generation flip.
+        assert!(entry.fields.iter().any(|f| f.key == "brightness"));
+        assert!(!entry.fields.iter().any(|f| f.key == "state"));
     }
 
     /// Round-2 finding 3: `remove-device` (via `mark_device_stale`)

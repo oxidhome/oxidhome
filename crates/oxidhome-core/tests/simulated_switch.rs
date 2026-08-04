@@ -109,7 +109,7 @@ async fn simulated_switch_round_trip() {
         .snapshot_capability(&device_id, "switch")
         .expect("state projection updated by execute_command");
     assert_eq!(field_bool(&projected.fields, "state"), Some(true));
-    assert_eq!(projected.quality, oxidhome_core::state::StateQuality::Fresh,);
+    assert_eq!(projected.quality, oxidhome_core::state::StateQuality::Fresh);
 
     // The plugin's `publish_state_change` should land on the bus.
     // `recv` is async; bound it with a timeout so a missing event

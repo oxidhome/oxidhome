@@ -754,14 +754,18 @@ async fn run_one_lifecycle(
     engine.devices().remove_by_owner(instance_id);
     engine.services().remove_by_owner(instance_id);
     // H9: mark any device-state entries this instance previously
-    // published as `Stale`, then bump the supervisor generation so
+    // published as `Stale` and bump the supervisor generation so
     // fresh entries applied under this life are distinguishable
     // from anything left over. Consumers polling `deltas_since`
     // observe the stale transition; consumers hitting the snapshot
     // API see `quality: "stale"` on the pre-restart values until
-    // the plugin re-publishes.
-    engine.device_state().mark_instance_stale(instance_id);
-    engine.device_state().bump_generation(instance_id);
+    // the plugin re-publishes. H9 round-5 finding 1: the composite
+    // `restart_generation` holds the store's write lock across
+    // both steps — the pre-fix two-call shape let a delayed
+    // writer read the pre-bump generation and insert a fresh
+    // entry stamped with the previous generation *after* the
+    // stale sweep.
+    engine.device_state().restart_generation(instance_id);
 
     transition(state_tx, instance_id, InstanceState::Loading);
 
