@@ -32,7 +32,10 @@ pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery, credential_
 pub use auth_token::{IssuedToken, TokenError, TokenRecord, TokenStore};
 pub use blobs::{BlobError, BlobInfo, BlobStore, is_safe_instance_id};
 pub use db::Db;
-pub use device_state::{DeviceState, DeviceStateStore, SharedDeviceStateStore, StateQuality};
+pub use device_state::{
+    DeltaPage, DeviceState, DeviceStateStore, MAX_STALE_ENTRIES, SharedDeviceStateStore,
+    StateQuality,
+};
 pub use devices::{DeviceMeta, DeviceRegistry};
 pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicMatch};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};

@@ -3879,6 +3879,9 @@ async fn devices_state_snapshot_reflects_applied_changes() {
     let body = body_to_json(response.into_body()).await;
     assert_eq!(body["device_id"], "dev-42");
     assert_eq!(body["revision"].as_u64().unwrap(), 1);
+    // H9 round-6 finding 1: snapshot carries the store epoch so
+    // clients can detect a daemon restart.
+    assert!(body["epoch"].as_u64().unwrap() > 0);
     let caps = body["capabilities"].as_array().expect("capabilities");
     assert_eq!(caps.len(), 1);
     assert_eq!(caps[0]["capability"], "switch");
@@ -3944,6 +3947,64 @@ async fn devices_state_changes_returns_cursor_deltas() {
     assert_eq!(changes[1]["global_revision"].as_u64().unwrap(), 4);
     assert_eq!(changes[0]["device_id"], "dev-2");
     assert_eq!(changes[1]["device_id"], "dev-3");
+    // H9 round-6 finding 1: normal cursor advance carries the
+    // store epoch, and `reset_required` is false when the
+    // caller's cursor is within the current revision.
+    assert!(body["epoch"].as_u64().unwrap() > 0);
+    assert_eq!(body["reset_required"], false);
+}
+
+/// H9 round-6 finding 1: `since_revision > current_revision` (as
+/// happens when a client held a pre-restart cursor and the daemon
+/// restarted, dropping the in-memory store back to revision 0)
+/// returns `reset_required: true` with an empty `changes` and the
+/// current store epoch. The client sees this and resyncs.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_changes_signals_reset_when_cursor_exceeds_current() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    // Seed a few entries so current_revision = 2 (well below the
+    // 999 cursor the client sends).
+    let store = engine.device_state();
+    store.apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    store.apply_delta(
+        "dev-2".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state/changes?since_revision=999")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["reset_required"], true);
+    assert_eq!(body["changes"].as_array().unwrap().len(), 0);
+    assert_eq!(body["current_revision"].as_u64().unwrap(), 2);
+    assert!(body["epoch"].as_u64().unwrap() > 0);
 }
 
 /// H9: `GET /api/v1/devices/{id}/state` and

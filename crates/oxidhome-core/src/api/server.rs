@@ -305,6 +305,13 @@ async fn list_devices(
 #[derive(Serialize)]
 struct DeviceStateSnapshot {
     device_id: String,
+    /// H9 round-6 finding 1: opaque store epoch. Clients
+    /// persist this alongside `revision`; a subsequent response
+    /// carrying a different `epoch` means the daemon restarted
+    /// (the projection is in-memory), the previously-held
+    /// `revision` cursor is invalid, and the client should
+    /// resync by re-fetching this endpoint.
+    epoch: u64,
     /// Store-wide monotonic revision at read time. Even if this
     /// device has no observed state yet (empty `capabilities`),
     /// the revision is meaningful for driving the `changes`
@@ -390,7 +397,7 @@ async fn get_device_state(
     // `global_revision > revision` — the response then carried a
     // per-entry revision above the top-level one, contradicting
     // the documented `M ≤ N` invariant.
-    let (revision, entries) = state
+    let (epoch, revision, entries) = state
         .engine
         .device_state()
         .snapshot_device_with_revision(&device_id);
@@ -402,6 +409,7 @@ async fn get_device_state(
     capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
     Ok(Json(DeviceStateSnapshot {
         device_id,
+        epoch,
         revision,
         capabilities,
     }))
@@ -445,10 +453,25 @@ struct StateChangesParams {
 /// `changes` with `current_revision > since_revision` just means
 /// every changed slot's latest value is within the current page —
 /// advance and re-poll.
+///
+/// H9 round-6 finding 1: `epoch` is the store's opaque
+/// process-scoped nonce; a client that persists the last-seen
+/// epoch and observes a change knows the daemon restarted, the
+/// in-memory projection reset, and its cursor is invalid. As a
+/// belt-and-suspenders check, `reset_required` is `true` when
+/// `since_revision > current_revision` (typical after a
+/// restart drops the store back to 0) — the client discards
+/// its cursor and re-fetches the snapshot.
 #[derive(Serialize)]
 struct StateChangesBody {
+    epoch: u64,
     current_revision: u64,
     changes: Vec<DeviceStateEntry>,
+    /// True when the caller's `since_revision` is beyond the
+    /// store's current revision (see field-level doc). Serialized
+    /// unconditionally so a client can `if body.reset_required { ... }`
+    /// without checking for absence.
+    reset_required: bool,
 }
 
 /// Default page size for `state/changes`. Chosen to comfortably
@@ -481,17 +504,23 @@ async fn query_device_state_changes(
     // H9 round-3 finding 3: read `current_revision` and `deltas`
     // **under one lock** — see the sibling comment on
     // `get_device_state` for the invariant.
-    let (current_revision, deltas) = state
+    // H9 round-6 finding 1: the store now returns a `DeltaPage`
+    // carrying `epoch` + `reset_required` so the client can
+    // detect a daemon restart and resync.
+    let page = state
         .engine
         .device_state()
         .deltas_since_with_revision(since, limit);
-    let changes: Vec<DeviceStateEntry> = deltas
+    let changes: Vec<DeviceStateEntry> = page
+        .entries
         .iter()
         .map(|s| DeviceStateEntry::from_state(s))
         .collect();
     Ok(Json(StateChangesBody {
-        current_revision,
+        epoch: page.epoch,
+        current_revision: page.current_revision,
         changes,
+        reset_required: page.reset_required,
     }))
 }
 
