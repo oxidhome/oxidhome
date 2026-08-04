@@ -310,8 +310,10 @@ struct DeviceStateSnapshot {
     /// carrying a different `epoch` means the daemon restarted
     /// (the projection is in-memory), the previously-held
     /// `revision` cursor is invalid, and the client should
-    /// resync by re-fetching this endpoint.
-    epoch: u64,
+    /// resync by re-fetching this endpoint. Round-7 finding 2:
+    /// serialized as a string (128-bit OS-random nonce, hex)
+    /// so JavaScript clients can compare it losslessly.
+    epoch: String,
     /// Store-wide monotonic revision at read time. Even if this
     /// device has no observed state yet (empty `capabilities`),
     /// the revision is meaningful for driving the `changes`
@@ -464,13 +466,20 @@ struct StateChangesParams {
 /// its cursor and re-fetches the snapshot.
 #[derive(Serialize)]
 struct StateChangesBody {
-    epoch: u64,
+    /// See [`DeviceStateSnapshot::epoch`] — 128-bit OS-random
+    /// nonce, string-encoded (round-7 finding 2).
+    epoch: String,
     current_revision: u64,
     changes: Vec<DeviceStateEntry>,
-    /// True when the caller's `since_revision` is beyond the
-    /// store's current revision (see field-level doc). Serialized
-    /// unconditionally so a client can `if body.reset_required { ... }`
-    /// without checking for absence.
+    /// True when the caller's cursor is invalid — either it's
+    /// beyond the store's current revision (typical after a
+    /// daemon restart drops the store back to 0), or it's below
+    /// the store's `evicted_through_revision` watermark (an
+    /// evicted stale slot may have been the client's last
+    /// chance to observe a `Fresh → Stale` flip). Serialized
+    /// unconditionally so a client can
+    /// `if body.reset_required { ... }` without checking for
+    /// absence.
     reset_required: bool,
 }
 

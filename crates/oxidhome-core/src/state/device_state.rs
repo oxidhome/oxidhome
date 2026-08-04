@@ -74,6 +74,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use rand::TryRng;
+
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue};
 
 /// Freshness marker for a stored state entry. `Stale` isn't a value
@@ -160,11 +162,27 @@ struct StoreInner {
     /// forever — the new store never reaches 100. The API
     /// returns the epoch on every response; a client that
     /// observes an epoch change (or a `reset_required` signal)
-    /// discards its cursor and resyncs. The value itself is
-    /// derived from the host wall-clock at store creation, so it
-    /// changes on every restart and is monotonic across boots on
-    /// a machine whose clock isn't drifting backwards.
-    epoch: u64,
+    /// discards its cursor and resyncs.
+    ///
+    /// Round-7 finding 2: the value is a 128-bit OS-random nonce
+    /// hex-encoded as a String (not a wall-clock ms), so
+    /// distinct stores collide with negligible probability
+    /// (2⁻¹²⁸ per rebuild), regardless of clock resolution or
+    /// timing. String-encoded so JavaScript clients (which lose
+    /// precision above 2⁵³ on the Number type) can compare it
+    /// as an ordinary string identifier.
+    epoch: String,
+    /// H9 round-7 finding 1: highest `global_revision` of any
+    /// stale entry ever evicted by [`Self::enforce_stale_cap_locked`].
+    /// A client with `since_revision < evicted_through_revision`
+    /// may have missed the stale-transition-and-eviction path
+    /// of a slot they cached as `Fresh`, so
+    /// [`Self::deltas_since_with_revision`] returns
+    /// `reset_required: true` on that condition. Pre-fix, only
+    /// `since_revision > current_revision` triggered a reset —
+    /// so a cursor *below* the current revision but above what
+    /// eviction had swept could silently miss removals.
+    evicted_through_revision: u64,
     /// Current supervisor generation per `owner_instance`, bumped
     /// by [`DeviceStateStore::bump_generation`] on each start.
     /// Sharing the entries lock means read-gen-then-insert-entry
@@ -178,16 +196,35 @@ impl Default for StoreInner {
         Self {
             entries: HashMap::new(),
             global_revision: 0,
-            // Round-6 finding 1: epoch = wall-clock ms at store
-            // creation, so every process gets a distinct value.
-            // The exact value is opaque to clients; they only
-            // check equality across responses. Cast from i64 is
-            // safe — the wall clock is always positive after 1970.
-            #[allow(clippy::cast_sign_loss)]
-            epoch: crate::state::event_log::now_unix_ms().max(0) as u64,
+            epoch: mint_epoch(),
+            evicted_through_revision: 0,
             generations: HashMap::new(),
         }
     }
+}
+
+/// H9 round-7 finding 2: 128-bit OS-random nonce, hex-encoded.
+/// Called from [`StoreInner::default`] — every fresh store gets
+/// a distinct opaque identifier that clients compare as a
+/// string. String encoding sidesteps JavaScript's 2⁵³ integer
+/// precision limit; hex is the same shape as
+/// `installed_plugins::mint_installation_uuid`.
+fn mint_epoch() -> String {
+    let mut bytes = [0u8; 16];
+    // `SysRng::try_fill_bytes` returns `Result<(), Infallible>` on
+    // supported platforms; `.expect` documents the "must be
+    // available" operational contract (same shape as
+    // `mint_installation_uuid`).
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system RNG must be available");
+    let mut hex = String::with_capacity(6 + 32);
+    hex.push_str("epoch-");
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 impl StoreInner {
@@ -237,9 +274,14 @@ impl DeviceStateStore {
     /// projection isn't persisted) and every previously-held
     /// `since_revision` cursor is invalid — the client should
     /// resync from the snapshot.
+    ///
+    /// Round-7 finding 2: string, not integer — a 128-bit
+    /// OS-random nonce so distinct stores collide with
+    /// negligible probability, and JavaScript clients can
+    /// compare it losslessly.
     #[must_use]
-    pub fn epoch(&self) -> u64 {
-        self.inner_read().epoch
+    pub fn epoch(&self) -> String {
+        self.inner_read().epoch.clone()
     }
 
     /// Bump the supervisor generation for `owner_instance`. Called
@@ -436,7 +478,7 @@ impl DeviceStateStore {
     pub fn snapshot_device_with_revision(
         &self,
         device_id: &str,
-    ) -> (u64, u64, Vec<Arc<DeviceState>>) {
+    ) -> (String, u64, Vec<Arc<DeviceState>>) {
         let inner = self.inner_read();
         let entries: Vec<Arc<DeviceState>> = inner
             .entries
@@ -444,7 +486,7 @@ impl DeviceStateStore {
             .filter(|((did, _), _)| did == device_id)
             .map(|(_, meta)| Arc::clone(meta))
             .collect();
-        (inner.epoch, inner.global_revision, entries)
+        (inner.epoch.clone(), inner.global_revision, entries)
     }
 
     /// Snapshot a single `(device, capability)` slot.
@@ -501,12 +543,23 @@ impl DeviceStateStore {
     /// the snapshot instead of quietly waiting for the store to
     /// catch up (which it never will, because the pre-restart
     /// revision is irrecoverable).
+    ///
+    /// H9 round-7 finding 1: also sets `reset_required = true`
+    /// when `since_revision < evicted_through_revision` — the
+    /// stale-cap sweep may have evicted transitions the client
+    /// hadn't yet observed (e.g. a `Fresh → Stale` flip that
+    /// dropped from the map because too many other stale slots
+    /// accumulated). Pre-fix, only the above-current case
+    /// triggered a reset, so a cursor *below* the current
+    /// revision but *below* the eviction watermark silently
+    /// missed those transitions.
     #[must_use]
     pub fn deltas_since_with_revision(&self, since_revision: u64, limit: usize) -> DeltaPage {
         let inner = self.inner_read();
-        if since_revision > inner.global_revision {
+        if since_revision > inner.global_revision || since_revision < inner.evicted_through_revision
+        {
             return DeltaPage {
-                epoch: inner.epoch,
+                epoch: inner.epoch.clone(),
                 current_revision: inner.global_revision,
                 entries: Vec::new(),
                 reset_required: true,
@@ -521,7 +574,7 @@ impl DeviceStateStore {
         out.sort_by_key(|m| m.global_revision);
         out.truncate(limit);
         DeltaPage {
-            epoch: inner.epoch,
+            epoch: inner.epoch.clone(),
             current_revision: inner.global_revision,
             entries: out,
             reset_required: false,
@@ -625,11 +678,16 @@ impl DeviceStateStore {
     /// H9 round-6 finding 2: cap total `Stale` entries at
     /// [`MAX_STALE_ENTRIES`]; evict oldest-by-`global_revision`
     /// once the cap is exceeded. Called after every stale
-    /// transition batch. Evicted entries are dropped from the
-    /// map entirely (they were already `Stale` — consumers
-    /// filtering on `quality` were already ignoring them, and
-    /// consumers holding a cursor above the evicted entries'
-    /// `global_revision` are unaffected).
+    /// transition batch.
+    ///
+    /// H9 round-7 finding 1: also updates
+    /// `evicted_through_revision` to the highest evicted
+    /// `global_revision`, so [`Self::deltas_since_with_revision`]
+    /// can force `reset_required` on any client whose cursor is
+    /// at or below that watermark — they might have missed the
+    /// stale-transition of a slot they'd cached as `Fresh`.
+    /// Pre-fix, evictions were silent and such a client would
+    /// keep serving pre-eviction values forever.
     ///
     /// Fresh entries are never evicted here — a bounded store
     /// under normal operation stays well within the cap; the
@@ -645,7 +703,6 @@ impl DeviceStateStore {
             return;
         }
         let excess = stale_count - MAX_STALE_ENTRIES;
-        // Pick the `excess` oldest Stale entries by global_revision.
         let mut stale_by_age: Vec<(u64, (DeviceId, String))> = inner
             .entries
             .iter()
@@ -653,8 +710,16 @@ impl DeviceStateStore {
             .map(|(k, m)| (m.global_revision, k.clone()))
             .collect();
         stale_by_age.sort_by_key(|(rev, _)| *rev);
-        for (_, key) in stale_by_age.into_iter().take(excess) {
+        for (rev, key) in stale_by_age.into_iter().take(excess) {
             inner.entries.remove(&key);
+            // Round-7 finding 1: advance the watermark to the
+            // highest evicted revision. Cursors at or below
+            // this value need a reset (they may have missed
+            // this slot's flip to Stale, which was already the
+            // client's final chance to observe the transition).
+            if rev > inner.evicted_through_revision {
+                inner.evicted_through_revision = rev;
+            }
         }
     }
 }
@@ -689,7 +754,10 @@ pub type SharedDeviceStateStore = Arc<DeviceStateStore>;
 /// [`DeviceStateStore::snapshot_device_with_revision`].
 #[derive(Debug)]
 pub struct DeltaPage {
-    pub epoch: u64,
+    /// H9 round-7 finding 2: string (128-bit OS-random nonce)
+    /// so distinct stores collide with negligible probability
+    /// and JavaScript clients compare it losslessly.
+    pub epoch: String,
     pub current_revision: u64,
     pub entries: Vec<Arc<DeviceState>>,
     pub reset_required: bool,
@@ -1400,6 +1468,55 @@ mod tests {
         );
     }
 
+    /// H9 round-7 finding 1: `deltas_since_with_revision` also
+    /// returns `reset_required = true` when the caller's cursor
+    /// is below the store's `evicted_through_revision` watermark
+    /// — the stale-cap sweep may have evicted a `Fresh → Stale`
+    /// transition the client hadn't yet observed. Pre-fix, only
+    /// the cursor-above-current case triggered a reset, so an
+    /// entry evicted at revision E left every cursor with
+    /// `since_revision < E` silently missing the transition.
+    #[test]
+    fn deltas_since_with_revision_flags_reset_when_cursor_below_evicted() {
+        let store = DeviceStateStore::new();
+        // Register + stale-sweep enough entries to overflow the
+        // stale cap and trigger eviction.
+        let overflow = 32;
+        for i in 0..MAX_STALE_ENTRIES + overflow {
+            store.apply_delta(
+                format!("dev-{i}"),
+                "alpha".into(),
+                "switch".into(),
+                Vec::new(),
+                0,
+                0,
+            );
+        }
+        store.mark_instance_stale("alpha");
+        // Store has evicted at least `overflow` entries. Any
+        // cursor at or below any evicted revision must reset.
+        let current = store.current_revision();
+        let page = store.deltas_since_with_revision(0, 1024);
+        assert!(
+            page.reset_required,
+            "cursor 0 below eviction watermark should reset, current={} page={:?}",
+            current,
+            (
+                &page.epoch,
+                page.current_revision,
+                page.reset_required,
+                page.entries.len()
+            ),
+        );
+
+        // A cursor at or above the current revision is either
+        // fine (== current, no deltas) or a restart-cursor
+        // (> current, also resets — covered by round-6 test).
+        let page = store.deltas_since_with_revision(current, 1024);
+        assert!(!page.reset_required);
+        assert!(page.entries.is_empty());
+    }
+
     /// H9 round-6 finding 1: `deltas_since_with_revision` returns
     /// `reset_required = true` when the caller's cursor is above
     /// the current store revision — the daemon-restart signal.
@@ -1419,7 +1536,7 @@ mod tests {
         assert!(page.reset_required);
         assert!(page.entries.is_empty());
         assert_eq!(page.current_revision, 1);
-        assert!(page.epoch > 0);
+        assert!(page.epoch.starts_with("epoch-"));
 
         // Cursor at or below → normal read, no reset flag.
         let page = store.deltas_since_with_revision(0, 10);
@@ -1427,24 +1544,26 @@ mod tests {
         assert_eq!(page.entries.len(), 1);
     }
 
-    /// H9 round-6 finding 1: two freshly-constructed stores get
-    /// distinct epochs, so a caller comparing epochs across a
-    /// process restart observes the change and knows the cursor
-    /// is invalid.
+    /// H9 round-7 finding 2: two freshly-constructed stores get
+    /// **distinct** epochs, with 2⁻¹²⁸ collision probability.
+    /// Pre-fix, the epoch was `now_unix_ms()`, so two stores
+    /// created in the same millisecond collided — a client that
+    /// polled the pre-restart store at revision 100, saw a
+    /// restart, and re-polled quickly enough could observe the
+    /// same epoch and continue advancing its cursor into
+    /// nonsense. String encoding also sidesteps JavaScript's
+    /// 2⁵³ integer precision limit.
     #[test]
-    fn distinct_stores_get_distinct_epochs() {
+    fn distinct_stores_get_distinct_random_epochs() {
         let a = DeviceStateStore::new();
-        // Same-process construction reads the wall clock twice;
-        // a very fast test could get the same millisecond. Push
-        // through a small sleep-free workaround by writing an
-        // entry and asserting we can read a positive epoch on
-        // both. The important property (epoch changes across a
-        // daemon restart) is validated at the API layer by the
-        // `reset_required` signal, which fires regardless of
-        // epoch coincidence.
         let b = DeviceStateStore::new();
-        assert!(a.epoch() > 0);
-        assert!(b.epoch() > 0);
+        assert!(a.epoch().starts_with("epoch-"));
+        assert!(b.epoch().starts_with("epoch-"));
+        assert_ne!(
+            a.epoch(),
+            b.epoch(),
+            "distinct stores must mint distinct random epochs"
+        );
     }
 
     /// Round-2 finding 3: `update-device` with a narrower

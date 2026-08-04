@@ -3881,7 +3881,7 @@ async fn devices_state_snapshot_reflects_applied_changes() {
     assert_eq!(body["revision"].as_u64().unwrap(), 1);
     // H9 round-6 finding 1: snapshot carries the store epoch so
     // clients can detect a daemon restart.
-    assert!(body["epoch"].as_u64().unwrap() > 0);
+    assert!(body["epoch"].as_str().unwrap().starts_with("epoch-"));
     let caps = body["capabilities"].as_array().expect("capabilities");
     assert_eq!(caps.len(), 1);
     assert_eq!(caps[0]["capability"], "switch");
@@ -3950,7 +3950,7 @@ async fn devices_state_changes_returns_cursor_deltas() {
     // H9 round-6 finding 1: normal cursor advance carries the
     // store epoch, and `reset_required` is false when the
     // caller's cursor is within the current revision.
-    assert!(body["epoch"].as_u64().unwrap() > 0);
+    assert!(body["epoch"].as_str().unwrap().starts_with("epoch-"));
     assert_eq!(body["reset_required"], false);
 }
 
@@ -4004,7 +4004,7 @@ async fn devices_state_changes_signals_reset_when_cursor_exceeds_current() {
     assert_eq!(body["reset_required"], true);
     assert_eq!(body["changes"].as_array().unwrap().len(), 0);
     assert_eq!(body["current_revision"].as_u64().unwrap(), 2);
-    assert!(body["epoch"].as_u64().unwrap() > 0);
+    assert!(body["epoch"].as_str().unwrap().starts_with("epoch-"));
 }
 
 /// H9: `GET /api/v1/devices/{id}/state` and
