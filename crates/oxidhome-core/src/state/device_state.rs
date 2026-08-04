@@ -689,6 +689,18 @@ impl DeviceStateStore {
     /// Pre-fix, evictions were silent and such a client would
     /// keep serving pre-eviction values forever.
     ///
+    /// H9 round-8 finding 1: also **rotates the store epoch** if
+    /// any entry was evicted. Eviction discards the per-slot
+    /// `revision` counter; a subsequent re-register of the same
+    /// `(device_id, capability)` slot starts back at
+    /// `revision = 1`, breaking the per-key monotonicity
+    /// contract for any client whose cursor was already above
+    /// `evicted_through_revision` (the watermark handles
+    /// clients *below* it, but not above). Rotating the epoch
+    /// forces every client — regardless of cursor position —
+    /// to re-snapshot on their next poll, which is the same
+    /// signal the store already emits on a process restart.
+    ///
     /// Fresh entries are never evicted here — a bounded store
     /// under normal operation stays well within the cap; the
     /// cap exists to bound growth from a plugin registering
@@ -710,8 +722,10 @@ impl DeviceStateStore {
             .map(|(k, m)| (m.global_revision, k.clone()))
             .collect();
         stale_by_age.sort_by_key(|(rev, _)| *rev);
+        let mut evicted_any = false;
         for (rev, key) in stale_by_age.into_iter().take(excess) {
             inner.entries.remove(&key);
+            evicted_any = true;
             // Round-7 finding 1: advance the watermark to the
             // highest evicted revision. Cursors at or below
             // this value need a reset (they may have missed
@@ -720,6 +734,14 @@ impl DeviceStateStore {
             if rev > inner.evicted_through_revision {
                 inner.evicted_through_revision = rev;
             }
+        }
+        // Round-8 finding 1: rotate the epoch so cursors *above*
+        // `evicted_through_revision` also resync. Discarding the
+        // slot means the next re-register restarts `revision`
+        // at 1, and without this rotation such a client would
+        // silently observe the counter decrease.
+        if evicted_any {
+            inner.epoch = mint_epoch();
         }
     }
 }
@@ -1515,6 +1537,109 @@ mod tests {
         let page = store.deltas_since_with_revision(current, 1024);
         assert!(!page.reset_required);
         assert!(page.entries.is_empty());
+    }
+
+    /// H9 round-8 finding 1: the store rotates its `epoch` on
+    /// every stale-cap eviction. Eviction discards the per-slot
+    /// `revision` counter, so a subsequent re-register of the
+    /// same `(device, capability)` would silently reset the
+    /// per-key monotonic counter for any client whose cursor
+    /// was above `evicted_through_revision`. Epoch rotation
+    /// forces every client to re-snapshot instead.
+    #[test]
+    fn stale_cap_eviction_rotates_epoch() {
+        let store = DeviceStateStore::new();
+        let epoch_before = store.epoch();
+        let overflow = 8;
+        for i in 0..MAX_STALE_ENTRIES + overflow {
+            store.apply_delta(
+                format!("dev-{i}"),
+                "alpha".into(),
+                "switch".into(),
+                Vec::new(),
+                0,
+                0,
+            );
+        }
+        // No eviction yet — everything is Fresh.
+        assert_eq!(store.epoch(), epoch_before);
+        store.mark_instance_stale("alpha");
+        // The stale sweep exceeded MAX_STALE_ENTRIES → cap fired
+        // → eviction → epoch rotated.
+        let epoch_after = store.epoch();
+        assert_ne!(
+            epoch_after, epoch_before,
+            "epoch must rotate when eviction discards revision history",
+        );
+        assert!(epoch_after.starts_with("epoch-"));
+
+        // A read below with the pre-eviction epoch also flags
+        // reset_required, so a client that persisted only the
+        // epoch (not the cursor) still resyncs correctly.
+        let page = store.deltas_since_with_revision(store.current_revision(), 8);
+        assert_eq!(page.epoch, epoch_after);
+    }
+
+    /// H9 round-8 finding 1: after eviction discards a slot, if
+    /// the same `(device, capability)` re-registers, its per-key
+    /// `revision` restarts at 1. A client persisting only the
+    /// per-key counter would silently see it go backward; the
+    /// epoch rotation on eviction forces a resync before that
+    /// can happen. The test locates a device that eviction
+    /// actually removed (`mark_instance_stale` iterates
+    /// HashMap-ordered, so we can't hard-code which one), then
+    /// verifies re-registration restarts at revision 1 and the
+    /// epoch has rotated away from the pre-eviction value.
+    #[test]
+    fn re_register_after_eviction_resets_per_key_revision_but_rotates_epoch() {
+        let store = DeviceStateStore::new();
+        let epoch_before = store.epoch();
+
+        // Overflow with a burst of unique slots + mark all stale.
+        let overflow = 64;
+        for i in 0..MAX_STALE_ENTRIES + overflow {
+            store.apply_delta(
+                format!("dev-{i}"),
+                "alpha".into(),
+                "switch".into(),
+                Vec::new(),
+                0,
+                0,
+            );
+        }
+        store.mark_instance_stale("alpha");
+
+        // Eviction happened → epoch rotated.
+        assert_ne!(store.epoch(), epoch_before);
+
+        // Find a device that was evicted (its snapshot is empty).
+        let evicted_id = (0..MAX_STALE_ENTRIES + overflow)
+            .map(|i| format!("dev-{i}"))
+            .find(|id| store.snapshot_device(id).is_empty())
+            .expect("stale-cap eviction removed at least one device");
+
+        // Re-register it — the per-key counter restarts at 1
+        // because eviction discarded the prior slot.
+        store.replace_snapshot(
+            evicted_id.clone(),
+            "alpha".into(),
+            "switch".into(),
+            Vec::new(),
+            0,
+            0,
+        );
+        let post_rev = store
+            .snapshot_device(&evicted_id)
+            .first()
+            .map(|e| e.revision)
+            .expect("re-registered device present");
+        assert_eq!(
+            post_rev, 1,
+            "per-key revision resets after eviction; contract requires epoch rotation to signal it",
+        );
+        // A client comparing epochs already observed the rotation
+        // before it could see the counter decrease.
+        assert_ne!(store.epoch(), epoch_before);
     }
 
     /// H9 round-6 finding 1: `deltas_since_with_revision` returns

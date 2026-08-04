@@ -329,8 +329,15 @@ struct DeviceStateEntry {
     device_id: String,
     capability: String,
     fields: Vec<WireKeyValue>,
-    /// Per-`(device, capability)` monotonic counter. Independent
-    /// of `global_revision` — bumps only when *this* slot changes.
+    /// Per-`(device, capability)` monotonic counter — **within
+    /// one `epoch`**. Independent of `global_revision`; bumps
+    /// only when *this* slot changes. Round-8 finding 1: the
+    /// per-key counter resets to 1 if the slot's `Stale` entry
+    /// was evicted (see `MAX_STALE_ENTRIES`) and the same key
+    /// is re-registered; the store rotates its `epoch` on any
+    /// eviction, so a client that persists both `epoch` and
+    /// `entry_revision` sees the epoch change and re-snapshots
+    /// before it can observe the counter decrease.
     entry_revision: u64,
     /// Store-wide revision at write time. Compare with the
     /// caller's cursor to decide which entries are new.
