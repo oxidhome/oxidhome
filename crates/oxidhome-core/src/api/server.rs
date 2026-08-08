@@ -33,9 +33,9 @@ use crate::state::{
 
 use super::auth::{AuthState, require_token};
 use super::scopes::{
-    AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
-    PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, ScopeDenied,
-    require_scope,
+    AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ, EVENTS_READ, EVENTS_TAIL,
+    INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP,
+    PLUGINS_UNINSTALL, ScopeDenied, require_scope,
 };
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
@@ -76,6 +76,12 @@ pub fn build_router(engine: Engine) -> Router {
     let authenticated: Router<ApiState> = Router::new()
         .route("/api/v1/instances", get(list_instances))
         .route("/api/v1/devices", get(list_devices))
+        .route(
+            "/api/v1/devices/state/changes",
+            get(query_device_state_changes),
+        )
+        .route("/api/v1/devices/state", get(get_all_device_state))
+        .route("/api/v1/devices/{device_id}/state", get(get_device_state))
         .route("/api/v1/devices/{device_id}/command", post(send_command))
         .route("/api/v1/plugins", get(list_plugins).post(install_plugin))
         .route(
@@ -282,6 +288,319 @@ async fn list_devices(
         })
         .collect();
     Ok(Json(DevicesBody { devices }))
+}
+
+// ── Device state (H9 host-owned projection) ──────────────────────
+
+/// JSON snapshot of one device's current per-capability state.
+/// Returned by `GET /api/v1/devices/{device_id}/state`. `revision`
+/// is the store-wide monotonic value at the moment of the read
+/// (read atomically with `capabilities` under one lock — no entry
+/// in the response has `global_revision > revision`). Callers pair
+/// `{revision, capabilities}` with a subsequent
+/// `GET /api/v1/devices/state/changes?since_revision=<revision>`
+/// call to observe the **latest per-slot value** for slots that
+/// changed after the snapshot. See the `state/changes` docs for
+/// the coalescing semantics — this is a materialized-state view,
+/// not an append-only event stream.
+#[derive(Serialize)]
+struct DeviceStateSnapshot {
+    device_id: String,
+    /// H9 round-6 finding 1: opaque store epoch. Clients
+    /// persist this alongside `revision`; a subsequent response
+    /// carrying a different `epoch` means the daemon restarted
+    /// (the projection is in-memory), the previously-held
+    /// `revision` cursor is invalid, and the client should
+    /// resync by re-fetching this endpoint. Round-7 finding 2:
+    /// serialized as a string (128-bit OS-random nonce, hex)
+    /// so JavaScript clients can compare it losslessly.
+    epoch: String,
+    /// Store-wide monotonic revision at read time. Even if this
+    /// device has no observed state yet (empty `capabilities`),
+    /// the revision is meaningful for driving the `changes`
+    /// cursor forward.
+    revision: u64,
+    capabilities: Vec<DeviceStateEntry>,
+}
+
+/// One entry in the snapshot or changes response — same shape both
+/// places so a client's decoder is reusable.
+#[derive(Serialize)]
+struct DeviceStateEntry {
+    device_id: String,
+    capability: String,
+    fields: Vec<WireKeyValue>,
+    /// Store-wide revision at write time. Compare with the
+    /// caller's cursor to decide which entries are new — this
+    /// is the **only** ordering axis. H9 round-9 finding 1
+    /// removed the per-key `entry_revision`: preserving it
+    /// across stale-cap eviction would either grow the store
+    /// unboundedly with tombstones or force a global epoch
+    /// rotation on every eviction — a `DoS` vector where one
+    /// plugin churning unique `local_id`s could trigger a
+    /// process-wide resync for every API client.
+    global_revision: u64,
+    /// Host wall-clock (ms since epoch) when the update was
+    /// applied. Trusted for ordering; `observed_ms` isn't.
+    received_ms: i64,
+    /// Plugin-supplied observed-at timestamp (from
+    /// `event.timestamp`). Informational — the plugin's clock,
+    /// not the host's.
+    observed_ms: u64,
+    /// Supervisor generation of the owning instance at write time.
+    /// Bumps on each restart; a jump means a re-init sequence.
+    source_generation: u64,
+    /// `"fresh"` while the owning instance is alive; `"stale"`
+    /// after it stops. Safety-critical consumers filter on this.
+    quality: crate::state::StateQuality,
+}
+
+impl DeviceStateEntry {
+    fn from_state(state: &crate::state::DeviceState) -> Self {
+        Self {
+            device_id: state.device_id.clone(),
+            capability: state.capability.clone(),
+            fields: state
+                .fields
+                .iter()
+                .map(|kv| WireKeyValue {
+                    key: kv.key.clone(),
+                    value: kv.value.clone().into(),
+                })
+                .collect(),
+            global_revision: state.global_revision,
+            received_ms: state.received_ms,
+            observed_ms: state.observed_ms,
+            source_generation: state.source_generation,
+            quality: state.quality,
+        }
+    }
+}
+
+/// H9 `GET /api/v1/devices/{device_id}/state`. Returns the current
+/// state of every capability observed on `device_id`. `capabilities`
+/// is empty when the device has never published a `state-changed`
+/// and had no `initial_state` on registration — the response still
+/// carries the current store-wide `revision` so the client can
+/// drive the changes cursor forward.
+///
+/// **Not owner-scoped** — the state projection is a host-owned
+/// aggregate meant for API / UI / MCP consumers, not the plugin
+/// world. Gated on `devices:read`.
+///
+/// # Errors
+/// - `403` scope check failed.
+async fn get_device_state(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(device_id): Path<String>,
+) -> Result<Json<DeviceStateSnapshot>, ScopeDenied> {
+    require_scope(&actor, DEVICES_READ)?;
+    // H9 round-3 finding 3: read `revision` and `entries` **under
+    // one lock**. The pre-fix shape called `current_revision()`
+    // then `snapshot_device()` in two separate lock acquires, so
+    // a writer in between could commit an entry with
+    // `global_revision > revision` — the response then carried a
+    // per-entry revision above the top-level one, contradicting
+    // the documented `M ≤ N` invariant.
+    let (epoch, revision, entries) = state
+        .engine
+        .device_state()
+        .snapshot_device_with_revision(&device_id);
+    let mut capabilities: Vec<DeviceStateEntry> = entries
+        .iter()
+        .map(|s| DeviceStateEntry::from_state(s))
+        .collect();
+    // Deterministic ordering so a client can eyeball snapshots.
+    capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
+    Ok(Json(DeviceStateSnapshot {
+        device_id,
+        epoch,
+        revision,
+        capabilities,
+    }))
+}
+
+/// Body of `GET /api/v1/devices/state`. Same shape as
+/// [`DeviceStateSnapshot`] but returns entries across every
+/// device — the resync primitive a client falls back on after
+/// `reset_required` (H9 round-10 finding 2).
+#[derive(Serialize)]
+struct AllDevicesStateSnapshot {
+    /// See [`DeviceStateSnapshot::epoch`].
+    epoch: String,
+    /// Store-wide revision at read time — the value a resyncing
+    /// client sets as its next `since_revision` cursor.
+    revision: u64,
+    /// Every entry in the projection, grouped by device.
+    devices: Vec<DeviceStateSnapshot>,
+}
+
+/// H9 round-10 finding 2: `GET /api/v1/devices/state`. Atomic
+/// full-store snapshot for `reset_required` recovery. When
+/// [`StateChangesBody::reset_required`] is `true` (cursor
+/// beyond current revision after a daemon restart, or below
+/// the store's stale-eviction watermark), the caller has no
+/// way to know which per-device snapshots to fetch — device
+/// enumeration lives behind the separate `devices:list` scope
+/// and the reset itself may have dropped device IDs from the
+/// client's cache. This endpoint is the single-round-trip
+/// resync path, gated on `devices:read` (same scope as the
+/// per-device snapshot and cursor endpoints), and read under
+/// one lock so `revision` + entries are consistent.
+///
+/// # Errors
+/// - `403` scope check failed.
+async fn get_all_device_state(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+) -> Result<Json<AllDevicesStateSnapshot>, ScopeDenied> {
+    require_scope(&actor, DEVICES_READ)?;
+    let (epoch, revision, entries) = state.engine.device_state().snapshot_all_with_revision();
+    let mut by_device: std::collections::BTreeMap<String, Vec<DeviceStateEntry>> =
+        std::collections::BTreeMap::new();
+    for state in &entries {
+        by_device
+            .entry(state.device_id.clone())
+            .or_default()
+            .push(DeviceStateEntry::from_state(state));
+    }
+    let devices: Vec<DeviceStateSnapshot> = by_device
+        .into_iter()
+        .map(|(device_id, mut capabilities)| {
+            capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
+            DeviceStateSnapshot {
+                device_id,
+                epoch: epoch.clone(),
+                revision,
+                capabilities,
+            }
+        })
+        .collect();
+    Ok(Json(AllDevicesStateSnapshot {
+        epoch,
+        revision,
+        devices,
+    }))
+}
+
+/// `GET /api/v1/devices/state/changes` query params. Cursor-based
+/// catch-up over the H9 state projection.
+///
+/// **Materialized view, not an append-only stream.** The projection
+/// stores one entry per `(device_id, capability)`; a slot that
+/// updates multiple times between polls is **coalesced** to the
+/// latest value at read time, and the intermediate `global_revision`
+/// values do not appear in any `state/changes` response. A caller
+/// that needs every historical transition reads the full event log
+/// (`GET /api/v1/events`) instead — the projection is the "current
+/// value per slot" view. Consequence: `current_revision` can exceed
+/// the highest `global_revision` in `changes` even when nothing has
+/// been dropped.
+#[derive(Deserialize)]
+struct StateChangesParams {
+    /// Return only entries with `global_revision > since_revision`.
+    /// Absent ⇒ start from the beginning (revision 0), useful for
+    /// the initial full-history sync.
+    #[serde(default)]
+    since_revision: Option<u64>,
+    /// Cap on returned entries. Absent / 0 ⇒ default of 256.
+    /// The store returns the earliest deltas first so the caller
+    /// can page forward: take the highest `global_revision` in the
+    /// response as the next call's `since_revision`.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// JSON body for `GET /api/v1/devices/state/changes`.
+/// `current_revision` is the store-wide value at read time (read
+/// atomically with `changes` under one lock — no entry in the
+/// response has `global_revision > current_revision`). Callers
+/// advance their cursor by taking the highest `global_revision` in
+/// `changes`; the response reflects each slot's coalesced latest
+/// value, not its history (see [`StateChangesParams`]). Empty
+/// `changes` with `current_revision > since_revision` just means
+/// every changed slot's latest value is within the current page —
+/// advance and re-poll.
+///
+/// H9 round-6 finding 1: `epoch` is the store's opaque
+/// process-scoped nonce; a client that persists the last-seen
+/// epoch and observes a change knows the daemon restarted, the
+/// in-memory projection reset, and its cursor is invalid. As a
+/// belt-and-suspenders check, `reset_required` is `true` when
+/// `since_revision > current_revision` (typical after a
+/// restart drops the store back to 0) — the client discards
+/// its cursor and re-fetches the snapshot.
+#[derive(Serialize)]
+struct StateChangesBody {
+    /// See [`DeviceStateSnapshot::epoch`] — 128-bit OS-random
+    /// nonce, string-encoded (round-7 finding 2).
+    epoch: String,
+    current_revision: u64,
+    changes: Vec<DeviceStateEntry>,
+    /// True when the caller's cursor is invalid — either it's
+    /// beyond the store's current revision (typical after a
+    /// daemon restart drops the store back to 0), or it's below
+    /// the store's `evicted_through_revision` watermark (an
+    /// evicted stale slot may have been the client's last
+    /// chance to observe a `Fresh → Stale` flip). Recovery:
+    /// fetch `GET /api/v1/devices/state` for an atomic
+    /// all-device snapshot (H9 round-10 finding 2), take the
+    /// returned `revision` as the new cursor, and resume
+    /// polling. Serialized unconditionally so a client can
+    /// `if body.reset_required { ... }` without checking for
+    /// absence.
+    reset_required: bool,
+}
+
+/// Default page size for `state/changes`. Chosen to comfortably
+/// carry the initial-sync case (a few dozen devices × a few
+/// capabilities each) in one round-trip, while capping the
+/// worst-case JSON body for a caller that forgets to send `limit`.
+const DEFAULT_STATE_CHANGES_LIMIT: usize = 256;
+/// Hard ceiling — a caller can't push the page past this even if
+/// they explicitly ask.
+const MAX_STATE_CHANGES_LIMIT: usize = 1024;
+
+/// H9 `GET /api/v1/devices/state/changes`. Cursor-based catch-up.
+/// See [`StateChangesParams`] for the parameter shapes and the
+/// paging rule.
+///
+/// # Errors
+/// - `403` scope check failed.
+async fn query_device_state_changes(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Query(params): Query<StateChangesParams>,
+) -> Result<Json<StateChangesBody>, ScopeDenied> {
+    require_scope(&actor, DEVICES_READ)?;
+    let limit = params
+        .limit
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_STATE_CHANGES_LIMIT)
+        .min(MAX_STATE_CHANGES_LIMIT);
+    let since = params.since_revision.unwrap_or(0);
+    // H9 round-3 finding 3: read `current_revision` and `deltas`
+    // **under one lock** — see the sibling comment on
+    // `get_device_state` for the invariant.
+    // H9 round-6 finding 1: the store now returns a `DeltaPage`
+    // carrying `epoch` + `reset_required` so the client can
+    // detect a daemon restart and resync.
+    let page = state
+        .engine
+        .device_state()
+        .deltas_since_with_revision(since, limit);
+    let changes: Vec<DeviceStateEntry> = page
+        .entries
+        .iter()
+        .map(|s| DeviceStateEntry::from_state(s))
+        .collect();
+    Ok(Json(StateChangesBody {
+        epoch: page.epoch,
+        current_revision: page.current_revision,
+        changes,
+        reset_required: page.reset_required,
+    }))
 }
 
 // ── Device command (write path) ──────────────────────────────────
