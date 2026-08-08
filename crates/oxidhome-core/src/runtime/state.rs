@@ -737,36 +737,28 @@ impl host_devices::Host for PluginState {
         // move into `register` — need them for state seeding /
         // reconciliation.
         let seed_state = seed_state_from_initial(&info);
-        let live_capabilities: Vec<String> =
-            info.capabilities.iter().map(capability_name).collect();
         let id = self
             .devices
             .register(&self.installation_uuid, self.instance_id.clone(), info);
-        // H9 round-2 finding 3: the stable device-id derivation
-        // can resurrect the same id from a prior life. Reconcile
-        // any pre-existing entries against the current
-        // capabilities list so an omitted capability doesn't
-        // linger as `Fresh`.
-        self.device_state
-            .reconcile_capabilities(&id, &live_capabilities);
         let received_ms = crate::state::event_log::now_unix_ms();
-        for (capability, fields) in seed_state {
-            // H9 round-3 finding 1: `initial_state` is a **snapshot**
-            // (the plugin's authoritative state at register time),
-            // not a partial delta. `replace_snapshot` overwrites the
-            // slot rather than merging so a re-registration that
-            // omits a field (e.g. `color_temp_kelvin`) actually
-            // clears the previously-observed value — the documented
-            // remove-and-re-register deletion procedure now works.
-            self.device_state.replace_snapshot(
-                id.clone(),
-                self.instance_id.clone(),
-                capability,
-                fields,
-                0, // observed_ms — plugin didn't attach one for register-time state
-                received_ms,
-            );
-        }
+        // H9 round-10 finding 1: atomically flip every pre-existing
+        // `Fresh` entry for this stable device-id to `Stale`, then
+        // seed the current registration's `initial_state`. Handles
+        // three cases in one lock:
+        //   * capability removed — flipped stale, not re-seeded
+        //   * capability retained, seeded — re-appears Fresh
+        //   * capability retained, NOT seeded — stays Stale until
+        //     the plugin publishes a `state-change`, matching the
+        //     "empty initial_state means state arrives later"
+        //     contract. Pre-fix, that last case silently retained
+        //     the pre-restart value as Fresh.
+        self.device_state.reset_and_seed_device(
+            &id,
+            &self.instance_id,
+            seed_state,
+            0, // observed_ms — plugin didn't attach one for register-time state
+            received_ms,
+        );
         tracing::debug!(
             instance_id = %self.instance_id,
             device_id = %id,

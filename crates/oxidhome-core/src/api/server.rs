@@ -80,6 +80,7 @@ pub fn build_router(engine: Engine) -> Router {
             "/api/v1/devices/state/changes",
             get(query_device_state_changes),
         )
+        .route("/api/v1/devices/state", get(get_all_device_state))
         .route("/api/v1/devices/{device_id}/state", get(get_device_state))
         .route("/api/v1/devices/{device_id}/command", post(send_command))
         .route("/api/v1/plugins", get(list_plugins).post(install_plugin))
@@ -420,6 +421,69 @@ async fn get_device_state(
     }))
 }
 
+/// Body of `GET /api/v1/devices/state`. Same shape as
+/// [`DeviceStateSnapshot`] but returns entries across every
+/// device — the resync primitive a client falls back on after
+/// `reset_required` (H9 round-10 finding 2).
+#[derive(Serialize)]
+struct AllDevicesStateSnapshot {
+    /// See [`DeviceStateSnapshot::epoch`].
+    epoch: String,
+    /// Store-wide revision at read time — the value a resyncing
+    /// client sets as its next `since_revision` cursor.
+    revision: u64,
+    /// Every entry in the projection, grouped by device.
+    devices: Vec<DeviceStateSnapshot>,
+}
+
+/// H9 round-10 finding 2: `GET /api/v1/devices/state`. Atomic
+/// full-store snapshot for `reset_required` recovery. When
+/// [`StateChangesBody::reset_required`] is `true` (cursor
+/// beyond current revision after a daemon restart, or below
+/// the store's stale-eviction watermark), the caller has no
+/// way to know which per-device snapshots to fetch — device
+/// enumeration lives behind the separate `devices:list` scope
+/// and the reset itself may have dropped device IDs from the
+/// client's cache. This endpoint is the single-round-trip
+/// resync path, gated on `devices:read` (same scope as the
+/// per-device snapshot and cursor endpoints), and read under
+/// one lock so `revision` + entries are consistent.
+///
+/// # Errors
+/// - `403` scope check failed.
+async fn get_all_device_state(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+) -> Result<Json<AllDevicesStateSnapshot>, ScopeDenied> {
+    require_scope(&actor, DEVICES_READ)?;
+    let (epoch, revision, entries) = state.engine.device_state().snapshot_all_with_revision();
+    let mut by_device: std::collections::BTreeMap<String, Vec<DeviceStateEntry>> =
+        std::collections::BTreeMap::new();
+    for state in &entries {
+        by_device
+            .entry(state.device_id.clone())
+            .or_default()
+            .push(DeviceStateEntry::from_state(state));
+    }
+    let devices: Vec<DeviceStateSnapshot> = by_device
+        .into_iter()
+        .map(|(device_id, mut capabilities)| {
+            capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
+            DeviceStateSnapshot {
+                device_id,
+                epoch: epoch.clone(),
+                revision,
+                capabilities,
+            }
+        })
+        .collect();
+    Ok(Json(AllDevicesStateSnapshot {
+        epoch,
+        revision,
+        devices,
+    }))
+}
+
 /// `GET /api/v1/devices/state/changes` query params. Cursor-based
 /// catch-up over the H9 state projection.
 ///
@@ -479,8 +543,11 @@ struct StateChangesBody {
     /// daemon restart drops the store back to 0), or it's below
     /// the store's `evicted_through_revision` watermark (an
     /// evicted stale slot may have been the client's last
-    /// chance to observe a `Fresh → Stale` flip). Serialized
-    /// unconditionally so a client can
+    /// chance to observe a `Fresh → Stale` flip). Recovery:
+    /// fetch `GET /api/v1/devices/state` for an atomic
+    /// all-device snapshot (H9 round-10 finding 2), take the
+    /// returned `revision` as the new cursor, and resume
+    /// polling. Serialized unconditionally so a client can
     /// `if body.reset_required { ... }` without checking for
     /// absence.
     reset_required: bool,

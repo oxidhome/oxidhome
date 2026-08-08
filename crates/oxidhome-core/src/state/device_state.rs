@@ -491,6 +491,24 @@ impl DeviceStateStore {
         (inner.epoch.clone(), inner.global_revision, entries)
     }
 
+    /// H9 round-10 finding 2: atomic full-store snapshot for
+    /// `reset_required` recovery. Returns
+    /// `(epoch, current_revision, entries)` — every entry across
+    /// every device, under one read lock. The pre-existing
+    /// snapshot API was per-device; a `devices:read`-scoped
+    /// client hit by a cursor reset had no way to enumerate
+    /// devices to resync (that took a separate `devices:list`
+    /// scope) and could still miss a device the reset dropped
+    /// from its cache. This method is the resync primitive
+    /// [`super::super::api::server`] exposes as
+    /// `GET /api/v1/devices/state`.
+    #[must_use]
+    pub fn snapshot_all_with_revision(&self) -> (String, u64, Vec<Arc<DeviceState>>) {
+        let inner = self.inner_read();
+        let entries: Vec<Arc<DeviceState>> = inner.entries.values().map(Arc::clone).collect();
+        (inner.epoch.clone(), inner.global_revision, entries)
+    }
+
     /// Snapshot a single `(device, capability)` slot.
     #[must_use]
     pub fn snapshot_capability(
@@ -600,10 +618,11 @@ impl DeviceStateStore {
     /// H9 round-2 finding 3: mark every entry for `device_id` as
     /// `Stale`. Called from `remove-device` — the device is gone,
     /// so its projection entries must not continue to advertise
-    /// as `Fresh`. Also called from `register-device` before
-    /// seeding, so any pre-existing entries from a prior life of
-    /// the same stable id start `Stale` and are re-initialized
-    /// only for the capabilities the current registration declares.
+    /// as `Fresh`. `register-device` uses
+    /// [`Self::reset_and_seed_device`] instead: it needs the
+    /// same stale-sweep, but atomically paired with the initial
+    /// seed so a reader can't observe a "gone-then-back with
+    /// old values" transient (H9 round-10 finding 1).
     ///
     /// Returns the number of entries flipped.
     pub fn mark_device_stale(&self, device_id: &str) -> usize {
@@ -613,10 +632,11 @@ impl DeviceStateStore {
     /// H9 round-2 finding 3: reconcile the projection with a
     /// `DeviceInfo.capabilities` list — flip any entry whose
     /// `capability` isn't in `live_capabilities` to `Stale`.
-    /// Called from `register-device` and `update-device` so a
-    /// device that dropped a capability (or re-registered with a
-    /// narrower spec list) doesn't leave the old entries
-    /// advertising as `Fresh` under the same stable id.
+    /// Called from `update-device` — an update narrows the
+    /// declared capabilities but doesn't necessarily reset the
+    /// retained ones. See [`Self::reset_and_seed_device`] for
+    /// the register-device path (which flips *everything* and
+    /// re-seeds atomically).
     ///
     /// Returns the number of entries flipped.
     pub fn reconcile_capabilities(&self, device_id: &str, live_capabilities: &[String]) -> usize {
@@ -625,6 +645,61 @@ impl DeviceStateStore {
                 && entry.quality == StateQuality::Fresh
                 && !live_capabilities.iter().any(|live| live == cap)
         })
+    }
+
+    /// H9 round-10 finding 1: atomic register-device reset +
+    /// seed. Under a single write lock: (1) flip every `Fresh`
+    /// entry for `device_id` to `Stale` (bumping revisions and
+    /// `received_ms` on each flip), then (2) write each
+    /// `(capability, fields)` from `initial_state` back as a
+    /// fresh snapshot. Concurrent readers observe either the
+    /// pre-reset state or the fully-reset+seeded state — never
+    /// a mix. Any capability the caller declares but doesn't
+    /// seed stays `Stale` until a subsequent `state-change`
+    /// arrives — the desired behavior for a re-registration
+    /// with empty `initial_state`.
+    ///
+    /// Pre-fix, register-device called `reconcile_capabilities`
+    /// (which only flips *removed* capabilities) then looped
+    /// `replace_snapshot` per seed entry. A re-register of the
+    /// same stable id with the same capability list but empty
+    /// `initial_state` left every previous entry untouched and
+    /// `Fresh`, silently retaining pre-restart values as
+    /// authoritative — the exact H9 problem the store exists
+    /// to solve.
+    pub fn reset_and_seed_device(
+        &self,
+        device_id: &DeviceId,
+        owner_instance: &str,
+        initial_state: Vec<(String, Vec<KeyValue>)>,
+        observed_ms: u64,
+        received_ms: i64,
+    ) {
+        let mut inner = self.inner_write();
+        // (1) Flip every Fresh entry for device_id to Stale.
+        Self::stale_where_locked(&mut inner, received_ms, |(did, _), entry| {
+            did == device_id && entry.quality == StateQuality::Fresh
+        });
+        // (2) Seed each capability. Same generation lookup shape
+        // as `write_entry` so post-restart writes stamp the right
+        // generation onto the reseeded slots.
+        let generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
+        for (capability, fields) in initial_state {
+            let global_revision = inner.next_revision();
+            let key = (device_id.clone(), capability.clone());
+            let entry = Arc::new(DeviceState {
+                device_id: device_id.clone(),
+                capability,
+                fields,
+                global_revision,
+                received_ms,
+                observed_ms,
+                source_generation: generation,
+                owner_instance: owner_instance.to_string(),
+                quality: StateQuality::Fresh,
+            });
+            inner.entries.insert(key, entry);
+        }
     }
 
     /// Round-4 finding 2 helper: flip every `Fresh` entry matching

@@ -4178,6 +4178,135 @@ async fn devices_state_mark_device_stale_bumps_revision_and_flips_all_caps() {
     }
 }
 
+/// H9 round-10 finding 2: `GET /api/v1/devices/state` returns an
+/// atomic all-device snapshot with `epoch` + `revision`, so a
+/// client that hit `reset_required` can resync in one round-trip
+/// on the `devices:read` scope alone — no `devices:list` needed.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_returns_every_device_atomically() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    for i in 0..3 {
+        store.apply_delta(
+            format!("dev-{i}"),
+            "alpha".into(),
+            "switch".into(),
+            vec![KeyValue {
+                key: "state".into(),
+                value: Value::BoolVal(i % 2 == 0),
+            }],
+            0,
+            0,
+        );
+    }
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert!(body["epoch"].as_str().unwrap().starts_with("epoch-"));
+    assert_eq!(body["revision"].as_u64().unwrap(), 3);
+    let devices = body["devices"].as_array().expect("devices");
+    assert_eq!(devices.len(), 3);
+    let device_ids: Vec<&str> = devices
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(device_ids, ["dev-0", "dev-1", "dev-2"]);
+    for device in devices {
+        let caps = device["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0]["capability"], "switch");
+    }
+}
+
+/// H9 round-10 finding 2: `GET /api/v1/devices/state` requires
+/// `devices:read` — not `devices:list`. A `devices:list`-only
+/// token gets 403.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_requires_devices_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let lister = engine
+        .auth_tokens()
+        .create("lister", b"[\"devices:list\"]")
+        .unwrap();
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", lister.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// H9 round-10 finding 1: register-device runs an atomic
+/// reset-and-seed. Re-registering the same stable id with the
+/// same capability but empty `initial_state` must flip the
+/// prior entry to `Stale` — pre-fix, the old value stayed
+/// `Fresh` forever because `reconcile_capabilities` only
+/// touched *removed* capabilities.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_re_register_with_empty_initial_state_flips_prior_entry_stale() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let store = engine.device_state();
+    // First registration seeded a Fresh value.
+    store.reset_and_seed_device(
+        &"dev-1".into(),
+        "alpha",
+        vec![(
+            "switch".into(),
+            vec![KeyValue {
+                key: "state".into(),
+                value: Value::BoolVal(true),
+            }],
+        )],
+        0,
+        1,
+    );
+    assert_eq!(
+        store
+            .snapshot_capability("dev-1", "switch")
+            .unwrap()
+            .quality,
+        oxidhome_core::state::StateQuality::Fresh
+    );
+
+    // Re-register the same id with the same capability but no
+    // initial_state — atomic reset flips the prior entry stale.
+    store.reset_and_seed_device(&"dev-1".into(), "alpha", Vec::new(), 0, 2);
+    let entry = store
+        .snapshot_capability("dev-1", "switch")
+        .expect("entry present as Stale");
+    assert_eq!(entry.quality, oxidhome_core::state::StateQuality::Stale);
+}
+
 /// H9 round-2 finding 3: `reconcile_capabilities` flips entries
 /// whose capability was dropped, keeps entries whose capability
 /// is still declared.
