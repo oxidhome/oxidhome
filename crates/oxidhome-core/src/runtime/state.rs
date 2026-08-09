@@ -682,6 +682,34 @@ fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
 /// the most useful existing variant rather than reaching for a new
 /// WIT error today.
 fn authorize_device_info(declared: &[String], info: &DeviceInfo) -> Result<(), WitError> {
+    // H9 round-11 finding 2: WIT contract is one entry per
+    // stateful capability. Duplicates in either list are
+    // rejected up front — pre-fix, two `Switch` entries in
+    // `initial_state` silently hit the same projection key and
+    // the last-written value won, producing non-deterministic
+    // canonical state. Same story for two `Switch` entries in
+    // `capabilities`: `reset_and_seed_device` sees the key
+    // once but the reconciliation semantics get muddled.
+    let mut seen_caps: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for spec in &info.capabilities {
+        let name = capability_name(spec);
+        if !seen_caps.insert(name.clone()) {
+            return Err(WitError::InvalidArgument(format!(
+                "capability `{name}` appears more than once in `DeviceInfo.capabilities` \
+                 (the WIT contract is one spec per capability)"
+            )));
+        }
+    }
+    let mut seen_state: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for state in &info.initial_state {
+        let name = capability_state_name(state);
+        if !seen_state.insert(name) {
+            return Err(WitError::InvalidArgument(format!(
+                "initial_state contains multiple `{name}` entries (the WIT contract is \
+                 one entry per stateful capability)"
+            )));
+        }
+    }
     for state in &info.initial_state {
         let name = capability_state_name(state);
         if !info
@@ -705,6 +733,63 @@ fn authorize_device_info(declared: &[String], info: &DeviceInfo) -> Result<(), W
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod authorize_device_info_tests {
+    use super::*;
+    use crate::host_impl::plugin::oxidhome::plugin::capabilities;
+
+    fn info(
+        caps: Vec<capabilities::CapabilitySpec>,
+        state: Vec<capabilities::CapabilityState>,
+    ) -> DeviceInfo {
+        DeviceInfo {
+            local_id: "d".into(),
+            name: "d".into(),
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            capabilities: caps,
+            initial_state: state,
+            metadata: Vec::new(),
+        }
+    }
+
+    /// H9 round-11 finding 2: two `Switch` entries in
+    /// `capabilities` are rejected up front. Pre-fix the second
+    /// spec was silently accepted.
+    #[test]
+    fn rejects_duplicate_capability_spec() {
+        let declared = vec!["switch".to_string()];
+        let d = info(
+            vec![
+                capabilities::CapabilitySpec::Switch,
+                capabilities::CapabilitySpec::Switch,
+            ],
+            Vec::new(),
+        );
+        let err = authorize_device_info(&declared, &d).unwrap_err();
+        assert!(matches!(err, WitError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    /// H9 round-11 finding 2: two `Switch` entries in
+    /// `initial_state` are rejected. Pre-fix both hit the same
+    /// projection key sequentially and the second silently
+    /// overwrote the first.
+    #[test]
+    fn rejects_duplicate_initial_state_entry() {
+        let declared = vec!["switch".to_string()];
+        let d = info(
+            vec![capabilities::CapabilitySpec::Switch],
+            vec![
+                capabilities::CapabilityState::Switch(capabilities::Switchable { state: true }),
+                capabilities::CapabilityState::Switch(capabilities::Switchable { state: false }),
+            ],
+        );
+        let err = authorize_device_info(&declared, &d).unwrap_err();
+        assert!(matches!(err, WitError::InvalidArgument(_)), "got {err:?}");
+    }
 }
 
 impl host_devices::Host for PluginState {
@@ -737,9 +822,26 @@ impl host_devices::Host for PluginState {
         // move into `register` — need them for state seeding /
         // reconciliation.
         let seed_state = seed_state_from_initial(&info);
-        let id = self
-            .devices
-            .register(&self.installation_uuid, self.instance_id.clone(), info);
+        // H9 round-11 finding 1: per-instance registration cap
+        // is enforced under the registry's write lock so a
+        // check-then-insert can't overshoot. Refusal returns
+        // `Unavailable` — the plugin can retry after removing
+        // some devices.
+        let id =
+            match self
+                .devices
+                .try_register(&self.installation_uuid, self.instance_id.clone(), info)
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(
+                        instance_id = %self.instance_id,
+                        error = %err,
+                        "register-device denied (per-instance device cap)",
+                    );
+                    return Err(err);
+                }
+            };
         let received_ms = crate::state::event_log::now_unix_ms();
         // H9 round-10 finding 1: atomically flip every pre-existing
         // `Fresh` entry for this stable device-id to `Stale`, then

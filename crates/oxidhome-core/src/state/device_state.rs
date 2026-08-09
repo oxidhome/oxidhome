@@ -491,21 +491,57 @@ impl DeviceStateStore {
         (inner.epoch.clone(), inner.global_revision, entries)
     }
 
-    /// H9 round-10 finding 2: atomic full-store snapshot for
-    /// `reset_required` recovery. Returns
-    /// `(epoch, current_revision, entries)` — every entry across
-    /// every device, under one read lock. The pre-existing
-    /// snapshot API was per-device; a `devices:read`-scoped
-    /// client hit by a cursor reset had no way to enumerate
-    /// devices to resync (that took a separate `devices:list`
-    /// scope) and could still miss a device the reset dropped
-    /// from its cache. This method is the resync primitive
-    /// [`super::super::api::server`] exposes as
-    /// `GET /api/v1/devices/state`.
+    /// H9 round-10 finding 2 / round-11 finding 1: atomic
+    /// full-store snapshot page for `reset_required` recovery.
+    /// Returns every entry whose `device_id > after_device_id`
+    /// (or every entry if `None`), grouped so all capabilities
+    /// for a given device land on the same page, capped at
+    /// `device_limit` distinct devices. Reads `epoch` +
+    /// `global_revision` under the same read lock as the entry
+    /// scan, so the page is internally consistent even if
+    /// writers commit between pages.
+    ///
+    /// Round-11 finding 1 note: the pre-fix `snapshot_all`
+    /// returned every entry in one unpaged allocation; on a
+    /// large store that meant one host-side copy of every
+    /// entry per concurrent request. Paging by *device* (not
+    /// entry) bounds each response and keeps a device's
+    /// capabilities atomic within one page — pagination by
+    /// entry could split a device across two pages, breaking
+    /// the "per-device snapshot is atomic" contract callers
+    /// rely on.
     #[must_use]
-    pub fn snapshot_all_with_revision(&self) -> (String, u64, Vec<Arc<DeviceState>>) {
+    pub fn snapshot_page_with_revision(
+        &self,
+        after_device_id: Option<&str>,
+        device_limit: usize,
+    ) -> (String, u64, Vec<Arc<DeviceState>>) {
         let inner = self.inner_read();
-        let entries: Vec<Arc<DeviceState>> = inner.entries.values().map(Arc::clone).collect();
+        let mut candidates: Vec<Arc<DeviceState>> = inner
+            .entries
+            .iter()
+            .filter(|((did, _), _)| match after_device_id {
+                Some(cursor) => did.as_str() > cursor,
+                None => true,
+            })
+            .map(|(_, m)| Arc::clone(m))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.device_id
+                .cmp(&b.device_id)
+                .then_with(|| a.capability.cmp(&b.capability))
+        });
+        let mut selected_devices: Vec<String> = Vec::new();
+        let mut entries: Vec<Arc<DeviceState>> = Vec::new();
+        for entry in candidates {
+            if selected_devices.last().map(String::as_str) != Some(entry.device_id.as_str()) {
+                if selected_devices.len() >= device_limit {
+                    break;
+                }
+                selected_devices.push(entry.device_id.clone());
+            }
+            entries.push(entry);
+        }
         (inner.epoch.clone(), inner.global_revision, entries)
     }
 

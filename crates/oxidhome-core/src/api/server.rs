@@ -421,6 +421,33 @@ async fn get_device_state(
     }))
 }
 
+/// Query params for `GET /api/v1/devices/state` (H9 round-11
+/// finding 1). Pagination is by *device* — a device's
+/// capabilities all land on the same page so per-device
+/// snapshots stay atomic.
+#[derive(Deserialize)]
+struct AllDevicesStateParams {
+    /// Return only devices whose `device_id > after_device_id`.
+    /// Absent ⇒ start from the beginning. To page forward,
+    /// take the last device's `device_id` from the previous
+    /// response and pass it here.
+    #[serde(default)]
+    after_device_id: Option<String>,
+    /// Cap on distinct devices in the response. Absent / 0 ⇒
+    /// default of 128. Capped at
+    /// [`MAX_ALL_DEVICES_STATE_LIMIT`].
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Default page size for `GET /api/v1/devices/state` — chosen
+/// to comfortably carry a household-sized deployment in one
+/// round-trip while capping the worst-case response body.
+const DEFAULT_ALL_DEVICES_STATE_LIMIT: usize = 128;
+/// Hard ceiling for the same endpoint — a caller can't push
+/// the page past this even if they explicitly ask.
+const MAX_ALL_DEVICES_STATE_LIMIT: usize = 512;
+
 /// Body of `GET /api/v1/devices/state`. Same shape as
 /// [`DeviceStateSnapshot`] but returns entries across every
 /// device — the resync primitive a client falls back on after
@@ -430,42 +457,65 @@ struct AllDevicesStateSnapshot {
     /// See [`DeviceStateSnapshot::epoch`].
     epoch: String,
     /// Store-wide revision at read time — the value a resyncing
-    /// client sets as its next `since_revision` cursor.
+    /// client sets as its next `since_revision` cursor once
+    /// pagination is done.
     revision: u64,
-    /// Every entry in the projection, grouped by device.
+    /// Devices in this page, ordered by `device_id`.
     devices: Vec<DeviceStateSnapshot>,
+    /// H9 round-11 finding 1: cursor for the next page —
+    /// `None` when this page is the final one. The client
+    /// keeps calling with `after_device_id =
+    /// next_after_device_id` until it comes back `None`. All
+    /// pages of one resync should observe the same `epoch`
+    /// (and typically the same `revision`); if the client
+    /// sees the epoch change mid-paging, the store reset and
+    /// the resync must restart from the beginning.
+    next_after_device_id: Option<String>,
 }
 
-/// H9 round-10 finding 2: `GET /api/v1/devices/state`. Atomic
-/// full-store snapshot for `reset_required` recovery. When
+/// H9 round-10 finding 2 / round-11 finding 1:
+/// `GET /api/v1/devices/state`. Paginated atomic full-store
+/// snapshot for `reset_required` recovery. When
 /// [`StateChangesBody::reset_required`] is `true` (cursor
 /// beyond current revision after a daemon restart, or below
 /// the store's stale-eviction watermark), the caller has no
 /// way to know which per-device snapshots to fetch — device
 /// enumeration lives behind the separate `devices:list` scope
 /// and the reset itself may have dropped device IDs from the
-/// client's cache. This endpoint is the single-round-trip
-/// resync path, gated on `devices:read` (same scope as the
-/// per-device snapshot and cursor endpoints), and read under
-/// one lock so `revision` + entries are consistent.
+/// client's cache. This endpoint is the resync path, gated on
+/// `devices:read` (same scope as the per-device snapshot and
+/// cursor endpoints), read under one lock so `revision` +
+/// entries within one page are consistent, and paginated so
+/// one request never allocates the entire store.
 ///
 /// # Errors
 /// - `403` scope check failed.
 async fn get_all_device_state(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
+    Query(params): Query<AllDevicesStateParams>,
 ) -> Result<Json<AllDevicesStateSnapshot>, ScopeDenied> {
     require_scope(&actor, DEVICES_READ)?;
-    let (epoch, revision, entries) = state.engine.device_state().snapshot_all_with_revision();
+    let limit = params
+        .limit
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_ALL_DEVICES_STATE_LIMIT)
+        .min(MAX_ALL_DEVICES_STATE_LIMIT);
+    // Ask for `limit + 1` distinct devices so we can tell
+    // whether another page exists without a second lookup.
+    let (epoch, revision, entries) = state
+        .engine
+        .device_state()
+        .snapshot_page_with_revision(params.after_device_id.as_deref(), limit + 1);
     let mut by_device: std::collections::BTreeMap<String, Vec<DeviceStateEntry>> =
         std::collections::BTreeMap::new();
-    for state in &entries {
+    for entry in &entries {
         by_device
-            .entry(state.device_id.clone())
+            .entry(entry.device_id.clone())
             .or_default()
-            .push(DeviceStateEntry::from_state(state));
+            .push(DeviceStateEntry::from_state(entry));
     }
-    let devices: Vec<DeviceStateSnapshot> = by_device
+    let mut devices: Vec<DeviceStateSnapshot> = by_device
         .into_iter()
         .map(|(device_id, mut capabilities)| {
             capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
@@ -477,10 +527,19 @@ async fn get_all_device_state(
             }
         })
         .collect();
+    let next_after_device_id = if devices.len() > limit {
+        // Drop the sentinel `limit + 1`-th device and hand its
+        // predecessor's id back as the next cursor.
+        devices.truncate(limit);
+        devices.last().map(|d| d.device_id.clone())
+    } else {
+        None
+    };
     Ok(Json(AllDevicesStateSnapshot {
         epoch,
         revision,
         devices,
+        next_after_device_id,
     }))
 }
 

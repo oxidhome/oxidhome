@@ -4235,6 +4235,99 @@ async fn devices_state_full_snapshot_returns_every_device_atomically() {
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0]["capability"], "switch");
     }
+    // H9 round-11 finding 1: single page — no forward cursor.
+    assert!(
+        body.get("next_after_device_id")
+            .and_then(|v| v.as_str())
+            .is_none()
+    );
+}
+
+/// H9 round-11 finding 1: `GET /api/v1/devices/state` pages by
+/// device — `limit` caps distinct devices, a device's
+/// capabilities stay atomic within one page, and
+/// `next_after_device_id` drives forward pagination.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_paginates_by_device_id() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    // Five devices, each with two capabilities.
+    for i in 0..5 {
+        for cap in ["switch", "dimmer"] {
+            store.apply_delta(
+                format!("dev-{i}"),
+                "alpha".into(),
+                (*cap).into(),
+                Vec::new(),
+                0,
+                0,
+            );
+        }
+    }
+
+    let fetch = |uri: &str| {
+        let uri = uri.to_string();
+        let engine = engine.clone();
+        let bearer = reader.plaintext.clone();
+        async move {
+            let response = build_router(engine)
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            body_to_json(response.into_body()).await
+        }
+    };
+
+    let body = fetch("/api/v1/devices/state?limit=2").await;
+    let ids: Vec<String> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["dev-0", "dev-1"]);
+    for device in body["devices"].as_array().unwrap() {
+        assert_eq!(
+            device["capabilities"].as_array().unwrap().len(),
+            2,
+            "a device's capabilities must not split across pages",
+        );
+    }
+    assert_eq!(body["next_after_device_id"].as_str().unwrap(), "dev-1");
+
+    let body = fetch("/api/v1/devices/state?limit=2&after_device_id=dev-1").await;
+    let ids: Vec<String> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["dev-2", "dev-3"]);
+
+    let body = fetch("/api/v1/devices/state?limit=2&after_device_id=dev-3").await;
+    let ids: Vec<String> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["dev-4"]);
+    assert!(
+        body.get("next_after_device_id")
+            .and_then(|v| v.as_str())
+            .is_none()
+    );
 }
 
 /// H9 round-10 finding 2: `GET /api/v1/devices/state` requires
