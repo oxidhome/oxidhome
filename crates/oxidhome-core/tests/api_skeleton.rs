@@ -4235,12 +4235,9 @@ async fn devices_state_full_snapshot_returns_every_device_atomically() {
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0]["capability"], "switch");
     }
-    // H9 round-11 finding 1: single page — no forward cursor.
-    assert!(
-        body.get("next_after_device_id")
-            .and_then(|v| v.as_str())
-            .is_none()
-    );
+    // H9 round-11 finding 1 + round-13 finding 1: single page —
+    // no forward cursor.
+    assert!(body.get("next_cursor").and_then(|v| v.as_str()).is_none());
 }
 
 /// H9 round-12 finding 1: `GET /api/v1/devices/state` pins the
@@ -4292,11 +4289,14 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
         }
     };
 
-    // Page 1: no pin — server returns the current revision.
+    // Page 1: no cursor — server returns the current revision.
     let page1 = fetch("/api/v1/devices/state?limit=2").await;
     let pinned = page1["revision"].as_u64().unwrap();
     assert_eq!(pinned, 4);
-    assert_eq!(page1["next_after_device_id"].as_str().unwrap(), "dev-1");
+    let cursor = page1["next_cursor"]
+        .as_str()
+        .expect("second page's cursor")
+        .to_string();
 
     // Simulate a mutation between pages — new revision on
     // an *already-paged-past* device (dev-0). The naive
@@ -4311,16 +4311,14 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
     );
     assert_eq!(store.current_revision(), 5);
 
-    // Page 2: pass `pinned_revision` back — server echoes it
-    // as `revision`, even though `current_revision` is now 5.
-    let page2 = fetch(&format!(
-        "/api/v1/devices/state?limit=2&after_device_id=dev-1&pinned_revision={pinned}"
-    ))
-    .await;
+    // Page 2: pass the server-issued cursor back. Its embedded
+    // pinned revision (not the store's `current_revision`) is
+    // echoed as `revision`.
+    let page2 = fetch(&format!("/api/v1/devices/state?limit=2&cursor={cursor}")).await;
     assert_eq!(
         page2["revision"].as_u64().unwrap(),
         pinned,
-        "pinned_revision must be echoed so the client's post-resync cursor is the pre-pagination anchor",
+        "pinned revision must be echoed so the client's post-resync cursor is the pre-pagination anchor",
     );
 
     // A follow-up `/state/changes?since_revision=<pinned>`
@@ -4338,6 +4336,59 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
     assert!(
         changed_ids.contains(&"dev-0"),
         "the update that landed during pagination must surface via /state/changes; got {changed_ids:?}",
+    );
+}
+
+/// H9 round-13 finding 1: the pin is enforced by the
+/// server-issued cursor. Malformed cursors are 400; a
+/// cursor whose epoch no longer matches the store's current
+/// epoch is 409 so the client restarts the resync.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_rejects_forged_and_stale_cursors() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    engine.device_state().apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+
+    let fetch_status = |uri: &str| {
+        let uri = uri.to_string();
+        let engine = engine.clone();
+        let bearer = reader.plaintext.clone();
+        async move {
+            build_router(engine)
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // Malformed cursor (not `<epoch>.<rev>.<device_id>`) → 400.
+    assert_eq!(
+        fetch_status("/api/v1/devices/state?cursor=garbage").await,
+        StatusCode::BAD_REQUEST,
+    );
+    // Well-formed but wrong-epoch cursor → 409 (the store's
+    // real epoch is minted per-process and won't match this
+    // fabricated one).
+    assert_eq!(
+        fetch_status("/api/v1/devices/state?cursor=epoch-deadbeef.1.dev-x").await,
+        StatusCode::CONFLICT,
     );
 }
 
@@ -4402,9 +4453,12 @@ async fn devices_state_full_snapshot_paginates_by_device_id() {
             "a device's capabilities must not split across pages",
         );
     }
-    assert_eq!(body["next_after_device_id"].as_str().unwrap(), "dev-1");
+    let cursor_2 = body["next_cursor"]
+        .as_str()
+        .expect("second page's cursor")
+        .to_string();
 
-    let body = fetch("/api/v1/devices/state?limit=2&after_device_id=dev-1").await;
+    let body = fetch(&format!("/api/v1/devices/state?limit=2&cursor={cursor_2}")).await;
     let ids: Vec<String> = body["devices"]
         .as_array()
         .unwrap()
@@ -4412,8 +4466,12 @@ async fn devices_state_full_snapshot_paginates_by_device_id() {
         .map(|d| d["device_id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, ["dev-2", "dev-3"]);
+    let cursor_3 = body["next_cursor"]
+        .as_str()
+        .expect("third page's cursor")
+        .to_string();
 
-    let body = fetch("/api/v1/devices/state?limit=2&after_device_id=dev-3").await;
+    let body = fetch(&format!("/api/v1/devices/state?limit=2&cursor={cursor_3}")).await;
     let ids: Vec<String> = body["devices"]
         .as_array()
         .unwrap()
@@ -4421,11 +4479,7 @@ async fn devices_state_full_snapshot_paginates_by_device_id() {
         .map(|d| d["device_id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, ["dev-4"]);
-    assert!(
-        body.get("next_after_device_id")
-            .and_then(|v| v.as_str())
-            .is_none()
-    );
+    assert!(body.get("next_cursor").and_then(|v| v.as_str()).is_none());
 }
 
 /// H9 round-10 finding 2: `GET /api/v1/devices/state` requires

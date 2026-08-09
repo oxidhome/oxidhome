@@ -439,13 +439,46 @@ impl DeviceStateStore {
         // meant to fix. Only merge when the prior entry is `Fresh`
         // and from the same live generation; otherwise treat the
         // input as the initial state for this generation.
+        // H9 round-13 finding 2: cap the slot's field count so
+        // `apply_delta` with unique keys can't grow one slot
+        // without bound. `replace_snapshot` also gets capped
+        // (truncate to first MAX_FIELDS_PER_SLOT) — the input
+        // can carry arbitrary field count, and letting a
+        // register-device install a slot already at 10 000
+        // fields defeats the point.
         let final_fields = match (inner.entries.get(&key), merge) {
             (Some(prev), true)
                 if prev.quality == StateQuality::Fresh && prev.source_generation == generation =>
             {
-                merge_fields(&prev.fields, &fields)
+                let (merged, dropped) = merge_fields(&prev.fields, &fields);
+                if dropped > 0 {
+                    tracing::warn!(
+                        target: "device_state.slot_field_cap",
+                        device_id = %device_id,
+                        capability = %capability,
+                        dropped,
+                        cap = MAX_FIELDS_PER_SLOT,
+                        "apply_delta dropped {dropped} new field(s): per-slot cap reached",
+                    );
+                }
+                merged
             }
-            _ => fields,
+            _ => {
+                let mut f = fields;
+                if f.len() > MAX_FIELDS_PER_SLOT {
+                    let dropped = f.len() - MAX_FIELDS_PER_SLOT;
+                    tracing::warn!(
+                        target: "device_state.slot_field_cap",
+                        device_id = %device_id,
+                        capability = %capability,
+                        dropped,
+                        cap = MAX_FIELDS_PER_SLOT,
+                        "replace_snapshot truncated {dropped} field(s): per-slot cap exceeded",
+                    );
+                    f.truncate(MAX_FIELDS_PER_SLOT);
+                }
+                f
+            }
         };
         let entry = Arc::new(DeviceState {
             device_id,
@@ -537,13 +570,6 @@ impl DeviceStateStore {
         device_limit: usize,
     ) -> (String, u64, Vec<Arc<DeviceState>>) {
         let inner = self.inner_read();
-        // `MAX_CAP_SENTINEL` bytes (F4 8F BF BF, `\u{10FFFF}`)
-        // sort strictly after every real capability name
-        // (lowercase ASCII in practice), so
-        // `Bound::Excluded((cursor, MAX))` skips every entry
-        // whose `device_id == cursor` — exactly what
-        // "device_id > cursor" needs.
-        const MAX_CAP_SENTINEL: &str = "\u{10FFFF}";
         let start = match after_device_id {
             Some(cursor) => Bound::Excluded((cursor.to_string(), MAX_CAP_SENTINEL.to_string())),
             None => Bound::Unbounded,
@@ -739,7 +765,21 @@ impl DeviceStateStore {
         // as `write_entry` so post-restart writes stamp the right
         // generation onto the reseeded slots.
         let generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
-        for (capability, fields) in initial_state {
+        for (capability, mut fields) in initial_state {
+            // H9 round-13 finding 2: same per-slot field cap
+            // as `write_entry`.
+            if fields.len() > MAX_FIELDS_PER_SLOT {
+                let dropped = fields.len() - MAX_FIELDS_PER_SLOT;
+                tracing::warn!(
+                    target: "device_state.slot_field_cap",
+                    device_id = %device_id,
+                    capability = %capability,
+                    dropped,
+                    cap = MAX_FIELDS_PER_SLOT,
+                    "reset_and_seed_device truncated {dropped} field(s): per-slot cap exceeded",
+                );
+                fields.truncate(MAX_FIELDS_PER_SLOT);
+            }
             let global_revision = inner.next_revision();
             let key = (device_id.clone(), capability.clone());
             let entry = Arc::new(DeviceState {
@@ -864,20 +904,46 @@ impl DeviceStateStore {
     }
 }
 
+/// H9 round-13 finding 2: per-slot cap on distinct field
+/// keys. `apply_delta` merges partial updates key-by-key,
+/// growing the `fields` vec by one per unseen key — so a
+/// plugin repeatedly publishing `state-change` events with
+/// unique keys could grow a single `Fresh` slot without
+/// bound, bypassing the device count quota (only one slot)
+/// and the stale-entry cap (never flipped stale). It would
+/// also make merge cost quadratic and inflate every
+/// snapshot page carrying the oversized device.
+///
+/// The cap bounds field count, not bytes — each `Value` is
+/// already bounded by the 64 KiB per-event limit
+/// (`payload_limits::MAX_EVENT_JSON_BYTES`), so `count *
+/// per-event = 64 * 64 KiB = 4 MiB` worst case per slot.
+/// Chosen generously: real capabilities carry a handful of
+/// fields (a color-light: 5–8; a sensor: 2), so the cap
+/// only bites malicious / buggy plugins.
+pub const MAX_FIELDS_PER_SLOT: usize = 64;
+
 /// Merge `updates` into `prev` by `key` — new keys are appended,
 /// duplicated keys have their value replaced by the update. Preserves
 /// `prev`'s ordering for stable keys so a snapshot-diffing consumer
-/// sees minimal churn.
-fn merge_fields(prev: &[KeyValue], updates: &[KeyValue]) -> Vec<KeyValue> {
+/// sees minimal churn. H9 round-13 finding 2: rejects new keys
+/// once the merged vec would exceed [`MAX_FIELDS_PER_SLOT`];
+/// updates to existing keys are always accepted (they don't
+/// grow the slot). Returns `(merged, dropped_new_keys)` so
+/// the caller can `tracing::warn` on drops.
+fn merge_fields(prev: &[KeyValue], updates: &[KeyValue]) -> (Vec<KeyValue>, usize) {
     let mut out: Vec<KeyValue> = prev.to_vec();
+    let mut dropped = 0;
     for update in updates {
         if let Some(existing) = out.iter_mut().find(|kv| kv.key == update.key) {
             existing.value = update.value.clone();
-        } else {
+        } else if out.len() < MAX_FIELDS_PER_SLOT {
             out.push(update.clone());
+        } else {
+            dropped += 1;
         }
     }
-    out
+    (out, dropped)
 }
 
 /// Shared `Arc` alias, parallel to `SharedDeviceRegistry`.
@@ -902,6 +968,15 @@ pub struct DeltaPage {
     pub entries: Vec<Arc<DeviceState>>,
     pub reset_required: bool,
 }
+
+/// H9 round-12 finding 2: sentinel string that sorts strictly
+/// after every real capability name. Bytes are `F4 8F BF BF`
+/// (`\u{10FFFF}` in UTF-8), higher than any lowercase-ASCII
+/// capability name (`switch`, `dimmer`, `sensor`, …), so
+/// `Bound::Excluded((cursor, MAX_CAP_SENTINEL.to_string()))`
+/// skips every entry whose `device_id == cursor` — exactly
+/// what "`device_id` > cursor" pagination needs.
+const MAX_CAP_SENTINEL: &str = "\u{10FFFF}";
 
 /// H9 round-6 finding 2: total-Stale-entries cap, enforced by
 /// [`DeviceStateStore::stale_where_locked`] via LRU eviction on
@@ -1732,6 +1807,77 @@ mod tests {
             b.epoch(),
             "distinct stores must mint distinct random epochs"
         );
+    }
+
+    /// H9 round-13 finding 2: `apply_delta` with unique keys
+    /// cannot grow one slot past [`MAX_FIELDS_PER_SLOT`].
+    /// Updates to existing keys are still accepted at the cap
+    /// (they don't grow the slot). A `replace_snapshot`
+    /// carrying an oversized fields vec is truncated to the
+    /// same cap.
+    #[test]
+    fn apply_delta_caps_slot_fields_at_max_fields_per_slot() {
+        let store = DeviceStateStore::new();
+        // Push MAX + 32 unique keys through apply_delta, one at
+        // a time, mimicking the "state-change per unique key"
+        // growth vector.
+        for i in 0..MAX_FIELDS_PER_SLOT + 32 {
+            store.apply_delta(
+                "dev-1".into(),
+                "alpha".into(),
+                "switch".into(),
+                vec![kv(&format!("k{i}"), Value::StringVal("v".into()))],
+                0,
+                0,
+            );
+        }
+        let entry = store.snapshot_capability("dev-1", "switch").unwrap();
+        assert_eq!(
+            entry.fields.len(),
+            MAX_FIELDS_PER_SLOT,
+            "apply_delta must cap the slot's distinct-key growth",
+        );
+
+        // Updating an EXISTING key still applies at the cap.
+        let old_v = entry.fields[0].value.clone();
+        let existing_key = entry.fields[0].key.clone();
+        store.apply_delta(
+            "dev-1".into(),
+            "alpha".into(),
+            "switch".into(),
+            vec![kv(&existing_key, Value::StringVal("updated".into()))],
+            0,
+            0,
+        );
+        let updated = store.snapshot_capability("dev-1", "switch").unwrap();
+        assert_eq!(updated.fields.len(), MAX_FIELDS_PER_SLOT);
+        let after = &updated
+            .fields
+            .iter()
+            .find(|kv| kv.key == existing_key)
+            .unwrap()
+            .value;
+        assert!(
+            !matches!(after, v if std::mem::discriminant(v) == std::mem::discriminant(&old_v)
+                                 && matches!(v, Value::StringVal(s) if s == "v")),
+            "existing key must have picked up the new value",
+        );
+
+        // replace_snapshot with an oversized fields vec is
+        // truncated (not rejected).
+        let oversized: Vec<KeyValue> = (0..MAX_FIELDS_PER_SLOT + 8)
+            .map(|i| kv(&format!("r{i}"), Value::StringVal("x".into())))
+            .collect();
+        store.replace_snapshot(
+            "dev-2".into(),
+            "alpha".into(),
+            "switch".into(),
+            oversized,
+            0,
+            0,
+        );
+        let entry = store.snapshot_capability("dev-2", "switch").unwrap();
+        assert_eq!(entry.fields.len(), MAX_FIELDS_PER_SLOT);
     }
 
     /// H9 round-12 finding 2: `snapshot_page_with_revision`

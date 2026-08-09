@@ -422,51 +422,86 @@ async fn get_device_state(
 }
 
 /// Query params for `GET /api/v1/devices/state` (H9 round-11
-/// finding 1, extended in round-12 finding 1). Pagination is
-/// by *device* — a device's capabilities all land on the same
-/// page so per-device snapshots stay atomic — and by
-/// **pinned revision** so cross-page reads are consistent.
+/// finding 1, revised again in round-13 finding 1).
+/// Pagination is by *device* — a device's capabilities all
+/// land on the same page so per-device snapshots stay
+/// atomic — and by **server-issued cursor** carrying epoch +
+/// pinned revision + `after_device_id`, so a client can't
+/// omit or forge the pin.
 ///
-/// Cross-page consistency (round-12 finding 1): the store
-/// keeps advancing while a client is paging. If page one
-/// returned device D at revision 10 and D changed to revision
-/// 11 before page two, the naive "use the last page's
-/// revision as the next `since_revision`" pattern would
-/// silently miss the update: page two excludes D (behind the
-/// cursor) and reports revision 11, so a subsequent
-/// `/state/changes?since_revision=11` never surfaces the
-/// change. Same story for a device registered mid-pagination
-/// that sorts behind the current cursor.
+/// Protocol:
+/// - First page: no `cursor` param. Response includes
+///   `next_cursor` (opaque string) if more pages exist.
+/// - Continuation: pass the previous `next_cursor` back
+///   verbatim; the server decodes epoch + pinned revision +
+///   `after_device_id`, verifies the epoch still matches the
+///   store's current epoch (409 if not — restart resync),
+///   and echoes the pinned revision as `revision` in the
+///   response.
+/// - After the final page (`next_cursor` absent), the client
+///   uses the response's `revision` as its next
+///   `since_revision` for `/state/changes`. Every write that
+///   landed mid-pagination — including writes to devices
+///   already paged past, or new devices sorting behind the
+///   cursor — has `global_revision > pinned_revision` and
+///   surfaces on that cursor poll.
 ///
-/// Protocol: the client tracks the revision returned on the
-/// *first* page and passes it back as `pinned_revision` on
-/// every subsequent page — the server echoes it in the
-/// response, so the client can uniformly use the response's
-/// `revision` as its next `since_revision`. Everything that
-/// changed at or after the pinned revision is then picked up
-/// by the client's next `/state/changes` poll.
+/// The old round-11/12 shape (flat `after_device_id` +
+/// `pinned_revision` params) let a client omit the pin on
+/// continuation (falling back to current revision — the
+/// original lost-update race) or supply a stale pin on page
+/// one (skipping updates). The opaque cursor closes both
+/// holes: page one refuses to accept a cursor, continuation
+/// requires one, and only the server ever constructs one.
 #[derive(Deserialize)]
 struct AllDevicesStateParams {
-    /// Return only devices whose `device_id > after_device_id`.
-    /// Absent ⇒ start from the beginning. To page forward,
-    /// take the previous response's `next_after_device_id`.
+    /// Opaque continuation cursor from the previous page's
+    /// `next_cursor`. Do not parse or fabricate — the format
+    /// is a private server contract that may change.
+    /// Rejected on the first-page request (no cursor) with
+    /// 400 if malformed, 409 if its epoch has since changed.
     #[serde(default)]
-    after_device_id: Option<String>,
-    /// H9 round-12 finding 1: the revision returned on the
-    /// first page of this resync. The server echoes it as
-    /// `revision` in the response so the client's
-    /// `since_revision` cursor after pagination is the
-    /// pre-pagination anchor — not the store's revision at
-    /// the last page (which could hide updates to devices
-    /// already paged past). REQUIRED on any request that
-    /// sets `after_device_id`; ignored on the first page.
-    #[serde(default)]
-    pinned_revision: Option<u64>,
+    cursor: Option<String>,
     /// Cap on distinct devices in the response. Absent / 0 ⇒
     /// default of 128. Capped at
     /// [`MAX_ALL_DEVICES_STATE_LIMIT`].
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Decoded form of the opaque `cursor` query parameter. Format
+/// on the wire: `<epoch>.<pinned_revision>.<after_device_id>`.
+/// All three components are URL-safe (epoch is
+/// `epoch-<32hex>`, revision is decimal, `device_id` is
+/// `dev-<16hex>` — none contain `.`), so plain string
+/// concatenation with a `.` delimiter suffices without
+/// pulling in a base64 dep.
+struct DecodedCursor {
+    epoch: String,
+    pinned_revision: u64,
+    after_device_id: String,
+}
+
+impl DecodedCursor {
+    fn parse(raw: &str) -> Result<Self, ()> {
+        let mut parts = raw.splitn(3, '.');
+        let epoch = parts.next().ok_or(())?;
+        let rev = parts.next().ok_or(())?;
+        let device = parts.next().ok_or(())?;
+        if epoch.is_empty() || device.is_empty() {
+            return Err(());
+        }
+        let pinned_revision = rev.parse::<u64>().map_err(|_| ())?;
+        Ok(Self {
+            epoch: epoch.to_string(),
+            pinned_revision,
+            after_device_id: device.to_string(),
+        })
+    }
+
+    fn encode(epoch: &str, pinned_revision: u64, after_device_id: &str) -> String {
+        format!("{epoch}.{pinned_revision}.{after_device_id}")
+    }
 }
 
 /// Default page size for `GET /api/v1/devices/state` — chosen
@@ -498,20 +533,52 @@ struct AllDevicesStateSnapshot {
     revision: u64,
     /// Devices in this page, ordered by `device_id`.
     devices: Vec<DeviceStateSnapshot>,
-    /// H9 round-11 finding 1: cursor for the next page —
-    /// `None` when this page is the final one. The client
-    /// keeps calling with `after_device_id =
-    /// next_after_device_id` (AND `pinned_revision =
-    /// <first page's revision>`) until it comes back `None`.
-    /// If the client sees the `epoch` change mid-paging,
-    /// the store reset and the resync must restart from the
-    /// beginning.
-    next_after_device_id: Option<String>,
+    /// H9 round-13 finding 1: opaque continuation cursor —
+    /// `None` on the final page. The client passes this
+    /// back verbatim as `?cursor=<value>` on the next
+    /// request. Encodes epoch + pinned revision + last
+    /// device id; server-verified on the way back in, so a
+    /// client can't omit the pin or forge a stale one.
+    next_cursor: Option<String>,
 }
 
-/// H9 round-10 finding 2 / round-11 finding 1:
-/// `GET /api/v1/devices/state`. Paginated atomic full-store
-/// snapshot for `reset_required` recovery. When
+/// Handler-local error type covering scope denial, malformed
+/// cursor, and epoch drift. See [`get_all_device_state`].
+enum AllDevicesStateError {
+    Scope(ScopeDenied),
+    BadCursor,
+    EpochChanged,
+}
+
+impl IntoResponse for AllDevicesStateError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::BadCursor => (
+                StatusCode::BAD_REQUEST,
+                "invalid `cursor` — expected the opaque value returned as \
+                 `next_cursor` on the previous page",
+            )
+                .into_response(),
+            Self::EpochChanged => (
+                StatusCode::CONFLICT,
+                "store `epoch` has changed since the cursor was issued \
+                 (daemon restart); restart the resync from an unpinned request",
+            )
+                .into_response(),
+        }
+    }
+}
+
+impl From<ScopeDenied> for AllDevicesStateError {
+    fn from(value: ScopeDenied) -> Self {
+        Self::Scope(value)
+    }
+}
+
+/// H9 round-10 finding 2 / round-11 finding 1 / round-13
+/// finding 1: `GET /api/v1/devices/state`. Paginated atomic
+/// full-store snapshot for `reset_required` recovery. When
 /// [`StateChangesBody::reset_required`] is `true` (cursor
 /// beyond current revision after a daemon restart, or below
 /// the store's stale-eviction watermark), the caller has no
@@ -519,37 +586,58 @@ struct AllDevicesStateSnapshot {
 /// enumeration lives behind the separate `devices:list` scope
 /// and the reset itself may have dropped device IDs from the
 /// client's cache. This endpoint is the resync path, gated on
-/// `devices:read` (same scope as the per-device snapshot and
-/// cursor endpoints), read under one lock so `revision` +
-/// entries within one page are consistent, and paginated so
-/// one request never allocates the entire store.
+/// `devices:read`, read under one lock so `revision` + entries
+/// within one page are consistent, and paginated with a
+/// server-issued opaque cursor so cross-page consistency
+/// (the pin protocol) is enforced instead of documented.
 ///
 /// # Errors
+/// - `400` cursor is malformed.
 /// - `403` scope check failed.
+/// - `409` cursor's epoch no longer matches the store's
+///   current epoch — restart the resync from an unpinned
+///   request.
 async fn get_all_device_state(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
     Query(params): Query<AllDevicesStateParams>,
-) -> Result<Json<AllDevicesStateSnapshot>, ScopeDenied> {
+) -> Result<Json<AllDevicesStateSnapshot>, AllDevicesStateError> {
     require_scope(&actor, DEVICES_READ)?;
     let limit = params
         .limit
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_ALL_DEVICES_STATE_LIMIT)
         .min(MAX_ALL_DEVICES_STATE_LIMIT);
+    let cursor = params
+        .cursor
+        .as_deref()
+        .map(DecodedCursor::parse)
+        .transpose()
+        .map_err(|()| AllDevicesStateError::BadCursor)?;
     // Ask for `limit + 1` distinct devices so we can tell
     // whether another page exists without a second lookup.
-    let (epoch, current_revision, entries) = state
-        .engine
-        .device_state()
-        .snapshot_page_with_revision(params.after_device_id.as_deref(), limit + 1);
-    // H9 round-12 finding 1: on the first page (no
-    // `pinned_revision` supplied), report the store's current
-    // revision — the client keeps this as its resync anchor
-    // and passes it back on subsequent pages so all pages
-    // agree. On follow-up pages, echo whatever the client
-    // pinned.
-    let revision = params.pinned_revision.unwrap_or(current_revision);
+    let (epoch, current_revision, entries) =
+        state.engine.device_state().snapshot_page_with_revision(
+            cursor.as_ref().map(|c| c.after_device_id.as_str()),
+            limit + 1,
+        );
+    // H9 round-13 finding 1: opaque cursor carries the pinned
+    // revision. On page one it isn't set; server reports the
+    // store's current revision as both the response revision
+    // *and* the pin encoded into any `next_cursor`. On
+    // continuation the cursor's epoch must still match the
+    // store's current epoch (409 if it doesn't — daemon
+    // restart mid-resync); the pinned revision comes from
+    // the cursor, not from the client's request body.
+    let revision = match cursor.as_ref() {
+        Some(c) => {
+            if c.epoch != epoch {
+                return Err(AllDevicesStateError::EpochChanged);
+            }
+            c.pinned_revision
+        }
+        None => current_revision,
+    };
     let mut by_device: std::collections::BTreeMap<String, Vec<DeviceStateEntry>> =
         std::collections::BTreeMap::new();
     for entry in &entries {
@@ -570,11 +658,13 @@ async fn get_all_device_state(
             }
         })
         .collect();
-    let next_after_device_id = if devices.len() > limit {
-        // Drop the sentinel `limit + 1`-th device and hand its
-        // predecessor's id back as the next cursor.
+    let next_cursor = if devices.len() > limit {
+        // Drop the sentinel `limit + 1`-th device and issue a
+        // cursor anchored at its predecessor's id.
         devices.truncate(limit);
-        devices.last().map(|d| d.device_id.clone())
+        devices
+            .last()
+            .map(|d| DecodedCursor::encode(&epoch, revision, &d.device_id))
     } else {
         None
     };
@@ -582,7 +672,7 @@ async fn get_all_device_state(
         epoch,
         revision,
         devices,
-        next_after_device_id,
+        next_cursor,
     }))
 }
 
