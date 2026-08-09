@@ -4243,6 +4243,104 @@ async fn devices_state_full_snapshot_returns_every_device_atomically() {
     );
 }
 
+/// H9 round-12 finding 1: `GET /api/v1/devices/state` pins the
+/// resync anchor to the *first* page's revision — subsequent
+/// pages echo `pinned_revision` back as `revision`, so a write
+/// that lands between pages (to a device already paged past,
+/// or a device sorting behind the current cursor) is picked
+/// up on the next `/state/changes` poll rather than being
+/// silently skipped. Pre-fix, each page reported the store's
+/// current revision, and a client using the last page's
+/// revision as its cursor could miss updates that happened
+/// mid-pagination.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_pins_revision_across_pages() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    for i in 0..4 {
+        store.apply_delta(
+            format!("dev-{i}"),
+            "alpha".into(),
+            "switch".into(),
+            Vec::new(),
+            0,
+            0,
+        );
+    }
+
+    let fetch = |uri: &str| {
+        let uri = uri.to_string();
+        let engine = engine.clone();
+        let bearer = reader.plaintext.clone();
+        async move {
+            let response = build_router(engine)
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            body_to_json(response.into_body()).await
+        }
+    };
+
+    // Page 1: no pin — server returns the current revision.
+    let page1 = fetch("/api/v1/devices/state?limit=2").await;
+    let pinned = page1["revision"].as_u64().unwrap();
+    assert_eq!(pinned, 4);
+    assert_eq!(page1["next_after_device_id"].as_str().unwrap(), "dev-1");
+
+    // Simulate a mutation between pages — new revision on
+    // an *already-paged-past* device (dev-0). The naive
+    // "use the last page's revision" pattern would miss this.
+    store.apply_delta(
+        "dev-0".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    assert_eq!(store.current_revision(), 5);
+
+    // Page 2: pass `pinned_revision` back — server echoes it
+    // as `revision`, even though `current_revision` is now 5.
+    let page2 = fetch(&format!(
+        "/api/v1/devices/state?limit=2&after_device_id=dev-1&pinned_revision={pinned}"
+    ))
+    .await;
+    assert_eq!(
+        page2["revision"].as_u64().unwrap(),
+        pinned,
+        "pinned_revision must be echoed so the client's post-resync cursor is the pre-pagination anchor",
+    );
+
+    // A follow-up `/state/changes?since_revision=<pinned>`
+    // now picks up dev-0's update (it has global_revision > pinned).
+    let changes = fetch(&format!(
+        "/api/v1/devices/state/changes?since_revision={pinned}"
+    ))
+    .await;
+    let changed_ids: Vec<&str> = changes["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["device_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        changed_ids.contains(&"dev-0"),
+        "the update that landed during pagination must surface via /state/changes; got {changed_ids:?}",
+    );
+}
+
 /// H9 round-11 finding 1: `GET /api/v1/devices/state` pages by
 /// device — `limit` caps distinct devices, a device's
 /// capabilities stay atomic within one page, and

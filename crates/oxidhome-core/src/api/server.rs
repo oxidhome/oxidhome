@@ -422,17 +422,46 @@ async fn get_device_state(
 }
 
 /// Query params for `GET /api/v1/devices/state` (H9 round-11
-/// finding 1). Pagination is by *device* — a device's
-/// capabilities all land on the same page so per-device
-/// snapshots stay atomic.
+/// finding 1, extended in round-12 finding 1). Pagination is
+/// by *device* — a device's capabilities all land on the same
+/// page so per-device snapshots stay atomic — and by
+/// **pinned revision** so cross-page reads are consistent.
+///
+/// Cross-page consistency (round-12 finding 1): the store
+/// keeps advancing while a client is paging. If page one
+/// returned device D at revision 10 and D changed to revision
+/// 11 before page two, the naive "use the last page's
+/// revision as the next `since_revision`" pattern would
+/// silently miss the update: page two excludes D (behind the
+/// cursor) and reports revision 11, so a subsequent
+/// `/state/changes?since_revision=11` never surfaces the
+/// change. Same story for a device registered mid-pagination
+/// that sorts behind the current cursor.
+///
+/// Protocol: the client tracks the revision returned on the
+/// *first* page and passes it back as `pinned_revision` on
+/// every subsequent page — the server echoes it in the
+/// response, so the client can uniformly use the response's
+/// `revision` as its next `since_revision`. Everything that
+/// changed at or after the pinned revision is then picked up
+/// by the client's next `/state/changes` poll.
 #[derive(Deserialize)]
 struct AllDevicesStateParams {
     /// Return only devices whose `device_id > after_device_id`.
     /// Absent ⇒ start from the beginning. To page forward,
-    /// take the last device's `device_id` from the previous
-    /// response and pass it here.
+    /// take the previous response's `next_after_device_id`.
     #[serde(default)]
     after_device_id: Option<String>,
+    /// H9 round-12 finding 1: the revision returned on the
+    /// first page of this resync. The server echoes it as
+    /// `revision` in the response so the client's
+    /// `since_revision` cursor after pagination is the
+    /// pre-pagination anchor — not the store's revision at
+    /// the last page (which could hide updates to devices
+    /// already paged past). REQUIRED on any request that
+    /// sets `after_device_id`; ignored on the first page.
+    #[serde(default)]
+    pinned_revision: Option<u64>,
     /// Cap on distinct devices in the response. Absent / 0 ⇒
     /// default of 128. Capped at
     /// [`MAX_ALL_DEVICES_STATE_LIMIT`].
@@ -456,20 +485,27 @@ const MAX_ALL_DEVICES_STATE_LIMIT: usize = 512;
 struct AllDevicesStateSnapshot {
     /// See [`DeviceStateSnapshot::epoch`].
     epoch: String,
-    /// Store-wide revision at read time — the value a resyncing
-    /// client sets as its next `since_revision` cursor once
-    /// pagination is done.
+    /// Resync anchor. On the first page, this is the store's
+    /// `current_revision` at read time. On subsequent pages
+    /// (`pinned_revision` set), the server echoes the pinned
+    /// value so all pages of one resync agree. After
+    /// pagination completes, the client uses this as its
+    /// next `since_revision` cursor for `/state/changes`.
+    /// (H9 round-12 finding 1: this pin is the guarantee
+    /// that writes landing mid-pagination — including to
+    /// devices already paged past — are picked up on the
+    /// next cursor poll.)
     revision: u64,
     /// Devices in this page, ordered by `device_id`.
     devices: Vec<DeviceStateSnapshot>,
     /// H9 round-11 finding 1: cursor for the next page —
     /// `None` when this page is the final one. The client
     /// keeps calling with `after_device_id =
-    /// next_after_device_id` until it comes back `None`. All
-    /// pages of one resync should observe the same `epoch`
-    /// (and typically the same `revision`); if the client
-    /// sees the epoch change mid-paging, the store reset and
-    /// the resync must restart from the beginning.
+    /// next_after_device_id` (AND `pinned_revision =
+    /// <first page's revision>`) until it comes back `None`.
+    /// If the client sees the `epoch` change mid-paging,
+    /// the store reset and the resync must restart from the
+    /// beginning.
     next_after_device_id: Option<String>,
 }
 
@@ -503,10 +539,17 @@ async fn get_all_device_state(
         .min(MAX_ALL_DEVICES_STATE_LIMIT);
     // Ask for `limit + 1` distinct devices so we can tell
     // whether another page exists without a second lookup.
-    let (epoch, revision, entries) = state
+    let (epoch, current_revision, entries) = state
         .engine
         .device_state()
         .snapshot_page_with_revision(params.after_device_id.as_deref(), limit + 1);
+    // H9 round-12 finding 1: on the first page (no
+    // `pinned_revision` supplied), report the store's current
+    // revision — the client keeps this as its resync anchor
+    // and passes it back on subsequent pages so all pages
+    // agree. On follow-up pages, echo whatever the client
+    // pinned.
+    let revision = params.pinned_revision.unwrap_or(current_revision);
     let mut by_device: std::collections::BTreeMap<String, Vec<DeviceStateEntry>> =
         std::collections::BTreeMap::new();
     for entry in &entries {

@@ -71,7 +71,8 @@
 //!   follow-up if a use case surfaces (post-restart state
 //!   reconciliation without re-observing).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rand::TryRng;
@@ -150,7 +151,15 @@ pub struct DeviceState {
 /// overwriting the just-marked-stale slot.
 #[derive(Debug)]
 struct StoreInner {
-    entries: HashMap<(DeviceId, String), Arc<DeviceState>>,
+    /// H9 round-12 finding 2: keyed on `(device_id, capability)`
+    /// in a `BTreeMap` so pagination can `range` from the cursor
+    /// in `O(log N + k)` without scanning + sorting the entire
+    /// store on every request. Point lookups (`write_entry`,
+    /// `snapshot_capability`) become `O(log N)` rather than
+    /// `O(1)`, but at the store's expected size (≤ a few
+    /// thousand entries per host) that's a handful of
+    /// comparisons — well below the noise of a wasm host call.
+    entries: BTreeMap<(DeviceId, String), Arc<DeviceState>>,
     /// Store-wide monotonic revision. Every mutating operation
     /// increments this and stamps the value onto the entry being
     /// written. Held under the same lock as `entries` so an
@@ -198,7 +207,7 @@ struct StoreInner {
 impl Default for StoreInner {
     fn default() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
             global_revision: 0,
             epoch: mint_epoch(),
             evicted_through_revision: 0,
@@ -491,25 +500,36 @@ impl DeviceStateStore {
         (inner.epoch.clone(), inner.global_revision, entries)
     }
 
-    /// H9 round-10 finding 2 / round-11 finding 1: atomic
-    /// full-store snapshot page for `reset_required` recovery.
-    /// Returns every entry whose `device_id > after_device_id`
-    /// (or every entry if `None`), grouped so all capabilities
-    /// for a given device land on the same page, capped at
-    /// `device_limit` distinct devices. Reads `epoch` +
-    /// `global_revision` under the same read lock as the entry
-    /// scan, so the page is internally consistent even if
-    /// writers commit between pages.
+    /// H9 round-10 finding 2 / round-11 finding 1 / round-12
+    /// findings 1+2: full-store snapshot **page** for
+    /// `reset_required` recovery.
     ///
-    /// Round-11 finding 1 note: the pre-fix `snapshot_all`
-    /// returned every entry in one unpaged allocation; on a
-    /// large store that meant one host-side copy of every
-    /// entry per concurrent request. Paging by *device* (not
-    /// entry) bounds each response and keeps a device's
-    /// capabilities atomic within one page — pagination by
-    /// entry could split a device across two pages, breaking
-    /// the "per-device snapshot is atomic" contract callers
-    /// rely on.
+    /// Returns entries strictly after `after_device_id`
+    /// (or from the start if `None`), grouped so all
+    /// capabilities of one device land on the same page,
+    /// capped at `device_limit` distinct devices. Reads
+    /// `epoch` + `global_revision` under the same read lock
+    /// as the range scan, so a single page is internally
+    /// consistent.
+    ///
+    /// Round-12 finding 2: uses `BTreeMap::range` from
+    /// `(cursor, MAX)` exclusive, iterates lazily, and stops
+    /// after `device_limit` distinct device ids. Cost:
+    /// `O(log N + k · caps-per-device)` — no full-store
+    /// clone-then-sort, and the lock is released the moment
+    /// the page fills.
+    ///
+    /// Round-12 finding 1: cross-page consistency is the
+    /// **caller's** responsibility. The caller pins the
+    /// resync anchor to the revision returned on the *first*
+    /// page and, after paging through the full set, uses
+    /// that pinned value as the `since_revision` for
+    /// subsequent `/state/changes` polls — so any write that
+    /// happened during pagination (including to devices
+    /// sorting behind the current cursor, or to devices
+    /// registered mid-pagination) is picked up on the next
+    /// cursor poll. The API handler enforces this by
+    /// echoing the pinned revision through subsequent pages.
     #[must_use]
     pub fn snapshot_page_with_revision(
         &self,
@@ -517,30 +537,29 @@ impl DeviceStateStore {
         device_limit: usize,
     ) -> (String, u64, Vec<Arc<DeviceState>>) {
         let inner = self.inner_read();
-        let mut candidates: Vec<Arc<DeviceState>> = inner
-            .entries
-            .iter()
-            .filter(|((did, _), _)| match after_device_id {
-                Some(cursor) => did.as_str() > cursor,
-                None => true,
-            })
-            .map(|(_, m)| Arc::clone(m))
-            .collect();
-        candidates.sort_by(|a, b| {
-            a.device_id
-                .cmp(&b.device_id)
-                .then_with(|| a.capability.cmp(&b.capability))
-        });
-        let mut selected_devices: Vec<String> = Vec::new();
+        // `MAX_CAP_SENTINEL` bytes (F4 8F BF BF, `\u{10FFFF}`)
+        // sort strictly after every real capability name
+        // (lowercase ASCII in practice), so
+        // `Bound::Excluded((cursor, MAX))` skips every entry
+        // whose `device_id == cursor` — exactly what
+        // "device_id > cursor" needs.
+        const MAX_CAP_SENTINEL: &str = "\u{10FFFF}";
+        let start = match after_device_id {
+            Some(cursor) => Bound::Excluded((cursor.to_string(), MAX_CAP_SENTINEL.to_string())),
+            None => Bound::Unbounded,
+        };
         let mut entries: Vec<Arc<DeviceState>> = Vec::new();
-        for entry in candidates {
-            if selected_devices.last().map(String::as_str) != Some(entry.device_id.as_str()) {
-                if selected_devices.len() >= device_limit {
+        let mut distinct_devices: usize = 0;
+        let mut current_device: Option<&DeviceId> = None;
+        for ((did, _cap), entry) in inner.entries.range((start, Bound::Unbounded)) {
+            if current_device != Some(did) {
+                if distinct_devices >= device_limit {
                     break;
                 }
-                selected_devices.push(entry.device_id.clone());
+                distinct_devices += 1;
+                current_device = Some(did);
             }
-            entries.push(entry);
+            entries.push(Arc::clone(entry));
         }
         (inner.epoch.clone(), inner.global_revision, entries)
     }
@@ -1712,6 +1731,64 @@ mod tests {
             a.epoch(),
             b.epoch(),
             "distinct stores must mint distinct random epochs"
+        );
+    }
+
+    /// H9 round-12 finding 2: `snapshot_page_with_revision`
+    /// ranges from the cursor via `BTreeMap::range` — the
+    /// returned entries are in `(device_id, capability)`
+    /// order, and pages after the cursor start strictly past
+    /// the cursor's `device_id`. Also proves `device_limit`
+    /// caps distinct devices (not entries) so per-device
+    /// atomicity holds.
+    #[test]
+    fn snapshot_page_with_revision_pages_in_device_order_from_cursor() {
+        let store = DeviceStateStore::new();
+        // Five devices × two capabilities each, inserted in a
+        // deliberately-out-of-order sequence so the BTreeMap's
+        // sort — not insertion order — is what pagination
+        // observes.
+        for i in [3, 1, 4, 0, 2] {
+            for cap in ["switch", "dimmer"] {
+                store.apply_delta(
+                    format!("dev-{i}"),
+                    "alpha".into(),
+                    (*cap).into(),
+                    Vec::new(),
+                    0,
+                    0,
+                );
+            }
+        }
+        // Page 1: limit=2 distinct devices → dev-0, dev-1,
+        // each with both capabilities (dimmer sorts before
+        // switch).
+        let (_, _, page) = store.snapshot_page_with_revision(None, 2);
+        assert_eq!(
+            page.iter()
+                .map(|e| format!("{}/{}", e.device_id, e.capability))
+                .collect::<Vec<_>>(),
+            vec![
+                "dev-0/dimmer",
+                "dev-0/switch",
+                "dev-1/dimmer",
+                "dev-1/switch",
+            ],
+        );
+
+        // Page 2: cursor at dev-1 → strictly past dev-1's
+        // entries.
+        let (_, _, page) = store.snapshot_page_with_revision(Some("dev-1"), 2);
+        let ids: Vec<String> = page.iter().map(|e| e.device_id.clone()).collect();
+        assert!(
+            ids.iter().all(|d| d.as_str() > "dev-1"),
+            "range must skip cursor's own entries, got {ids:?}",
+        );
+        assert_eq!(
+            page.iter()
+                .map(|e| e.device_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["dev-2", "dev-3"].into_iter().collect(),
         );
     }
 
