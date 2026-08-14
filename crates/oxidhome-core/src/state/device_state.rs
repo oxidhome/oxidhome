@@ -1488,19 +1488,28 @@ fn check_instance_caps_locked(
     Ok(())
 }
 
-/// H9 round-19 finding 1: compute the projected merged
-/// `(field_count, byte_size)` of `baseline ⊕ incoming` under
-/// last-wins semantics **without cloning any `KeyValue`**.
-/// Uses `HashMap<&str, usize>` keyed on borrowed key slices
-/// (bounded by unique key count) so a plugin returning a
-/// huge unique-fields vec doesn't cause a full host-side
-/// clone before admission rejects.
+/// H9 round-19 finding 1 / round-20 finding 1: compute the
+/// projected merged `(field_count, byte_size)` of
+/// `baseline ⊕ incoming` under last-wins semantics
+/// **without cloning any `KeyValue`**. Uses
+/// `HashMap<&str, usize>` keyed on borrowed key slices so a
+/// plugin returning a huge unique-fields vec doesn't cause
+/// a full host-side clone before admission rejects.
 ///
-/// Early-exits the moment either cap would be exceeded, so
-/// the map itself is bounded at
-/// `MAX_FIELDS_PER_SLOT + 1` entries regardless of input
-/// size. Returns `Err` with the currently-observed sizes so
-/// the caller can surface them in the rejection message.
+/// **Only field-count overflow can early-exit.** Duplicate
+/// keys under last-wins can shrink the byte total between
+/// iterations (an oversized value followed by a small value
+/// for the same key ends up small), so an early byte check
+/// would reject a payload the write path would accept.
+/// Round-20 finding 1 removed the byte early-exit; bytes
+/// are checked only after the loop has folded every
+/// duplicate. Field count IS monotonic — the map grows on
+/// new keys and never shrinks — so the count check remains
+/// eager and bounds the map at `MAX_FIELDS_PER_SLOT + 1`
+/// entries regardless of input size. If a plugin sends
+/// many duplicates of one key with huge values, iteration
+/// is O(N) but memory is O(1); no `KeyValue` is cloned in
+/// either case.
 fn projected_slot_size(
     baseline: &[KeyValue],
     incoming: &[KeyValue],
@@ -1513,7 +1522,7 @@ fn projected_slot_size(
         running_bytes = running_bytes
             .saturating_sub(prev.unwrap_or(0))
             .saturating_add(bytes);
-        if seen.len() > MAX_FIELDS_PER_SLOT || running_bytes > MAX_BYTES_PER_SLOT {
+        if seen.len() > MAX_FIELDS_PER_SLOT {
             return Err(SlotCapExceeded::Slot {
                 projected_fields: seen.len(),
                 projected_bytes: running_bytes,
@@ -1521,6 +1530,14 @@ fn projected_slot_size(
                 cap_bytes: MAX_BYTES_PER_SLOT,
             });
         }
+    }
+    if running_bytes > MAX_BYTES_PER_SLOT {
+        return Err(SlotCapExceeded::Slot {
+            projected_fields: seen.len(),
+            projected_bytes: running_bytes,
+            cap_fields: MAX_FIELDS_PER_SLOT,
+            cap_bytes: MAX_BYTES_PER_SLOT,
+        });
     }
     Ok((seen.len(), running_bytes))
 }
@@ -2773,6 +2790,45 @@ mod tests {
                 &[kv("new", Value::StringVal("y".into()))],
             )
             .expect("generation-mismatched baseline: write would replace");
+    }
+
+    /// H9 round-20 finding 1: admission's byte check must
+    /// respect last-wins semantics. An `[big, small]`
+    /// sequence for the same key ends up small — accepted
+    /// by the write path — so admission must not reject on
+    /// the intermediate running byte total. Pre-fix, the
+    /// eager byte early-exit rejected as soon as the first
+    /// oversized value inflated `running_bytes`, even
+    /// though the small final value would have fit.
+    #[test]
+    fn check_snapshot_admission_respects_last_wins_ordering() {
+        // Oversized-then-small: canonical result fits.
+        let big = "a".repeat(MAX_BYTES_PER_SLOT + 1);
+        let big_then_small = vec![
+            kv("state", Value::StringVal(big.clone())),
+            kv("state", Value::BoolVal(true)),
+        ];
+        DeviceStateStore::check_snapshot_admission(&big_then_small)
+            .expect("last-wins collapses `[big, small]` to the small value, which fits");
+
+        // Small-then-oversized: canonical result overflows.
+        let small_then_big = vec![
+            kv("state", Value::BoolVal(true)),
+            kv("state", Value::StringVal(big.clone())),
+        ];
+        DeviceStateStore::check_snapshot_admission(&small_then_big)
+            .expect_err("last value is the oversized one → admission must reject");
+
+        // Same for `apply_delta` admission: baseline is
+        // empty here (Stale generation-mismatched), so this
+        // exercises the incoming-only path.
+        let store = DeviceStateStore::new();
+        store
+            .check_delta_admission("dev-1", "alpha", "switch", &big_then_small)
+            .expect("apply_delta admission also respects last-wins on the incoming vec");
+        store
+            .check_delta_admission("dev-1", "alpha", "switch", &small_then_big)
+            .expect_err("apply_delta admission rejects when the last value overflows");
     }
 
     /// H9 round-15 finding 2: duplicates in the incoming
