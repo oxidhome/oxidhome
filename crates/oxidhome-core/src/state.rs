@@ -34,7 +34,8 @@ pub use blobs::{BlobError, BlobInfo, BlobStore, is_safe_instance_id};
 pub use db::Db;
 pub use device_state::{
     CursorError, DeltaPage, DeviceState, DeviceStateStore, MAX_BYTES_PER_SLOT, MAX_FIELDS_PER_SLOT,
-    MAX_STALE_ENTRIES, SharedDeviceStateStore, SlotCapExceeded, StateQuality,
+    MAX_PROJECTED_BYTES_PER_INSTANCE, MAX_STALE_ENTRIES, SharedDeviceStateStore, SlotCapExceeded,
+    StateQuality,
 };
 pub use devices::{
     DeviceMeta, DeviceRegistry, MAX_CAPABILITIES_PER_DEVICE, MAX_DEVICES_PER_INSTANCE,

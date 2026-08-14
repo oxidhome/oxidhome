@@ -436,7 +436,7 @@ impl DeviceStateStore {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn write_entry(
         &self,
         device_id: DeviceId,
@@ -491,7 +491,19 @@ impl DeviceStateStore {
                 merged
             }
             _ => {
-                let mut f = fields;
+                // H9 round-16 finding 1: canonicalize the
+                // snapshot input by folding duplicate keys
+                // last-wins BEFORE storing. Pre-fix, an
+                // `OkWithState([state=true, state=false])`
+                // (or a register-device `initial_state`
+                // with duplicate keys) went into the
+                // projection unchanged — the wire response
+                // and REST HashMap conversion disagreed
+                // about which value was authoritative, and
+                // a later `apply_delta` updated only the
+                // first match, leaving contradictory
+                // values in the same slot forever.
+                let mut f = merge_fields_unbounded(&[], &fields);
                 if f.len() > MAX_FIELDS_PER_SLOT {
                     let dropped = f.len() - MAX_FIELDS_PER_SLOT;
                     tracing::warn!(
@@ -687,9 +699,8 @@ impl DeviceStateStore {
         // the merge baseline if the write path would too.
         // See `write_entry`.
         let caller_generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
-        let baseline: &[KeyValue] = inner
-            .entries
-            .get(&key)
+        let existing_slot = inner.entries.get(&key);
+        let baseline: &[KeyValue] = existing_slot
             .filter(|prev| {
                 prev.quality == StateQuality::Fresh && prev.source_generation == caller_generation
             })
@@ -702,7 +713,16 @@ impl DeviceStateStore {
         // whole point of admission is to see the true
         // merged size and reject at the WIT boundary.
         let projected = merge_fields_unbounded(baseline, incoming);
-        check_slot_caps(projected.len(), fields_byte_estimate(&projected))
+        check_slot_caps(projected.len(), fields_byte_estimate(&projected))?;
+        // Round-16 finding 2: per-instance aggregate bytes
+        // cap. Compute (existing owner total − old slot
+        // bytes for this write's key + projected slot
+        // bytes) and reject if the sum exceeds the cap.
+        // A write that replaces an existing slot doesn't
+        // double-count the old bytes.
+        let projected_bytes = fields_byte_estimate(&projected);
+        let old_slot_bytes = existing_slot.map_or(0, |e| fields_byte_estimate(&e.fields));
+        check_instance_caps_locked(&inner, owner_instance, old_slot_bytes, projected_bytes)
     }
 
     /// H9 round-14 finding 1: pre-check whether a
@@ -712,10 +732,93 @@ impl DeviceStateStore {
     /// existing slot, so the check is purely on the
     /// incoming vec.
     ///
+    /// H9 round-16 finding 1: measures the vec *after*
+    /// deduplicating duplicate keys last-wins, matching
+    /// what the write path stores. Without this, a
+    /// snapshot like `[state=<big1>, state=<big2>]` would
+    /// count both values toward the byte cap even though
+    /// only `<big2>` reaches the projection.
+    ///
     /// # Errors
     /// [`SlotCapExceeded`] with the offending measurement.
     pub fn check_snapshot_admission(fields: &[KeyValue]) -> Result<(), SlotCapExceeded> {
-        check_slot_caps(fields.len(), fields_byte_estimate(fields))
+        let deduped = merge_fields_unbounded(&[], fields);
+        check_slot_caps(deduped.len(), fields_byte_estimate(&deduped))
+    }
+
+    /// H9 round-16 finding 2: pre-check whether accepting a
+    /// single-slot snapshot-shape write (`OkWithState`) for
+    /// `owner_instance` on `(device_id, capability)` would
+    /// push that instance's aggregate projected bytes past
+    /// [`MAX_PROJECTED_BYTES_PER_INSTANCE`]. Called from
+    /// `execute_command` alongside
+    /// [`Self::check_snapshot_admission`] (which handles
+    /// the per-slot cap). Separated because the per-slot
+    /// check doesn't need to know the owner, while the
+    /// aggregate check does.
+    ///
+    /// # Errors
+    /// [`SlotCapExceeded::Instance`] with the offending
+    /// aggregate.
+    pub fn check_instance_snapshot_admission(
+        &self,
+        device_id: &str,
+        owner_instance: &str,
+        capability: &str,
+        incoming: &[KeyValue],
+    ) -> Result<(), SlotCapExceeded> {
+        let inner = self.inner_read();
+        let key = (device_id.to_string(), capability.to_string());
+        let old_slot_bytes = inner
+            .entries
+            .get(&key)
+            .map_or(0, |e| fields_byte_estimate(&e.fields));
+        let deduped = merge_fields_unbounded(&[], incoming);
+        let projected_bytes = fields_byte_estimate(&deduped);
+        check_instance_caps_locked(&inner, owner_instance, old_slot_bytes, projected_bytes)
+    }
+
+    /// H9 round-16 finding 2: batch pre-check for
+    /// `register-device` — verifies that the whole
+    /// `initial_state` seed, taken together with all
+    /// existing entries owned by `owner_instance` (minus the
+    /// bytes the register will replace for this device),
+    /// stays within
+    /// [`MAX_PROJECTED_BYTES_PER_INSTANCE`]. Necessary
+    /// because a register call installs multiple slots for
+    /// one device in one atomic step; a per-slot check
+    /// couldn't see the cumulative effect until it was too
+    /// late to reject.
+    ///
+    /// # Errors
+    /// [`SlotCapExceeded::Instance`] with the offending
+    /// aggregate.
+    pub fn check_instance_register_admission(
+        &self,
+        device_id: &str,
+        owner_instance: &str,
+        seed_state: &[(String, Vec<KeyValue>)],
+    ) -> Result<(), SlotCapExceeded> {
+        let inner = self.inner_read();
+        // Sum bytes of the existing slots for this device
+        // (regardless of capability) — the register will
+        // replace them wholesale.
+        let old_device_bytes: usize = inner
+            .entries
+            .iter()
+            .filter(|((did, _), _)| did == device_id)
+            .map(|(_, e)| fields_byte_estimate(&e.fields))
+            .sum();
+        // Sum of the new (deduped) slot bytes across the
+        // whole seed.
+        let new_device_bytes: usize = seed_state
+            .iter()
+            .map(|(_, fields)| {
+                let deduped = merge_fields_unbounded(&[], fields);
+                fields_byte_estimate(&deduped)
+            })
+            .sum();
+        check_instance_caps_locked(&inner, owner_instance, old_device_bytes, new_device_bytes)
     }
 
     /// H9 round-14 finding 3: sign an all-devices-snapshot
@@ -962,7 +1065,11 @@ impl DeviceStateStore {
         // as `write_entry` so post-restart writes stamp the right
         // generation onto the reseeded slots.
         let generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
-        for (capability, mut fields) in initial_state {
+        for (capability, fields) in initial_state {
+            // H9 round-16 finding 1: canonicalize the input
+            // by folding duplicate keys last-wins BEFORE
+            // storing, same as `write_entry`'s replace path.
+            let mut fields = merge_fields_unbounded(&[], &fields);
             // H9 round-13 finding 2: same per-slot field cap
             // as `write_entry`.
             if fields.len() > MAX_FIELDS_PER_SLOT {
@@ -1123,16 +1230,36 @@ impl DeviceStateStore {
 /// [`Self::check_snapshot_admission`].
 pub const MAX_FIELDS_PER_SLOT: usize = 64;
 
-/// H9 round-14 finding 2: per-slot cap on the *serialized*
-/// byte size of a slot's fields (approximated as the sum of
-/// key bytes + value byte estimates). Bounds one slot's
-/// share of every snapshot response body — one slot at 4 MiB
-/// (the pre-fix worst case: 64 fields × 64 KiB each) would
-/// dominate a page and any subscriber's copy on the bus.
-/// Chosen to match the per-event 64 KiB budget so a single
-/// `state-change` event physically cannot exceed the slot
-/// cap on its own.
-pub const MAX_BYTES_PER_SLOT: usize = 64 * 1024;
+/// H9 round-14 finding 2 / round-16 finding 2: per-slot cap
+/// on the *serialized* byte size of a slot's fields
+/// (approximated as the sum of key bytes + value byte
+/// estimates). Bounds one slot's share of every snapshot
+/// response body — one slot at 4 MiB (the pre-fix worst
+/// case: 64 fields × 64 KiB each) would dominate a page
+/// and any subscriber's copy on the bus.
+///
+/// Round-16 tightened this from 64 KiB → 16 KiB. Real
+/// capabilities carry a handful of fields — a color-light
+/// with `hue` / `saturation` / `value` / `color-temp-kelvin`
+/// sits at tens of bytes, not thousands; even a JSON blob
+/// state comfortably fits in 16 KiB. The old 64 KiB
+/// aggregated (with `MAX_DEVICES_PER_INSTANCE = 1024`
+/// and `MAX_CAPABILITIES_PER_DEVICE = 32`) to 2 GiB per
+/// instance worst-case; the new bound plus the
+/// per-instance quota below caps that at
+/// `MAX_PROJECTED_BYTES_PER_INSTANCE` regardless.
+pub const MAX_BYTES_PER_SLOT: usize = 16 * 1024;
+
+/// H9 round-16 finding 2: per-instance aggregate cap on the
+/// projected byte size of all this instance's slots. Paired
+/// with the per-slot cap, this is the actual memory bound
+/// a plugin can push into the projection: pre-fix,
+/// `MAX_DEVICES_PER_INSTANCE × MAX_CAPABILITIES_PER_DEVICE
+/// × MAX_BYTES_PER_SLOT` multiplied to 2 GiB per instance —
+/// well over the host's budget. Checked at admission
+/// against an on-demand scan (only fires on the WIT-boundary
+/// admission path, not on every internal write).
+pub const MAX_PROJECTED_BYTES_PER_INSTANCE: usize = 16 * 1024 * 1024;
 
 /// Merge `updates` into `prev` by `key` — new keys are appended,
 /// duplicated keys have their value replaced by the update. Preserves
@@ -1212,38 +1339,94 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// H9 round-14 finding 1: per-slot cap violation from
+/// H9 round-14 finding 1 / round-16 finding 2: cap
+/// violation from
 /// [`DeviceStateStore::check_delta_admission`] /
 /// [`DeviceStateStore::check_snapshot_admission`]. The
 /// runtime maps this to `WitError::InvalidArgument` so the
 /// plugin sees a rejection instead of the projection
 /// silently truncating while the durable event log records
-/// the full state.
+/// the full state. Carries either a per-slot violation or
+/// a per-instance aggregate-bytes violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlotCapExceeded {
-    /// Projected merged / snapshot key count if the write
-    /// were accepted.
-    pub projected_fields: usize,
-    /// Projected merged / snapshot byte size (approximate,
-    /// key + value bytes).
-    pub projected_bytes: usize,
-    pub cap_fields: usize,
-    pub cap_bytes: usize,
+pub enum SlotCapExceeded {
+    /// A single slot would exceed the per-slot field or
+    /// byte cap.
+    Slot {
+        projected_fields: usize,
+        projected_bytes: usize,
+        cap_fields: usize,
+        cap_bytes: usize,
+    },
+    /// Accepting the write would push this instance's
+    /// total projected bytes past
+    /// [`MAX_PROJECTED_BYTES_PER_INSTANCE`].
+    Instance {
+        projected_instance_bytes: usize,
+        cap_instance_bytes: usize,
+    },
 }
 
 impl std::fmt::Display for SlotCapExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "device-state slot cap exceeded: fields={}/{} bytes={}/{}",
-            self.projected_fields, self.cap_fields, self.projected_bytes, self.cap_bytes,
-        )
+        match self {
+            Self::Slot {
+                projected_fields,
+                projected_bytes,
+                cap_fields,
+                cap_bytes,
+            } => write!(
+                f,
+                "device-state slot cap exceeded: fields={projected_fields}/{cap_fields} \
+                 bytes={projected_bytes}/{cap_bytes}",
+            ),
+            Self::Instance {
+                projected_instance_bytes,
+                cap_instance_bytes,
+            } => write!(
+                f,
+                "device-state per-instance aggregate cap exceeded: \
+                 bytes={projected_instance_bytes}/{cap_instance_bytes}",
+            ),
+        }
     }
+}
+
+/// H9 round-16 finding 2: aggregate-bytes check for one
+/// instance. Runs under an already-held read lock so the
+/// scan sees a consistent set of entries. On-demand rather
+/// than incremental — admission is only invoked at the WIT
+/// boundary, not on every internal write, so the scan cost
+/// (O(N) over the store, bounded by
+/// `MAX_DEVICES_PER_INSTANCE × MAX_CAPABILITIES_PER_DEVICE`)
+/// is acceptable next to a wasm host-call.
+fn check_instance_caps_locked(
+    inner: &StoreInner,
+    owner_instance: &str,
+    old_slot_bytes: usize,
+    projected_slot_bytes: usize,
+) -> Result<(), SlotCapExceeded> {
+    let owner_total: usize = inner
+        .entries
+        .values()
+        .filter(|e| e.owner_instance == owner_instance)
+        .map(|e| fields_byte_estimate(&e.fields))
+        .sum();
+    let projected_instance_bytes = owner_total
+        .saturating_sub(old_slot_bytes)
+        .saturating_add(projected_slot_bytes);
+    if projected_instance_bytes > MAX_PROJECTED_BYTES_PER_INSTANCE {
+        return Err(SlotCapExceeded::Instance {
+            projected_instance_bytes,
+            cap_instance_bytes: MAX_PROJECTED_BYTES_PER_INSTANCE,
+        });
+    }
+    Ok(())
 }
 
 fn check_slot_caps(projected_fields: usize, projected_bytes: usize) -> Result<(), SlotCapExceeded> {
     if projected_fields > MAX_FIELDS_PER_SLOT || projected_bytes > MAX_BYTES_PER_SLOT {
-        return Err(SlotCapExceeded {
+        return Err(SlotCapExceeded::Slot {
             projected_fields,
             projected_bytes,
             cap_fields: MAX_FIELDS_PER_SLOT,
@@ -2243,8 +2426,17 @@ mod tests {
                 ],
             )
             .expect_err("two new keys must overflow the field cap");
-        assert_eq!(err.cap_fields, MAX_FIELDS_PER_SLOT);
-        assert!(err.projected_fields > MAX_FIELDS_PER_SLOT);
+        match err {
+            SlotCapExceeded::Slot {
+                cap_fields,
+                projected_fields,
+                ..
+            } => {
+                assert_eq!(cap_fields, MAX_FIELDS_PER_SLOT);
+                assert!(projected_fields > MAX_FIELDS_PER_SLOT);
+            }
+            other @ SlotCapExceeded::Instance { .. } => panic!("expected Slot, got {other:?}"),
+        }
 
         // Byte cap: a single oversized value overflows even
         // when the field count is fine.
@@ -2257,8 +2449,104 @@ mod tests {
                 &[kv("giant", Value::StringVal(big))],
             )
             .expect_err("one oversized value must overflow the byte cap");
-        assert_eq!(err.cap_bytes, MAX_BYTES_PER_SLOT);
-        assert!(err.projected_bytes > MAX_BYTES_PER_SLOT);
+        match err {
+            SlotCapExceeded::Slot {
+                cap_bytes,
+                projected_bytes,
+                ..
+            } => {
+                assert_eq!(cap_bytes, MAX_BYTES_PER_SLOT);
+                assert!(projected_bytes > MAX_BYTES_PER_SLOT);
+            }
+            other @ SlotCapExceeded::Instance { .. } => panic!("expected Slot, got {other:?}"),
+        }
+    }
+
+    /// H9 round-16 finding 1: `replace_snapshot` inputs are
+    /// canonicalized last-wins before storing — a snapshot
+    /// with duplicate keys ends up as a single entry per
+    /// key in the projection.
+    #[test]
+    fn replace_snapshot_canonicalizes_duplicate_keys_last_wins() {
+        let store = DeviceStateStore::new();
+        store.replace_snapshot(
+            "dev-1".into(),
+            "alpha".into(),
+            "switch".into(),
+            vec![
+                kv("state", Value::BoolVal(true)),
+                kv("state", Value::BoolVal(false)),
+            ],
+            0,
+            0,
+        );
+        let entry = store.snapshot_capability("dev-1", "switch").unwrap();
+        assert_eq!(entry.fields.len(), 1);
+        assert_eq!(entry.fields[0].key, "state");
+        assert!(matches!(entry.fields[0].value, Value::BoolVal(false)));
+    }
+
+    /// H9 round-16 finding 2: per-instance aggregate cap
+    /// rejects writes that would push one plugin's total
+    /// projected bytes past
+    /// [`MAX_PROJECTED_BYTES_PER_INSTANCE`], even when
+    /// each individual write stays under the per-slot cap.
+    #[test]
+    fn check_delta_admission_enforces_per_instance_aggregate_cap() {
+        let store = DeviceStateStore::new();
+        // Fill the instance to just under the aggregate
+        // cap with slots each near the per-slot cap.
+        let per_slot_bytes = MAX_BYTES_PER_SLOT - 32;
+        let slots = MAX_PROJECTED_BYTES_PER_INSTANCE / per_slot_bytes;
+        for i in 0..slots {
+            store.apply_delta(
+                format!("dev-{i}"),
+                "alpha".into(),
+                "switch".into(),
+                vec![kv(
+                    "state",
+                    Value::StringVal("s".repeat(per_slot_bytes - "state".len())),
+                )],
+                0,
+                0,
+            );
+        }
+        // One more slot's-worth of bytes overflows the
+        // aggregate cap.
+        let err = store
+            .check_delta_admission(
+                "dev-tip",
+                "alpha",
+                "switch",
+                &[kv(
+                    "state",
+                    Value::StringVal("s".repeat(per_slot_bytes - "state".len())),
+                )],
+            )
+            .expect_err("aggregate cap must fire");
+        match err {
+            SlotCapExceeded::Instance {
+                cap_instance_bytes,
+                projected_instance_bytes,
+            } => {
+                assert_eq!(cap_instance_bytes, MAX_PROJECTED_BYTES_PER_INSTANCE);
+                assert!(projected_instance_bytes > MAX_PROJECTED_BYTES_PER_INSTANCE);
+            }
+            other @ SlotCapExceeded::Slot { .. } => panic!("expected Instance, got {other:?}"),
+        }
+        // A different owner_instance has its own quota
+        // bucket — same-shape write goes through.
+        store
+            .check_delta_admission(
+                "dev-tip",
+                "beta",
+                "switch",
+                &[kv(
+                    "state",
+                    Value::StringVal("s".repeat(per_slot_bytes - "state".len())),
+                )],
+            )
+            .expect("other instance has its own aggregate bucket");
     }
 
     /// H9 round-15 finding 1: admission mirrors
@@ -2330,25 +2618,26 @@ mod tests {
     #[test]
     fn check_delta_admission_normalizes_duplicate_keys_before_measuring() {
         let store = DeviceStateStore::new();
-        // Seed the slot with two ~30 KiB values (fits at
-        // ~60 KiB, well under the 64 KiB cap).
-        let thirty = "a".repeat(30 * 1024);
+        // Seed the slot near the per-slot byte cap: two
+        // ~7 KiB values (14 KiB total, under the 16 KiB cap).
+        let seven = "a".repeat(7 * 1024);
         store.apply_delta(
             "dev-1".into(),
             "alpha".into(),
             "switch".into(),
             vec![
-                kv("a", Value::StringVal(thirty.clone())),
-                kv("b", Value::StringVal(thirty.clone())),
+                kv("a", Value::StringVal(seven.clone())),
+                kv("b", Value::StringVal(seven.clone())),
             ],
             0,
             0,
         );
-        // Incoming that would end at ~70 KiB after
-        // last-wins: [a="" , a=<40 KiB>]. Pre-fix math
-        // treated this as ~40 KiB and admitted; round-15
-        // catches it.
-        let forty = "z".repeat(40 * 1024);
+        // Incoming that folds last-wins to `a=<12 KiB>`
+        // (7 replaced) alongside the untouched `b=7 KiB`,
+        // projecting to ~19 KiB — over the 16 KiB slot cap.
+        // Pre-fix (round-15) math subtracted `a`'s bytes
+        // twice and undercounted.
+        let twelve = "z".repeat(12 * 1024);
         let err = store
             .check_delta_admission(
                 "dev-1",
@@ -2356,11 +2645,16 @@ mod tests {
                 "switch",
                 &[
                     kv("a", Value::StringVal(String::new())),
-                    kv("a", Value::StringVal(forty)),
+                    kv("a", Value::StringVal(twelve)),
                 ],
             )
             .expect_err("duplicates must fold last-wins before the byte cap check");
-        assert!(err.projected_bytes > MAX_BYTES_PER_SLOT);
+        match err {
+            SlotCapExceeded::Slot {
+                projected_bytes, ..
+            } => assert!(projected_bytes > MAX_BYTES_PER_SLOT),
+            other @ SlotCapExceeded::Instance { .. } => panic!("expected Slot, got {other:?}"),
+        }
     }
 
     /// H9 round-15 finding 3: `verify_cursor` compares the

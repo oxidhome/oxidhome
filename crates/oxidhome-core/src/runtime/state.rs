@@ -875,6 +875,30 @@ impl host_devices::Host for PluginState {
                     return Err(err);
                 }
             };
+        // H9 round-16 finding 2: aggregate-bytes check
+        // *across the whole seed batch* — a per-slot check
+        // couldn't see that N slots each fitting the per-
+        // slot cap can still blow past the per-instance
+        // aggregate. Rejection here means the register is
+        // reversed: unregister the device_registry entry
+        // and return `InvalidArgument` before touching the
+        // projection.
+        if let Err(overflow) =
+            self.device_state
+                .check_instance_register_admission(&id, &self.instance_id, &seed_state)
+        {
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                device_id = %id,
+                overflow = %overflow,
+                "register-device denied (per-instance aggregate cap); rolling back registry",
+            );
+            let _ = self.devices.remove(&self.instance_id, &id);
+            return Err(WitError::InvalidArgument(format!(
+                "register-device on `{id}` would exceed the projection's per-instance \
+                 aggregate cap ({overflow})",
+            )));
+        }
         let received_ms = crate::state::event_log::now_unix_ms();
         // H9 round-10 finding 1: atomically flip every pre-existing
         // `Fresh` entry for this stable device-id to `Stale`, then
@@ -1336,16 +1360,13 @@ impl host_events::Host for PluginState {
                 instance_id = %self.instance_id,
                 device_id = %device_id,
                 capability = %sc.capability,
-                projected_fields = overflow.projected_fields,
-                projected_bytes = overflow.projected_bytes,
-                cap_fields = overflow.cap_fields,
-                cap_bytes = overflow.cap_bytes,
-                "publish_event denied: state-change would exceed the per-slot cap",
+                overflow = %overflow,
+                "publish_event denied: state-change would exceed a projection cap",
             );
             return Err(WitError::InvalidArgument(format!(
-                "state-change on `{device_id}/{cap}` would exceed the projection's \
-                 per-slot cap ({overflow}); host refuses the publish so the durable \
-                 log and the projection stay consistent",
+                "state-change on `{device_id}/{cap}` would exceed a projection cap \
+                 ({overflow}); host refuses the publish so the durable log and the \
+                 projection stay consistent",
                 cap = sc.capability,
             )));
         }

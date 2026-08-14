@@ -483,10 +483,24 @@ struct AllDevicesStateParams {
 /// Default page size for `GET /api/v1/devices/state` — chosen
 /// to comfortably carry a household-sized deployment in one
 /// round-trip while capping the worst-case response body.
-const DEFAULT_ALL_DEVICES_STATE_LIMIT: usize = 128;
+/// H9 round-16 finding 2: reduced from 128 to 64.
+const DEFAULT_ALL_DEVICES_STATE_LIMIT: usize = 64;
 /// Hard ceiling for the same endpoint — a caller can't push
 /// the page past this even if they explicitly ask.
-const MAX_ALL_DEVICES_STATE_LIMIT: usize = 512;
+/// H9 round-16 finding 2: reduced from 512 to 256.
+const MAX_ALL_DEVICES_STATE_LIMIT: usize = 256;
+/// H9 round-16 finding 2: hard cap on the cumulative
+/// serialized *bytes* of one snapshot page. The `limit`
+/// (device count) cap alone can't bound the response body
+/// when devices carry many capabilities each at the per-
+/// slot byte cap; the page truncates at a device boundary
+/// once cumulative bytes reach this ceiling. Chosen at
+/// 1 MiB — 2× the per-device × capability × slot bytes
+/// worst case of `MAX_CAPABILITIES_PER_DEVICE (32) *
+/// MAX_BYTES_PER_SLOT (16 KiB) = 512 KiB`, so a well-
+/// behaved plugin's single device never triggers the byte
+/// cap before the count cap does.
+const MAX_ALL_DEVICES_STATE_PAGE_BYTES: usize = 1024 * 1024;
 
 /// Body of `GET /api/v1/devices/state`. Same shape as
 /// [`DeviceStateSnapshot`] but returns entries across every
@@ -635,10 +649,39 @@ async fn get_all_device_state(
             }
         })
         .collect();
-    let next_cursor = if devices.len() > limit {
-        // Drop the sentinel `limit + 1`-th device and issue an
-        // HMAC-signed cursor anchored at its predecessor's id.
+    // H9 round-16 finding 2: enforce the cumulative-byte
+    // ceiling — walk devices in order, track running bytes,
+    // truncate at the last device that fits. Always keep
+    // at least one device even if it exceeds the ceiling on
+    // its own (bounded by per-slot × per-device caps, so
+    // 512 KiB worst case), so pagination always makes
+    // progress.
+    let mut running_bytes: usize = 0;
+    let mut byte_capped_at: Option<usize> = None;
+    for (i, device) in devices.iter().enumerate() {
+        let device_bytes: usize = device
+            .capabilities
+            .iter()
+            .map(|c| c.capability.len() + c.fields.iter().map(wire_kv_byte_estimate).sum::<usize>())
+            .sum();
+        if i > 0 && running_bytes.saturating_add(device_bytes) > MAX_ALL_DEVICES_STATE_PAGE_BYTES {
+            byte_capped_at = Some(i);
+            break;
+        }
+        running_bytes += device_bytes;
+    }
+    if let Some(cut) = byte_capped_at {
+        devices.truncate(cut);
+    }
+    let count_capped = devices.len() > limit;
+    if count_capped {
         devices.truncate(limit);
+    }
+    let next_cursor = if count_capped || byte_capped_at.is_some() {
+        // Issue an HMAC-signed cursor anchored at the last
+        // device we returned. `devices.last()` is guaranteed
+        // non-empty because either the count-cap or byte-cap
+        // truncation kept at least one device.
         devices.last().map(|d| {
             state
                 .engine
@@ -836,6 +879,23 @@ impl From<WireValue> for Value {
             WireValue::Json(j) => Value::JsonVal(j),
         }
     }
+}
+
+/// H9 round-16 finding 2: byte estimate for a
+/// `WireKeyValue` used by the snapshot handler's
+/// cumulative-page-bytes accounting. Rough approximation
+/// of the serialized JSON size — key length plus value
+/// payload length. Under-counts JSON overhead (`{"t":...,
+/// "v":...}` framing plus quoting), which is fine because
+/// the cap is a coarse ceiling, not an exact accounting.
+fn wire_kv_byte_estimate(kv: &WireKeyValue) -> usize {
+    let value_bytes = match &kv.value {
+        WireValue::Bool(_) => 5,                       // "true"/"false"
+        WireValue::Int(_) | WireValue::Float(_) => 20, // decimal digits
+        WireValue::String(s) | WireValue::Json(s) => s.len(),
+        WireValue::Bytes(b) => b.len(),
+    };
+    kv.key.len() + value_bytes
 }
 
 impl From<Value> for WireValue {

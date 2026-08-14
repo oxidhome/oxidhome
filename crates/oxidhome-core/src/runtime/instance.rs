@@ -815,6 +815,7 @@ impl PluginInstance {
     /// today, in the API/MCP layers later) looks up the device's
     /// owner in [`DeviceRegistry`](crate::DeviceRegistry) and calls
     /// this method on the matching [`PluginInstance`].
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_command(
         &mut self,
         device: DeviceId,
@@ -916,6 +917,7 @@ impl PluginInstance {
                 // already ran — nothing we can do about
                 // that — but the caller now knows the state
                 // isn't authoritative).
+                // Per-slot cap check.
                 if let Err(overflow) =
                     crate::state::DeviceStateStore::check_snapshot_admission(fields)
                 {
@@ -923,17 +925,39 @@ impl PluginInstance {
                         instance_id = %owner_instance,
                         device_id = %device_for_projection,
                         capability = %capability,
-                        projected_fields = overflow.projected_fields,
-                        projected_bytes = overflow.projected_bytes,
-                        cap_fields = overflow.cap_fields,
-                        cap_bytes = overflow.cap_bytes,
-                        "execute-command OkWithState exceeds the per-slot cap; downgrading to Err",
+                        overflow = %overflow,
+                        "execute-command OkWithState exceeds a projection cap; downgrading to Err",
                     );
                     return Ok(CommandResult::Err(
                         crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(
                             format!(
                                 "OkWithState on `{device_for_projection}/{capability}` would exceed \
                                  the projection's per-slot cap ({overflow})",
+                            ),
+                        ),
+                    ));
+                }
+                // H9 round-16 finding 2: per-instance
+                // aggregate-bytes cap check. Same downgrade
+                // semantics.
+                if let Err(overflow) = device_state.check_instance_snapshot_admission(
+                    &device_for_projection,
+                    &owner_instance,
+                    &capability,
+                    fields,
+                ) {
+                    tracing::warn!(
+                        instance_id = %owner_instance,
+                        device_id = %device_for_projection,
+                        capability = %capability,
+                        overflow = %overflow,
+                        "execute-command OkWithState exceeds a projection cap; downgrading to Err",
+                    );
+                    return Ok(CommandResult::Err(
+                        crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(
+                            format!(
+                                "OkWithState on `{device_for_projection}/{capability}` would exceed \
+                                 the projection's per-instance aggregate cap ({overflow})",
                             ),
                         ),
                     ));
