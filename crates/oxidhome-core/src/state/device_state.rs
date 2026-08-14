@@ -721,7 +721,13 @@ impl DeviceStateStore {
         // A write that replaces an existing slot doesn't
         // double-count the old bytes.
         let projected_bytes = fields_byte_estimate(&projected);
-        let old_slot_bytes = existing_slot.map_or(0, |e| fields_byte_estimate(&e.fields));
+        // Round-17 finding 3: only subtract the old slot's
+        // bytes if it was Fresh (Stale bytes are excluded
+        // from the owner's aggregate total, so subtracting
+        // them would under-count).
+        let old_slot_bytes = existing_slot
+            .filter(|e| e.quality == StateQuality::Fresh)
+            .map_or(0, |e| fields_byte_estimate(&e.fields));
         check_instance_caps_locked(&inner, owner_instance, old_slot_bytes, projected_bytes)
     }
 
@@ -744,6 +750,20 @@ impl DeviceStateStore {
     pub fn check_snapshot_admission(fields: &[KeyValue]) -> Result<(), SlotCapExceeded> {
         let deduped = merge_fields_unbounded(&[], fields);
         check_slot_caps(deduped.len(), fields_byte_estimate(&deduped))
+    }
+
+    /// H9 round-17 finding 2: fold duplicate keys in
+    /// `fields` last-wins, returning the canonical vec
+    /// the projection would store for a `replace_snapshot`
+    /// or `OkWithState`. Callers wrap this around any
+    /// snapshot vec that also feeds a wire response (the
+    /// `execute-command` result) so the projection, the
+    /// REST `HashMap` conversion, and the Connect RPC
+    /// duplicate-preserving encoding all agree on which
+    /// values are authoritative.
+    #[must_use]
+    pub fn canonicalize_snapshot_fields(fields: &[KeyValue]) -> Vec<KeyValue> {
+        merge_fields_unbounded(&[], fields)
     }
 
     /// H9 round-16 finding 2: pre-check whether accepting a
@@ -769,9 +789,13 @@ impl DeviceStateStore {
     ) -> Result<(), SlotCapExceeded> {
         let inner = self.inner_read();
         let key = (device_id.to_string(), capability.to_string());
+        // Round-17 finding 3: Stale slot bytes are excluded
+        // from the owner's aggregate — subtract only Fresh
+        // ones to stay symmetric.
         let old_slot_bytes = inner
             .entries
             .get(&key)
+            .filter(|e| e.quality == StateQuality::Fresh)
             .map_or(0, |e| fields_byte_estimate(&e.fields));
         let deduped = merge_fields_unbounded(&[], incoming);
         let projected_bytes = fields_byte_estimate(&deduped);
@@ -800,13 +824,16 @@ impl DeviceStateStore {
         seed_state: &[(String, Vec<KeyValue>)],
     ) -> Result<(), SlotCapExceeded> {
         let inner = self.inner_read();
-        // Sum bytes of the existing slots for this device
-        // (regardless of capability) — the register will
-        // replace them wholesale.
+        // Sum Fresh bytes of the existing slots for this
+        // device (regardless of capability) — the register
+        // will replace them wholesale. Round-17 finding 3:
+        // Stale bytes are excluded from the owner's
+        // aggregate, so they must be excluded from the
+        // subtract-baseline too.
         let old_device_bytes: usize = inner
             .entries
             .iter()
-            .filter(|((did, _), _)| did == device_id)
+            .filter(|((did, _), e)| did == device_id && e.quality == StateQuality::Fresh)
             .map(|(_, e)| fields_byte_estimate(&e.fields))
             .sum();
         // Sum of the new (deduped) slot bytes across the
@@ -1392,14 +1419,25 @@ impl std::fmt::Display for SlotCapExceeded {
     }
 }
 
-/// H9 round-16 finding 2: aggregate-bytes check for one
-/// instance. Runs under an already-held read lock so the
-/// scan sees a consistent set of entries. On-demand rather
-/// than incremental — admission is only invoked at the WIT
-/// boundary, not on every internal write, so the scan cost
-/// (O(N) over the store, bounded by
+/// H9 round-16 finding 2 / round-17 finding 3: aggregate-
+/// bytes check for one instance. Runs under an already-
+/// held read lock so the scan sees a consistent set of
+/// entries. On-demand rather than incremental — admission
+/// is only invoked at the WIT boundary, not on every
+/// internal write, so the scan cost (O(N) over the store,
+/// bounded by
 /// `MAX_DEVICES_PER_INSTANCE × MAX_CAPABILITIES_PER_DEVICE`)
 /// is acceptable next to a wasm host-call.
+///
+/// Round-17 finding 3: **counts Fresh entries only**. Stale
+/// entries are eligible for reclamation by the stale-cap
+/// evictor and by remove/re-register flows; charging them
+/// against a plugin's live quota would let an instance fill
+/// its quota, remove those devices, and then be locked
+/// out of publishing any new state until the total-store
+/// stale cap fires. The caller must symmetrically pass
+/// `old_slot_bytes = 0` when replacing a Stale slot (see
+/// callers).
 fn check_instance_caps_locked(
     inner: &StoreInner,
     owner_instance: &str,
@@ -1409,7 +1447,7 @@ fn check_instance_caps_locked(
     let owner_total: usize = inner
         .entries
         .values()
-        .filter(|e| e.owner_instance == owner_instance)
+        .filter(|e| e.owner_instance == owner_instance && e.quality == StateQuality::Fresh)
         .map(|e| fields_byte_estimate(&e.fields))
         .sum();
     let projected_instance_bytes = owner_total
@@ -2460,6 +2498,61 @@ mod tests {
             }
             other @ SlotCapExceeded::Instance { .. } => panic!("expected Slot, got {other:?}"),
         }
+    }
+
+    /// H9 round-17 finding 3: Stale entries don't count
+    /// against the per-instance aggregate quota — an
+    /// instance can fill 16 MiB with Fresh, mark it Stale,
+    /// and then publish new Fresh state up to the quota
+    /// again without waiting for the total-store stale-cap
+    /// evictor.
+    #[test]
+    fn stale_entries_do_not_charge_against_per_instance_quota() {
+        let store = DeviceStateStore::new();
+        // Fill the instance close to the aggregate cap with
+        // Fresh entries near the per-slot cap.
+        let per_slot_bytes = MAX_BYTES_PER_SLOT - 32;
+        let slots = MAX_PROJECTED_BYTES_PER_INSTANCE / per_slot_bytes;
+        for i in 0..slots {
+            store.apply_delta(
+                format!("dev-{i}"),
+                "alpha".into(),
+                "switch".into(),
+                vec![kv(
+                    "state",
+                    Value::StringVal("s".repeat(per_slot_bytes - "state".len())),
+                )],
+                0,
+                0,
+            );
+        }
+        // Adding another slot would overflow.
+        store
+            .check_delta_admission(
+                "dev-post",
+                "alpha",
+                "switch",
+                &[kv(
+                    "state",
+                    Value::StringVal("s".repeat(per_slot_bytes - "state".len())),
+                )],
+            )
+            .expect_err("Fresh baseline: aggregate cap must fire");
+
+        // Flip everything Stale. Aggregate accounting
+        // excludes Stale now — the same write goes through.
+        assert!(store.mark_instance_stale("alpha") >= slots);
+        store
+            .check_delta_admission(
+                "dev-post",
+                "alpha",
+                "switch",
+                &[kv(
+                    "state",
+                    Value::StringVal("s".repeat(per_slot_bytes - "state".len())),
+                )],
+            )
+            .expect("Stale entries must not consume the live quota");
     }
 
     /// H9 round-16 finding 1: `replace_snapshot` inputs are

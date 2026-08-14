@@ -855,6 +855,38 @@ impl host_devices::Host for PluginState {
         // move into `register` — need them for state seeding /
         // reconciliation.
         let seed_state = seed_state_from_initial(&info);
+        // H9 round-17 finding 1: run the aggregate-bytes
+        // check BEFORE the registry mutation. The device_id
+        // is deterministic (`stable_device_id`), so we can
+        // compute it without registering first. Pre-fix, a
+        // re-register that passed the device-count cap but
+        // failed the aggregate cap called `devices.remove`
+        // to roll back — which unconditionally deleted the
+        // entry, dropping the *pre-register* metadata that
+        // had been overwritten in-place. State APIs would
+        // then advertise a Fresh device that command routing
+        // and registry reads said didn't exist.
+        let would_be_id = crate::state::devices::stable_device_id(
+            &self.installation_uuid,
+            &self.instance_id,
+            &info.local_id,
+        );
+        if let Err(overflow) = self.device_state.check_instance_register_admission(
+            &would_be_id,
+            &self.instance_id,
+            &seed_state,
+        ) {
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                device_id = %would_be_id,
+                overflow = %overflow,
+                "register-device denied (per-instance aggregate cap); registry untouched",
+            );
+            return Err(WitError::InvalidArgument(format!(
+                "register-device on `{would_be_id}` would exceed the projection's \
+                 per-instance aggregate cap ({overflow})",
+            )));
+        }
         // H9 round-11 finding 1: per-instance registration cap
         // is enforced under the registry's write lock so a
         // check-then-insert can't overshoot. Refusal returns
@@ -875,30 +907,10 @@ impl host_devices::Host for PluginState {
                     return Err(err);
                 }
             };
-        // H9 round-16 finding 2: aggregate-bytes check
-        // *across the whole seed batch* — a per-slot check
-        // couldn't see that N slots each fitting the per-
-        // slot cap can still blow past the per-instance
-        // aggregate. Rejection here means the register is
-        // reversed: unregister the device_registry entry
-        // and return `InvalidArgument` before touching the
-        // projection.
-        if let Err(overflow) =
-            self.device_state
-                .check_instance_register_admission(&id, &self.instance_id, &seed_state)
-        {
-            tracing::warn!(
-                instance_id = %self.instance_id,
-                device_id = %id,
-                overflow = %overflow,
-                "register-device denied (per-instance aggregate cap); rolling back registry",
-            );
-            let _ = self.devices.remove(&self.instance_id, &id);
-            return Err(WitError::InvalidArgument(format!(
-                "register-device on `{id}` would exceed the projection's per-instance \
-                 aggregate cap ({overflow})",
-            )));
-        }
+        debug_assert_eq!(
+            id, would_be_id,
+            "stable_device_id must match try_register's derivation"
+        );
         let received_ms = crate::state::event_log::now_unix_ms();
         // H9 round-10 finding 1: atomically flip every pre-existing
         // `Fresh` entry for this stable device-id to `Stale`, then

@@ -875,6 +875,17 @@ impl PluginInstance {
             let data = self.store.data();
             let devices = Arc::clone(&data.devices);
             let device_state = Arc::clone(&data.device_state);
+            // H9 round-17 finding 2: canonicalize the
+            // returned fields once (fold duplicate keys
+            // last-wins) and use the canonical vec for
+            // both the projection write AND the returned
+            // `CommandResult` — round-16 canonicalized
+            // storage but returned the original vec, so
+            // Connect RPC still surfaced duplicate keys
+            // while REST + projection saw the last-wins
+            // value. Now every consumer sees the same
+            // authoritative vec.
+            let canonical = crate::state::DeviceStateStore::canonicalize_snapshot_fields(fields);
             let projection_ok =
                 if let Ok(meta) = devices.get(&owner_instance, &device_for_projection) {
                     let capability_declared = meta
@@ -917,9 +928,11 @@ impl PluginInstance {
                 // already ran — nothing we can do about
                 // that — but the caller now knows the state
                 // isn't authoritative).
-                // Per-slot cap check.
+                // Per-slot cap check — measured on the
+                // canonical vec (matches what the projection
+                // and the returned result carry).
                 if let Err(overflow) =
-                    crate::state::DeviceStateStore::check_snapshot_admission(fields)
+                    crate::state::DeviceStateStore::check_snapshot_admission(&canonical)
                 {
                     tracing::warn!(
                         instance_id = %owner_instance,
@@ -944,7 +957,7 @@ impl PluginInstance {
                     &device_for_projection,
                     &owner_instance,
                     &capability,
-                    fields,
+                    &canonical,
                 ) {
                     tracing::warn!(
                         instance_id = %owner_instance,
@@ -967,11 +980,12 @@ impl PluginInstance {
                     device_for_projection,
                     owner_instance,
                     capability,
-                    fields.clone(),
+                    canonical.clone(),
                     0, // observed_ms — commands don't carry a plugin timestamp
                     received_ms,
                 );
             }
+            return Ok(CommandResult::OkWithState(canonical));
         }
         Ok(result)
     }
