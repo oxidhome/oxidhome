@@ -933,19 +933,18 @@ impl PluginInstance {
             );
             false
         };
-        // Canonicalize once — feeds both the wire response
-        // (both branches) and, if projection_ok, the store
-        // write.
-        let canonical = crate::state::DeviceStateStore::canonicalize_snapshot_fields(&fields);
         if projection_ok {
             // H9 round-16 finding 2: per-instance
             // aggregate-bytes cap check. Same downgrade
-            // semantics as the per-slot cap.
+            // semantics as the per-slot cap. Round-19
+            // finding 1: measures against `&fields`
+            // (borrowed, no clone) via
+            // `projected_slot_size` internally.
             if let Err(overflow) = device_state.check_instance_snapshot_admission(
                 &device_for_projection,
                 &owner_instance,
                 &capability,
-                &canonical,
+                &fields,
             ) {
                 tracing::warn!(
                     instance_id = %owner_instance,
@@ -963,6 +962,16 @@ impl PluginInstance {
                     ),
                 ));
             }
+        }
+        // H9 round-19 finding 1: canonicalize by **consuming**
+        // the owned `fields` vec — moves values, only
+        // clones keys for the dedup index (bounded by
+        // `MAX_FIELDS_PER_SLOT` since admission already
+        // passed). Runs unconditionally so both the
+        // projection write AND the returned wire response
+        // see the same last-wins vec.
+        let canonical = crate::state::DeviceStateStore::canonicalize_snapshot_fields(fields);
+        if projection_ok {
             let received_ms = crate::state::event_log::now_unix_ms();
             device_state.replace_snapshot(
                 device_for_projection,

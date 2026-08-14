@@ -588,6 +588,7 @@ impl From<ScopeDenied> for AllDevicesStateError {
 /// - `409` cursor's epoch no longer matches the store's
 ///   current epoch — restart the resync from an unpinned
 ///   request.
+#[allow(clippy::too_many_lines)]
 async fn get_all_device_state(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
@@ -642,40 +643,87 @@ async fn get_all_device_state(
     // Entries are already sorted `(device_id, capability)` by
     // `snapshot_page_with_revision`, so we can group into
     // devices on the fly while tracking cumulative bytes.
+    // H9 round-19 finding 2: accumulate an entire pending
+    // device before committing it as one unit. Pre-fix, the
+    // byte-cap check ran only on the first capability of a
+    // new device — once that fit, every remaining capability
+    // for that device was appended unchecked, so a page could
+    // silently exceed the 1 MiB ceiling by up to
+    // `MAX_CAPABILITIES_PER_DEVICE × MAX_BYTES_PER_SLOT`
+    // (~512 KiB) per device. Whole-device admission keeps
+    // per-device atomicity while honouring the page ceiling.
     let mut retained_devices: Vec<Vec<Arc<crate::state::DeviceState>>> = Vec::new();
     let mut running_bytes: usize = 0;
+    let mut pending: Vec<Arc<crate::state::DeviceState>> = Vec::new();
+    let mut pending_bytes: usize = 0;
     let mut byte_capped = false;
     let mut count_capped = false;
-    for entry in entries {
-        let is_new_device = retained_devices
-            .last()
-            .and_then(|caps| caps.first())
-            .is_none_or(|first| first.device_id != entry.device_id);
-        if is_new_device {
-            if retained_devices.len() >= limit {
-                count_capped = true;
-                break;
-            }
-            retained_devices.push(Vec::new());
+
+    // Try to commit the current `pending` device to
+    // `retained_devices`. Returns whether to keep iterating
+    // (false = we hit a cap and should break).
+    #[allow(clippy::items_after_statements)]
+    let commit = |retained: &mut Vec<Vec<Arc<crate::state::DeviceState>>>,
+                  running: &mut usize,
+                  pending: &mut Vec<Arc<crate::state::DeviceState>>,
+                  pending_bytes: &mut usize,
+                  count_capped: &mut bool,
+                  byte_capped: &mut bool|
+     -> bool {
+        if pending.is_empty() {
+            return true;
         }
-        let entry_bytes = entry.capability.len() + entry.field_byte_estimate();
-        // Keep at least one device even if it exceeds the
-        // ceiling on its own (bounded by per-device caps),
-        // so pagination always makes progress.
-        let would_be_bytes = running_bytes.saturating_add(entry_bytes);
-        if retained_devices.len() > 1
-            && is_new_device
-            && would_be_bytes > MAX_ALL_DEVICES_STATE_PAGE_BYTES
+        if retained.len() >= limit {
+            *count_capped = true;
+            return false;
+        }
+        // Always keep the first device even if it exceeds
+        // the ceiling on its own (bounded by per-device
+        // caps, ~512 KiB), so pagination always makes
+        // progress.
+        let would_be_total = running.saturating_add(*pending_bytes);
+        if !retained.is_empty() && would_be_total > MAX_ALL_DEVICES_STATE_PAGE_BYTES {
+            *byte_capped = true;
+            return false;
+        }
+        *running = would_be_total;
+        retained.push(std::mem::take(pending));
+        *pending_bytes = 0;
+        true
+    };
+
+    for entry in entries {
+        let is_new_device = pending
+            .first()
+            .is_none_or(|first| first.device_id != entry.device_id);
+        if is_new_device
+            && !commit(
+                &mut retained_devices,
+                &mut running_bytes,
+                &mut pending,
+                &mut pending_bytes,
+                &mut count_capped,
+                &mut byte_capped,
+            )
         {
-            byte_capped = true;
-            retained_devices.pop();
             break;
         }
-        running_bytes = would_be_bytes;
-        retained_devices
-            .last_mut()
-            .expect("just pushed")
-            .push(entry);
+        pending_bytes = pending_bytes
+            .saturating_add(entry.capability.len())
+            .saturating_add(entry.field_byte_estimate());
+        pending.push(entry);
+    }
+    // Commit the trailing pending device unless we already
+    // broke out on a cap.
+    if !count_capped && !byte_capped {
+        let _ = commit(
+            &mut retained_devices,
+            &mut running_bytes,
+            &mut pending,
+            &mut pending_bytes,
+            &mut count_capped,
+            &mut byte_capped,
+        );
     }
     // Wire conversion only for retained entries.
     let devices: Vec<DeviceStateSnapshot> = retained_devices

@@ -721,22 +721,19 @@ impl DeviceStateStore {
                 prev.quality == StateQuality::Fresh && prev.source_generation == caller_generation
             })
             .map_or(&[][..], |prev| prev.fields.as_slice());
-        // Round-15 finding 2: last-wins normalization of
-        // duplicates in the incoming vec, matching
-        // `merge_fields`'s sequential-apply semantics.
-        // Uses an *unbounded* merge (unlike `merge_fields`,
-        // which silently truncates at the field cap): the
-        // whole point of admission is to see the true
-        // merged size and reject at the WIT boundary.
-        let projected = merge_fields_unbounded(baseline, incoming);
-        check_slot_caps(projected.len(), fields_byte_estimate(&projected))?;
+        // Round-15 finding 2 / round-19 finding 1: last-wins
+        // normalization of duplicates in the incoming vec,
+        // matching `merge_fields`'s sequential-apply
+        // semantics. Round-19 uses `projected_slot_size` so
+        // measurement doesn't clone any `KeyValue`.
+        let (_, projected_bytes) = projected_slot_size(baseline, incoming)?;
         // Round-16 finding 2: per-instance aggregate bytes
         // cap. Compute (existing owner total − old slot
         // bytes for this write's key + projected slot
         // bytes) and reject if the sum exceeds the cap.
         // A write that replaces an existing slot doesn't
         // double-count the old bytes.
-        let projected_bytes = fields_byte_estimate(&projected);
+        //
         // Round-17 finding 3: only subtract the old slot's
         // bytes if it was Fresh (Stale bytes are excluded
         // from the owner's aggregate total, so subtracting
@@ -764,22 +761,28 @@ impl DeviceStateStore {
     /// # Errors
     /// [`SlotCapExceeded`] with the offending measurement.
     pub fn check_snapshot_admission(fields: &[KeyValue]) -> Result<(), SlotCapExceeded> {
-        let deduped = merge_fields_unbounded(&[], fields);
-        check_slot_caps(deduped.len(), fields_byte_estimate(&deduped))
+        // H9 round-19 finding 1: measure without cloning
+        // any `KeyValue`. Early-exits on overflow so an
+        // oversized guest response gets rejected before any
+        // per-field allocation.
+        projected_slot_size(&[], fields).map(|_| ())
     }
 
-    /// H9 round-17 finding 2: fold duplicate keys in
-    /// `fields` last-wins, returning the canonical vec
-    /// the projection would store for a `replace_snapshot`
-    /// or `OkWithState`. Callers wrap this around any
+    /// H9 round-17 finding 2 / round-19 finding 1:
+    /// consuming canonicalizer — folds duplicate keys
+    /// last-wins in a `Vec<KeyValue>` by moving values (no
+    /// per-`KeyValue` clone). Callers wrap this around any
     /// snapshot vec that also feeds a wire response (the
     /// `execute-command` result) so the projection, the
     /// REST `HashMap` conversion, and the Connect RPC
     /// duplicate-preserving encoding all agree on which
-    /// values are authoritative.
+    /// values are authoritative. Must run *after*
+    /// [`Self::check_snapshot_admission`] has confirmed
+    /// the projected size fits — otherwise the output can
+    /// exceed the per-slot caps.
     #[must_use]
-    pub fn canonicalize_snapshot_fields(fields: &[KeyValue]) -> Vec<KeyValue> {
-        merge_fields_unbounded(&[], fields)
+    pub fn canonicalize_snapshot_fields(fields: Vec<KeyValue>) -> Vec<KeyValue> {
+        canonicalize_owned(fields)
     }
 
     /// H9 round-16 finding 2: pre-check whether accepting a
@@ -813,8 +816,13 @@ impl DeviceStateStore {
             .get(&key)
             .filter(|e| e.quality == StateQuality::Fresh)
             .map_or(0, |e| fields_byte_estimate(&e.fields));
-        let deduped = merge_fields_unbounded(&[], incoming);
-        let projected_bytes = fields_byte_estimate(&deduped);
+        // Round-19 finding 1: measure without cloning any
+        // `KeyValue`. `projected_slot_size` returns the
+        // per-slot cap error too, but the callers of this
+        // method already ran `check_snapshot_admission`, so
+        // treat the per-slot error as an internal invariant
+        // failure.
+        let (_, projected_bytes) = projected_slot_size(&[], incoming)?;
         check_instance_caps_locked(&inner, owner_instance, old_slot_bytes, projected_bytes)
     }
 
@@ -853,14 +861,16 @@ impl DeviceStateStore {
             .map(|(_, e)| fields_byte_estimate(&e.fields))
             .sum();
         // Sum of the new (deduped) slot bytes across the
-        // whole seed.
-        let new_device_bytes: usize = seed_state
-            .iter()
-            .map(|(_, fields)| {
-                let deduped = merge_fields_unbounded(&[], fields);
-                fields_byte_estimate(&deduped)
-            })
-            .sum();
+        // whole seed. Round-19 finding 1: measure without
+        // cloning any `KeyValue`. Each capability's per-slot
+        // caps are already checked upstream by
+        // `check_snapshot_admission`, so a per-slot error
+        // here would be an invariant break — propagate.
+        let mut new_device_bytes: usize = 0;
+        for (_, fields) in seed_state {
+            let (_, bytes) = projected_slot_size(&[], fields)?;
+            new_device_bytes = new_device_bytes.saturating_add(bytes);
+        }
         check_instance_caps_locked(&inner, owner_instance, old_device_bytes, new_device_bytes)
     }
 
@@ -1478,16 +1488,63 @@ fn check_instance_caps_locked(
     Ok(())
 }
 
-fn check_slot_caps(projected_fields: usize, projected_bytes: usize) -> Result<(), SlotCapExceeded> {
-    if projected_fields > MAX_FIELDS_PER_SLOT || projected_bytes > MAX_BYTES_PER_SLOT {
-        return Err(SlotCapExceeded::Slot {
-            projected_fields,
-            projected_bytes,
-            cap_fields: MAX_FIELDS_PER_SLOT,
-            cap_bytes: MAX_BYTES_PER_SLOT,
-        });
+/// H9 round-19 finding 1: compute the projected merged
+/// `(field_count, byte_size)` of `baseline ⊕ incoming` under
+/// last-wins semantics **without cloning any `KeyValue`**.
+/// Uses `HashMap<&str, usize>` keyed on borrowed key slices
+/// (bounded by unique key count) so a plugin returning a
+/// huge unique-fields vec doesn't cause a full host-side
+/// clone before admission rejects.
+///
+/// Early-exits the moment either cap would be exceeded, so
+/// the map itself is bounded at
+/// `MAX_FIELDS_PER_SLOT + 1` entries regardless of input
+/// size. Returns `Err` with the currently-observed sizes so
+/// the caller can surface them in the rejection message.
+fn projected_slot_size(
+    baseline: &[KeyValue],
+    incoming: &[KeyValue],
+) -> Result<(usize, usize), SlotCapExceeded> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut running_bytes: usize = 0;
+    for kv in baseline.iter().chain(incoming.iter()) {
+        let bytes = key_value_byte_estimate(kv);
+        let prev = seen.insert(kv.key.as_str(), bytes);
+        running_bytes = running_bytes
+            .saturating_sub(prev.unwrap_or(0))
+            .saturating_add(bytes);
+        if seen.len() > MAX_FIELDS_PER_SLOT || running_bytes > MAX_BYTES_PER_SLOT {
+            return Err(SlotCapExceeded::Slot {
+                projected_fields: seen.len(),
+                projected_bytes: running_bytes,
+                cap_fields: MAX_FIELDS_PER_SLOT,
+                cap_bytes: MAX_BYTES_PER_SLOT,
+            });
+        }
     }
-    Ok(())
+    Ok((seen.len(), running_bytes))
+}
+
+/// H9 round-19 finding 1: consuming canonicalizer — folds
+/// duplicate keys last-wins in a `Vec<KeyValue>` by *moving*
+/// values (no per-`KeyValue` clone). Called ONLY after
+/// admission has confirmed the projected size fits, so the
+/// output is bounded by [`MAX_FIELDS_PER_SLOT`] × the
+/// per-value cap. The dedup index clones only the keys of
+/// retained entries (≤ `MAX_FIELDS_PER_SLOT`), never the
+/// value payload.
+fn canonicalize_owned(fields: Vec<KeyValue>) -> Vec<KeyValue> {
+    let mut idx_of: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<KeyValue> = Vec::new();
+    for kv in fields {
+        if let Some(&i) = idx_of.get(kv.key.as_str()) {
+            out[i].value = kv.value;
+        } else {
+            idx_of.insert(kv.key.clone(), out.len());
+            out.push(kv);
+        }
+    }
+    out
 }
 
 fn key_value_byte_estimate(kv: &KeyValue) -> usize {
