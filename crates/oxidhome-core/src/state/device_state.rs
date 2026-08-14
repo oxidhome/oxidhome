@@ -139,6 +139,22 @@ pub struct DeviceState {
     pub quality: StateQuality,
 }
 
+impl DeviceState {
+    /// H9 round-18 finding 1: approximate serialized byte
+    /// size of this entry's fields (key + value bytes). Used
+    /// by the snapshot pagination handler to enforce a
+    /// cumulative-page-byte cap on the raw `Arc<DeviceState>`
+    /// entries, *before* the expensive deep-clone into wire
+    /// form. Pre-fix, the handler cloned every fetched
+    /// entry's fields, then applied the cap — at the max
+    /// per-page count that meant up to ~128 MiB cloned to
+    /// serve a nominally 1 MiB response.
+    #[must_use]
+    pub fn field_byte_estimate(&self) -> usize {
+        fields_byte_estimate(&self.fields)
+    }
+}
+
 /// The map + the monotonic revision counter + per-instance
 /// generation + store epoch, **jointly under one `RwLock`** so
 /// every mutating operation linearizes.

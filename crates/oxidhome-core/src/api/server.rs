@@ -6,6 +6,7 @@
 //! without binding a TCP port.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use std::collections::HashMap;
 
@@ -629,55 +630,76 @@ async fn get_all_device_state(
         Some((_, r, _)) => *r,
         None => current_revision,
     };
-    let mut by_device: std::collections::BTreeMap<String, Vec<DeviceStateEntry>> =
-        std::collections::BTreeMap::new();
-    for entry in &entries {
-        by_device
-            .entry(entry.device_id.clone())
-            .or_default()
-            .push(DeviceStateEntry::from_state(entry));
+    // H9 round-18 finding 1: apply the cumulative-byte and
+    // count caps to the raw `Arc<DeviceState>` entries FIRST
+    // — cheap `Arc::clone` per retained entry, no wire
+    // conversion — and only deep-clone into wire values for
+    // the survivors. Pre-fix, `DeviceStateEntry::from_state`
+    // ran on every fetched entry (up to `(limit+1) *
+    // MAX_CAPABILITIES_PER_DEVICE * MAX_BYTES_PER_SLOT` ≈
+    // 128 MiB at max limit) before truncation.
+    //
+    // Entries are already sorted `(device_id, capability)` by
+    // `snapshot_page_with_revision`, so we can group into
+    // devices on the fly while tracking cumulative bytes.
+    let mut retained_devices: Vec<Vec<Arc<crate::state::DeviceState>>> = Vec::new();
+    let mut running_bytes: usize = 0;
+    let mut byte_capped = false;
+    let mut count_capped = false;
+    for entry in entries {
+        let is_new_device = retained_devices
+            .last()
+            .and_then(|caps| caps.first())
+            .is_none_or(|first| first.device_id != entry.device_id);
+        if is_new_device {
+            if retained_devices.len() >= limit {
+                count_capped = true;
+                break;
+            }
+            retained_devices.push(Vec::new());
+        }
+        let entry_bytes = entry.capability.len() + entry.field_byte_estimate();
+        // Keep at least one device even if it exceeds the
+        // ceiling on its own (bounded by per-device caps),
+        // so pagination always makes progress.
+        let would_be_bytes = running_bytes.saturating_add(entry_bytes);
+        if retained_devices.len() > 1
+            && is_new_device
+            && would_be_bytes > MAX_ALL_DEVICES_STATE_PAGE_BYTES
+        {
+            byte_capped = true;
+            retained_devices.pop();
+            break;
+        }
+        running_bytes = would_be_bytes;
+        retained_devices
+            .last_mut()
+            .expect("just pushed")
+            .push(entry);
     }
-    let mut devices: Vec<DeviceStateSnapshot> = by_device
+    // Wire conversion only for retained entries.
+    let devices: Vec<DeviceStateSnapshot> = retained_devices
         .into_iter()
-        .map(|(device_id, mut capabilities)| {
-            capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
+        .map(|caps| {
+            let device_id = caps
+                .first()
+                .expect("retained device has at least one entry")
+                .device_id
+                .clone();
+            let mut wire: Vec<DeviceStateEntry> = caps
+                .iter()
+                .map(|a| DeviceStateEntry::from_state(a))
+                .collect();
+            wire.sort_by(|a, b| a.capability.cmp(&b.capability));
             DeviceStateSnapshot {
                 device_id,
                 epoch: epoch.clone(),
                 revision,
-                capabilities,
+                capabilities: wire,
             }
         })
         .collect();
-    // H9 round-16 finding 2: enforce the cumulative-byte
-    // ceiling — walk devices in order, track running bytes,
-    // truncate at the last device that fits. Always keep
-    // at least one device even if it exceeds the ceiling on
-    // its own (bounded by per-slot × per-device caps, so
-    // 512 KiB worst case), so pagination always makes
-    // progress.
-    let mut running_bytes: usize = 0;
-    let mut byte_capped_at: Option<usize> = None;
-    for (i, device) in devices.iter().enumerate() {
-        let device_bytes: usize = device
-            .capabilities
-            .iter()
-            .map(|c| c.capability.len() + c.fields.iter().map(wire_kv_byte_estimate).sum::<usize>())
-            .sum();
-        if i > 0 && running_bytes.saturating_add(device_bytes) > MAX_ALL_DEVICES_STATE_PAGE_BYTES {
-            byte_capped_at = Some(i);
-            break;
-        }
-        running_bytes += device_bytes;
-    }
-    if let Some(cut) = byte_capped_at {
-        devices.truncate(cut);
-    }
-    let count_capped = devices.len() > limit;
-    if count_capped {
-        devices.truncate(limit);
-    }
-    let next_cursor = if count_capped || byte_capped_at.is_some() {
+    let next_cursor = if count_capped || byte_capped {
         // Issue an HMAC-signed cursor anchored at the last
         // device we returned. `devices.last()` is guaranteed
         // non-empty because either the count-cap or byte-cap
@@ -879,23 +901,6 @@ impl From<WireValue> for Value {
             WireValue::Json(j) => Value::JsonVal(j),
         }
     }
-}
-
-/// H9 round-16 finding 2: byte estimate for a
-/// `WireKeyValue` used by the snapshot handler's
-/// cumulative-page-bytes accounting. Rough approximation
-/// of the serialized JSON size — key length plus value
-/// payload length. Under-counts JSON overhead (`{"t":...,
-/// "v":...}` framing plus quoting), which is fine because
-/// the cap is a coarse ceiling, not an exact accounting.
-fn wire_kv_byte_estimate(kv: &WireKeyValue) -> usize {
-    let value_bytes = match &kv.value {
-        WireValue::Bool(_) => 5,                       // "true"/"false"
-        WireValue::Int(_) | WireValue::Float(_) => 20, // decimal digits
-        WireValue::String(s) | WireValue::Json(s) => s.len(),
-        WireValue::Bytes(b) => b.len(),
-    };
-    kv.key.len() + value_bytes
 }
 
 impl From<Value> for WireValue {
