@@ -1324,9 +1324,12 @@ impl host_events::Host for PluginState {
             Some(device_id),
             crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
         ) = (ev.device.as_deref(), &ev.payload)
-            && let Err(overflow) =
-                self.device_state
-                    .check_delta_admission(device_id, &sc.capability, &sc.fields)
+            && let Err(overflow) = self.device_state.check_delta_admission(
+                device_id,
+                &self.instance_id,
+                &sc.capability,
+                &sc.fields,
+            )
         {
             tracing::warn!(
                 target: "device_state.slot_field_cap",

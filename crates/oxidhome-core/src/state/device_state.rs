@@ -507,6 +507,16 @@ impl DeviceStateStore {
                 f
             }
         };
+        // H9 round-15 finding 2: byte-cap backstop. Admission
+        // at the WIT boundary catches the common case
+        // correctly (round-15 fixed the last-wins-with-
+        // duplicates math), but the store's write path is
+        // reachable from direct-callers (tests, in-process
+        // helpers) and rare cross-instance races. Drop
+        // trailing fields until the total serialized size
+        // fits `MAX_BYTES_PER_SLOT`, matching the
+        // field-count backstop pattern above.
+        let final_fields = truncate_to_byte_cap(final_fields, &device_id, &capability);
         let entry = Arc::new(DeviceState {
             device_id,
             capability,
@@ -640,49 +650,59 @@ impl DeviceStateStore {
     /// desyncing from the durable log and the bus fanout
     /// (round-13's silent truncation).
     ///
-    /// Reads the current slot under a read lock, computes the
-    /// projected merged size, and returns
-    /// `Err(SlotCapExceeded)` if either cap would be
-    /// exceeded. There's a small check-then-write TOCTOU
-    /// window, but concurrent writes come from *this* store
-    /// only through serialized per-instance WIT calls; the
-    /// backstop hard-cap in the write path catches the rare
-    /// cross-instance race.
+    /// H9 round-15 finding 1: the admission math mirrors
+    /// [`Self::write_entry`]'s merge-vs-replace rule.
+    /// `apply_delta` only *merges* into a Fresh entry from
+    /// the caller's current generation; otherwise it treats
+    /// the incoming vec as a replace. Round-14 baselined
+    /// against the existing slot unconditionally, so a
+    /// post-restart 64-field Stale slot + a one-field
+    /// delta got counted as 65 fields and rejected —
+    /// even though the write would have replaced the slot
+    /// with just that one field.
+    ///
+    /// H9 round-15 finding 2: the incoming vec is
+    /// **normalized to last-wins per key** before
+    /// measuring. Round-14 subtracted the existing value's
+    /// bytes for every duplicate occurrence of a key,
+    /// under-counting the merged result. E.g. an existing
+    /// `{a=40 KiB, b=20 KiB}` + incoming `[a="", a=<50 KiB>]`
+    /// used to project to 50 KiB but actually writes 70 KiB.
+    /// Normalizing first captures the last value only —
+    /// which is what `merge_fields` observes after applying
+    /// updates sequentially.
     ///
     /// # Errors
     /// [`SlotCapExceeded`] with the offending measurement.
     pub fn check_delta_admission(
         &self,
         device_id: &str,
+        owner_instance: &str,
         capability: &str,
         incoming: &[KeyValue],
     ) -> Result<(), SlotCapExceeded> {
         let inner = self.inner_read();
         let key = (device_id.to_string(), capability.to_string());
-        let (existing_keys, existing_bytes): (Vec<&str>, usize) = inner
+        // Round-15 finding 1: only take the existing slot as
+        // the merge baseline if the write path would too.
+        // See `write_entry`.
+        let caller_generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
+        let baseline: &[KeyValue] = inner
             .entries
             .get(&key)
-            .map(|e| {
-                (
-                    e.fields.iter().map(|kv| kv.key.as_str()).collect(),
-                    fields_byte_estimate(&e.fields),
-                )
+            .filter(|prev| {
+                prev.quality == StateQuality::Fresh && prev.source_generation == caller_generation
             })
-            .unwrap_or_default();
-        let mut projected_keys = existing_keys.len();
-        let mut projected_bytes = existing_bytes;
-        for kv in incoming {
-            let byte_delta = key_value_byte_estimate(kv);
-            if let Some(prev_bytes) = existing_bytes_of(&inner, &key, &kv.key) {
-                // Update: replaces the value in place; key count
-                // unchanged, byte delta = new − old.
-                projected_bytes = projected_bytes.saturating_sub(prev_bytes) + byte_delta;
-            } else {
-                projected_keys += 1;
-                projected_bytes += byte_delta;
-            }
-        }
-        check_slot_caps(projected_keys, projected_bytes)
+            .map_or(&[][..], |prev| prev.fields.as_slice());
+        // Round-15 finding 2: last-wins normalization of
+        // duplicates in the incoming vec, matching
+        // `merge_fields`'s sequential-apply semantics.
+        // Uses an *unbounded* merge (unlike `merge_fields`,
+        // which silently truncates at the field cap): the
+        // whole point of admission is to see the true
+        // merged size and reject at the WIT boundary.
+        let projected = merge_fields_unbounded(baseline, incoming);
+        check_slot_caps(projected.len(), fields_byte_estimate(&projected))
     }
 
     /// H9 round-14 finding 1: pre-check whether a
@@ -724,11 +744,26 @@ impl DeviceStateStore {
     /// H9 round-14 finding 3: verify + decode a paginated
     /// cursor issued by [`Self::issue_cursor`]. Returns
     /// `(epoch, pinned_revision, after_device_id)` on
-    /// success. Any of: malformed shape, bad revision,
-    /// missing MAC, MAC mismatch → `Err(CursorError::Bad)`.
-    /// If the payload verifies but its epoch doesn't match
-    /// the store's current epoch (daemon restart mid-
-    /// resync), `Err(CursorError::EpochChanged)`.
+    /// success. Malformed shape, bad revision, or MAC
+    /// mismatch → `Err(CursorError::Bad)`. Well-formed
+    /// cursor whose epoch no longer matches the store's
+    /// current epoch → `Err(CursorError::EpochChanged)`.
+    ///
+    /// H9 round-15 finding 3: **epoch comparison happens
+    /// before MAC verification**. A cursor issued by a
+    /// prior life of the daemon has both a stale epoch AND
+    /// a stale MAC (because a restart rotates
+    /// [`StoreInner::cursor_secret`] alongside
+    /// [`StoreInner::epoch`]); round-14 checked the MAC
+    /// first, so every legitimate pre-restart cursor
+    /// failed as `Bad` (→ 400) instead of `EpochChanged`
+    /// (→ 409). Reordering is safe: the epoch is public
+    /// information (every response emits it), so
+    /// short-circuiting on epoch mismatch doesn't leak
+    /// anything a fabricated cursor couldn't already
+    /// discover, and it lets the handler tell the
+    /// documented "daemon restarted, restart the resync"
+    /// story instead of a 400 that reads as a client bug.
     ///
     /// # Errors
     /// See [`CursorError`].
@@ -743,6 +778,13 @@ impl DeviceStateStore {
         }
         let pinned_revision = rev.parse::<u64>().map_err(|_| CursorError::Bad)?;
         let inner = self.inner_read();
+        // Round-15 finding 3: epoch check first — a
+        // pre-restart cursor cleanly surfaces as
+        // `EpochChanged` even though its MAC is signed
+        // with the previous life's secret.
+        if epoch != inner.epoch {
+            return Err(CursorError::EpochChanged);
+        }
         let expected = hmac_sha256(&inner.cursor_secret, payload.as_bytes());
         let mut supplied = [0u8; 16];
         for (i, chunk) in mac_hex.as_bytes().chunks(2).enumerate() {
@@ -754,9 +796,6 @@ impl DeviceStateStore {
         }
         if !constant_time_eq(&expected[..16], &supplied) {
             return Err(CursorError::Bad);
-        }
-        if epoch != inner.epoch {
-            return Err(CursorError::EpochChanged);
         }
         Ok((epoch.to_string(), pinned_revision, device.to_string()))
     }
@@ -1232,16 +1271,58 @@ fn fields_byte_estimate(fields: &[KeyValue]) -> usize {
     fields.iter().map(key_value_byte_estimate).sum()
 }
 
-/// Byte count of the value currently stored under `key`,
-/// if any — used by [`DeviceStateStore::check_delta_admission`]
-/// to compute the byte delta of an existing-key update
-/// (byte-delta = new − old, not new + old).
-fn existing_bytes_of(inner: &StoreInner, slot: &(DeviceId, String), key: &str) -> Option<usize> {
-    inner
-        .entries
-        .get(slot)
-        .and_then(|e| e.fields.iter().find(|kv| kv.key == key))
-        .map(key_value_byte_estimate)
+/// H9 round-15 finding 2: byte-cap backstop for the write
+/// path — drop trailing fields until the total serialized
+/// size fits `MAX_BYTES_PER_SLOT`. Belt-and-suspenders
+/// counterpart to the field-count truncation already in
+/// `write_entry`; admission at the WIT boundary is the
+/// primary check.
+fn truncate_to_byte_cap(fields: Vec<KeyValue>, device_id: &str, capability: &str) -> Vec<KeyValue> {
+    let total = fields_byte_estimate(&fields);
+    if total <= MAX_BYTES_PER_SLOT {
+        return fields;
+    }
+    let mut running = 0usize;
+    let mut out = Vec::with_capacity(fields.len());
+    for kv in fields {
+        let n = key_value_byte_estimate(&kv);
+        if running.saturating_add(n) > MAX_BYTES_PER_SLOT {
+            break;
+        }
+        running += n;
+        out.push(kv);
+    }
+    let dropped = total - running;
+    tracing::warn!(
+        target: "device_state.slot_field_cap",
+        device_id = %device_id,
+        capability = %capability,
+        dropped_bytes = dropped,
+        cap = MAX_BYTES_PER_SLOT,
+        "write_entry byte-cap backstop truncated {dropped} bytes: per-slot byte cap exceeded",
+    );
+    out
+}
+
+/// H9 round-15 finding 2: unbounded variant of
+/// [`merge_fields`] used by
+/// [`DeviceStateStore::check_delta_admission`]. Matches
+/// merge semantics — new keys appended, existing keys
+/// replaced in place, duplicate keys in `updates` collapse
+/// to last-wins — but never truncates, so the caller sees
+/// the true projected size and can reject at the WIT
+/// boundary before persistence. The write path still uses
+/// the truncating [`merge_fields`] as a backstop.
+fn merge_fields_unbounded(prev: &[KeyValue], updates: &[KeyValue]) -> Vec<KeyValue> {
+    let mut out: Vec<KeyValue> = prev.to_vec();
+    for update in updates {
+        if let Some(existing) = out.iter_mut().find(|kv| kv.key == update.key) {
+            existing.value = update.value.clone();
+        } else {
+            out.push(update.clone());
+        }
+    }
+    out
 }
 
 /// Shared `Arc` alias, parallel to `SharedDeviceRegistry`.
@@ -2134,12 +2215,18 @@ mod tests {
         }
         // Adding one existing key is OK (no growth).
         store
-            .check_delta_admission("dev-1", "switch", &[kv("k0", Value::StringVal("y".into()))])
+            .check_delta_admission(
+                "dev-1",
+                "alpha",
+                "switch",
+                &[kv("k0", Value::StringVal("y".into()))],
+            )
             .expect("existing-key update fits");
         // Adding one new key fits.
         store
             .check_delta_admission(
                 "dev-1",
+                "alpha",
                 "switch",
                 &[kv("new-key", Value::StringVal("z".into()))],
             )
@@ -2148,6 +2235,7 @@ mod tests {
         let err = store
             .check_delta_admission(
                 "dev-1",
+                "alpha",
                 "switch",
                 &[
                     kv("more1", Value::StringVal("z".into())),
@@ -2162,10 +2250,141 @@ mod tests {
         // when the field count is fine.
         let big = "a".repeat(MAX_BYTES_PER_SLOT + 1);
         let err = store
-            .check_delta_admission("dev-2", "switch", &[kv("giant", Value::StringVal(big))])
+            .check_delta_admission(
+                "dev-2",
+                "alpha",
+                "switch",
+                &[kv("giant", Value::StringVal(big))],
+            )
             .expect_err("one oversized value must overflow the byte cap");
         assert_eq!(err.cap_bytes, MAX_BYTES_PER_SLOT);
         assert!(err.projected_bytes > MAX_BYTES_PER_SLOT);
+    }
+
+    /// H9 round-15 finding 1: admission mirrors
+    /// `write_entry`'s merge-vs-replace rule. When the
+    /// existing slot is Stale (or from a prior
+    /// generation), the write would replace — so admission
+    /// treats the incoming vec as the whole slot, not as
+    /// an addition to the old baseline.
+    #[test]
+    fn check_delta_admission_uses_write_semantics_for_stale_baseline() {
+        let store = DeviceStateStore::new();
+        // Fill the slot near the field cap while it's Fresh.
+        for i in 0..MAX_FIELDS_PER_SLOT {
+            store.apply_delta(
+                "dev-1".into(),
+                "alpha".into(),
+                "switch".into(),
+                vec![kv(&format!("k{i}"), Value::StringVal("x".into()))],
+                0,
+                0,
+            );
+        }
+        // A single-new-key delta on the Fresh slot correctly
+        // overflows (baseline is the existing 64 fields).
+        store
+            .check_delta_admission(
+                "dev-1",
+                "alpha",
+                "switch",
+                &[kv("new", Value::StringVal("y".into()))],
+            )
+            .expect_err("Fresh + 1 new key overflows the field cap");
+        // Flip the slot Stale (mimicking `mark_instance_stale`
+        // after the owning instance terminates). Same delta
+        // now must succeed — the write path would treat the
+        // Stale slot as absent and replace it with `[new]`.
+        assert!(store.mark_instance_stale("alpha") >= 1);
+        store
+            .check_delta_admission(
+                "dev-1",
+                "alpha",
+                "switch",
+                &[kv("new", Value::StringVal("y".into()))],
+            )
+            .expect(
+                "Stale baseline: write would replace with 1 field, admission must not \
+                 double-count the pre-restart slot",
+            );
+        // Same story for a delta from a *newer* generation
+        // against a still-Fresh but same-generation-mismatched
+        // baseline (register the same instance's next life).
+        store.bump_generation("alpha");
+        store
+            .check_delta_admission(
+                "dev-1",
+                "alpha",
+                "switch",
+                &[kv("new", Value::StringVal("y".into()))],
+            )
+            .expect("generation-mismatched baseline: write would replace");
+    }
+
+    /// H9 round-15 finding 2: duplicates in the incoming
+    /// vec normalize to last-wins before measurement.
+    /// Pre-fix the admission math subtracted the existing
+    /// value's bytes for every duplicate occurrence,
+    /// under-counting the real merged size and letting the
+    /// slot overflow past the byte cap.
+    #[test]
+    fn check_delta_admission_normalizes_duplicate_keys_before_measuring() {
+        let store = DeviceStateStore::new();
+        // Seed the slot with two ~30 KiB values (fits at
+        // ~60 KiB, well under the 64 KiB cap).
+        let thirty = "a".repeat(30 * 1024);
+        store.apply_delta(
+            "dev-1".into(),
+            "alpha".into(),
+            "switch".into(),
+            vec![
+                kv("a", Value::StringVal(thirty.clone())),
+                kv("b", Value::StringVal(thirty.clone())),
+            ],
+            0,
+            0,
+        );
+        // Incoming that would end at ~70 KiB after
+        // last-wins: [a="" , a=<40 KiB>]. Pre-fix math
+        // treated this as ~40 KiB and admitted; round-15
+        // catches it.
+        let forty = "z".repeat(40 * 1024);
+        let err = store
+            .check_delta_admission(
+                "dev-1",
+                "alpha",
+                "switch",
+                &[
+                    kv("a", Value::StringVal(String::new())),
+                    kv("a", Value::StringVal(forty)),
+                ],
+            )
+            .expect_err("duplicates must fold last-wins before the byte cap check");
+        assert!(err.projected_bytes > MAX_BYTES_PER_SLOT);
+    }
+
+    /// H9 round-15 finding 3: `verify_cursor` compares the
+    /// epoch before validating the MAC, so a legitimate
+    /// cursor from a prior daemon life (rotated
+    /// `cursor_secret` AND rotated `epoch`) surfaces as
+    /// `EpochChanged` — mapped to 409 by the API handler —
+    /// rather than `Bad` (400). Pre-fix, the MAC check
+    /// ran first and failed against the new secret, so
+    /// every pre-restart cursor looked like a fabricated
+    /// one.
+    #[test]
+    fn verify_cursor_flags_epoch_mismatch_before_mac_mismatch() {
+        let old_life = DeviceStateStore::new();
+        let cursor = old_life.issue_cursor(7, "dev-1");
+        // Simulate a daemon restart — fresh store, fresh
+        // secret, fresh epoch.
+        let new_life = DeviceStateStore::new();
+        assert_ne!(old_life.epoch(), new_life.epoch());
+        assert_eq!(
+            new_life.verify_cursor(&cursor),
+            Err(CursorError::EpochChanged),
+            "pre-restart cursor must surface as EpochChanged (409), not Bad (400)",
+        );
     }
 
     /// H9 round-14 finding 3: `verify_cursor` accepts a
@@ -2197,11 +2416,14 @@ mod tests {
         let mutated = format!("{stored_epoch}.42.dev-forged.{mac}");
         assert_eq!(store.verify_cursor(&mutated), Err(CursorError::Bad));
 
-        // A cursor issued by a *different* store fails —
-        // different secret AND different epoch.
+        // A cursor issued by a *different* store fails.
+        // Round-15 finding 3: epoch check runs before the
+        // MAC check, so this surfaces as `EpochChanged`
+        // (409) — a legitimate cursor from a prior daemon
+        // life, not a forged one.
         let other = DeviceStateStore::new();
         let alien = other.issue_cursor(42, "dev-1");
-        assert_eq!(store.verify_cursor(&alien), Err(CursorError::Bad));
+        assert_eq!(store.verify_cursor(&alien), Err(CursorError::EpochChanged));
 
         // Malformed shape.
         assert_eq!(store.verify_cursor("garbage"), Err(CursorError::Bad));
