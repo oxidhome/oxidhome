@@ -310,7 +310,9 @@ use crate::host_impl::plugin::oxidhome::plugin::{
     types::{DeviceId, Error as WitError, KeyValue, ServiceId, SubscriptionId, Value as WitValue},
 };
 use crate::runtime::registry::InstanceRegistry;
-use crate::state::{DeviceRegistry, EventBus, EventSubscription, ServiceRegistry};
+use crate::state::{
+    DeviceRegistry, EventBus, EventSubscription, MAX_CAPABILITIES_PER_DEVICE, ServiceRegistry,
+};
 
 /// Identifier the host assigns to a plugin instance — Phase 6 fleshes
 /// this out (manifest-driven IDs, multi-instance dedup). Phase 2 uses
@@ -372,6 +374,10 @@ pub struct PluginState {
     pub wasi: WasiCtx,
     /// Shared device registry — Phase 3.
     pub devices: Arc<DeviceRegistry>,
+    /// H9 host-owned device-state projection. Seeded from
+    /// `register-device.initial_state` and updated on every
+    /// `publish-event` carrying a `state-changed` payload.
+    pub device_state: Arc<crate::state::DeviceStateStore>,
     /// Shared event bus — Phase 3.
     pub events: Arc<EventBus>,
     /// Per-instance subscriptions: filter + receiver per active
@@ -461,6 +467,7 @@ impl PluginState {
         actor: Actor,
         config: InstanceConfig,
         devices: Arc<DeviceRegistry>,
+        device_state: Arc<crate::state::DeviceStateStore>,
         events: Arc<EventBus>,
         kv: Arc<crate::state::KvStore>,
         event_log: Arc<crate::state::EventLog>,
@@ -501,6 +508,7 @@ impl PluginState {
             table: ResourceTable::new(),
             wasi: wasi.build(),
             devices,
+            device_state,
             events,
             kv,
             event_log,
@@ -571,7 +579,7 @@ impl services::Host for PluginState {}
 /// Stable string name for a `capability-spec` variant — what
 /// `manifest.capabilities.declares_devices` lists. Mirrors
 /// `capability-spec` in `wit/oxidhome.wit`.
-fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
+pub(crate) fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
     match spec {
         capabilities::CapabilitySpec::Switch => "switch".into(),
         capabilities::CapabilitySpec::Dimmer => "dimmer".into(),
@@ -599,6 +607,66 @@ fn capability_state_name(state: &capabilities::CapabilityState) -> &'static str 
     }
 }
 
+/// H9: project a `DeviceInfo.initial_state` list into the
+/// `(capability_name, Vec<KeyValue>)` shape that
+/// [`crate::state::DeviceStateStore::seed`] takes. Uses the same
+/// field names the plugin author would emit on a
+/// `state-changed(...)` event so seed and post-registration updates
+/// share a shape.
+fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
+    use crate::host_impl::plugin::oxidhome::plugin::types::Value;
+    info.initial_state
+        .iter()
+        .map(|state| {
+            let name = capability_state_name(state).to_string();
+            let fields = match state {
+                capabilities::CapabilityState::Switch(s) => vec![KeyValue {
+                    key: "state".into(),
+                    value: Value::BoolVal(s.state),
+                }],
+                capabilities::CapabilityState::Dimmer(d) => vec![KeyValue {
+                    key: "level".into(),
+                    value: Value::FloatVal(d.level),
+                }],
+                capabilities::CapabilityState::ColorLight(c) => {
+                    let mut fields = vec![
+                        KeyValue {
+                            key: "hue".into(),
+                            value: Value::FloatVal(c.hue),
+                        },
+                        KeyValue {
+                            key: "saturation".into(),
+                            value: Value::FloatVal(c.saturation),
+                        },
+                        KeyValue {
+                            key: "value".into(),
+                            value: Value::FloatVal(c.value),
+                        },
+                    ];
+                    if let Some(kelvin) = c.color_temp_kelvin {
+                        fields.push(KeyValue {
+                            key: "color_temp_kelvin".into(),
+                            value: Value::IntVal(i64::from(kelvin)),
+                        });
+                    }
+                    fields
+                }
+                capabilities::CapabilityState::Sensor(m) => vec![
+                    KeyValue {
+                        key: "value".into(),
+                        value: Value::FloatVal(m.value),
+                    },
+                    KeyValue {
+                        key: "unit".into(),
+                        value: Value::StringVal(m.unit.clone()),
+                    },
+                ],
+            };
+            (name, fields)
+        })
+        .collect()
+}
+
 /// Run both gates for a `register-device` / `update-device` call:
 ///
 /// 1. Every `initial_state` entry must have a matching
@@ -616,6 +684,65 @@ fn capability_state_name(state: &capabilities::CapabilityState) -> &'static str 
 /// the most useful existing variant rather than reaching for a new
 /// WIT error today.
 fn authorize_device_info(declared: &[String], info: &DeviceInfo) -> Result<(), WitError> {
+    // H9 round-14 finding 2: cap capabilities per device.
+    // Without this, a single device can hold arbitrarily
+    // many `extension(<unique>)` slots — bypassing the
+    // per-instance device quota (only one device) and
+    // amplifying every snapshot page (one device forces
+    // every capability onto the same page). Chosen
+    // generously — real devices in the review's registry
+    // don't exceed a handful of capabilities.
+    if info.capabilities.len() > MAX_CAPABILITIES_PER_DEVICE {
+        return Err(WitError::InvalidArgument(format!(
+            "device `{}` declares {} capabilities; the per-device cap is {MAX_CAPABILITIES_PER_DEVICE}",
+            info.local_id,
+            info.capabilities.len(),
+        )));
+    }
+    // H9 round-14 finding 1: reject oversized `initial_state`
+    // entries at the WIT boundary. Pre-fix, the store
+    // silently truncated them and the caller saw success.
+    // Uses the same per-variant projection as
+    // `seed_state_from_initial` so the check matches what
+    // actually reaches the store.
+    for (name, fields) in seed_state_from_initial(info) {
+        if let Err(overflow) = crate::state::DeviceStateStore::check_snapshot_admission(&fields) {
+            return Err(WitError::InvalidArgument(format!(
+                "initial_state entry `{name}` on device `{}` would exceed the projection's \
+                 per-slot cap ({overflow})",
+                info.local_id,
+            )));
+        }
+    }
+
+    // H9 round-11 finding 2: WIT contract is one entry per
+    // stateful capability. Duplicates in either list are
+    // rejected up front — pre-fix, two `Switch` entries in
+    // `initial_state` silently hit the same projection key and
+    // the last-written value won, producing non-deterministic
+    // canonical state. Same story for two `Switch` entries in
+    // `capabilities`: `reset_and_seed_device` sees the key
+    // once but the reconciliation semantics get muddled.
+    let mut seen_caps: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for spec in &info.capabilities {
+        let name = capability_name(spec);
+        if !seen_caps.insert(name.clone()) {
+            return Err(WitError::InvalidArgument(format!(
+                "capability `{name}` appears more than once in `DeviceInfo.capabilities` \
+                 (the WIT contract is one spec per capability)"
+            )));
+        }
+    }
+    let mut seen_state: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for state in &info.initial_state {
+        let name = capability_state_name(state);
+        if !seen_state.insert(name) {
+            return Err(WitError::InvalidArgument(format!(
+                "initial_state contains multiple `{name}` entries (the WIT contract is \
+                 one entry per stateful capability)"
+            )));
+        }
+    }
     for state in &info.initial_state {
         let name = capability_state_name(state);
         if !info
@@ -641,6 +768,63 @@ fn authorize_device_info(declared: &[String], info: &DeviceInfo) -> Result<(), W
     Ok(())
 }
 
+#[cfg(test)]
+mod authorize_device_info_tests {
+    use super::*;
+    use crate::host_impl::plugin::oxidhome::plugin::capabilities;
+
+    fn info(
+        caps: Vec<capabilities::CapabilitySpec>,
+        state: Vec<capabilities::CapabilityState>,
+    ) -> DeviceInfo {
+        DeviceInfo {
+            local_id: "d".into(),
+            name: "d".into(),
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            capabilities: caps,
+            initial_state: state,
+            metadata: Vec::new(),
+        }
+    }
+
+    /// H9 round-11 finding 2: two `Switch` entries in
+    /// `capabilities` are rejected up front. Pre-fix the second
+    /// spec was silently accepted.
+    #[test]
+    fn rejects_duplicate_capability_spec() {
+        let declared = vec!["switch".to_string()];
+        let d = info(
+            vec![
+                capabilities::CapabilitySpec::Switch,
+                capabilities::CapabilitySpec::Switch,
+            ],
+            Vec::new(),
+        );
+        let err = authorize_device_info(&declared, &d).unwrap_err();
+        assert!(matches!(err, WitError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    /// H9 round-11 finding 2: two `Switch` entries in
+    /// `initial_state` are rejected. Pre-fix both hit the same
+    /// projection key sequentially and the second silently
+    /// overwrote the first.
+    #[test]
+    fn rejects_duplicate_initial_state_entry() {
+        let declared = vec!["switch".to_string()];
+        let d = info(
+            vec![capabilities::CapabilitySpec::Switch],
+            vec![
+                capabilities::CapabilityState::Switch(capabilities::Switchable { state: true }),
+                capabilities::CapabilityState::Switch(capabilities::Switchable { state: false }),
+            ],
+        );
+        let err = authorize_device_info(&declared, &d).unwrap_err();
+        assert!(matches!(err, WitError::InvalidArgument(_)), "got {err:?}");
+    }
+}
+
 impl host_devices::Host for PluginState {
     async fn register_device(&mut self, info: DeviceInfo) -> Result<DeviceId, WitError> {
         // Authorize the full DeviceInfo: gate `capabilities` against
@@ -661,9 +845,91 @@ impl host_devices::Host for PluginState {
         // C1b: derive device_id from `installation_uuid` (host-minted
         // per-install) rather than `manifest.plugin.id` (reusable
         // name). Uninstall + reinstall produces different device ids.
-        let id = self
-            .devices
-            .register(&self.installation_uuid, self.instance_id.clone(), info);
+        //
+        // H9: also seed the host-owned state projection with any
+        // `initial_state` entries the plugin registered. The
+        // `authorize_device_info` gate above already refused any
+        // `initial_state` entry that doesn't match a declared
+        // capability, so what lands here is safe to project.
+        // Cloning `info.initial_state` + `capabilities` before the
+        // move into `register` — need them for state seeding /
+        // reconciliation.
+        let seed_state = seed_state_from_initial(&info);
+        // H9 round-17 finding 1: run the aggregate-bytes
+        // check BEFORE the registry mutation. The device_id
+        // is deterministic (`stable_device_id`), so we can
+        // compute it without registering first. Pre-fix, a
+        // re-register that passed the device-count cap but
+        // failed the aggregate cap called `devices.remove`
+        // to roll back — which unconditionally deleted the
+        // entry, dropping the *pre-register* metadata that
+        // had been overwritten in-place. State APIs would
+        // then advertise a Fresh device that command routing
+        // and registry reads said didn't exist.
+        let would_be_id = crate::state::devices::stable_device_id(
+            &self.installation_uuid,
+            &self.instance_id,
+            &info.local_id,
+        );
+        if let Err(overflow) = self.device_state.check_instance_register_admission(
+            &would_be_id,
+            &self.instance_id,
+            &seed_state,
+        ) {
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                device_id = %would_be_id,
+                overflow = %overflow,
+                "register-device denied (per-instance aggregate cap); registry untouched",
+            );
+            return Err(WitError::InvalidArgument(format!(
+                "register-device on `{would_be_id}` would exceed the projection's \
+                 per-instance aggregate cap ({overflow})",
+            )));
+        }
+        // H9 round-11 finding 1: per-instance registration cap
+        // is enforced under the registry's write lock so a
+        // check-then-insert can't overshoot. Refusal returns
+        // `Unavailable` — the plugin can retry after removing
+        // some devices.
+        let id =
+            match self
+                .devices
+                .try_register(&self.installation_uuid, self.instance_id.clone(), info)
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(
+                        instance_id = %self.instance_id,
+                        error = %err,
+                        "register-device denied (per-instance device cap)",
+                    );
+                    return Err(err);
+                }
+            };
+        debug_assert_eq!(
+            id, would_be_id,
+            "stable_device_id must match try_register's derivation"
+        );
+        let received_ms = crate::state::event_log::now_unix_ms();
+        // H9 round-10 finding 1: atomically flip every pre-existing
+        // `Fresh` entry for this stable device-id to `Stale`, then
+        // seed the current registration's `initial_state`. Handles
+        // three cases in one lock:
+        //   * capability removed — flipped stale, not re-seeded
+        //   * capability retained, seeded — re-appears Fresh
+        //   * capability retained, NOT seeded — stays Stale until
+        //     the plugin publishes a `state-change`, matching the
+        //     "empty initial_state means state arrives later"
+        //     contract. Pre-fix, that last case silently retained
+        //     the pre-restart value as Fresh.
+        self.device_state.reset_and_seed_device(
+            &id,
+            &self.instance_id,
+            seed_state,
+            0, // observed_ms — plugin didn't attach one for register-time state
+            received_ms,
+        );
         tracing::debug!(
             instance_id = %self.instance_id,
             device_id = %id,
@@ -689,12 +955,32 @@ impl host_devices::Host for PluginState {
             );
             return Err(err);
         }
-        self.devices.update(&self.instance_id, &id, info)
+        // H9 round-2 finding 3: reconcile the projection with the
+        // (possibly narrower) capabilities list before the update
+        // lands, so a dropped capability's entries flip to `Stale`
+        // instead of continuing to advertise as `Fresh` on a
+        // device that no longer declares them.
+        let live_capabilities: Vec<String> =
+            info.capabilities.iter().map(capability_name).collect();
+        let outcome = self.devices.update(&self.instance_id, &id, info);
+        if outcome.is_ok() {
+            self.device_state
+                .reconcile_capabilities(&id, &live_capabilities);
+        }
+        outcome
     }
 
     async fn remove_device(&mut self, id: DeviceId) -> Result<(), WitError> {
         let outcome = self.devices.remove(&self.instance_id, &id);
         if outcome.is_ok() {
+            // H9 round-2 finding 3: the device is gone; flip every
+            // projection entry for it to `Stale` so consumers stop
+            // reading pre-remove values as `Fresh`. Runs only on
+            // successful remove — a `NotFound` / `Unavailable`
+            // return means the device wasn't ours (or is
+            // uninstall-locked) and its state is someone else's
+            // to sweep.
+            self.device_state.mark_device_stale(&id);
             tracing::debug!(
                 instance_id = %self.instance_id,
                 device_id = %id,
@@ -962,6 +1248,7 @@ fn require_publish_authorized(
 }
 
 impl host_events::Host for PluginState {
+    #[allow(clippy::too_many_lines)]
     async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
         // Architecture-review C2 — three gates before the event
         // reaches the bus:
@@ -1062,6 +1349,40 @@ impl host_events::Host for PluginState {
             )));
         }
 
+        // H9 round-14 finding 1: for `state-changed` events,
+        // pre-check the per-slot cap before persisting to
+        // the event log / broadcasting. Pre-fix, the store
+        // silently dropped overflow fields — leaving the
+        // durable log carrying the full event and the
+        // projection carrying a truncated slot, two
+        // conflicting authoritative views.
+        if let (
+            Some(device_id),
+            crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
+        ) = (ev.device.as_deref(), &ev.payload)
+            && let Err(overflow) = self.device_state.check_delta_admission(
+                device_id,
+                &self.instance_id,
+                &sc.capability,
+                &sc.fields,
+            )
+        {
+            tracing::warn!(
+                target: "device_state.slot_field_cap",
+                instance_id = %self.instance_id,
+                device_id = %device_id,
+                capability = %sc.capability,
+                overflow = %overflow,
+                "publish_event denied: state-change would exceed a projection cap",
+            );
+            return Err(WitError::InvalidArgument(format!(
+                "state-change on `{device_id}/{cap}` would exceed a projection cap \
+                 ({overflow}); host refuses the publish so the durable log and the \
+                 projection stay consistent",
+                cap = sc.capability,
+            )));
+        }
+
         // Durable mirror first (Phase 5d): if the write fails — disk
         // full, sqlite corruption, etc. — we'd rather refuse the
         // publish than silently lose history. Live broadcast comes
@@ -1114,6 +1435,33 @@ impl host_events::Host for PluginState {
                 )));
             }
         };
+
+        // H9: update the host-owned state projection before the
+        // fanout. Runs under the same `publish_sequence` gate as
+        // `event_log.record` above, so a snapshot API call
+        // observes the same ordering the durable log records —
+        // no post-fanout callers can see a state update before
+        // the projection has it. Only `state-changed` events
+        // land here; other variants (button, inference, custom)
+        // aren't state-carrying by the WIT contract. H9 round-3:
+        // uses `apply_delta` (merge by key) because WIT
+        // `state-change.fields` is documented as *changes only*
+        // — the register-device / OkWithState paths use
+        // `replace_snapshot` instead.
+        if let (
+            Some(device_id),
+            crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
+        ) = (ev.device.clone(), &ev.payload)
+        {
+            self.device_state.apply_delta(
+                device_id,
+                self.instance_id.clone(),
+                sc.capability.clone(),
+                sc.fields.clone(),
+                ev.timestamp,
+                crate::state::event_log::now_unix_ms(),
+            );
+        }
 
         // Admission already consumed above (pre-persistence). The
         // bus's `publish_with_id` sends the event onto every
@@ -1792,6 +2140,7 @@ mod tests {
             Actor::plugin(instance_id),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv(instance_id, 0),
             fresh_event_log(),
@@ -1818,6 +2167,7 @@ mod tests {
             Actor::plugin(instance_id),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv(instance_id, quota_kb),
             fresh_event_log(),
@@ -1839,6 +2189,7 @@ mod tests {
             Actor::plugin(instance_id),
             InstanceConfig::new(),
             registry,
+            Arc::new(crate::state::DeviceStateStore::new()),
             bus,
             fresh_kv(instance_id, 0),
             fresh_event_log(),
@@ -2177,6 +2528,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2218,6 +2570,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2332,6 +2685,7 @@ mod tests {
             Actor::plugin("beta"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::clone(&events),
             fresh_kv("beta", 0),
             fresh_event_log(),
@@ -2501,6 +2855,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2547,6 +2902,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2631,6 +2987,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2684,6 +3041,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2723,6 +3081,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),
@@ -2913,6 +3272,7 @@ mod tests {
             Actor::plugin("alpha"),
             InstanceConfig::new(),
             Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
             Arc::new(EventBus::new()),
             fresh_kv("alpha", 0),
             fresh_event_log(),

@@ -34,8 +34,8 @@ use anyhow::{Context, anyhow};
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
 use crate::state::{
-    AuditLog, BlobStore, Db, DeviceRegistry, EventBus, EventLog, InstalledPluginRegistry, KvStore,
-    LogStore, ServiceRegistry,
+    AuditLog, BlobStore, Db, DeviceRegistry, DeviceStateStore, EventBus, EventLog,
+    InstalledPluginRegistry, KvStore, LogStore, ServiceRegistry,
 };
 
 /// Process-wide Wasmtime engine. Components are compiled once per engine
@@ -60,6 +60,13 @@ pub struct Engine {
     /// database directly without depending on any one store.
     db: Arc<Db>,
     devices: Arc<DeviceRegistry>,
+    /// H9: host-owned device-state projection. Seeded from
+    /// `register-device.initial_state`, updated on every
+    /// `publish-event` that carries a `state-changed` payload,
+    /// marked `Stale` when the owning instance stops. Consumers
+    /// (API/UI, MCP) read from here rather than trusting each
+    /// plugin's private view.
+    device_state: Arc<DeviceStateStore>,
     events: Arc<EventBus>,
     kv: Arc<KvStore>,
     event_log: Arc<EventLog>,
@@ -211,6 +218,7 @@ impl Engine {
         Ok(Self {
             inner,
             devices: Arc::new(DeviceRegistry::new()),
+            device_state: Arc::new(DeviceStateStore::new()),
             events: Arc::new(EventBus::new()),
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
@@ -254,6 +262,15 @@ impl Engine {
     #[must_use]
     pub fn devices(&self) -> Arc<DeviceRegistry> {
         Arc::clone(&self.devices)
+    }
+
+    /// H9 host-owned device-state projection. Consumers (API/UI,
+    /// MCP, host-side tests) read the current per-`(device,
+    /// capability)` state from here rather than trusting each
+    /// plugin's private view.
+    #[must_use]
+    pub fn device_state(&self) -> Arc<DeviceStateStore> {
+        Arc::clone(&self.device_state)
     }
 
     /// Shared event bus. Use this to subscribe a host-side listener
@@ -603,6 +620,18 @@ impl Engine {
                     engine_for_reaper
                         .services()
                         .remove_by_owner(&instance_id_for_reaper);
+                    // H9: device-state entries survive the terminal
+                    // (unlike `DeviceRegistry` entries, which are
+                    // reaped) so consumers can still read the last
+                    // observed values with `quality: "stale"`.
+                    // Flipping the marker here catches the case
+                    // where the instance reached Stopped / Failed
+                    // and no restart follows — the pre-restart
+                    // sweep in `spawn_supervisor_lifecycle` won't
+                    // fire in that path.
+                    engine_for_reaper
+                        .device_state()
+                        .mark_instance_stale(&instance_id_for_reaper);
                     registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
                 });
                 handle

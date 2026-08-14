@@ -3831,3 +3831,774 @@ async fn publisher_order_sequencer_preserves_row_id_order() {
         "publisher-order gate must preserve row-id ordering",
     );
 }
+
+// ── H9: device-state projection ──────────────────────────────────
+
+/// H9: `GET /api/v1/devices/{id}/state` reflects state changes
+/// written through the host-owned projection. Uses the engine's
+/// `device_state()` handle directly (bypasses the WIT publish path)
+/// so the test doesn't need a live plugin — the runtime integration
+/// is covered separately.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_snapshot_reflects_applied_changes() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+
+    let store = engine.device_state();
+    store.apply_delta(
+        "dev-42".into(),
+        "alpha".into(),
+        "switch".into(),
+        vec![KeyValue {
+            key: "state".into(),
+            value: Value::BoolVal(true),
+        }],
+        1234,
+        5678,
+    );
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/dev-42/state")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["device_id"], "dev-42");
+    assert_eq!(body["revision"].as_u64().unwrap(), 1);
+    // H9 round-6 finding 1: snapshot carries the store epoch so
+    // clients can detect a daemon restart.
+    assert!(body["epoch"].as_str().unwrap().starts_with("epoch-"));
+    let caps = body["capabilities"].as_array().expect("capabilities");
+    assert_eq!(caps.len(), 1);
+    assert_eq!(caps[0]["capability"], "switch");
+    assert!(caps[0].get("entry_revision").is_none());
+    assert_eq!(caps[0]["global_revision"].as_u64().unwrap(), 1);
+    assert_eq!(caps[0]["quality"], "fresh");
+    assert_eq!(caps[0]["received_ms"].as_i64().unwrap(), 5678);
+    assert_eq!(caps[0]["observed_ms"].as_u64().unwrap(), 1234);
+    let fields = caps[0]["fields"].as_array().expect("fields array");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["key"], "state");
+    assert_eq!(fields[0]["value"]["t"], "Bool");
+    assert_eq!(fields[0]["value"]["v"], true);
+}
+
+/// H9: `GET /api/v1/devices/state/changes` returns entries whose
+/// `global_revision > since_revision`, sorted ascending, capped at
+/// `limit`. This is a materialized-view read (latest value per
+/// slot), not an append-only stream — a slot updated multiple
+/// times between polls is coalesced. This test writes each slot
+/// exactly once so the coalescing doesn't apply and the cursor
+/// paging semantics are easy to observe.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_changes_returns_cursor_deltas() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+
+    let store = engine.device_state();
+    for i in 0..4 {
+        store.apply_delta(
+            format!("dev-{i}"),
+            "alpha".into(),
+            "switch".into(),
+            Vec::new(),
+            0,
+            0,
+        );
+    }
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state/changes?since_revision=2&limit=10")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["current_revision"].as_u64().unwrap(), 4);
+    let changes = body["changes"].as_array().expect("changes");
+    assert_eq!(changes.len(), 2);
+    // Ascending by global_revision so paging forward is well-defined.
+    assert_eq!(changes[0]["global_revision"].as_u64().unwrap(), 3);
+    assert_eq!(changes[1]["global_revision"].as_u64().unwrap(), 4);
+    assert_eq!(changes[0]["device_id"], "dev-2");
+    assert_eq!(changes[1]["device_id"], "dev-3");
+    // H9 round-6 finding 1: normal cursor advance carries the
+    // store epoch, and `reset_required` is false when the
+    // caller's cursor is within the current revision.
+    assert!(body["epoch"].as_str().unwrap().starts_with("epoch-"));
+    assert_eq!(body["reset_required"], false);
+}
+
+/// H9 round-6 finding 1: `since_revision > current_revision` (as
+/// happens when a client held a pre-restart cursor and the daemon
+/// restarted, dropping the in-memory store back to revision 0)
+/// returns `reset_required: true` with an empty `changes` and the
+/// current store epoch. The client sees this and resyncs.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_changes_signals_reset_when_cursor_exceeds_current() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    // Seed a few entries so current_revision = 2 (well below the
+    // 999 cursor the client sends).
+    let store = engine.device_state();
+    store.apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    store.apply_delta(
+        "dev-2".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state/changes?since_revision=999")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["reset_required"], true);
+    assert_eq!(body["changes"].as_array().unwrap().len(), 0);
+    assert_eq!(body["current_revision"].as_u64().unwrap(), 2);
+    assert!(body["epoch"].as_str().unwrap().starts_with("epoch-"));
+}
+
+/// H9: `GET /api/v1/devices/{id}/state` and
+/// `GET /api/v1/devices/state/changes` both require the
+/// `devices:read` scope. `devices:list` (registration snapshot)
+/// does not satisfy — this is a distinct capability.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_endpoints_require_devices_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let list_only = engine
+        .auth_tokens()
+        .create("list-only", b"[\"devices:list\"]")
+        .unwrap();
+
+    for path in [
+        "/api/v1/devices/dev-1/state",
+        "/api/v1/devices/state/changes",
+    ] {
+        let response = build_router(engine.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", list_only.plaintext),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{path} must require devices:read",
+        );
+    }
+}
+
+/// H9 round-2 finding 2: partial state updates merge by key.
+/// Applies an initial color-light state, then a subsequent update
+/// with only `hue`, then asserts saturation / value survive.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_partial_updates_merge_untouched_fields() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    store.apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "color-light".into(),
+        vec![
+            KeyValue {
+                key: "hue".into(),
+                value: Value::FloatVal(0.1),
+            },
+            KeyValue {
+                key: "saturation".into(),
+                value: Value::FloatVal(0.9),
+            },
+            KeyValue {
+                key: "value".into(),
+                value: Value::FloatVal(0.8),
+            },
+        ],
+        0,
+        0,
+    );
+    store.apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "color-light".into(),
+        vec![KeyValue {
+            key: "hue".into(),
+            value: Value::FloatVal(0.5),
+        }],
+        0,
+        0,
+    );
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/dev-1/state")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let cap = &body["capabilities"][0];
+    assert_eq!(cap["capability"], "color-light");
+    let fields = cap["fields"].as_array().unwrap();
+    let get = |k: &str| -> serde_json::Value {
+        fields
+            .iter()
+            .find(|f| f["key"] == k)
+            .expect("field present")["value"]
+            .clone()
+    };
+    // hue updated to 0.5, saturation / value preserved.
+    assert_eq!(get("hue")["t"], "Float");
+    assert!((get("hue")["v"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    assert!((get("saturation")["v"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+    assert!((get("value")["v"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+}
+
+/// H9 round-2 finding 3: `mark_device_stale` flips every entry
+/// for a device to `Stale` and bumps the store revision so a
+/// delta poller catches the transition. Simulates a
+/// `remove-device` at the store level.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_mark_device_stale_bumps_revision_and_flips_all_caps() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    store.apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    store.apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "dimmer".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    assert_eq!(store.current_revision(), 2);
+    let flipped = store.mark_device_stale("dev-1");
+    assert_eq!(flipped, 2);
+    assert_eq!(store.current_revision(), 4);
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state/changes?since_revision=2&limit=10")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    let changes = body["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2);
+    for change in changes {
+        assert_eq!(change["device_id"], "dev-1");
+        assert_eq!(change["quality"], "stale");
+    }
+}
+
+/// H9 round-10 finding 2: `GET /api/v1/devices/state` returns an
+/// atomic all-device snapshot with `epoch` + `revision`, so a
+/// client that hit `reset_required` can resync in one round-trip
+/// on the `devices:read` scope alone — no `devices:list` needed.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_returns_every_device_atomically() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    for i in 0..3 {
+        store.apply_delta(
+            format!("dev-{i}"),
+            "alpha".into(),
+            "switch".into(),
+            vec![KeyValue {
+                key: "state".into(),
+                value: Value::BoolVal(i % 2 == 0),
+            }],
+            0,
+            0,
+        );
+    }
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert!(body["epoch"].as_str().unwrap().starts_with("epoch-"));
+    assert_eq!(body["revision"].as_u64().unwrap(), 3);
+    let devices = body["devices"].as_array().expect("devices");
+    assert_eq!(devices.len(), 3);
+    let device_ids: Vec<&str> = devices
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(device_ids, ["dev-0", "dev-1", "dev-2"]);
+    for device in devices {
+        let caps = device["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0]["capability"], "switch");
+    }
+    // H9 round-11 finding 1 + round-13 finding 1: single page —
+    // no forward cursor.
+    assert!(body.get("next_cursor").and_then(|v| v.as_str()).is_none());
+}
+
+/// H9 round-12 finding 1: `GET /api/v1/devices/state` pins the
+/// resync anchor to the *first* page's revision — subsequent
+/// pages echo `pinned_revision` back as `revision`, so a write
+/// that lands between pages (to a device already paged past,
+/// or a device sorting behind the current cursor) is picked
+/// up on the next `/state/changes` poll rather than being
+/// silently skipped. Pre-fix, each page reported the store's
+/// current revision, and a client using the last page's
+/// revision as its cursor could miss updates that happened
+/// mid-pagination.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_pins_revision_across_pages() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    for i in 0..4 {
+        store.apply_delta(
+            format!("dev-{i}"),
+            "alpha".into(),
+            "switch".into(),
+            Vec::new(),
+            0,
+            0,
+        );
+    }
+
+    let fetch = |uri: &str| {
+        let uri = uri.to_string();
+        let engine = engine.clone();
+        let bearer = reader.plaintext.clone();
+        async move {
+            let response = build_router(engine)
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            body_to_json(response.into_body()).await
+        }
+    };
+
+    // Page 1: no cursor — server returns the current revision.
+    let page1 = fetch("/api/v1/devices/state?limit=2").await;
+    let pinned = page1["revision"].as_u64().unwrap();
+    assert_eq!(pinned, 4);
+    let cursor = page1["next_cursor"]
+        .as_str()
+        .expect("second page's cursor")
+        .to_string();
+
+    // Simulate a mutation between pages — new revision on
+    // an *already-paged-past* device (dev-0). The naive
+    // "use the last page's revision" pattern would miss this.
+    store.apply_delta(
+        "dev-0".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    assert_eq!(store.current_revision(), 5);
+
+    // Page 2: pass the server-issued cursor back. Its embedded
+    // pinned revision (not the store's `current_revision`) is
+    // echoed as `revision`.
+    let page2 = fetch(&format!("/api/v1/devices/state?limit=2&cursor={cursor}")).await;
+    assert_eq!(
+        page2["revision"].as_u64().unwrap(),
+        pinned,
+        "pinned revision must be echoed so the client's post-resync cursor is the pre-pagination anchor",
+    );
+
+    // A follow-up `/state/changes?since_revision=<pinned>`
+    // now picks up dev-0's update (it has global_revision > pinned).
+    let changes = fetch(&format!(
+        "/api/v1/devices/state/changes?since_revision={pinned}"
+    ))
+    .await;
+    let changed_ids: Vec<&str> = changes["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["device_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        changed_ids.contains(&"dev-0"),
+        "the update that landed during pagination must surface via /state/changes; got {changed_ids:?}",
+    );
+}
+
+/// H9 round-13 finding 1: the pin is enforced by the
+/// server-issued cursor. Malformed cursors are 400; a
+/// cursor whose epoch no longer matches the store's current
+/// epoch is 409 so the client restarts the resync.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_rejects_forged_and_stale_cursors() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    engine.device_state().apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+
+    let fetch_status = |uri: &str| {
+        let uri = uri.to_string();
+        let engine = engine.clone();
+        let bearer = reader.plaintext.clone();
+        async move {
+            build_router(engine)
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // Malformed cursor (not `<epoch>.<rev>.<device>.<hmac>`)
+    // → 400.
+    assert_eq!(
+        fetch_status("/api/v1/devices/state?cursor=garbage").await,
+        StatusCode::BAD_REQUEST,
+    );
+    // H9 round-15 finding 3: a well-formed cursor whose
+    // epoch doesn't match this store's current epoch
+    // returns 409 (documented "restart the resync" path),
+    // not 400 — the epoch check runs before the MAC check
+    // so a legitimate pre-restart cursor lands here too.
+    assert_eq!(
+        fetch_status(
+            "/api/v1/devices/state?cursor=epoch-deadbeef.1.dev-x.00000000000000000000000000000000",
+        )
+        .await,
+        StatusCode::CONFLICT,
+    );
+    // Fabricated cursor carrying *this* store's epoch but
+    // a garbage MAC still returns 400 (MAC failure).
+    let live_epoch = engine.device_state().epoch();
+    let forged = format!("{live_epoch}.1.dev-x.00000000000000000000000000000000");
+    assert_eq!(
+        fetch_status(&format!("/api/v1/devices/state?cursor={forged}")).await,
+        StatusCode::BAD_REQUEST,
+    );
+}
+
+/// H9 round-11 finding 1: `GET /api/v1/devices/state` pages by
+/// device — `limit` caps distinct devices, a device's
+/// capabilities stay atomic within one page, and
+/// `next_after_device_id` drives forward pagination.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_paginates_by_device_id() {
+    let engine = Engine::new().expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let store = engine.device_state();
+    // Five devices, each with two capabilities.
+    for i in 0..5 {
+        for cap in ["switch", "dimmer"] {
+            store.apply_delta(
+                format!("dev-{i}"),
+                "alpha".into(),
+                (*cap).into(),
+                Vec::new(),
+                0,
+                0,
+            );
+        }
+    }
+
+    let fetch = |uri: &str| {
+        let uri = uri.to_string();
+        let engine = engine.clone();
+        let bearer = reader.plaintext.clone();
+        async move {
+            let response = build_router(engine)
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            body_to_json(response.into_body()).await
+        }
+    };
+
+    let body = fetch("/api/v1/devices/state?limit=2").await;
+    let ids: Vec<String> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["dev-0", "dev-1"]);
+    for device in body["devices"].as_array().unwrap() {
+        assert_eq!(
+            device["capabilities"].as_array().unwrap().len(),
+            2,
+            "a device's capabilities must not split across pages",
+        );
+    }
+    let cursor_2 = body["next_cursor"]
+        .as_str()
+        .expect("second page's cursor")
+        .to_string();
+
+    let body = fetch(&format!("/api/v1/devices/state?limit=2&cursor={cursor_2}")).await;
+    let ids: Vec<String> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["dev-2", "dev-3"]);
+    let cursor_3 = body["next_cursor"]
+        .as_str()
+        .expect("third page's cursor")
+        .to_string();
+
+    let body = fetch(&format!("/api/v1/devices/state?limit=2&cursor={cursor_3}")).await;
+    let ids: Vec<String> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["dev-4"]);
+    assert!(body.get("next_cursor").and_then(|v| v.as_str()).is_none());
+}
+
+/// H9 round-10 finding 2: `GET /api/v1/devices/state` requires
+/// `devices:read` — not `devices:list`. A `devices:list`-only
+/// token gets 403.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_full_snapshot_requires_devices_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let lister = engine
+        .auth_tokens()
+        .create("lister", b"[\"devices:list\"]")
+        .unwrap();
+
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/state")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", lister.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// H9 round-10 finding 1: register-device runs an atomic
+/// reset-and-seed. Re-registering the same stable id with the
+/// same capability but empty `initial_state` must flip the
+/// prior entry to `Stale` — pre-fix, the old value stayed
+/// `Fresh` forever because `reconcile_capabilities` only
+/// touched *removed* capabilities.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_re_register_with_empty_initial_state_flips_prior_entry_stale() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let store = engine.device_state();
+    // First registration seeded a Fresh value.
+    store.reset_and_seed_device(
+        &"dev-1".into(),
+        "alpha",
+        vec![(
+            "switch".into(),
+            vec![KeyValue {
+                key: "state".into(),
+                value: Value::BoolVal(true),
+            }],
+        )],
+        0,
+        1,
+    );
+    assert_eq!(
+        store
+            .snapshot_capability("dev-1", "switch")
+            .unwrap()
+            .quality,
+        oxidhome_core::state::StateQuality::Fresh
+    );
+
+    // Re-register the same id with the same capability but no
+    // initial_state — atomic reset flips the prior entry stale.
+    store.reset_and_seed_device(&"dev-1".into(), "alpha", Vec::new(), 0, 2);
+    let entry = store
+        .snapshot_capability("dev-1", "switch")
+        .expect("entry present as Stale");
+    assert_eq!(entry.quality, oxidhome_core::state::StateQuality::Stale);
+}
+
+/// H9 round-2 finding 3: `reconcile_capabilities` flips entries
+/// whose capability was dropped, keeps entries whose capability
+/// is still declared.
+#[tokio::test(flavor = "current_thread")]
+async fn devices_state_reconcile_capabilities_flips_only_dropped_caps() {
+    let engine = Engine::new().expect("engine");
+    let store = engine.device_state();
+    for cap in ["switch", "dimmer", "color-light"] {
+        store.apply_delta(
+            "dev-1".into(),
+            "alpha".into(),
+            (*cap).into(),
+            Vec::new(),
+            0,
+            0,
+        );
+    }
+    // Drop `dimmer` from the live capability set.
+    let flipped =
+        store.reconcile_capabilities("dev-1", &["switch".to_string(), "color-light".to_string()]);
+    assert_eq!(flipped, 1);
+    assert_eq!(
+        store
+            .snapshot_capability("dev-1", "dimmer")
+            .unwrap()
+            .quality,
+        oxidhome_core::state::StateQuality::Stale
+    );
+    assert_eq!(
+        store
+            .snapshot_capability("dev-1", "switch")
+            .unwrap()
+            .quality,
+        oxidhome_core::state::StateQuality::Fresh
+    );
+}

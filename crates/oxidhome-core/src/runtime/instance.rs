@@ -667,6 +667,7 @@ impl PluginInstance {
             actor,
             config,
             engine.devices(),
+            engine.device_state(),
             engine.events(),
             kv,
             engine.event_log(),
@@ -814,6 +815,7 @@ impl PluginInstance {
     /// today, in the API/MCP layers later) looks up the device's
     /// owner in [`DeviceRegistry`](crate::DeviceRegistry) and calls
     /// this method on the matching [`PluginInstance`].
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_command(
         &mut self,
         device: DeviceId,
@@ -828,7 +830,15 @@ impl PluginInstance {
             capability = %cmd.capability,
             action = %cmd.action,
         );
-        async {
+        // Snapshot the identity + capability + owner before the
+        // move-into-`call_execute_command` so the H9 projection
+        // hook below can attribute an `OkWithState` return to the
+        // correct `(device, capability)` slot with the owning
+        // instance id.
+        let capability = cmd.capability.clone();
+        let device_for_projection = device.clone();
+        let owner_instance = data.instance_id.clone();
+        let result = async {
             self.arm_watchdog();
             self.bindings
                 .call_execute_command(&mut self.store, &device, &cmd)
@@ -837,7 +847,142 @@ impl PluginInstance {
                 .context("invoking plugin execute-command")
         }
         .instrument(span)
-        .await
+        .await?;
+        // H9 round-2 finding 4: `OkWithState` is authoritative
+        // state (per proto docs) — project it into the store so
+        // the snapshot / delta APIs reflect the post-command
+        // value. `Ok` and `Err` don't carry state; skip.
+        //
+        // H9 round-3 finding 1: use `replace_snapshot` (not
+        // `apply_delta`). `OkWithState` is the plugin's
+        // authoritative post-command state, not a partial
+        // change list — merging would preserve stale fields the
+        // fresh snapshot doesn't declare.
+        //
+        // H9 round-3 finding 2: re-validate **after** the guest
+        // call before projecting. A plugin may have called
+        // `remove-device` mid-`execute-command` and then
+        // returned `OkWithState`; without the re-check the
+        // projection would resurrect the removed slot as
+        // `Fresh`. Similarly, the WIT surface accepts any
+        // command capability string, so a plugin could return
+        // `OkWithState` for a capability the device doesn't
+        // declare. Refuse both silently — return the plugin's
+        // result unchanged (the caller made no state-projection
+        // promise) and log a warn so operators can spot the
+        // misbehavior.
+        // H9 round-18 finding 2: consume the guest's returned
+        // vec instead of holding a reference (which forced the
+        // canonicalization + admission helpers to clone every
+        // KeyValue up front — a guest can return data
+        // approaching its 128 MiB memory cap, and each clone
+        // was a full host-side copy). Now we take ownership
+        // once and canonicalize by consuming.
+        let fields = match result {
+            CommandResult::OkWithState(fields) => fields,
+            other => return Ok(other),
+        };
+        // Round-18 finding 2: **enforce the per-slot cap first,
+        // before any ownership / capability check**. Pre-fix,
+        // size checks lived inside `if projection_ok`, so a
+        // plugin that removed the device mid-call (or returned
+        // state for an undeclared capability) got its
+        // unrestricted result returned unchecked. The check
+        // is O(fields.len()) on borrowed data — no allocations
+        // — so it's safe to run before the ownership lookup.
+        if let Err(overflow) = crate::state::DeviceStateStore::check_snapshot_admission(&fields) {
+            tracing::warn!(
+                instance_id = %owner_instance,
+                device_id = %device_for_projection,
+                capability = %capability,
+                overflow = %overflow,
+                "execute-command OkWithState exceeds the per-slot cap; downgrading to Err",
+            );
+            return Ok(CommandResult::Err(
+                crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(format!(
+                    "OkWithState on `{device_for_projection}/{capability}` would exceed \
+                     the projection's per-slot cap ({overflow})",
+                )),
+            ));
+        }
+        let data = self.store.data();
+        let devices = Arc::clone(&data.devices);
+        let device_state = Arc::clone(&data.device_state);
+        let projection_ok = if let Ok(meta) = devices.get(&owner_instance, &device_for_projection) {
+            let capability_declared = meta
+                .info
+                .capabilities
+                .iter()
+                .any(|spec| super::state::capability_name(spec) == capability);
+            if !capability_declared {
+                tracing::warn!(
+                    instance_id = %owner_instance,
+                    device_id = %device_for_projection,
+                    capability = %capability,
+                    "execute-command returned OkWithState for a capability the device \
+                     doesn't declare; skipping state projection",
+                );
+            }
+            capability_declared
+        } else {
+            tracing::warn!(
+                instance_id = %owner_instance,
+                device_id = %device_for_projection,
+                "execute-command returned OkWithState for a device this instance no \
+                 longer owns; skipping state projection",
+            );
+            false
+        };
+        if projection_ok {
+            // H9 round-16 finding 2: per-instance
+            // aggregate-bytes cap check. Same downgrade
+            // semantics as the per-slot cap. Round-19
+            // finding 1: measures against `&fields`
+            // (borrowed, no clone) via
+            // `projected_slot_size` internally.
+            if let Err(overflow) = device_state.check_instance_snapshot_admission(
+                &device_for_projection,
+                &owner_instance,
+                &capability,
+                &fields,
+            ) {
+                tracing::warn!(
+                    instance_id = %owner_instance,
+                    device_id = %device_for_projection,
+                    capability = %capability,
+                    overflow = %overflow,
+                    "execute-command OkWithState exceeds the per-instance cap; downgrading to Err",
+                );
+                return Ok(CommandResult::Err(
+                    crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(
+                        format!(
+                            "OkWithState on `{device_for_projection}/{capability}` would exceed \
+                             the projection's per-instance aggregate cap ({overflow})",
+                        ),
+                    ),
+                ));
+            }
+        }
+        // H9 round-19 finding 1: canonicalize by **consuming**
+        // the owned `fields` vec — moves values, only
+        // clones keys for the dedup index (bounded by
+        // `MAX_FIELDS_PER_SLOT` since admission already
+        // passed). Runs unconditionally so both the
+        // projection write AND the returned wire response
+        // see the same last-wins vec.
+        let canonical = crate::state::DeviceStateStore::canonicalize_snapshot_fields(fields);
+        if projection_ok {
+            let received_ms = crate::state::event_log::now_unix_ms();
+            device_state.replace_snapshot(
+                device_for_projection,
+                owner_instance,
+                capability,
+                canonical.clone(),
+                0, // observed_ms — commands don't carry a plugin timestamp
+                received_ms,
+            );
+        }
+        Ok(CommandResult::OkWithState(canonical))
     }
 
     /// Call the plugin's exported `execute-service-command` for a

@@ -208,6 +208,52 @@ impl DeviceRegistry {
         id
     }
 
+    /// H9 round-11 finding 1: quota-checked variant of
+    /// [`Self::register`]. Under one write lock: refuse if
+    /// `owner_instance` already owns `MAX_DEVICES_PER_INSTANCE`
+    /// distinct devices AND the target `local_id` is new (a
+    /// re-register of an existing id is always allowed — it
+    /// doesn't grow the population). Returns
+    /// `WitError::Unavailable` at the cap.
+    ///
+    /// Pre-fix `register-device` had no quota; a plugin that
+    /// looped `register-device` with unique `local_id`s could
+    /// grow the registry (and the paired state projection —
+    /// where `Fresh` entries are never evicted) without bound.
+    /// A single instance calls `register-device` serially
+    /// (the WIT guest is single-threaded within a call), so
+    /// the count check + insert under one write lock has no
+    /// intra-instance race; other instances register into
+    /// their own count buckets.
+    pub fn try_register(
+        &self,
+        installation_uuid: &str,
+        owner_instance: String,
+        info: DeviceInfo,
+    ) -> Result<DeviceId, WitError> {
+        let id = stable_device_id(installation_uuid, &owner_instance, &info.local_id);
+        let mut guard = self.write();
+        if !guard.contains_key(&id) {
+            let owned = guard
+                .values()
+                .filter(|m| m.owner_instance == owner_instance)
+                .count();
+            if owned >= MAX_DEVICES_PER_INSTANCE {
+                return Err(WitError::Unavailable(format!(
+                    "instance `{owner_instance}` has {owned} devices registered; \
+                     the per-instance cap is {MAX_DEVICES_PER_INSTANCE}"
+                )));
+            }
+        }
+        let meta = Arc::new(DeviceMeta {
+            id: id.clone(),
+            owner_instance,
+            info,
+        });
+        guard.insert(id.clone(), meta);
+        Ok(id)
+    }
+
     /// Replace an already-registered device's info, scoped to the
     /// caller's plugin instance. The WIT `host-devices` interface
     /// scopes every read/write to the calling plugin's own devices —
@@ -328,6 +374,28 @@ impl DeviceRegistry {
         before - guard.len()
     }
 }
+
+/// H9 round-11 finding 1: per-instance registration cap.
+/// Refuses new `local_id`s beyond this count from one instance;
+/// re-registering an existing `local_id` (which just updates
+/// the entry) is always allowed. Chosen generously — a normal
+/// household plugin registers well under 100 devices — so the
+/// cap only bites malicious / buggy plugins looping unique
+/// ids. Bounds both the registry and the paired state
+/// projection (which never evicts `Fresh` entries).
+pub const MAX_DEVICES_PER_INSTANCE: usize = 1024;
+
+/// H9 round-14 finding 2: per-*device* capability cap. One
+/// `DeviceInfo.capabilities` list caps at this many entries.
+/// Without it, a plugin can grow one device's projection
+/// footprint arbitrarily via unique
+/// `capability-spec::extension(<name>)` values — bypassing
+/// the per-instance device quota (that device counts as
+/// one) and forcing every capability onto the same snapshot
+/// page (all-caps-for-one-device is atomic). Chosen
+/// generously: real devices declare a handful of
+/// capabilities.
+pub const MAX_CAPABILITIES_PER_DEVICE: usize = 32;
 
 /// Bundle the registry into a shared `Arc` for [`Engine`] /
 /// [`PluginState`](crate::runtime::PluginState) clones.
@@ -504,5 +572,43 @@ mod tests {
         let after = reg.get("alpha", &id).expect("still there");
         assert_eq!(after.info.local_id, "front-door");
         assert_eq!(after.info.name, "Foyer Door");
+    }
+
+    /// H9 round-11 finding 1: `try_register` enforces the
+    /// per-instance cap for *new* `local_id`s and refuses with
+    /// `Unavailable`. Re-registering an existing `local_id`
+    /// (same-tuple update) is always allowed even at the cap
+    /// — it doesn't grow the population.
+    #[test]
+    fn try_register_enforces_per_instance_cap() {
+        let reg = DeviceRegistry::new();
+        // Fill the cap.
+        for i in 0..MAX_DEVICES_PER_INSTANCE {
+            let mut info = empty_info();
+            info.local_id = format!("dev-{i}");
+            reg.try_register("plugin.a", "alpha".into(), info)
+                .expect("under cap");
+        }
+        // One more distinct local_id → rejected.
+        let mut overflow = empty_info();
+        overflow.local_id = "overflow".into();
+        let err = reg
+            .try_register("plugin.a", "alpha".into(), overflow)
+            .unwrap_err();
+        assert!(matches!(err, WitError::Unavailable(_)), "got {err:?}");
+
+        // But a repeat registration of an existing local_id still
+        // works — it updates in place, doesn't grow the count.
+        let mut repeat = empty_info();
+        repeat.local_id = "dev-0".into();
+        repeat.name = "renamed".into();
+        reg.try_register("plugin.a", "alpha".into(), repeat)
+            .expect("re-register existing local_id is not a growth op");
+
+        // A *different* instance has its own cap bucket.
+        let mut other = empty_info();
+        other.local_id = "hello".into();
+        reg.try_register("plugin.a", "beta".into(), other)
+            .expect("other instance has its own count");
     }
 }

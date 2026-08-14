@@ -101,6 +101,16 @@ async fn simulated_switch_round_trip() {
         other => panic!("expected OkWithState, got {other:?}"),
     }
 
+    // H9 round-2 finding 4: the `OkWithState` return above
+    // should have projected the new value into the host-owned
+    // device-state store synchronously.
+    let projected = engine
+        .device_state()
+        .snapshot_capability(&device_id, "switch")
+        .expect("state projection updated by execute_command");
+    assert_eq!(field_bool(&projected.fields, "state"), Some(true));
+    assert_eq!(projected.quality, oxidhome_core::state::StateQuality::Fresh);
+
     // The plugin's `publish_state_change` should land on the bus.
     // `recv` is async; bound it with a timeout so a missing event
     // fails the test instead of hanging.

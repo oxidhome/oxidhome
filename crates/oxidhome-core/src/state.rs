@@ -19,6 +19,7 @@ pub mod audit_log;
 pub mod auth_token;
 pub mod blobs;
 pub mod db;
+pub mod device_state;
 pub mod devices;
 pub mod event_log;
 pub mod events;
@@ -31,7 +32,14 @@ pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery, credential_
 pub use auth_token::{IssuedToken, TokenError, TokenRecord, TokenStore};
 pub use blobs::{BlobError, BlobInfo, BlobStore, is_safe_instance_id};
 pub use db::Db;
-pub use devices::{DeviceMeta, DeviceRegistry};
+pub use device_state::{
+    CursorError, DeltaPage, DeviceState, DeviceStateStore, MAX_BYTES_PER_SLOT, MAX_FIELDS_PER_SLOT,
+    MAX_PROJECTED_BYTES_PER_INSTANCE, MAX_STALE_ENTRIES, SharedDeviceStateStore, SlotCapExceeded,
+    StateQuality,
+};
+pub use devices::{
+    DeviceMeta, DeviceRegistry, MAX_CAPABILITIES_PER_DEVICE, MAX_DEVICES_PER_INSTANCE,
+};
 pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicMatch};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
