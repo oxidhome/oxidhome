@@ -4378,17 +4378,24 @@ async fn devices_state_full_snapshot_rejects_forged_and_stale_cursors() {
         }
     };
 
-    // Malformed cursor (not `<epoch>.<rev>.<device_id>`) → 400.
+    // Malformed cursor (not `<epoch>.<rev>.<device>.<hmac>`)
+    // → 400. Round-14 MAC-verification means any client-side
+    // fabricated cursor (even one that would decode cleanly)
+    // fails HMAC and lands here too.
     assert_eq!(
         fetch_status("/api/v1/devices/state?cursor=garbage").await,
         StatusCode::BAD_REQUEST,
     );
-    // Well-formed but wrong-epoch cursor → 409 (the store's
-    // real epoch is minted per-process and won't match this
-    // fabricated one).
+    // Structurally-plausible-but-not-signed cursor → 400
+    // (bad MAC). Pre-fix (round-13), the same string
+    // decoded cleanly and the handler trusted its epoch/rev
+    // enough to run.
     assert_eq!(
-        fetch_status("/api/v1/devices/state?cursor=epoch-deadbeef.1.dev-x").await,
-        StatusCode::CONFLICT,
+        fetch_status(
+            "/api/v1/devices/state?cursor=epoch-deadbeef.1.dev-x.00000000000000000000000000000000",
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
     );
 }
 

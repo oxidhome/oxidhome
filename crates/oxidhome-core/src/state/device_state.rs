@@ -202,6 +202,21 @@ struct StoreInner {
     /// is one atomic operation, and mark-stale-then-bump-gen is
     /// another.
     generations: HashMap<String, u64>,
+    /// H9 round-14 finding 3: per-process 256-bit random secret
+    /// used to HMAC-sign the resync pagination cursor exposed
+    /// by `GET /api/v1/devices/state`. The cursor payload
+    /// (`epoch.revision.device_id`) travels in plain-text so
+    /// the server can decode it, but the trailing MAC ties
+    /// each cursor to *this* store's secret — a client can't
+    /// forge a cursor with a modified revision or device id
+    /// even though the epoch is publicly visible.
+    ///
+    /// Stays constant for the lifetime of the store (i.e., the
+    /// daemon process): a restart mints a new secret, but
+    /// also mints a new `epoch`, so any cursor from the prior
+    /// life fails epoch verification long before the MAC
+    /// check ever fires.
+    cursor_secret: [u8; 32],
 }
 
 impl Default for StoreInner {
@@ -212,8 +227,20 @@ impl Default for StoreInner {
             epoch: mint_epoch(),
             evicted_through_revision: 0,
             generations: HashMap::new(),
+            cursor_secret: mint_cursor_secret(),
         }
     }
+}
+
+/// H9 round-14 finding 3: 256-bit OS-random secret used to
+/// HMAC-sign the resync-pagination cursor. See
+/// [`StoreInner::cursor_secret`].
+fn mint_cursor_secret() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system RNG must be available");
+    bytes
 }
 
 /// H9 round-7 finding 2: 128-bit OS-random nonce, hex-encoded.
@@ -603,6 +630,137 @@ impl DeviceStateStore {
             .map(Arc::clone)
     }
 
+    /// H9 round-14 finding 1: pre-check whether an
+    /// `apply_delta` would push the slot past
+    /// [`MAX_FIELDS_PER_SLOT`] or [`MAX_BYTES_PER_SLOT`].
+    /// Callers invoke this at the WIT boundary before
+    /// persisting the event log record and before updating
+    /// the projection, so an oversized `state-change` is
+    /// rejected outright instead of the projection silently
+    /// desyncing from the durable log and the bus fanout
+    /// (round-13's silent truncation).
+    ///
+    /// Reads the current slot under a read lock, computes the
+    /// projected merged size, and returns
+    /// `Err(SlotCapExceeded)` if either cap would be
+    /// exceeded. There's a small check-then-write TOCTOU
+    /// window, but concurrent writes come from *this* store
+    /// only through serialized per-instance WIT calls; the
+    /// backstop hard-cap in the write path catches the rare
+    /// cross-instance race.
+    ///
+    /// # Errors
+    /// [`SlotCapExceeded`] with the offending measurement.
+    pub fn check_delta_admission(
+        &self,
+        device_id: &str,
+        capability: &str,
+        incoming: &[KeyValue],
+    ) -> Result<(), SlotCapExceeded> {
+        let inner = self.inner_read();
+        let key = (device_id.to_string(), capability.to_string());
+        let (existing_keys, existing_bytes): (Vec<&str>, usize) = inner
+            .entries
+            .get(&key)
+            .map(|e| {
+                (
+                    e.fields.iter().map(|kv| kv.key.as_str()).collect(),
+                    fields_byte_estimate(&e.fields),
+                )
+            })
+            .unwrap_or_default();
+        let mut projected_keys = existing_keys.len();
+        let mut projected_bytes = existing_bytes;
+        for kv in incoming {
+            let byte_delta = key_value_byte_estimate(kv);
+            if let Some(prev_bytes) = existing_bytes_of(&inner, &key, &kv.key) {
+                // Update: replaces the value in place; key count
+                // unchanged, byte delta = new − old.
+                projected_bytes = projected_bytes.saturating_sub(prev_bytes) + byte_delta;
+            } else {
+                projected_keys += 1;
+                projected_bytes += byte_delta;
+            }
+        }
+        check_slot_caps(projected_keys, projected_bytes)
+    }
+
+    /// H9 round-14 finding 1: pre-check whether a
+    /// `replace_snapshot` (register-device `initial_state`
+    /// or execute-command `OkWithState`) exceeds the per-
+    /// slot caps. Unlike `apply_delta`, replace ignores the
+    /// existing slot, so the check is purely on the
+    /// incoming vec.
+    ///
+    /// # Errors
+    /// [`SlotCapExceeded`] with the offending measurement.
+    pub fn check_snapshot_admission(fields: &[KeyValue]) -> Result<(), SlotCapExceeded> {
+        check_slot_caps(fields.len(), fields_byte_estimate(fields))
+    }
+
+    /// H9 round-14 finding 3: sign an all-devices-snapshot
+    /// pagination cursor. Returns
+    /// `"<epoch>.<pinned_revision>.<after_device_id>.<hmac>"`
+    /// where `hmac` is a 128-bit prefix of HMAC-SHA256 keyed
+    /// on this store's per-process
+    /// [`StoreInner::cursor_secret`]. Because the secret is
+    /// server-side only, a client can neither forge a valid
+    /// cursor from scratch nor mutate the pinned revision /
+    /// device id in an existing one without the MAC failing
+    /// verification.
+    #[must_use]
+    pub fn issue_cursor(&self, pinned_revision: u64, after_device_id: &str) -> String {
+        let inner = self.inner_read();
+        let payload = format!("{}.{pinned_revision}.{after_device_id}", inner.epoch);
+        let mac = hmac_sha256(&inner.cursor_secret, payload.as_bytes());
+        let mut hex = String::with_capacity(32);
+        for b in &mac[..16] {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        format!("{payload}.{hex}")
+    }
+
+    /// H9 round-14 finding 3: verify + decode a paginated
+    /// cursor issued by [`Self::issue_cursor`]. Returns
+    /// `(epoch, pinned_revision, after_device_id)` on
+    /// success. Any of: malformed shape, bad revision,
+    /// missing MAC, MAC mismatch → `Err(CursorError::Bad)`.
+    /// If the payload verifies but its epoch doesn't match
+    /// the store's current epoch (daemon restart mid-
+    /// resync), `Err(CursorError::EpochChanged)`.
+    ///
+    /// # Errors
+    /// See [`CursorError`].
+    pub fn verify_cursor(&self, raw: &str) -> Result<(String, u64, String), CursorError> {
+        let (payload, mac_hex) = raw.rsplit_once('.').ok_or(CursorError::Bad)?;
+        let mut parts = payload.splitn(3, '.');
+        let epoch = parts.next().ok_or(CursorError::Bad)?;
+        let rev = parts.next().ok_or(CursorError::Bad)?;
+        let device = parts.next().ok_or(CursorError::Bad)?;
+        if epoch.is_empty() || device.is_empty() || mac_hex.len() != 32 {
+            return Err(CursorError::Bad);
+        }
+        let pinned_revision = rev.parse::<u64>().map_err(|_| CursorError::Bad)?;
+        let inner = self.inner_read();
+        let expected = hmac_sha256(&inner.cursor_secret, payload.as_bytes());
+        let mut supplied = [0u8; 16];
+        for (i, chunk) in mac_hex.as_bytes().chunks(2).enumerate() {
+            supplied[i] = u8::from_str_radix(
+                std::str::from_utf8(chunk).map_err(|_| CursorError::Bad)?,
+                16,
+            )
+            .map_err(|_| CursorError::Bad)?;
+        }
+        if !constant_time_eq(&expected[..16], &supplied) {
+            return Err(CursorError::Bad);
+        }
+        if epoch != inner.epoch {
+            return Err(CursorError::EpochChanged);
+        }
+        Ok((epoch.to_string(), pinned_revision, device.to_string()))
+    }
+
     /// Return every entry with `global_revision > since_revision`,
     /// sorted ascending on `global_revision`, capped at `limit`.
     ///
@@ -914,14 +1072,28 @@ impl DeviceStateStore {
 /// also make merge cost quadratic and inflate every
 /// snapshot page carrying the oversized device.
 ///
-/// The cap bounds field count, not bytes — each `Value` is
-/// already bounded by the 64 KiB per-event limit
-/// (`payload_limits::MAX_EVENT_JSON_BYTES`), so `count *
-/// per-event = 64 * 64 KiB = 4 MiB` worst case per slot.
 /// Chosen generously: real capabilities carry a handful of
 /// fields (a color-light: 5–8; a sensor: 2), so the cap
-/// only bites malicious / buggy plugins.
+/// only bites malicious / buggy plugins. Paired with
+/// [`MAX_BYTES_PER_SLOT`] so field count alone can't get
+/// you to the count cap with 64 KiB values (a 4 MiB slot),
+/// and pre-checked at the WIT boundary
+/// (`publish_event` / `execute_command` / `register-device`)
+/// so an overflow is rejected before the event log records
+/// it — see [`Self::check_delta_admission`] and
+/// [`Self::check_snapshot_admission`].
 pub const MAX_FIELDS_PER_SLOT: usize = 64;
+
+/// H9 round-14 finding 2: per-slot cap on the *serialized*
+/// byte size of a slot's fields (approximated as the sum of
+/// key bytes + value byte estimates). Bounds one slot's
+/// share of every snapshot response body — one slot at 4 MiB
+/// (the pre-fix worst case: 64 fields × 64 KiB each) would
+/// dominate a page and any subscriber's copy on the bus.
+/// Chosen to match the per-event 64 KiB budget so a single
+/// `state-change` event physically cannot exceed the slot
+/// cap on its own.
+pub const MAX_BYTES_PER_SLOT: usize = 64 * 1024;
 
 /// Merge `updates` into `prev` by `key` — new keys are appended,
 /// duplicated keys have their value replaced by the update. Preserves
@@ -944,6 +1116,132 @@ fn merge_fields(prev: &[KeyValue], updates: &[KeyValue]) -> (Vec<KeyValue>, usiz
         }
     }
     (out, dropped)
+}
+
+/// H9 round-14 finding 3: outcome of
+/// [`DeviceStateStore::verify_cursor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorError {
+    /// Malformed shape, unparseable revision, missing/short
+    /// MAC, or MAC mismatch — a client-side error.
+    Bad,
+    /// Cursor's MAC verified but its epoch no longer matches
+    /// the store's current epoch — the daemon restarted (or
+    /// the store was re-initialized) between page fetches.
+    /// Client should restart the resync from an unpinned
+    /// request.
+    EpochChanged,
+}
+
+/// HMAC-SHA256 keyed on `key`, over `msg`. Standard
+/// construction: `H((K' ⊕ opad) || H((K' ⊕ ipad) || msg))`
+/// where `K'` is `key` padded / re-hashed to the block size
+/// (64 bytes for SHA-256). Only ~15 lines — not worth
+/// pulling in the `hmac` crate just for the cursor MAC.
+fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k_padded = [0u8; BLOCK];
+    k_padded[..key.len()].copy_from_slice(key);
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k_padded[i];
+        opad[i] ^= k_padded[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+/// Constant-time byte comparison for the cursor MAC check —
+/// early-exit `==` would leak timing info about how much of
+/// the MAC matched, so use `subtle`-style OR-accumulation.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// H9 round-14 finding 1: per-slot cap violation from
+/// [`DeviceStateStore::check_delta_admission`] /
+/// [`DeviceStateStore::check_snapshot_admission`]. The
+/// runtime maps this to `WitError::InvalidArgument` so the
+/// plugin sees a rejection instead of the projection
+/// silently truncating while the durable event log records
+/// the full state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotCapExceeded {
+    /// Projected merged / snapshot key count if the write
+    /// were accepted.
+    pub projected_fields: usize,
+    /// Projected merged / snapshot byte size (approximate,
+    /// key + value bytes).
+    pub projected_bytes: usize,
+    pub cap_fields: usize,
+    pub cap_bytes: usize,
+}
+
+impl std::fmt::Display for SlotCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "device-state slot cap exceeded: fields={}/{} bytes={}/{}",
+            self.projected_fields, self.cap_fields, self.projected_bytes, self.cap_bytes,
+        )
+    }
+}
+
+fn check_slot_caps(projected_fields: usize, projected_bytes: usize) -> Result<(), SlotCapExceeded> {
+    if projected_fields > MAX_FIELDS_PER_SLOT || projected_bytes > MAX_BYTES_PER_SLOT {
+        return Err(SlotCapExceeded {
+            projected_fields,
+            projected_bytes,
+            cap_fields: MAX_FIELDS_PER_SLOT,
+            cap_bytes: MAX_BYTES_PER_SLOT,
+        });
+    }
+    Ok(())
+}
+
+fn key_value_byte_estimate(kv: &KeyValue) -> usize {
+    kv.key.len() + value_byte_estimate(&kv.value)
+}
+
+fn value_byte_estimate(v: &crate::host_impl::plugin::oxidhome::plugin::types::Value) -> usize {
+    use crate::host_impl::plugin::oxidhome::plugin::types::Value;
+    match v {
+        Value::BoolVal(_) => 1,
+        Value::IntVal(_) | Value::FloatVal(_) => 8,
+        Value::StringVal(s) | Value::JsonVal(s) => s.len(),
+        Value::BytesVal(b) => b.len(),
+    }
+}
+
+fn fields_byte_estimate(fields: &[KeyValue]) -> usize {
+    fields.iter().map(key_value_byte_estimate).sum()
+}
+
+/// Byte count of the value currently stored under `key`,
+/// if any — used by [`DeviceStateStore::check_delta_admission`]
+/// to compute the byte delta of an existing-key update
+/// (byte-delta = new − old, not new + old).
+fn existing_bytes_of(inner: &StoreInner, slot: &(DeviceId, String), key: &str) -> Option<usize> {
+    inner
+        .entries
+        .get(slot)
+        .and_then(|e| e.fields.iter().find(|kv| kv.key == key))
+        .map(key_value_byte_estimate)
 }
 
 /// Shared `Arc` alias, parallel to `SharedDeviceRegistry`.
@@ -1807,6 +2105,107 @@ mod tests {
             b.epoch(),
             "distinct stores must mint distinct random epochs"
         );
+    }
+
+    /// H9 round-14 finding 1: `check_delta_admission` returns
+    /// `Err(SlotCapExceeded)` when a `state-change` would
+    /// push the slot past field count OR byte budget. The
+    /// runtime calls this at the WIT boundary before
+    /// persisting the event log record, so an overflow is
+    /// rejected outright — pre-fix, the store silently
+    /// truncated and the durable log / bus fanout kept the
+    /// full state, desyncing the projection from every
+    /// downstream authoritative view.
+    #[test]
+    fn check_delta_admission_flags_field_and_byte_overflow() {
+        let store = DeviceStateStore::new();
+        // Fill the slot to just under the field cap with tiny
+        // string values (1 byte each) so the byte cap isn't
+        // the trigger.
+        for i in 0..MAX_FIELDS_PER_SLOT - 1 {
+            store.apply_delta(
+                "dev-1".into(),
+                "alpha".into(),
+                "switch".into(),
+                vec![kv(&format!("k{i}"), Value::StringVal("x".into()))],
+                0,
+                0,
+            );
+        }
+        // Adding one existing key is OK (no growth).
+        store
+            .check_delta_admission("dev-1", "switch", &[kv("k0", Value::StringVal("y".into()))])
+            .expect("existing-key update fits");
+        // Adding one new key fits.
+        store
+            .check_delta_admission(
+                "dev-1",
+                "switch",
+                &[kv("new-key", Value::StringVal("z".into()))],
+            )
+            .expect("one new key stays under the field cap");
+        // Adding two new keys overflows the field cap.
+        let err = store
+            .check_delta_admission(
+                "dev-1",
+                "switch",
+                &[
+                    kv("more1", Value::StringVal("z".into())),
+                    kv("more2", Value::StringVal("z".into())),
+                ],
+            )
+            .expect_err("two new keys must overflow the field cap");
+        assert_eq!(err.cap_fields, MAX_FIELDS_PER_SLOT);
+        assert!(err.projected_fields > MAX_FIELDS_PER_SLOT);
+
+        // Byte cap: a single oversized value overflows even
+        // when the field count is fine.
+        let big = "a".repeat(MAX_BYTES_PER_SLOT + 1);
+        let err = store
+            .check_delta_admission("dev-2", "switch", &[kv("giant", Value::StringVal(big))])
+            .expect_err("one oversized value must overflow the byte cap");
+        assert_eq!(err.cap_bytes, MAX_BYTES_PER_SLOT);
+        assert!(err.projected_bytes > MAX_BYTES_PER_SLOT);
+    }
+
+    /// H9 round-14 finding 3: `verify_cursor` accepts a
+    /// cursor issued by the same store, rejects a mutated
+    /// one, rejects a fabricated one (no MAC), and returns
+    /// `EpochChanged` for a MAC-valid cursor whose epoch
+    /// belongs to a different store instance.
+    #[test]
+    fn verify_cursor_authenticates_hmac_and_epoch() {
+        let store = DeviceStateStore::new();
+        let cursor = store.issue_cursor(42, "dev-1");
+        let (epoch, rev, device) = store
+            .verify_cursor(&cursor)
+            .expect("issuing store must verify its own cursor");
+        assert_eq!(epoch, store.epoch());
+        assert_eq!(rev, 42);
+        assert_eq!(device, "dev-1");
+
+        // Mutate the pinned revision — MAC fails.
+        let (payload, mac) = cursor.rsplit_once('.').unwrap();
+        let mut parts = payload.splitn(3, '.');
+        let stored_epoch = parts.next().unwrap();
+        let _rev = parts.next().unwrap();
+        let stored_device = parts.next().unwrap();
+        let mutated = format!("{stored_epoch}.999.{stored_device}.{mac}");
+        assert_eq!(store.verify_cursor(&mutated), Err(CursorError::Bad));
+
+        // Mutate the device id — MAC fails.
+        let mutated = format!("{stored_epoch}.42.dev-forged.{mac}");
+        assert_eq!(store.verify_cursor(&mutated), Err(CursorError::Bad));
+
+        // A cursor issued by a *different* store fails —
+        // different secret AND different epoch.
+        let other = DeviceStateStore::new();
+        let alien = other.issue_cursor(42, "dev-1");
+        assert_eq!(store.verify_cursor(&alien), Err(CursorError::Bad));
+
+        // Malformed shape.
+        assert_eq!(store.verify_cursor("garbage"), Err(CursorError::Bad));
+        assert_eq!(store.verify_cursor("a.b.c"), Err(CursorError::Bad));
     }
 
     /// H9 round-13 finding 2: `apply_delta` with unique keys

@@ -905,6 +905,39 @@ impl PluginInstance {
                     false
                 };
             if projection_ok {
+                // H9 round-14 finding 1: pre-check the slot
+                // cap. Pre-fix, the store silently truncated
+                // OkWithState fields but returned the full
+                // vec to the API caller, so the API response
+                // and the projection carried different
+                // canonical states. Downgrade the whole
+                // command result to `Err` so the API caller
+                // sees the rejection (the physical action
+                // already ran — nothing we can do about
+                // that — but the caller now knows the state
+                // isn't authoritative).
+                if let Err(overflow) =
+                    crate::state::DeviceStateStore::check_snapshot_admission(fields)
+                {
+                    tracing::warn!(
+                        instance_id = %owner_instance,
+                        device_id = %device_for_projection,
+                        capability = %capability,
+                        projected_fields = overflow.projected_fields,
+                        projected_bytes = overflow.projected_bytes,
+                        cap_fields = overflow.cap_fields,
+                        cap_bytes = overflow.cap_bytes,
+                        "execute-command OkWithState exceeds the per-slot cap; downgrading to Err",
+                    );
+                    return Ok(CommandResult::Err(
+                        crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(
+                            format!(
+                                "OkWithState on `{device_for_projection}/{capability}` would exceed \
+                                 the projection's per-slot cap ({overflow})",
+                            ),
+                        ),
+                    ));
+                }
                 let received_ms = crate::state::event_log::now_unix_ms();
                 device_state.replace_snapshot(
                     device_for_projection,

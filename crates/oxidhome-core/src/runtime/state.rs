@@ -310,7 +310,9 @@ use crate::host_impl::plugin::oxidhome::plugin::{
     types::{DeviceId, Error as WitError, KeyValue, ServiceId, SubscriptionId, Value as WitValue},
 };
 use crate::runtime::registry::InstanceRegistry;
-use crate::state::{DeviceRegistry, EventBus, EventSubscription, ServiceRegistry};
+use crate::state::{
+    DeviceRegistry, EventBus, EventSubscription, MAX_CAPABILITIES_PER_DEVICE, ServiceRegistry,
+};
 
 /// Identifier the host assigns to a plugin instance — Phase 6 fleshes
 /// this out (manifest-driven IDs, multi-instance dedup). Phase 2 uses
@@ -682,6 +684,37 @@ fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
 /// the most useful existing variant rather than reaching for a new
 /// WIT error today.
 fn authorize_device_info(declared: &[String], info: &DeviceInfo) -> Result<(), WitError> {
+    // H9 round-14 finding 2: cap capabilities per device.
+    // Without this, a single device can hold arbitrarily
+    // many `extension(<unique>)` slots — bypassing the
+    // per-instance device quota (only one device) and
+    // amplifying every snapshot page (one device forces
+    // every capability onto the same page). Chosen
+    // generously — real devices in the review's registry
+    // don't exceed a handful of capabilities.
+    if info.capabilities.len() > MAX_CAPABILITIES_PER_DEVICE {
+        return Err(WitError::InvalidArgument(format!(
+            "device `{}` declares {} capabilities; the per-device cap is {MAX_CAPABILITIES_PER_DEVICE}",
+            info.local_id,
+            info.capabilities.len(),
+        )));
+    }
+    // H9 round-14 finding 1: reject oversized `initial_state`
+    // entries at the WIT boundary. Pre-fix, the store
+    // silently truncated them and the caller saw success.
+    // Uses the same per-variant projection as
+    // `seed_state_from_initial` so the check matches what
+    // actually reaches the store.
+    for (name, fields) in seed_state_from_initial(info) {
+        if let Err(overflow) = crate::state::DeviceStateStore::check_snapshot_admission(&fields) {
+            return Err(WitError::InvalidArgument(format!(
+                "initial_state entry `{name}` on device `{}` would exceed the projection's \
+                 per-slot cap ({overflow})",
+                info.local_id,
+            )));
+        }
+    }
+
     // H9 round-11 finding 2: WIT contract is one entry per
     // stateful capability. Duplicates in either list are
     // rejected up front — pre-fix, two `Switch` entries in
@@ -1179,6 +1212,7 @@ fn require_publish_authorized(
 }
 
 impl host_events::Host for PluginState {
+    #[allow(clippy::too_many_lines)]
     async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
         // Architecture-review C2 — three gates before the event
         // reaches the bus:
@@ -1276,6 +1310,40 @@ impl host_events::Host for PluginState {
             return Err(WitError::Unavailable(format!(
                 "publish-event: per-instance publish quota exhausted \
                  (capacity {capacity} events, refill {refill_per_sec}/s)",
+            )));
+        }
+
+        // H9 round-14 finding 1: for `state-changed` events,
+        // pre-check the per-slot cap before persisting to
+        // the event log / broadcasting. Pre-fix, the store
+        // silently dropped overflow fields — leaving the
+        // durable log carrying the full event and the
+        // projection carrying a truncated slot, two
+        // conflicting authoritative views.
+        if let (
+            Some(device_id),
+            crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
+        ) = (ev.device.as_deref(), &ev.payload)
+            && let Err(overflow) =
+                self.device_state
+                    .check_delta_admission(device_id, &sc.capability, &sc.fields)
+        {
+            tracing::warn!(
+                target: "device_state.slot_field_cap",
+                instance_id = %self.instance_id,
+                device_id = %device_id,
+                capability = %sc.capability,
+                projected_fields = overflow.projected_fields,
+                projected_bytes = overflow.projected_bytes,
+                cap_fields = overflow.cap_fields,
+                cap_bytes = overflow.cap_bytes,
+                "publish_event denied: state-change would exceed the per-slot cap",
+            );
+            return Err(WitError::InvalidArgument(format!(
+                "state-change on `{device_id}/{cap}` would exceed the projection's \
+                 per-slot cap ({overflow}); host refuses the publish so the durable \
+                 log and the projection stay consistent",
+                cap = sc.capability,
             )));
         }
 

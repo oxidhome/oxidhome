@@ -385,6 +385,18 @@ impl DeviceRegistry {
 /// projection (which never evicts `Fresh` entries).
 pub const MAX_DEVICES_PER_INSTANCE: usize = 1024;
 
+/// H9 round-14 finding 2: per-*device* capability cap. One
+/// `DeviceInfo.capabilities` list caps at this many entries.
+/// Without it, a plugin can grow one device's projection
+/// footprint arbitrarily via unique
+/// `capability-spec::extension(<name>)` values — bypassing
+/// the per-instance device quota (that device counts as
+/// one) and forcing every capability onto the same snapshot
+/// page (all-caps-for-one-device is atomic). Chosen
+/// generously: real devices declare a handful of
+/// capabilities.
+pub const MAX_CAPABILITIES_PER_DEVICE: usize = 32;
+
 /// Bundle the registry into a shared `Arc` for [`Engine`] /
 /// [`PluginState`](crate::runtime::PluginState) clones.
 pub type SharedDeviceRegistry = Arc<DeviceRegistry>;

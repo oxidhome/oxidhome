@@ -469,40 +469,16 @@ struct AllDevicesStateParams {
     limit: Option<usize>,
 }
 
-/// Decoded form of the opaque `cursor` query parameter. Format
-/// on the wire: `<epoch>.<pinned_revision>.<after_device_id>`.
-/// All three components are URL-safe (epoch is
-/// `epoch-<32hex>`, revision is decimal, `device_id` is
-/// `dev-<16hex>` — none contain `.`), so plain string
-/// concatenation with a `.` delimiter suffices without
-/// pulling in a base64 dep.
-struct DecodedCursor {
-    epoch: String,
-    pinned_revision: u64,
-    after_device_id: String,
-}
-
-impl DecodedCursor {
-    fn parse(raw: &str) -> Result<Self, ()> {
-        let mut parts = raw.splitn(3, '.');
-        let epoch = parts.next().ok_or(())?;
-        let rev = parts.next().ok_or(())?;
-        let device = parts.next().ok_or(())?;
-        if epoch.is_empty() || device.is_empty() {
-            return Err(());
-        }
-        let pinned_revision = rev.parse::<u64>().map_err(|_| ())?;
-        Ok(Self {
-            epoch: epoch.to_string(),
-            pinned_revision,
-            after_device_id: device.to_string(),
-        })
-    }
-
-    fn encode(epoch: &str, pinned_revision: u64, after_device_id: &str) -> String {
-        format!("{epoch}.{pinned_revision}.{after_device_id}")
-    }
-}
+// H9 round-14 finding 3: cursor issue/verify moved into
+// `DeviceStateStore` — [`DeviceStateStore::issue_cursor`] and
+// [`DeviceStateStore::verify_cursor`]. Format is
+// `<epoch>.<pinned_revision>.<after_device_id>.<hmac>`
+// where `hmac` is HMAC-SHA256-128 keyed on a per-process
+// secret. The round-13 in-handler `DecodedCursor` was
+// forgeable — a client could construct any cursor from
+// scratch (the epoch is publicly visible) and mutate the
+// revision or device id to skip pages or recreate the
+// round-12 lost-update race.
 
 /// Default page size for `GET /api/v1/devices/state` — chosen
 /// to comfortably carry a household-sized deployment in one
@@ -608,34 +584,35 @@ async fn get_all_device_state(
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_ALL_DEVICES_STATE_LIMIT)
         .min(MAX_ALL_DEVICES_STATE_LIMIT);
-    let cursor = params
-        .cursor
-        .as_deref()
-        .map(DecodedCursor::parse)
-        .transpose()
-        .map_err(|()| AllDevicesStateError::BadCursor)?;
+    // H9 round-14 finding 3: verify the cursor's HMAC before
+    // trusting *any* of its fields (the round-13 plain-text
+    // cursor was forgeable). Bad shape / MAC → 400; MAC
+    // verifies but the store's epoch has rotated → 409.
+    let cursor_fields = match params.cursor.as_deref() {
+        Some(raw) => match state.engine.device_state().verify_cursor(raw) {
+            Ok(triple) => Some(triple),
+            Err(crate::state::CursorError::Bad) => {
+                return Err(AllDevicesStateError::BadCursor);
+            }
+            Err(crate::state::CursorError::EpochChanged) => {
+                return Err(AllDevicesStateError::EpochChanged);
+            }
+        },
+        None => None,
+    };
     // Ask for `limit + 1` distinct devices so we can tell
     // whether another page exists without a second lookup.
     let (epoch, current_revision, entries) =
         state.engine.device_state().snapshot_page_with_revision(
-            cursor.as_ref().map(|c| c.after_device_id.as_str()),
+            cursor_fields.as_ref().map(|(_, _, did)| did.as_str()),
             limit + 1,
         );
-    // H9 round-13 finding 1: opaque cursor carries the pinned
-    // revision. On page one it isn't set; server reports the
-    // store's current revision as both the response revision
-    // *and* the pin encoded into any `next_cursor`. On
-    // continuation the cursor's epoch must still match the
-    // store's current epoch (409 if it doesn't — daemon
-    // restart mid-resync); the pinned revision comes from
-    // the cursor, not from the client's request body.
-    let revision = match cursor.as_ref() {
-        Some(c) => {
-            if c.epoch != epoch {
-                return Err(AllDevicesStateError::EpochChanged);
-            }
-            c.pinned_revision
-        }
+    // On page one (no cursor), report the store's current
+    // revision; on continuation, echo the pinned revision
+    // from the (verified) cursor so all pages of one resync
+    // agree.
+    let revision = match cursor_fields.as_ref() {
+        Some((_, r, _)) => *r,
         None => current_revision,
     };
     let mut by_device: std::collections::BTreeMap<String, Vec<DeviceStateEntry>> =
@@ -659,12 +636,15 @@ async fn get_all_device_state(
         })
         .collect();
     let next_cursor = if devices.len() > limit {
-        // Drop the sentinel `limit + 1`-th device and issue a
-        // cursor anchored at its predecessor's id.
+        // Drop the sentinel `limit + 1`-th device and issue an
+        // HMAC-signed cursor anchored at its predecessor's id.
         devices.truncate(limit);
-        devices
-            .last()
-            .map(|d| DecodedCursor::encode(&epoch, revision, &d.device_id))
+        devices.last().map(|d| {
+            state
+                .engine
+                .device_state()
+                .issue_cursor(revision, &d.device_id)
+        })
     } else {
         None
     };

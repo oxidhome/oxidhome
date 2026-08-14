@@ -75,6 +75,14 @@ pub enum ValidationError {
     )]
     TooManyKeywords { count: usize, max: usize },
 
+    #[error(
+        "capabilities.declares_devices has {count} entries; the cap is {max}. \
+         Every entry contributes to per-device projection cost and permission \
+         gates checked on register-device — narrow the list to the capabilities \
+         this plugin actually publishes."
+    )]
+    TooManyDeclaresDevices { count: usize, max: usize },
+
     #[error("plugin.keywords[{index}] `{got}` is invalid: {reason}")]
     InvalidKeyword {
         index: usize,
@@ -259,6 +267,19 @@ pub const MIN_TICK_INTERVAL_MS: u64 = 10;
 /// non-DoS-able from the manifest side.
 pub const MAX_CONSUMES_SERVICES_GRANTS: usize = 128;
 
+/// H9 round-14 finding 2: cap on
+/// `capabilities.declares_devices` — the list of
+/// capabilities this plugin is authorized to publish on
+/// registered devices. Every entry participates in the
+/// per-register-device permission gate and contributes to
+/// per-device projection scope, so the cap bounds admission
+/// work AND the ceiling of any one device's capability set.
+/// Chosen generously — the known capability universe is
+/// small (`switch`, `dimmer`, `color-light`, `sensor`,
+/// `button`, `video-stream`, `audio-stream`, plus
+/// `extension(<name>)` — a real plugin picks a handful).
+pub const MAX_DECLARES_DEVICES: usize = 64;
+
 /// H10 round-4: hard cap on a single grant's `commands` list.
 /// A grant that wants "every command" uses `["*"]` — the cap
 /// bounds enumerated lists.
@@ -387,6 +408,12 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
         });
     }
 
+    if m.capabilities.declares_devices.len() > MAX_DECLARES_DEVICES {
+        errors.push(ValidationError::TooManyDeclaresDevices {
+            count: m.capabilities.declares_devices.len(),
+            max: MAX_DECLARES_DEVICES,
+        });
+    }
     for cap in &m.capabilities.declares_devices {
         if !is_known_device_capability(cap) {
             errors.push(ValidationError::UnknownDeclaredDeviceCapability { got: cap.clone() });
