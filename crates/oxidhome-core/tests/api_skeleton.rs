@@ -5370,3 +5370,302 @@ async fn plugin_schema_returns_404_for_unknown_plugin() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+// ── Phase 13 slice 3: dashboard CRUD endpoints ──────────────────
+
+/// Phase 13 slice 3: `POST /dashboards` creates a row,
+/// `GET /dashboards/{id}` reads it back, `GET
+/// /dashboards` lists it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_create_read_and_list_round_trip() {
+    let state_dir = support::tempdir("dashboards-round-trip");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let body = serde_json::json!({
+        "name": "home",
+        "layout": {"rows": [{"widgets": [{"type": "toggle"}]}]},
+        "schema_version": 3,
+    });
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = body_to_json(response.into_body()).await;
+    let id = created["id"].as_i64().expect("id");
+    assert!(id > 0);
+    assert_eq!(created["name"], "home");
+    assert_eq!(created["schema_version"], 3);
+    assert_eq!(created["layout"]["rows"][0]["widgets"][0]["type"], "toggle");
+
+    // GET by id.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched = body_to_json(response.into_body()).await;
+    assert_eq!(fetched["id"], id);
+    assert_eq!(fetched["name"], "home");
+
+    // LIST (should include the row).
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed = body_to_json(response.into_body()).await;
+    let dashboards = listed["dashboards"].as_array().expect("dashboards");
+    assert_eq!(dashboards.len(), 1);
+    assert_eq!(dashboards[0]["id"], id);
+}
+
+/// Phase 13 slice 3: PUT updates the layout in place;
+/// DELETE removes the row and subsequent GETs 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_update_and_delete_round_trip() {
+    let state_dir = support::tempdir("dashboards-update-delete");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"home","layout":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = body_to_json(response.into_body()).await["id"]
+        .as_i64()
+        .unwrap();
+
+    // PUT.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"home v2","layout":{"rows":[]}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated = body_to_json(response.into_body()).await;
+    assert_eq!(updated["name"], "home v2");
+
+    // DELETE → 204.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Second DELETE / GET → 404.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Phase 13 slice 3: cross-owner reads / writes / deletes
+/// return 404 — same shape as "no such dashboard", so
+/// multi-user rollout doesn't leak the id-space to other
+/// operators.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_cross_owner_is_a_404() {
+    let state_dir = support::tempdir("dashboards-cross-owner");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let alice = engine
+        .auth_tokens()
+        .create("alice", b"[\"dashboards:read\",\"dashboards:write\"]")
+        .unwrap();
+    let bob = engine
+        .auth_tokens()
+        .create("bob", b"[\"dashboards:read\",\"dashboards:write\"]")
+        .unwrap();
+    let router = build_router(engine);
+    // Alice creates a dashboard.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", alice.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"alice-home","layout":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = body_to_json(response.into_body()).await["id"]
+        .as_i64()
+        .unwrap();
+
+    // Bob's list is empty.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", bob.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed = body_to_json(response.into_body()).await;
+    assert!(listed["dashboards"].as_array().unwrap().is_empty());
+
+    // Bob's GET of alice's id → 404.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", bob.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Bob's PUT → 404, alice's row unchanged.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", bob.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"bob-was-here","layout":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", alice.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let alice_view = body_to_json(response.into_body()).await;
+    assert_eq!(alice_view["name"], "alice-home");
+}
+
+/// Phase 13 slice 3: read + write scopes gate the CRUD
+/// endpoints independently. `dashboards:read` alone
+/// forbids POST / PUT / DELETE.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_write_requires_dashboards_write_scope() {
+    let state_dir = support::tempdir("dashboards-scope");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"dashboards:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"nope","layout":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // LIST still works with dashboards:read alone.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboards")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

@@ -34,9 +34,9 @@ use crate::state::{
 
 use super::auth::{AuthState, require_token};
 use super::scopes::{
-    AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ, EVENTS_READ, EVENTS_TAIL,
-    INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP,
-    PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, require_scope,
+    AUDIT_READ, DASHBOARDS_READ, DASHBOARDS_WRITE, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ,
+    EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST,
+    PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, require_scope,
 };
 use super::ui_ticket;
 
@@ -107,6 +107,19 @@ pub fn build_router(engine: Engine) -> Router {
         // that lists installed plugins can see their
         // schemas.
         .route("/api/v1/plugins/{plugin_id}/schema", get(get_plugin_schema))
+        // Phase 13 slice 3: dashboard CRUD. Layout bytes
+        // are opaque to the host; the shell owns the
+        // serialization contract.
+        .route(
+            "/api/v1/dashboards",
+            get(list_dashboards).post(create_dashboard),
+        )
+        .route(
+            "/api/v1/dashboards/{id}",
+            get(get_dashboard)
+                .put(update_dashboard)
+                .delete(delete_dashboard),
+        )
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/events", get(query_events))
         .route("/api/v1/logs", get(query_logs))
@@ -3000,6 +3013,250 @@ impl WireAuditEntry {
             execution_outcome: row.execution_outcome,
             domain_error: row.domain_error,
             credential_fp: row.credential_fp,
+        }
+    }
+}
+
+// ── Dashboards (Phase 13 slice 3) ────────────────────────────────
+
+/// Wire shape for a dashboard row. `layout` is the shell's
+/// opaque JSON tree — represented as `serde_json::Value` so
+/// clients can send/receive typed JSON without base64.
+#[derive(Debug, Serialize, Deserialize)]
+struct WireDashboard {
+    id: i64,
+    name: String,
+    owner_user_id: String,
+    layout: serde_json::Value,
+    schema_version: i64,
+    created_ms: i64,
+    updated_ms: i64,
+}
+
+impl WireDashboard {
+    fn from_row(row: crate::state::Dashboard) -> Result<Self, DashboardsError> {
+        let layout = serde_json::from_slice(&row.layout_json)
+            .map_err(|err| DashboardsError::CorruptRow(err.to_string()))?;
+        Ok(Self {
+            id: row.id,
+            name: row.name,
+            owner_user_id: row.owner_user_id,
+            layout,
+            schema_version: row.schema_version,
+            created_ms: row.created_ms,
+            updated_ms: row.updated_ms,
+        })
+    }
+}
+
+/// `POST /api/v1/dashboards` / `PUT /.../{id}` request body.
+/// `layout` is the shell's opaque tree; the host encodes it
+/// to bytes on the way in and back to `Value` on the way
+/// out.
+#[derive(Debug, Deserialize)]
+struct DashboardInputBody {
+    name: String,
+    layout: serde_json::Value,
+    #[serde(default = "default_schema_version")]
+    schema_version: i64,
+}
+
+fn default_schema_version() -> i64 {
+    1
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardsBody {
+    dashboards: Vec<WireDashboard>,
+}
+
+/// `GET /api/v1/dashboards` — every dashboard owned by the
+/// caller. Sorted by `updated_ms DESC` (most recently
+/// edited first), so a shell picker can show the useful
+/// dashboards without an extra sort round trip.
+///
+/// # Errors
+/// - `403` scope check failed.
+async fn list_dashboards(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+) -> Result<Json<DashboardsBody>, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_READ)?;
+    let owner = actor.id().to_string();
+    let rows = tokio::task::spawn_blocking(move || state.engine.dashboards().list_by_owner(&owner))
+        .await
+        .map_err(|err| DashboardsError::Internal(err.into()))??;
+    let dashboards = rows
+        .into_iter()
+        .map(WireDashboard::from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(DashboardsBody { dashboards }))
+}
+
+/// `POST /api/v1/dashboards` — create a fresh dashboard
+/// owned by the caller. Returns the stored row with its
+/// server-minted id.
+///
+/// # Errors
+/// - `400` request body isn't valid JSON.
+/// - `403` scope check failed.
+async fn create_dashboard(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Json(body): Json<DashboardInputBody>,
+) -> Result<Json<WireDashboard>, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_WRITE)?;
+    let layout_json =
+        serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
+    let input = crate::state::DashboardInput {
+        name: body.name,
+        owner_user_id: actor.id().to_string(),
+        layout_json,
+        schema_version: body.schema_version,
+    };
+    let created = tokio::task::spawn_blocking(move || state.engine.dashboards().create(input))
+        .await
+        .map_err(|err| DashboardsError::Internal(err.into()))??;
+    Ok(Json(WireDashboard::from_row(created)?))
+}
+
+/// `GET /api/v1/dashboards/{id}` — load one dashboard the
+/// caller owns. Cross-owner reads return 404 (same shape
+/// as "no such dashboard" — no enumeration oracle across
+/// operators once multi-user lands).
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` dashboard doesn't exist OR is owned by a
+///   different user.
+async fn get_dashboard(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<WireDashboard>, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_READ)?;
+    let owner = actor.id().to_string();
+    let row = tokio::task::spawn_blocking(move || state.engine.dashboards().get(id))
+        .await
+        .map_err(|err| DashboardsError::Internal(err.into()))??
+        .filter(|d| d.owner_user_id == owner)
+        .ok_or(DashboardsError::NotFound)?;
+    Ok(Json(WireDashboard::from_row(row)?))
+}
+
+/// `PUT /api/v1/dashboards/{id}` — replace the caller's
+/// dashboard. Ownership is checked on the current row
+/// before the write so a cross-owner attempt returns 404
+/// without touching the row.
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` dashboard doesn't exist OR is owned by a
+///   different user.
+async fn update_dashboard(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+    Json(body): Json<DashboardInputBody>,
+) -> Result<Json<WireDashboard>, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_WRITE)?;
+    let owner = actor.id().to_string();
+    let layout_json =
+        serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
+    let store = state.engine.dashboards();
+    let existing = tokio::task::spawn_blocking({
+        let store = Arc::clone(&store);
+        move || store.get(id)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??
+    .filter(|d| d.owner_user_id == owner)
+    .ok_or(DashboardsError::NotFound)?;
+    let input = crate::state::DashboardInput {
+        name: body.name,
+        owner_user_id: existing.owner_user_id,
+        layout_json,
+        schema_version: body.schema_version,
+    };
+    let updated = tokio::task::spawn_blocking(move || store.update(id, input))
+        .await
+        .map_err(|err| DashboardsError::Internal(err.into()))??;
+    Ok(Json(WireDashboard::from_row(updated)?))
+}
+
+/// `DELETE /api/v1/dashboards/{id}` — remove the caller's
+/// dashboard. Cross-owner attempts return 404. Idempotent
+/// on the owner path (deleting a dashboard the caller
+/// already deleted returns 404).
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` dashboard doesn't exist OR is owned by a
+///   different user.
+async fn delete_dashboard(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_WRITE)?;
+    let owner = actor.id().to_string();
+    let store = state.engine.dashboards();
+    let existing = tokio::task::spawn_blocking({
+        let store = Arc::clone(&store);
+        move || store.get(id)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??
+    .filter(|d| d.owner_user_id == owner)
+    .ok_or(DashboardsError::NotFound)?;
+    let _ = existing;
+    tokio::task::spawn_blocking(move || store.delete(id))
+        .await
+        .map_err(|err| DashboardsError::Internal(err.into()))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Handler-local error type. Errors from the store fold
+/// into this via `?`.
+enum DashboardsError {
+    Scope(ScopeDenied),
+    NotFound,
+    /// `layout_json` on disk doesn't parse as JSON. Should
+    /// never happen — the write path always serializes via
+    /// `serde_json::to_vec` — but if it does, treat as an
+    /// integrity failure.
+    CorruptRow(String),
+    Internal(anyhow::Error),
+}
+
+impl From<ScopeDenied> for DashboardsError {
+    fn from(value: ScopeDenied) -> Self {
+        Self::Scope(value)
+    }
+}
+
+impl From<crate::state::DashboardError> for DashboardsError {
+    fn from(value: crate::state::DashboardError) -> Self {
+        match value {
+            crate::state::DashboardError::NotFound(_) => Self::NotFound,
+            crate::state::DashboardError::Persistence(err) => Self::Internal(err.into()),
+        }
+    }
+}
+
+impl IntoResponse for DashboardsError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            Self::CorruptRow(err) => {
+                tracing::error!(target: "api.dashboards", error = %err, "corrupt dashboard row");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+            Self::Internal(err) => {
+                tracing::error!(target: "api.dashboards", error = %err, "dashboard store failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
         }
     }
 }

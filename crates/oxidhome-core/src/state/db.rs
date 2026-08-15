@@ -672,6 +672,44 @@ const MIGRATIONS: &[&str] = &[
            AND instance_id       = NEW.instance_id;
     END;
     ",
+    // Migration 15 — Phase 13 slice 3: dashboard storage.
+    //
+    // User-composed dashboards (rows of widgets, per the UI
+    // architecture design note). Persisted centrally so the
+    // shell can show the same dashboard on any browser the
+    // operator logs in from, and so a host restart doesn't
+    // lose the layout.
+    //
+    // `layout_json` is the tree the shell serializes — the
+    // host treats it as opaque bytes; the *shape* is the
+    // shell's contract with itself, versioned by
+    // `schema_version` so a widget catalog change (widget
+    // renamed / removed / config-shape migrated) can drive
+    // a declarative shell-side transform on load.
+    //
+    // `owner_user_id` mirrors the Phase 12 actor id space —
+    // v1 is single-role "admin" (only the admin actor's
+    // dashboards are addressable), but the column already
+    // exists so the multi-user follow-up is a routing change,
+    // not a migration. `created_ms` / `updated_ms` are host
+    // wall-clock — the shell shows relative timestamps off
+    // them.
+    //
+    // `by_owner` index is what the list-dashboards endpoint
+    // scans; primary-key ordering happens to match creation
+    // order which is fine for the common case.
+    "
+    CREATE TABLE dashboard (
+        id            INTEGER PRIMARY KEY,
+        name          TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        layout_json   BLOB NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        created_ms    INTEGER NOT NULL,
+        updated_ms    INTEGER NOT NULL
+    );
+    CREATE INDEX dashboard_by_owner ON dashboard(owner_user_id);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

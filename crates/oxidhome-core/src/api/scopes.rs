@@ -184,6 +184,19 @@ pub(crate) const PLUGINS_STOP: Scope = Scope::new("plugins:stop");
 /// enough to do both. Audited.
 pub(crate) const PLUGINS_UNINSTALL: Scope = Scope::new("plugins:uninstall");
 
+/// Phase 13 slice 3: `dashboards:read` — see
+/// `GET /api/v1/dashboards` and `GET /api/v1/dashboards/{id}`.
+/// Read-only view over an operator's persisted dashboards.
+pub(crate) const DASHBOARDS_READ: Scope = Scope::new("dashboards:read");
+
+/// Phase 13 slice 3: `dashboards:write` — see
+/// `POST /api/v1/dashboards`, `PUT /api/v1/dashboards/{id}`,
+/// `DELETE /api/v1/dashboards/{id}`. Layout bytes are
+/// opaque to the host; the shell owns the serialization
+/// contract, so `write` doesn't require any per-widget
+/// grant.
+pub(crate) const DASHBOARDS_WRITE: Scope = Scope::new("dashboards:write");
+
 /// C6: `plugins:ui` — see `GET /api/v1/plugins/{plugin_id}/ui`.
 /// Gates the sandboxed-iframe wrapper endpoint that hosts the
 /// plugin's UI. The wrapper page mints a short-lived

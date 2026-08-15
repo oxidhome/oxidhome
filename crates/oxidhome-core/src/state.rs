@@ -18,6 +18,7 @@
 pub mod audit_log;
 pub mod auth_token;
 pub mod blobs;
+pub mod dashboards;
 pub mod db;
 pub mod device_state;
 pub mod devices;
@@ -31,6 +32,9 @@ pub mod services;
 pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery, credential_fingerprint};
 pub use auth_token::{IssuedToken, TokenError, TokenRecord, TokenStore};
 pub use blobs::{BlobError, BlobInfo, BlobStore, is_safe_instance_id};
+pub use dashboards::{
+    Dashboard, DashboardError, DashboardInput, DashboardStore, SharedDashboardStore,
+};
 pub use db::Db;
 pub use device_state::{
     CursorError, DeltaPage, DeviceState, DeviceStateStore, MAX_BYTES_PER_SLOT, MAX_FIELDS_PER_SLOT,
