@@ -24,6 +24,7 @@ mod bootstrap;
 mod connect_rpc;
 mod scopes;
 mod server;
+mod ui_ticket;
 
 pub use bootstrap::ensure_admin_token;
 pub use server::{ApiConfig, bind, build_router, serve};

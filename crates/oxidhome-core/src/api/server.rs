@@ -36,8 +36,9 @@ use super::auth::{AuthState, require_token};
 use super::scopes::{
     AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ, EVENTS_READ, EVENTS_TAIL,
     INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP,
-    PLUGINS_UNINSTALL, ScopeDenied, require_scope,
+    PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, require_scope,
 };
+use super::ui_ticket;
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
 /// loopback port — what tests use). Daemon callers set `bind` to
@@ -101,6 +102,19 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/events", get(query_events))
         .route("/api/v1/logs", get(query_logs))
         .route("/api/v1/audit", get(query_audit))
+        // C6: bearer-gated JSON endpoint that mints a
+        // short-lived HMAC ticket and returns the wrapper
+        // URL for the dashboard to hand off as an iframe
+        // `src`. `/ui` itself sits on the ticket-gated
+        // router below — browsers can't attach the parent's
+        // `Authorization` header to a subresource nav or a
+        // top-level document nav, so requiring bearer on
+        // the wrapper would 401 every legitimate browser
+        // flow. Gated on `plugins:ui`.
+        .route(
+            "/api/v1/plugins/{plugin_id}/ui-session",
+            post(post_plugin_ui_session),
+        )
         .layer(from_fn_with_state(auth_state.clone(), require_token));
 
     // `/readyz` mounts **outside** the authenticated router (PR-#83
@@ -116,8 +130,28 @@ pub fn build_router(engine: Engine) -> Router {
     // construction.
     let public: Router<ApiState> = Router::new().route("/api/v1/readyz", get(readyz));
 
+    // C6: `/ui` and `/ui/frame` mount on their own router
+    // with **no bearer layer** — browsers can't attach the
+    // parent page's `Authorization` header to iframe
+    // subresource navigations OR top-level document
+    // navigations, so both authenticate via the HMAC
+    // ticket in `?tk=…` (verified inside each handler).
+    // Physical separation from `authenticated` means an
+    // accidental route add on this router can't inherit
+    // bearer-gated scopes, and ticket verification is the
+    // only auth check that can grant access to plugin UI
+    // content. `POST /ui-session` above (bearer-gated)
+    // is the only path that mints these tickets.
+    let ticket_gated: Router<ApiState> = Router::new()
+        .route("/api/v1/plugins/{plugin_id}/ui", get(get_plugin_ui))
+        .route(
+            "/api/v1/plugins/{plugin_id}/ui/frame",
+            get(get_plugin_ui_frame),
+        );
+
     public
         .merge(authenticated)
+        .merge(ticket_gated)
         .fallback_service(connect_service)
         .with_state(ApiState { engine })
 }
@@ -1597,6 +1631,492 @@ impl IntoResponse for PluginLifecycleError {
                 .into_response(),
         }
     }
+}
+
+// ── Plugin UI (sandboxed iframe wrapper + ticketed frame) ────────
+
+/// C6 round-2 finding 1: `POST /api/v1/plugins/{plugin_id}/ui-session`
+/// — bearer-gated JSON endpoint that mints a short-lived
+/// HMAC ticket and returns the wrapper URL for the
+/// dashboard to hand off as an iframe `src`. This is the
+/// only path that mints tickets; both `/ui` and
+/// `/ui/frame` verify them.
+///
+/// The dashboard flow:
+/// 1. Dashboard (holds bearer) `POST`s here and reads
+///    `{"url": ".../ui?tk=<t>", "expires_ms": …}`.
+/// 2. Dashboard renders `<iframe src=<url>>` (or opens
+///    `window.open(url)`) — no bearer in the request the
+///    browser makes, because it can't attach one to an
+///    iframe / top-level navigation.
+/// 3. `/ui` verifies the ticket, returns the sandboxed
+///    wrapper HTML which embeds the same ticket into the
+///    inner `<iframe sandbox src=".../ui/frame?tk=<t>">`.
+/// 4. `/ui/frame` verifies the ticket again and serves
+///    the plugin's UI assets.
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` no such installed plugin.
+async fn post_plugin_ui_session(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Response, PluginUiError> {
+    require_scope(&actor, PLUGINS_UI)?;
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginUiError::NotFound);
+    };
+    let secret = state.engine.ui_ticket_secret();
+    let now = std::time::SystemTime::now();
+    let ticket = ui_ticket::issue(&secret, &plugin_id, &installed.installation_uuid, now);
+    let url = format!(
+        "/api/v1/plugins/{}/ui?tk={}",
+        percent_encode_path_segment(&plugin_id),
+        percent_encode_query_value(&ticket),
+    );
+    let expires_ms = now
+        .checked_add(ui_ticket::TICKET_TTL)
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    let mut response = Json(UiSessionBody { url, expires_ms }).into_response();
+    // Round-3 finding 2: the session response body carries
+    // a freshly-minted ticket. HTTP caches must not store
+    // it (RFC 9111) — a shared proxy that replayed this
+    // body would hand every subsequent caller a
+    // still-valid ticket authorising the plugin UI.
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+#[derive(Serialize)]
+struct UiSessionBody {
+    /// Ticketed URL the dashboard hands to the browser as
+    /// an iframe `src` (or `window.open` argument).
+    url: String,
+    /// Absolute Unix-epoch expiry (milliseconds) — clients
+    /// can pre-emptively refresh before this deadline.
+    expires_ms: u64,
+}
+
+/// C6 round-2 finding 1: `GET /api/v1/plugins/{plugin_id}/ui`
+/// — sandboxed-iframe wrapper page. Ticket-gated (no
+/// bearer possible from a browser document navigation),
+/// verifies `?tk=…` against the per-process secret and the
+/// current installation's UUID. The wrapper embeds the
+/// same ticket into an inner `<iframe sandbox>` targeting
+/// the frame endpoint; the sandbox list omits
+/// `allow-same-origin` so the browser assigns each iframe
+/// a fresh opaque origin — distinct from the daemon's and
+/// from every other plugin's iframe.
+///
+/// The wrapper's inline broker JS creates a fresh
+/// `MessageChannel` per iframe and transfers `port2` on
+/// the `oxidhome:init` handshake. All subsequent host↔
+/// plugin IPC flows on that port — an origin-based
+/// `postMessage` filter would be wrong here (opaque-origin
+/// senders all report `origin: "null"`), and per-port
+/// binding makes cross-plugin dispatch impossible by
+/// construction.
+///
+/// CSP: `default-src 'none'; frame-src 'self'; script-src
+/// 'unsafe-inline'` — inline broker JS is host-controlled,
+/// nothing else can load.
+///
+/// # Errors
+/// - `400` ticket missing or malformed.
+/// - `401` ticket well-formed but expired.
+/// - `404` no such installed plugin, or the ticket is
+///   bound to a different `plugin_id` / `installation_uuid`
+///   (round-2 finding 2 — an uninstall + reinstall race
+///   under the same id fails closed here).
+async fn get_plugin_ui(
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+    ticket: TicketQuery,
+) -> Result<Response, PluginUiError> {
+    // Round-3 finding 1: verify the ticket FIRST — any
+    // garbage ticket returns 400 uniformly, so an
+    // unauthenticated caller can't use `?tk=garbage` to
+    // distinguish installed from unknown plugins.
+    let Some(ticket_raw) = ticket.tk else {
+        return Err(PluginUiError::TicketBad);
+    };
+    let secret = state.engine.ui_ticket_secret();
+    let decoded = match ui_ticket::verify(&secret, &ticket_raw, std::time::SystemTime::now()) {
+        Ok(d) => d,
+        Err(ui_ticket::TicketError::Bad) => return Err(PluginUiError::TicketBad),
+        Err(ui_ticket::TicketError::Expired) => return Err(PluginUiError::TicketExpired),
+    };
+    // MAC verified. Now compare decoded claims against
+    // the URL path + current registry entry. Every branch
+    // below surfaces as 404 — same shape as "no such
+    // plugin" — so a valid-MAC-but-wrong-target ticket
+    // can't be used to enumerate installed ids either.
+    if decoded.plugin_id != plugin_id {
+        return Err(PluginUiError::NotFound);
+    }
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginUiError::NotFound);
+    };
+    if decoded.installation_uuid != *installed.installation_uuid {
+        return Err(PluginUiError::NotFound);
+    }
+    let src = format!(
+        "/api/v1/plugins/{}/ui/frame?tk={}",
+        percent_encode_path_segment(&plugin_id),
+        percent_encode_query_value(&ticket_raw),
+    );
+    let body = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>plugin ui</title>
+</head>
+<body>
+<iframe
+  id="oxidhome-plugin-frame"
+  sandbox="allow-scripts allow-forms"
+  src="{src_attr}"
+  style="border:0;width:100%;height:100vh"
+></iframe>
+<script>
+  // C6 typed postMessage broker. Bound to the iframe's
+  // *exact* MessagePort object, transferred at load time;
+  // NOT to event.origin (opaque-origin iframes all report
+  // origin: "null", so origin can't disambiguate plugins).
+  (function () {{
+    var iframe = document.getElementById("oxidhome-plugin-frame");
+    iframe.addEventListener("load", function () {{
+      var channel = new MessageChannel();
+      // port1 stays with the host page; port2 is transferred
+      // to the sandboxed iframe. All subsequent host <->
+      // plugin traffic flows on this dedicated pair — each
+      // plugin's iframe holds its own port and cannot reach
+      // any other plugin's channel.
+      channel.port1.onmessage = function (event) {{
+        // TODO(phase-13): route typed message envelopes to
+        // the per-plugin capability dispatcher. First-cut
+        // shape: {{"type": "state.snapshot" | ..., "req": <id>, ...}}.
+        // Every message is bound to `iframe.contentWindow` by
+        // *arriving on this specific port*, so per-plugin
+        // capability enforcement is trivial: port ⇒ plugin.
+      }};
+      iframe.contentWindow.postMessage(
+        {{ type: "oxidhome:init", plugin_id: "{plugin_js}" }},
+        "*",
+        [channel.port2],
+      );
+    }});
+  }})();
+</script>
+</body>
+</html>
+"#,
+        src_attr = html_escape(&src),
+        plugin_js = js_string_escape(&plugin_id),
+    );
+    let mut response = (StatusCode::OK, body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; frame-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
+        ),
+    );
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("SAMEORIGIN"),
+    );
+    // Round-3 finding 2: ticket-authenticated responses
+    // MUST NOT be cached. HTTP intermediaries would
+    // otherwise serve stored 200 (or heuristically
+    // cacheable 501) responses past the ticket's expiry
+    // or after an uninstall + reinstall rotates the
+    // installation UUID (RFC 9111).
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+/// C6: iframe destination. Loaded by the wrapper page above
+/// as a sandboxed subresource → browsers don't propagate
+/// the parent's `Authorization` header, so authentication
+/// is via the same HMAC ticket in `?tk=…`. Round-2
+/// finding 2: verifies the ticket's baked-in
+/// `installation_uuid` against the current registry entry
+/// so an uninstall + reinstall under the same
+/// `plugin_id` doesn't let an old ticket authorise the
+/// replacement package.
+///
+/// Stub in the first cut — real UI assets land in Phase 13.
+///
+/// # Errors
+/// - `400` ticket missing or malformed.
+/// - `401` ticket well-formed but expired.
+/// - `404` unknown plugin, or ticket bound to a different
+///   `plugin_id` / `installation_uuid`.
+/// - `501` plugin exists + ticket valid; UI assets not yet
+///   implemented.
+async fn get_plugin_ui_frame(
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+    ticket: TicketQuery,
+) -> Result<Response, PluginUiError> {
+    // Round-3 finding 1: same verify-before-lookup order
+    // as `/ui`.
+    let Some(ticket_raw) = ticket.tk else {
+        return Err(PluginUiError::TicketBad);
+    };
+    let secret = state.engine.ui_ticket_secret();
+    let decoded = match ui_ticket::verify(&secret, &ticket_raw, std::time::SystemTime::now()) {
+        Ok(d) => d,
+        Err(ui_ticket::TicketError::Bad) => return Err(PluginUiError::TicketBad),
+        Err(ui_ticket::TicketError::Expired) => return Err(PluginUiError::TicketExpired),
+    };
+    if decoded.plugin_id != plugin_id {
+        return Err(PluginUiError::NotFound);
+    }
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginUiError::NotFound);
+    };
+    if decoded.installation_uuid != *installed.installation_uuid {
+        return Err(PluginUiError::NotFound);
+    }
+    let mut response = (
+        StatusCode::NOT_IMPLEMENTED,
+        "plugin UI assets are a Phase 13 follow-up",
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("default-src 'none'"),
+    );
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("SAMEORIGIN"),
+    );
+    // Round-3 finding 2: ticket-authenticated responses
+    // MUST NOT be cached. HTTP intermediaries would
+    // otherwise serve stored 200 (or heuristically
+    // cacheable 501) responses past the ticket's expiry
+    // or after an uninstall + reinstall rotates the
+    // installation UUID (RFC 9111).
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+/// C6 round-4 finding 2: custom extractor for the ticket
+/// query param that bounds the raw query string length
+/// **before** allocating or URL-decoding. Pre-fix,
+/// `Query<TicketParams>` ran serde deserialization first
+/// — an unauthenticated request could ship a `tk=…` value
+/// up to the HTTP request-head limit (hyper defaults are
+/// KiB-scale) and force an owned `String` allocation plus
+/// percent-decoding, all before our `MAX_TICKET_LEN` check
+/// on the frame endpoint. Bounding at
+/// `parts.uri.query()` — a borrowed `&str` slice into the
+/// pre-parsed URI, no alloc — moves the size cap ahead of
+/// any attacker-controlled allocation.
+///
+/// The bound (`MAX_UI_QUERY_LEN`) is
+/// `MAX_TICKET_LEN + "tk=".len()` so a valid ticket
+/// always fits and any query longer than that is
+/// rejected wholesale.
+struct TicketQuery {
+    tk: Option<String>,
+}
+
+const MAX_UI_QUERY_LEN: usize = ui_ticket::MAX_TICKET_LEN + b"tk=".len();
+
+impl<S> axum::extract::FromRequestParts<S> for TicketQuery
+where
+    S: Send + Sync,
+{
+    type Rejection = PluginUiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let query = parts.uri.query().unwrap_or("");
+        if query.len() > MAX_UI_QUERY_LEN {
+            return Err(PluginUiError::TicketBad);
+        }
+        // Query is bounded — safe to parse now. Ticket
+        // chars are all URL-safe (`~`, digits, hex, hyphens,
+        // dots) so no percent-decoding is expected; if the
+        // caller sends a percent-encoded ticket the raw
+        // bytes will fail HMAC verify, which is the correct
+        // outcome (`Bad`).
+        let mut tk: Option<String> = None;
+        for pair in query.split('&') {
+            let Some(value) = pair.strip_prefix("tk=") else {
+                continue;
+            };
+            // Last-`tk` wins, matching serde_urlencoded's
+            // Option<T> shape.
+            tk = Some(value.to_string());
+        }
+        Ok(Self { tk })
+    }
+}
+
+/// C6: handler-local error type for the two UI endpoints.
+enum PluginUiError {
+    Scope(ScopeDenied),
+    NotFound,
+    TicketBad,
+    TicketExpired,
+}
+
+impl From<ScopeDenied> for PluginUiError {
+    fn from(value: ScopeDenied) -> Self {
+        Self::Scope(value)
+    }
+}
+
+impl IntoResponse for PluginUiError {
+    fn into_response(self) -> Response {
+        let mut response = match self {
+            // Round-3 finding 2: scope-denied responses go
+            // through the shared 403 shape without our
+            // Cache-Control stamp — they aren't
+            // ticket-authenticated and don't leak
+            // anything cacheable-across-request either.
+            Self::Scope(s) => return s.into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            // Round-3 finding 3: recovery is `POST
+            // /api/v1/plugins/{id}/ui-session` (bearer + the
+            // `plugins:ui` scope) — `/ui` no longer mints
+            // tickets, it consumes them.
+            Self::TicketBad => (
+                StatusCode::BAD_REQUEST,
+                "invalid or missing `tk` — POST /api/v1/plugins/{plugin_id}/ui-session to mint a fresh ticket",
+            )
+                .into_response(),
+            Self::TicketExpired => (
+                StatusCode::UNAUTHORIZED,
+                "ticket expired — POST /api/v1/plugins/{plugin_id}/ui-session to mint a fresh one",
+            )
+                .into_response(),
+        };
+        // Round-3 finding 2: error responses are cacheable
+        // by default too (RFC 9110 marks 404 as
+        // heuristically cacheable, and 501 explicitly so).
+        // Stamp `no-store` uniformly so a shared proxy
+        // can't replay a stale ticket-error response past
+        // the failure that produced it.
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response
+    }
+}
+
+/// C6: percent-encode a value destined for a URL path
+/// segment (`plugin_id` in the iframe `src`). Encodes every
+/// byte outside the RFC 3986 "unreserved" set — the
+/// manifest validator restricts `plugin_id` to `[a-z0-9.-]+`
+/// which are all unreserved, but defence-in-depth: a future
+/// relaxation shouldn't let a `plugin_id` smuggle URL syntax
+/// (`?`, `#`, `/`, `..`) into the wrapper page's iframe src.
+fn percent_encode_path_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        if is_url_unreserved(b) {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// C6: percent-encode a value destined for a URL query
+/// value (the ticket in `?tk=…`). Same encoding as
+/// `percent_encode_path_segment` — the ticket format uses
+/// `~` (unreserved) and hex digits, but we don't want to
+/// bake that assumption into the wrapper page's HTML.
+fn percent_encode_query_value(input: &str) -> String {
+    percent_encode_path_segment(input)
+}
+
+/// RFC 3986 §2.3 unreserved characters: `A-Z a-z 0-9 - . _ ~`.
+fn is_url_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+}
+
+/// C6: HTML-attribute-value escape — the src attribute
+/// lives inside double quotes, so `&`, `<`, `>`, `"`, and
+/// `'` all need entity encoding. Percent-encoded `plugin_id`
+/// / ticket already avoid the special ASCII, but the
+/// escape is here so a template edit that drops
+/// percent-encoding doesn't silently open an injection.
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// C6: JS-string-literal escape for the `plugin_id` embedded
+/// as `"..."` in the broker init. Escapes `\`, quotes,
+/// newlines, and `</` (which would prematurely close the
+/// `<script>` block if a `plugin_id` ever contained it).
+fn js_string_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ── Events tail (WebSocket) ──────────────────────────────────────

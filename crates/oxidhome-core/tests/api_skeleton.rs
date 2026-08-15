@@ -4602,3 +4602,666 @@ async fn devices_state_reconcile_capabilities_flips_only_dropped_caps() {
         oxidhome_core::state::StateQuality::Fresh
     );
 }
+
+// ── C6: sandboxed plugin UI + ticketed frame endpoint ───────────
+
+/// C6: happy path. `GET /api/v1/plugins/{id}/ui` returns a
+/// 200 HTML wrapper whose `<iframe>` uses `sandbox=
+/// "allow-scripts allow-forms"` (deliberately no
+/// `allow-same-origin`, so the browser assigns each iframe
+/// a fresh opaque origin) and points at
+/// `/ui/frame?tk=<opaque-ticket>`. Follow-up request to the
+/// frame endpoint with that ticket returns 501 (Phase-13
+/// stub) — but crucially, it doesn't need the parent's
+/// bearer, so the flow works in a real browser.
+/// C6 round-2 finding 1: full browser-shaped flow.
+/// Dashboard `POST`s `/ui-session` with bearer, receives
+/// a ticketed URL, then follows that URL WITHOUT the
+/// bearer (as an iframe / top-level navigation would).
+/// `/ui` and `/ui/frame` both authenticate via the
+/// embedded ticket — no `Authorization` header needed
+/// once the session is minted.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_session_wrapper_and_frame_round_trip_without_bearer() {
+    let state_dir = support::tempdir("ui-round-trip");
+    let source = stage_install_source("ui-round-trip-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+
+    // Install the plugin so `/ui-session` will find it.
+    let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(install_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Step 1: dashboard mints a UI session (bearer-gated).
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.kv-counter/ui-session")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = body_to_json(response.into_body()).await;
+    let ui_url = session["url"].as_str().expect("session url").to_string();
+    assert!(
+        ui_url.starts_with("/api/v1/plugins/example.kv-counter/ui?tk="),
+        "unexpected session url: {ui_url}",
+    );
+    assert!(
+        session["expires_ms"].as_u64().is_some_and(|ms| ms > 0),
+        "expires_ms must be a positive timestamp",
+    );
+
+    // Step 2: browser follows the URL as an iframe src /
+    // top-level nav — NO Authorization header attached.
+    let response = router
+        .clone()
+        .oneshot(Request::builder().uri(&ui_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "wrapper must authenticate via the URL ticket, not a bearer header",
+    );
+    let csp = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .expect("CSP header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("default-src 'none'"), "CSP was: {csp}");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = std::str::from_utf8(&bytes).expect("utf8");
+    assert!(
+        body.contains(r#"sandbox="allow-scripts allow-forms""#),
+        "wrapper must sandbox the iframe without allow-same-origin, got:\n{body}",
+    );
+    assert!(
+        !body.contains("allow-same-origin"),
+        "sandbox must NOT grant allow-same-origin (would collapse the opaque-origin isolation)",
+    );
+    let iframe_src = extract_iframe_src(body).expect("iframe src");
+    assert!(
+        iframe_src.starts_with("/api/v1/plugins/example.kv-counter/ui/frame?tk="),
+        "unexpected iframe src: {iframe_src}",
+    );
+    assert!(
+        body.contains("new MessageChannel"),
+        "wrapper must construct a per-plugin MessageChannel; broker JS missing",
+    );
+    assert!(
+        body.contains("channel.port2"),
+        "wrapper must transfer port2 to the iframe (typed broker bound to a MessagePort, not origin)",
+    );
+
+    // Step 3: browser fetches the iframe subresource —
+    // again NO bearer.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&iframe_src)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "valid ticket must reach the (stub) frame handler even without a bearer",
+    );
+    let csp = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .expect("frame CSP")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("default-src 'none'"), "frame CSP was: {csp}");
+}
+
+/// C6 round-2 finding 2: a ticket minted for one
+/// installation of `plugin_id` must NOT unlock the UI
+/// after an uninstall + reinstall under the same id
+/// (which mints a new `installation_uuid`).
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_ticket_does_not_survive_uninstall_reinstall() {
+    let state_dir = support::tempdir("ui-reinstall");
+    let source = stage_install_source("ui-reinstall-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+
+    // Install v1 of the plugin.
+    let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(install_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Mint a session against v1.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.kv-counter/ui-session")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = body_to_json(response.into_body()).await;
+    let ui_url = session["url"].as_str().unwrap().to_string();
+
+    // Uninstall and reinstall under the same plugin_id.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/plugins/example.kv-counter")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source.path().to_str().unwrap()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Old session URL now targets the *replacement*
+    // installation. It must fail closed — 404, same shape
+    // as "no such plugin", so old sessions can't
+    // authorise the new package.
+    let response = router
+        .clone()
+        .oneshot(Request::builder().uri(&ui_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+fn extract_iframe_src(html: &str) -> Option<String> {
+    let marker = r#"src=""#;
+    let start = html.find(marker)? + marker.len();
+    let end = html[start..].find('"')? + start;
+    Some(html_entity_decode(&html[start..end]))
+}
+
+fn html_entity_decode(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+/// C6: `GET /ui/frame` refuses the ticket for one plugin
+/// when the URL path names a different plugin —
+/// indistinguishable from "no such plugin" (404) so it
+/// can't be used as an enumeration oracle.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_frame_rejects_ticket_bound_to_wrong_plugin() {
+    let state_dir = support::tempdir("ui-wrong-plugin");
+    let source_a = stage_install_source("ui-wrong-a", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // Install plugin A.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source_a.path().to_str().unwrap()})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Mint a session for A.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.kv-counter/ui-session")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = body_to_json(response.into_body()).await;
+    let ui_url = session["url"].as_str().unwrap();
+    let ticket = ui_url.split("tk=").nth(1).unwrap().to_string();
+    // Try to use A's ticket at B's frame path. Even if B
+    // doesn't exist, the ticket-plugin mismatch should
+    // surface as 404 (not a leaky 401/400 that would let
+    // callers enumerate installed plugin ids).
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/plugins/example.other/ui/frame?tk={ticket}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// C6 round-2 finding 3: `/ui/frame` rejects an oversized
+/// ticket without allocating one string per `~`-separator.
+/// Bad-shape / missing / oversized all surface as 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_frame_rejects_missing_malformed_and_oversized_ticket() {
+    let state_dir = support::tempdir("ui-bad-ticket");
+    let source = stage_install_source("ui-bad-ticket-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // Install the plugin so path lookups don't 404 before
+    // the ticket check even runs.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source.path().to_str().unwrap()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // No `tk=` at all.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/ui/frame")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Garbage ticket.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/ui/frame?tk=garbage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Round-2 finding 3: separator-heavy oversized ticket
+    // rejected without allocation amplification.
+    let bombshell = "~".repeat(2048);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/plugins/example.kv-counter/ui/frame?tk={bombshell}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// C6 round-2 finding 1: `POST /ui-session` requires the
+/// `plugins:ui` scope; a token with only `plugins:list`
+/// gets 403. `/ui` itself is public (ticket-gated), so a
+/// scope check there would be a category error.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_session_requires_plugins_ui_scope() {
+    let state_dir = support::tempdir("ui-scope");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let lister = engine
+        .auth_tokens()
+        .create("lister", b"[\"plugins:list\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.kv-counter/ui-session")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", lister.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// C6 round-4 finding 2: raw query length is capped
+/// **before** axum's Query extractor runs, so an
+/// unauthenticated request can't force per-request
+/// allocation or URL-decoding work up to hyper's
+/// request-head limit by shipping a very long `tk=…`
+/// value. Anything longer than
+/// `ui_ticket::MAX_TICKET_LEN + "tk=".len()` is rejected
+/// wholesale by the custom `TicketQuery` extractor
+/// without allocating an owned `String` for the value.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_frame_bounds_query_length_before_allocation() {
+    let state_dir = support::tempdir("ui-query-bound");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let router = build_router(engine);
+    // Well over MAX_TICKET_LEN (512 bytes). Value length
+    // scales the attacker's per-request allocation if we
+    // weren't bounding at the raw-query layer.
+    let oversized_value = "x".repeat(8 * 1024);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/plugins/example.kv-counter/ui/frame?tk={oversized_value}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Same protection on the wrapper endpoint.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/plugins/example.kv-counter/ui?tk={oversized_value}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// C6 round-3 finding 1: `?tk=garbage` on `/ui` and
+/// `/ui/frame` returns 400 uniformly — the same status
+/// regardless of whether the URL's `plugin_id` names an
+/// installed plugin. Pre-fix, an installed id + garbage
+/// ticket → 400; an unknown id + garbage ticket → 404, so
+/// an unauthenticated caller could enumerate integrations.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_endpoints_do_not_enumerate_installed_ids_on_bad_ticket() {
+    let state_dir = support::tempdir("ui-no-oracle");
+    let source = stage_install_source("ui-no-oracle-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // Install `example.kv-counter`; leave `example.other`
+    // absent. Query both with a garbage ticket via each
+    // endpoint and assert the outcomes are the same.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source.path().to_str().unwrap()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let fetch = |uri: &str| {
+        let uri = uri.to_string();
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+    let installed_wrapper = fetch("/api/v1/plugins/example.kv-counter/ui?tk=garbage").await;
+    let unknown_wrapper = fetch("/api/v1/plugins/example.other/ui?tk=garbage").await;
+    assert_eq!(installed_wrapper.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        unknown_wrapper.status(),
+        installed_wrapper.status(),
+        "installed vs unknown plugin_id must be indistinguishable on garbage ticket",
+    );
+
+    let installed_frame = fetch("/api/v1/plugins/example.kv-counter/ui/frame?tk=garbage").await;
+    let unknown_frame = fetch("/api/v1/plugins/example.other/ui/frame?tk=garbage").await;
+    assert_eq!(installed_frame.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        unknown_frame.status(),
+        installed_frame.status(),
+        "installed vs unknown plugin_id must be indistinguishable on garbage ticket (frame endpoint)",
+    );
+}
+
+/// C6 round-3 finding 2: every ticket-authenticated
+/// response — session mint, wrapper, frame, and every
+/// error variant — carries `Cache-Control: no-store` so an
+/// intermediate proxy can't replay a ticket past its
+/// expiry or through a reinstall.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_responses_forbid_caching() {
+    let state_dir = support::tempdir("ui-nostore");
+    let source = stage_install_source("ui-nostore-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source.path().to_str().unwrap()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let assert_no_store = |response: &axum::response::Response| {
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("Cache-Control")
+                .to_str()
+                .unwrap(),
+            "no-store",
+        );
+    };
+
+    // Session mint.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.kv-counter/ui-session")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_no_store(&response);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let session: Value = serde_json::from_slice(&bytes).unwrap();
+    let ui_url = session["url"].as_str().unwrap().to_string();
+    let ticket = ui_url.split("tk=").nth(1).unwrap().to_string();
+
+    // Wrapper (success).
+    let response = router
+        .clone()
+        .oneshot(Request::builder().uri(&ui_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_no_store(&response);
+
+    // Frame (success = 501 stub).
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/plugins/example.kv-counter/ui/frame?tk={ticket}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_no_store(&response);
+
+    // Error paths — 400 (bad ticket), 404 (unknown
+    // plugin). Both must also carry `no-store`.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/ui?tk=garbage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_no_store(&response);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/example.other/ui-session")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_no_store(&response);
+}
+
+/// C6: `/ui-session` returns 404 for a plugin that isn't
+/// installed.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_session_returns_404_for_unknown_plugin() {
+    let state_dir = support::tempdir("ui-unknown");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins/com.example.notinstalled/ui-session")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
