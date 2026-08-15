@@ -209,6 +209,56 @@ pub enum ValidationError {
          (a sub-{min}ms tick is a runaway, not a schedule)"
     )]
     RuntimeTickIntervalTooSmall { got: u64, min: u64 },
+
+    /// Phase 13: a `[ui]` asset path is empty, absolute, or
+    /// contains `..` / `.` components — same escape family
+    /// as [`Self::RuntimeWasmPathEscapes`]. The host serves
+    /// these paths from inside the plugin dir, so an
+    /// escape-shaped path can't be safely resolved.
+    #[error(
+        "ui.{field} `{got}` must be a relative path under the manifest's \
+         directory (no leading `/`, no `..` or `.` components): {reason}"
+    )]
+    UiAssetPathEscapes {
+        field: &'static str,
+        got: String,
+        reason: WasmPathProblem,
+    },
+
+    /// Phase 13: `[ui.widgets]` has more entries than
+    /// [`MAX_UI_WIDGETS`] — every widget contributes to
+    /// the shell's dashboard-catalog build and to the C6
+    /// wrapper's `MessageChannel` fanout, so the list has
+    /// an operational ceiling.
+    #[error(
+        "ui.widgets has {count} entries; the cap is {max}. Merge related \
+         widgets into a single bundle or ship them as a separate plugin."
+    )]
+    TooManyUiWidgets { count: usize, max: usize },
+
+    /// Phase 13: `[ui.widgets]` contains the same path
+    /// twice. The host indexes widgets by their asset
+    /// path, so a duplicate is either a copy-paste bug
+    /// or a deliberate override attempt.
+    #[error("ui.widgets[{index}] `{got}` is listed more than once")]
+    DuplicateUiWidget { index: usize, got: String },
+
+    /// Phase 13: `[ui.permissions].network` /
+    /// `.storage` / `.scripts` carries a value the host
+    /// doesn't know how to translate into a CSP
+    /// directive. See the per-field allowed lists in
+    /// [`UI_NETWORK_PERMISSIONS`],
+    /// [`UI_STORAGE_PERMISSIONS`], and
+    /// [`UI_SCRIPTS_PERMISSIONS`].
+    #[error(
+        "ui.permissions.{field} `{got}` is not one of {allowed:?} — the host \
+         wouldn't know which CSP directive to emit for it"
+    )]
+    UnknownUiPermission {
+        field: &'static str,
+        got: String,
+        allowed: &'static [&'static str],
+    },
 }
 
 /// Why a `runtime.wasm` path was rejected. Carried in
@@ -284,6 +334,30 @@ pub const MAX_DECLARES_DEVICES: usize = 64;
 /// A grant that wants "every command" uses `["*"]` — the cap
 /// bounds enumerated lists.
 pub const MAX_COMMANDS_PER_GRANT: usize = 64;
+
+/// Phase 13: cap on `[ui.widgets]`. Every widget path
+/// contributes to the shell's dashboard-catalog build and
+/// to the C6 wrapper's `MessageChannel` fanout, so the
+/// list has an operational ceiling. A plugin that needs
+/// more distinct widgets should ship a sibling plugin.
+pub const MAX_UI_WIDGETS: usize = 32;
+
+/// Phase 13: allowed values for `[ui.permissions].network`.
+/// Each maps to a CSP `connect-src` directive the host
+/// emits when serving the plugin's UI bundle. `None`
+/// (the manifest field is absent) leaves the shell's
+/// default in effect. Order matches the docs' preference:
+/// most-restrictive first.
+pub const UI_NETWORK_PERMISSIONS: &[&str] = &["none", "self-only", "manifest-domains"];
+
+/// Phase 13: allowed values for `[ui.permissions].storage`.
+/// Maps to `sandbox` / `Cache-Control` behaviour on the
+/// wrapper page.
+pub const UI_STORAGE_PERMISSIONS: &[&str] = &["none", "session-only", "persistent"];
+
+/// Phase 13: allowed values for `[ui.permissions].scripts`.
+/// Maps to CSP `script-src`.
+pub const UI_SCRIPTS_PERMISSIONS: &[&str] = &["none", "self-only", "inline"];
 
 /// Why a `plugin.keywords` entry was rejected. Encoded as a typed
 /// enum (rather than a `&'static str` message) so the limit in
@@ -369,6 +443,90 @@ pub fn check_capability_limits_owned(
     }
 }
 
+/// Phase 13: validate the `[ui]` section. Path-safety
+/// (each asset path is relative and doesn't escape the
+/// plugin dir), widget count / duplicate checks, and
+/// permission enum values. Pushes findings into `errors`
+/// rather than returning them so callers can collect ui
+/// checks alongside capability + manifest-level checks in
+/// one pile.
+pub fn check_ui(ui: &crate::manifest::UiSection, errors: &mut Vec<ValidationError>) {
+    for (field, path) in [
+        ("config", ui.config.as_ref()),
+        ("device-config", ui.device_config.as_ref()),
+        ("commands", ui.commands.as_ref()),
+        ("config-schema", ui.config_schema.as_ref()),
+        ("commands-schema", ui.commands_schema.as_ref()),
+    ] {
+        let Some(p) = path else {
+            continue;
+        };
+        if let Some(reason) = wasm_path_problem(p) {
+            errors.push(ValidationError::UiAssetPathEscapes {
+                field,
+                got: p.display().to_string(),
+                reason,
+            });
+        }
+    }
+    if ui.widgets.len() > MAX_UI_WIDGETS {
+        errors.push(ValidationError::TooManyUiWidgets {
+            count: ui.widgets.len(),
+            max: MAX_UI_WIDGETS,
+        });
+    }
+    let mut seen: std::collections::HashSet<&std::path::Path> = std::collections::HashSet::new();
+    for (index, p) in ui.widgets.iter().enumerate() {
+        if let Some(reason) = wasm_path_problem(p) {
+            errors.push(ValidationError::UiAssetPathEscapes {
+                field: "widgets",
+                got: p.display().to_string(),
+                reason,
+            });
+        }
+        if !seen.insert(p.as_path()) {
+            errors.push(ValidationError::DuplicateUiWidget {
+                index,
+                got: p.display().to_string(),
+            });
+        }
+    }
+    check_ui_permission(
+        "network",
+        ui.permissions.network.as_deref(),
+        UI_NETWORK_PERMISSIONS,
+        errors,
+    );
+    check_ui_permission(
+        "storage",
+        ui.permissions.storage.as_deref(),
+        UI_STORAGE_PERMISSIONS,
+        errors,
+    );
+    check_ui_permission(
+        "scripts",
+        ui.permissions.scripts.as_deref(),
+        UI_SCRIPTS_PERMISSIONS,
+        errors,
+    );
+}
+
+fn check_ui_permission(
+    field: &'static str,
+    value: Option<&str>,
+    allowed: &'static [&'static str],
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(v) = value else { return };
+    if !allowed.contains(&v) {
+        errors.push(ValidationError::UnknownUiPermission {
+            field,
+            got: v.to_string(),
+            allowed,
+        });
+    }
+}
+
 /// Run every check against `m` and collect all findings.
 ///
 /// # Errors
@@ -430,6 +588,13 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
     // hand-repaired or operator-modified grant that bypasses
     // manifest validation would otherwise re-open the DoS surface.
     check_capability_limits(&m.capabilities, &mut errors);
+
+    // Phase 13: `[ui]` section is optional; if present,
+    // validate asset paths, widget count / dedup, and the
+    // three permission enums.
+    if let Some(ui) = &m.ui {
+        check_ui(ui, &mut errors);
+    }
 
     validate_keywords(&m.plugin.keywords, &mut errors);
 
@@ -1589,5 +1754,169 @@ mod tests {
             e,
             ValidationError::ConfigIntDefaultOutOfRange { path, .. } if path == "broker.port"
         )));
+    }
+
+    // Phase 13: `[ui]` section validation ────────────────
+
+    fn ok_manifest_with_ui(ui: crate::manifest::UiSection) -> PluginManifest {
+        let mut m = ok_manifest();
+        m.ui = Some(ui);
+        m
+    }
+
+    #[test]
+    fn ui_missing_is_ok() {
+        let m = ok_manifest();
+        assert!(m.ui.is_none());
+        validate(&m).expect("no [ui] section is a legal manifest");
+    }
+
+    #[test]
+    fn ui_asset_paths_reject_escapes() {
+        for (field, ui) in [
+            (
+                "config",
+                crate::manifest::UiSection {
+                    config: Some(std::path::PathBuf::from("/etc/passwd")),
+                    ..Default::default()
+                },
+            ),
+            (
+                "device-config",
+                crate::manifest::UiSection {
+                    device_config: Some(std::path::PathBuf::from("../etc/passwd")),
+                    ..Default::default()
+                },
+            ),
+            (
+                "commands",
+                crate::manifest::UiSection {
+                    commands: Some(std::path::PathBuf::from("./ui/commands.js")),
+                    ..Default::default()
+                },
+            ),
+            (
+                "config-schema",
+                crate::manifest::UiSection {
+                    config_schema: Some(std::path::PathBuf::from("")),
+                    ..Default::default()
+                },
+            ),
+            (
+                "commands-schema",
+                crate::manifest::UiSection {
+                    commands_schema: Some(std::path::PathBuf::from("../..")),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let m = ok_manifest_with_ui(ui);
+            let errs = validate(&m).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::UiAssetPathEscapes { field: f, .. } if *f == field
+                )),
+                "expected UiAssetPathEscapes on field `{field}`, got {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ui_widgets_reject_escapes_and_duplicates() {
+        let ui = crate::manifest::UiSection {
+            widgets: vec![
+                std::path::PathBuf::from("ui/one.js"),
+                std::path::PathBuf::from("ui/one.js"), // duplicate
+                std::path::PathBuf::from("/abs/two.js"), // escape
+            ],
+            ..Default::default()
+        };
+        let errs = validate(&ok_manifest_with_ui(ui)).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::DuplicateUiWidget { index: 1, .. }))
+        );
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::UiAssetPathEscapes {
+                field: "widgets",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn ui_widgets_reject_over_cap() {
+        let ui = crate::manifest::UiSection {
+            widgets: (0..=MAX_UI_WIDGETS)
+                .map(|i| std::path::PathBuf::from(format!("ui/w{i}.js")))
+                .collect(),
+            ..Default::default()
+        };
+        let errs = validate(&ok_manifest_with_ui(ui)).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::TooManyUiWidgets { count, max }
+                if *max == MAX_UI_WIDGETS && *count == MAX_UI_WIDGETS + 1
+        )));
+    }
+
+    #[test]
+    fn ui_permissions_reject_unknown_values() {
+        let ui = crate::manifest::UiSection {
+            permissions: crate::manifest::UiPermissions {
+                network: Some("everywhere".into()),
+                storage: Some("session-only".into()),
+                scripts: Some("permissive".into()),
+            },
+            ..Default::default()
+        };
+        let errs = validate(&ok_manifest_with_ui(ui)).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::UnknownUiPermission { field: "network", got, .. } if got == "everywhere"
+        )));
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::UnknownUiPermission { field: "scripts", got, .. } if got == "permissive"
+        )));
+        // `session-only` is legal — no error for `storage`.
+        assert!(!errs.iter().any(|e| matches!(
+            e,
+            ValidationError::UnknownUiPermission {
+                field: "storage",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn ui_permissions_accept_all_documented_values() {
+        for &(field_setter, value) in &[
+            ("network", "none"),
+            ("network", "self-only"),
+            ("network", "manifest-domains"),
+            ("storage", "none"),
+            ("storage", "session-only"),
+            ("storage", "persistent"),
+            ("scripts", "none"),
+            ("scripts", "self-only"),
+            ("scripts", "inline"),
+        ] {
+            let mut perms = crate::manifest::UiPermissions::default();
+            match field_setter {
+                "network" => perms.network = Some(value.into()),
+                "storage" => perms.storage = Some(value.into()),
+                "scripts" => perms.scripts = Some(value.into()),
+                _ => unreachable!(),
+            }
+            let ui = crate::manifest::UiSection {
+                permissions: perms,
+                ..Default::default()
+            };
+            validate(&ok_manifest_with_ui(ui))
+                .unwrap_or_else(|e| panic!("expected `{field_setter}={value}` to be legal: {e:?}"));
+        }
     }
 }
