@@ -1304,6 +1304,20 @@ async fn get_plugin_schema(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<PluginSchemaBody>, PluginSchemaError> {
     require_scope(&actor, PLUGINS_LIST)?;
+    // Round-2 finding 4: hold the per-plugin lifecycle
+    // lock across the registry lookup + the manifest re-
+    // read. Without it, a concurrent uninstall + reinstall
+    // between the two visits could return a mixed view —
+    // the old row's `version` alongside the new
+    // installation's `config` / `ui` — or a transient 500
+    // if the on-disk `manifest.toml` momentarily disappears
+    // during the reinstall's copy phase. The lifecycle
+    // lock is the same one that serializes `start_instance`
+    // and `uninstall_plugin` for the same id (see H2 round-2
+    // F1), so holding it here rides on machinery the
+    // reinstall path already respects.
+    let lifecycle = state.engine.plugin_lifecycle_lock(&plugin_id);
+    let _guard = lifecycle.lock().await;
     let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
         return Err(PluginSchemaError::NotFound);
     };
@@ -3019,6 +3033,19 @@ impl WireAuditEntry {
 
 // ── Dashboards (Phase 13 slice 3) ────────────────────────────────
 
+/// C6 round-2 finding 2: stable owner id for v1's
+/// single-role admin. Actor.id for API actors is the
+/// **token id** (rotates when the operator issues a new
+/// token) — using it as `owner_user_id` would mean two
+/// admin tokens can't see each other's dashboards, and a
+/// token rotation strands the operator's rows. The
+/// multi-user follow-up replaces this constant with the
+/// real session identity, and the migration is a single
+/// `UPDATE dashboard SET owner_user_id = <real id> WHERE
+/// owner_user_id = 'admin'` — one predicate, one row per
+/// admin dashboard.
+const DASHBOARD_ADMIN_OWNER: &str = "admin";
+
 /// Wire shape for a dashboard row. `layout` is the shell's
 /// opaque JSON tree — represented as `serde_json::Value` so
 /// clients can send/receive typed JSON without base64.
@@ -3049,6 +3076,37 @@ impl WireDashboard {
     }
 }
 
+/// Round-2 finding 3: list response omits `layout_json`
+/// so the body is bounded by
+/// `MAX_DASHBOARDS_PER_OWNER × (name + fixed metadata)`
+/// regardless of layout size. Clients fetch the actual
+/// layout via `GET /api/v1/dashboards/{id}` when the
+/// operator selects one.
+#[derive(Debug, Serialize)]
+struct WireDashboardMetadata {
+    id: i64,
+    name: String,
+    owner_user_id: String,
+    schema_version: i64,
+    created_ms: i64,
+    updated_ms: i64,
+    layout_bytes: usize,
+}
+
+impl From<crate::state::dashboards::DashboardMetadata> for WireDashboardMetadata {
+    fn from(row: crate::state::dashboards::DashboardMetadata) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            owner_user_id: row.owner_user_id,
+            schema_version: row.schema_version,
+            created_ms: row.created_ms,
+            updated_ms: row.updated_ms,
+            layout_bytes: row.layout_bytes,
+        }
+    }
+}
+
 /// `POST /api/v1/dashboards` / `PUT /.../{id}` request body.
 /// `layout` is the shell's opaque tree; the host encodes it
 /// to bytes on the way in and back to `Value` on the way
@@ -3067,13 +3125,13 @@ fn default_schema_version() -> i64 {
 
 #[derive(Debug, Serialize)]
 struct DashboardsBody {
-    dashboards: Vec<WireDashboard>,
+    dashboards: Vec<WireDashboardMetadata>,
 }
 
-/// `GET /api/v1/dashboards` — every dashboard owned by the
-/// caller. Sorted by `updated_ms DESC` (most recently
-/// edited first), so a shell picker can show the useful
-/// dashboards without an extra sort round trip.
+/// `GET /api/v1/dashboards` — metadata-only list of every
+/// dashboard the caller owns (`updated_ms DESC`). The
+/// `layout` body is omitted for size — clients fetch it
+/// via `GET /dashboards/{id}` when they need it.
 ///
 /// # Errors
 /// - `403` scope check failed.
@@ -3082,14 +3140,15 @@ async fn list_dashboards(
     State(state): State<ApiState>,
 ) -> Result<Json<DashboardsBody>, DashboardsError> {
     require_scope(&actor, DASHBOARDS_READ)?;
-    let owner = actor.id().to_string();
-    let rows = tokio::task::spawn_blocking(move || state.engine.dashboards().list_by_owner(&owner))
-        .await
-        .map_err(|err| DashboardsError::Internal(err.into()))??;
-    let dashboards = rows
-        .into_iter()
-        .map(WireDashboard::from_row)
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .dashboards()
+            .list_metadata_by_owner(DASHBOARD_ADMIN_OWNER)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??;
+    let dashboards = rows.into_iter().map(WireDashboardMetadata::from).collect();
     Ok(Json(DashboardsBody { dashboards }))
 }
 
@@ -3098,8 +3157,10 @@ async fn list_dashboards(
 /// server-minted id.
 ///
 /// # Errors
-/// - `400` request body isn't valid JSON.
+/// - `400` request body isn't valid JSON, or `name` /
+///   `layout` exceeds the per-row cap.
 /// - `403` scope check failed.
+/// - `409` the owner is already at `MAX_DASHBOARDS_PER_OWNER`.
 async fn create_dashboard(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
@@ -3110,7 +3171,7 @@ async fn create_dashboard(
         serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
     let input = crate::state::DashboardInput {
         name: body.name,
-        owner_user_id: actor.id().to_string(),
+        owner_user_id: DASHBOARD_ADMIN_OWNER.to_string(),
         layout_json,
         schema_version: body.schema_version,
     };
@@ -3121,9 +3182,8 @@ async fn create_dashboard(
 }
 
 /// `GET /api/v1/dashboards/{id}` — load one dashboard the
-/// caller owns. Cross-owner reads return 404 (same shape
-/// as "no such dashboard" — no enumeration oracle across
-/// operators once multi-user lands).
+/// caller owns. Owner-scoped predicate travels inside
+/// the SELECT statement; cross-owner reads return 404.
 ///
 /// # Errors
 /// - `403` scope check failed.
@@ -3135,21 +3195,27 @@ async fn get_dashboard(
     Path(id): Path<i64>,
 ) -> Result<Json<WireDashboard>, DashboardsError> {
     require_scope(&actor, DASHBOARDS_READ)?;
-    let owner = actor.id().to_string();
-    let row = tokio::task::spawn_blocking(move || state.engine.dashboards().get(id))
-        .await
-        .map_err(|err| DashboardsError::Internal(err.into()))??
-        .filter(|d| d.owner_user_id == owner)
-        .ok_or(DashboardsError::NotFound)?;
+    let row = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .dashboards()
+            .get_owned(id, DASHBOARD_ADMIN_OWNER)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??
+    .ok_or(DashboardsError::NotFound)?;
     Ok(Json(WireDashboard::from_row(row)?))
 }
 
 /// `PUT /api/v1/dashboards/{id}` — replace the caller's
-/// dashboard. Ownership is checked on the current row
-/// before the write so a cross-owner attempt returns 404
-/// without touching the row.
+/// dashboard. Round-2 finding 1: the owner predicate
+/// travels **inside** the UPDATE statement (via
+/// `store.update_owned`) so a concurrent delete + create
+/// that recycles the primary key under a different owner
+/// can't be modified by this request.
 ///
 /// # Errors
+/// - `400` `name` / `layout` exceeds the per-row cap.
 /// - `403` scope check failed.
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
@@ -3160,34 +3226,30 @@ async fn update_dashboard(
     Json(body): Json<DashboardInputBody>,
 ) -> Result<Json<WireDashboard>, DashboardsError> {
     require_scope(&actor, DASHBOARDS_WRITE)?;
-    let owner = actor.id().to_string();
     let layout_json =
         serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
-    let store = state.engine.dashboards();
-    let existing = tokio::task::spawn_blocking({
-        let store = Arc::clone(&store);
-        move || store.get(id)
-    })
-    .await
-    .map_err(|err| DashboardsError::Internal(err.into()))??
-    .filter(|d| d.owner_user_id == owner)
-    .ok_or(DashboardsError::NotFound)?;
     let input = crate::state::DashboardInput {
         name: body.name,
-        owner_user_id: existing.owner_user_id,
+        owner_user_id: DASHBOARD_ADMIN_OWNER.to_string(),
         layout_json,
         schema_version: body.schema_version,
     };
-    let updated = tokio::task::spawn_blocking(move || store.update(id, input))
-        .await
-        .map_err(|err| DashboardsError::Internal(err.into()))??;
+    let updated = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .dashboards()
+            .update_owned(id, DASHBOARD_ADMIN_OWNER, input)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??;
     Ok(Json(WireDashboard::from_row(updated)?))
 }
 
 /// `DELETE /api/v1/dashboards/{id}` — remove the caller's
-/// dashboard. Cross-owner attempts return 404. Idempotent
-/// on the owner path (deleting a dashboard the caller
-/// already deleted returns 404).
+/// dashboard. Owner predicate travels inside the DELETE
+/// (round-2 finding 1). Cross-owner attempts return 404
+/// (idempotent on the owner path — deleting a dashboard
+/// the caller already deleted returns 404).
 ///
 /// # Errors
 /// - `403` scope check failed.
@@ -3199,21 +3261,19 @@ async fn delete_dashboard(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, DashboardsError> {
     require_scope(&actor, DASHBOARDS_WRITE)?;
-    let owner = actor.id().to_string();
-    let store = state.engine.dashboards();
-    let existing = tokio::task::spawn_blocking({
-        let store = Arc::clone(&store);
-        move || store.get(id)
+    let removed = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .dashboards()
+            .delete_owned(id, DASHBOARD_ADMIN_OWNER)
     })
     .await
-    .map_err(|err| DashboardsError::Internal(err.into()))??
-    .filter(|d| d.owner_user_id == owner)
-    .ok_or(DashboardsError::NotFound)?;
-    let _ = existing;
-    tokio::task::spawn_blocking(move || store.delete(id))
-        .await
-        .map_err(|err| DashboardsError::Internal(err.into()))??;
-    Ok(StatusCode::NO_CONTENT)
+    .map_err(|err| DashboardsError::Internal(err.into()))??;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(DashboardsError::NotFound)
+    }
 }
 
 /// Handler-local error type. Errors from the store fold
@@ -3221,6 +3281,19 @@ async fn delete_dashboard(
 enum DashboardsError {
     Scope(ScopeDenied),
     NotFound,
+    /// Round-2 finding 3: input violated the per-row cap
+    /// or per-owner quota. Wired distinctly from
+    /// `Internal` so the client sees 400 / 409 instead of
+    /// 500.
+    TooLarge {
+        field: &'static str,
+        size: usize,
+        max: usize,
+    },
+    QuotaExceeded {
+        existing: usize,
+        max: usize,
+    },
     /// `layout_json` on disk doesn't parse as JSON. Should
     /// never happen — the write path always serializes via
     /// `serde_json::to_vec` — but if it does, treat as an
@@ -3239,6 +3312,12 @@ impl From<crate::state::DashboardError> for DashboardsError {
     fn from(value: crate::state::DashboardError) -> Self {
         match value {
             crate::state::DashboardError::NotFound(_) => Self::NotFound,
+            crate::state::DashboardError::TooLarge { field, size, max } => {
+                Self::TooLarge { field, size, max }
+            }
+            crate::state::DashboardError::QuotaExceeded { existing, max } => {
+                Self::QuotaExceeded { existing, max }
+            }
             crate::state::DashboardError::Persistence(err) => Self::Internal(err.into()),
         }
     }
@@ -3249,6 +3328,25 @@ impl IntoResponse for DashboardsError {
         match self {
             Self::Scope(s) => s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            Self::TooLarge { field, size, max } => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "too_large",
+                    "field": field,
+                    "size": size,
+                    "max": max,
+                })),
+            )
+                .into_response(),
+            Self::QuotaExceeded { existing, max } => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "quota_exceeded",
+                    "existing": existing,
+                    "max": max,
+                })),
+            )
+                .into_response(),
             Self::CorruptRow(err) => {
                 tracing::error!(target: "api.dashboards", error = %err, "corrupt dashboard row");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

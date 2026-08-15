@@ -1183,6 +1183,25 @@ impl InstalledPluginRegistry {
             });
         }
 
+        // Phase 13 round-2 finding 5: verify every UI
+        // asset path declared in `[ui]` resolves to a
+        // regular file in the staged tree. `validate.rs`
+        // in `oxidhome-manifest` catches shape / escape
+        // problems on the paths themselves, but only a
+        // package-aware check catches "this manifest
+        // declares `ui/config.js` and the file simply
+        // isn't there" — an installation that promises a
+        // declarative renderer surface and can't deliver.
+        if let Some(ui) = staged_manifest.ui.as_ref()
+            && let Err(reason) = check_ui_assets_present(ui, &staging)
+        {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(InstallError::BadManifest {
+                path: staged_manifest_path,
+                reason,
+            });
+        }
+
         // C5 review F3 + round-4 F2: compute the content digest
         // over the staged package's `manifest.toml` + wasm bytes
         // (post-copy, before rename). The loader recomputes from
@@ -1659,6 +1678,56 @@ fn load_live_installation_uuid_for(
 /// Validates the manifest schema via `oxidhome_manifest::validate`
 /// before returning — a malformed manifest is rejected at install
 /// time so a `start` call later doesn't surface the same error.
+/// Phase 13 round-2 finding 5: verify every UI asset
+/// path declared in `[ui]` exists as a regular file
+/// under `base_dir`. Called from `install` on the staged
+/// package (i.e. the exact tree that becomes live), so
+/// an installation missing a declared config-schema or
+/// widget bundle is refused with a specific reason.
+///
+/// The manifest validator already enforces that each
+/// path is relative and doesn't escape via `.` / `..` /
+/// leading `/`, so `base_dir.join(path)` is safe to use.
+/// Returns an error message suitable for
+/// `InstallError::BadManifest.reason`.
+fn check_ui_assets_present(
+    ui: &oxidhome_manifest::UiSection,
+    base_dir: &Path,
+) -> Result<(), String> {
+    for (field, path) in [
+        ("config", ui.config.as_ref()),
+        ("device-config", ui.device_config.as_ref()),
+        ("commands", ui.commands.as_ref()),
+        ("config-schema", ui.config_schema.as_ref()),
+        ("commands-schema", ui.commands_schema.as_ref()),
+    ] {
+        if let Some(p) = path {
+            check_ui_asset_file(field, base_dir, p)?;
+        }
+    }
+    for (index, p) in ui.widgets.iter().enumerate() {
+        check_ui_asset_file(&format!("widgets[{index}]"), base_dir, p)?;
+    }
+    Ok(())
+}
+
+fn check_ui_asset_file(field_label: &str, base_dir: &Path, rel: &Path) -> Result<(), String> {
+    let full = base_dir.join(rel);
+    let metadata = std::fs::metadata(&full).map_err(|err| {
+        format!(
+            "ui.{field_label} `{}` doesn't exist in the plugin package: {err}",
+            rel.display(),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "ui.{field_label} `{}` must be a regular file",
+            rel.display(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn read_manifest_sync(path: &Path) -> anyhow::Result<PluginManifest> {
     use anyhow::Context;
     let text =

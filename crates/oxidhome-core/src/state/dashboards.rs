@@ -21,6 +21,30 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::state::db::Db;
 
+/// Round-2 finding 3: hard cap on dashboard `name`
+/// length. Names are shown in the shell picker; huge
+/// names make the picker unusable AND contribute
+/// per-row to the list-endpoint response body.
+pub const MAX_DASHBOARD_NAME_BYTES: usize = 256;
+
+/// Round-2 finding 3: hard cap on a single dashboard's
+/// serialized `layout_json`. Layouts are opaque bytes
+/// (the shell owns the shape), but the byte cost is real
+/// — the list endpoint reads every layout for the owner
+/// into memory. 128 KiB is comfortable headroom for a
+/// household-sized dashboard (dozens of widgets with
+/// configs) and small enough that an owner filling their
+/// count quota stays under a bounded memory footprint.
+pub const MAX_DASHBOARD_LAYOUT_BYTES: usize = 128 * 1024;
+
+/// Round-2 finding 3: cap on dashboards per owner.
+/// Combined with the layout cap, one owner's total
+/// projected bytes are bounded (`128 × 128 KiB = 16 MiB`).
+/// The count itself keeps the list endpoint bounded and
+/// prevents a scoped token from filling the database
+/// through repeated creates.
+pub const MAX_DASHBOARDS_PER_OWNER: usize = 128;
+
 /// One dashboard row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dashboard {
@@ -74,14 +98,48 @@ pub struct DashboardStore {
 }
 
 /// Errors surfaced from the store. The API layer maps
-/// `NotFound` to `404` and `Persistence` to `500`
-/// (host-side integrity / disk issue).
+/// `NotFound` to `404`, cap violations to `400` /
+/// `409`, and `Persistence` to `500` (host-side
+/// integrity / disk issue).
 #[derive(Debug, thiserror::Error)]
 pub enum DashboardError {
     #[error("dashboard {0} not found")]
     NotFound(i64),
+    /// Round-2 finding 3: request-time cap. `name` /
+    /// `layout` came in over the allowed size.
+    #[error("dashboard {field} exceeds the cap: {size} > {max}")]
+    TooLarge {
+        field: &'static str,
+        size: usize,
+        max: usize,
+    },
+    /// Round-2 finding 3: this owner is at the
+    /// [`MAX_DASHBOARDS_PER_OWNER`] cap. Delete an
+    /// existing dashboard to free a slot.
+    #[error("owner already has {existing} dashboards; cap is {max}")]
+    QuotaExceeded { existing: usize, max: usize },
     #[error(transparent)]
     Persistence(#[from] rusqlite::Error),
+}
+
+/// Round-2 finding 3: metadata-only projection surfaced
+/// by [`DashboardStore::list_metadata_by_owner`]. Omits
+/// `layout_json` so the list endpoint response body is
+/// bounded by `MAX_DASHBOARDS_PER_OWNER *
+/// (MAX_DASHBOARD_NAME_BYTES + fixed metadata)` regardless
+/// of layout size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardMetadata {
+    pub id: i64,
+    pub name: String,
+    pub owner_user_id: String,
+    pub schema_version: i64,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+    /// Round-2 finding 3: byte size of `layout_json` on
+    /// disk, so a client can render a size indicator
+    /// without fetching every full row.
+    pub layout_bytes: usize,
 }
 
 impl DashboardStore {
@@ -101,25 +159,48 @@ impl DashboardStore {
     /// # Errors
     /// [`DashboardError::Persistence`] on `SQLite` failure.
     pub fn create(&self, input: DashboardInput) -> Result<Dashboard, DashboardError> {
+        check_caps(&input)?;
         let now = now_ms();
-        let id = self.db.write(|conn| {
-            let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO dashboard \
-                     (name, owner_user_id, layout_json, schema_version, created_ms, updated_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                params![
-                    &input.name,
-                    &input.owner_user_id,
-                    &input.layout_json,
-                    input.schema_version,
-                    now,
-                ],
-            )?;
-            let id = tx.last_insert_rowid();
-            tx.commit()?;
-            Ok::<_, rusqlite::Error>(id)
-        })?;
+        // Round-2 finding 3: check the per-owner count
+        // quota inside the same transaction as the insert
+        // so a burst of concurrent creates can't slip past
+        // by racing. `BEGIN IMMEDIATE` (SQLite's default
+        // via rusqlite's `transaction()`) serializes
+        // writers, so the count read is a valid pre-check.
+        let owner_for_quota = input.owner_user_id.clone();
+        let id = self
+            .db
+            .write(|conn| -> Result<Result<i64, DashboardError>, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                let existing: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM dashboard WHERE owner_user_id = ?1",
+                    params![&owner_for_quota],
+                    |r| r.get(0),
+                )?;
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let existing_usize = existing.max(0) as usize;
+                if existing_usize >= MAX_DASHBOARDS_PER_OWNER {
+                    return Ok(Err(DashboardError::QuotaExceeded {
+                        existing: existing_usize,
+                        max: MAX_DASHBOARDS_PER_OWNER,
+                    }));
+                }
+                tx.execute(
+                    "INSERT INTO dashboard \
+                         (name, owner_user_id, layout_json, schema_version, created_ms, updated_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![
+                        &input.name,
+                        &owner_for_quota,
+                        &input.layout_json,
+                        input.schema_version,
+                        now,
+                    ],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.commit()?;
+                Ok(Ok(id))
+            })??;
         Ok(Dashboard {
             id,
             name: input.name,
@@ -131,99 +212,157 @@ impl DashboardStore {
         })
     }
 
-    /// Load one dashboard by id. Returns `Ok(None)` if the
-    /// row doesn't exist — callers wanting `NotFound`
-    /// semantics wrap with `.ok_or(...)`.
+    /// Metadata-only projection of every dashboard owned by
+    /// `owner_user_id`, ordered `updated_ms DESC` so the
+    /// most-recently-touched surface first in the shell's
+    /// picker. Round-2 finding 3: omits `layout_json` so the
+    /// list response is bounded by
+    /// `MAX_DASHBOARDS_PER_OWNER * (name + fixed metadata)`
+    /// regardless of layout size; the caller fetches an
+    /// individual layout with `get_owned` once the operator
+    /// picks one. Pre-fix the endpoint surfaced every full
+    /// row — an owner at the count quota with max-sized
+    /// layouts would ship 16 MiB per list call.
     ///
     /// # Errors
     /// [`DashboardError::Persistence`] on `SQLite` failure.
-    pub fn get(&self, id: i64) -> Result<Option<Dashboard>, DashboardError> {
-        let row = self.db.read(|conn| {
-            conn.query_row(
-                "SELECT id, name, owner_user_id, layout_json, schema_version, created_ms, updated_ms \
-                 FROM dashboard WHERE id = ?1",
-                params![id],
-                Self::row_to_dashboard,
-            )
-            .optional()
-        })?;
-        Ok(row)
-    }
-
-    /// List every dashboard owned by `owner_user_id`,
-    /// ordered by `updated_ms DESC` so the "most recently
-    /// touched" bubble to the top of the shell's picker.
-    ///
-    /// # Errors
-    /// [`DashboardError::Persistence`] on `SQLite` failure.
-    pub fn list_by_owner(&self, owner_user_id: &str) -> Result<Vec<Dashboard>, DashboardError> {
+    pub fn list_metadata_by_owner(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<DashboardMetadata>, DashboardError> {
         let rows = self.db.read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, owner_user_id, layout_json, schema_version, created_ms, updated_ms \
+                "SELECT id, name, owner_user_id, schema_version, created_ms, updated_ms, \
+                        length(layout_json) \
                  FROM dashboard \
                  WHERE owner_user_id = ?1 \
                  ORDER BY updated_ms DESC",
             )?;
-            stmt.query_map(params![owner_user_id], Self::row_to_dashboard)?
-                .collect::<Result<Vec<_>, _>>()
+            stmt.query_map(params![owner_user_id], |row| {
+                let layout_bytes: i64 = row.get(6)?;
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let layout_bytes_usize = layout_bytes.max(0) as usize;
+                Ok(DashboardMetadata {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    owner_user_id: row.get(2)?,
+                    schema_version: row.get(3)?,
+                    created_ms: row.get(4)?,
+                    updated_ms: row.get(5)?,
+                    layout_bytes: layout_bytes_usize,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
         })?;
         Ok(rows)
     }
 
-    /// Replace an existing dashboard's `name`, `layout_json`,
-    /// and `schema_version`. Updates `updated_ms`; leaves
-    /// `owner_user_id` and `created_ms` alone (the row's
-    /// identity + creation time don't change on edit).
+    /// Replace an existing dashboard's `name`,
+    /// `layout_json`, and `schema_version` — scoped to
+    /// `owner_user_id` **inside the same statement** so a
+    /// concurrent delete + create that recycles the
+    /// `INTEGER PRIMARY KEY` value under a different owner
+    /// can't be modified by a stale request that only
+    /// remembers the id. Uses `RETURNING` so the response
+    /// row is the one this statement actually wrote —
+    /// eliminates the post-commit `get()` that pre-fix
+    /// could observe a subsequent writer's row.
+    ///
+    /// Round-2 finding 1: pre-fix the handler did
+    /// `get()`-then-`update-by-id` in two separate DB
+    /// visits. `SQLite` reuses deleted `PRIMARY KEY` values,
+    /// so a concurrent delete + create between the two
+    /// visits could substitute a different owner's
+    /// dashboard under the same id and the stale request
+    /// would happily modify it.
     ///
     /// # Errors
-    /// - [`DashboardError::NotFound`] if no row has `id`.
+    /// - [`DashboardError::NotFound`] if no row matches
+    ///   `id AND owner_user_id`.
     /// - [`DashboardError::Persistence`] on `SQLite` failure.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn update(&self, id: i64, input: DashboardInput) -> Result<Dashboard, DashboardError> {
+    pub fn update_owned(
+        &self,
+        id: i64,
+        owner_user_id: &str,
+        input: DashboardInput,
+    ) -> Result<Dashboard, DashboardError> {
+        check_caps(&input)?;
         let now = now_ms();
-        let outcome = self.db.write(|conn| {
+        let row = self.db.write(|conn| {
             let tx = conn.transaction()?;
-            let rows = tx.execute(
+            let mut stmt = tx.prepare(
                 "UPDATE dashboard \
                     SET name = ?2, \
                         layout_json = ?3, \
                         schema_version = ?4, \
                         updated_ms = ?5 \
-                  WHERE id = ?1",
-                params![
-                    id,
-                    &input.name,
-                    &input.layout_json,
-                    input.schema_version,
-                    now,
-                ],
+                  WHERE id = ?1 AND owner_user_id = ?6 \
+              RETURNING id, name, owner_user_id, layout_json, schema_version, created_ms, updated_ms",
             )?;
-            if rows == 0 {
-                return Ok::<_, rusqlite::Error>(None);
-            }
+            let row = stmt
+                .query_row(
+                    params![
+                        id,
+                        &input.name,
+                        &input.layout_json,
+                        input.schema_version,
+                        now,
+                        owner_user_id,
+                    ],
+                    Self::row_to_dashboard,
+                )
+                .optional()?;
+            drop(stmt);
             tx.commit()?;
-            Ok(Some(()))
+            Ok::<_, rusqlite::Error>(row)
         })?;
-        match outcome {
-            Some(()) => self.get(id)?.ok_or(DashboardError::NotFound(id)),
-            None => Err(DashboardError::NotFound(id)),
-        }
+        row.ok_or(DashboardError::NotFound(id))
     }
 
-    /// Delete a dashboard by id. Returns `Ok(true)` on
-    /// success, `Ok(false)` if no row matched (idempotent
-    /// — the caller can treat a repeat delete as a no-op).
+    /// Delete a dashboard by id, scoped to
+    /// `owner_user_id` in the same statement (round-2
+    /// finding 1 — see [`Self::update_owned`]). Returns
+    /// `Ok(true)` on success, `Ok(false)` if no row
+    /// matched.
     ///
     /// # Errors
     /// [`DashboardError::Persistence`] on `SQLite` failure.
-    pub fn delete(&self, id: i64) -> Result<bool, DashboardError> {
+    pub fn delete_owned(&self, id: i64, owner_user_id: &str) -> Result<bool, DashboardError> {
         let rows = self.db.write(|conn| {
             let tx = conn.transaction()?;
-            let n = tx.execute("DELETE FROM dashboard WHERE id = ?1", params![id])?;
+            let n = tx.execute(
+                "DELETE FROM dashboard WHERE id = ?1 AND owner_user_id = ?2",
+                params![id, owner_user_id],
+            )?;
             tx.commit()?;
             Ok::<_, rusqlite::Error>(n)
         })?;
         Ok(rows > 0)
+    }
+
+    /// Owner-scoped point read — same shape as
+    /// [`Self::update_owned`] / [`Self::delete_owned`] so
+    /// the handler can uniformly enforce ownership in one
+    /// statement without a post-fetch owner filter.
+    ///
+    /// # Errors
+    /// [`DashboardError::Persistence`] on `SQLite` failure.
+    pub fn get_owned(
+        &self,
+        id: i64,
+        owner_user_id: &str,
+    ) -> Result<Option<Dashboard>, DashboardError> {
+        let row = self.db.read(|conn| {
+            conn.query_row(
+                "SELECT id, name, owner_user_id, layout_json, schema_version, created_ms, updated_ms \
+                 FROM dashboard WHERE id = ?1 AND owner_user_id = ?2",
+                params![id, owner_user_id],
+                Self::row_to_dashboard,
+            )
+            .optional()
+        })?;
+        Ok(row)
     }
 
     fn row_to_dashboard(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dashboard> {
@@ -242,6 +381,28 @@ impl DashboardStore {
 /// Shared `Arc` alias, parallel to `SharedKvStore` /
 /// `SharedEventLog` etc.
 pub type SharedDashboardStore = Arc<DashboardStore>;
+
+/// Round-2 finding 3: name and layout size guards used by
+/// both `create` and `update_owned`. Owner-quota check
+/// lives inside `create`'s transaction (an owner at the
+/// count cap can still update / delete existing rows).
+fn check_caps(input: &DashboardInput) -> Result<(), DashboardError> {
+    if input.name.len() > MAX_DASHBOARD_NAME_BYTES {
+        return Err(DashboardError::TooLarge {
+            field: "name",
+            size: input.name.len(),
+            max: MAX_DASHBOARD_NAME_BYTES,
+        });
+    }
+    if input.layout_json.len() > MAX_DASHBOARD_LAYOUT_BYTES {
+        return Err(DashboardError::TooLarge {
+            field: "layout",
+            size: input.layout_json.len(),
+            max: MAX_DASHBOARD_LAYOUT_BYTES,
+        });
+    }
+    Ok(())
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -278,33 +439,32 @@ mod tests {
         assert_eq!(created.owner_user_id, "admin");
         assert_eq!(created.schema_version, 1);
         assert_eq!(created.created_ms, created.updated_ms);
-        let fetched = s.get(created.id).expect("get").expect("row");
+        let fetched = s.get_owned(created.id, "admin").expect("get").expect("row");
         assert_eq!(fetched, created);
     }
 
     #[test]
-    fn get_missing_returns_none() {
+    fn get_owned_scopes_to_owner() {
         let s = store();
-        assert!(s.get(999).expect("get").is_none());
+        let created = s.create(input("home", "admin")).expect("create");
+        assert!(
+            s.get_owned(created.id, "someone-else")
+                .expect("get")
+                .is_none()
+        );
+        assert!(s.get_owned(999, "admin").expect("get").is_none());
     }
 
     #[test]
-    fn list_by_owner_orders_most_recent_first() {
+    fn list_metadata_by_owner_orders_most_recent_first_and_omits_layout() {
         let s = store();
-        // Two dashboards, first created earlier, second
-        // touched later — `updated_ms DESC` must put the
-        // second one first even though it has a higher id
-        // that already implies later creation. Give them
-        // deterministic timestamps by updating the second
-        // one after creation.
         let a = s.create(input("a", "admin")).expect("a");
         let b = s.create(input("b", "admin")).expect("b");
-        // Sleep a millisecond so the update's timestamp is
-        // strictly greater than `a`'s.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let b_updated = s
-            .update(
+        let _ = s
+            .update_owned(
                 b.id,
+                "admin",
                 DashboardInput {
                     name: "b (renamed)".into(),
                     owner_user_id: "admin".into(),
@@ -313,22 +473,24 @@ mod tests {
                 },
             )
             .expect("update b");
-        let listed = s.list_by_owner("admin").expect("list");
+        let listed = s.list_metadata_by_owner("admin").expect("list");
         assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].id, b_updated.id);
+        assert_eq!(listed[0].id, b.id);
         assert_eq!(listed[1].id, a.id);
-        // Different owner shouldn't see either.
-        assert!(s.list_by_owner("someone-else").expect("list").is_empty());
+        // Metadata carries the size, not the bytes themselves.
+        assert!(listed[0].layout_bytes > 0);
+        assert!(s.list_metadata_by_owner("nobody").expect("list").is_empty());
     }
 
     #[test]
-    fn update_touches_updated_ms_but_not_created_ms() {
+    fn update_owned_touches_updated_ms_but_not_created_ms() {
         let s = store();
         let created = s.create(input("home", "admin")).expect("create");
         std::thread::sleep(std::time::Duration::from_millis(2));
         let updated = s
-            .update(
+            .update_owned(
                 created.id,
+                "admin",
                 DashboardInput {
                     name: "home v2".into(),
                     owner_user_id: "admin".into(),
@@ -344,19 +506,107 @@ mod tests {
         assert_eq!(updated.schema_version, 2);
     }
 
+    /// Round-2 finding 1: `update_owned` refuses to modify
+    /// a row that isn't owned by the caller — even if the
+    /// id matches. Regardless of a concurrent delete-plus-
+    /// create sequence, the owner predicate travels
+    /// *inside* the `UPDATE` statement.
     #[test]
-    fn update_missing_row_returns_not_found() {
+    fn update_owned_refuses_cross_owner_id() {
         let s = store();
-        let err = s.update(999, input("nope", "admin")).unwrap_err();
+        let alice_row = s.create(input("alice-home", "alice")).expect("create");
+        let err = s
+            .update_owned(
+                alice_row.id,
+                "bob",
+                DashboardInput {
+                    name: "bob-was-here".into(),
+                    owner_user_id: "bob".into(),
+                    layout_json: b"{}".to_vec(),
+                    schema_version: 1,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, DashboardError::NotFound(_)));
+        // Alice's row is untouched.
+        let refetched = s
+            .get_owned(alice_row.id, "alice")
+            .expect("get")
+            .expect("row");
+        assert_eq!(refetched.name, "alice-home");
+    }
+
+    #[test]
+    fn update_owned_missing_row_returns_not_found() {
+        let s = store();
+        let err = s
+            .update_owned(999, "admin", input("nope", "admin"))
+            .unwrap_err();
         assert!(matches!(err, DashboardError::NotFound(999)));
     }
 
     #[test]
-    fn delete_reports_whether_a_row_was_removed() {
+    fn delete_owned_reports_whether_a_row_was_removed_and_scopes_to_owner() {
         let s = store();
         let created = s.create(input("home", "admin")).expect("create");
-        assert!(s.delete(created.id).expect("delete"));
-        assert!(!s.delete(created.id).expect("re-delete is idempotent"));
-        assert!(s.get(created.id).expect("get").is_none());
+        // Cross-owner attempt: no-op.
+        assert!(!s.delete_owned(created.id, "not-admin").expect("delete"));
+        // Owner delete: succeeds.
+        assert!(s.delete_owned(created.id, "admin").expect("delete"));
+        // Idempotent re-delete.
+        assert!(!s.delete_owned(created.id, "admin").expect("re-delete"));
+        assert!(s.get_owned(created.id, "admin").expect("get").is_none());
+    }
+
+    /// Round-2 finding 3: create refuses oversized name
+    /// and oversized layout up front.
+    #[test]
+    fn create_refuses_oversized_name_and_layout() {
+        let s = store();
+        let big_name = "a".repeat(MAX_DASHBOARD_NAME_BYTES + 1);
+        let err = s
+            .create(DashboardInput {
+                name: big_name,
+                owner_user_id: "admin".into(),
+                layout_json: b"{}".to_vec(),
+                schema_version: 1,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DashboardError::TooLarge { field: "name", .. }
+        ));
+        let big_layout = vec![b'a'; MAX_DASHBOARD_LAYOUT_BYTES + 1];
+        let err = s
+            .create(DashboardInput {
+                name: "home".into(),
+                owner_user_id: "admin".into(),
+                layout_json: big_layout,
+                schema_version: 1,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DashboardError::TooLarge {
+                field: "layout",
+                ..
+            }
+        ));
+    }
+
+    /// Round-2 finding 3: per-owner count quota enforced
+    /// inside the create transaction. Once at cap, a
+    /// scoped token can't fill the DB through repeated
+    /// creates.
+    #[test]
+    fn create_refuses_past_per_owner_count_quota() {
+        let s = store();
+        for i in 0..MAX_DASHBOARDS_PER_OWNER {
+            s.create(input(&format!("d{i}"), "admin")).unwrap();
+        }
+        let err = s.create(input("overflow", "admin")).unwrap_err();
+        assert!(matches!(err, DashboardError::QuotaExceeded { .. }));
+        // Different owner still has room.
+        s.create(input("theirs", "someone-else")).unwrap();
     }
 }

@@ -5522,34 +5522,40 @@ async fn dashboards_update_and_delete_round_trip() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-/// Phase 13 slice 3: cross-owner reads / writes / deletes
-/// return 404 — same shape as "no such dashboard", so
-/// multi-user rollout doesn't leak the id-space to other
-/// operators.
+/// Phase 13 slice 3 / round-2 finding 2: v1 collapses
+/// every API caller to a single stable `"admin"` owner —
+/// two admin tokens (or a rotated replacement) see each
+/// other's dashboards. Pre-fix the owner was `actor.id()`
+/// which for API actors is the *token id*, so two tokens
+/// couldn't see each other's dashboards and rotating a
+/// token stranded its rows.
 #[tokio::test(flavor = "multi_thread")]
-async fn dashboards_cross_owner_is_a_404() {
-    let state_dir = support::tempdir("dashboards-cross-owner");
+async fn dashboards_share_across_admin_tokens() {
+    let state_dir = support::tempdir("dashboards-shared-owner");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let alice = engine
+    let token_a = engine
         .auth_tokens()
-        .create("alice", b"[\"dashboards:read\",\"dashboards:write\"]")
+        .create("admin-a", b"[\"dashboards:read\",\"dashboards:write\"]")
         .unwrap();
-    let bob = engine
+    let token_b = engine
         .auth_tokens()
-        .create("bob", b"[\"dashboards:read\",\"dashboards:write\"]")
+        .create("admin-b", b"[\"dashboards:read\",\"dashboards:write\"]")
         .unwrap();
     let router = build_router(engine);
-    // Alice creates a dashboard.
+    // Token A creates a dashboard.
     let response = router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/dashboards")
-                .header(header::AUTHORIZATION, format!("Bearer {}", alice.plaintext))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token_a.plaintext),
+                )
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({"name":"alice-home","layout":{}}).to_string(),
+                    serde_json::json!({"name":"shared","layout":{}}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -5560,65 +5566,78 @@ async fn dashboards_cross_owner_is_a_404() {
         .as_i64()
         .unwrap();
 
-    // Bob's list is empty.
+    // Token B sees it via LIST and GET.
     let response = router
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/dashboards")
-                .header(header::AUTHORIZATION, format!("Bearer {}", bob.plaintext))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token_b.plaintext),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     let listed = body_to_json(response.into_body()).await;
-    assert!(listed["dashboards"].as_array().unwrap().is_empty());
-
-    // Bob's GET of alice's id → 404.
+    let dashboards = listed["dashboards"].as_array().unwrap();
+    assert_eq!(dashboards.len(), 1);
+    assert_eq!(dashboards[0]["id"], id);
+    // Metadata-only listing — no `layout` field.
+    assert!(dashboards[0].get("layout").is_none());
+    assert!(dashboards[0]["layout_bytes"].as_u64().is_some());
     let response = router
         .clone()
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/dashboards/{id}"))
-                .header(header::AUTHORIZATION, format!("Bearer {}", bob.plaintext))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token_b.plaintext),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched = body_to_json(response.into_body()).await;
+    assert_eq!(fetched["name"], "shared");
+    assert_eq!(fetched["owner_user_id"], "admin");
+}
 
-    // Bob's PUT → 404, alice's row unchanged.
+/// Round-2 finding 3: an oversized `layout` returns 400
+/// (`too_large`) and does not persist. Repeated creates at
+/// the per-owner quota return 409 (`quota_exceeded`).
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_enforce_size_and_quota_caps() {
+    let state_dir = support::tempdir("dashboards-caps");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // Oversized `name` → 400.
+    let huge_name = "a".repeat(1024);
     let response = router
         .clone()
         .oneshot(
             Request::builder()
-                .method("PUT")
-                .uri(format!("/api/v1/dashboards/{id}"))
-                .header(header::AUTHORIZATION, format!("Bearer {}", bob.plaintext))
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({"name":"bob-was-here","layout":{}}).to_string(),
+                    serde_json::json!({"name": huge_name, "layout": {}}).to_string(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/dashboards/{id}"))
-                .header(header::AUTHORIZATION, format!("Bearer {}", alice.plaintext))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let alice_view = body_to_json(response.into_body()).await;
-    assert_eq!(alice_view["name"], "alice-home");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["error"], "too_large");
+    assert_eq!(body["field"], "name");
 }
 
 /// Phase 13 slice 3: read + write scopes gate the CRUD
