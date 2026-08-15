@@ -98,6 +98,15 @@ pub fn build_router(engine: Engine) -> Router {
             "/api/v1/plugins/{plugin_id}/stop",
             post(stop_plugin_instances),
         )
+        // Phase 13 slice 2: schema-driven UI. Returns the
+        // installed manifest's `config` schema (Phase 4)
+        // and `[ui]` section (Phase 13 slice 1) so the
+        // shell can render config forms and load declared
+        // UI assets without a custom panel per plugin.
+        // Gated on `plugins:list` — same read-only role
+        // that lists installed plugins can see their
+        // schemas.
+        .route("/api/v1/plugins/{plugin_id}/schema", get(get_plugin_schema))
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/events", get(query_events))
         .route("/api/v1/logs", get(query_logs))
@@ -1232,6 +1241,102 @@ async fn list_plugins(
     }
     plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
     Ok(Json(PluginsBody { plugins }))
+}
+
+/// Phase 13 slice 2: JSON body for
+/// `GET /api/v1/plugins/{plugin_id}/schema`. Returns the
+/// installed manifest's `config` schema and the `[ui]`
+/// section verbatim — same shape the manifest already
+/// deserializes, so the shell's default renderer can
+/// treat this endpoint as the source of truth without
+/// re-parsing TOML.
+///
+/// `ui: null` means the plugin didn't declare `[ui]`; the
+/// shell then falls back to the host's default config
+/// renderer only.
+#[derive(Serialize)]
+struct PluginSchemaBody {
+    plugin_id: String,
+    version: String,
+    config: std::collections::BTreeMap<String, oxidhome_manifest::ConfigField>,
+    ui: Option<oxidhome_manifest::UiSection>,
+}
+
+/// Phase 13 slice 2:
+/// `GET /api/v1/plugins/{plugin_id}/schema` — returns the
+/// installed manifest's `config` block and `[ui]` section
+/// so a UI shell can render declarative config forms and
+/// know which plugin-shipped assets are declared.
+///
+/// Reads the manifest from disk on demand
+/// (`<state_dir>/plugins/<plugin_id>/manifest.toml`) via
+/// `installed_plugins::read_manifest_sync`, which
+/// re-runs `oxidhome_manifest::validate` and refuses to
+/// return anything if the on-disk manifest is malformed.
+/// Not hot-path: called once per plugin selection in the
+/// dashboard, not per render.
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` no such installed plugin (dev-only in-memory
+///   plugins aren't reachable — they have no on-disk
+///   manifest).
+/// - `500` on-disk manifest is missing / unparseable —
+///   surfaces as `Internal` because the installer
+///   guarantees a valid manifest, so an unreadable one
+///   is a host-side integrity failure.
+async fn get_plugin_schema(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<PluginSchemaBody>, PluginSchemaError> {
+    require_scope(&actor, PLUGINS_LIST)?;
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginSchemaError::NotFound);
+    };
+    let manifest_path = installed.path.join("manifest.toml");
+    let manifest = tokio::task::spawn_blocking(move || {
+        crate::state::installed_plugins::read_manifest_sync(&manifest_path)
+    })
+    .await
+    .map_err(|err| PluginSchemaError::Internal(err.into()))?
+    .map_err(PluginSchemaError::Internal)?;
+    Ok(Json(PluginSchemaBody {
+        plugin_id: (*installed.plugin_id).to_string(),
+        version: installed.version,
+        config: manifest.config,
+        ui: manifest.ui,
+    }))
+}
+
+/// Phase 13 slice 2: handler-local error type for the
+/// schema endpoint. `Internal` covers both "manifest file
+/// vanished" (registry says installed, disk disagrees —
+/// a host-side integrity failure the operator needs to
+/// see logged) and "`spawn_blocking` panicked".
+enum PluginSchemaError {
+    Scope(ScopeDenied),
+    NotFound,
+    Internal(anyhow::Error),
+}
+
+impl From<ScopeDenied> for PluginSchemaError {
+    fn from(value: ScopeDenied) -> Self {
+        Self::Scope(value)
+    }
+}
+
+impl IntoResponse for PluginSchemaError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            Self::Internal(err) => {
+                tracing::error!(target: "api.plugins.schema", error = %err, "manifest re-read failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        }
+    }
 }
 
 // ── Plugin lifecycle (install / start / stop / uninstall) ────────

@@ -1659,7 +1659,7 @@ fn load_live_installation_uuid_for(
 /// Validates the manifest schema via `oxidhome_manifest::validate`
 /// before returning — a malformed manifest is rejected at install
 /// time so a `start` call later doesn't surface the same error.
-fn read_manifest_sync(path: &Path) -> anyhow::Result<PluginManifest> {
+pub(crate) fn read_manifest_sync(path: &Path) -> anyhow::Result<PluginManifest> {
     use anyhow::Context;
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;

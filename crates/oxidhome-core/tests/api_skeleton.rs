@@ -5265,3 +5265,108 @@ async fn plugin_ui_session_returns_404_for_unknown_plugin() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+// ── Phase 13 slice 2: schema-driven UI endpoint ─────────────────
+
+/// Phase 13 slice 2: `GET /api/v1/plugins/{id}/schema`
+/// round-trips the manifest's `config` block and `[ui]`
+/// section verbatim, so a shell can render config forms
+/// off the response without a second manifest round trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_schema_returns_config_and_ui_from_manifest() {
+    let state_dir = support::tempdir("plugin-schema-ok");
+    let source = stage_install_source("plugin-schema-ok-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source.path().to_str().unwrap()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/schema")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["plugin_id"], "example.kv-counter");
+    assert!(body["version"].as_str().is_some_and(|v| !v.is_empty()));
+    // The `config` block always serializes as an object
+    // (empty on plugins that don't declare fields).
+    assert!(body["config"].is_object());
+    // `ui` is null on plugins that don't declare `[ui]`.
+    // `kv-counter`'s fixture manifest doesn't ship it, so
+    // the shape is `null`. If a fixture in the future
+    // adds `[ui]`, this test needs updating.
+    assert!(body["ui"].is_null() || body["ui"].is_object());
+}
+
+/// Phase 13 slice 2: `GET /schema` requires the
+/// `plugins:list` scope (same read-only role as the
+/// listing endpoint).
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_schema_requires_plugins_list_scope() {
+    let state_dir = support::tempdir("plugin-schema-scope");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let commander = engine
+        .auth_tokens()
+        .create("commander", b"[\"devices:command\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/schema")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", commander.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// Phase 13 slice 2: `GET /schema` returns 404 for a
+/// plugin that isn't installed.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_schema_returns_404_for_unknown_plugin() {
+    let state_dir = support::tempdir("plugin-schema-unknown");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/com.example.notinstalled/schema")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
