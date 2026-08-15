@@ -93,6 +93,14 @@ pub struct Engine {
     /// the outer map is a `std::sync::Mutex` because insertion is
     /// synchronous and short.
     plugin_lifecycle_locks: PluginLifecycleLocks,
+    /// C6: per-process 256-bit HMAC key used to sign the
+    /// short-lived UI tickets embedded in the sandboxed
+    /// iframe's `src`. Every `GET /api/v1/plugins/{id}/ui`
+    /// mints a ticket bound to `(plugin_id, expiry_ms)` and
+    /// signs it with this secret; `GET /ui/frame?tk=<t>`
+    /// verifies against it. Rotated on daemon restart —
+    /// nobody's ticket survives a restart.
+    ui_ticket_secret: Arc<[u8; 32]>,
 }
 
 /// H2 round-2 F1: shared, lazily-populated map of per-`plugin_id`
@@ -109,6 +117,20 @@ pub struct Engine {
 type PluginLifecycleLocks = Arc<
     std::sync::Mutex<std::collections::HashMap<Arc<str>, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 >;
+
+/// C6: 256-bit OS-random HMAC key for signing UI tickets.
+/// Called once from `with_db_arc`; the resulting secret
+/// lives on `Engine` for the process lifetime, so a daemon
+/// restart invalidates every outstanding ticket. Same shape
+/// as the H9 cursor secret in `state::device_state`.
+fn mint_ui_ticket_secret() -> [u8; 32] {
+    use rand::TryRng;
+    let mut bytes = [0u8; 32];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system RNG must be available");
+    bytes
+}
 
 impl Engine {
     /// Build the default engine with an in-memory `SQLite` database.
@@ -233,7 +255,15 @@ impl Engine {
             plugin_lifecycle_locks: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            ui_ticket_secret: Arc::new(mint_ui_ticket_secret()),
         })
+    }
+
+    /// C6: HMAC secret for `plugins:ui` tickets. See
+    /// [`crate::api::ui_ticket`]. Rotated on daemon restart.
+    #[must_use]
+    pub fn ui_ticket_secret(&self) -> Arc<[u8; 32]> {
+        Arc::clone(&self.ui_ticket_secret)
     }
 
     pub(crate) fn raw(&self) -> &WasmtimeEngine {

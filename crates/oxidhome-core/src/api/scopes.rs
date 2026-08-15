@@ -184,6 +184,18 @@ pub(crate) const PLUGINS_STOP: Scope = Scope::new("plugins:stop");
 /// enough to do both. Audited.
 pub(crate) const PLUGINS_UNINSTALL: Scope = Scope::new("plugins:uninstall");
 
+/// C6: `plugins:ui` — see `GET /api/v1/plugins/{plugin_id}/ui`.
+/// Gates the sandboxed-iframe wrapper endpoint that hosts the
+/// plugin's UI. The wrapper page mints a short-lived
+/// HMAC-signed **ui ticket** scoped to this `plugin_id` and
+/// embeds it in the sandboxed iframe's `src` query string, so
+/// the iframe (which browsers won't let carry the bearer
+/// Authorization header) can authenticate itself to the frame
+/// endpoint. The ticket authorises `GET /ui/frame` for the
+/// same `plugin_id` only, for a short window (~5 min), and
+/// nothing else — no bearer-derived scopes ride with it.
+pub(crate) const PLUGINS_UI: Scope = Scope::new("plugins:ui");
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4602,3 +4602,300 @@ async fn devices_state_reconcile_capabilities_flips_only_dropped_caps() {
         oxidhome_core::state::StateQuality::Fresh
     );
 }
+
+// ── C6: sandboxed plugin UI + ticketed frame endpoint ───────────
+
+/// C6: happy path. `GET /api/v1/plugins/{id}/ui` returns a
+/// 200 HTML wrapper whose `<iframe>` uses `sandbox=
+/// "allow-scripts allow-forms"` (deliberately no
+/// `allow-same-origin`, so the browser assigns each iframe
+/// a fresh opaque origin) and points at
+/// `/ui/frame?tk=<opaque-ticket>`. Follow-up request to the
+/// frame endpoint with that ticket returns 501 (Phase-13
+/// stub) — but crucially, it doesn't need the parent's
+/// bearer, so the flow works in a real browser.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_wrapper_and_ticketed_frame_round_trip() {
+    let state_dir = support::tempdir("ui-round-trip");
+    let source = stage_install_source("ui-round-trip-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+
+    // Install the plugin so `/ui` will find it.
+    let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(install_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Fetch the wrapper page.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/ui")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/html; charset=utf-8",
+    );
+    let csp = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .expect("CSP header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("default-src 'none'"), "CSP was: {csp}");
+    assert_eq!(
+        response
+            .headers()
+            .get(header::X_FRAME_OPTIONS)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "SAMEORIGIN",
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = std::str::from_utf8(&bytes).expect("utf8");
+    // Sandbox attribute deliberately omits allow-same-origin.
+    assert!(
+        body.contains(r#"sandbox="allow-scripts allow-forms""#),
+        "wrapper must sandbox the iframe without allow-same-origin, got:\n{body}",
+    );
+    assert!(
+        !body.contains("allow-same-origin"),
+        "sandbox must NOT grant allow-same-origin (would collapse the opaque-origin isolation)",
+    );
+    // Frame src carries a `tk=` ticket.
+    let iframe_src = extract_iframe_src(body).expect("iframe src");
+    assert!(
+        iframe_src.starts_with("/api/v1/plugins/example.kv-counter/ui/frame?tk="),
+        "unexpected iframe src: {iframe_src}",
+    );
+    // Broker JS transfers a MessagePort to the iframe.
+    assert!(
+        body.contains("new MessageChannel"),
+        "wrapper must construct a per-plugin MessageChannel; broker JS missing",
+    );
+    assert!(
+        body.contains("channel.port2"),
+        "wrapper must transfer port2 to the iframe (typed broker bound to a MessagePort, not origin)",
+    );
+
+    // Follow the ticketed link — WITHOUT a bearer. This is
+    // the flow a real browser executes for an iframe
+    // subresource: no `Authorization` header is propagated,
+    // so the request must be authenticated via `tk=` alone.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&iframe_src)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "valid ticket must reach the (stub) frame handler even without a bearer",
+    );
+    let csp = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .expect("frame CSP")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("default-src 'none'"), "frame CSP was: {csp}");
+}
+
+fn extract_iframe_src(html: &str) -> Option<String> {
+    let marker = r#"src=""#;
+    let start = html.find(marker)? + marker.len();
+    let end = html[start..].find('"')? + start;
+    Some(html_entity_decode(&html[start..end]))
+}
+
+fn html_entity_decode(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+/// C6: `GET /ui/frame` refuses the ticket for one plugin
+/// when the URL path names a different plugin —
+/// indistinguishable from "no such plugin" (404) so it
+/// can't be used as an enumeration oracle.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_frame_rejects_ticket_bound_to_wrong_plugin() {
+    let state_dir = support::tempdir("ui-wrong-plugin");
+    let source_a = stage_install_source("ui-wrong-a", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // Install plugin A.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source_a.path().to_str().unwrap()})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Mint a ticket for A via `/ui`.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/ui")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let src = extract_iframe_src(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    let ticket = src.split("tk=").nth(1).unwrap().to_string();
+    // Try to use A's ticket at B's frame path. Even if B
+    // doesn't exist, the ticket-plugin mismatch should
+    // surface as 404 (not a leaky 401/400 that would let
+    // callers enumerate installed plugin ids).
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/plugins/example.other/ui/frame?tk={ticket}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// C6: `/ui/frame` refuses a missing / malformed ticket
+/// with 400 (client error, refetch `/ui`).
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_frame_rejects_missing_or_malformed_ticket() {
+    let state_dir = support::tempdir("ui-bad-ticket");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let router = build_router(engine);
+    // No `tk=` at all.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/ui/frame")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Garbage ticket.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/ui/frame?tk=garbage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// C6: `/ui` requires the `plugins:ui` scope; a token with
+/// only `plugins:list` gets 403.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_wrapper_requires_plugins_ui_scope() {
+    let state_dir = support::tempdir("ui-scope");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let lister = engine
+        .auth_tokens()
+        .create("lister", b"[\"plugins:list\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/ui")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", lister.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// C6: `/ui` returns 404 for a plugin that isn't installed.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_wrapper_returns_404_for_unknown_plugin() {
+    let state_dir = support::tempdir("ui-unknown");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/com.example.notinstalled/ui")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

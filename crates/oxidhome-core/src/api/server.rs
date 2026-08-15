@@ -36,8 +36,9 @@ use super::auth::{AuthState, require_token};
 use super::scopes::{
     AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ, EVENTS_READ, EVENTS_TAIL,
     INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP,
-    PLUGINS_UNINSTALL, ScopeDenied, require_scope,
+    PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, require_scope,
 };
+use super::ui_ticket;
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
 /// loopback port — what tests use). Daemon callers set `bind` to
@@ -101,6 +102,12 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/events", get(query_events))
         .route("/api/v1/logs", get(query_logs))
         .route("/api/v1/audit", get(query_audit))
+        // C6: sandboxed-iframe wrapper page. Bearer-gated on
+        // `plugins:ui`. Response body embeds a short-lived
+        // ticket in the iframe's src so `/ui/frame` (which
+        // browsers won't let carry the bearer as an iframe
+        // subresource) can authenticate.
+        .route("/api/v1/plugins/{plugin_id}/ui", get(get_plugin_ui))
         .layer(from_fn_with_state(auth_state.clone(), require_token));
 
     // `/readyz` mounts **outside** the authenticated router (PR-#83
@@ -116,8 +123,23 @@ pub fn build_router(engine: Engine) -> Router {
     // construction.
     let public: Router<ApiState> = Router::new().route("/api/v1/readyz", get(readyz));
 
+    // C6: `/ui/frame` mounts on its own router with **no
+    // bearer layer** — browsers can't propagate the parent
+    // page's `Authorization` header into an iframe subresource
+    // navigation, so the frame authenticates via the ticket
+    // in `?tk=…` (verified inside the handler). Physical
+    // separation from `authenticated` means an accidental
+    // route add on this router can't inherit bearer-gated
+    // scopes, and the ticket verification is the only auth
+    // check that can grant access to plugin UI assets.
+    let ticket_gated: Router<ApiState> = Router::new().route(
+        "/api/v1/plugins/{plugin_id}/ui/frame",
+        get(get_plugin_ui_frame),
+    );
+
     public
         .merge(authenticated)
+        .merge(ticket_gated)
         .fallback_service(connect_service)
         .with_state(ApiState { engine })
 }
@@ -1597,6 +1619,324 @@ impl IntoResponse for PluginLifecycleError {
                 .into_response(),
         }
     }
+}
+
+// ── Plugin UI (sandboxed iframe wrapper + ticketed frame) ────────
+
+/// C6: minimum viable HTML wrapper page — one `<iframe>` on
+/// its own row of the sandbox flags, targeting the frame
+/// endpoint with the freshly-minted ticket. The sandbox list
+/// deliberately OMITS `allow-same-origin`: the browser then
+/// assigns the iframe a fresh **opaque origin** per
+/// navigation, distinct from the daemon's origin AND
+/// distinct from every other plugin's iframe. Two plugin
+/// iframes cannot reach each other via the DOM, cookies,
+/// or storage; the wrapper page addresses each iframe via
+/// its `contentWindow` handle (an unforgeable reference)
+/// and hands each a dedicated `MessagePort` for typed IPC.
+///
+/// A `postMessage` filter on `event.origin` would be *wrong*
+/// here: opaque-origin senders all report `origin: "null"`,
+/// so an origin-based filter can't tell plugins apart. The
+/// broker below binds every response to the exact
+/// `MessagePort` object that was transferred to each iframe
+/// at load time, so cross-plugin dispatch is impossible by
+/// construction (each port is per-plugin and never shared).
+///
+/// CSP:
+/// - `default-src 'none'` — nothing loads by default.
+/// - `frame-src 'self'` — the iframe can only target
+///   same-origin (the frame endpoint on this daemon).
+/// - `script-src 'unsafe-inline'` — the broker JS is
+///   inline in this exact response body, so a hash-based
+///   allowlist is future-work; the wrapper page itself is
+///   host-controlled HTML, not attacker-controlled.
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` no such installed plugin.
+async fn get_plugin_ui(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Response, PluginUiError> {
+    require_scope(&actor, PLUGINS_UI)?;
+    if state.engine.installed_plugins().get(&plugin_id).is_none() {
+        return Err(PluginUiError::NotFound);
+    }
+    let secret = state.engine.ui_ticket_secret();
+    let ticket = ui_ticket::issue(&secret, &plugin_id, std::time::SystemTime::now());
+    // C6: percent-encode the plugin_id AND the ticket into
+    // both the URL src attribute and the JS string literal
+    // — the manifest validator restricts `plugin_id` to
+    // reverse-DNS chars, but defence-in-depth: a future
+    // relaxation or a hand-crafted registry row shouldn't
+    // let a plugin_id smuggle HTML / URL syntax through the
+    // template. Ticket contains `~` and hex, both URL-safe
+    // but percent-encoding avoids relying on that.
+    let src = format!(
+        "/api/v1/plugins/{}/ui/frame?tk={}",
+        percent_encode_path_segment(&plugin_id),
+        percent_encode_query_value(&ticket),
+    );
+    let body = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>plugin ui</title>
+</head>
+<body>
+<iframe
+  id="oxidhome-plugin-frame"
+  sandbox="allow-scripts allow-forms"
+  src="{src_attr}"
+  style="border:0;width:100%;height:100vh"
+></iframe>
+<script>
+  // C6 typed postMessage broker. Bound to the iframe's
+  // *exact* MessagePort object, transferred at load time;
+  // NOT to event.origin (opaque-origin iframes all report
+  // origin: "null", so origin can't disambiguate plugins).
+  (function () {{
+    var iframe = document.getElementById("oxidhome-plugin-frame");
+    iframe.addEventListener("load", function () {{
+      var channel = new MessageChannel();
+      // port1 stays with the host page; port2 is transferred
+      // to the sandboxed iframe. All subsequent host <->
+      // plugin traffic flows on this dedicated pair — each
+      // plugin's iframe holds its own port and cannot reach
+      // any other plugin's channel.
+      channel.port1.onmessage = function (event) {{
+        // TODO(phase-13): route typed message envelopes to
+        // the per-plugin capability dispatcher. First-cut
+        // shape: {{"type": "state.snapshot" | ..., "req": <id>, ...}}.
+        // Every message is bound to `iframe.contentWindow` by
+        // *arriving on this specific port*, so per-plugin
+        // capability enforcement is trivial: port ⇒ plugin.
+      }};
+      iframe.contentWindow.postMessage(
+        {{ type: "oxidhome:init", plugin_id: "{plugin_js}" }},
+        "*",
+        [channel.port2],
+      );
+    }});
+  }})();
+</script>
+</body>
+</html>
+"#,
+        src_attr = html_escape(&src),
+        plugin_js = js_string_escape(&plugin_id),
+    );
+    let mut response = (StatusCode::OK, body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; frame-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
+        ),
+    );
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("SAMEORIGIN"),
+    );
+    Ok(response)
+}
+
+/// C6: iframe destination. Loaded by the wrapper page above
+/// as a sandboxed subresource → the browser does NOT
+/// propagate the parent's `Authorization` header, so this
+/// endpoint sits *outside* the bearer middleware and
+/// authenticates via the ticket in `?tk=…` instead. The
+/// ticket is bound to this route's `plugin_id` path
+/// segment, so a ticket minted for plugin A can't unlock
+/// plugin B's frame.
+///
+/// Stub in the first cut — real UI assets land in Phase 13.
+/// Returns `501 Not Implemented` with strict headers so the
+/// shape is inherited when content lands.
+///
+/// # Errors
+/// - `400` ticket missing or malformed.
+/// - `401` ticket well-formed but expired (client should
+///   re-fetch `/ui` to mint a fresh one).
+/// - `404` unknown plugin OR ticket bound to a different
+///   plugin (indistinguishable, avoids an enumeration
+///   oracle).
+/// - `501` plugin exists + ticket valid; UI assets not yet
+///   implemented.
+async fn get_plugin_ui_frame(
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+    Query(params): Query<FrameParams>,
+) -> Result<Response, PluginUiError> {
+    let Some(ticket_raw) = params.tk else {
+        return Err(PluginUiError::TicketBad);
+    };
+    let secret = state.engine.ui_ticket_secret();
+    match ui_ticket::verify(
+        &secret,
+        &ticket_raw,
+        &plugin_id,
+        std::time::SystemTime::now(),
+    ) {
+        Ok(()) => {}
+        Err(ui_ticket::TicketError::Bad) => return Err(PluginUiError::TicketBad),
+        Err(ui_ticket::TicketError::Expired) => return Err(PluginUiError::TicketExpired),
+        Err(ui_ticket::TicketError::WrongPlugin) => return Err(PluginUiError::NotFound),
+    }
+    if state.engine.installed_plugins().get(&plugin_id).is_none() {
+        return Err(PluginUiError::NotFound);
+    }
+    let mut response = (
+        StatusCode::NOT_IMPLEMENTED,
+        "plugin UI assets are a Phase 13 follow-up",
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("default-src 'none'"),
+    );
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("SAMEORIGIN"),
+    );
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+struct FrameParams {
+    /// C6: opaque ticket minted by the `/ui` handler. Required.
+    #[serde(default)]
+    tk: Option<String>,
+}
+
+/// C6: handler-local error type for the two UI endpoints.
+enum PluginUiError {
+    Scope(ScopeDenied),
+    NotFound,
+    TicketBad,
+    TicketExpired,
+}
+
+impl From<ScopeDenied> for PluginUiError {
+    fn from(value: ScopeDenied) -> Self {
+        Self::Scope(value)
+    }
+}
+
+impl IntoResponse for PluginUiError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            Self::TicketBad => (
+                StatusCode::BAD_REQUEST,
+                "invalid or missing `tk` — refetch /ui to mint a fresh ticket",
+            )
+                .into_response(),
+            Self::TicketExpired => (
+                StatusCode::UNAUTHORIZED,
+                "ticket expired — refetch /ui to mint a fresh one",
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// C6: percent-encode a value destined for a URL path
+/// segment (`plugin_id` in the iframe `src`). Encodes every
+/// byte outside the RFC 3986 "unreserved" set — the
+/// manifest validator restricts `plugin_id` to `[a-z0-9.-]+`
+/// which are all unreserved, but defence-in-depth: a future
+/// relaxation shouldn't let a `plugin_id` smuggle URL syntax
+/// (`?`, `#`, `/`, `..`) into the wrapper page's iframe src.
+fn percent_encode_path_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        if is_url_unreserved(b) {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// C6: percent-encode a value destined for a URL query
+/// value (the ticket in `?tk=…`). Same encoding as
+/// `percent_encode_path_segment` — the ticket format uses
+/// `~` (unreserved) and hex digits, but we don't want to
+/// bake that assumption into the wrapper page's HTML.
+fn percent_encode_query_value(input: &str) -> String {
+    percent_encode_path_segment(input)
+}
+
+/// RFC 3986 §2.3 unreserved characters: `A-Z a-z 0-9 - . _ ~`.
+fn is_url_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+}
+
+/// C6: HTML-attribute-value escape — the src attribute
+/// lives inside double quotes, so `&`, `<`, `>`, `"`, and
+/// `'` all need entity encoding. Percent-encoded `plugin_id`
+/// / ticket already avoid the special ASCII, but the
+/// escape is here so a template edit that drops
+/// percent-encoding doesn't silently open an injection.
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// C6: JS-string-literal escape for the `plugin_id` embedded
+/// as `"..."` in the broker init. Escapes `\`, quotes,
+/// newlines, and `</` (which would prematurely close the
+/// `<script>` block if a `plugin_id` ever contained it).
+fn js_string_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ── Events tail (WebSocket) ──────────────────────────────────────
