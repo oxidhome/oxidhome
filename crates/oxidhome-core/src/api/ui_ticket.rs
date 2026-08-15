@@ -77,25 +77,37 @@ pub(crate) const TICKET_TTL: Duration = Duration::from_mins(5);
 /// stuffing the query with separator-heavy garbage.
 pub(crate) const MAX_TICKET_LEN: usize = 512;
 
+/// C6 round-3 finding 1: decoded, MAC-verified,
+/// unexpired ticket claims. The handler compares these
+/// against the URL path (`plugin_id`) and the current
+/// registry entry (`installation_uuid`) itself; the
+/// verifier no longer takes those as arguments so a
+/// garbage ticket can't be used to distinguish "installed"
+/// from "not installed" via the error mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedTicket {
+    pub plugin_id: String,
+    pub installation_uuid: String,
+}
+
 /// C6: outcome of [`verify`]. The frame handler maps `Bad`
 /// to `400 Bad Request` (client bug — refetch
-/// `/ui-session`), `Expired` to `401 Unauthorized`
-/// (natural retry-with-fresh-ticket signal), and
-/// `WrongPlugin` to `404 Not Found` (indistinguishable
-/// from a nonexistent plugin, so cross-plugin ticket
-/// misuse can't enumerate installed ids).
+/// `/ui-session`) and `Expired` to `401 Unauthorized`
+/// (natural retry-with-fresh-ticket signal). Mismatch
+/// against the URL path or the current installation is
+/// checked by the handler *after* [`verify`] returns
+/// `Ok`, and surfaces as `404 Not Found` there — same
+/// shape as "no such plugin", so unauthenticated callers
+/// can't distinguish "installed but wrong ticket" from
+/// "not installed".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TicketError {
     /// Shape / decoding / MAC mismatch, or ticket too long.
+    /// Uniform outcome for every garbage ticket regardless
+    /// of URL path.
     Bad,
     /// MAC verifies but `expiry_ms` is in the past.
     Expired,
-    /// MAC verifies and the ticket is fresh, but its
-    /// `(plugin_id, installation_uuid)` pair doesn't match
-    /// what the caller passed. Covers both cross-plugin
-    /// ticket use AND the uninstall + reinstall race
-    /// (same `plugin_id`, different `installation_uuid`).
-    WrongPlugin,
 }
 
 /// Sign a fresh ticket for `plugin_id` @ `installation_uuid`
@@ -122,18 +134,25 @@ pub(crate) fn issue(
     format!("{payload}~{hex}")
 }
 
-/// Verify a ticket the wrapper / frame handler received in
-/// `?tk=…` against the per-process secret,
-/// `expected_plugin_id` (from the URL path), and
-/// `expected_installation_uuid` (looked up from the
-/// current registry row).
+/// C6 round-3 finding 1: verify a ticket the wrapper /
+/// frame handler received in `?tk=…` against the
+/// per-process secret. Returns the decoded
+/// `(plugin_id, installation_uuid)` claims on success —
+/// **the handler compares those against the URL path and
+/// the current registry entry** so that any garbage
+/// ticket surfaces as a uniform `Bad` regardless of the
+/// URL path. Pre-fix, `verify` took the expected
+/// `plugin_id` + `installation_uuid` as arguments and
+/// distinguished `WrongPlugin` from `Bad`; the handler
+/// looked up the installation before calling `verify`,
+/// so `?tk=garbage` returned 400 for installed plugins
+/// and 404 for unknown ones — an unauthenticated
+/// enumeration oracle.
 pub(crate) fn verify(
     secret: &[u8; 32],
     raw: &str,
-    expected_plugin_id: &str,
-    expected_installation_uuid: &str,
     now: SystemTime,
-) -> Result<(), TicketError> {
+) -> Result<DecodedTicket, TicketError> {
     // Round-2 finding 3: cap raw length first. Parsing an
     // over-long ticket allocates nothing beyond the check.
     if raw.len() > MAX_TICKET_LEN {
@@ -157,10 +176,6 @@ pub(crate) fn verify(
         return Err(TicketError::Bad);
     }
     let expiry_ms: u64 = expiry_ms_str.parse().map_err(|_| TicketError::Bad)?;
-    // MAC first — even a wrong-plugin or expired ticket
-    // must present a valid signature, otherwise attackers
-    // can enumerate accepted `(plugin_id, uuid)` tuples or
-    // probe the clock.
     let expected = hmac_sha256(secret, payload.as_bytes());
     let mut supplied = [0u8; 16];
     for (i, chunk) in mac_hex.as_bytes().chunks(2).enumerate() {
@@ -173,9 +188,6 @@ pub(crate) fn verify(
     if !constant_time_eq(&expected[..16], &supplied) {
         return Err(TicketError::Bad);
     }
-    if plugin_id != expected_plugin_id || installation_uuid != expected_installation_uuid {
-        return Err(TicketError::WrongPlugin);
-    }
     let now_ms = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()
@@ -184,7 +196,10 @@ pub(crate) fn verify(
     if now_ms >= expiry_ms {
         return Err(TicketError::Expired);
     }
-    Ok(())
+    Ok(DecodedTicket {
+        plugin_id: plugin_id.to_string(),
+        installation_uuid: installation_uuid.to_string(),
+    })
 }
 
 /// HMAC-SHA256 — hand-rolled on top of the existing `sha2`
@@ -229,35 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn issued_ticket_verifies_for_same_id_and_uuid() {
+    fn issued_ticket_verifies_and_returns_decoded_claims() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let t = issue(&secret(), "com.example.foo", "inst-uuid-1", now);
-        verify(&secret(), &t, "com.example.foo", "inst-uuid-1", now)
-            .expect("fresh ticket verifies");
-    }
-
-    /// Round-2 finding 2: a ticket for the same
-    /// `plugin_id` under a *different* `installation_uuid`
-    /// (uninstall + reinstall race) is rejected as
-    /// `WrongPlugin`.
-    #[test]
-    fn ticket_rejects_wrong_installation_uuid() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let t = issue(&secret(), "com.example.foo", "inst-uuid-1", now);
-        assert_eq!(
-            verify(&secret(), &t, "com.example.foo", "inst-uuid-2", now),
-            Err(TicketError::WrongPlugin),
-        );
-    }
-
-    #[test]
-    fn ticket_rejects_wrong_plugin() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let t = issue(&secret(), "com.example.foo", "inst-uuid-1", now);
-        assert_eq!(
-            verify(&secret(), &t, "com.example.bar", "inst-uuid-1", now),
-            Err(TicketError::WrongPlugin),
-        );
+        let decoded = verify(&secret(), &t, now).expect("fresh ticket verifies");
+        assert_eq!(decoded.plugin_id, "com.example.foo");
+        assert_eq!(decoded.installation_uuid, "inst-uuid-1");
     }
 
     #[test]
@@ -265,10 +257,7 @@ mod tests {
         let issued_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let t = issue(&secret(), "com.example.foo", "inst-uuid-1", issued_at);
         let later = issued_at + TICKET_TTL + Duration::from_secs(1);
-        assert_eq!(
-            verify(&secret(), &t, "com.example.foo", "inst-uuid-1", later),
-            Err(TicketError::Expired),
-        );
+        assert_eq!(verify(&secret(), &t, later), Err(TicketError::Expired));
     }
 
     #[test]
@@ -279,10 +268,7 @@ mod tests {
         let last = chars.len() - 1;
         chars[last] = if chars[last] == '0' { '1' } else { '0' };
         let tampered: String = chars.into_iter().collect();
-        assert_eq!(
-            verify(&secret(), &tampered, "com.example.foo", "inst-uuid-1", now),
-            Err(TicketError::Bad),
-        );
+        assert_eq!(verify(&secret(), &tampered, now), Err(TicketError::Bad));
     }
 
     #[test]
@@ -290,37 +276,22 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let t = issue(&secret(), "com.example.foo", "inst-uuid-1", now);
         let other_secret = [0xa5; 32];
-        assert_eq!(
-            verify(&other_secret, &t, "com.example.foo", "inst-uuid-1", now),
-            Err(TicketError::Bad),
-        );
+        assert_eq!(verify(&other_secret, &t, now), Err(TicketError::Bad));
     }
 
     #[test]
     fn ticket_rejects_malformed_shapes() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        assert_eq!(
-            verify(&secret(), "", "id", "uuid", now),
-            Err(TicketError::Bad),
-        );
-        assert_eq!(
-            verify(&secret(), "a~b", "id", "uuid", now),
-            Err(TicketError::Bad),
-        );
+        assert_eq!(verify(&secret(), "", now), Err(TicketError::Bad));
+        assert_eq!(verify(&secret(), "a~b", now), Err(TicketError::Bad));
         // Missing installation_uuid segment (old 3-part
         // shape from round-1) → Bad.
         assert_eq!(
-            verify(
-                &secret(),
-                "1~id~00000000000000000000000000000000",
-                "id",
-                "uuid",
-                now,
-            ),
+            verify(&secret(), "1~id~00000000000000000000000000000000", now),
             Err(TicketError::Bad),
         );
         assert_eq!(
-            verify(&secret(), "1~id~uuid~short", "id", "uuid", now),
+            verify(&secret(), "1~id~uuid~short", now),
             Err(TicketError::Bad),
         );
     }
@@ -332,7 +303,7 @@ mod tests {
         let mut oversized = "1~id~uuid~".to_string();
         oversized.push_str(&"~".repeat(MAX_TICKET_LEN));
         assert_eq!(
-            verify(&secret(), &oversized, "id", "uuid", SystemTime::UNIX_EPOCH),
+            verify(&secret(), &oversized, SystemTime::UNIX_EPOCH),
             Err(TicketError::Bad),
         );
     }
@@ -344,7 +315,7 @@ mod tests {
     fn separator_heavy_ticket_does_not_amplify_allocation() {
         let long = "~".repeat(MAX_TICKET_LEN + 1);
         assert_eq!(
-            verify(&secret(), &long, "id", "uuid", SystemTime::UNIX_EPOCH),
+            verify(&secret(), &long, SystemTime::UNIX_EPOCH),
             Err(TicketError::Bad),
         );
     }

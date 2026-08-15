@@ -1662,7 +1662,7 @@ async fn post_plugin_ui_session(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
-) -> Result<Json<UiSessionBody>, PluginUiError> {
+) -> Result<Response, PluginUiError> {
     require_scope(&actor, PLUGINS_UI)?;
     let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
         return Err(PluginUiError::NotFound);
@@ -1680,7 +1680,17 @@ async fn post_plugin_ui_session(
         .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
         .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(0);
-    Ok(Json(UiSessionBody { url, expires_ms }))
+    let mut response = Json(UiSessionBody { url, expires_ms }).into_response();
+    // Round-3 finding 2: the session response body carries
+    // a freshly-minted ticket. HTTP caches must not store
+    // it (RFC 9111) — a shared proxy that replayed this
+    // body would hand every subsequent caller a
+    // still-valid ticket authorising the plugin UI.
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 #[derive(Serialize)]
@@ -1729,32 +1739,33 @@ async fn get_plugin_ui(
     Path(plugin_id): Path<String>,
     Query(params): Query<TicketParams>,
 ) -> Result<Response, PluginUiError> {
-    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
-        return Err(PluginUiError::NotFound);
-    };
+    // Round-3 finding 1: verify the ticket FIRST — any
+    // garbage ticket returns 400 uniformly, so an
+    // unauthenticated caller can't use `?tk=garbage` to
+    // distinguish installed from unknown plugins.
     let Some(ticket_raw) = params.tk else {
         return Err(PluginUiError::TicketBad);
     };
     let secret = state.engine.ui_ticket_secret();
-    match ui_ticket::verify(
-        &secret,
-        &ticket_raw,
-        &plugin_id,
-        &installed.installation_uuid,
-        std::time::SystemTime::now(),
-    ) {
-        Ok(()) => {}
+    let decoded = match ui_ticket::verify(&secret, &ticket_raw, std::time::SystemTime::now()) {
+        Ok(d) => d,
         Err(ui_ticket::TicketError::Bad) => return Err(PluginUiError::TicketBad),
         Err(ui_ticket::TicketError::Expired) => return Err(PluginUiError::TicketExpired),
-        Err(ui_ticket::TicketError::WrongPlugin) => return Err(PluginUiError::NotFound),
+    };
+    // MAC verified. Now compare decoded claims against
+    // the URL path + current registry entry. Every branch
+    // below surfaces as 404 — same shape as "no such
+    // plugin" — so a valid-MAC-but-wrong-target ticket
+    // can't be used to enumerate installed ids either.
+    if decoded.plugin_id != plugin_id {
+        return Err(PluginUiError::NotFound);
     }
-    // Percent-encode `plugin_id` and the ticket into both
-    // the URL src attribute and the JS string literal.
-    // Manifest validator restricts `plugin_id` to
-    // reverse-DNS today, but a future relaxation shouldn't
-    // let a `plugin_id` smuggle HTML / URL syntax through
-    // the template. Ticket contains `~` and hex, both
-    // URL-safe, but percent-encoding avoids relying on that.
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginUiError::NotFound);
+    };
+    if decoded.installation_uuid != *installed.installation_uuid {
+        return Err(PluginUiError::NotFound);
+    }
     let src = format!(
         "/api/v1/plugins/{}/ui/frame?tk={}",
         percent_encode_path_segment(&plugin_id),
@@ -1830,6 +1841,16 @@ async fn get_plugin_ui(
         axum::http::header::X_FRAME_OPTIONS,
         axum::http::HeaderValue::from_static("SAMEORIGIN"),
     );
+    // Round-3 finding 2: ticket-authenticated responses
+    // MUST NOT be cached. HTTP intermediaries would
+    // otherwise serve stored 200 (or heuristically
+    // cacheable 501) responses past the ticket's expiry
+    // or after an uninstall + reinstall rotates the
+    // installation UUID (RFC 9111).
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
     Ok(response)
 }
 
@@ -1857,24 +1878,25 @@ async fn get_plugin_ui_frame(
     Path(plugin_id): Path<String>,
     Query(params): Query<TicketParams>,
 ) -> Result<Response, PluginUiError> {
-    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
-        return Err(PluginUiError::NotFound);
-    };
+    // Round-3 finding 1: same verify-before-lookup order
+    // as `/ui`.
     let Some(ticket_raw) = params.tk else {
         return Err(PluginUiError::TicketBad);
     };
     let secret = state.engine.ui_ticket_secret();
-    match ui_ticket::verify(
-        &secret,
-        &ticket_raw,
-        &plugin_id,
-        &installed.installation_uuid,
-        std::time::SystemTime::now(),
-    ) {
-        Ok(()) => {}
+    let decoded = match ui_ticket::verify(&secret, &ticket_raw, std::time::SystemTime::now()) {
+        Ok(d) => d,
         Err(ui_ticket::TicketError::Bad) => return Err(PluginUiError::TicketBad),
         Err(ui_ticket::TicketError::Expired) => return Err(PluginUiError::TicketExpired),
-        Err(ui_ticket::TicketError::WrongPlugin) => return Err(PluginUiError::NotFound),
+    };
+    if decoded.plugin_id != plugin_id {
+        return Err(PluginUiError::NotFound);
+    }
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginUiError::NotFound);
+    };
+    if decoded.installation_uuid != *installed.installation_uuid {
+        return Err(PluginUiError::NotFound);
     }
     let mut response = (
         StatusCode::NOT_IMPLEMENTED,
@@ -1897,6 +1919,16 @@ async fn get_plugin_ui_frame(
     headers.insert(
         axum::http::header::X_FRAME_OPTIONS,
         axum::http::HeaderValue::from_static("SAMEORIGIN"),
+    );
+    // Round-3 finding 2: ticket-authenticated responses
+    // MUST NOT be cached. HTTP intermediaries would
+    // otherwise serve stored 200 (or heuristically
+    // cacheable 501) responses past the ticket's expiry
+    // or after an uninstall + reinstall rotates the
+    // installation UUID (RFC 9111).
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
     );
     Ok(response)
 }
@@ -1925,20 +1957,40 @@ impl From<ScopeDenied> for PluginUiError {
 
 impl IntoResponse for PluginUiError {
     fn into_response(self) -> Response {
-        match self {
-            Self::Scope(s) => s.into_response(),
+        let mut response = match self {
+            // Round-3 finding 2: scope-denied responses go
+            // through the shared 403 shape without our
+            // Cache-Control stamp — they aren't
+            // ticket-authenticated and don't leak
+            // anything cacheable-across-request either.
+            Self::Scope(s) => return s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            // Round-3 finding 3: recovery is `POST
+            // /api/v1/plugins/{id}/ui-session` (bearer + the
+            // `plugins:ui` scope) — `/ui` no longer mints
+            // tickets, it consumes them.
             Self::TicketBad => (
                 StatusCode::BAD_REQUEST,
-                "invalid or missing `tk` — refetch /ui to mint a fresh ticket",
+                "invalid or missing `tk` — POST /api/v1/plugins/{plugin_id}/ui-session to mint a fresh ticket",
             )
                 .into_response(),
             Self::TicketExpired => (
                 StatusCode::UNAUTHORIZED,
-                "ticket expired — refetch /ui to mint a fresh one",
+                "ticket expired — POST /api/v1/plugins/{plugin_id}/ui-session to mint a fresh one",
             )
                 .into_response(),
-        }
+        };
+        // Round-3 finding 2: error responses are cacheable
+        // by default too (RFC 9110 marks 404 as
+        // heuristically cacheable, and 501 explicitly so).
+        // Stamp `no-store` uniformly so a shared proxy
+        // can't replay a stale ticket-error response past
+        // the failure that produced it.
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response
     }
 }
 
