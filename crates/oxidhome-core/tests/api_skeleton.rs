@@ -5015,6 +5015,53 @@ async fn plugin_ui_session_requires_plugins_ui_scope() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+/// C6 round-4 finding 2: raw query length is capped
+/// **before** axum's Query extractor runs, so an
+/// unauthenticated request can't force per-request
+/// allocation or URL-decoding work up to hyper's
+/// request-head limit by shipping a very long `tk=…`
+/// value. Anything longer than
+/// `ui_ticket::MAX_TICKET_LEN + "tk=".len()` is rejected
+/// wholesale by the custom `TicketQuery` extractor
+/// without allocating an owned `String` for the value.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_ui_frame_bounds_query_length_before_allocation() {
+    let state_dir = support::tempdir("ui-query-bound");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let router = build_router(engine);
+    // Well over MAX_TICKET_LEN (512 bytes). Value length
+    // scales the attacker's per-request allocation if we
+    // weren't bounding at the raw-query layer.
+    let oversized_value = "x".repeat(8 * 1024);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/plugins/example.kv-counter/ui/frame?tk={oversized_value}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Same protection on the wrapper endpoint.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/plugins/example.kv-counter/ui?tk={oversized_value}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 /// C6 round-3 finding 1: `?tk=garbage` on `/ui` and
 /// `/ui/frame` returns 400 uniformly — the same status
 /// regardless of whether the URL's `plugin_id` names an

@@ -1737,13 +1737,13 @@ struct UiSessionBody {
 async fn get_plugin_ui(
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
-    Query(params): Query<TicketParams>,
+    ticket: TicketQuery,
 ) -> Result<Response, PluginUiError> {
     // Round-3 finding 1: verify the ticket FIRST — any
     // garbage ticket returns 400 uniformly, so an
     // unauthenticated caller can't use `?tk=garbage` to
     // distinguish installed from unknown plugins.
-    let Some(ticket_raw) = params.tk else {
+    let Some(ticket_raw) = ticket.tk else {
         return Err(PluginUiError::TicketBad);
     };
     let secret = state.engine.ui_ticket_secret();
@@ -1876,11 +1876,11 @@ async fn get_plugin_ui(
 async fn get_plugin_ui_frame(
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
-    Query(params): Query<TicketParams>,
+    ticket: TicketQuery,
 ) -> Result<Response, PluginUiError> {
     // Round-3 finding 1: same verify-before-lookup order
     // as `/ui`.
-    let Some(ticket_raw) = params.tk else {
+    let Some(ticket_raw) = ticket.tk else {
         return Err(PluginUiError::TicketBad);
     };
     let secret = state.engine.ui_ticket_secret();
@@ -1933,12 +1933,60 @@ async fn get_plugin_ui_frame(
     Ok(response)
 }
 
-#[derive(Deserialize)]
-struct TicketParams {
-    /// C6: opaque ticket minted by `POST /ui-session`.
-    /// Required by `/ui` and `/ui/frame`.
-    #[serde(default)]
+/// C6 round-4 finding 2: custom extractor for the ticket
+/// query param that bounds the raw query string length
+/// **before** allocating or URL-decoding. Pre-fix,
+/// `Query<TicketParams>` ran serde deserialization first
+/// — an unauthenticated request could ship a `tk=…` value
+/// up to the HTTP request-head limit (hyper defaults are
+/// KiB-scale) and force an owned `String` allocation plus
+/// percent-decoding, all before our `MAX_TICKET_LEN` check
+/// on the frame endpoint. Bounding at
+/// `parts.uri.query()` — a borrowed `&str` slice into the
+/// pre-parsed URI, no alloc — moves the size cap ahead of
+/// any attacker-controlled allocation.
+///
+/// The bound (`MAX_UI_QUERY_LEN`) is
+/// `MAX_TICKET_LEN + "tk=".len()` so a valid ticket
+/// always fits and any query longer than that is
+/// rejected wholesale.
+struct TicketQuery {
     tk: Option<String>,
+}
+
+const MAX_UI_QUERY_LEN: usize = ui_ticket::MAX_TICKET_LEN + b"tk=".len();
+
+impl<S> axum::extract::FromRequestParts<S> for TicketQuery
+where
+    S: Send + Sync,
+{
+    type Rejection = PluginUiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let query = parts.uri.query().unwrap_or("");
+        if query.len() > MAX_UI_QUERY_LEN {
+            return Err(PluginUiError::TicketBad);
+        }
+        // Query is bounded — safe to parse now. Ticket
+        // chars are all URL-safe (`~`, digits, hex, hyphens,
+        // dots) so no percent-decoding is expected; if the
+        // caller sends a percent-encoded ticket the raw
+        // bytes will fail HMAC verify, which is the correct
+        // outcome (`Bad`).
+        let mut tk: Option<String> = None;
+        for pair in query.split('&') {
+            let Some(value) = pair.strip_prefix("tk=") else {
+                continue;
+            };
+            // Last-`tk` wins, matching serde_urlencoded's
+            // Option<T> shape.
+            tk = Some(value.to_string());
+        }
+        Ok(Self { tk })
+    }
 }
 
 /// C6: handler-local error type for the two UI endpoints.
