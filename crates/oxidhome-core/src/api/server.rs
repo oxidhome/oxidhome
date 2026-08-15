@@ -102,12 +102,19 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/events", get(query_events))
         .route("/api/v1/logs", get(query_logs))
         .route("/api/v1/audit", get(query_audit))
-        // C6: sandboxed-iframe wrapper page. Bearer-gated on
-        // `plugins:ui`. Response body embeds a short-lived
-        // ticket in the iframe's src so `/ui/frame` (which
-        // browsers won't let carry the bearer as an iframe
-        // subresource) can authenticate.
-        .route("/api/v1/plugins/{plugin_id}/ui", get(get_plugin_ui))
+        // C6: bearer-gated JSON endpoint that mints a
+        // short-lived HMAC ticket and returns the wrapper
+        // URL for the dashboard to hand off as an iframe
+        // `src`. `/ui` itself sits on the ticket-gated
+        // router below — browsers can't attach the parent's
+        // `Authorization` header to a subresource nav or a
+        // top-level document nav, so requiring bearer on
+        // the wrapper would 401 every legitimate browser
+        // flow. Gated on `plugins:ui`.
+        .route(
+            "/api/v1/plugins/{plugin_id}/ui-session",
+            post(post_plugin_ui_session),
+        )
         .layer(from_fn_with_state(auth_state.clone(), require_token));
 
     // `/readyz` mounts **outside** the authenticated router (PR-#83
@@ -123,19 +130,24 @@ pub fn build_router(engine: Engine) -> Router {
     // construction.
     let public: Router<ApiState> = Router::new().route("/api/v1/readyz", get(readyz));
 
-    // C6: `/ui/frame` mounts on its own router with **no
-    // bearer layer** — browsers can't propagate the parent
-    // page's `Authorization` header into an iframe subresource
-    // navigation, so the frame authenticates via the ticket
-    // in `?tk=…` (verified inside the handler). Physical
-    // separation from `authenticated` means an accidental
-    // route add on this router can't inherit bearer-gated
-    // scopes, and the ticket verification is the only auth
-    // check that can grant access to plugin UI assets.
-    let ticket_gated: Router<ApiState> = Router::new().route(
-        "/api/v1/plugins/{plugin_id}/ui/frame",
-        get(get_plugin_ui_frame),
-    );
+    // C6: `/ui` and `/ui/frame` mount on their own router
+    // with **no bearer layer** — browsers can't attach the
+    // parent page's `Authorization` header to iframe
+    // subresource navigations OR top-level document
+    // navigations, so both authenticate via the HMAC
+    // ticket in `?tk=…` (verified inside each handler).
+    // Physical separation from `authenticated` means an
+    // accidental route add on this router can't inherit
+    // bearer-gated scopes, and ticket verification is the
+    // only auth check that can grant access to plugin UI
+    // content. `POST /ui-session` above (bearer-gated)
+    // is the only path that mints these tickets.
+    let ticket_gated: Router<ApiState> = Router::new()
+        .route("/api/v1/plugins/{plugin_id}/ui", get(get_plugin_ui))
+        .route(
+            "/api/v1/plugins/{plugin_id}/ui/frame",
+            get(get_plugin_ui_frame),
+        );
 
     public
         .merge(authenticated)
@@ -1623,61 +1635,130 @@ impl IntoResponse for PluginLifecycleError {
 
 // ── Plugin UI (sandboxed iframe wrapper + ticketed frame) ────────
 
-/// C6: minimum viable HTML wrapper page — one `<iframe>` on
-/// its own row of the sandbox flags, targeting the frame
-/// endpoint with the freshly-minted ticket. The sandbox list
-/// deliberately OMITS `allow-same-origin`: the browser then
-/// assigns the iframe a fresh **opaque origin** per
-/// navigation, distinct from the daemon's origin AND
-/// distinct from every other plugin's iframe. Two plugin
-/// iframes cannot reach each other via the DOM, cookies,
-/// or storage; the wrapper page addresses each iframe via
-/// its `contentWindow` handle (an unforgeable reference)
-/// and hands each a dedicated `MessagePort` for typed IPC.
+/// C6 round-2 finding 1: `POST /api/v1/plugins/{plugin_id}/ui-session`
+/// — bearer-gated JSON endpoint that mints a short-lived
+/// HMAC ticket and returns the wrapper URL for the
+/// dashboard to hand off as an iframe `src`. This is the
+/// only path that mints tickets; both `/ui` and
+/// `/ui/frame` verify them.
 ///
-/// A `postMessage` filter on `event.origin` would be *wrong*
-/// here: opaque-origin senders all report `origin: "null"`,
-/// so an origin-based filter can't tell plugins apart. The
-/// broker below binds every response to the exact
-/// `MessagePort` object that was transferred to each iframe
-/// at load time, so cross-plugin dispatch is impossible by
-/// construction (each port is per-plugin and never shared).
-///
-/// CSP:
-/// - `default-src 'none'` — nothing loads by default.
-/// - `frame-src 'self'` — the iframe can only target
-///   same-origin (the frame endpoint on this daemon).
-/// - `script-src 'unsafe-inline'` — the broker JS is
-///   inline in this exact response body, so a hash-based
-///   allowlist is future-work; the wrapper page itself is
-///   host-controlled HTML, not attacker-controlled.
+/// The dashboard flow:
+/// 1. Dashboard (holds bearer) `POST`s here and reads
+///    `{"url": ".../ui?tk=<t>", "expires_ms": …}`.
+/// 2. Dashboard renders `<iframe src=<url>>` (or opens
+///    `window.open(url)`) — no bearer in the request the
+///    browser makes, because it can't attach one to an
+///    iframe / top-level navigation.
+/// 3. `/ui` verifies the ticket, returns the sandboxed
+///    wrapper HTML which embeds the same ticket into the
+///    inner `<iframe sandbox src=".../ui/frame?tk=<t>">`.
+/// 4. `/ui/frame` verifies the ticket again and serves
+///    the plugin's UI assets.
 ///
 /// # Errors
 /// - `403` scope check failed.
 /// - `404` no such installed plugin.
-async fn get_plugin_ui(
+async fn post_plugin_ui_session(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
-) -> Result<Response, PluginUiError> {
+) -> Result<Json<UiSessionBody>, PluginUiError> {
     require_scope(&actor, PLUGINS_UI)?;
-    if state.engine.installed_plugins().get(&plugin_id).is_none() {
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
         return Err(PluginUiError::NotFound);
-    }
+    };
     let secret = state.engine.ui_ticket_secret();
-    let ticket = ui_ticket::issue(&secret, &plugin_id, std::time::SystemTime::now());
-    // C6: percent-encode the plugin_id AND the ticket into
-    // both the URL src attribute and the JS string literal
-    // — the manifest validator restricts `plugin_id` to
-    // reverse-DNS chars, but defence-in-depth: a future
-    // relaxation or a hand-crafted registry row shouldn't
-    // let a plugin_id smuggle HTML / URL syntax through the
-    // template. Ticket contains `~` and hex, both URL-safe
-    // but percent-encoding avoids relying on that.
+    let now = std::time::SystemTime::now();
+    let ticket = ui_ticket::issue(&secret, &plugin_id, &installed.installation_uuid, now);
+    let url = format!(
+        "/api/v1/plugins/{}/ui?tk={}",
+        percent_encode_path_segment(&plugin_id),
+        percent_encode_query_value(&ticket),
+    );
+    let expires_ms = now
+        .checked_add(ui_ticket::TICKET_TTL)
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    Ok(Json(UiSessionBody { url, expires_ms }))
+}
+
+#[derive(Serialize)]
+struct UiSessionBody {
+    /// Ticketed URL the dashboard hands to the browser as
+    /// an iframe `src` (or `window.open` argument).
+    url: String,
+    /// Absolute Unix-epoch expiry (milliseconds) — clients
+    /// can pre-emptively refresh before this deadline.
+    expires_ms: u64,
+}
+
+/// C6 round-2 finding 1: `GET /api/v1/plugins/{plugin_id}/ui`
+/// — sandboxed-iframe wrapper page. Ticket-gated (no
+/// bearer possible from a browser document navigation),
+/// verifies `?tk=…` against the per-process secret and the
+/// current installation's UUID. The wrapper embeds the
+/// same ticket into an inner `<iframe sandbox>` targeting
+/// the frame endpoint; the sandbox list omits
+/// `allow-same-origin` so the browser assigns each iframe
+/// a fresh opaque origin — distinct from the daemon's and
+/// from every other plugin's iframe.
+///
+/// The wrapper's inline broker JS creates a fresh
+/// `MessageChannel` per iframe and transfers `port2` on
+/// the `oxidhome:init` handshake. All subsequent host↔
+/// plugin IPC flows on that port — an origin-based
+/// `postMessage` filter would be wrong here (opaque-origin
+/// senders all report `origin: "null"`), and per-port
+/// binding makes cross-plugin dispatch impossible by
+/// construction.
+///
+/// CSP: `default-src 'none'; frame-src 'self'; script-src
+/// 'unsafe-inline'` — inline broker JS is host-controlled,
+/// nothing else can load.
+///
+/// # Errors
+/// - `400` ticket missing or malformed.
+/// - `401` ticket well-formed but expired.
+/// - `404` no such installed plugin, or the ticket is
+///   bound to a different `plugin_id` / `installation_uuid`
+///   (round-2 finding 2 — an uninstall + reinstall race
+///   under the same id fails closed here).
+async fn get_plugin_ui(
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+    Query(params): Query<TicketParams>,
+) -> Result<Response, PluginUiError> {
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginUiError::NotFound);
+    };
+    let Some(ticket_raw) = params.tk else {
+        return Err(PluginUiError::TicketBad);
+    };
+    let secret = state.engine.ui_ticket_secret();
+    match ui_ticket::verify(
+        &secret,
+        &ticket_raw,
+        &plugin_id,
+        &installed.installation_uuid,
+        std::time::SystemTime::now(),
+    ) {
+        Ok(()) => {}
+        Err(ui_ticket::TicketError::Bad) => return Err(PluginUiError::TicketBad),
+        Err(ui_ticket::TicketError::Expired) => return Err(PluginUiError::TicketExpired),
+        Err(ui_ticket::TicketError::WrongPlugin) => return Err(PluginUiError::NotFound),
+    }
+    // Percent-encode `plugin_id` and the ticket into both
+    // the URL src attribute and the JS string literal.
+    // Manifest validator restricts `plugin_id` to
+    // reverse-DNS today, but a future relaxation shouldn't
+    // let a `plugin_id` smuggle HTML / URL syntax through
+    // the template. Ticket contains `~` and hex, both
+    // URL-safe, but percent-encoding avoids relying on that.
     let src = format!(
         "/api/v1/plugins/{}/ui/frame?tk={}",
         percent_encode_path_segment(&plugin_id),
-        percent_encode_query_value(&ticket),
+        percent_encode_query_value(&ticket_raw),
     );
     let body = format!(
         r#"<!DOCTYPE html>
@@ -1753,32 +1834,32 @@ async fn get_plugin_ui(
 }
 
 /// C6: iframe destination. Loaded by the wrapper page above
-/// as a sandboxed subresource → the browser does NOT
-/// propagate the parent's `Authorization` header, so this
-/// endpoint sits *outside* the bearer middleware and
-/// authenticates via the ticket in `?tk=…` instead. The
-/// ticket is bound to this route's `plugin_id` path
-/// segment, so a ticket minted for plugin A can't unlock
-/// plugin B's frame.
+/// as a sandboxed subresource → browsers don't propagate
+/// the parent's `Authorization` header, so authentication
+/// is via the same HMAC ticket in `?tk=…`. Round-2
+/// finding 2: verifies the ticket's baked-in
+/// `installation_uuid` against the current registry entry
+/// so an uninstall + reinstall under the same
+/// `plugin_id` doesn't let an old ticket authorise the
+/// replacement package.
 ///
 /// Stub in the first cut — real UI assets land in Phase 13.
-/// Returns `501 Not Implemented` with strict headers so the
-/// shape is inherited when content lands.
 ///
 /// # Errors
 /// - `400` ticket missing or malformed.
-/// - `401` ticket well-formed but expired (client should
-///   re-fetch `/ui` to mint a fresh one).
-/// - `404` unknown plugin OR ticket bound to a different
-///   plugin (indistinguishable, avoids an enumeration
-///   oracle).
+/// - `401` ticket well-formed but expired.
+/// - `404` unknown plugin, or ticket bound to a different
+///   `plugin_id` / `installation_uuid`.
 /// - `501` plugin exists + ticket valid; UI assets not yet
 ///   implemented.
 async fn get_plugin_ui_frame(
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
-    Query(params): Query<FrameParams>,
+    Query(params): Query<TicketParams>,
 ) -> Result<Response, PluginUiError> {
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginUiError::NotFound);
+    };
     let Some(ticket_raw) = params.tk else {
         return Err(PluginUiError::TicketBad);
     };
@@ -1787,15 +1868,13 @@ async fn get_plugin_ui_frame(
         &secret,
         &ticket_raw,
         &plugin_id,
+        &installed.installation_uuid,
         std::time::SystemTime::now(),
     ) {
         Ok(()) => {}
         Err(ui_ticket::TicketError::Bad) => return Err(PluginUiError::TicketBad),
         Err(ui_ticket::TicketError::Expired) => return Err(PluginUiError::TicketExpired),
         Err(ui_ticket::TicketError::WrongPlugin) => return Err(PluginUiError::NotFound),
-    }
-    if state.engine.installed_plugins().get(&plugin_id).is_none() {
-        return Err(PluginUiError::NotFound);
     }
     let mut response = (
         StatusCode::NOT_IMPLEMENTED,
@@ -1823,8 +1902,9 @@ async fn get_plugin_ui_frame(
 }
 
 #[derive(Deserialize)]
-struct FrameParams {
-    /// C6: opaque ticket minted by the `/ui` handler. Required.
+struct TicketParams {
+    /// C6: opaque ticket minted by `POST /ui-session`.
+    /// Required by `/ui` and `/ui/frame`.
     #[serde(default)]
     tk: Option<String>,
 }
