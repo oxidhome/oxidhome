@@ -53,15 +53,21 @@ const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 /// a well-behaved plugin's `shutdown` handler to run;
 /// short enough that a hung plugin doesn't wedge the
 /// daemon indefinitely. A timed-out stop is logged; the
-/// subsequent drain skips its reaper (the tokio runtime
-/// teardown aborts it, matching the pre-fix behaviour
-/// for those cases only).
+/// subsequent drain (round-3 F1 + round-5 F1) then aborts
+/// the corresponding reaper task, awaits it via a bounded
+/// fallback, and performs equivalent cleanup itself if the
+/// reaper's synchronous cleanup step is still running —
+/// so no supervised instance is stranded past shutdown.
 const SHUTDOWN_STOP_PER_INSTANCE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Round-3 F1: bounded reaper-drain deadline for daemon
-/// shutdown. Ensures a supervisor that ignored its `stop`
-/// request can't wedge process exit — after this deadline
-/// the drain aborts any straggler reapers and returns.
+/// Round-3 F1 + round-5 F1: bounded reaper-drain deadline
+/// for daemon shutdown. If the primary deadline elapses,
+/// the drain aborts the real reaper tasks, waits a short
+/// fallback for the aborts to propagate, and — for any
+/// reaper still stuck in synchronous cleanup — performs
+/// the equivalent cleanup itself (device / service
+/// eviction, device-state stale-mark, `instances.unregister`)
+/// so the singleton / `instance_id` slots aren't stranded.
 /// Independent from `SHUTDOWN_STOP_PER_INSTANCE_DEADLINE`
 /// because reaper work runs AFTER each supervisor reaches
 /// a terminal state and does its own bounded FS / SQL

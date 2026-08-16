@@ -812,7 +812,7 @@ impl Engine {
     /// settled engine.
     pub async fn drain_supervised_instances(&self) {
         let handles = self.take_reaper_handles();
-        for jh in handles {
+        for (_id, jh) in handles {
             let _ = jh.await;
         }
     }
@@ -840,70 +840,123 @@ impl Engine {
         }
         // Round-4 F1: capture each REAL reaper's
         // `AbortHandle` before moving the `JoinHandle` into
-        // the wrapper task. The wrapper is what the
-        // `JoinSet` polls; calling `js.abort_all()` would
-        // otherwise only abort the wrapper tasks — dropping
-        // the enclosed real `JoinHandle` just detaches the
-        // real reaper, leaving it running past the
-        // "aborted" return and violating the method
-        // contract. Keeping the abort handles alive here
-        // lets us actually cancel the reapers on timeout.
-        let abort_handles: Vec<tokio::task::AbortHandle> = handles
-            .iter()
-            .map(tokio::task::JoinHandle::abort_handle)
-            .collect();
-        // Race the whole drain against a single deadline
-        // sleep so total wall-clock is bounded regardless
-        // of how many reapers are outstanding.
+        // the wrapper task. Without this, `js.abort_all()`
+        // would abort only the wrappers and dropping the
+        // enclosed real `JoinHandle` would just detach the
+        // real reaper.
+        //
+        // Round-5 F2: keep the wrappers ALIVE after
+        // aborting the real reapers so the drain waits for
+        // each reaper task to actually end — either by
+        // observing cancellation at its next await, or by
+        // running remaining synchronous cleanup to
+        // completion (tokio abort is cooperative and can't
+        // interrupt sync work between await points).
+        // Pre-fix, `js.abort_all()` right after abort
+        // cancelled the wrappers immediately; we never
+        // learned whether the reapers had wound down.
+        let instance_ids: Vec<Arc<str>> = handles.iter().map(|(k, _)| Arc::clone(k)).collect();
+        let abort_handles: Vec<tokio::task::AbortHandle> =
+            handles.iter().map(|(_, jh)| jh.abort_handle()).collect();
         let mut js = tokio::task::JoinSet::new();
-        for jh in handles {
+        for (_, jh) in handles {
             js.spawn(async move {
                 let _ = jh.await;
             });
         }
+        // Phase 1: give reapers up to `deadline` to complete
+        // naturally.
         let result =
             tokio::time::timeout(deadline, async { while js.join_next().await.is_some() {} }).await;
         if result.is_ok() {
-            Ok(())
-        } else {
-            let remaining = js.len();
-            // Abort the REAL reapers first (round-4 F1) so
-            // they actually stop executing, then wait for
-            // the wrappers to observe the aborts. Without
-            // the first step, the wrappers' `jh.await`
-            // would surface a `JoinError::Cancelled` only
-            // when the underlying task truly stops, which
-            // for a wedged reaper is never.
-            for ah in &abort_handles {
-                ah.abort();
+            return Ok(());
+        }
+        let remaining_at_deadline = js.len();
+
+        // Phase 2: abort the real reapers; keep wrappers
+        // alive to observe termination. Bounded fallback
+        // so a reaper mid-sync-cleanup (which abort can't
+        // interrupt) still doesn't wedge the drain.
+        for ah in &abort_handles {
+            ah.abort();
+        }
+        let fallback = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while js.join_next().await.is_some() {}
+        })
+        .await;
+
+        if fallback.is_err() {
+            // Round-5 F1: reapers are stuck in synchronous
+            // cleanup we can't interrupt. Do the
+            // equivalent cleanup ourselves for every
+            // drained instance — otherwise an aborted
+            // reaper's `registry.unregister` never runs
+            // and the instance_id / singleton slot are
+            // stranded forever. Idempotent — if a racing
+            // reaper reaches the same step first, the
+            // second call is a no-op.
+            for id in &instance_ids {
+                self.reap_instance_state(id);
             }
             js.abort_all();
-            // Drain the wrappers post-abort so the JoinSet
-            // is empty on return — otherwise dropping it
-            // would detach every remaining wrapper task
-            // and lose the visible-cleanup guarantee. This
-            // await is bounded by the wrapper's `jh.await`
-            // returning a `JoinError::Cancelled` promptly
-            // once the real reaper's abort takes effect.
             while js.join_next().await.is_some() {}
             tracing::warn!(
-                remaining,
+                remaining = remaining_at_deadline,
                 deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-                "reaper drain deadline exceeded; aborted stragglers",
+                "reaper drain deadline + 500ms fallback both exceeded; performed equivalent cleanup and detached wrapper stragglers",
             );
-            Err(remaining)
+        } else {
+            // Round-5 F1: even in the happy fallback path,
+            // an aborted reaper task doesn't unregister the
+            // instance_id. Perform the equivalent cleanup
+            // so a long-lived Engine doesn't strand
+            // singleton / instance_id slots forever.
+            for id in &instance_ids {
+                self.reap_instance_state(id);
+            }
+            tracing::warn!(
+                remaining = remaining_at_deadline,
+                deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                "reaper drain deadline exceeded; real reapers aborted and equivalent cleanup performed",
+            );
+        }
+        Err(remaining_at_deadline)
+    }
+
+    /// Round-5 F1: emergency equivalent-cleanup for one
+    /// instance whose reaper task the bounded drain had
+    /// to abort. Runs the same side effects the reaper's
+    /// task body would have — evict device / service
+    /// registrations, flip the device-state stale marker,
+    /// clear the instance-registry entry (and its
+    /// singleton slot). All idempotent — safe to run
+    /// alongside a racing reaper that hasn't yet reached
+    /// its own cleanup step.
+    fn reap_instance_state(&self, instance_id: &Arc<str>) {
+        self.devices.remove_by_owner(instance_id);
+        self.services.remove_by_owner(instance_id);
+        self.device_state.mark_instance_stale(instance_id);
+        // `unregister` needs the plugin_id to also clear
+        // the singleton slot. If the entry is already gone
+        // (racing reaper won), this is a no-op.
+        if let Some(handle) = self.instances.get(instance_id) {
+            let plugin_id = handle.plugin_id().to_string();
+            self.instances.unregister(instance_id, &plugin_id);
         }
     }
 
     /// Round-3 F1 helper: atomically drain the reaper map
     /// under the sync mutex so the caller can await the
-    /// snapshot outside the lock.
-    fn take_reaper_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
+    /// snapshot outside the lock. Round-5 F1: returns
+    /// `(instance_id, JoinHandle)` pairs so the timeout
+    /// fallback can perform equivalent per-instance
+    /// cleanup.
+    fn take_reaper_handles(&self) -> Vec<(Arc<str>, tokio::task::JoinHandle<()>)> {
         let mut guard = self
             .reapers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.drain().map(|(_, (_gen, jh))| jh).collect()
+        guard.drain().map(|(k, (_gen, jh))| (k, jh)).collect()
     }
 
     /// Round-2 F1: request every supervised instance to
