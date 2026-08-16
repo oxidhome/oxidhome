@@ -1053,15 +1053,49 @@ impl InstalledPluginRegistry {
                     reason = %reason,
                     "skipping installed dir with invalid UI package — deferring orphan-live-row sweep this boot",
                 );
-                if let Some(live) = live_rows.get(&manifest_id) {
+                // Round-4 F1 + round-7 F1: preserve the real
+                // UUID by looking up in BOTH `live_rows` and
+                // `quarantined_uuids`. A SQL row whose
+                // `granted_capabilities_json` is malformed or
+                // whose `content_digest` is NULL sits in
+                // `quarantined_uuids` (fail-closed per C5
+                // F1/F3) — not `live_rows` — and if the
+                // matching directory name differs from
+                // `manifest.plugin.id` (aliased-dir case), the
+                // pre-populated quarantine slot's path list is
+                // empty. Pre-fix we returned early here after
+                // consulting only `live_rows`, so the
+                // aliased-invalid-UI directory never got
+                // recorded; `uninstall` then tombstoned the
+                // SQL row but left the dir on disk, and an
+                // operator repair backfilled a fresh UUID off
+                // it — the H8 identity-reactivation shape.
+                let uuid = live_rows
+                    .get(&manifest_id)
+                    .map(|l| Arc::clone(&l.installation_uuid))
+                    .or_else(|| quarantined_uuids.get(&manifest_id).map(Arc::clone));
+                if let Some(uuid) = uuid {
                     let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
-                    quarantined_registry.insert(
-                        id_arc,
-                        QuarantineEntry {
-                            installation_uuid: Arc::clone(&live.installation_uuid),
-                            paths: vec![path.clone()],
-                        },
-                    );
+                    // Merge into the pre-populated slot (may
+                    // already carry paths from earlier
+                    // sibling dirs); don't overwrite.
+                    match quarantined_registry.get_mut(&id_arc) {
+                        Some(entry) => {
+                            entry.installation_uuid = uuid;
+                            if !entry.paths.contains(&path) {
+                                entry.paths.push(path.clone());
+                            }
+                        }
+                        None => {
+                            quarantined_registry.insert(
+                                id_arc,
+                                QuarantineEntry {
+                                    installation_uuid: uuid,
+                                    paths: vec![path.clone()],
+                                },
+                            );
+                        }
+                    }
                 }
                 defer_orphan_sweep = true;
                 continue;
@@ -3916,6 +3950,114 @@ widgets = ["ui/w0.js","ui/w1.js","ui/w2.js","ui/w3.js","ui/w4.js"]
             }
             other => panic!("expected BadManifest; got {other:?}"),
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-7 F1: a live SQL row with a malformed
+    /// grant lives only in `quarantined_uuids`, and its
+    /// installed directory may use a name that differs from
+    /// `manifest.plugin.id` (aliased-dir case — the scan
+    /// explicitly permits this). If that aliased directory
+    /// ALSO has invalid UI, the UI-failure branch must still
+    /// record the FS path against the quarantine entry so
+    /// `uninstall` yanks the directory alongside tombstoning
+    /// the SQL row. Pre-fix, that branch consulted only
+    /// `live_rows`; the aliased dir's path was never
+    /// recorded, `uninstall` reported success while the
+    /// directory stayed on disk, and an operator repair then
+    /// backfilled a fresh UUID from the leftover.
+    #[test]
+    fn scan_records_aliased_invalid_ui_dir_for_quarantined_uuid_rows() {
+        let root = tempdir("aliased-invalid-ui-with-malformed-grant");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+        let db = fresh_db();
+
+        let plugin_id = "example.aliased-broken";
+        let alias_dir = "some-other-name";
+        let real_uuid = mint_installation_uuid();
+        // Persist a live row whose granted_capabilities_json
+        // is not valid JSON — load_live_installations routes
+        // it into `quarantined_uuids`.
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO plugin_installation
+                     (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms,
+                      granted_capabilities_json, content_digest)
+                 VALUES (?1, ?2, '0.1.0', 1, NULL, 'not-json', ?3)",
+                rusqlite::params![&*real_uuid, plugin_id, &"0".repeat(64)],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        // On-disk directory whose NAME differs from
+        // manifest.plugin.id and whose UI declaration
+        // references a schema file that doesn't exist —
+        // validate_ui_package fails here.
+        let d = plugins_root.join(alias_dir);
+        std::fs::create_dir_all(d.join("ui")).unwrap();
+        std::fs::write(
+            d.join("manifest.toml"),
+            format!(
+                r#"manifest_version = 1
+[plugin]
+id = "{plugin_id}"
+name = "Aliased Broken"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+[ui]
+config = "ui/config.js"
+config-schema = "ui/config.schema.json"
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(d.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        std::fs::write(d.join("ui/config.js"), b"export default {};").unwrap();
+        // Note: intentionally omit ui/config.schema.json so
+        // validate_ui_package returns Err on this dir.
+
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).expect("scan");
+        assert!(
+            reg.list().iter().all(|p| &*p.plugin_id != plugin_id),
+            "the id must not be indexed as live",
+        );
+        assert!(reg.is_quarantined(plugin_id), "the id must be quarantined",);
+
+        reg.uninstall(plugin_id).expect("uninstall");
+        assert!(
+            !plugins_root.join(alias_dir).exists(),
+            "round-7 F1: one uninstall must remove the aliased dir even though the SQL row was quarantined for a bad grant",
+        );
+
+        // And the real SQL row must be tombstoned so a
+        // subsequent install with the same plugin_id
+        // succeeds instead of hitting AlreadyInstalled.
+        let tombstoned: Option<i64> = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT uninstalled_ms
+                     FROM plugin_installation
+                     WHERE installation_uuid = ?1",
+                    [&*real_uuid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(
+            tombstoned.is_some(),
+            "the real row must be tombstoned by uninstall",
+        );
+
+        let source = write_plugin_dir(&root, plugin_id);
+        let installed = reg.install(&source).expect("reinstall must succeed");
+        assert_ne!(*installed.installation_uuid, *real_uuid);
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 
