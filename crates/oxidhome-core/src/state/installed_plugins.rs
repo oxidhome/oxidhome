@@ -271,32 +271,37 @@ pub fn recompute_installed_digest(
     Ok(content_digest(manifest_bytes, wasm_bytes, &frames))
 }
 
-/// Round-13 F1: scan-only digest recomputation that hashes
-/// **caller-provided** UI asset bytes rather than re-reading
-/// them from disk. Scan first runs `validate_ui_package`
-/// (which meta-validates the JSON-Schema files and returns
-/// the exact bytes it inspected); this helper then uses
-/// those same bytes for the digest. Pre-fix, scan called
-/// `read_installed_bytes` here — which re-reads the UI
-/// bytes internally WITHOUT meta-validating — so a
-/// schema swap between the validator's read and the
-/// digest's re-read would let scan persist a digest for
-/// an invalid schema and index it as live.
+/// Round-13 F1 + round-14 F1: scan-only digest recomputation
+/// that hashes **caller-provided** manifest AND UI asset
+/// bytes rather than re-reading them from disk. Scan first
+/// captures manifest bytes via
+/// [`read_manifest_sync_capturing_bytes`] (which parses
+/// from those exact bytes) and validates UI assets via
+/// `validate_ui_package` (which returns the exact bytes it
+/// meta-validated); this helper then hashes those same
+/// bytes plus a fresh wasm read.
+///
+/// Pre-fix, scan re-read `manifest.toml` here — so an
+/// atomic replacement between the parse-time read and this
+/// digest-time read could persist a digest for the new
+/// manifest while storing the OLD manifest's `version` and
+/// grant, silently binding metadata and authorization to
+/// different snapshots.
 ///
 /// # Errors
 ///
-/// Any `std::io::Error` from the manifest.toml / wasm
-/// reads. UI asset bytes are supplied by the caller, so
-/// there's no additional IO here for them.
+/// Any `std::io::Error` from the wasm read. Manifest and
+/// UI asset bytes are supplied by the caller, so there's
+/// no additional IO here for them.
 pub(crate) fn scan_digest_with_validated_ui(
     plugin_dir: &Path,
+    manifest_bytes: &[u8],
     runtime_wasm_rel: &Path,
     ui_assets: Option<&ValidatedUiAssets>,
 ) -> std::io::Result<String> {
-    let manifest_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join("manifest.toml"))?;
     let wasm_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join(runtime_wasm_rel))?;
     let frames = ui_assets.map(ui_asset_digest_frames).unwrap_or_default();
-    Ok(content_digest(&manifest_bytes, &wasm_bytes, &frames))
+    Ok(content_digest(manifest_bytes, &wasm_bytes, &frames))
 }
 
 /// Scan-time helper: quarantine a directory whose UI
@@ -316,11 +321,19 @@ fn handle_invalid_ui_dir(
     quarantined_uuids: &HashMap<String, Arc<str>>,
     quarantined_registry: &mut HashMap<Arc<str>, QuarantineEntry>,
 ) {
+    // Round-14 F2: the pre-round-11 log claimed this
+    // branch deferred the orphan sweep, but round-11 F1
+    // removed that defer (the id is already in
+    // `observed_manifest_ids`, so the sweep skips this
+    // specific id via `.contains_key` — unrelated rows
+    // still get tombstoned this boot). Wording updated to
+    // match the actual behaviour so the reconciliation
+    // log isn't materially misleading.
     tracing::warn!(
         plugin_id = %manifest_id,
         path = %path.display(),
         reason = %reason,
-        "skipping installed dir with invalid UI package — deferring orphan-live-row sweep this boot",
+        "skipping installed dir with invalid UI package — quarantining this id (unrelated orphan rows are still swept this boot)",
     );
     let uuid = live_rows
         .get(manifest_id)
@@ -961,8 +974,13 @@ impl InstalledPluginRegistry {
                 entry.paths.push(path.clone());
             }
             let manifest_path = path.join("manifest.toml");
-            let manifest = match read_manifest_sync(&manifest_path) {
-                Ok(m) => m,
+            // Round-14 F1: capture manifest bytes at the
+            // same read that yields the parsed manifest, so
+            // the digest computed downstream hashes the
+            // exact same snapshot that produced the row's
+            // `version`, grant, and runtime path.
+            let (manifest, manifest_bytes) = match read_manifest_sync_capturing_bytes(&path) {
+                Ok(pair) => pair,
                 Err(err) => {
                     tracing::warn!(
                         path = %manifest_path.display(),
@@ -1259,6 +1277,7 @@ impl InstalledPluginRegistry {
                 // authoritative digest.
                 match scan_digest_with_validated_ui(
                     &path,
+                    &manifest_bytes,
                     &manifest.runtime.wasm,
                     validated_ui_assets.as_ref(),
                 ) {
@@ -1320,6 +1339,7 @@ impl InstalledPluginRegistry {
                 // meta-validated.
                 let digest = match scan_digest_with_validated_ui(
                     &path,
+                    &manifest_bytes,
                     &manifest.runtime.wasm,
                     validated_ui_assets.as_ref(),
                 ) {
@@ -2412,6 +2432,37 @@ pub(crate) fn read_manifest_sync(path: &Path) -> anyhow::Result<PluginManifest> 
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     parse_manifest_bytes(&text, path)
+}
+
+/// Round-14 F1: bytes-capturing variant of
+/// [`read_manifest_sync`]. Reads via `read_no_follow_within`
+/// so the read is TOCTOU-safe against `manifest.toml`
+/// symlinks / FIFOs / etc., parses from those exact bytes,
+/// and returns both the parsed manifest AND the bytes.
+/// Scan uses this so the same manifest snapshot that
+/// yields the row's `version` / grant / runtime path also
+/// yields the content digest — pre-fix scan parsed via
+/// `read_manifest_sync` and then had `scan_digest_with_validated_ui`
+/// read `manifest.toml` a SECOND time, so an atomic
+/// replacement between the two reads could persist a
+/// digest for the new manifest while storing the old
+/// manifest's version and grant.
+///
+/// # Errors
+///
+/// Any IO error from the read, or a `BadManifest`-style
+/// anyhow error when parse / validation fails.
+pub(crate) fn read_manifest_sync_capturing_bytes(
+    plugin_dir: &Path,
+) -> anyhow::Result<(PluginManifest, Vec<u8>)> {
+    use anyhow::Context;
+    let manifest_path = plugin_dir.join("manifest.toml");
+    let bytes = read_no_follow_within(plugin_dir, &manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{} is not valid UTF-8", manifest_path.display()))?;
+    let manifest = parse_manifest_bytes(text, &manifest_path)?;
+    Ok((manifest, bytes))
 }
 
 fn parse_manifest_bytes(text: &str, path: &Path) -> anyhow::Result<PluginManifest> {
@@ -4501,6 +4552,58 @@ wasm = "plugin.wasm"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-14 F1: backfill's row metadata
+    /// (`version`, grant, runtime path) AND its persisted
+    /// digest come from the SAME manifest read. Asserts
+    /// that a backfilled row's declared `version` matches
+    /// what the persisted digest hashes — pre-fix the two
+    /// were read separately, so a manifest atomically
+    /// replaced between the parse-time and digest-time
+    /// reads could persist a mismatch. Post-fix the single
+    /// `read_manifest_sync_capturing_bytes` read supplies
+    /// both, making the property structural.
+    #[test]
+    fn scan_backfill_manifest_snapshot_matches_persisted_digest() {
+        let root = tempdir("backfill-snapshot-consistency");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+
+        let plugin_id = "example.snapshot";
+        let d = plugins_root.join(plugin_id);
+        std::fs::create_dir_all(&d).unwrap();
+        let manifest_bytes = format!(
+            r#"manifest_version = 1
+[plugin]
+id = "{plugin_id}"
+name = "Snapshot"
+version = "0.4.2"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+        )
+        .into_bytes();
+        std::fs::write(d.join("manifest.toml"), &manifest_bytes).unwrap();
+        let wasm_bytes = b"\0asm\x01\x00\x00\x00".to_vec();
+        std::fs::write(d.join("plugin.wasm"), &wasm_bytes).unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root, fresh_db()).expect("scan");
+        let backfilled = reg
+            .list()
+            .into_iter()
+            .find(|p| &*p.plugin_id == plugin_id)
+            .expect("backfill must index the id");
+
+        // The row's version came from the manifest read; the
+        // digest was computed from bytes captured on that
+        // same read. Recompute the digest from the exact
+        // bytes we wrote and assert equality.
+        let expected = content_digest(&manifest_bytes, &wasm_bytes, &[]);
+        assert_eq!(*backfilled.content_digest, expected);
+        assert_eq!(backfilled.version, "0.4.2");
     }
 
     /// Phase 13 round-13 F1: backfill's digest comes from
