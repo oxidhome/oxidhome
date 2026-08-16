@@ -55,11 +55,19 @@ pub struct Dashboard {
     /// dashboard picker. Not unique — two dashboards can
     /// share a name (they're addressed by `id`).
     pub name: String,
-    /// Phase 12 actor id of the operator who created this
-    /// dashboard. v1 is single-role "admin" so every row
-    /// carries the admin actor's id; the column exists so
-    /// the multi-user follow-up can route by owner
-    /// without a migration.
+    /// Owner-user id for row-level ownership. v1 is
+    /// single-role: every row carries the stable string
+    /// `"admin"` (see `DASHBOARD_ADMIN_OWNER` in
+    /// `oxidhome-core::api::server`). It is deliberately
+    /// **not** the Phase 12 `Actor::id()` — that returns
+    /// a per-token id that rotates when the operator
+    /// mints a new token, which would silo dashboards
+    /// per-token and strand rows on rotation (Phase 13
+    /// round-2 F2). The multi-user follow-up replaces
+    /// the constant with the real session identity, and
+    /// the migration is one statement:
+    /// `UPDATE dashboard SET owner_user_id = <real id>
+    /// WHERE owner_user_id = 'admin'`.
     pub owner_user_id: String,
     /// Opaque bytes — the shell's serialized layout tree.
     /// The host doesn't parse it; the shell's own

@@ -121,23 +121,38 @@ pub struct InstalledPlugin {
     pub content_digest: Arc<str>,
 }
 
-/// C5 review F3 + round-4 F2: compute a stable content digest
-/// binding a plugin's `manifest.toml` bytes and the component's
-/// wasm bytes. Install captures this over the staged package
+/// C5 review F3 + round-4 F2 + Phase 13 round-3 F2: compute a
+/// stable content digest binding a plugin's `manifest.toml`
+/// bytes, its component's wasm bytes, **and** every declared UI
+/// asset's bytes. Install captures this over the staged package
 /// (in-memory bytes); the loader recomputes it from the exact
 /// bytes it reads into memory for parse + instantiate, so there
 /// is no TOCTOU window between the digest walk and the bytes
-/// wasmtime actually executes.
+/// wasmtime actually executes; the boot scan does the same, so
+/// a post-install swap of a UI asset flips the stored digest
+/// and quarantines the row until the operator reinstalls.
 ///
 /// Format: SHA-256 with a domain-separation tag + `u32`
-/// length-prefix framing over `(manifest_bytes, wasm_bytes)`.
-/// Assets under the plugin dir are intentionally excluded — they
-/// aren't executed and can drift without affecting the grant
-/// boundary; only manifest + component determine what runs.
+/// length-prefix framing over `(manifest_bytes, wasm_bytes,
+/// [(field_label, bytes), …])`. `ui_assets` MUST arrive in the
+/// canonical order [`validate_ui_package`] returns them; that
+/// ordering is what pins the digest across the install / scan
+/// pair. A plugin with no `[ui]` section passes an empty slice
+/// and the digest reduces to the pre-Phase-13 tag-bumped form.
+///
+/// Tag v3 (was v2) — pre-Phase-13 installs' stored digests will
+/// no longer verify after this bump; the C5 fail-closed path
+/// quarantines those rows on the next scan, and the operator
+/// resolves by `uninstall` + `install` (a well-documented
+/// route that already handles grant-shape drift).
 #[must_use]
-pub fn content_digest(manifest_bytes: &[u8], wasm_bytes: &[u8]) -> String {
+pub fn content_digest(
+    manifest_bytes: &[u8],
+    wasm_bytes: &[u8],
+    ui_assets: &[(&str, &[u8])],
+) -> String {
     let mut hasher = Sha256::new();
-    let tag = b"oxidhome:plugin-content:v2";
+    let tag = b"oxidhome:plugin-content:v3";
     #[allow(clippy::cast_possible_truncation)]
     hasher.update((tag.len() as u32).to_be_bytes());
     hasher.update(tag);
@@ -147,6 +162,20 @@ pub fn content_digest(manifest_bytes: &[u8], wasm_bytes: &[u8]) -> String {
     #[allow(clippy::cast_possible_truncation)]
     hasher.update((wasm_bytes.len() as u32).to_be_bytes());
     hasher.update(wasm_bytes);
+    // UI asset frame: length-prefix the ASSET COUNT so a plugin
+    // going from zero → one declared asset can't accidentally
+    // collide with the pre-declaration digest.
+    #[allow(clippy::cast_possible_truncation)]
+    hasher.update((ui_assets.len() as u32).to_be_bytes());
+    for (label, bytes) in ui_assets {
+        let label_bytes = label.as_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        hasher.update((label_bytes.len() as u32).to_be_bytes());
+        hasher.update(label_bytes);
+        #[allow(clippy::cast_possible_truncation)]
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for byte in &digest {
@@ -156,28 +185,90 @@ pub fn content_digest(manifest_bytes: &[u8], wasm_bytes: &[u8]) -> String {
     hex
 }
 
-/// Read the manifest.toml and referenced wasm bytes from an
-/// installed plugin dir into memory, returning them alongside the
-/// computed digest. The caller controls what happens with the
-/// bytes — the loader uses them to instantiate wasmtime directly
-/// so hash + parse + compile are all bound to the same in-memory
-/// snapshot (C5 review F3 codex round-4 F2 TOCTOU fix).
+/// Read the manifest.toml, referenced wasm bytes, and every
+/// declared UI asset from an installed plugin dir into memory,
+/// returning them alongside the computed digest. The caller
+/// controls what happens with the bytes — the loader uses them
+/// to instantiate wasmtime directly so hash + parse + compile
+/// are all bound to the same in-memory snapshot (C5 review F3
+/// codex round-4 F2 TOCTOU fix); Phase 13 round-3 F2 extends
+/// the same guarantee to UI assets, which now execute in the
+/// sandboxed frame.
 ///
-/// `runtime_wasm_rel` is the manifest's `[runtime].wasm` relative
-/// path (already validated to live under `plugin_dir` by
-/// `resolve_wasm_path` at load time; scan re-does the join).
+/// `runtime_wasm_rel` is the manifest's `[runtime].wasm`
+/// relative path (already validated to live under `plugin_dir`
+/// by `resolve_wasm_path` at load time; scan re-does the join).
+/// `ui` is the manifest's `[ui]` section (or `None` for plugins
+/// that don't ship UI); [`read_declared_ui_asset_bytes`] reads
+/// them via the same `read_no_follow_within` used for
+/// manifest / wasm so a mid-scan asset swap can't smuggle
+/// unhashed bytes past the digest.
 ///
 /// # Errors
 ///
-/// Any `std::io::Error` from the two file reads.
+/// Any `std::io::Error` from the file reads, or an
+/// `InvalidInput` error carrying a UI-asset diagnostic when
+/// [`read_declared_ui_asset_bytes`] rejects a declared entry.
 pub fn read_installed_bytes(
     plugin_dir: &Path,
     runtime_wasm_rel: &Path,
+    ui: Option<&oxidhome_manifest::UiSection>,
 ) -> std::io::Result<(String, Vec<u8>, Vec<u8>)> {
     let manifest_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join("manifest.toml"))?;
     let wasm_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join(runtime_wasm_rel))?;
-    let digest = content_digest(&manifest_bytes, &wasm_bytes);
+    let ui_assets = if let Some(ui) = ui {
+        Some(
+            read_declared_ui_asset_bytes(ui, plugin_dir)
+                .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?,
+        )
+    } else {
+        None
+    };
+    let frames = ui_assets
+        .as_ref()
+        .map(ui_asset_digest_frames)
+        .unwrap_or_default();
+    let digest = content_digest(&manifest_bytes, &wasm_bytes, &frames);
     Ok((digest, manifest_bytes, wasm_bytes))
+}
+
+/// Loader-side digest recomputation (`runtime::instance`):
+/// hashes the in-memory `manifest_bytes` + `wasm_bytes` the
+/// loader already read (closing the TOCTOU window on manifest
+/// / wasm), plus every declared UI asset read fresh from
+/// `plugin_dir`. Returns the same string install /
+/// `read_installed_bytes` produced for the same on-disk state.
+///
+/// Reading UI assets here rather than passing them in from
+/// the caller keeps the loader's public signature stable and
+/// centralises the "canonical UI asset order → digest frame"
+/// mapping in one place; a mismatch means either the UI
+/// bytes were swapped post-install (round-3 F2) or the
+/// manifest / wasm bytes were (C5 F3).
+///
+/// # Errors
+///
+/// Returns the same `String` diagnostics
+/// [`read_declared_ui_asset_bytes`] produces when a declared
+/// UI asset is missing / unreadable / not a regular file.
+/// Wrapped by the caller into the loader's `anyhow::Error`
+/// with the standard "content digest mismatch" refusal
+/// message when appropriate.
+pub fn recompute_installed_digest(
+    plugin_dir: &Path,
+    manifest: &PluginManifest,
+    manifest_bytes: &[u8],
+    wasm_bytes: &[u8],
+) -> Result<String, String> {
+    let ui_assets = match manifest.ui.as_ref() {
+        Some(ui) => Some(read_declared_ui_asset_bytes(ui, plugin_dir)?),
+        None => None,
+    };
+    let frames = ui_assets
+        .as_ref()
+        .map(ui_asset_digest_frames)
+        .unwrap_or_default();
+    Ok(content_digest(manifest_bytes, wasm_bytes, &frames))
 }
 
 /// Read `path` into a `Vec<u8>` after refusing to follow a
@@ -747,6 +838,28 @@ impl InstalledPluginRegistry {
                     "installed dir name disagrees with manifest plugin.id; indexing by manifest id",
                 );
             }
+            // Phase 13 round-3 F2: run the same UI-package
+            // validator install runs, so a declared UI asset
+            // that was deleted (or a config-schema whose JSON
+            // was corrupted) after install doesn't re-appear
+            // as an indexed live plugin after a restart. On
+            // failure, defer the orphan sweep and skip
+            // indexing — the operator sees the tracing::warn
+            // and resolves via uninstall + reinstall. We do
+            // NOT tombstone here: identity stays intact so
+            // a fix + restart re-indexes cleanly.
+            if let Some(ui) = manifest.ui.as_ref()
+                && let Err(reason) = validate_ui_package(ui, &path)
+            {
+                tracing::warn!(
+                    plugin_id = %manifest_id,
+                    path = %path.display(),
+                    reason = %reason,
+                    "skipping installed dir with invalid UI package — deferring orphan-live-row sweep this boot",
+                );
+                defer_orphan_sweep = true;
+                continue;
+            }
             // Follow-up review H8: reject/quarantine duplicate
             // manifest ids. If we've already seen a dir declaring
             // this `plugin_id`, both dirs are ambiguous — the
@@ -893,7 +1006,11 @@ impl InstalledPluginRegistry {
                 // fresh content digest, matching what the
                 // API's `install` would have done.
                 let uuid = mint_installation_uuid();
-                let digest = match read_installed_bytes(&path, &manifest.runtime.wasm) {
+                let digest = match read_installed_bytes(
+                    &path,
+                    &manifest.runtime.wasm,
+                    manifest.ui.as_ref(),
+                ) {
                     Ok((d, _, _)) => Arc::<str>::from(d),
                     Err(err) => {
                         tracing::error!(
@@ -1183,38 +1300,50 @@ impl InstalledPluginRegistry {
             });
         }
 
-        // Phase 13 round-2 finding 5: verify every UI
-        // asset path declared in `[ui]` resolves to a
-        // regular file in the staged tree. `validate.rs`
-        // in `oxidhome-manifest` catches shape / escape
-        // problems on the paths themselves, but only a
-        // package-aware check catches "this manifest
-        // declares `ui/config.js` and the file simply
-        // isn't there" — an installation that promises a
-        // declarative renderer surface and can't deliver.
-        if let Some(ui) = staged_manifest.ui.as_ref()
-            && let Err(reason) = check_ui_assets_present(ui, &staging)
-        {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(InstallError::BadManifest {
-                path: staged_manifest_path,
-                reason,
-            });
-        }
+        // Phase 13 round-2 F5 + round-3 F1/F2: package-aware
+        // UI validation over the staged tree.
+        // `validate_ui_package` verifies every declared asset
+        // exists as a regular file (F5), meta-validates the
+        // JSON-Schema files as draft 2020-12 (round-3 F1),
+        // and returns the exact bytes we feed to the digest
+        // below (round-3 F2) — install and boot-scan agree
+        // byte-for-byte because both compute the digest from
+        // this same reader.
+        let staged_ui_assets = match staged_manifest.ui.as_ref() {
+            Some(ui) => match validate_ui_package(ui, &staging) {
+                Ok(assets) => Some(assets),
+                Err(reason) => {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(InstallError::BadManifest {
+                        path: staged_manifest_path,
+                        reason,
+                    });
+                }
+            },
+            None => None,
+        };
 
-        // C5 review F3 + round-4 F2: compute the content digest
-        // over the staged package's `manifest.toml` + wasm bytes
-        // (post-copy, before rename). The loader recomputes from
-        // the SAME in-memory bytes it uses to instantiate
-        // wasmtime, so a mid-load rewrite of the on-disk files
-        // can't slip past the digest check.
-        let staged_digest = match read_installed_bytes(&staging, &staged_manifest.runtime.wasm) {
+        // C5 review F3 + round-4 F2 + round-3 F2: compute the
+        // content digest over the staged package's
+        // `manifest.toml` + wasm bytes + declared UI assets.
+        // The loader recomputes from the SAME in-memory bytes
+        // it uses to instantiate wasmtime; the boot scan
+        // recomputes over the same on-disk tree, so a mid-load
+        // or post-install rewrite of the manifest, wasm, OR
+        // declared UI assets flips the digest and quarantines
+        // the row.
+        let staged_digest = match read_installed_bytes(
+            &staging,
+            &staged_manifest.runtime.wasm,
+            staged_manifest.ui.as_ref(),
+        ) {
             Ok((d, _, _)) => d,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&staging);
                 return Err(InstallError::Io(err));
             }
         };
+        drop(staged_ui_assets); // bytes-only inspection; digest is authoritative
 
         let row = InstalledPlugin {
             plugin_id: Arc::clone(&id_arc),
@@ -1678,53 +1807,178 @@ fn load_live_installation_uuid_for(
 /// Validates the manifest schema via `oxidhome_manifest::validate`
 /// before returning — a malformed manifest is rejected at install
 /// time so a `start` call later doesn't surface the same error.
-/// Phase 13 round-2 finding 5: verify every UI asset
-/// path declared in `[ui]` exists as a regular file
-/// under `base_dir`. Called from `install` on the staged
-/// package (i.e. the exact tree that becomes live), so
-/// an installation missing a declared config-schema or
-/// widget bundle is refused with a specific reason.
+/// Phase 13 round-3 F2: bytes of every declared UI asset,
+/// in the canonical order the digest hashes them. Returned
+/// by [`validate_ui_package`] so the caller can feed the
+/// same bytes it validated into [`content_digest`] — install
+/// and boot-scan see the identical byte-for-byte snapshot,
+/// so a post-install swap of `ui/config.js` (which now
+/// **does** execute in the sandboxed frame, unlike the pre-
+/// C6 assumption) flips the stored digest on the next scan.
+pub(crate) struct ValidatedUiAssets {
+    /// `(field_label, bytes)` in the canonical order.
+    /// `field_label` doubles as the digest-input tag so
+    /// two different fields pointing at the same file
+    /// contribute distinct bytes to the digest — that
+    /// stops a rename-only refactor from silently matching
+    /// a pre-refactor digest.
+    pub(crate) items: Vec<(&'static str, Vec<u8>)>,
+    /// Same items but keyed by owned label — used for
+    /// per-widget entries that share the `widgets[N]` tag
+    /// but have per-N distinct owned strings.
+    pub(crate) widgets: Vec<(String, Vec<u8>)>,
+}
+
+/// Phase 13 round-3 F1+F2: single validator run by both
+/// install (on the staged tree) **and** boot-scan (on the
+/// installed tree). Two callers, one shape — so an asset
+/// that was accepted at install and later mutated on disk
+/// isn't silently indexed as live by the next scan.
 ///
-/// The manifest validator already enforces that each
-/// path is relative and doesn't escape via `.` / `..` /
-/// leading `/`, so `base_dir.join(path)` is safe to use.
+/// Runs three checks per declared `[ui]` entry:
+///
+/// - Round-2 F5: file exists as a regular file under
+///   `base_dir` (no directories, no FIFOs, no symlinks
+///   through [`read_no_follow_within`]).
+/// - Round-3 F1: JSON-Schema files (`config-schema`,
+///   `commands-schema`) compile as JSON Schema draft
+///   2020-12. Malformed JSON, JavaScript-looking
+///   payloads, or JSON whose structure isn't a valid
+///   Draft 2020-12 schema all fail here — pre-fix the
+///   manifest validator only checked path shape, so a
+///   `config-schema = "commands.js"` typo shipped garbage
+///   to the UI serving path.
+/// - Round-3 F2: returns the exact bytes the caller can
+///   feed to `content_digest`. Install and scan compute
+///   the same digest for the same on-disk tree; any
+///   post-install mutation of a declared UI asset
+///   invalidates the C5 grant boundary on next scan the
+///   same way a `manifest.toml` mutation does.
+///
+/// The manifest validator already enforces that each path
+/// is relative and doesn't escape via `.` / `..` / leading
+/// `/`, so `base_dir.join(path)` is safe to use.
+///
+/// # Errors
+///
 /// Returns an error message suitable for
-/// `InstallError::BadManifest.reason`.
-fn check_ui_assets_present(
+/// `InstallError::BadManifest.reason` on any of:
+/// - a declared asset is missing / not a regular file /
+///   unreadable / symlink through the plugin root;
+/// - a schema file doesn't parse as JSON;
+/// - a schema file parses as JSON but isn't a valid draft
+///   2020-12 schema.
+pub(crate) fn validate_ui_package(
     ui: &oxidhome_manifest::UiSection,
     base_dir: &Path,
-) -> Result<(), String> {
-    for (field, path) in [
+) -> Result<ValidatedUiAssets, String> {
+    let assets = read_declared_ui_asset_bytes(ui, base_dir)?;
+    for (field, bytes) in &assets.items {
+        if *field == "config-schema" || *field == "commands-schema" {
+            let path_hint = match *field {
+                "config-schema" => ui.config_schema.as_deref(),
+                "commands-schema" => ui.commands_schema.as_deref(),
+                _ => None,
+            };
+            meta_validate_json_schema(field, path_hint.unwrap_or(Path::new(field)), bytes)?;
+        }
+    }
+    Ok(assets)
+}
+
+/// Read every declared UI asset in the canonical order the
+/// digest hashes them, WITHOUT re-running JSON-Schema meta-
+/// validation. The loader (`start-instance`) and the boot
+/// scan use this: they need the bytes to recompute the
+/// digest, and the schema was already validated at install
+/// time on this exact byte stream (any post-install swap
+/// flips the digest, so a bad-schema swap is caught by the
+/// digest mismatch, not by re-validating on every load).
+pub(crate) fn read_declared_ui_asset_bytes(
+    ui: &oxidhome_manifest::UiSection,
+    base_dir: &Path,
+) -> Result<ValidatedUiAssets, String> {
+    let scalar_assets: [(&'static str, Option<&std::path::PathBuf>); 5] = [
         ("config", ui.config.as_ref()),
         ("device-config", ui.device_config.as_ref()),
         ("commands", ui.commands.as_ref()),
         ("config-schema", ui.config_schema.as_ref()),
         ("commands-schema", ui.commands_schema.as_ref()),
-    ] {
-        if let Some(p) = path {
-            check_ui_asset_file(field, base_dir, p)?;
-        }
+    ];
+
+    let mut items: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for (field, path) in scalar_assets {
+        let Some(rel) = path else { continue };
+        let bytes = read_ui_asset_file(field, base_dir, rel)?;
+        items.push((field, bytes));
     }
-    for (index, p) in ui.widgets.iter().enumerate() {
-        check_ui_asset_file(&format!("widgets[{index}]"), base_dir, p)?;
+
+    let mut widgets: Vec<(String, Vec<u8>)> = Vec::with_capacity(ui.widgets.len());
+    for (index, rel) in ui.widgets.iter().enumerate() {
+        let label = format!("widgets[{index}]");
+        let bytes = read_ui_asset_file(&label, base_dir, rel)?;
+        widgets.push((label, bytes));
     }
-    Ok(())
+
+    Ok(ValidatedUiAssets { items, widgets })
 }
 
-fn check_ui_asset_file(field_label: &str, base_dir: &Path, rel: &Path) -> Result<(), String> {
+/// Flatten a [`ValidatedUiAssets`] into the borrowed
+/// `(label, bytes)` slice shape [`content_digest`] hashes.
+/// The scalar entries come first (their `&'static str`
+/// labels), then the per-widget entries in index order.
+pub(crate) fn ui_asset_digest_frames<'a>(
+    assets: &'a ValidatedUiAssets,
+) -> Vec<(&'a str, &'a [u8])> {
+    let mut frames: Vec<(&'a str, &'a [u8])> =
+        Vec::with_capacity(assets.items.len() + assets.widgets.len());
+    for (label, bytes) in &assets.items {
+        frames.push((*label, bytes.as_slice()));
+    }
+    for (label, bytes) in &assets.widgets {
+        frames.push((label.as_str(), bytes.as_slice()));
+    }
+    frames
+}
+
+/// Read a declared UI asset via [`read_no_follow_within`]
+/// — same TOCTOU-safe path as manifest / wasm reads. The
+/// returned bytes are what the digest hashes, so the read
+/// **has** to be the same call the validator saw; a
+/// separate stat-then-read would race a swap between the
+/// two syscalls.
+fn read_ui_asset_file(field_label: &str, base_dir: &Path, rel: &Path) -> Result<Vec<u8>, String> {
     let full = base_dir.join(rel);
-    let metadata = std::fs::metadata(&full).map_err(|err| {
+    read_no_follow_within(base_dir, &full).map_err(|err| {
         format!(
-            "ui.{field_label} `{}` doesn't exist in the plugin package: {err}",
+            "ui.{field_label} `{}` is not a readable regular file in the plugin package: {err}",
+            rel.display(),
+        )
+    })
+}
+
+/// Phase 13 round-3 F1: parse `bytes` as JSON and
+/// compile the result as a JSON Schema draft 2020-12
+/// document. `jsonschema::draft202012::new` runs the
+/// bundled meta-schema against the input — a valid
+/// draft 2020-12 schema compiles, anything else (invalid
+/// JSON, non-object root, malformed `$defs`, etc.)
+/// surfaces the first `ValidationError`. The compiled
+/// validator is discarded; we only care about the
+/// meta-validation side-effect.
+fn meta_validate_json_schema(field_label: &str, rel: &Path, bytes: &[u8]) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|err| {
+        format!(
+            "ui.{field_label} `{}` is not valid JSON: {err}",
             rel.display(),
         )
     })?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "ui.{field_label} `{}` must be a regular file",
+    jsonschema::draft202012::new(&value).map_err(|err| {
+        format!(
+            "ui.{field_label} `{}` is not a valid JSON Schema draft 2020-12 document: {err}",
             rel.display(),
-        ));
-    }
+        )
+    })?;
     Ok(())
 }
 
@@ -2377,8 +2631,8 @@ wasm = "plugin.wasm"
         std::fs::write(&outside, b"\0asm\x01\x00\x00\x00").unwrap();
         symlink(&outside, plugin_dir.join("plugin.wasm")).unwrap();
 
-        let err =
-            read_installed_bytes(&plugin_dir, std::path::Path::new("plugin.wasm")).unwrap_err();
+        let err = read_installed_bytes(&plugin_dir, std::path::Path::new("plugin.wasm"), None)
+            .unwrap_err();
         // On Linux, O_NOFOLLOW yields ELOOP (which surfaces as
         // FilesystemLoop); the wrapping err kind can differ per
         // OS. Assert the error is present rather than pinning
@@ -3033,6 +3287,177 @@ wasm = "plugin.wasm"
             "scan must auto-tombstone the orphan live row",
         );
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn write_plugin_dir_with_ui(root: &Path, plugin_id: &str, extras: &[(&str, &[u8])]) -> PathBuf {
+        let dir = root.join(format!("source-{plugin_id}"));
+        std::fs::create_dir_all(dir.join("ui")).unwrap();
+        std::fs::write(
+            dir.join("manifest.toml"),
+            format!(
+                r#"manifest_version = 1
+[plugin]
+id = "{plugin_id}"
+name = "UI Plugin"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+[ui]
+config = "ui/config.js"
+config-schema = "ui/config.schema.json"
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        std::fs::write(dir.join("ui/config.js"), b"export default {}").unwrap();
+        std::fs::write(
+            dir.join("ui/config.schema.json"),
+            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+        )
+        .unwrap();
+        for (rel, bytes) in extras {
+            let full = dir.join(rel);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, bytes).unwrap();
+        }
+        dir
+    }
+
+    /// Phase 13 round-3 F1: install refuses a package whose
+    /// `ui.config-schema` file is valid JSON but not a valid
+    /// draft 2020-12 JSON Schema. Pre-fix the manifest
+    /// validator checked path shape but not schema shape, so
+    /// a `config-schema = "ui/config.schema.json"` whose
+    /// contents were, say, `{"type": 42}` would ship broken
+    /// bytes to the UI serving path.
+    #[test]
+    fn install_refuses_ui_schema_that_isnt_valid_draft_2020_12() {
+        let root = tempdir("bad-schema");
+        let plugins_root = root.join("plugins");
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).expect("scan empty");
+        let source = write_plugin_dir_with_ui(
+            &root,
+            "example.badschema",
+            // Not a valid JSON Schema: `type` must be a string
+            // or an array of strings — an integer fails the
+            // draft 2020-12 meta-schema.
+            &[("ui/config.schema.json", br#"{"type": 42}"#)],
+        );
+        let err = reg.install(&source).expect_err("install must refuse");
+        match err {
+            InstallError::BadManifest { reason, .. } => {
+                assert!(
+                    reason.contains("config-schema") && reason.contains("draft 2020-12"),
+                    "reason should mention config-schema + 2020-12; got: {reason}",
+                );
+            }
+            other => panic!("expected BadManifest; got {other:?}"),
+        }
+        assert!(!plugins_root.join("example.badschema").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-3 F2: install refuses a package whose
+    /// `ui.config-schema` file isn't valid JSON at all (e.g.
+    /// a JavaScript file mistakenly declared as a schema).
+    /// The manifest's path check passed, but the shape check
+    /// runs before the digest is minted.
+    #[test]
+    fn install_refuses_ui_schema_that_isnt_valid_json() {
+        let root = tempdir("nonjson-schema");
+        let plugins_root = root.join("plugins");
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).expect("scan empty");
+        let source = write_plugin_dir_with_ui(
+            &root,
+            "example.nonjson",
+            &[("ui/config.schema.json", b"export default {};")],
+        );
+        let err = reg.install(&source).expect_err("install must refuse");
+        assert!(
+            matches!(err, InstallError::BadManifest { .. }),
+            "non-JSON schema must surface as BadManifest",
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-3 F2: mutating a declared UI asset
+    /// after install flips the stored `content_digest` on
+    /// the next scan-time backfill and is detected at load
+    /// time. Directly asserts the digest changes; the
+    /// loader-side refusal path is exercised by the
+    /// runtime-instance test suite.
+    #[test]
+    fn ui_asset_mutation_invalidates_content_digest() {
+        let root = tempdir("ui-mutation");
+        let plugins_root = root.join("plugins");
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).expect("scan empty");
+        let source = write_plugin_dir_with_ui(&root, "example.mutui", &[]);
+        let installed = reg.install(&source).expect("install");
+        let digest_before = installed.content_digest.clone();
+
+        let installed_dir = plugins_root.join("example.mutui");
+        std::fs::write(
+            installed_dir.join("ui/config.js"),
+            b"export default {mutated:true}",
+        )
+        .unwrap();
+
+        // Recompute the digest over the current on-disk state —
+        // the loader would do exactly this and refuse if it
+        // disagrees with the stored value.
+        let manifest = read_manifest_sync(&installed_dir.join("manifest.toml")).unwrap();
+        let (digest_after, _, _) =
+            read_installed_bytes(&installed_dir, &manifest.runtime.wasm, manifest.ui.as_ref())
+                .unwrap();
+        assert_ne!(
+            *digest_before, digest_after,
+            "post-install UI mutation must produce a different digest",
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-3 F2: boot-scan validates declared UI
+    /// assets the same way install does. If an operator (or
+    /// a malicious FS write) deletes `ui/config.schema.json`
+    /// after install, the next scan refuses to index the dir
+    /// as a live plugin — the plugin_id doesn't reappear in
+    /// the registry and the row is neither auto-tombstoned
+    /// nor silently activated.
+    #[test]
+    fn scan_refuses_to_index_dir_whose_declared_ui_asset_is_missing() {
+        let root = tempdir("boot-missing-ui");
+        let plugins_root = root.join("plugins");
+        let db = fresh_db();
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).expect("scan");
+        let source = write_plugin_dir_with_ui(&root, "example.missingui", &[]);
+        reg.install(&source).expect("install");
+        drop(reg);
+
+        // Simulate post-install tampering: yank the schema
+        // file out from under the installed dir.
+        std::fs::remove_file(plugins_root.join("example.missingui/ui/config.schema.json")).unwrap();
+
+        let reg2 = InstalledPluginRegistry::scan(plugins_root, db).expect("second scan");
+        assert!(
+            reg2.list()
+                .iter()
+                .all(|p| &*p.plugin_id != "example.missingui"),
+            "dir with a missing declared UI asset must not appear in the live registry",
+        );
+        assert!(
+            !reg2.is_quarantined("example.missingui"),
+            "the row stays live (identity intact); operator resolves via uninstall + reinstall",
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

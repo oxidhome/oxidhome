@@ -510,9 +510,6 @@ impl PluginInstance {
         // grant. Dev-time loads (no registry row, or mismatched
         // registry path) inherently have no digest to check.
         let requested = &manifest.capabilities;
-        let _ = plugin_dir; // retained for future callsites; the
-        // digest below already binds to the exact bytes we
-        // parsed + will compile.
         // H11 round-2 F1: pick the identity + grant based on the
         // caller-declared `LoadMode`. `Installed { expected }` is
         // API-driven production; the registry row named by
@@ -527,13 +524,31 @@ impl PluginInstance {
                 if row.installation_uuid == *expected
                     && loaded_dir_matches_registry(wasm_path, &row.path) =>
             {
-                // C5 review F3 round-4 F2: hash the SAME
-                // in-memory manifest + wasm buffers that
+                // C5 review F3 round-4 F2 + Phase 13
+                // round-3 F2: hash the SAME in-memory
+                // manifest + wasm buffers that
                 // `Component::from_binary` will compile
-                // from. Reading files again here would
+                // from, PLUS every declared UI asset read
+                // from `plugin_dir` on the way in. Reading
+                // manifest / wasm files again here would
                 // reintroduce the TOCTOU window this fix
-                // exists to close.
-                let on_disk = crate::state::content_digest(manifest_bytes, wasm_bytes);
+                // exists to close; UI assets are read fresh
+                // because the loader doesn't hold them in
+                // memory, but the digest still catches a
+                // post-install swap on the next start.
+                let on_disk = crate::state::recompute_installed_digest(
+                    plugin_dir,
+                    manifest.as_ref(),
+                    manifest_bytes,
+                    wasm_bytes,
+                )
+                .map_err(|reason| {
+                    anyhow!(
+                        "failed to recompute content digest for plugin {}: {}",
+                        manifest.plugin.id,
+                        reason
+                    )
+                })?;
                 if on_disk != *row.content_digest {
                     return Err(anyhow!(
                         "content digest mismatch for plugin {} (installed contents \
@@ -578,7 +593,19 @@ impl PluginInstance {
                 ));
             }
             (LoadMode::Dev, Some(row)) if loaded_dir_matches_registry(wasm_path, &row.path) => {
-                let on_disk = crate::state::content_digest(manifest_bytes, wasm_bytes);
+                let on_disk = crate::state::recompute_installed_digest(
+                    plugin_dir,
+                    manifest.as_ref(),
+                    manifest_bytes,
+                    wasm_bytes,
+                )
+                .map_err(|reason| {
+                    anyhow!(
+                        "failed to recompute content digest for plugin {}: {}",
+                        manifest.plugin.id,
+                        reason
+                    )
+                })?;
                 if on_disk != *row.content_digest {
                     return Err(anyhow!(
                         "content digest mismatch for plugin {} (installed contents \

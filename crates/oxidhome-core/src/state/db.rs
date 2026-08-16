@@ -687,13 +687,20 @@ const MIGRATIONS: &[&str] = &[
     // renamed / removed / config-shape migrated) can drive
     // a declarative shell-side transform on load.
     //
-    // `owner_user_id` mirrors the Phase 12 actor id space —
-    // v1 is single-role "admin" (only the admin actor's
-    // dashboards are addressable), but the column already
-    // exists so the multi-user follow-up is a routing change,
-    // not a migration. `created_ms` / `updated_ms` are host
-    // wall-clock — the shell shows relative timestamps off
-    // them.
+    // `owner_user_id` is v1's row-level ownership key. Every
+    // row carries the stable literal `"admin"` (see
+    // `DASHBOARD_ADMIN_OWNER` in `oxidhome-core::api::server`
+    // and the Phase 13 round-2 F2 doc trail on
+    // `state::dashboards`). It is deliberately NOT the
+    // Phase 12 `Actor::id()` — that returns a per-token id
+    // that rotates when the operator mints a new token,
+    // which would silo dashboards per-token and strand rows
+    // on rotation. The multi-user follow-up will require a
+    // one-line migration to map the placeholder onto the
+    // real session identity:
+    // `UPDATE dashboard SET owner_user_id = <real id> WHERE owner_user_id = 'admin'`.
+    // `created_ms` / `updated_ms` are host wall-clock — the
+    // shell shows relative timestamps off them.
     //
     // `by_owner` index is what the list-dashboards endpoint
     // scans; primary-key ordering happens to match creation

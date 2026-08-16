@@ -121,6 +121,15 @@ semver.workspace = true
 # treats values as opaque bytes.
 serde = { workspace = true }
 serde_json.workspace = true
+# Phase 13 round-3 F1: meta-validate a plugin's declared
+# `ui.config-schema` / `ui.commands-schema` files as JSON Schema
+# draft 2020-12 at install and boot-scan. The manifest validator
+# in `oxidhome-manifest` checks *paths*; this compiles the actual
+# schema documents so a manifest declaring `ui/config.schema.json`
+# whose contents are malformed JSON — or a valid JSON blob that
+# isn't a valid JSON Schema — fails the install rather than
+# reaching the UI serving path.
+jsonschema.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "net", "time", "signal"] }
 toml.workspace = true
