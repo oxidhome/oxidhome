@@ -205,25 +205,30 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Round-2 F1 + round-3 F1: stop every supervised
-    // instance and await its reaper's cleanup before
-    // returning. Both phases are bounded so a misbehaving
-    // plugin (or a supervisor that ignored its stop) can't
-    // block process exit indefinitely. Pre-fix, `main`
-    // dropped `serve` and returned; tokio runtime teardown
-    // aborted supervisors + reapers mid-flight, so device
-    // / service registry eviction and
-    // `instances.unregister` never ran on shutdown.
+    // Round-2 F1 + round-3 F1 + round-7 F3: BEST-EFFORT
+    // bounded shutdown of every supervised instance.
+    // `stop_all_supervised_instances` gives each supervisor
+    // `SHUTDOWN_STOP_PER_INSTANCE_DEADLINE` to reach a
+    // terminal state; the subsequent bounded reaper drain
+    // gives their cleanup tasks (device / service
+    // eviction, `instances.unregister`) up to
+    // `SHUTDOWN_REAPER_DRAIN_DEADLINE` to complete. Any
+    // reaper still pending at that deadline is DETACHED —
+    // the tokio runtime teardown that follows process
+    // exit aborts the tail alongside everything else, so
+    // per-instance cleanup is process-lifetime bounded but
+    // NOT guaranteed to have run before we return here.
+    // Pre-round-2 `main` skipped this entire sequence and
+    // relied on runtime teardown for every supervisor +
+    // reaper, so mid-`init` aborts left partially-cleaned
+    // state; this recovers the common case (well-behaved
+    // plugins) without wedging the daemon.
     //
-    // Stops fire in parallel with a per-instance deadline;
-    // the reaper drain has its OWN overall deadline (round-
-    // 3 F1) — a timed-out `stop` leaves the supervisor
-    // running, whose reaper would then block an unbounded
-    // drain forever.
-    // Round-6 F2: the report names any supervisor that
-    // didn't reach terminal within the deadline; we don't
-    // inspect it here because the bounded drain below
-    // handles the timed-out subset uniformly (detaches).
+    // Round-6 F2: the stop report names any supervisor
+    // that didn't reach terminal within the deadline; we
+    // don't inspect it here because the bounded drain
+    // handles the timed-out subset uniformly (by
+    // detaching).
     let _ = engine
         .stop_all_supervised_instances(SHUTDOWN_STOP_PER_INSTANCE_DEADLINE)
         .await;

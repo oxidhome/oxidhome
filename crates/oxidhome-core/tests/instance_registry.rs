@@ -335,6 +335,51 @@ async fn shutdown_trap_is_terminal_not_a_restart() {
     }
 }
 
+/// Round-7 F1: `stop_all_supervised_instances` flips a
+/// shutdown gate so a concurrent `start_instance` can't
+/// slip a fresh supervisor into the registry between the
+/// stop's snapshot and the caller's follow-up drain.
+/// Pre-fix, the recipe on the bounded drain's docstring
+/// ("stop-then-unbounded-drain") had a TOCTOU where a
+/// race-started supervisor's reaper would wait forever
+/// under the unbounded drain.
+#[tokio::test(flavor = "multi_thread")]
+async fn start_instance_refused_after_stop_all() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+    let handle = engine
+        .start_instance(switch_dir.clone(), "gate-1", None)
+        .await
+        .expect("first start");
+    handle.wait_for_running().await.expect("Running");
+
+    // Stop_all flips the gate BEFORE snapshotting.
+    let report = engine
+        .stop_all_supervised_instances(Duration::from_secs(5))
+        .await;
+    assert!(report.all_stopped(), "all supervisors reached terminal");
+
+    // Round-7 F1: a fresh start after stop_all must be
+    // refused, so the caller's follow-up unbounded drain
+    // can't observe a race-started reaper.
+    let err = engine
+        .start_instance(switch_dir, "gate-2", None)
+        .await
+        .expect_err("start after stop_all must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("shutting down"),
+        "expected EngineShuttingDown error, got: {msg}",
+    );
+
+    // Follow-up unbounded drain terminates promptly
+    // because no new supervisor was allowed to register.
+    engine.drain_supervised_instances().await;
+}
+
 /// Round-3 F1 + round-6 F1/F2/F3: the bounded drain is
 /// best-effort. It returns promptly on timeout, but it
 /// does NOT reclaim registry state under a live

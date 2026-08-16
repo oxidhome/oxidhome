@@ -125,7 +125,38 @@ pub struct Engine {
     /// Round-2 F2: monotonic generation counter for
     /// reaper-tracker entries. Bumped once per spawn.
     reaper_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Round-7 F1: shutdown gate. Set by
+    /// [`Self::stop_all_supervised_instances`] BEFORE it
+    /// snapshots the instance registry — once set,
+    /// [`Self::start_instance`] and its variants refuse
+    /// with a `EngineShuttingDown` error, so a concurrent
+    /// start can't slip a fresh supervisor into the
+    /// registry between the snapshot and the caller's
+    /// follow-up unbounded drain (which would then wait
+    /// on the fresh supervisor's reaper forever, defeating
+    /// the strong-cleanup recipe).
+    ///
+    /// One-way latch: never cleared. The intended lifecycle
+    /// is `main` (or a test) creates an `Engine`, runs it,
+    /// eventually calls `stop_all_supervised_instances`
+    /// during shutdown; the engine value is dropped
+    /// shortly after. Long-lived Engine users who want to
+    /// restart the engine's plugin activity build a fresh
+    /// `Engine`.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Round-7 F1: error returned by
+/// [`Engine::start_instance`] / friends after
+/// [`Engine::stop_all_supervised_instances`] has been
+/// called. Prevents a concurrent start from slipping a
+/// fresh supervisor into the registry between the stop's
+/// snapshot and the caller's follow-up drain.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "engine is shutting down: no new supervised instances may be started (stop_all_supervised_instances was called)"
+)]
+pub struct EngineShuttingDown;
 
 /// Round-6 F2: outcome of [`Engine::stop_all_supervised_instances`].
 /// Callers who follow the "stop then unbounded drain"
@@ -147,6 +178,16 @@ pub struct StopAllReport {
     /// `per_stop_timeout` — their supervisor task is still
     /// running.
     pub timed_out: Vec<Arc<str>>,
+    /// Round-7 F2: number of per-instance stop tasks whose
+    /// tokio `JoinHandle` returned `JoinError` (panicked
+    /// or was cancelled). We can't recover the
+    /// `instance_id` from a `JoinError`, so we count them
+    /// separately — but they still block
+    /// `all_stopped()` because the panicked instance's
+    /// supervisor state is unknown (may or may not have
+    /// stopped) and the follow-up unbounded drain must
+    /// not assume it did.
+    pub panicked: usize,
 }
 
 impl StopAllReport {
@@ -155,7 +196,7 @@ impl StopAllReport {
     /// [`Engine::drain_supervised_instances`].
     #[must_use]
     pub fn all_stopped(&self) -> bool {
-        self.errored.is_empty() && self.timed_out.is_empty()
+        self.errored.is_empty() && self.timed_out.is_empty() && self.panicked == 0
     }
 }
 
@@ -333,6 +374,7 @@ impl Engine {
             ui_ticket_secret: Arc::new(mint_ui_ticket_secret()),
             reapers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             reaper_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -687,6 +729,22 @@ impl Engine {
         mode: LoadMode,
         tuning: SupervisorTuning,
     ) -> anyhow::Result<InstanceHandle> {
+        // Round-7 F1: refuse new starts once shutdown has
+        // begun. `stop_all_supervised_instances` sets this
+        // flag before snapshotting the instance registry —
+        // without the check, a concurrent start could slip
+        // a fresh supervisor into the registry between the
+        // snapshot and the caller's follow-up unbounded
+        // drain, and the drain would wait on that fresh
+        // reaper forever, defeating the strong-cleanup
+        // recipe advertised on the bounded drain's
+        // docstring.
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(anyhow::Error::from(EngineShuttingDown));
+        }
         let plugin_dir = plugin_dir.into();
         let instance_id = instance_id.into();
         // H10 round-3 finding 3 + H1: refuse structurally-unsafe
@@ -1006,6 +1064,18 @@ impl Engine {
         &self,
         per_stop_timeout: std::time::Duration,
     ) -> StopAllReport {
+        // Round-7 F1: flip the shutdown gate BEFORE
+        // snapshotting the registry so any start_instance
+        // that races us either lands in the snapshot (we
+        // stop it) or is refused with `EngineShuttingDown`
+        // (never starts). Without this the caller's
+        // follow-up unbounded drain could observe a fresh
+        // reaper spawned after our snapshot and wait on
+        // it forever. `AtomicBool` (not lock) — no `.await`
+        // between set and snapshot, so no reordering
+        // concern beyond the release/acquire below.
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
         let handles = self.instances.list();
         // Fire every stop in parallel so total wall-clock is
         // bounded by `per_stop_timeout`, not
@@ -1046,7 +1116,17 @@ impl Engine {
                 Ok(StopOne::Stopped) => report.stopped += 1,
                 Ok(StopOne::Errored(id)) => report.errored.push(id),
                 Ok(StopOne::TimedOut(id)) => report.timed_out.push(id),
-                Err(join_err) => tracing::error!(%join_err, "stop task panicked"),
+                Err(join_err) => {
+                    // Round-7 F2: count panics so
+                    // `all_stopped()` returns false and
+                    // the caller doesn't advance to the
+                    // unbounded drain (which would wait
+                    // forever if the panicked stop
+                    // corresponded to a still-running
+                    // supervisor).
+                    report.panicked += 1;
+                    tracing::error!(%join_err, "stop task panicked");
+                }
             }
         }
         report
