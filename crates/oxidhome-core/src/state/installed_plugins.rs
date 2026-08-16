@@ -794,15 +794,48 @@ impl InstalledPluginRegistry {
             match child {
                 Ok(c) => children.push(c),
                 Err(err) => {
-                    tracing::warn!(?err, "skipping unreadable entry in plugins dir");
+                    // Round-12 F1: a `read_dir` entry error
+                    // could hide an installed plugin's
+                    // directory — we can't parse its
+                    // manifest, so we can't record its
+                    // plugin_id in `observed_manifest_ids`,
+                    // so the orphan sweep would tombstone
+                    // its live SQL row. Next successful scan
+                    // then backfills a fresh installation
+                    // UUID off the surviving dir, silently
+                    // rotating identity without an uninstall
+                    // (C1b's whole reason to exist). Match
+                    // the unreadable-manifest branch's shape
+                    // and defer the global sweep.
+                    tracing::warn!(
+                        ?err,
+                        "skipping unreadable entry in plugins dir — deferring orphan-live-row sweep this boot"
+                    );
+                    defer_orphan_sweep = true;
                 }
             }
         }
         children.sort_by_key(std::fs::DirEntry::path);
         for child in children {
             let path = child.path();
-            let Ok(file_type) = child.file_type() else {
-                continue;
+            let file_type = match child.file_type() {
+                Ok(ft) => ft,
+                Err(err) => {
+                    // Round-12 F1: same reasoning as the
+                    // `read_dir` entry error above. A
+                    // `file_type()` failure on what might be
+                    // a legitimate plugin directory hides
+                    // its identity from `observed_manifest_ids`,
+                    // and the orphan sweep would then tombstone
+                    // its live SQL row.
+                    tracing::warn!(
+                        path = %path.display(),
+                        %err,
+                        "skipping entry whose file_type() failed — deferring orphan-live-row sweep this boot",
+                    );
+                    defer_orphan_sweep = true;
+                    continue;
+                }
             };
             if !file_type.is_dir() {
                 continue;
