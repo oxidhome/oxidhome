@@ -768,14 +768,26 @@ impl InstalledPluginRegistry {
         // the cost of leaving genuine orphans in place for one
         // extra boot.
         let mut defer_orphan_sweep = false;
+        // Round-5 F1: sort the directory listing so scan
+        // reconciliation is order-deterministic across
+        // filesystems and reboots. FS enumeration order is
+        // not guaranteed (`std::fs::read_dir` is
+        // platform-dependent), and the duplicate-manifest-id
+        // + UI-validation branches make specific assumptions
+        // about "first-seen" vs. "second-seen" — a
+        // reproducible order makes both those branches, and
+        // their regression tests, deterministic.
+        let mut children: Vec<std::fs::DirEntry> = Vec::new();
         for child in std::fs::read_dir(&plugins_root)? {
-            let child = match child {
-                Ok(c) => c,
+            match child {
+                Ok(c) => children.push(c),
                 Err(err) => {
                     tracing::warn!(?err, "skipping unreadable entry in plugins dir");
-                    continue;
                 }
-            };
+            }
+        }
+        children.sort_by_key(std::fs::DirEntry::path);
+        for child in children {
             let path = child.path();
             let Ok(file_type) = child.file_type() else {
                 continue;
@@ -874,48 +886,6 @@ impl InstalledPluginRegistry {
                     "installed dir name disagrees with manifest plugin.id; indexing by manifest id",
                 );
             }
-            // Phase 13 round-3 F2 + round-4 F1: run the same
-            // UI-package validator install runs, so a declared
-            // UI asset that was deleted (or a config-schema
-            // whose JSON was corrupted) after install doesn't
-            // re-appear as an indexed live plugin after a
-            // restart. Round-4 F1 refinement: if there IS a
-            // live SQL row for this `plugin_id`, add it to the
-            // quarantined registry with the live row's
-            // installation UUID. Pre-fix the scan just
-            // `continue`d, which left `is_quarantined()`
-            // returning false for the id — a raw-path
-            // `LoadMode::Dev` load then fell through to
-            // synthetic identity + manifest-requested
-            // capabilities, silently bypassing the persisted
-            // grant boundary the digest was supposed to guard.
-            if let Some(ui) = manifest.ui.as_ref()
-                && let Err(reason) = validate_ui_package(ui, &path)
-            {
-                tracing::warn!(
-                    plugin_id = %manifest_id,
-                    path = %path.display(),
-                    reason = %reason,
-                    "skipping installed dir with invalid UI package — deferring orphan-live-row sweep this boot",
-                );
-                if let Some(live) = live_rows.get(&manifest_id) {
-                    let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
-                    quarantined_registry.insert(
-                        id_arc,
-                        QuarantineEntry {
-                            installation_uuid: Arc::clone(&live.installation_uuid),
-                            paths: vec![path.clone()],
-                        },
-                    );
-                    // Same-boot suppression: keep the id off the
-                    // orphan-sweep target list so the row isn't
-                    // tombstoned before the operator gets a chance
-                    // to repair.
-                    observed_manifest_ids.insert(manifest_id.clone(), path.clone());
-                }
-                defer_orphan_sweep = true;
-                continue;
-            }
             // Follow-up review H8: reject/quarantine duplicate
             // manifest ids. If we've already seen a dir declaring
             // this `plugin_id`, both dirs are ambiguous — the
@@ -1005,6 +975,46 @@ impl InstalledPluginRegistry {
             // just the id set (via `.keys()`) to decide which
             // live SQL rows still have a matching dir on disk.
             observed_manifest_ids.insert(manifest_id.clone(), path.clone());
+            // Phase 13 round-3 F2 + round-4 F1 + round-5 F1:
+            // run the install-time UI-package validator so a
+            // declared asset that was deleted or a
+            // config-schema whose JSON was corrupted after
+            // install doesn't re-appear as an indexed live
+            // plugin after a restart. Ordering matters — this
+            // block sits AFTER the duplicate-manifest-id
+            // reconciliation above (round-5 F1): if the same
+            // `plugin_id` shows up in a second dir with bad
+            // UI, that dir is already routed into the
+            // quarantine branch as a duplicate and never
+            // reaches this validator, so the previously-
+            // indexed valid dir stays in `entries` uncontested
+            // and `uninstall` yanks every dir the id covers in
+            // one call. Round-4 F1: if there's a live SQL row
+            // for the id we're rejecting here, add it to the
+            // quarantine registry so raw-path `LoadMode::Dev`
+            // stays fail-closed.
+            if let Some(ui) = manifest.ui.as_ref()
+                && let Err(reason) = validate_ui_package(ui, &path)
+            {
+                tracing::warn!(
+                    plugin_id = %manifest_id,
+                    path = %path.display(),
+                    reason = %reason,
+                    "skipping installed dir with invalid UI package — deferring orphan-live-row sweep this boot",
+                );
+                if let Some(live) = live_rows.get(&manifest_id) {
+                    let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
+                    quarantined_registry.insert(
+                        id_arc,
+                        QuarantineEntry {
+                            installation_uuid: Arc::clone(&live.installation_uuid),
+                            paths: vec![path.clone()],
+                        },
+                    );
+                }
+                defer_orphan_sweep = true;
+                continue;
+            }
             // C5 review F1: quarantine any installation whose
             // grant JSON is malformed. Skip indexing so
             // `start_instance` can't launch the plugin under an
@@ -3707,6 +3717,105 @@ config-schema = "ui/config.schema.json"
         }
         assert!(!plugins_root.join("example.bigconfig").exists());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-5 F1: two dirs declaring the same
+    /// `plugin_id`, one with a valid UI package and one
+    /// missing a declared UI asset, must land in the SAME
+    /// consistent state regardless of scan order:
+    /// - Neither dir indexed as live (`entries` empty for
+    ///   this id).
+    /// - Both dirs recorded on the same quarantine entry.
+    /// - One `uninstall` removes BOTH dirs.
+    /// - A subsequent scan can't backfill a fresh
+    ///   installation UUID against a surviving dir
+    ///   (H8 identity-reactivation refusal).
+    ///
+    /// Pre-fix: when the valid dir was scanned first, it
+    /// landed in `entries`; when the invalid dir was
+    /// scanned second, the UI failure branch returned
+    /// before duplicate detection — leaving the valid dir
+    /// in `entries` AND recording only the invalid dir in
+    /// quarantine. `uninstall` yanked only the valid dir,
+    /// the invalid dir survived, an operator repair
+    /// backfilled a fresh UUID, and the H8 identity
+    /// reactivation returned.
+    #[test]
+    fn scan_duplicate_ids_with_mixed_ui_validity_reconcile_either_order() {
+        for &(first_name, second_name, first_valid) in &[
+            ("a-valid", "z-invalid", true),
+            ("a-invalid", "z-valid", false),
+        ] {
+            let scenario = format!("{first_name}-then-{second_name}");
+            let root = tempdir(&scenario);
+            let plugins_root = root.join("plugins");
+            std::fs::create_dir_all(&plugins_root).unwrap();
+
+            for (dir_name, is_valid) in [(first_name, first_valid), (second_name, !first_valid)] {
+                let d = plugins_root.join(dir_name);
+                std::fs::create_dir_all(d.join("ui")).unwrap();
+                std::fs::write(
+                    d.join("manifest.toml"),
+                    r#"manifest_version = 1
+[plugin]
+id = "example.mixdup"
+name = "Mixed"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+[ui]
+config = "ui/config.js"
+config-schema = "ui/config.schema.json"
+"#,
+                )
+                .unwrap();
+                std::fs::write(d.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+                std::fs::write(d.join("ui/config.js"), b"export default {};").unwrap();
+                if is_valid {
+                    std::fs::write(
+                        d.join("ui/config.schema.json"),
+                        br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+                    )
+                    .unwrap();
+                }
+                // else: intentionally omit the schema file
+                // so validate_ui_package fails on this dir.
+            }
+
+            let db = fresh_db();
+            let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+
+            assert!(
+                reg.list().iter().all(|p| &*p.plugin_id != "example.mixdup"),
+                "[{scenario}] duplicate id must not be indexed as live",
+            );
+            assert!(
+                reg.is_quarantined("example.mixdup"),
+                "[{scenario}] duplicate id must be quarantined",
+            );
+
+            reg.uninstall("example.mixdup").expect("uninstall");
+            for dn in [first_name, second_name] {
+                assert!(
+                    !plugins_root.join(dn).exists(),
+                    "[{scenario}] one uninstall must remove {dn}",
+                );
+            }
+
+            let reg2 = InstalledPluginRegistry::scan(plugins_root, db).unwrap();
+            assert!(
+                reg2.list().is_empty(),
+                "[{scenario}] no dir survived uninstall; scan must produce no entries",
+            );
+            assert!(
+                !reg2.is_quarantined("example.mixdup"),
+                "[{scenario}] no dir survived uninstall; quarantine must clear",
+            );
+
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// Phase 13 round-4 F4: install refuses a package whose
