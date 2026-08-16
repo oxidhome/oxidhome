@@ -460,6 +460,21 @@ pub fn supervise_with_tuning(
 /// paths and dev-load path both route through with their chosen
 /// mode). `supervise` / `supervise_with_tuning` above are the
 /// `LoadMode::Dev` sugar for tests.
+///
+/// Phase 6 leftover TOCTOU fix: `first_load_pinned_manifest` is
+/// the pre-parsed manifest snapshot that pre-flight used to
+/// decide the singleton slot / `plugin_id`. When present, the
+/// supervisor's FIRST load uses those exact bytes instead of
+/// re-reading `manifest.toml`, so an atomic replace between
+/// pre-flight and the first load can't sneak a different
+/// manifest under the same registry slot. Subsequent restarts
+/// re-read (a legitimate reinstall between crashes should pick
+/// up new manifest bytes).
+///
+/// `None` is the test-suite entry (`supervise` /
+/// `supervise_with_tuning`) that spawns without a pre-flight
+/// step; the supervisor falls back to reading the manifest from
+/// disk on every attempt.
 #[doc(hidden)]
 #[must_use]
 pub fn supervise_with_tuning_and_mode(
@@ -470,6 +485,31 @@ pub fn supervise_with_tuning_and_mode(
     overrides: Option<toml::Value>,
     mode: crate::runtime::LoadMode,
     tuning: SupervisorTuning,
+) -> InstanceHandle {
+    supervise_with_tuning_mode_and_pin(
+        engine,
+        plugin_dir,
+        instance_id,
+        plugin_id,
+        overrides,
+        mode,
+        tuning,
+        None,
+    )
+}
+
+#[doc(hidden)]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn supervise_with_tuning_mode_and_pin(
+    engine: Engine,
+    plugin_dir: PathBuf,
+    instance_id: impl Into<String>,
+    plugin_id: impl Into<String>,
+    overrides: Option<toml::Value>,
+    mode: crate::runtime::LoadMode,
+    tuning: SupervisorTuning,
+    first_load_pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) -> InstanceHandle {
     let instance_id: Arc<str> = Arc::from(instance_id.into());
     let plugin_id: Arc<str> = Arc::from(plugin_id.into());
@@ -490,6 +530,7 @@ pub fn supervise_with_tuning_and_mode(
         mode,
         control_rx,
         state_tx,
+        first_load_pinned_manifest,
     ));
     handle
 }
@@ -635,6 +676,11 @@ async fn run_supervisor(
     mode: crate::runtime::LoadMode,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     state_tx: watch::Sender<InstanceState>,
+    // Phase 6 leftover TOCTOU fix: `Some` on the first
+    // attempt after `start_instance` pre-flight, `None`
+    // thereafter. Once consumed here it's `take()`n so the
+    // second iteration re-reads.
+    mut first_load_pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) {
     // C2d — the pre-C2d supervisor eagerly subscribed to
     // `subscribe_all()` so every published event woke every
@@ -651,6 +697,9 @@ async fn run_supervisor(
     let mut restarts: u32 = 0;
 
     loop {
+        // `.take()` gives the pinned snapshot to the first
+        // attempt only; every subsequent iteration re-reads.
+        let pinned = first_load_pinned_manifest.take();
         let outcome = run_one_lifecycle(
             &engine,
             &plugin_dir,
@@ -661,6 +710,7 @@ async fn run_supervisor(
             &mode,
             &mut control_rx,
             &state_tx,
+            pinned,
         )
         .await;
 
@@ -745,6 +795,10 @@ async fn run_one_lifecycle(
     mode: &crate::runtime::LoadMode,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     state_tx: &watch::Sender<InstanceState>,
+    // Phase 6 leftover TOCTOU fix: pre-flight-captured
+    // manifest snapshot for the FIRST attempt only. `None`
+    // on restarts (the supervisor re-reads).
+    pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) -> LifecycleOutcome {
     // Sweep any device/service registry entries this instance left
     // behind on a previous life. First load is a no-op; on a restart
@@ -769,15 +823,31 @@ async fn run_one_lifecycle(
 
     transition(state_tx, instance_id, InstanceState::Loading);
 
-    let mut instance = match PluginInstance::load_with_mode(
-        engine,
-        plugin_dir,
-        instance_id.to_string(),
-        overrides,
-        mode.clone(),
-    )
-    .await
-    {
+    let load_result = match pinned_manifest {
+        Some((bytes, manifest)) => {
+            PluginInstance::load_with_pinned_manifest(
+                engine,
+                plugin_dir,
+                instance_id.to_string(),
+                overrides,
+                mode.clone(),
+                bytes,
+                manifest,
+            )
+            .await
+        }
+        None => {
+            PluginInstance::load_with_mode(
+                engine,
+                plugin_dir,
+                instance_id.to_string(),
+                overrides,
+                mode.clone(),
+            )
+            .await
+        }
+    };
+    let mut instance = match load_result {
         Ok(instance) => instance,
         Err(e) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
     };

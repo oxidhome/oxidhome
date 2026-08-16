@@ -181,3 +181,59 @@ async fn wait_until_unregistered(engine: &Engine, instance_id: &str) {
     }
     panic!("instance `{instance_id}` not unregistered within 5s");
 }
+
+/// Phase 6 leftover: `Engine::drain_supervised_instances`
+/// awaits every reaper's `JoinHandle` (previously discarded
+/// as a fire-and-forget `tokio::spawn`) so graceful daemon
+/// shutdown can wait for per-instance cleanup (device /
+/// service registry eviction, device-state stale marking,
+/// `instances.unregister`) before the process exits. Test
+/// starts multiple instances, sends `stop` to each, then
+/// drains — after drain, every instance is unregistered
+/// AND every device is evicted.
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_awaits_reaper_cleanup_for_every_instance() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+
+    let a = engine
+        .start_instance(switch_dir.clone(), "drain-a", None)
+        .await
+        .expect("start a");
+    let b = engine
+        .start_instance(switch_dir.clone(), "drain-b", None)
+        .await
+        .expect("start b");
+    let c = engine
+        .start_instance(switch_dir, "drain-c", None)
+        .await
+        .expect("start c");
+    a.wait_for_running().await.expect("a Running");
+    b.wait_for_running().await.expect("b Running");
+    c.wait_for_running().await.expect("c Running");
+    assert_eq!(engine.devices().list().len(), 3);
+
+    a.stop().await.expect("stop a");
+    b.stop().await.expect("stop b");
+    c.stop().await.expect("stop c");
+
+    // Drain awaits every reaper — no polling loop, no
+    // arbitrary sleep. Post-drain the tracker is empty and
+    // every reaper's cleanup has completed.
+    engine.drain_supervised_instances().await;
+
+    assert!(engine.instance("drain-a").is_none());
+    assert!(engine.instance("drain-b").is_none());
+    assert!(engine.instance("drain-c").is_none());
+    assert!(
+        engine.devices().list().is_empty(),
+        "reaper must have evicted every device",
+    );
+
+    // Idempotent: a second drain on a settled engine is a
+    // no-op that returns immediately.
+    engine.drain_supervised_instances().await;
+}

@@ -105,7 +105,26 @@ pub struct Engine {
     /// verifies against it. Rotated on daemon restart —
     /// nobody's ticket survives a restart.
     ui_ticket_secret: Arc<[u8; 32]>,
+    /// Phase 6 leftover: tracked reaper `JoinHandle`s so
+    /// `Engine::drain_supervised_instances` can await
+    /// per-instance cleanup (device / service registry
+    /// eviction, device-state stale marking,
+    /// `instances.unregister`) on daemon shutdown. Keyed
+    /// by `instance_id`; the reaper removes its own entry
+    /// as its final step, so a "steady-state" scan sees an
+    /// empty map even under heavy churn.
+    reapers: Reapers,
 }
+
+/// Phase 6 leftover: shared map of per-instance reaper
+/// `JoinHandle`s. `std::sync::Mutex` (not `tokio::sync`)
+/// because insertion / removal is short and synchronous —
+/// no `await` inside the guard. The `JoinHandle`s are
+/// awaited from `drain_supervised_instances` under a
+/// `tokio::task::JoinSet` so the drain doesn't hold the
+/// map's lock across `await`.
+type Reapers =
+    Arc<std::sync::Mutex<std::collections::HashMap<Arc<str>, tokio::task::JoinHandle<()>>>>;
 
 /// H2 round-2 F1: shared, lazily-populated map of per-`plugin_id`
 /// async mutexes. Held under an outer sync `Mutex` for the map
@@ -261,6 +280,7 @@ impl Engine {
                 std::collections::HashMap::new(),
             )),
             ui_ticket_secret: Arc::new(mint_ui_ticket_secret()),
+            reapers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -617,13 +637,22 @@ impl Engine {
             ));
         }
         // Pre-flight: parse + validate the manifest so we know the
-        // plugin id + singleton flag before spawning. The supervisor's
-        // load path re-reads + re-validates — small redundancy, but it
-        // keeps the supervisor self-contained for the test_host crate.
-        // See the immutability note on `start_instance`.
-        let manifest = instance::read_manifest(&plugin_dir).await?;
+        // plugin id + singleton flag before spawning. Phase 6
+        // leftover TOCTOU fix: capture the raw bytes alongside
+        // the parsed manifest and hand them into the supervisor's
+        // FIRST load, so the same snapshot that decided the
+        // singleton slot / plugin_id is the one that gets
+        // instantiated. An atomic replace of `manifest.toml`
+        // between pre-flight and the supervisor's first read can
+        // no longer swap the plugin under a mismatched registry
+        // slot. On restart the supervisor re-reads (a legitimate
+        // reinstall between crashes should pick up new bytes;
+        // that path goes through the installed-plugin registry's
+        // lifecycle lock, so it's safe).
+        let (manifest_bytes, manifest) = instance::read_manifest_with_bytes(&plugin_dir).await?;
         let plugin_id = manifest.plugin.id.clone();
         let singleton = manifest.runtime.singleton;
+        let pinned_manifest = Some((manifest_bytes, manifest));
 
         // Atomic check + spawn-supervisor + spawn-reaper + insert.
         // `register` only calls the factory after the singleton /
@@ -639,9 +668,10 @@ impl Engine {
         let plugin_id_for_spawn = plugin_id.clone();
         let plugin_id_for_reaper = plugin_id.clone();
         let instance_id_for_reaper = instance_id.clone();
+        let reapers_for_spawn = Arc::clone(&self.reapers);
         self.instances
             .register(instance_id, plugin_id, singleton, || {
-                let handle = crate::runtime::lifecycle::supervise_with_tuning_and_mode(
+                let handle = crate::runtime::lifecycle::supervise_with_tuning_mode_and_pin(
                     engine_for_spawn,
                     plugin_dir_for_spawn,
                     instance_id_for_spawn,
@@ -649,9 +679,13 @@ impl Engine {
                     overrides,
                     mode,
                     tuning,
+                    pinned_manifest,
                 );
                 let reaper_handle = handle.clone();
-                tokio::spawn(async move {
+                let reapers_for_reaper = Arc::clone(&reapers_for_spawn);
+                let reaper_key: Arc<str> = Arc::from(instance_id_for_reaper.as_str());
+                let reaper_key_for_task = Arc::clone(&reaper_key);
+                let reaper_join = tokio::spawn(async move {
                     let _ = reaper_handle.wait_terminal().await;
                     // Drop any device/service registry entries the
                     // instance left behind. The supervisor sweeps at
@@ -677,10 +711,75 @@ impl Engine {
                         .device_state()
                         .mark_instance_stale(&instance_id_for_reaper);
                     registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
+                    // Phase 6 leftover: reaper removes its own
+                    // entry from the tracker as its final step,
+                    // so under steady-state the map is empty
+                    // even under high churn. `drain_supervised_instances`
+                    // still observes any handle whose reaper is
+                    // mid-cleanup at drain time — the drain
+                    // atomically pulls the current snapshot out
+                    // and awaits it.
+                    if let Ok(mut guard) = reapers_for_reaper.lock() {
+                        guard.remove(&reaper_key_for_task);
+                    }
                 });
+                // Track the reaper handle. If a same-instance entry
+                // exists (shouldn't — `register` above rejects
+                // duplicates) the older handle is dropped, which
+                // detaches the old reaper but leaves its work
+                // scheduled to completion; the drain in
+                // `drain_supervised_instances` no longer awaits
+                // it, but the reaper task itself keeps running.
+                if let Ok(mut guard) = reapers_for_spawn.lock() {
+                    guard.insert(reaper_key, reaper_join);
+                }
                 handle
             })
             .map_err(anyhow::Error::from)
+    }
+
+    /// Phase 6 leftover: await every supervised instance's
+    /// reaper to completion. Called on graceful daemon
+    /// shutdown so per-instance cleanup (device / service
+    /// registry eviction, device-state stale marking,
+    /// `instances.unregister`) finishes before the process
+    /// exits — pre-fix reapers were fire-and-forget
+    /// `tokio::spawn`s whose `JoinHandle` was discarded, so
+    /// a shutdown could observe partially-cleaned state
+    /// (e.g. `DeviceRegistry` entries surviving into the
+    /// next scan).
+    ///
+    /// This method does NOT itself send `shutdown` to the
+    /// running supervisors — the caller is expected to
+    /// have already asked each `InstanceHandle` to stop
+    /// (or aborted them via task cancellation). Reapers
+    /// wait on the supervisor's `state` watch reaching a
+    /// terminal state; a still-running supervisor never
+    /// reaches one, so awaiting its reaper would block
+    /// forever. Post-shutdown, this drains the cleanup
+    /// tail.
+    ///
+    /// Idempotent: reapers self-remove from the tracker as
+    /// their final step, so calling this twice on a settled
+    /// engine just returns a no-op the second time.
+    pub async fn drain_supervised_instances(&self) {
+        // Snapshot + clear under the sync mutex so the
+        // await loop below doesn't hold the lock. Reapers
+        // that fire between the snapshot and their own
+        // `remove()` just fail their `remove` silently —
+        // the key we snapshotted is no longer in the map
+        // but the JoinHandle we already own is what we
+        // await here.
+        let handles: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = self
+                .reapers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.drain().map(|(_, jh)| jh).collect()
+        };
+        for jh in handles {
+            let _ = jh.await;
+        }
     }
 
     /// Look up a running instance by id. `None` if no such
