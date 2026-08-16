@@ -462,6 +462,18 @@ pub fn any_grant_matches(
     })
 }
 
+/// Round-10 F1: synthetic UUID placeholder for quarantine
+/// entries that are path-only — no matching SQL row exists
+/// (nor a `quarantined_uuids` entry). Used when a directory
+/// under the plugins root fails UI validation or a backfill
+/// digest read but has no persisted identity to tombstone.
+/// `uninstall` still removes the FS path; the SQL tombstone
+/// step is a no-op (0-row update) because the id doesn't
+/// exist in `plugin_installation`. Distinct from
+/// `"dup-unknown"` so log readers can tell "duplicate id we
+/// couldn't resolve" apart from "no SQL row at all".
+pub(crate) const NO_SQL_ROW_UUID: &str = "no-sql-row";
+
 /// Mint a fresh installation UUID. Format: `inst-<32 lowercase hex>`
 /// — 16 random bytes = 128 bits of entropy, matching a `UUIDv4`'s
 /// shape without pulling in the `uuid` crate. The `inst-` prefix
@@ -1070,31 +1082,49 @@ impl InstalledPluginRegistry {
                 // SQL row but left the dir on disk, and an
                 // operator repair backfilled a fresh UUID off
                 // it — the H8 identity-reactivation shape.
+                // Round-10 F1: fall through to a synthetic
+                // UUID when no SQL row (live or quarantined)
+                // exists for this id. Pre-fix we skipped
+                // silently, which left a canonical
+                // `<plugins_root>/<plugin_id>/` dir on disk
+                // that `uninstall` refused (404 — neither
+                // registry map contained the id) and a
+                // reinstall bounced off `AlreadyInstalled`
+                // because `dest.exists()`. Path-only
+                // quarantine makes the dir addressable via
+                // the API: `uninstall` yanks the dir and the
+                // synthetic UUID's tombstone update is a
+                // 0-row no-op — no SQL row to touch.
                 let uuid = live_rows
                     .get(&manifest_id)
                     .map(|l| Arc::clone(&l.installation_uuid))
-                    .or_else(|| quarantined_uuids.get(&manifest_id).map(Arc::clone));
-                if let Some(uuid) = uuid {
-                    let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
-                    // Merge into the pre-populated slot (may
-                    // already carry paths from earlier
-                    // sibling dirs); don't overwrite.
-                    match quarantined_registry.get_mut(&id_arc) {
-                        Some(entry) => {
+                    .or_else(|| quarantined_uuids.get(&manifest_id).map(Arc::clone))
+                    .unwrap_or_else(|| Arc::from(NO_SQL_ROW_UUID));
+                let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
+                // Merge into the pre-populated slot (may
+                // already carry paths from earlier sibling
+                // dirs); don't overwrite. Preserve a
+                // pre-populated real UUID rather than
+                // clobbering it with the synthetic
+                // placeholder — the placeholder is a
+                // last-resort fallback.
+                match quarantined_registry.get_mut(&id_arc) {
+                    Some(entry) => {
+                        if &*entry.installation_uuid == NO_SQL_ROW_UUID {
                             entry.installation_uuid = uuid;
-                            if !entry.paths.contains(&path) {
-                                entry.paths.push(path.clone());
-                            }
                         }
-                        None => {
-                            quarantined_registry.insert(
-                                id_arc,
-                                QuarantineEntry {
-                                    installation_uuid: uuid,
-                                    paths: vec![path.clone()],
-                                },
-                            );
+                        if !entry.paths.contains(&path) {
+                            entry.paths.push(path.clone());
                         }
+                    }
+                    None => {
+                        quarantined_registry.insert(
+                            id_arc,
+                            QuarantineEntry {
+                                installation_uuid: uuid,
+                                paths: vec![path.clone()],
+                            },
+                        );
                     }
                 }
                 defer_orphan_sweep = true;
@@ -1208,22 +1238,58 @@ impl InstalledPluginRegistry {
                 // fresh content digest, matching what the
                 // API's `install` would have done.
                 let uuid = mint_installation_uuid();
-                let digest = match read_installed_bytes(
-                    &path,
-                    &manifest.runtime.wasm,
-                    manifest.ui.as_ref(),
-                ) {
-                    Ok((d, _, _)) => Arc::<str>::from(d),
-                    Err(err) => {
-                        tracing::error!(
-                            plugin_id = %manifest_id,
-                            path = %path.display(),
-                            %err,
-                            "content_digest computation failed during backfill; skipping this directory",
-                        );
-                        continue;
-                    }
-                };
+                let digest =
+                    match read_installed_bytes(&path, &manifest.runtime.wasm, manifest.ui.as_ref())
+                    {
+                        Ok((d, _, _)) => Arc::<str>::from(d),
+                        Err(err) => {
+                            // Round-10 F1: same fail-closed
+                            // reachability property as the UI
+                            // validation branch above. A backfill
+                            // whose bytes can't be read (missing
+                            // wasm, symlink refusal, UI asset
+                            // cap violation, ...) is not indexed
+                            // as live, but the directory still
+                            // exists on disk — record a
+                            // path-only quarantine so `uninstall`
+                            // can remove it. There's no live SQL
+                            // row here (we're in the `else` of
+                            // `live_rows.get`), so the tombstone
+                            // step in `uninstall` is a 0-row
+                            // no-op. Without this the operator
+                            // could not recover via the API:
+                            // `uninstall` → 404, `install` →
+                            // `AlreadyInstalled` from
+                            // `dest.exists()`.
+                            tracing::error!(
+                                plugin_id = %manifest_id,
+                                path = %path.display(),
+                                %err,
+                                "content_digest computation failed during backfill; \
+                                 recording path-only quarantine so uninstall can remove this dir",
+                            );
+                            let q_id: Arc<str> = Arc::from(manifest_id.as_str());
+                            let synth_uuid = Arc::from(NO_SQL_ROW_UUID);
+                            match quarantined_registry.get_mut(&q_id) {
+                                Some(entry) => {
+                                    if !entry.paths.contains(&path) {
+                                        entry.paths.push(path.clone());
+                                    }
+                                }
+                                None => {
+                                    quarantined_registry.insert(
+                                        q_id,
+                                        QuarantineEntry {
+                                            installation_uuid: synth_uuid,
+                                            paths: vec![path.clone()],
+                                        },
+                                    );
+                                }
+                            }
+                            defer_orphan_sweep = true;
+                            continue;
+                        }
+                    };
                 let grant_arc = Arc::new(manifest.capabilities.clone());
                 backfills.push(InstalledPlugin {
                     plugin_id: Arc::clone(&id_arc),
@@ -4217,6 +4283,134 @@ wasm = "plugin.wasm"
         assert_ne!(
             *installed.installation_uuid, *real_uuid,
             "reinstall must mint a fresh installation UUID (C1b identity rotation)",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-10 F1: a hand-placed dir under
+    /// `<plugins_root>/<plugin_id>/` whose UI declarations
+    /// don't validate AND which has no matching SQL row
+    /// must still be reachable by `uninstall`. Pre-fix, the
+    /// scan's UI failure branch consulted only `live_rows`
+    /// and `quarantined_uuids`; when both missed it just
+    /// `continue`d, leaving the dir orphaned — `uninstall`
+    /// returned 404 (neither registry map contained the id)
+    /// and a valid reinstall bounced off `AlreadyInstalled`
+    /// because `dest.exists()`. Path-only quarantine with a
+    /// synthetic UUID makes recovery API-only.
+    #[test]
+    fn scan_quarantines_invalid_ui_dir_with_no_sql_row_so_uninstall_can_recover() {
+        let root = tempdir("orphan-invalid-ui");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+
+        let plugin_id = "example.orphan-badui";
+        let d = plugins_root.join(plugin_id);
+        std::fs::create_dir_all(d.join("ui")).unwrap();
+        std::fs::write(
+            d.join("manifest.toml"),
+            format!(
+                r#"manifest_version = 1
+[plugin]
+id = "{plugin_id}"
+name = "Orphan Bad UI"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+[ui]
+config = "ui/config.js"
+config-schema = "ui/config.schema.json"
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(d.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        std::fs::write(d.join("ui/config.js"), b"export default {};").unwrap();
+        // Intentionally omit ui/config.schema.json so
+        // validate_ui_package fails on this dir.
+
+        let db = fresh_db();
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).expect("scan");
+        assert!(
+            reg.list().iter().all(|p| &*p.plugin_id != plugin_id),
+            "invalid-UI dir must not be indexed as live",
+        );
+        assert!(
+            reg.is_quarantined(plugin_id),
+            "round-10 F1: invalid-UI dir with no SQL row must still be quarantined",
+        );
+
+        reg.uninstall(plugin_id).expect("uninstall must succeed");
+        assert!(
+            !plugins_root.join(plugin_id).exists(),
+            "one uninstall must remove the orphan dir",
+        );
+
+        // And a follow-up install for the same id must
+        // succeed (dir is gone; no live SQL row to bounce
+        // off).
+        let source = write_plugin_dir(&root, plugin_id);
+        reg.install(&source)
+            .expect("fresh install must succeed after path-only quarantine uninstall");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-10 F1: same shape, but the reason
+    /// scan can't backfill is a wasm read failure (symlink
+    /// refusal), not a UI validation failure. Both branches
+    /// have to produce a path-only quarantine entry.
+    #[cfg(unix)]
+    #[test]
+    fn scan_quarantines_backfill_digest_failure_so_uninstall_can_recover() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir("orphan-backfill-fail");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+
+        let plugin_id = "example.orphan-badwasm";
+        let d = plugins_root.join(plugin_id);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("manifest.toml"),
+            format!(
+                r#"manifest_version = 1
+[plugin]
+id = "{plugin_id}"
+name = "Bad Wasm"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+            ),
+        )
+        .unwrap();
+        // plugin.wasm is a symlink to an out-of-tree file —
+        // read_no_follow_within rejects with `InvalidInput`.
+        let outside = root.join("out-of-tree.wasm");
+        std::fs::write(&outside, b"\0asm\x01\x00\x00\x00").unwrap();
+        symlink(&outside, d.join("plugin.wasm")).unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).expect("scan");
+        assert!(
+            reg.list().iter().all(|p| &*p.plugin_id != plugin_id),
+            "backfill-failing dir must not be indexed",
+        );
+        assert!(
+            reg.is_quarantined(plugin_id),
+            "round-10 F1: backfill-fail dir with no SQL row must still be quarantined",
+        );
+
+        reg.uninstall(plugin_id).expect("uninstall must succeed");
+        assert!(
+            !plugins_root.join(plugin_id).exists(),
+            "one uninstall must remove the orphan dir",
         );
 
         std::fs::remove_dir_all(&root).unwrap();
