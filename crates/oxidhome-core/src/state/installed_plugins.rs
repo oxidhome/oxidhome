@@ -1127,7 +1127,20 @@ impl InstalledPluginRegistry {
                         );
                     }
                 }
-                defer_orphan_sweep = true;
+                // Round-11 F1: do NOT set defer_orphan_sweep
+                // here. We've already parsed the manifest,
+                // resolved a safe id, and inserted into
+                // `observed_manifest_ids` above — the sweep
+                // already skips this specific id via
+                // `observed_manifest_ids.contains_key`.
+                // Deferring the GLOBAL sweep for one
+                // unrelated invalid package left every
+                // orphan live-row untombstoned every boot,
+                // so an unrelated dir the operator had
+                // manually cleaned up couldn't be reinstalled
+                // via the API (`AlreadyInstalled` from the
+                // unique index on the live row that never
+                // got tombstoned).
                 continue;
             }
             // C5 review F1: quarantine any installation whose
@@ -1286,7 +1299,12 @@ impl InstalledPluginRegistry {
                                     );
                                 }
                             }
-                            defer_orphan_sweep = true;
+                            // Round-11 F1: id is known and
+                            // already in `observed_manifest_ids`,
+                            // so the sweep protects this id
+                            // specifically — no need to defer
+                            // the global sweep for unrelated
+                            // rows.
                             continue;
                         }
                     };
@@ -4412,6 +4430,94 @@ wasm = "plugin.wasm"
             !plugins_root.join(plugin_id).exists(),
             "one uninstall must remove the orphan dir",
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-11 F1: an invalid UI package for one
+    /// plugin must NOT suppress orphan cleanup for
+    /// unrelated live rows. Pre-fix the UI failure branch
+    /// set `defer_orphan_sweep = true` unconditionally, so a
+    /// single unrelated invalid package on disk froze every
+    /// missing-dir SQL row in a live state forever — the
+    /// operator couldn't reinstall the missing plugin
+    /// (`AlreadyInstalled` from the untombstoned unique
+    /// index).
+    #[test]
+    fn scan_ui_failure_does_not_block_unrelated_orphan_sweep() {
+        let root = tempdir("ui-fail-orphan");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+        let db = fresh_db();
+
+        // Plugin A: live SQL row, NO on-disk dir → orphan.
+        let ghost = InstalledPlugin {
+            plugin_id: Arc::from("example.ghost"),
+            installation_uuid: mint_installation_uuid(),
+            version: "0.1.0".to_string(),
+            path: plugins_root.join("example.ghost"),
+            granted_capabilities: Arc::new(CapabilitiesSection::default()),
+            content_digest: Arc::from("0".repeat(64)),
+        };
+        insert_installation_row(&db, &ghost).unwrap();
+        let ghost_uuid = Arc::clone(&ghost.installation_uuid);
+
+        // Plugin B: on-disk dir with a missing declared UI
+        // schema — validate_ui_package fails, but the id is
+        // safely parsed.
+        let d = plugins_root.join("example.badui");
+        std::fs::create_dir_all(d.join("ui")).unwrap();
+        std::fs::write(
+            d.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.badui"
+name = "Bad UI"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+[ui]
+config = "ui/config.js"
+config-schema = "ui/config.schema.json"
+"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        std::fs::write(d.join("ui/config.js"), b"export default {};").unwrap();
+        // Intentionally omit ui/config.schema.json.
+
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).expect("scan");
+
+        // A: the orphan MUST be tombstoned.
+        let uninstalled_ms: Option<i64> = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT uninstalled_ms FROM plugin_installation
+                     WHERE installation_uuid = ?1",
+                    [&*ghost_uuid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(
+            uninstalled_ms.is_some(),
+            "round-11 F1: an unrelated invalid-UI dir must not defer the orphan sweep for example.ghost",
+        );
+
+        // B: the invalid-UI dir must be quarantined.
+        assert!(
+            reg.is_quarantined("example.badui"),
+            "the invalid-UI dir must land in the quarantine registry",
+        );
+
+        // And a fresh install for `example.ghost` must
+        // succeed now that its live row is tombstoned.
+        let source = write_plugin_dir(&root, "example.ghost");
+        reg.install(&source)
+            .expect("fresh install for the previously-orphaned id must succeed");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
