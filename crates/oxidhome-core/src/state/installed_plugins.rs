@@ -321,19 +321,20 @@ fn handle_invalid_ui_dir(
     quarantined_uuids: &HashMap<String, Arc<str>>,
     quarantined_registry: &mut HashMap<Arc<str>, QuarantineEntry>,
 ) {
-    // Round-14 F2: the pre-round-11 log claimed this
-    // branch deferred the orphan sweep, but round-11 F1
-    // removed that defer (the id is already in
-    // `observed_manifest_ids`, so the sweep skips this
-    // specific id via `.contains_key` — unrelated rows
-    // still get tombstoned this boot). Wording updated to
-    // match the actual behaviour so the reconciliation
-    // log isn't materially misleading.
+    // Round-14 F2 + round-15 F1: describe this branch's
+    // action only, not the aggregate boot outcome. This
+    // branch does NOT set `defer_orphan_sweep`; another
+    // branch this boot might (an unreadable manifest,
+    // unsafe id, `read_dir` entry error, `file_type()`
+    // error), so we can't state authoritatively here that
+    // the sweep will run — only that we didn't ourselves
+    // suppress it. The aggregate outcome is reported by
+    // the final reconciliation log below.
     tracing::warn!(
         plugin_id = %manifest_id,
         path = %path.display(),
         reason = %reason,
-        "skipping installed dir with invalid UI package — quarantining this id (unrelated orphan rows are still swept this boot)",
+        "skipping installed dir with invalid UI package — quarantining this id without deferring the orphan sweep",
     );
     let uuid = live_rows
         .get(manifest_id)
@@ -1448,10 +1449,24 @@ impl InstalledPluginRegistry {
         // manifest blips at the cost of leaving genuine orphans in
         // place for one extra boot.
         if defer_orphan_sweep {
+            // Round-15 F1: report the aggregate outcome so
+            // an operator reading the scan log doesn't have
+            // to correlate per-dir warnings to know whether
+            // any live rows got tombstoned this boot.
+            let candidates = live_rows
+                .keys()
+                .filter(|id| {
+                    !observed_manifest_ids.contains_key(id.as_str())
+                        && !duplicate_manifest_ids.contains(id.as_str())
+                })
+                .count();
             tracing::warn!(
-                "orphan-live-row sweep deferred this boot due to unresolvable directories (see prior warnings)",
+                candidate_orphan_rows = candidates,
+                "orphan-live-row sweep DEFERRED this boot due to unresolvable directories — no live rows tombstoned (see prior warnings)",
             );
         } else {
+            let mut tombstoned = 0usize;
+            let mut failed = 0usize;
             for (plugin_id, live) in &live_rows {
                 // A quarantined-as-duplicate id is still
                 // "observed on disk" for the orphan sweep —
@@ -1461,20 +1476,30 @@ impl InstalledPluginRegistry {
                 {
                     let uuid = &live.installation_uuid;
                     match tombstone_installation_row(&db, uuid) {
-                        Ok(()) => tracing::warn!(
-                            plugin_id = %plugin_id,
-                            installation_uuid = %uuid,
-                            "auto-tombstoned live plugin_installation row whose plugin dir is missing (crashed install or interrupted uninstall)",
-                        ),
-                        Err(err) => tracing::error!(
-                            plugin_id = %plugin_id,
-                            installation_uuid = %uuid,
-                            %err,
-                            "failed to auto-tombstone orphan live plugin_installation row",
-                        ),
+                        Ok(()) => {
+                            tombstoned += 1;
+                            tracing::warn!(
+                                plugin_id = %plugin_id,
+                                installation_uuid = %uuid,
+                                "auto-tombstoned live plugin_installation row whose plugin dir is missing (crashed install or interrupted uninstall)",
+                            );
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            tracing::error!(
+                                plugin_id = %plugin_id,
+                                installation_uuid = %uuid,
+                                %err,
+                                "failed to auto-tombstone orphan live plugin_installation row",
+                            );
+                        }
                     }
                 }
             }
+            // Round-15 F1: final outcome line so an operator
+            // reading the log sees "sweep ran; N rows
+            // tombstoned" alongside per-row detail.
+            tracing::info!(tombstoned, failed, "orphan-live-row sweep RAN this boot",);
         }
 
         // Persist backfilled UUIDs so the identity survives the
