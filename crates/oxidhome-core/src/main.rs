@@ -186,14 +186,24 @@ async fn main() -> anyhow::Result<()> {
     // incident, since for a home hub a missed actuation response
     // is recoverable from the audit log + state, and a wedged
     // shutdown is not.
-    tokio::select! {
+    // Round-6 F1: capture the serve error (if any)
+    // instead of propagating with `?` inside the select —
+    // the propagation used to skip stop / drain / log
+    // flush on an accept-loop failure. Cleanup still runs,
+    // then we return the deferred error at the bottom of
+    // main.
+    let serve_error: Option<anyhow::Error> = tokio::select! {
         result = serve(engine.clone(), listener) => {
-            result.context("api server stopped unexpectedly")?;
+            match result {
+                Ok(()) => None,
+                Err(err) => Some(err.context("api server stopped unexpectedly")),
+            }
         }
         signal = shutdown_signal() => {
             tracing::info!(signal = signal, "shutdown signal received; draining");
+            None
         }
-    }
+    };
 
     // Round-2 F1 + round-3 F1: stop every supervised
     // instance and await its reaper's cleanup before
@@ -210,7 +220,11 @@ async fn main() -> anyhow::Result<()> {
     // 3 F1) — a timed-out `stop` leaves the supervisor
     // running, whose reaper would then block an unbounded
     // drain forever.
-    engine
+    // Round-6 F2: the report names any supervisor that
+    // didn't reach terminal within the deadline; we don't
+    // inspect it here because the bounded drain below
+    // handles the timed-out subset uniformly (detaches).
+    let _ = engine
         .stop_all_supervised_instances(SHUTDOWN_STOP_PER_INSTANCE_DEADLINE)
         .await;
     let _ = engine
@@ -231,6 +245,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Round-6 F1: propagate the serve error (if any) AFTER
+    // running the full shutdown-cleanup sequence, so
+    // systemd / runit still see a non-zero exit and can
+    // restart.
+    if let Some(err) = serve_error {
+        return Err(err);
+    }
     Ok(())
 }
 

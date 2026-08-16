@@ -388,13 +388,26 @@ async fn drain_with_timeout_is_bounded_and_leaves_live_supervisor_untouched() {
         "round-6 F1: bounded drain must NOT unregister a supervisor that is still running",
     );
 
-    // Clean up properly for the test's own teardown. The
-    // reaper is still alive on this Engine (only the
-    // wrapper was aborted), so a proper stop + unbounded
-    // drain converges on a clean state.
+    // Round-6 F3: proper test teardown — stop the
+    // supervisor and then poll the registry until the
+    // (still-alive, but detached from our tracker) reaper
+    // wakes on the terminal transition and calls
+    // `registry.unregister`. Calling
+    // `drain_supervised_instances` here would be a no-op
+    // because the bounded drain already emptied the
+    // tracker; the reaper task is running but no longer
+    // observable through the drain API.
     handle.stop().await.expect("stop");
     assert_eq!(handle.wait_terminal().await, InstanceState::Stopped);
-    engine.drain_supervised_instances().await;
+    wait_until_unregistered(&engine, "drain-timeout").await;
+    assert!(
+        engine.instance("drain-timeout").is_none(),
+        "reaper must eventually run its unregister step once the supervisor terminates",
+    );
+    assert!(
+        engine.devices().list().is_empty(),
+        "reaper must eventually evict devices once the supervisor terminates",
+    );
 }
 
 /// Round-2 F3: the pinned manifest snapshot supplied at

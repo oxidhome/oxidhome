@@ -127,6 +127,46 @@ pub struct Engine {
     reaper_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Round-6 F2: outcome of [`Engine::stop_all_supervised_instances`].
+/// Callers who follow the "stop then unbounded drain"
+/// recipe MUST inspect `timed_out` — an unbounded drain
+/// following a partial stop waits forever on the
+/// timed-out supervisor's reaper. `main.rs` skips the
+/// inspection because it uses the bounded drain, which
+/// handles both subsets uniformly by detaching stragglers.
+#[derive(Debug, Default)]
+pub struct StopAllReport {
+    /// Number of supervisors that reached a terminal state
+    /// within `per_stop_timeout`.
+    pub stopped: usize,
+    /// `instance_id`s whose `stop` returned an error (rare
+    /// — the current `stop` implementation is infallible
+    /// on the happy path).
+    pub errored: Vec<Arc<str>>,
+    /// `instance_id`s whose `stop` didn't return within
+    /// `per_stop_timeout` — their supervisor task is still
+    /// running.
+    pub timed_out: Vec<Arc<str>>,
+}
+
+impl StopAllReport {
+    /// True when every supervisor reached a terminal
+    /// state — safe to follow with the unbounded
+    /// [`Engine::drain_supervised_instances`].
+    #[must_use]
+    pub fn all_stopped(&self) -> bool {
+        self.errored.is_empty() && self.timed_out.is_empty()
+    }
+}
+
+/// Internal per-instance stop outcome, folded into
+/// `StopAllReport` in the `JoinSet` loop.
+enum StopOne {
+    Stopped,
+    Errored(Arc<str>),
+    TimedOut(Arc<str>),
+}
+
 /// Phase 6 leftover: shared map of per-instance reaper
 /// `JoinHandle`s + their generation tokens.
 /// `std::sync::Mutex` (not `tokio::sync`) because insertion
@@ -836,17 +876,22 @@ impl Engine {
     /// state invariants on a LONG-LIVED [`Engine`]**
     /// (tests, embedding). Callers who need that must
     /// first stop every supervisor via
-    /// [`Self::stop_all_supervised_instances`] (which
-    /// ensures reapers wake up naturally on the terminal
-    /// transition) THEN call the UNBOUNDED
-    /// [`Self::drain_supervised_instances`]. Trying to
-    /// clean up on behalf of a wedged reaper here would
-    /// either (a) unregister a still-running supervisor
-    /// (freeing its singleton slot for a duplicate to
-    /// start under the same id), (b) mis-target cleanup
-    /// against a reaper generation that had already been
-    /// recycled, or (c) deadlock on whichever lock
-    /// wedged the reaper in the first place.
+    /// [`Self::stop_all_supervised_instances`] AND check
+    /// its [`StopAllReport::all_stopped`] return; only
+    /// then is the unbounded
+    /// [`Self::drain_supervised_instances`] safe. A
+    /// supervisor that timed out on stop still has its
+    /// reaper blocked on `wait_terminal`, and an unbounded
+    /// drain would await it forever (round-6 F2).
+    ///
+    /// Trying to clean up on behalf of a wedged reaper
+    /// here would either (a) unregister a still-running
+    /// supervisor (freeing its singleton slot for a
+    /// duplicate to start under the same id), (b) mis-
+    /// target cleanup against a reaper generation that
+    /// had already been recycled, or (c) deadlock on
+    /// whichever lock wedged the reaper in the first
+    /// place.
     ///
     /// Returns `Ok(())` if every reaper completed within
     /// the deadline; `Err(count)` — the number of reapers
@@ -939,51 +984,72 @@ impl Engine {
         guard.drain().map(|(_, (_gen, jh))| jh).collect()
     }
 
-    /// Round-2 F1: request every supervised instance to
-    /// stop, giving each one up to `per_stop_timeout` to
-    /// reach a terminal state. Returns after every request
-    /// has either drained or timed out; a timed-out instance
-    /// still has its supervisor task alive, but the
-    /// subsequent `drain_supervised_instances` will still
-    /// await its reaper once it does terminate (or leak the
-    /// task to the tokio runtime teardown, which is the
-    /// pre-existing behaviour we were already stuck with).
+    /// Round-2 F1 + round-6 F2: request every supervised
+    /// instance to stop, giving each one up to
+    /// `per_stop_timeout` to reach a terminal state.
+    /// Returns a [`StopAllReport`] naming every supervisor
+    /// that DIDN'T reach terminal — pre-round-6 the method
+    /// returned `()` and swallowed timeouts, which meant
+    /// the "stop-then-unbounded-drain" recipe in the
+    /// bounded drain's docstring silently hung forever
+    /// when even one supervisor timed out (its reaper
+    /// stays blocked on `wait_terminal` and an unbounded
+    /// drain awaits it indefinitely).
     ///
     /// Called from `main.rs`'s shutdown path so a SIGTERM /
     /// Ctrl-C stops supervisors cleanly instead of relying
     /// on runtime teardown to abort them mid-`init`.
-    ///
-    /// Best-effort — a supervisor that ignores its
-    /// `shutdown` command (bug) or a plugin whose graceful-
-    /// shutdown budget exceeds `per_stop_timeout` are both
-    /// visible as `stop` errors we swallow here (the
-    /// tracing log records the outcome).
-    pub async fn stop_all_supervised_instances(&self, per_stop_timeout: std::time::Duration) {
+    /// `main` doesn't inspect the report — the subsequent
+    /// bounded drain handles both the healthy and the
+    /// timed-out subsets uniformly.
+    pub async fn stop_all_supervised_instances(
+        &self,
+        per_stop_timeout: std::time::Duration,
+    ) -> StopAllReport {
         let handles = self.instances.list();
         // Fire every stop in parallel so total wall-clock is
         // bounded by `per_stop_timeout`, not
         // `N * per_stop_timeout`.
         let mut js = tokio::task::JoinSet::new();
         for handle in handles {
-            let instance_id = handle.instance_id().to_string();
+            let instance_id: Arc<str> = Arc::from(handle.instance_id());
+            let per = per_stop_timeout;
             js.spawn(async move {
-                match tokio::time::timeout(per_stop_timeout, handle.stop()).await {
-                    Ok(Ok(())) => tracing::info!(instance_id, "supervised instance stopped"),
-                    Ok(Err(err)) => tracing::warn!(
-                        instance_id,
-                        %err,
-                        "supervised instance stop returned error",
-                    ),
-                    Err(_) => tracing::warn!(
-                        instance_id,
-                        timeout_ms =
-                            u64::try_from(per_stop_timeout.as_millis()).unwrap_or(u64::MAX),
-                        "supervised instance did not stop within per-instance deadline",
-                    ),
+                match tokio::time::timeout(per, handle.stop()).await {
+                    Ok(Ok(())) => {
+                        tracing::info!(instance_id = %instance_id, "supervised instance stopped");
+                        StopOne::Stopped
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            instance_id = %instance_id,
+                            %err,
+                            "supervised instance stop returned error",
+                        );
+                        StopOne::Errored(instance_id)
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            instance_id = %instance_id,
+                            timeout_ms =
+                                u64::try_from(per.as_millis()).unwrap_or(u64::MAX),
+                            "supervised instance did not stop within per-instance deadline",
+                        );
+                        StopOne::TimedOut(instance_id)
+                    }
                 }
             });
         }
-        while js.join_next().await.is_some() {}
+        let mut report = StopAllReport::default();
+        while let Some(res) = js.join_next().await {
+            match res {
+                Ok(StopOne::Stopped) => report.stopped += 1,
+                Ok(StopOne::Errored(id)) => report.errored.push(id),
+                Ok(StopOne::TimedOut(id)) => report.timed_out.push(id),
+                Err(join_err) => tracing::error!(%join_err, "stop task panicked"),
+            }
+        }
+        report
     }
 
     /// Look up a running instance by id. `None` if no such
