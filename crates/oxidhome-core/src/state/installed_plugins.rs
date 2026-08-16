@@ -915,6 +915,23 @@ impl InstalledPluginRegistry {
                 if !duplicate_manifest_ids.contains(&manifest_id) {
                     duplicate_manifest_ids.insert(manifest_id.clone());
                     let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
+                    // Round-6 F1: the UUID resolution order
+                    // MUST include `quarantined_uuids` and
+                    // the pre-populated `quarantined_registry`
+                    // slot before dropping to the synthetic
+                    // `"dup-unknown"` placeholder. A live SQL
+                    // row with a malformed grant / missing
+                    // digest is intentionally absent from
+                    // `entries` AND `live_rows` (fail-closed
+                    // per C5 F1) but present in
+                    // `quarantined_uuids`; the pre-fix chain
+                    // fell straight through to
+                    // `"dup-unknown"`, and `uninstall` then
+                    // tombstoned that placeholder — a 0-row
+                    // update that reported success while the
+                    // real SQL row stayed live, so the
+                    // operator's immediate reinstall failed
+                    // with `AlreadyInstalled`.
                     let prior_uuid = entries
                         .remove(&id_arc)
                         .map(|e| e.installation_uuid)
@@ -923,6 +940,12 @@ impl InstalledPluginRegistry {
                                 .get(&manifest_id)
                                 .map(|l| Arc::clone(&l.installation_uuid))
                         })
+                        .or_else(|| quarantined_uuids.get(&manifest_id).map(Arc::clone))
+                        .or_else(|| {
+                            quarantined_registry
+                                .get(&id_arc)
+                                .map(|e| Arc::clone(&e.installation_uuid))
+                        })
                         .unwrap_or_else(|| Arc::from("dup-unknown"));
                     if let Some(prior_path) = observed_manifest_ids.get(&manifest_id) {
                         tracing::error!(
@@ -930,13 +953,29 @@ impl InstalledPluginRegistry {
                             first_path = %prior_path.display(),
                             "duplicate manifest.plugin.id on scan — quarantining first-seen dir",
                         );
-                        quarantined_registry.insert(
-                            Arc::clone(&id_arc),
-                            QuarantineEntry {
-                                installation_uuid: Arc::clone(&prior_uuid),
-                                paths: vec![prior_path.clone()],
-                            },
-                        );
+                        // Round-6 F1: merge into an existing
+                        // pre-populated quarantine slot rather
+                        // than overwriting — the pre-populated
+                        // entry may already carry the real
+                        // UUID that `unwrap_or_else` above
+                        // would have dropped.
+                        match quarantined_registry.get_mut(&id_arc) {
+                            Some(entry) => {
+                                entry.installation_uuid = Arc::clone(&prior_uuid);
+                                if !entry.paths.contains(prior_path) {
+                                    entry.paths.push(prior_path.clone());
+                                }
+                            }
+                            None => {
+                                quarantined_registry.insert(
+                                    Arc::clone(&id_arc),
+                                    QuarantineEntry {
+                                        installation_uuid: Arc::clone(&prior_uuid),
+                                        paths: vec![prior_path.clone()],
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
                 tracing::error!(
@@ -951,21 +990,33 @@ impl InstalledPluginRegistry {
                 // next scan then saw it as unique + backfilled a
                 // fresh UUID, reactivating the exact H8 scenario.
                 let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
-                match quarantined_registry.get_mut(&id_arc) {
-                    Some(entry) => {
-                        if !entry.paths.contains(&path) {
-                            entry.paths.push(path.clone());
-                        }
+                if let Some(entry) = quarantined_registry.get_mut(&id_arc) {
+                    if !entry.paths.contains(&path) {
+                        entry.paths.push(path.clone());
                     }
-                    None => {
-                        quarantined_registry.insert(
-                            id_arc,
-                            QuarantineEntry {
-                                installation_uuid: Arc::from("dup-unknown"),
-                                paths: vec![path.clone()],
-                            },
-                        );
-                    }
+                } else {
+                    // Round-6 F1: fall back through the same
+                    // UUID chain here so a third-sighting
+                    // whose sibling entries vanished from
+                    // `quarantined_registry` between
+                    // iterations doesn't reinsert the
+                    // placeholder.
+                    let uuid = quarantined_uuids
+                        .get(&manifest_id)
+                        .map(Arc::clone)
+                        .or_else(|| {
+                            live_rows
+                                .get(&manifest_id)
+                                .map(|l| Arc::clone(&l.installation_uuid))
+                        })
+                        .unwrap_or_else(|| Arc::from("dup-unknown"));
+                    quarantined_registry.insert(
+                        id_arc,
+                        QuarantineEntry {
+                            installation_uuid: uuid,
+                            paths: vec![path.clone()],
+                        },
+                    );
                 }
                 continue;
             }
@@ -3865,6 +3916,116 @@ widgets = ["ui/w0.js","ui/w1.js","ui/w2.js","ui/w3.js","ui/w4.js"]
             }
             other => panic!("expected BadManifest; got {other:?}"),
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-6 F1: a SQL row with a malformed
+    /// `granted_capabilities_json` is intentionally kept out
+    /// of `live_rows` (fail-closed per C5 F1) and lands in
+    /// `quarantined_uuids` instead. When the same
+    /// `plugin_id` also has two directories on disk,
+    /// duplicate reconciliation must resolve the real UUID
+    /// from `quarantined_uuids` — pre-fix the chain fell
+    /// through to `"dup-unknown"`, `uninstall` tombstoned
+    /// the placeholder (0-row update reported as success),
+    /// the real row stayed live, and the operator's
+    /// immediate reinstall failed with `AlreadyInstalled`.
+    #[test]
+    fn scan_duplicate_ids_with_malformed_grant_row_still_uninstalls_real_uuid() {
+        let root = tempdir("dup-with-malformed-grant");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+        let db = fresh_db();
+
+        // Persist a live SQL row whose granted_capabilities_json
+        // is not valid JSON — load_live_installations will move
+        // it into `quarantined_uuids` (not `live`).
+        let plugin_id = "example.malformed-dup";
+        let real_uuid = mint_installation_uuid();
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO plugin_installation
+                     (installation_uuid, plugin_id, version, installed_ms, uninstalled_ms,
+                      granted_capabilities_json, content_digest)
+                 VALUES (?1, ?2, '0.1.0', 1, NULL, 'not-json', ?3)",
+                rusqlite::params![&*real_uuid, plugin_id, &"0".repeat(64)],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        // Two directories both declaring plugin_id = the same id.
+        for dir_name in ["a-first", "z-second"] {
+            let d = plugins_root.join(dir_name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("manifest.toml"),
+                format!(
+                    r#"manifest_version = 1
+[plugin]
+id = "{plugin_id}"
+name = "Malformed Dup"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+"#,
+                ),
+            )
+            .unwrap();
+            std::fs::write(d.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        }
+
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).expect("scan");
+        assert!(
+            reg.list().iter().all(|p| &*p.plugin_id != plugin_id),
+            "duplicate id backed by a malformed-grant row must not be indexed as live",
+        );
+        assert!(
+            reg.is_quarantined(plugin_id),
+            "duplicate id must be quarantined",
+        );
+
+        reg.uninstall(plugin_id).expect("uninstall");
+        for dir_name in ["a-first", "z-second"] {
+            assert!(
+                !plugins_root.join(dir_name).exists(),
+                "one uninstall must remove both duplicate dirs (dir: {dir_name})",
+            );
+        }
+        // Round-6 F1 core assertion: uninstall MUST have
+        // tombstoned the real installation row — not the
+        // synthetic `"dup-unknown"` placeholder. The stored
+        // UUID for the real row now has a non-NULL
+        // uninstalled_ms.
+        let tombstoned: Option<i64> = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT uninstalled_ms
+                     FROM plugin_installation
+                     WHERE installation_uuid = ?1",
+                    [&*real_uuid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(
+            tombstoned.is_some(),
+            "the real installation row must be tombstoned by uninstall",
+        );
+
+        // And an immediate reinstall must succeed — pre-fix
+        // the real live row remained, so this hit
+        // `AlreadyInstalled`.
+        let source = write_plugin_dir(&root, plugin_id);
+        let installed = reg.install(&source).expect("reinstall must succeed");
+        assert_ne!(
+            *installed.installation_uuid, *real_uuid,
+            "reinstall must mint a fresh installation UUID (C1b identity rotation)",
+        );
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
