@@ -271,6 +271,84 @@ pub fn recompute_installed_digest(
     Ok(content_digest(manifest_bytes, wasm_bytes, &frames))
 }
 
+/// Round-13 F1: scan-only digest recomputation that hashes
+/// **caller-provided** UI asset bytes rather than re-reading
+/// them from disk. Scan first runs `validate_ui_package`
+/// (which meta-validates the JSON-Schema files and returns
+/// the exact bytes it inspected); this helper then uses
+/// those same bytes for the digest. Pre-fix, scan called
+/// `read_installed_bytes` here — which re-reads the UI
+/// bytes internally WITHOUT meta-validating — so a
+/// schema swap between the validator's read and the
+/// digest's re-read would let scan persist a digest for
+/// an invalid schema and index it as live.
+///
+/// # Errors
+///
+/// Any `std::io::Error` from the manifest.toml / wasm
+/// reads. UI asset bytes are supplied by the caller, so
+/// there's no additional IO here for them.
+pub(crate) fn scan_digest_with_validated_ui(
+    plugin_dir: &Path,
+    runtime_wasm_rel: &Path,
+    ui_assets: Option<&ValidatedUiAssets>,
+) -> std::io::Result<String> {
+    let manifest_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join("manifest.toml"))?;
+    let wasm_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join(runtime_wasm_rel))?;
+    let frames = ui_assets.map(ui_asset_digest_frames).unwrap_or_default();
+    Ok(content_digest(&manifest_bytes, &wasm_bytes, &frames))
+}
+
+/// Scan-time helper: quarantine a directory whose UI
+/// validation just failed, preserving whatever UUID we can
+/// resolve (`live_rows` → `quarantined_uuids` → synthetic
+/// [`NO_SQL_ROW_UUID`]) and merging into any pre-populated
+/// quarantine slot so its persisted UUID + prior paths
+/// survive. Extracted in round-13 F1 to keep the scan
+/// loop's `let validated_ui_assets = ...` conditional
+/// readable — the branch used to be inlined and dominated
+/// the surrounding flow.
+fn handle_invalid_ui_dir(
+    manifest_id: &str,
+    path: &Path,
+    reason: &str,
+    live_rows: &HashMap<String, LiveInstallation>,
+    quarantined_uuids: &HashMap<String, Arc<str>>,
+    quarantined_registry: &mut HashMap<Arc<str>, QuarantineEntry>,
+) {
+    tracing::warn!(
+        plugin_id = %manifest_id,
+        path = %path.display(),
+        reason = %reason,
+        "skipping installed dir with invalid UI package — deferring orphan-live-row sweep this boot",
+    );
+    let uuid = live_rows
+        .get(manifest_id)
+        .map(|l| Arc::clone(&l.installation_uuid))
+        .or_else(|| quarantined_uuids.get(manifest_id).map(Arc::clone))
+        .unwrap_or_else(|| Arc::from(NO_SQL_ROW_UUID));
+    let id_arc: Arc<str> = Arc::from(manifest_id);
+    match quarantined_registry.get_mut(&id_arc) {
+        Some(entry) => {
+            if &*entry.installation_uuid == NO_SQL_ROW_UUID {
+                entry.installation_uuid = uuid;
+            }
+            if !entry.paths.contains(&path.to_path_buf()) {
+                entry.paths.push(path.to_path_buf());
+            }
+        }
+        None => {
+            quarantined_registry.insert(
+                id_arc,
+                QuarantineEntry {
+                    installation_uuid: uuid,
+                    paths: vec![path.to_path_buf()],
+                },
+            );
+        }
+    }
+}
+
 /// Read `path` into a `Vec<u8>` after refusing to follow a
 /// symlink AND after verifying the canonicalized path lives
 /// under `root`. Used by [`read_installed_bytes`] so a
@@ -1089,93 +1167,36 @@ impl InstalledPluginRegistry {
             // for the id we're rejecting here, add it to the
             // quarantine registry so raw-path `LoadMode::Dev`
             // stays fail-closed.
-            if let Some(ui) = manifest.ui.as_ref()
-                && let Err(reason) = validate_ui_package(ui, &path)
-            {
-                tracing::warn!(
-                    plugin_id = %manifest_id,
-                    path = %path.display(),
-                    reason = %reason,
-                    "skipping installed dir with invalid UI package — deferring orphan-live-row sweep this boot",
-                );
-                // Round-4 F1 + round-7 F1: preserve the real
-                // UUID by looking up in BOTH `live_rows` and
-                // `quarantined_uuids`. A SQL row whose
-                // `granted_capabilities_json` is malformed or
-                // whose `content_digest` is NULL sits in
-                // `quarantined_uuids` (fail-closed per C5
-                // F1/F3) — not `live_rows` — and if the
-                // matching directory name differs from
-                // `manifest.plugin.id` (aliased-dir case), the
-                // pre-populated quarantine slot's path list is
-                // empty. Pre-fix we returned early here after
-                // consulting only `live_rows`, so the
-                // aliased-invalid-UI directory never got
-                // recorded; `uninstall` then tombstoned the
-                // SQL row but left the dir on disk, and an
-                // operator repair backfilled a fresh UUID off
-                // it — the H8 identity-reactivation shape.
-                // Round-10 F1: fall through to a synthetic
-                // UUID when no SQL row (live or quarantined)
-                // exists for this id. Pre-fix we skipped
-                // silently, which left a canonical
-                // `<plugins_root>/<plugin_id>/` dir on disk
-                // that `uninstall` refused (404 — neither
-                // registry map contained the id) and a
-                // reinstall bounced off `AlreadyInstalled`
-                // because `dest.exists()`. Path-only
-                // quarantine makes the dir addressable via
-                // the API: `uninstall` yanks the dir and the
-                // synthetic UUID's tombstone update is a
-                // 0-row no-op — no SQL row to touch.
-                let uuid = live_rows
-                    .get(&manifest_id)
-                    .map(|l| Arc::clone(&l.installation_uuid))
-                    .or_else(|| quarantined_uuids.get(&manifest_id).map(Arc::clone))
-                    .unwrap_or_else(|| Arc::from(NO_SQL_ROW_UUID));
-                let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
-                // Merge into the pre-populated slot (may
-                // already carry paths from earlier sibling
-                // dirs); don't overwrite. Preserve a
-                // pre-populated real UUID rather than
-                // clobbering it with the synthetic
-                // placeholder — the placeholder is a
-                // last-resort fallback.
-                match quarantined_registry.get_mut(&id_arc) {
-                    Some(entry) => {
-                        if &*entry.installation_uuid == NO_SQL_ROW_UUID {
-                            entry.installation_uuid = uuid;
-                        }
-                        if !entry.paths.contains(&path) {
-                            entry.paths.push(path.clone());
+            // Round-13 F1: validate the UI package ONCE and
+            // keep the returned `ValidatedUiAssets` alive
+            // across every downstream branch that needs to
+            // hash UI bytes — so the digest is computed
+            // against the same bytes the validator actually
+            // inspected. Pre-fix scan validated + discarded
+            // + re-read via `read_installed_bytes`, so a
+            // schema flip from valid to invalid between the
+            // two reads let scan hash the invalid second
+            // snapshot and persist it as the authoritative
+            // digest.
+            let validated_ui_assets: Option<ValidatedUiAssets> =
+                if let Some(ui) = manifest.ui.as_ref() {
+                    match validate_ui_package(ui, &path) {
+                        Ok(assets) => Some(assets),
+                        Err(reason) => {
+                            handle_invalid_ui_dir(
+                                &manifest_id,
+                                &path,
+                                &reason,
+                                &live_rows,
+                                &quarantined_uuids,
+                                &mut quarantined_registry,
+                            );
+                            continue;
                         }
                     }
-                    None => {
-                        quarantined_registry.insert(
-                            id_arc,
-                            QuarantineEntry {
-                                installation_uuid: uuid,
-                                paths: vec![path.clone()],
-                            },
-                        );
-                    }
-                }
-                // Round-11 F1: do NOT set defer_orphan_sweep
-                // here. We've already parsed the manifest,
-                // resolved a safe id, and inserted into
-                // `observed_manifest_ids` above — the sweep
-                // already skips this specific id via
-                // `observed_manifest_ids.contains_key`.
-                // Deferring the GLOBAL sweep for one
-                // unrelated invalid package left every
-                // orphan live-row untombstoned every boot,
-                // so an unrelated dir the operator had
-                // manually cleaned up couldn't be reinstalled
-                // via the API (`AlreadyInstalled` from the
-                // unique index on the live row that never
-                // got tombstoned).
-                continue;
-            }
+                } else {
+                    None
+                };
             // C5 review F1: quarantine any installation whose
             // grant JSON is malformed. Skip indexing so
             // `start_instance` can't launch the plugin under an
@@ -1231,13 +1252,22 @@ impl InstalledPluginRegistry {
                 // Same fix covers pre-v3 (v2-tagged) digests
                 // whose UI bytes never contributed to the
                 // hash — they mismatch as soon as v3 lands.
-                match read_installed_bytes(&path, &manifest.runtime.wasm, manifest.ui.as_ref()) {
-                    Ok((current_digest, _, _)) if current_digest == *live.content_digest => (
+                // Round-13 F1: hash the validated UI
+                // snapshot from above (not a fresh re-read)
+                // so a schema flip between validation and
+                // digest can't sneak invalid bytes into the
+                // authoritative digest.
+                match scan_digest_with_validated_ui(
+                    &path,
+                    &manifest.runtime.wasm,
+                    validated_ui_assets.as_ref(),
+                ) {
+                    Ok(current_digest) if current_digest == *live.content_digest => (
                         Arc::clone(&live.installation_uuid),
                         Arc::clone(&live.granted_capabilities),
                         Arc::clone(&live.content_digest),
                     ),
-                    Ok((current_digest, _, _)) => {
+                    Ok(current_digest) => {
                         tracing::warn!(
                             plugin_id = %manifest_id,
                             path = %path.display(),
@@ -1284,63 +1314,69 @@ impl InstalledPluginRegistry {
                 // fresh content digest, matching what the
                 // API's `install` would have done.
                 let uuid = mint_installation_uuid();
-                let digest =
-                    match read_installed_bytes(&path, &manifest.runtime.wasm, manifest.ui.as_ref())
-                    {
-                        Ok((d, _, _)) => Arc::<str>::from(d),
-                        Err(err) => {
-                            // Round-10 F1: same fail-closed
-                            // reachability property as the UI
-                            // validation branch above. A backfill
-                            // whose bytes can't be read (missing
-                            // wasm, symlink refusal, UI asset
-                            // cap violation, ...) is not indexed
-                            // as live, but the directory still
-                            // exists on disk — record a
-                            // path-only quarantine so `uninstall`
-                            // can remove it. There's no live SQL
-                            // row here (we're in the `else` of
-                            // `live_rows.get`), so the tombstone
-                            // step in `uninstall` is a 0-row
-                            // no-op. Without this the operator
-                            // could not recover via the API:
-                            // `uninstall` → 404, `install` →
-                            // `AlreadyInstalled` from
-                            // `dest.exists()`.
-                            tracing::error!(
-                                plugin_id = %manifest_id,
-                                path = %path.display(),
-                                %err,
-                                "content_digest computation failed during backfill; \
-                                 recording path-only quarantine so uninstall can remove this dir",
-                            );
-                            let q_id: Arc<str> = Arc::from(manifest_id.as_str());
-                            let synth_uuid = Arc::from(NO_SQL_ROW_UUID);
-                            match quarantined_registry.get_mut(&q_id) {
-                                Some(entry) => {
-                                    if !entry.paths.contains(&path) {
-                                        entry.paths.push(path.clone());
-                                    }
-                                }
-                                None => {
-                                    quarantined_registry.insert(
-                                        q_id,
-                                        QuarantineEntry {
-                                            installation_uuid: synth_uuid,
-                                            paths: vec![path.clone()],
-                                        },
-                                    );
+                // Round-13 F1: use the validated UI snapshot
+                // (see above) so backfill can't persist a
+                // digest for UI bytes that were never
+                // meta-validated.
+                let digest = match scan_digest_with_validated_ui(
+                    &path,
+                    &manifest.runtime.wasm,
+                    validated_ui_assets.as_ref(),
+                ) {
+                    Ok(d) => Arc::<str>::from(d),
+                    Err(err) => {
+                        // Round-10 F1: same fail-closed
+                        // reachability property as the UI
+                        // validation branch above. A backfill
+                        // whose bytes can't be read (missing
+                        // wasm, symlink refusal, UI asset
+                        // cap violation, ...) is not indexed
+                        // as live, but the directory still
+                        // exists on disk — record a
+                        // path-only quarantine so `uninstall`
+                        // can remove it. There's no live SQL
+                        // row here (we're in the `else` of
+                        // `live_rows.get`), so the tombstone
+                        // step in `uninstall` is a 0-row
+                        // no-op. Without this the operator
+                        // could not recover via the API:
+                        // `uninstall` → 404, `install` →
+                        // `AlreadyInstalled` from
+                        // `dest.exists()`.
+                        tracing::error!(
+                            plugin_id = %manifest_id,
+                            path = %path.display(),
+                            %err,
+                            "content_digest computation failed during backfill; \
+                             recording path-only quarantine so uninstall can remove this dir",
+                        );
+                        let q_id: Arc<str> = Arc::from(manifest_id.as_str());
+                        let synth_uuid = Arc::from(NO_SQL_ROW_UUID);
+                        match quarantined_registry.get_mut(&q_id) {
+                            Some(entry) => {
+                                if !entry.paths.contains(&path) {
+                                    entry.paths.push(path.clone());
                                 }
                             }
-                            // Round-11 F1: id is known and
-                            // already in `observed_manifest_ids`,
-                            // so the sweep protects this id
-                            // specifically — no need to defer
-                            // the global sweep for unrelated
-                            // rows.
-                            continue;
+                            None => {
+                                quarantined_registry.insert(
+                                    q_id,
+                                    QuarantineEntry {
+                                        installation_uuid: synth_uuid,
+                                        paths: vec![path.clone()],
+                                    },
+                                );
+                            }
                         }
-                    };
+                        // Round-11 F1: id is known and
+                        // already in `observed_manifest_ids`,
+                        // so the sweep protects this id
+                        // specifically — no need to defer
+                        // the global sweep for unrelated
+                        // rows.
+                        continue;
+                    }
+                };
                 let grant_arc = Arc::new(manifest.capabilities.clone());
                 backfills.push(InstalledPlugin {
                     plugin_id: Arc::clone(&id_arc),
@@ -4462,6 +4498,77 @@ wasm = "plugin.wasm"
         assert!(
             !plugins_root.join(plugin_id).exists(),
             "one uninstall must remove the orphan dir",
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-13 F1: backfill's digest comes from
+    /// the exact `ValidatedUiAssets` snapshot the UI
+    /// validator returned — not a fresh re-read that could
+    /// see different bytes if the disk was tampered with
+    /// between the two reads. Asserts the backfilled digest
+    /// equals `content_digest(manifest_bytes, wasm_bytes,
+    /// frames)` computed over the on-disk state at scan
+    /// time, so future refactors can't slip an
+    /// unvalidated-second-read regression past this test.
+    #[test]
+    fn scan_backfill_digest_covers_validated_ui_snapshot() {
+        let root = tempdir("backfill-digest-ui");
+        let plugins_root = root.join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+
+        let plugin_id = "example.backfill-ui";
+        let d = plugins_root.join(plugin_id);
+        std::fs::create_dir_all(d.join("ui")).unwrap();
+        std::fs::write(
+            d.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.backfill-ui"
+name = "Backfill UI"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+[ui]
+config = "ui/config.js"
+config-schema = "ui/config.schema.json"
+"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        let config_bytes = b"export default {};".to_vec();
+        let schema_bytes =
+            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#
+                .to_vec();
+        std::fs::write(d.join("ui/config.js"), &config_bytes).unwrap();
+        std::fs::write(d.join("ui/config.schema.json"), &schema_bytes).unwrap();
+
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db())
+            .expect("scan must succeed");
+        let backfilled = reg
+            .list()
+            .into_iter()
+            .find(|p| &*p.plugin_id == plugin_id)
+            .expect("backfill must index the id");
+
+        let manifest_bytes = std::fs::read(d.join("manifest.toml")).unwrap();
+        let wasm_bytes = std::fs::read(d.join("plugin.wasm")).unwrap();
+        // The validator visits scalar entries in this
+        // canonical order: config, device-config, commands,
+        // config-schema, commands-schema. This fixture
+        // declares only config + config-schema, so those two
+        // frames define the digest.
+        let expected = content_digest(
+            &manifest_bytes,
+            &wasm_bytes,
+            &[("config", &config_bytes), ("config-schema", &schema_bytes)],
+        );
+        assert_eq!(
+            *backfilled.content_digest, expected,
+            "backfill must hash the validated UI snapshot, not skip UI or read it a second time",
         );
 
         std::fs::remove_dir_all(&root).unwrap();
