@@ -244,21 +244,19 @@ impl PluginInstance {
         .await
     }
 
-    /// Phase 6 leftover TOCTOU fix: like [`Self::load_with_mode`],
-    /// but skips the on-disk manifest read and uses the supplied
-    /// pre-parsed `(manifest_bytes, manifest)` instead. Used on
-    /// the FIRST load attempt inside `run_supervisor`, so
-    /// `start_instance`'s pre-flight parse (which decided the
-    /// singleton slot + `plugin_id`) is the same manifest that
-    /// actually gets loaded — closing the race where an atomic
-    /// replace between pre-flight and supervisor load could let
-    /// a plugin start under one identity while its manifest
-    /// declared another.
-    ///
-    /// On subsequent restarts the supervisor re-reads (a
-    /// legitimate reinstall between crashes should pick up the
-    /// new manifest; the installed-plugin registry's lifecycle
-    /// lock keeps that path safe).
+    /// Phase 6 leftover TOCTOU fix + round-2 F3: like
+    /// [`Self::load_with_mode`], but skips the on-disk
+    /// manifest read and uses the supplied pre-parsed
+    /// `(manifest_bytes, manifest)` instead. Used on every
+    /// load attempt inside `run_supervisor` (first load
+    /// AND every restart), so `start_instance`'s
+    /// pre-flight parse — which decided the singleton slot
+    /// + `plugin_id` — is the same manifest that
+    /// instantiates for the supervisor's lifetime. A
+    /// legitimate reinstall between crashes goes through
+    /// the install/uninstall API path (per-plugin
+    /// lifecycle lock), which starts a fresh supervisor
+    /// with a fresh pin.
     #[doc(hidden)]
     pub async fn load_with_pinned_manifest(
         engine: &Engine,
@@ -307,16 +305,18 @@ impl PluginInstance {
         );
         async move {
             let manifest_path = plugin_dir.join("manifest.toml");
-            // Phase 6 leftover TOCTOU fix: if the caller passed
-            // a pre-parsed manifest snapshot, use those exact
-            // bytes rather than re-reading. The supervisor's
-            // FIRST load supplies pre-flight's snapshot so the
-            // manifest whose `plugin_id` / `singleton` flag
-            // decided the registry slot is the manifest that
-            // actually gets instantiated. On restart the
-            // supervisor calls the un-pinned variant, which
-            // re-reads (a legitimate reinstall between crashes
-            // is expected to pick up new manifest bytes).
+            // Phase 6 leftover TOCTOU fix + round-2 F3:
+            // if the caller passed a pre-parsed manifest
+            // snapshot, use those exact bytes rather than
+            // re-reading. The supervisor supplies the
+            // pre-flight snapshot on EVERY load attempt so
+            // the manifest whose `plugin_id` / `singleton`
+            // flag decided the registry slot is the manifest
+            // that instantiates for the supervisor's
+            // lifetime. `None` reaches this branch only via
+            // the un-pinned test-suite paths (`supervise` /
+            // `supervise_with_tuning`); those re-read from
+            // disk on every attempt.
             let (manifest_bytes, manifest) = if let Some((bytes, manifest)) = pinned {
                 (bytes, manifest)
             } else {

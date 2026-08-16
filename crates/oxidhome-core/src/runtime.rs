@@ -559,13 +559,26 @@ impl Engine {
     /// removes the entry once the supervisor reaches a terminal
     /// state, so the slot frees up for a fresh start.
     ///
-    /// **Manifest immutability assumption.** This call reads the
-    /// manifest once for the singleton / `plugin_id` check, then the
-    /// supervisor's load path reads it again to instantiate. The two
-    /// reads are *not* atomic against an on-disk edit between them; a
-    /// manifest swap mid-call could let a singleton coexist with a
-    /// non-singleton or unregister the wrong slot on terminal. Live-
-    /// reload (Phase 7+) needs a re-register through this method.
+    /// **Manifest immutability guarantee (Phase-6 leftover
+    /// TOCTOU fix + round-2 F3).** The manifest is read
+    /// ONCE at pre-flight via
+    /// [`crate::runtime::instance::read_manifest_with_bytes`],
+    /// yielding the parsed manifest AND the raw bytes. That
+    /// snapshot is pinned into the supervisor and used on
+    /// **every** load attempt (first load and every
+    /// restart) via [`PluginInstance::load_with_pinned_manifest`],
+    /// so the manifest whose singleton / `plugin_id`
+    /// decided the registry slot is the manifest that
+    /// gets instantiated for the lifetime of this
+    /// supervisor. A manifest swap during startup or
+    /// restart backoff can no longer sneak a mismatched
+    /// identity or capability set past the registry.
+    ///
+    /// A legitimate reinstall between crashes goes through
+    /// the install/uninstall API path (stop → uninstall →
+    /// install → start), which holds the per-plugin
+    /// lifecycle lock and starts a fresh supervisor with
+    /// a fresh pin.
     ///
     /// # Errors
     ///
@@ -787,24 +800,80 @@ impl Engine {
     /// Idempotent: reapers self-remove from the tracker as
     /// their final step, so calling this twice on a settled
     /// engine just returns a no-op the second time.
+    ///
+    /// Round-3 F1: this is the **unbounded** variant —
+    /// callers who need a bounded shutdown must go through
+    /// [`Self::drain_supervised_instances_with_timeout`].
+    /// The unbounded variant stays available for tests that
+    /// want deterministic post-shutdown assertions on a
+    /// settled engine.
     pub async fn drain_supervised_instances(&self) {
-        // Snapshot + clear under the sync mutex so the
-        // await loop below doesn't hold the lock. Reapers
-        // that fire between the snapshot and their own
-        // `remove()` just fail their `remove` silently —
-        // the key we snapshotted is no longer in the map
-        // but the JoinHandle we already own is what we
-        // await here.
-        let handles: Vec<tokio::task::JoinHandle<()>> = {
-            let mut guard = self
-                .reapers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.drain().map(|(_, (_gen, jh))| jh).collect()
-        };
+        let handles = self.take_reaper_handles();
         for jh in handles {
             let _ = jh.await;
         }
+    }
+
+    /// Round-3 F1: bounded reaper drain. Awaits up to
+    /// `deadline` for every outstanding reaper to complete;
+    /// any still-running reaper at the deadline is aborted
+    /// via its `JoinHandle` and the drain returns. The
+    /// daemon's shutdown path uses this so a supervisor
+    /// that ignored its `stop` (F1 leftover from the
+    /// per-instance timeout) can't block process exit
+    /// indefinitely.
+    ///
+    /// Returns `Ok(())` if every reaper completed within
+    /// the deadline; `Err(count)` — the number of reapers
+    /// that had to be aborted — if any timed out. Both
+    /// paths log; callers rarely inspect the return.
+    pub async fn drain_supervised_instances_with_timeout(
+        &self,
+        deadline: std::time::Duration,
+    ) -> Result<(), usize> {
+        let handles = self.take_reaper_handles();
+        if handles.is_empty() {
+            return Ok(());
+        }
+        // Race the whole drain against a single deadline
+        // sleep so total wall-clock is bounded regardless of
+        // how many reapers are outstanding.
+        let mut js = tokio::task::JoinSet::new();
+        for jh in handles {
+            js.spawn(async move {
+                let _ = jh.await;
+            });
+        }
+        let result =
+            tokio::time::timeout(deadline, async { while js.join_next().await.is_some() {} }).await;
+        if result.is_ok() {
+            Ok(())
+        } else {
+            let remaining = js.len();
+            // Abort the stragglers so their tasks stop
+            // consuming host resources beyond process
+            // exit — the runtime teardown would abort
+            // them anyway; doing it explicitly here
+            // documents the intent.
+            js.abort_all();
+            tracing::warn!(
+                remaining,
+                deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                "reaper drain deadline exceeded; aborting stragglers",
+            );
+            Err(remaining)
+        }
+    }
+
+    /// Round-3 F1 helper: atomically drain the reaper map
+    /// under the sync mutex so the caller can await the
+    /// snapshot outside the lock.
+    fn take_reaper_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut guard = self
+            .reapers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.drain().map(|(_, (_gen, jh))| jh).collect()
     }
 
     /// Round-2 F1: request every supervised instance to

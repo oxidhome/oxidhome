@@ -19,8 +19,10 @@ tick_interval_ms = 50
 restart = "on-trap"
 
 [config.crash_on]
-# "tick" → init succeeds, the first tick traps; "init" → init fails.
+# "tick" → init succeeds, the first tick traps;
+# "init" → init fails;
+# "shutdown" → init + tick succeed, guest shutdown traps.
 type = "enum"
-values = ["tick", "init"]
+values = ["tick", "init", "shutdown"]
 default = "tick"
 description = "Which lifecycle hook the crasher fails in."

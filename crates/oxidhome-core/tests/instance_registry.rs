@@ -291,6 +291,85 @@ async fn drain_still_awaits_reaper_after_instance_id_recycle() {
     );
 }
 
+/// Round-3 F1: an operator-requested shutdown that traps
+/// mid-teardown must be terminal — regardless of the
+/// manifest's `restart = "on-trap"` policy. Pre-fix, the
+/// serve loop propagated the shutdown trap through `?`,
+/// which funneled the outcome into `ServeOutcome::Crashed`
+/// and the outer supervisor then restarted the instance
+/// the operator had just asked to stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_trap_is_terminal_not_a_restart() {
+    let _wasm = support::build_example("crasher", "crasher.wasm");
+    let crasher_dir = support::workspace_root().join("examples").join("crasher");
+    let engine = Engine::new().expect("engine");
+    // Override picks the shutdown-panic mode; the real
+    // crasher manifest declares `restart = "on-trap"`, so
+    // pre-fix the shutdown trap would have restarted.
+    let overrides: toml::Value =
+        toml::from_str("crash_on = \"shutdown\"\n").expect("override blob parses");
+
+    let handle = engine
+        .start_instance(crasher_dir, "crasher-shutdown-trap", Some(overrides))
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("Running");
+
+    // Operator asks to stop; the guest's shutdown panics.
+    // `stop()` still returns Ok because the supervisor
+    // acked before the trap propagated.
+    let _ = handle.stop().await;
+
+    match handle.wait_terminal().await {
+        InstanceState::Failed { error } => {
+            assert!(
+                error.contains("shutdown trapped"),
+                "expected the shutdown-trap reason on the Failed transition; got: {error}",
+            );
+            assert!(
+                !error.contains("gave up") && !error.contains("on-trap"),
+                "expected NO restart-policy language (proves the shutdown was terminal, not restarted then giving up); got: {error}",
+            );
+        }
+        other => panic!("expected Failed (round-3 F1: shutdown trap is terminal); got {other:?}"),
+    }
+}
+
+/// Round-3 F1: `drain_supervised_instances_with_timeout`
+/// bounds total wall-clock. If a supervisor never reaches
+/// a terminal state (e.g. because `stop` was never sent),
+/// its reaper never fires; the bounded drain must abort
+/// the stragglers and return `Err(count)` rather than
+/// blocking process exit forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_with_timeout_aborts_never_terminal_reapers() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+    let _handle = engine
+        .start_instance(switch_dir, "drain-timeout", None)
+        .await
+        .expect("start");
+    // Intentionally NOT calling stop — the supervisor is
+    // still running, its reaper never fires. Pre-round-3
+    // an unbounded drain would await forever.
+    let start = Instant::now();
+    let result = engine
+        .drain_supervised_instances_with_timeout(Duration::from_millis(200))
+        .await;
+    let elapsed = start.elapsed();
+    assert!(
+        result.is_err(),
+        "expected the bounded drain to time out and return Err(count)",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "expected the bounded drain to return promptly after the deadline; elapsed={elapsed:?}",
+    );
+}
+
 /// Round-2 F3: the pinned manifest snapshot supplied at
 /// pre-flight is used on EVERY load attempt (first load
 /// and every restart), not just the first — so a manifest
@@ -332,7 +411,7 @@ restart = "on-trap"
         backoff_base: Duration::from_millis(10),
         backoff_max: Duration::from_millis(40),
         max_restarts: 2,
-        healthy_reset: Duration::from_secs(60),
+        healthy_reset: Duration::from_mins(1),
         ..SupervisorTuning::default()
     };
     let handle = engine

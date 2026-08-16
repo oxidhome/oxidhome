@@ -58,6 +58,16 @@ const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 /// for those cases only).
 const SHUTDOWN_STOP_PER_INSTANCE_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Round-3 F1: bounded reaper-drain deadline for daemon
+/// shutdown. Ensures a supervisor that ignored its `stop`
+/// request can't wedge process exit — after this deadline
+/// the drain aborts any straggler reapers and returns.
+/// Independent from `SHUTDOWN_STOP_PER_INSTANCE_DEADLINE`
+/// because reaper work runs AFTER each supervisor reaches
+/// a terminal state and does its own bounded FS / SQL
+/// cleanup.
+const SHUTDOWN_REAPER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Loopback-only by default — the API isn't meant to face the
 /// open network. Operators who want a different listen address
 /// set `OXIDHOME_BIND`; the daemon parses the value as a
@@ -176,19 +186,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Round-2 F1: stop every supervised instance and await
-    // its reaper's cleanup before returning. Pre-fix,
-    // `main` dropped `serve` and returned; the tokio
-    // runtime teardown then aborted every supervisor task
-    // and every reaper task mid-flight, so device / service
-    // registry eviction and `instances.unregister` never
-    // ran on shutdown. Per-stop deadline bounds total
-    // wall-clock — stops fire in parallel — and drain
-    // awaits every reaper's cleanup afterwards.
+    // Round-2 F1 + round-3 F1: stop every supervised
+    // instance and await its reaper's cleanup before
+    // returning. Both phases are bounded so a misbehaving
+    // plugin (or a supervisor that ignored its stop) can't
+    // block process exit indefinitely. Pre-fix, `main`
+    // dropped `serve` and returned; tokio runtime teardown
+    // aborted supervisors + reapers mid-flight, so device
+    // / service registry eviction and
+    // `instances.unregister` never ran on shutdown.
+    //
+    // Stops fire in parallel with a per-instance deadline;
+    // the reaper drain has its OWN overall deadline (round-
+    // 3 F1) — a timed-out `stop` leaves the supervisor
+    // running, whose reaper would then block an unbounded
+    // drain forever.
     engine
         .stop_all_supervised_instances(SHUTDOWN_STOP_PER_INSTANCE_DEADLINE)
         .await;
-    engine.drain_supervised_instances().await;
+    let _ = engine
+        .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
+        .await;
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s
