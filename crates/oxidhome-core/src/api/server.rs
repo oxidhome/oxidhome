@@ -1308,39 +1308,43 @@ async fn get_plugin_schema(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<PluginSchemaBody>, PluginSchemaError> {
     require_scope(&actor, PLUGINS_LIST)?;
-    // Round-2 finding 4: hold the per-plugin lifecycle
-    // lock across the registry lookup + the manifest re-
-    // read. Without it, a concurrent uninstall + reinstall
-    // between the two visits could return a mixed view —
-    // the old row's `version` alongside the new
-    // installation's `config` / `ui` — or a transient 500
-    // if the on-disk `manifest.toml` momentarily disappears
-    // during the reinstall's copy phase. The lifecycle
-    // lock is the same one that serializes `start_instance`
-    // and `uninstall_plugin` for the same id (see H2 round-2
-    // F1), so holding it here rides on machinery the
-    // reinstall path already respects.
+    // Round-2 F4 + round-9 F1: hold the per-plugin
+    // lifecycle lock across the registry lookup + the
+    // package re-read + the digest verification. Without it,
+    // a concurrent uninstall + reinstall between the two
+    // visits could return a mixed view — the old row's
+    // `version` alongside the new installation's `config` /
+    // `ui` — or a transient 500 if the on-disk
+    // `manifest.toml` momentarily disappears during the
+    // reinstall's copy phase.
+    //
+    // Round-9 F1: use `lock_owned()` and move the guard INTO
+    // the `spawn_blocking` closure, then return it back with
+    // the result. A borrowed `_guard` on the handler frame
+    // would drop the moment the client cancels the request
+    // (tokio drops the handler future) — but `spawn_blocking`
+    // detaches and keeps running unbounded reads of the
+    // installed wasm + UI assets. Repeated cancelled
+    // requests would then race those reads concurrently for
+    // the same `plugin_id`, defeating the per-plugin
+    // serialization and pinning the blocking-thread pool /
+    // heap. Owned guard + return-with-result keeps the
+    // lock live for the duration of the actual work, even
+    // when the caller has walked away.
     let lifecycle = state.engine.plugin_lifecycle_lock(&plugin_id);
-    let _guard = lifecycle.lock().await;
+    let guard = lifecycle.lock_owned().await;
     let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
         return Err(PluginSchemaError::NotFound);
     };
-    // Round-8 F1: read the manifest + wasm + declared UI
-    // assets in one snapshot, parse the manifest from those
-    // exact bytes, and recompute the content digest. Refuse
-    // if the on-disk snapshot disagrees with the persisted
-    // digest — pre-fix a direct-FS swap of `manifest.toml`
-    // (which the lifecycle lock DOES NOT prevent — it only
-    // serializes API-mediated install / uninstall / start)
-    // returned new `config` / `ui` metadata alongside the
-    // registry row's old `plugin_id` and `version`.
     let plugin_dir = installed.path.clone();
-    let (digest, manifest) = tokio::task::spawn_blocking(move || {
-        crate::state::recompute_digest_and_manifest(&plugin_dir)
+    let (result, guard) = tokio::task::spawn_blocking(move || {
+        let result = crate::state::recompute_digest_and_manifest(&plugin_dir);
+        (result, guard)
     })
     .await
-    .map_err(|err| PluginSchemaError::Internal(err.into()))?
-    .map_err(PluginSchemaError::Internal)?;
+    .map_err(|err| PluginSchemaError::Internal(err.into()))?;
+    let _guard = guard;
+    let (digest, manifest) = result.map_err(PluginSchemaError::Internal)?;
     if digest != *installed.content_digest {
         return Err(PluginSchemaError::DigestMismatch {
             plugin_id: (*installed.plugin_id).to_string(),
