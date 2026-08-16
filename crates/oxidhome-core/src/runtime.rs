@@ -661,19 +661,22 @@ impl Engine {
                  (reserved wildcard, path separator, empty, or too long)"
             ));
         }
-        // Pre-flight: parse + validate the manifest so we know the
-        // plugin id + singleton flag before spawning. Phase 6
-        // leftover TOCTOU fix: capture the raw bytes alongside
-        // the parsed manifest and hand them into the supervisor's
-        // FIRST load, so the same snapshot that decided the
-        // singleton slot / plugin_id is the one that gets
-        // instantiated. An atomic replace of `manifest.toml`
-        // between pre-flight and the supervisor's first read can
-        // no longer swap the plugin under a mismatched registry
-        // slot. On restart the supervisor re-reads (a legitimate
-        // reinstall between crashes should pick up new bytes;
-        // that path goes through the installed-plugin registry's
-        // lifecycle lock, so it's safe).
+        // Pre-flight: parse + validate the manifest so we
+        // know the plugin id + singleton flag before
+        // spawning. Phase 6 leftover TOCTOU fix + round-2
+        // F3: capture the raw bytes alongside the parsed
+        // manifest and pin them into the supervisor for its
+        // ENTIRE lifetime. The snapshot that decided the
+        // singleton slot / plugin_id is the manifest that
+        // gets instantiated on the first load AND on every
+        // restart — an atomic replace of `manifest.toml`
+        // during startup or restart backoff can no longer
+        // swap a different plugin under a mismatched
+        // registry slot. A legitimate reinstall between
+        // crashes goes through the install/uninstall API's
+        // per-plugin lifecycle lock (stop → uninstall →
+        // install → start), which mints a fresh supervisor
+        // with a fresh pin.
         let (manifest_bytes, manifest) = instance::read_manifest_with_bytes(&plugin_dir).await?;
         let plugin_id = manifest.plugin.id.clone();
         let singleton = manifest.runtime.singleton;
@@ -835,9 +838,23 @@ impl Engine {
         if handles.is_empty() {
             return Ok(());
         }
+        // Round-4 F1: capture each REAL reaper's
+        // `AbortHandle` before moving the `JoinHandle` into
+        // the wrapper task. The wrapper is what the
+        // `JoinSet` polls; calling `js.abort_all()` would
+        // otherwise only abort the wrapper tasks — dropping
+        // the enclosed real `JoinHandle` just detaches the
+        // real reaper, leaving it running past the
+        // "aborted" return and violating the method
+        // contract. Keeping the abort handles alive here
+        // lets us actually cancel the reapers on timeout.
+        let abort_handles: Vec<tokio::task::AbortHandle> = handles
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
         // Race the whole drain against a single deadline
-        // sleep so total wall-clock is bounded regardless of
-        // how many reapers are outstanding.
+        // sleep so total wall-clock is bounded regardless
+        // of how many reapers are outstanding.
         let mut js = tokio::task::JoinSet::new();
         for jh in handles {
             js.spawn(async move {
@@ -850,16 +867,29 @@ impl Engine {
             Ok(())
         } else {
             let remaining = js.len();
-            // Abort the stragglers so their tasks stop
-            // consuming host resources beyond process
-            // exit — the runtime teardown would abort
-            // them anyway; doing it explicitly here
-            // documents the intent.
+            // Abort the REAL reapers first (round-4 F1) so
+            // they actually stop executing, then wait for
+            // the wrappers to observe the aborts. Without
+            // the first step, the wrappers' `jh.await`
+            // would surface a `JoinError::Cancelled` only
+            // when the underlying task truly stops, which
+            // for a wedged reaper is never.
+            for ah in &abort_handles {
+                ah.abort();
+            }
             js.abort_all();
+            // Drain the wrappers post-abort so the JoinSet
+            // is empty on return — otherwise dropping it
+            // would detach every remaining wrapper task
+            // and lose the visible-cleanup guarantee. This
+            // await is bounded by the wrapper's `jh.await`
+            // returning a `JoinError::Cancelled` promptly
+            // once the real reaper's abort takes effect.
+            while js.join_next().await.is_some() {}
             tracing::warn!(
                 remaining,
                 deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-                "reaper drain deadline exceeded; aborting stragglers",
+                "reaper drain deadline exceeded; aborted stragglers",
             );
             Err(remaining)
         }
