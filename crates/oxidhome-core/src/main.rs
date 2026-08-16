@@ -47,6 +47,17 @@ use tracing_subscriber::{EnvFilter, fmt};
 /// exit.
 const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 
+/// Round-2 F1: per-instance stop deadline on daemon
+/// shutdown. Stops fire in parallel, so total wall-clock
+/// is bounded by this (not `N * this`). Long enough for
+/// a well-behaved plugin's `shutdown` handler to run;
+/// short enough that a hung plugin doesn't wedge the
+/// daemon indefinitely. A timed-out stop is logged; the
+/// subsequent drain skips its reaper (the tokio runtime
+/// teardown aborts it, matching the pre-fix behaviour
+/// for those cases only).
+const SHUTDOWN_STOP_PER_INSTANCE_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Loopback-only by default — the API isn't meant to face the
 /// open network. Operators who want a different listen address
 /// set `OXIDHOME_BIND`; the daemon parses the value as a
@@ -164,6 +175,20 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(signal = signal, "shutdown signal received; draining");
         }
     }
+
+    // Round-2 F1: stop every supervised instance and await
+    // its reaper's cleanup before returning. Pre-fix,
+    // `main` dropped `serve` and returned; the tokio
+    // runtime teardown then aborted every supervisor task
+    // and every reaper task mid-flight, so device / service
+    // registry eviction and `instances.unregister` never
+    // ran on shutdown. Per-stop deadline bounds total
+    // wall-clock — stops fire in parallel — and drain
+    // awaits every reaper's cleanup afterwards.
+    engine
+        .stop_all_supervised_instances(SHUTDOWN_STOP_PER_INSTANCE_DEADLINE)
+        .await;
+    engine.drain_supervised_instances().await;
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s

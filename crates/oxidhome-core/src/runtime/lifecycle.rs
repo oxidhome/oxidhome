@@ -676,11 +676,26 @@ async fn run_supervisor(
     mode: crate::runtime::LoadMode,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     state_tx: watch::Sender<InstanceState>,
-    // Phase 6 leftover TOCTOU fix: `Some` on the first
-    // attempt after `start_instance` pre-flight, `None`
-    // thereafter. Once consumed here it's `take()`n so the
-    // second iteration re-reads.
-    mut first_load_pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
+    // Phase 6 leftover TOCTOU fix + review F3: when
+    // `Some`, the supervisor uses this snapshot on EVERY
+    // load attempt (first load AND every restart) — the
+    // manifest is treated as immutable for the supervisor's
+    // lifetime. A first cut of this fix only used the
+    // snapshot on the first attempt and re-read on
+    // restarts; reviewers flagged that as reopening the
+    // identity race during backoff (a dev-mode manifest
+    // could change plugin_id / singleton / capabilities
+    // between crashes while the registry stayed registered
+    // as the pre-change identity). A legitimate reinstall
+    // between crashes now requires the operator to stop
+    // and re-start (the install/uninstall API's per-plugin
+    // lifecycle lock enforces that path).
+    //
+    // `None` is the test-suite entry (`supervise` /
+    // `supervise_with_tuning`) — those still re-read on
+    // every attempt because there's no pre-flight parse
+    // to pin.
+    pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) {
     // C2d — the pre-C2d supervisor eagerly subscribed to
     // `subscribe_all()` so every published event woke every
@@ -697,9 +712,14 @@ async fn run_supervisor(
     let mut restarts: u32 = 0;
 
     loop {
-        // `.take()` gives the pinned snapshot to the first
-        // attempt only; every subsequent iteration re-reads.
-        let pinned = first_load_pinned_manifest.take();
+        // Round-2 F3: clone the pinned snapshot for THIS
+        // attempt, keeping the original held on the
+        // supervisor stack so every subsequent restart
+        // uses the same bytes. Cloning the manifest is
+        // cheap — small TOML in memory. `None` means "no
+        // pin was supplied at spawn"; the loader will
+        // re-read on every attempt (test-suite path only).
+        let pinned = pinned_manifest.clone();
         let outcome = run_one_lifecycle(
             &engine,
             &plugin_dir,

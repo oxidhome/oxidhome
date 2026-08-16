@@ -110,21 +110,32 @@ pub struct Engine {
     /// per-instance cleanup (device / service registry
     /// eviction, device-state stale marking,
     /// `instances.unregister`) on daemon shutdown. Keyed
-    /// by `instance_id`; the reaper removes its own entry
-    /// as its final step, so a "steady-state" scan sees an
-    /// empty map even under heavy churn.
+    /// by `instance_id`; each entry carries a monotonic
+    /// `generation` token minted at spawn time.
+    ///
+    /// Round-2 F2: the reaper's self-removal is
+    /// conditional — it removes only if the map still
+    /// carries ITS generation. That prevents an old
+    /// reaper from clobbering a fresh entry whose
+    /// `instance_id` was recycled after unregister and
+    /// registered again before the old reaper completed
+    /// its cleanup. Without the guard the drain would
+    /// silently skip the replacement's reaper.
     reapers: Reapers,
+    /// Round-2 F2: monotonic generation counter for
+    /// reaper-tracker entries. Bumped once per spawn.
+    reaper_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Phase 6 leftover: shared map of per-instance reaper
-/// `JoinHandle`s. `std::sync::Mutex` (not `tokio::sync`)
-/// because insertion / removal is short and synchronous —
-/// no `await` inside the guard. The `JoinHandle`s are
-/// awaited from `drain_supervised_instances` under a
-/// `tokio::task::JoinSet` so the drain doesn't hold the
-/// map's lock across `await`.
+/// `JoinHandle`s + their generation tokens.
+/// `std::sync::Mutex` (not `tokio::sync`) because insertion
+/// / removal is short and synchronous — no `await` inside
+/// the guard. `drain_supervised_instances` snapshots the
+/// map under the lock and awaits the handles OUTSIDE the
+/// guard.
 type Reapers =
-    Arc<std::sync::Mutex<std::collections::HashMap<Arc<str>, tokio::task::JoinHandle<()>>>>;
+    Arc<std::sync::Mutex<std::collections::HashMap<Arc<str>, (u64, tokio::task::JoinHandle<()>)>>>;
 
 /// H2 round-2 F1: shared, lazily-populated map of per-`plugin_id`
 /// async mutexes. Held under an outer sync `Mutex` for the map
@@ -281,6 +292,7 @@ impl Engine {
             )),
             ui_ticket_secret: Arc::new(mint_ui_ticket_secret()),
             reapers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            reaper_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -669,6 +681,7 @@ impl Engine {
         let plugin_id_for_reaper = plugin_id.clone();
         let instance_id_for_reaper = instance_id.clone();
         let reapers_for_spawn = Arc::clone(&self.reapers);
+        let reaper_gen_counter = Arc::clone(&self.reaper_gen);
         self.instances
             .register(instance_id, plugin_id, singleton, || {
                 let handle = crate::runtime::lifecycle::supervise_with_tuning_mode_and_pin(
@@ -685,6 +698,17 @@ impl Engine {
                 let reapers_for_reaper = Arc::clone(&reapers_for_spawn);
                 let reaper_key: Arc<str> = Arc::from(instance_id_for_reaper.as_str());
                 let reaper_key_for_task = Arc::clone(&reaper_key);
+                // Round-2 F2: mint a monotonic generation
+                // for THIS reaper spawn. The reaper carries
+                // the gen with it and only removes its
+                // tracker entry if the map's stored gen
+                // still matches — so a fresh start that
+                // reuses the same `instance_id` (after the
+                // registry unregister a moment ago) can't
+                // have its brand-new tracker entry
+                // silently clobbered by the old reaper's
+                // key-only remove.
+                let my_gen = reaper_gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let reaper_join = tokio::spawn(async move {
                     let _ = reaper_handle.wait_terminal().await;
                     // Drop any device/service registry entries the
@@ -711,27 +735,28 @@ impl Engine {
                         .device_state()
                         .mark_instance_stale(&instance_id_for_reaper);
                     registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
-                    // Phase 6 leftover: reaper removes its own
-                    // entry from the tracker as its final step,
-                    // so under steady-state the map is empty
-                    // even under high churn. `drain_supervised_instances`
-                    // still observes any handle whose reaper is
-                    // mid-cleanup at drain time — the drain
-                    // atomically pulls the current snapshot out
-                    // and awaits it.
-                    if let Ok(mut guard) = reapers_for_reaper.lock() {
-                        guard.remove(&reaper_key_for_task);
+                    // Round-2 F2: conditional remove —
+                    // don't yank a replacement reaper's
+                    // entry that happens to share the same
+                    // `instance_id`.
+                    if let Ok(mut guard) = reapers_for_reaper.lock()
+                        && let std::collections::hash_map::Entry::Occupied(entry) =
+                            guard.entry(reaper_key_for_task)
+                        && entry.get().0 == my_gen
+                    {
+                        entry.remove();
                     }
                 });
-                // Track the reaper handle. If a same-instance entry
-                // exists (shouldn't — `register` above rejects
-                // duplicates) the older handle is dropped, which
-                // detaches the old reaper but leaves its work
-                // scheduled to completion; the drain in
-                // `drain_supervised_instances` no longer awaits
-                // it, but the reaper task itself keeps running.
+                // Track the reaper handle keyed by `(gen,
+                // JoinHandle)`. If a same-instance entry is
+                // somehow already present, its
+                // JoinHandle is dropped — that detaches the
+                // old reaper but leaves its work scheduled;
+                // the conditional remove above still keys off
+                // gen, so the drop doesn't race the fresh
+                // reaper's cleanup.
                 if let Ok(mut guard) = reapers_for_spawn.lock() {
-                    guard.insert(reaper_key, reaper_join);
+                    guard.insert(reaper_key, (my_gen, reaper_join));
                 }
                 handle
             })
@@ -775,11 +800,58 @@ impl Engine {
                 .reapers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.drain().map(|(_, jh)| jh).collect()
+            guard.drain().map(|(_, (_gen, jh))| jh).collect()
         };
         for jh in handles {
             let _ = jh.await;
         }
+    }
+
+    /// Round-2 F1: request every supervised instance to
+    /// stop, giving each one up to `per_stop_timeout` to
+    /// reach a terminal state. Returns after every request
+    /// has either drained or timed out; a timed-out instance
+    /// still has its supervisor task alive, but the
+    /// subsequent `drain_supervised_instances` will still
+    /// await its reaper once it does terminate (or leak the
+    /// task to the tokio runtime teardown, which is the
+    /// pre-existing behaviour we were already stuck with).
+    ///
+    /// Called from `main.rs`'s shutdown path so a SIGTERM /
+    /// Ctrl-C stops supervisors cleanly instead of relying
+    /// on runtime teardown to abort them mid-`init`.
+    ///
+    /// Best-effort — a supervisor that ignores its
+    /// `shutdown` command (bug) or a plugin whose graceful-
+    /// shutdown budget exceeds `per_stop_timeout` are both
+    /// visible as `stop` errors we swallow here (the
+    /// tracing log records the outcome).
+    pub async fn stop_all_supervised_instances(&self, per_stop_timeout: std::time::Duration) {
+        let handles = self.instances.list();
+        // Fire every stop in parallel so total wall-clock is
+        // bounded by `per_stop_timeout`, not
+        // `N * per_stop_timeout`.
+        let mut js = tokio::task::JoinSet::new();
+        for handle in handles {
+            let instance_id = handle.instance_id().to_string();
+            js.spawn(async move {
+                match tokio::time::timeout(per_stop_timeout, handle.stop()).await {
+                    Ok(Ok(())) => tracing::info!(instance_id, "supervised instance stopped"),
+                    Ok(Err(err)) => tracing::warn!(
+                        instance_id,
+                        %err,
+                        "supervised instance stop returned error",
+                    ),
+                    Err(_) => tracing::warn!(
+                        instance_id,
+                        timeout_ms =
+                            u64::try_from(per_stop_timeout.as_millis()).unwrap_or(u64::MAX),
+                        "supervised instance did not stop within per-instance deadline",
+                    ),
+                }
+            });
+        }
+        while js.join_next().await.is_some() {}
     }
 
     /// Look up a running instance by id. `None` if no such

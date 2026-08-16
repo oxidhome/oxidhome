@@ -10,7 +10,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use oxidhome_core::{Engine, InstanceState};
+use oxidhome_core::{Engine, InstanceState, SupervisorTuning};
 
 /// simulated-switch manifest staged with a chosen `singleton` flag.
 /// Mirrors the real example's `[capabilities].declares_devices` so
@@ -236,4 +236,136 @@ async fn drain_awaits_reaper_cleanup_for_every_instance() {
     // Idempotent: a second drain on a settled engine is a
     // no-op that returns immediately.
     engine.drain_supervised_instances().await;
+}
+
+/// Round-2 F2: a rapidly-recycled `instance_id` (start, stop,
+/// start again) must NOT have its fresh tracker entry
+/// clobbered by the old reaper's key-only remove. The fix
+/// stamps each reaper spawn with a monotonic generation and
+/// the reaper only removes if the map's stored gen still
+/// matches. This test starts an instance under
+/// `switch-recycle`, stops it, immediately starts a fresh
+/// instance under the same id, then drains — the drain
+/// must observe and await the fresh reaper.
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_still_awaits_reaper_after_instance_id_recycle() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+
+    let first = engine
+        .start_instance(switch_dir.clone(), "switch-recycle", None)
+        .await
+        .expect("first start");
+    first.wait_for_running().await.expect("first Running");
+    first.stop().await.expect("stop first");
+    assert_eq!(first.wait_terminal().await, InstanceState::Stopped);
+    wait_until_unregistered(&engine, "switch-recycle").await;
+
+    // Fresh start on the same id — pre-fix, if the old
+    // reaper hadn't yet removed its tracker entry, the new
+    // entry would replace it; if the old reaper THEN fired
+    // its key-only remove, the new entry vanished and a
+    // subsequent drain silently skipped the new reaper.
+    let second = engine
+        .start_instance(switch_dir, "switch-recycle", None)
+        .await
+        .expect("second start reuses the id");
+    second.wait_for_running().await.expect("second Running");
+    second.stop().await.expect("stop second");
+
+    // Drain must actually await the fresh reaper's cleanup
+    // — asserted indirectly by checking the device registry
+    // is empty post-drain (only the fresh reaper's cleanup
+    // can evict the device it registered).
+    engine.drain_supervised_instances().await;
+    assert!(
+        engine.instance("switch-recycle").is_none(),
+        "post-drain, the recycled id must be unregistered by the fresh reaper",
+    );
+    assert!(
+        engine.devices().list().is_empty(),
+        "post-drain, the recycled instance's device must be evicted",
+    );
+}
+
+/// Round-2 F3: the pinned manifest snapshot supplied at
+/// pre-flight is used on EVERY load attempt (first load
+/// and every restart), not just the first — so a manifest
+/// atomically replaced during restart backoff can't sneak
+/// a different plugin under the same registry slot. Test
+/// starts a crasher plugin that traps repeatedly under
+/// `restart = "on-trap"`, then during the crash loop
+/// corrupts `manifest.toml` on disk with garbage bytes. If
+/// the supervisor re-read on restart (pre-fix), the
+/// corrupted read would surface as a `LoadFailed` with a
+/// manifest-parse error before hitting the restart cap;
+/// with the pin held across restarts, the supervisor
+/// keeps loading the pinned bytes and reaches the cap on
+/// normal traps.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_manifest_survives_disk_mutation_across_restart_backoff() {
+    let wasm = support::build_example("crasher", "crasher.wasm");
+    let plugin = support::stage_plugin(
+        "pin-across-restart",
+        &wasm,
+        "crasher.wasm",
+        r#"manifest_version = 1
+[plugin]
+id = "example.crasher"
+name = "Crasher"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "crasher.wasm"
+tick_interval_ms = 10
+restart = "on-trap"
+"#,
+    );
+    let engine = Engine::new().expect("engine");
+    // Fast tuning: low cap + short backoff so the test
+    // converges in seconds instead of minutes.
+    let tuning = SupervisorTuning {
+        backoff_base: Duration::from_millis(10),
+        backoff_max: Duration::from_millis(40),
+        max_restarts: 2,
+        healthy_reset: Duration::from_secs(60),
+        ..SupervisorTuning::default()
+    };
+    let handle = engine
+        .start_instance_with_tuning(
+            plugin.path().to_path_buf(),
+            "crasher-pinned",
+            None,
+            oxidhome_core::runtime::LoadMode::Dev,
+            tuning,
+        )
+        .await
+        .expect("start");
+    // Immediately corrupt the on-disk manifest. A
+    // pre-fix re-read on the next restart would fail
+    // load with a manifest-parse error.
+    std::fs::write(plugin.path().join("manifest.toml"), b"this is not toml [[[")
+        .expect("corrupt manifest");
+
+    match handle.wait_terminal().await {
+        InstanceState::Failed { error } => {
+            // Post-fix: the supervisor kept using the pinned
+            // manifest across every restart. The crasher's
+            // repeated trap eventually hits the restart cap
+            // and Failed names the cap.
+            assert!(
+                error.contains("gave up") || error.contains("trap"),
+                "expected the trap-restart-cap Failed reason (proves the supervisor kept loading the pinned manifest); got: {error}",
+            );
+            assert!(
+                !error.contains("not toml") && !error.contains("parsing"),
+                "expected NO manifest-parse error (a parse error means the pin was discarded on restart); got: {error}",
+            );
+        }
+        other => panic!("expected Failed after the restart cap, got {other:?}"),
+    }
 }
