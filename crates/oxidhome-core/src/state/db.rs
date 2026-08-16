@@ -672,6 +672,51 @@ const MIGRATIONS: &[&str] = &[
            AND instance_id       = NEW.instance_id;
     END;
     ",
+    // Migration 15 — Phase 13 slice 3: dashboard storage.
+    //
+    // User-composed dashboards (rows of widgets, per the UI
+    // architecture design note). Persisted centrally so the
+    // shell can show the same dashboard on any browser the
+    // operator logs in from, and so a host restart doesn't
+    // lose the layout.
+    //
+    // `layout_json` is the tree the shell serializes — the
+    // host treats it as opaque bytes; the *shape* is the
+    // shell's contract with itself, versioned by
+    // `schema_version` so a widget catalog change (widget
+    // renamed / removed / config-shape migrated) can drive
+    // a declarative shell-side transform on load.
+    //
+    // `owner_user_id` is v1's row-level ownership key. Every
+    // row carries the stable literal `"admin"` (see
+    // `DASHBOARD_ADMIN_OWNER` in `oxidhome-core::api::server`
+    // and the Phase 13 round-2 F2 doc trail on
+    // `state::dashboards`). It is deliberately NOT the
+    // Phase 12 `Actor::id()` — that returns a per-token id
+    // that rotates when the operator mints a new token,
+    // which would silo dashboards per-token and strand rows
+    // on rotation. The multi-user follow-up will require a
+    // one-line migration to map the placeholder onto the
+    // real session identity:
+    // `UPDATE dashboard SET owner_user_id = <real id> WHERE owner_user_id = 'admin'`.
+    // `created_ms` / `updated_ms` are host wall-clock — the
+    // shell shows relative timestamps off them.
+    //
+    // `by_owner` index is what the list-dashboards endpoint
+    // scans; primary-key ordering happens to match creation
+    // order which is fine for the common case.
+    "
+    CREATE TABLE dashboard (
+        id            INTEGER PRIMARY KEY,
+        name          TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        layout_json   BLOB NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        created_ms    INTEGER NOT NULL,
+        updated_ms    INTEGER NOT NULL
+    );
+    CREATE INDEX dashboard_by_owner ON dashboard(owner_user_id);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

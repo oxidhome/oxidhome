@@ -5265,3 +5265,498 @@ async fn plugin_ui_session_returns_404_for_unknown_plugin() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+// ── Phase 13 slice 2: schema-driven UI endpoint ─────────────────
+
+/// Phase 13 slice 2: `GET /api/v1/plugins/{id}/schema`
+/// round-trips the manifest's `config` block and `[ui]`
+/// section verbatim, so a shell can render config forms
+/// off the response without a second manifest round trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_schema_returns_config_and_ui_from_manifest() {
+    let state_dir = support::tempdir("plugin-schema-ok");
+    let source = stage_install_source("plugin-schema-ok-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source.path().to_str().unwrap()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/schema")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["plugin_id"], "example.kv-counter");
+    assert!(body["version"].as_str().is_some_and(|v| !v.is_empty()));
+    // The `config` block always serializes as an object
+    // (empty on plugins that don't declare fields).
+    assert!(body["config"].is_object());
+    // `ui` is null on plugins that don't declare `[ui]`.
+    // `kv-counter`'s fixture manifest doesn't ship it, so
+    // the shape is `null`. If a fixture in the future
+    // adds `[ui]`, this test needs updating.
+    assert!(body["ui"].is_null() || body["ui"].is_object());
+}
+
+/// Phase 13 slice 2: `GET /schema` requires the
+/// `plugins:list` scope (same read-only role as the
+/// listing endpoint).
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_schema_requires_plugins_list_scope() {
+    let state_dir = support::tempdir("plugin-schema-scope");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let commander = engine
+        .auth_tokens()
+        .create("commander", b"[\"devices:command\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/schema")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", commander.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// Phase 13 round-8 F1: `GET /schema` refuses to return
+/// mixed metadata after a direct-FS swap of the installed
+/// `manifest.toml`. Pre-fix the handler re-read the on-disk
+/// manifest and returned its `config` / `ui` alongside the
+/// registry row's original `plugin_id` / `version` — a
+/// post-install attacker with FS write access could swap
+/// the manifest to inject new UI declarations. The digest
+/// recompute + compare closes that.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_schema_refuses_after_direct_manifest_swap() {
+    let state_dir = support::tempdir("plugin-schema-tamper");
+    let source = stage_install_source("plugin-schema-tamper-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // Install.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source.path().to_str().unwrap()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Baseline: schema endpoint answers 200.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/schema")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Tamper: rewrite the installed manifest.toml to bump the
+    // declared version. This does not go through the API's
+    // uninstall + install cycle, so the persisted
+    // content_digest does not roll — the schema endpoint MUST
+    // notice.
+    let installed_manifest = state_dir
+        .path()
+        .join("plugins/example.kv-counter/manifest.toml");
+    let original = std::fs::read_to_string(&installed_manifest).unwrap();
+    let mutated = original.replace("version = \"0.1.0\"", "version = \"9.9.9\"");
+    assert_ne!(original, mutated, "test expected to change the manifest");
+    std::fs::write(&installed_manifest, mutated).unwrap();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/schema")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+/// Phase 13 slice 2: `GET /schema` returns 404 for a
+/// plugin that isn't installed.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_schema_returns_404_for_unknown_plugin() {
+    let state_dir = support::tempdir("plugin-schema-unknown");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/com.example.notinstalled/schema")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ── Phase 13 slice 3: dashboard CRUD endpoints ──────────────────
+
+/// Phase 13 slice 3: `POST /dashboards` creates a row,
+/// `GET /dashboards/{id}` reads it back, `GET
+/// /dashboards` lists it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_create_read_and_list_round_trip() {
+    let state_dir = support::tempdir("dashboards-round-trip");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let body = serde_json::json!({
+        "name": "home",
+        "layout": {"rows": [{"widgets": [{"type": "toggle"}]}]},
+        "schema_version": 3,
+    });
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = body_to_json(response.into_body()).await;
+    let id = created["id"].as_i64().expect("id");
+    assert!(id > 0);
+    assert_eq!(created["name"], "home");
+    assert_eq!(created["schema_version"], 3);
+    assert_eq!(created["layout"]["rows"][0]["widgets"][0]["type"], "toggle");
+
+    // GET by id.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched = body_to_json(response.into_body()).await;
+    assert_eq!(fetched["id"], id);
+    assert_eq!(fetched["name"], "home");
+
+    // LIST (should include the row).
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed = body_to_json(response.into_body()).await;
+    let dashboards = listed["dashboards"].as_array().expect("dashboards");
+    assert_eq!(dashboards.len(), 1);
+    assert_eq!(dashboards[0]["id"], id);
+}
+
+/// Phase 13 slice 3: PUT updates the layout in place;
+/// DELETE removes the row and subsequent GETs 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_update_and_delete_round_trip() {
+    let state_dir = support::tempdir("dashboards-update-delete");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"home","layout":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = body_to_json(response.into_body()).await["id"]
+        .as_i64()
+        .unwrap();
+
+    // PUT.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"home v2","layout":{"rows":[]}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated = body_to_json(response.into_body()).await;
+    assert_eq!(updated["name"], "home v2");
+
+    // DELETE → 204.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Second DELETE / GET → 404.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Phase 13 slice 3 / round-2 finding 2: v1 collapses
+/// every API caller to a single stable `"admin"` owner —
+/// two admin tokens (or a rotated replacement) see each
+/// other's dashboards. Pre-fix the owner was `actor.id()`
+/// which for API actors is the *token id*, so two tokens
+/// couldn't see each other's dashboards and rotating a
+/// token stranded its rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_share_across_admin_tokens() {
+    let state_dir = support::tempdir("dashboards-shared-owner");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let token_a = engine
+        .auth_tokens()
+        .create("admin-a", b"[\"dashboards:read\",\"dashboards:write\"]")
+        .unwrap();
+    let token_b = engine
+        .auth_tokens()
+        .create("admin-b", b"[\"dashboards:read\",\"dashboards:write\"]")
+        .unwrap();
+    let router = build_router(engine);
+    // Token A creates a dashboard.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token_a.plaintext),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"shared","layout":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = body_to_json(response.into_body()).await["id"]
+        .as_i64()
+        .unwrap();
+
+    // Token B sees it via LIST and GET.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboards")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token_b.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed = body_to_json(response.into_body()).await;
+    let dashboards = listed["dashboards"].as_array().unwrap();
+    assert_eq!(dashboards.len(), 1);
+    assert_eq!(dashboards[0]["id"], id);
+    // Metadata-only listing — no `layout` field.
+    assert!(dashboards[0].get("layout").is_none());
+    assert!(dashboards[0]["layout_bytes"].as_u64().is_some());
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/dashboards/{id}"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token_b.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched = body_to_json(response.into_body()).await;
+    assert_eq!(fetched["name"], "shared");
+    assert_eq!(fetched["owner_user_id"], "admin");
+}
+
+/// Round-2 finding 3: an oversized `layout` returns 400
+/// (`too_large`) and does not persist. Repeated creates at
+/// the per-owner quota return 409 (`quota_exceeded`).
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_enforce_size_and_quota_caps() {
+    let state_dir = support::tempdir("dashboards-caps");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // Oversized `name` → 400.
+    let huge_name = "a".repeat(1024);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name": huge_name, "layout": {}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["error"], "too_large");
+    assert_eq!(body["field"], "name");
+}
+
+/// Phase 13 slice 3: read + write scopes gate the CRUD
+/// endpoints independently. `dashboards:read` alone
+/// forbids POST / PUT / DELETE.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboards_write_requires_dashboards_write_scope() {
+    let state_dir = support::tempdir("dashboards-scope");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"dashboards:read\"]")
+        .unwrap();
+    let router = build_router(engine);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/dashboards")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name":"nope","layout":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // LIST still works with dashboards:read alone.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboards")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reader.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

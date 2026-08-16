@@ -34,9 +34,9 @@ use crate::state::{
 
 use super::auth::{AuthState, require_token};
 use super::scopes::{
-    AUDIT_READ, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ, EVENTS_READ, EVENTS_TAIL,
-    INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP,
-    PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, require_scope,
+    AUDIT_READ, DASHBOARDS_READ, DASHBOARDS_WRITE, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ,
+    EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST,
+    PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, require_scope,
 };
 use super::ui_ticket;
 
@@ -97,6 +97,28 @@ pub fn build_router(engine: Engine) -> Router {
         .route(
             "/api/v1/plugins/{plugin_id}/stop",
             post(stop_plugin_instances),
+        )
+        // Phase 13 slice 2: schema-driven UI. Returns the
+        // installed manifest's `config` schema (Phase 4)
+        // and `[ui]` section (Phase 13 slice 1) so the
+        // shell can render config forms and load declared
+        // UI assets without a custom panel per plugin.
+        // Gated on `plugins:list` — same read-only role
+        // that lists installed plugins can see their
+        // schemas.
+        .route("/api/v1/plugins/{plugin_id}/schema", get(get_plugin_schema))
+        // Phase 13 slice 3: dashboard CRUD. Layout bytes
+        // are opaque to the host; the shell owns the
+        // serialization contract.
+        .route(
+            "/api/v1/dashboards",
+            get(list_dashboards).post(create_dashboard),
+        )
+        .route(
+            "/api/v1/dashboards/{id}",
+            get(get_dashboard)
+                .put(update_dashboard)
+                .delete(delete_dashboard),
         )
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/events", get(query_events))
@@ -1232,6 +1254,167 @@ async fn list_plugins(
     }
     plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
     Ok(Json(PluginsBody { plugins }))
+}
+
+/// Phase 13 slice 2: JSON body for
+/// `GET /api/v1/plugins/{plugin_id}/schema`. Returns the
+/// installed manifest's `config` schema and the `[ui]`
+/// section verbatim — same shape the manifest already
+/// deserializes, so the shell's default renderer can
+/// treat this endpoint as the source of truth without
+/// re-parsing TOML.
+///
+/// `ui: null` means the plugin didn't declare `[ui]`; the
+/// shell then falls back to the host's default config
+/// renderer only.
+#[derive(Serialize)]
+struct PluginSchemaBody {
+    plugin_id: String,
+    version: String,
+    config: std::collections::BTreeMap<String, oxidhome_manifest::ConfigField>,
+    ui: Option<oxidhome_manifest::UiSection>,
+}
+
+/// Phase 13 slice 2:
+/// `GET /api/v1/plugins/{plugin_id}/schema` — returns the
+/// installed manifest's `config` block and `[ui]` section
+/// so a UI shell can render declarative config forms and
+/// know which plugin-shipped assets are declared.
+///
+/// Reads the manifest + wasm + declared UI assets on
+/// demand and recomputes the content digest, then refuses
+/// to serve any response whose bytes disagree with the
+/// installation's persisted `content_digest`. Not hot-path:
+/// called once per plugin selection in the dashboard, not
+/// per render.
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` no such installed plugin (dev-only in-memory
+///   plugins aren't reachable — they have no on-disk
+///   manifest).
+/// - `409` on-disk package bytes have drifted from the
+///   installation's persisted digest (round-8 F1) — the
+///   caller must reinstall via the API to re-issue the
+///   grant + digest before the schema endpoint returns
+///   again.
+/// - `500` on-disk manifest is missing / unparseable /
+///   package IO failed — surfaces as `Internal` because
+///   the installer guarantees a valid manifest, so an
+///   unreadable one is a host-side integrity failure.
+async fn get_plugin_schema(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<PluginSchemaBody>, PluginSchemaError> {
+    require_scope(&actor, PLUGINS_LIST)?;
+    // Round-2 F4 + round-9 F1: hold the per-plugin
+    // lifecycle lock across the registry lookup + the
+    // package re-read + the digest verification. Without it,
+    // a concurrent uninstall + reinstall between the two
+    // visits could return a mixed view — the old row's
+    // `version` alongside the new installation's `config` /
+    // `ui` — or a transient 500 if the on-disk
+    // `manifest.toml` momentarily disappears during the
+    // reinstall's copy phase.
+    //
+    // Round-9 F1: use `lock_owned()` and move the guard INTO
+    // the `spawn_blocking` closure, then return it back with
+    // the result. A borrowed `_guard` on the handler frame
+    // would drop the moment the client cancels the request
+    // (tokio drops the handler future) — but `spawn_blocking`
+    // detaches and keeps running unbounded reads of the
+    // installed wasm + UI assets. Repeated cancelled
+    // requests would then race those reads concurrently for
+    // the same `plugin_id`, defeating the per-plugin
+    // serialization and pinning the blocking-thread pool /
+    // heap. Owned guard + return-with-result keeps the
+    // lock live for the duration of the actual work, even
+    // when the caller has walked away.
+    let lifecycle = state.engine.plugin_lifecycle_lock(&plugin_id);
+    let guard = lifecycle.lock_owned().await;
+    let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
+        return Err(PluginSchemaError::NotFound);
+    };
+    let plugin_dir = installed.path.clone();
+    let (result, guard) = tokio::task::spawn_blocking(move || {
+        let result = crate::state::recompute_digest_and_manifest(&plugin_dir);
+        (result, guard)
+    })
+    .await
+    .map_err(|err| PluginSchemaError::Internal(err.into()))?;
+    let _guard = guard;
+    let (digest, manifest) = result.map_err(PluginSchemaError::Internal)?;
+    if digest != *installed.content_digest {
+        return Err(PluginSchemaError::DigestMismatch {
+            plugin_id: (*installed.plugin_id).to_string(),
+            stored: installed.content_digest.to_string(),
+            current: digest,
+        });
+    }
+    Ok(Json(PluginSchemaBody {
+        plugin_id: (*installed.plugin_id).to_string(),
+        version: installed.version,
+        config: manifest.config,
+        ui: manifest.ui,
+    }))
+}
+
+/// Phase 13 slice 2: handler-local error type for the
+/// schema endpoint. `Internal` covers both "manifest file
+/// vanished" (registry says installed, disk disagrees —
+/// a host-side integrity failure the operator needs to
+/// see logged) and "`spawn_blocking` panicked".
+/// `DigestMismatch` (round-8 F1) is separate so operators
+/// can tell "someone modified the package on disk since
+/// install" apart from generic 500s and act on it
+/// (reinstall via the API).
+enum PluginSchemaError {
+    Scope(ScopeDenied),
+    NotFound,
+    DigestMismatch {
+        plugin_id: String,
+        stored: String,
+        current: String,
+    },
+    Internal(anyhow::Error),
+}
+
+impl From<ScopeDenied> for PluginSchemaError {
+    fn from(value: ScopeDenied) -> Self {
+        Self::Scope(value)
+    }
+}
+
+impl IntoResponse for PluginSchemaError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            Self::DigestMismatch {
+                plugin_id,
+                stored,
+                current,
+            } => {
+                tracing::error!(
+                    target: "api.plugins.schema",
+                    plugin_id = %plugin_id,
+                    stored_digest = %stored,
+                    current_digest = %current,
+                    "installed package bytes have drifted from the persisted digest; refusing to serve schema"
+                );
+                (
+                    StatusCode::CONFLICT,
+                    "installed package contents have been modified since install; reinstall via the API to re-issue the grant + digest",
+                )
+                    .into_response()
+            }
+            Self::Internal(err) => {
+                tracing::error!(target: "api.plugins.schema", error = %err, "manifest re-read failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        }
+    }
 }
 
 // ── Plugin lifecycle (install / start / stop / uninstall) ────────
@@ -2895,6 +3078,334 @@ impl WireAuditEntry {
             execution_outcome: row.execution_outcome,
             domain_error: row.domain_error,
             credential_fp: row.credential_fp,
+        }
+    }
+}
+
+// ── Dashboards (Phase 13 slice 3) ────────────────────────────────
+
+/// C6 round-2 finding 2: stable owner id for v1's
+/// single-role admin. Actor.id for API actors is the
+/// **token id** (rotates when the operator issues a new
+/// token) — using it as `owner_user_id` would mean two
+/// admin tokens can't see each other's dashboards, and a
+/// token rotation strands the operator's rows. The
+/// multi-user follow-up replaces this constant with the
+/// real session identity, and the migration is a single
+/// `UPDATE dashboard SET owner_user_id = <real id> WHERE
+/// owner_user_id = 'admin'` — one predicate, one row per
+/// admin dashboard.
+const DASHBOARD_ADMIN_OWNER: &str = "admin";
+
+/// Wire shape for a dashboard row. `layout` is the shell's
+/// opaque JSON tree — represented as `serde_json::Value` so
+/// clients can send/receive typed JSON without base64.
+#[derive(Debug, Serialize, Deserialize)]
+struct WireDashboard {
+    id: i64,
+    name: String,
+    owner_user_id: String,
+    layout: serde_json::Value,
+    schema_version: i64,
+    created_ms: i64,
+    updated_ms: i64,
+}
+
+impl WireDashboard {
+    fn from_row(row: crate::state::Dashboard) -> Result<Self, DashboardsError> {
+        let layout = serde_json::from_slice(&row.layout_json)
+            .map_err(|err| DashboardsError::CorruptRow(err.to_string()))?;
+        Ok(Self {
+            id: row.id,
+            name: row.name,
+            owner_user_id: row.owner_user_id,
+            layout,
+            schema_version: row.schema_version,
+            created_ms: row.created_ms,
+            updated_ms: row.updated_ms,
+        })
+    }
+}
+
+/// Round-2 finding 3: list response omits `layout_json`
+/// so the body is bounded by
+/// `MAX_DASHBOARDS_PER_OWNER × (name + fixed metadata)`
+/// regardless of layout size. Clients fetch the actual
+/// layout via `GET /api/v1/dashboards/{id}` when the
+/// operator selects one.
+#[derive(Debug, Serialize)]
+struct WireDashboardMetadata {
+    id: i64,
+    name: String,
+    owner_user_id: String,
+    schema_version: i64,
+    created_ms: i64,
+    updated_ms: i64,
+    layout_bytes: usize,
+}
+
+impl From<crate::state::dashboards::DashboardMetadata> for WireDashboardMetadata {
+    fn from(row: crate::state::dashboards::DashboardMetadata) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            owner_user_id: row.owner_user_id,
+            schema_version: row.schema_version,
+            created_ms: row.created_ms,
+            updated_ms: row.updated_ms,
+            layout_bytes: row.layout_bytes,
+        }
+    }
+}
+
+/// `POST /api/v1/dashboards` / `PUT /.../{id}` request body.
+/// `layout` is the shell's opaque tree; the host encodes it
+/// to bytes on the way in and back to `Value` on the way
+/// out.
+#[derive(Debug, Deserialize)]
+struct DashboardInputBody {
+    name: String,
+    layout: serde_json::Value,
+    #[serde(default = "default_schema_version")]
+    schema_version: i64,
+}
+
+fn default_schema_version() -> i64 {
+    1
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardsBody {
+    dashboards: Vec<WireDashboardMetadata>,
+}
+
+/// `GET /api/v1/dashboards` — metadata-only list of every
+/// dashboard the caller owns (`updated_ms DESC`). The
+/// `layout` body is omitted for size — clients fetch it
+/// via `GET /dashboards/{id}` when they need it.
+///
+/// # Errors
+/// - `403` scope check failed.
+async fn list_dashboards(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+) -> Result<Json<DashboardsBody>, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_READ)?;
+    let rows = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .dashboards()
+            .list_metadata_by_owner(DASHBOARD_ADMIN_OWNER)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??;
+    let dashboards = rows.into_iter().map(WireDashboardMetadata::from).collect();
+    Ok(Json(DashboardsBody { dashboards }))
+}
+
+/// `POST /api/v1/dashboards` — create a fresh dashboard
+/// owned by the caller. Returns the stored row with its
+/// server-minted id.
+///
+/// # Errors
+/// - `400` request body isn't valid JSON, or `name` /
+///   `layout` exceeds the per-row cap.
+/// - `403` scope check failed.
+/// - `409` the owner is already at `MAX_DASHBOARDS_PER_OWNER`.
+async fn create_dashboard(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Json(body): Json<DashboardInputBody>,
+) -> Result<Json<WireDashboard>, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_WRITE)?;
+    let layout_json =
+        serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
+    let input = crate::state::DashboardInput {
+        name: body.name,
+        owner_user_id: DASHBOARD_ADMIN_OWNER.to_string(),
+        layout_json,
+        schema_version: body.schema_version,
+    };
+    let created = tokio::task::spawn_blocking(move || state.engine.dashboards().create(input))
+        .await
+        .map_err(|err| DashboardsError::Internal(err.into()))??;
+    Ok(Json(WireDashboard::from_row(created)?))
+}
+
+/// `GET /api/v1/dashboards/{id}` — load one dashboard the
+/// caller owns. Owner-scoped predicate travels inside
+/// the SELECT statement; cross-owner reads return 404.
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` dashboard doesn't exist OR is owned by a
+///   different user.
+async fn get_dashboard(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<WireDashboard>, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_READ)?;
+    let row = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .dashboards()
+            .get_owned(id, DASHBOARD_ADMIN_OWNER)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??
+    .ok_or(DashboardsError::NotFound)?;
+    Ok(Json(WireDashboard::from_row(row)?))
+}
+
+/// `PUT /api/v1/dashboards/{id}` — replace the caller's
+/// dashboard. Round-2 finding 1: the owner predicate
+/// travels **inside** the UPDATE statement (via
+/// `store.update_owned`) so a concurrent delete + create
+/// that recycles the primary key under a different owner
+/// can't be modified by this request.
+///
+/// # Errors
+/// - `400` `name` / `layout` exceeds the per-row cap.
+/// - `403` scope check failed.
+/// - `404` dashboard doesn't exist OR is owned by a
+///   different user.
+async fn update_dashboard(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+    Json(body): Json<DashboardInputBody>,
+) -> Result<Json<WireDashboard>, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_WRITE)?;
+    let layout_json =
+        serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
+    let input = crate::state::DashboardInput {
+        name: body.name,
+        owner_user_id: DASHBOARD_ADMIN_OWNER.to_string(),
+        layout_json,
+        schema_version: body.schema_version,
+    };
+    let updated = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .dashboards()
+            .update_owned(id, DASHBOARD_ADMIN_OWNER, input)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??;
+    Ok(Json(WireDashboard::from_row(updated)?))
+}
+
+/// `DELETE /api/v1/dashboards/{id}` — remove the caller's
+/// dashboard. Owner predicate travels inside the DELETE
+/// (round-2 finding 1). Cross-owner attempts return 404
+/// (idempotent on the owner path — deleting a dashboard
+/// the caller already deleted returns 404).
+///
+/// # Errors
+/// - `403` scope check failed.
+/// - `404` dashboard doesn't exist OR is owned by a
+///   different user.
+async fn delete_dashboard(
+    Extension(actor): Extension<Actor>,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, DashboardsError> {
+    require_scope(&actor, DASHBOARDS_WRITE)?;
+    let removed = tokio::task::spawn_blocking(move || {
+        state
+            .engine
+            .dashboards()
+            .delete_owned(id, DASHBOARD_ADMIN_OWNER)
+    })
+    .await
+    .map_err(|err| DashboardsError::Internal(err.into()))??;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(DashboardsError::NotFound)
+    }
+}
+
+/// Handler-local error type. Errors from the store fold
+/// into this via `?`.
+enum DashboardsError {
+    Scope(ScopeDenied),
+    NotFound,
+    /// Round-2 finding 3: input violated the per-row cap
+    /// or per-owner quota. Wired distinctly from
+    /// `Internal` so the client sees 400 / 409 instead of
+    /// 500.
+    TooLarge {
+        field: &'static str,
+        size: usize,
+        max: usize,
+    },
+    QuotaExceeded {
+        existing: usize,
+        max: usize,
+    },
+    /// `layout_json` on disk doesn't parse as JSON. Should
+    /// never happen — the write path always serializes via
+    /// `serde_json::to_vec` — but if it does, treat as an
+    /// integrity failure.
+    CorruptRow(String),
+    Internal(anyhow::Error),
+}
+
+impl From<ScopeDenied> for DashboardsError {
+    fn from(value: ScopeDenied) -> Self {
+        Self::Scope(value)
+    }
+}
+
+impl From<crate::state::DashboardError> for DashboardsError {
+    fn from(value: crate::state::DashboardError) -> Self {
+        match value {
+            crate::state::DashboardError::NotFound(_) => Self::NotFound,
+            crate::state::DashboardError::TooLarge { field, size, max } => {
+                Self::TooLarge { field, size, max }
+            }
+            crate::state::DashboardError::QuotaExceeded { existing, max } => {
+                Self::QuotaExceeded { existing, max }
+            }
+            crate::state::DashboardError::Persistence(err) => Self::Internal(err.into()),
+        }
+    }
+}
+
+impl IntoResponse for DashboardsError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            Self::TooLarge { field, size, max } => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "too_large",
+                    "field": field,
+                    "size": size,
+                    "max": max,
+                })),
+            )
+                .into_response(),
+            Self::QuotaExceeded { existing, max } => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "quota_exceeded",
+                    "existing": existing,
+                    "max": max,
+                })),
+            )
+                .into_response(),
+            Self::CorruptRow(err) => {
+                tracing::error!(target: "api.dashboards", error = %err, "corrupt dashboard row");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+            Self::Internal(err) => {
+                tracing::error!(target: "api.dashboards", error = %err, "dashboard store failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
         }
     }
 }

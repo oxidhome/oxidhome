@@ -72,6 +72,10 @@ pub struct Engine {
     event_log: Arc<EventLog>,
     log_store: Arc<LogStore>,
     audit_log: Arc<AuditLog>,
+    /// Phase 13 slice 3: persistent user-composed dashboards.
+    /// The shell reads/writes through the REST endpoints on
+    /// `/api/v1/dashboards`; this handle backs those.
+    dashboards: Arc<crate::state::DashboardStore>,
     blobs: Arc<BlobStore>,
     services: Arc<ServiceRegistry>,
     instances: Arc<InstanceRegistry>,
@@ -246,6 +250,7 @@ impl Engine {
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
             audit_log: Arc::new(AuditLog::new(Arc::clone(&db))),
+            dashboards: Arc::new(crate::state::DashboardStore::new(Arc::clone(&db))),
             auth_tokens: Arc::new(crate::state::TokenStore::new(Arc::clone(&db))),
             blobs: Arc::new(BlobStore::new(Arc::clone(&db), blobs_root)),
             services: Arc::new(ServiceRegistry::new()),
@@ -348,6 +353,15 @@ impl Engine {
     #[must_use]
     pub fn audit_log(&self) -> Arc<AuditLog> {
         Arc::clone(&self.audit_log)
+    }
+
+    /// Phase 13 slice 3: shared dashboard store. Backs the
+    /// `/api/v1/dashboards` REST endpoints; layout bytes
+    /// are opaque to the host (the shell owns the
+    /// serialization contract).
+    #[must_use]
+    pub fn dashboards(&self) -> Arc<crate::state::DashboardStore> {
+        Arc::clone(&self.dashboards)
     }
 
     /// Shared blob store — Phase 5b. Bytes live on the filesystem
