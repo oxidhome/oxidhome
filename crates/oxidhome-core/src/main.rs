@@ -52,26 +52,29 @@ const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 /// is bounded by this (not `N * this`). Long enough for
 /// a well-behaved plugin's `shutdown` handler to run;
 /// short enough that a hung plugin doesn't wedge the
-/// daemon indefinitely. A timed-out stop is logged; the
-/// subsequent drain (round-3 F1 + round-5 F1) then aborts
-/// the corresponding reaper task, awaits it via a bounded
-/// fallback, and performs equivalent cleanup itself if the
-/// reaper's synchronous cleanup step is still running —
-/// so no supervised instance is stranded past shutdown.
+/// daemon indefinitely. A timed-out stop is logged; that
+/// supervisor is left running (its reaper is still blocked
+/// on the terminal transition) and the subsequent bounded
+/// drain will eventually detach it — the tokio runtime
+/// teardown that follows process exit aborts every
+/// detached task.
 const SHUTDOWN_STOP_PER_INSTANCE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Round-3 F1 + round-5 F1: bounded reaper-drain deadline
-/// for daemon shutdown. If the primary deadline elapses,
-/// the drain aborts the real reaper tasks, waits a short
-/// fallback for the aborts to propagate, and — for any
-/// reaper still stuck in synchronous cleanup — performs
-/// the equivalent cleanup itself (device / service
-/// eviction, device-state stale-mark, `instances.unregister`)
-/// so the singleton / `instance_id` slots aren't stranded.
-/// Independent from `SHUTDOWN_STOP_PER_INSTANCE_DEADLINE`
-/// because reaper work runs AFTER each supervisor reaches
-/// a terminal state and does its own bounded FS / SQL
-/// cleanup.
+/// Round-3 F1 + round-6 F1/F2/F3: bounded reaper-drain
+/// deadline for daemon shutdown. Best-effort: reapers that
+/// don't complete inside this window get detached (their
+/// wrapper tasks are aborted; the real reaper tasks stay
+/// running). On process exit the tokio runtime teardown
+/// aborts the detached tasks, so any post-deadline leak
+/// is process-lifetime bounded. Round-5 tried to abort
+/// the real reapers + perform equivalent cleanup inline
+/// on timeout, but every version of that hit a sharper
+/// bug (unregistering a still-running supervisor,
+/// mis-targeting recycled generations, deadlocking on
+/// the very lock that had wedged the reaper). Best-effort
+/// is the correct contract here — see the docstring on
+/// [`oxidhome_core::Engine::drain_supervised_instances_with_timeout`]
+/// for the full rationale.
 const SHUTDOWN_REAPER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Loopback-only by default — the API isn't meant to face the

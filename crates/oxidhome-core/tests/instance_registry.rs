@@ -335,26 +335,32 @@ async fn shutdown_trap_is_terminal_not_a_restart() {
     }
 }
 
-/// Round-3 F1 + round-4 F1 + round-5 F1:
-/// `drain_supervised_instances_with_timeout` bounds
-/// total wall-clock, actually aborts straggler reapers,
-/// and — because an aborted reaper can't run its own
-/// `registry.unregister` step — performs equivalent
-/// cleanup itself so the `instance_id` / singleton slots
-/// aren't stranded on a long-lived Engine.
+/// Round-3 F1 + round-6 F1/F2/F3: the bounded drain is
+/// best-effort. It returns promptly on timeout, but it
+/// does NOT reclaim registry state under a live
+/// supervisor — that would either (a) unregister a
+/// still-running supervisor and let a duplicate id start
+/// under one identity (round-5 F1), (b) mis-target
+/// cleanup at a recycled reaper generation (round-5 F2),
+/// or (c) deadlock on the same lock that wedged the
+/// reaper (round-5 F3). Test proves the contract: the
+/// timeout returns quickly with `Err(count)`, and the
+/// still-running supervisor's registry entry stays
+/// intact.
 #[tokio::test(flavor = "multi_thread")]
-async fn drain_with_timeout_aborts_reapers_and_cleans_up_state() {
+async fn drain_with_timeout_is_bounded_and_leaves_live_supervisor_untouched() {
     let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
     let switch_dir = support::workspace_root()
         .join("examples")
         .join("simulated-switch");
     let engine = Engine::new().expect("engine");
     let handle = engine
-        .start_instance(switch_dir.clone(), "drain-timeout", None)
+        .start_instance(switch_dir, "drain-timeout", None)
         .await
         .expect("start");
     handle.wait_for_running().await.expect("Running");
     assert_eq!(engine.devices().list().len(), 1);
+
     // Intentionally NOT calling stop — the supervisor is
     // still running, its reaper is blocked at
     // `wait_terminal`. Pre-round-3 an unbounded drain
@@ -373,28 +379,22 @@ async fn drain_with_timeout_aborts_reapers_and_cleans_up_state() {
         "expected the bounded drain to return promptly after the deadline; elapsed={elapsed:?}",
     );
 
-    // Round-5 F1: the drain performed the equivalent
-    // cleanup itself for every reaper it aborted, so the
-    // instance-registry entry is gone even though the
-    // reaper's `registry.unregister` was cancelled.
+    // Round-6 F1/F2/F3: the still-running supervisor MUST
+    // remain registered. A drain that unregistered it
+    // would let a duplicate `instance_id` start alongside
+    // the live supervisor.
     assert!(
-        engine.instance("drain-timeout").is_none(),
-        "round-5 F1: drain must clean up instance_id even when the reaper was aborted",
-    );
-    assert!(
-        engine.devices().list().is_empty(),
-        "round-5 F1: drain must evict devices even when the reaper was aborted",
+        engine.instance("drain-timeout").is_some(),
+        "round-6 F1: bounded drain must NOT unregister a supervisor that is still running",
     );
 
-    // Round-5 F1: because the instance_id / singleton
-    // slot is properly cleaned up, a fresh start reusing
-    // the same id succeeds — pre-fix (round-4) it would
-    // have been rejected forever as duplicate.
-    let fresh = engine
-        .start_instance(switch_dir, "drain-timeout", None)
-        .await
-        .expect("re-start after drain must succeed (id slot was reclaimed)");
-    fresh.stop().await.expect("stop");
+    // Clean up properly for the test's own teardown. The
+    // reaper is still alive on this Engine (only the
+    // wrapper was aborted), so a proper stop + unbounded
+    // drain converges on a clean state.
+    handle.stop().await.expect("stop");
+    assert_eq!(handle.wait_terminal().await, InstanceState::Stopped);
+    engine.drain_supervised_instances().await;
 }
 
 /// Round-2 F3: the pinned manifest snapshot supplied at

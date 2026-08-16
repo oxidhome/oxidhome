@@ -812,24 +812,46 @@ impl Engine {
     /// settled engine.
     pub async fn drain_supervised_instances(&self) {
         let handles = self.take_reaper_handles();
-        for (_id, jh) in handles {
+        for jh in handles {
             let _ = jh.await;
         }
     }
 
-    /// Round-3 F1: bounded reaper drain. Awaits up to
-    /// `deadline` for every outstanding reaper to complete;
-    /// any still-running reaper at the deadline is aborted
-    /// via its `JoinHandle` and the drain returns. The
-    /// daemon's shutdown path uses this so a supervisor
-    /// that ignored its `stop` (F1 leftover from the
-    /// per-instance timeout) can't block process exit
-    /// indefinitely.
+    /// Round-3 F1 + round-6 F1/F2/F3: **best-effort**
+    /// bounded reaper drain. Awaits up to `deadline` for
+    /// every outstanding reaper to complete naturally
+    /// (each reaper's own cleanup runs the
+    /// `remove_by_owner` / `unregister` chain — a handful
+    /// of hashmap ops that finish in milliseconds under
+    /// normal load). If the deadline elapses, aborts the
+    /// wrapper tasks — the underlying real reaper tasks
+    /// are **detached** (dropping a `JoinHandle` doesn't
+    /// cancel the task) — and returns `Err(count)` with a
+    /// warn log. The tokio runtime teardown at process
+    /// exit aborts the detached reapers alongside
+    /// everything else, so on the daemon shutdown path
+    /// the leak is process-lifetime bounded.
+    ///
+    /// **Do not use this when you need strong post-drain
+    /// state invariants on a LONG-LIVED [`Engine`]**
+    /// (tests, embedding). Callers who need that must
+    /// first stop every supervisor via
+    /// [`Self::stop_all_supervised_instances`] (which
+    /// ensures reapers wake up naturally on the terminal
+    /// transition) THEN call the UNBOUNDED
+    /// [`Self::drain_supervised_instances`]. Trying to
+    /// clean up on behalf of a wedged reaper here would
+    /// either (a) unregister a still-running supervisor
+    /// (freeing its singleton slot for a duplicate to
+    /// start under the same id), (b) mis-target cleanup
+    /// against a reaper generation that had already been
+    /// recycled, or (c) deadlock on whichever lock
+    /// wedged the reaper in the first place.
     ///
     /// Returns `Ok(())` if every reaper completed within
     /// the deadline; `Err(count)` — the number of reapers
-    /// that had to be aborted — if any timed out. Both
-    /// paths log; callers rarely inspect the return.
+    /// still outstanding at deadline — if any timed out.
+    /// Both paths log.
     pub async fn drain_supervised_instances_with_timeout(
         &self,
         deadline: std::time::Duration,
@@ -838,125 +860,83 @@ impl Engine {
         if handles.is_empty() {
             return Ok(());
         }
-        // Round-4 F1: capture each REAL reaper's
-        // `AbortHandle` before moving the `JoinHandle` into
-        // the wrapper task. Without this, `js.abort_all()`
-        // would abort only the wrappers and dropping the
-        // enclosed real `JoinHandle` would just detach the
-        // real reaper.
-        //
-        // Round-5 F2: keep the wrappers ALIVE after
-        // aborting the real reapers so the drain waits for
-        // each reaper task to actually end — either by
-        // observing cancellation at its next await, or by
-        // running remaining synchronous cleanup to
-        // completion (tokio abort is cooperative and can't
-        // interrupt sync work between await points).
-        // Pre-fix, `js.abort_all()` right after abort
-        // cancelled the wrappers immediately; we never
-        // learned whether the reapers had wound down.
-        let instance_ids: Vec<Arc<str>> = handles.iter().map(|(k, _)| Arc::clone(k)).collect();
-        let abort_handles: Vec<tokio::task::AbortHandle> =
-            handles.iter().map(|(_, jh)| jh.abort_handle()).collect();
         let mut js = tokio::task::JoinSet::new();
-        for (_, jh) in handles {
+        for jh in handles {
             js.spawn(async move {
                 let _ = jh.await;
             });
         }
-        // Phase 1: give reapers up to `deadline` to complete
-        // naturally.
+        // Wait up to `deadline` for every reaper to
+        // complete naturally. Each reaper's own cleanup
+        // (device / service eviction, device-state stale
+        // marking, `instances.unregister`) is a handful of
+        // hashmap operations — a well-behaved shutdown
+        // finishes here in milliseconds.
         let result =
             tokio::time::timeout(deadline, async { while js.join_next().await.is_some() {} }).await;
         if result.is_ok() {
             return Ok(());
         }
-        let remaining_at_deadline = js.len();
-
-        // Phase 2: abort the real reapers; keep wrappers
-        // alive to observe termination. Bounded fallback
-        // so a reaper mid-sync-cleanup (which abort can't
-        // interrupt) still doesn't wedge the drain.
-        for ah in &abort_handles {
-            ah.abort();
-        }
-        let fallback = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-            while js.join_next().await.is_some() {}
-        })
-        .await;
-
-        if fallback.is_err() {
-            // Round-5 F1: reapers are stuck in synchronous
-            // cleanup we can't interrupt. Do the
-            // equivalent cleanup ourselves for every
-            // drained instance — otherwise an aborted
-            // reaper's `registry.unregister` never runs
-            // and the instance_id / singleton slot are
-            // stranded forever. Idempotent — if a racing
-            // reaper reaches the same step first, the
-            // second call is a no-op.
-            for id in &instance_ids {
-                self.reap_instance_state(id);
-            }
-            js.abort_all();
-            while js.join_next().await.is_some() {}
-            tracing::warn!(
-                remaining = remaining_at_deadline,
-                deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-                "reaper drain deadline + 500ms fallback both exceeded; performed equivalent cleanup and detached wrapper stragglers",
-            );
-        } else {
-            // Round-5 F1: even in the happy fallback path,
-            // an aborted reaper task doesn't unregister the
-            // instance_id. Perform the equivalent cleanup
-            // so a long-lived Engine doesn't strand
-            // singleton / instance_id slots forever.
-            for id in &instance_ids {
-                self.reap_instance_state(id);
-            }
-            tracing::warn!(
-                remaining = remaining_at_deadline,
-                deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-                "reaper drain deadline exceeded; real reapers aborted and equivalent cleanup performed",
-            );
-        }
-        Err(remaining_at_deadline)
-    }
-
-    /// Round-5 F1: emergency equivalent-cleanup for one
-    /// instance whose reaper task the bounded drain had
-    /// to abort. Runs the same side effects the reaper's
-    /// task body would have — evict device / service
-    /// registrations, flip the device-state stale marker,
-    /// clear the instance-registry entry (and its
-    /// singleton slot). All idempotent — safe to run
-    /// alongside a racing reaper that hasn't yet reached
-    /// its own cleanup step.
-    fn reap_instance_state(&self, instance_id: &Arc<str>) {
-        self.devices.remove_by_owner(instance_id);
-        self.services.remove_by_owner(instance_id);
-        self.device_state.mark_instance_stale(instance_id);
-        // `unregister` needs the plugin_id to also clear
-        // the singleton slot. If the entry is already gone
-        // (racing reaper won), this is a no-op.
-        if let Some(handle) = self.instances.get(instance_id) {
-            let plugin_id = handle.plugin_id().to_string();
-            self.instances.unregister(instance_id, &plugin_id);
-        }
+        let remaining = js.len();
+        // Round-6 F1/F2/F3 — DELIBERATELY DETACH on
+        // timeout. Aborting the real reapers or running
+        // their cleanup ourselves both introduce sharper
+        // bugs than the detachment they replace:
+        //
+        // - Unregistering an instance whose supervisor is
+        //   still running (i.e. why its reaper hadn't
+        //   fired) would free the singleton slot; a
+        //   subsequent `start_instance` for the same id
+        //   would coexist with the still-running
+        //   supervisor — two supervisors under one
+        //   identity, bypassing singleton enforcement
+        //   (round-5 F1).
+        // - Matching cleanup to a still-pending reaper
+        //   requires distinguishing its generation from a
+        //   fresh reaper whose `instance_id` was recycled
+        //   after some earlier reaper completed; getting
+        //   that wrong evicts the replacement's state
+        //   (round-5 F2).
+        // - The reaper's cleanup IS the same
+        //   `remove_by_owner` / `unregister` chain we'd
+        //   run inline. If the reaper was blocked on a
+        //   contended / poisoned lock in that chain,
+        //   running the same ops inline would deadlock on
+        //   the same lock — the shutdown deadline would
+        //   not bind (round-5 F3).
+        //
+        // On timeout we abort ONLY the wrapper tasks
+        // (which detaches the real reapers) and return
+        // `Err(count)`. On the daemon shutdown path, tokio
+        // runtime teardown at process exit aborts the
+        // detached tasks alongside everything else, so the
+        // leak is process-lifetime bounded. Long-lived
+        // Engine callers that need strong post-drain
+        // invariants must stop every supervisor first
+        // (`stop_all_supervised_instances`) then use the
+        // UNBOUNDED [`Self::drain_supervised_instances`] —
+        // the bounded variant is best-effort by
+        // construction, and its contract makes that
+        // explicit.
+        js.abort_all();
+        while js.join_next().await.is_some() {}
+        tracing::warn!(
+            remaining,
+            deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            "reaper drain deadline exceeded; wrapper tasks aborted, real reapers detached (best-effort: daemon shutdown relies on runtime teardown to catch the tail; long-lived Engine users should stop every supervisor first, then use the unbounded drain)",
+        );
+        Err(remaining)
     }
 
     /// Round-3 F1 helper: atomically drain the reaper map
     /// under the sync mutex so the caller can await the
-    /// snapshot outside the lock. Round-5 F1: returns
-    /// `(instance_id, JoinHandle)` pairs so the timeout
-    /// fallback can perform equivalent per-instance
-    /// cleanup.
-    fn take_reaper_handles(&self) -> Vec<(Arc<str>, tokio::task::JoinHandle<()>)> {
+    /// snapshot outside the lock.
+    fn take_reaper_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut guard = self
             .reapers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.drain().map(|(k, (_gen, jh))| (k, jh)).collect()
+        guard.drain().map(|(_, (_gen, jh))| jh).collect()
     }
 
     /// Round-2 F1: request every supervised instance to
