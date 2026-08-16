@@ -5349,6 +5349,78 @@ async fn plugin_schema_requires_plugins_list_scope() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+/// Phase 13 round-8 F1: `GET /schema` refuses to return
+/// mixed metadata after a direct-FS swap of the installed
+/// `manifest.toml`. Pre-fix the handler re-read the on-disk
+/// manifest and returned its `config` / `ui` alongside the
+/// registry row's original `plugin_id` / `version` — a
+/// post-install attacker with FS write access could swap
+/// the manifest to inject new UI declarations. The digest
+/// recompute + compare closes that.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_schema_refuses_after_direct_manifest_swap() {
+    let state_dir = support::tempdir("plugin-schema-tamper");
+    let source = stage_install_source("plugin-schema-tamper-src", "example.kv-counter");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    // Install.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"source_dir": source.path().to_str().unwrap()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Baseline: schema endpoint answers 200.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/schema")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Tamper: rewrite the installed manifest.toml to bump the
+    // declared version. This does not go through the API's
+    // uninstall + install cycle, so the persisted
+    // content_digest does not roll — the schema endpoint MUST
+    // notice.
+    let installed_manifest = state_dir
+        .path()
+        .join("plugins/example.kv-counter/manifest.toml");
+    let original = std::fs::read_to_string(&installed_manifest).unwrap();
+    let mutated = original.replace("version = \"0.1.0\"", "version = \"9.9.9\"");
+    assert_ne!(original, mutated, "test expected to change the manifest");
+    std::fs::write(&installed_manifest, mutated).unwrap();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins/example.kv-counter/schema")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
 /// Phase 13 slice 2: `GET /schema` returns 404 for a
 /// plugin that isn't installed.
 #[tokio::test(flavor = "multi_thread")]

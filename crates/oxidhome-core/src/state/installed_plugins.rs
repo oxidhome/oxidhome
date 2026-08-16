@@ -2258,8 +2258,13 @@ pub(crate) fn read_manifest_sync(path: &Path) -> anyhow::Result<PluginManifest> 
     use anyhow::Context;
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_manifest_bytes(&text, path)
+}
+
+fn parse_manifest_bytes(text: &str, path: &Path) -> anyhow::Result<PluginManifest> {
+    use anyhow::Context;
     let manifest: PluginManifest =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        toml::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
     if let Err(errors) = oxidhome_manifest::validate(&manifest) {
         anyhow::bail!(
             "manifest {} is invalid:\n  - {}",
@@ -2272,6 +2277,52 @@ pub(crate) fn read_manifest_sync(path: &Path) -> anyhow::Result<PluginManifest> 
         );
     }
     Ok(manifest)
+}
+
+/// Phase 13 round-8 F1: single-read package inspection for
+/// the plugin-schema HTTP endpoint. Reads `manifest.toml`,
+/// parses + validates it from those exact bytes, then reads
+/// the referenced wasm + every declared UI asset via the
+/// same TOCTOU-safe path used by install / scan / loader.
+/// Computes and returns the content digest bound to that
+/// snapshot. The caller compares the returned digest to
+/// the persisted `content_digest` for the row — if they
+/// disagree, the on-disk package has been swapped since
+/// install and the endpoint MUST refuse rather than serve
+/// mixed metadata (old row id + new manifest contents).
+///
+/// # Errors
+///
+/// - Any IO error from the underlying reads.
+/// - A `BadManifest`-style anyhow error when parse /
+///   validation fails.
+/// - An `InvalidInput` IO error when a declared UI asset is
+///   missing / oversized / not a regular file.
+pub fn recompute_digest_and_manifest(
+    plugin_dir: &Path,
+) -> anyhow::Result<(String, PluginManifest)> {
+    use anyhow::Context;
+    let manifest_path = plugin_dir.join("manifest.toml");
+    let manifest_bytes = read_no_follow_within(plugin_dir, &manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let manifest_text = std::str::from_utf8(&manifest_bytes)
+        .with_context(|| format!("{} is not valid UTF-8", manifest_path.display()))?;
+    let manifest = parse_manifest_bytes(manifest_text, &manifest_path)?;
+    let wasm_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join(&manifest.runtime.wasm))
+        .with_context(|| format!("reading wasm for {}", manifest.plugin.id))?;
+    let ui_assets = match manifest.ui.as_ref() {
+        Some(ui) => Some(
+            read_declared_ui_asset_bytes(ui, plugin_dir)
+                .map_err(|reason| anyhow::anyhow!("{reason}"))?,
+        ),
+        None => None,
+    };
+    let frames = ui_assets
+        .as_ref()
+        .map(ui_asset_digest_frames)
+        .unwrap_or_default();
+    let digest = content_digest(&manifest_bytes, &wasm_bytes, &frames);
+    Ok((digest, manifest))
 }
 
 /// Pure-Rust recursive copy. **Refuses symlinks** rather than
@@ -4027,7 +4078,7 @@ config-schema = "ui/config.schema.json"
             reg.list().iter().all(|p| &*p.plugin_id != plugin_id),
             "the id must not be indexed as live",
         );
-        assert!(reg.is_quarantined(plugin_id), "the id must be quarantined",);
+        assert!(reg.is_quarantined(plugin_id), "the id must be quarantined");
 
         reg.uninstall(plugin_id).expect("uninstall");
         assert!(

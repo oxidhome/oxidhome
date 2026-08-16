@@ -1281,23 +1281,27 @@ struct PluginSchemaBody {
 /// so a UI shell can render declarative config forms and
 /// know which plugin-shipped assets are declared.
 ///
-/// Reads the manifest from disk on demand
-/// (`<state_dir>/plugins/<plugin_id>/manifest.toml`) via
-/// `installed_plugins::read_manifest_sync`, which
-/// re-runs `oxidhome_manifest::validate` and refuses to
-/// return anything if the on-disk manifest is malformed.
-/// Not hot-path: called once per plugin selection in the
-/// dashboard, not per render.
+/// Reads the manifest + wasm + declared UI assets on
+/// demand and recomputes the content digest, then refuses
+/// to serve any response whose bytes disagree with the
+/// installation's persisted `content_digest`. Not hot-path:
+/// called once per plugin selection in the dashboard, not
+/// per render.
 ///
 /// # Errors
 /// - `403` scope check failed.
 /// - `404` no such installed plugin (dev-only in-memory
 ///   plugins aren't reachable — they have no on-disk
 ///   manifest).
-/// - `500` on-disk manifest is missing / unparseable —
-///   surfaces as `Internal` because the installer
-///   guarantees a valid manifest, so an unreadable one
-///   is a host-side integrity failure.
+/// - `409` on-disk package bytes have drifted from the
+///   installation's persisted digest (round-8 F1) — the
+///   caller must reinstall via the API to re-issue the
+///   grant + digest before the schema endpoint returns
+///   again.
+/// - `500` on-disk manifest is missing / unparseable /
+///   package IO failed — surfaces as `Internal` because
+///   the installer guarantees a valid manifest, so an
+///   unreadable one is a host-side integrity failure.
 async fn get_plugin_schema(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
@@ -1321,13 +1325,29 @@ async fn get_plugin_schema(
     let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
         return Err(PluginSchemaError::NotFound);
     };
-    let manifest_path = installed.path.join("manifest.toml");
-    let manifest = tokio::task::spawn_blocking(move || {
-        crate::state::installed_plugins::read_manifest_sync(&manifest_path)
+    // Round-8 F1: read the manifest + wasm + declared UI
+    // assets in one snapshot, parse the manifest from those
+    // exact bytes, and recompute the content digest. Refuse
+    // if the on-disk snapshot disagrees with the persisted
+    // digest — pre-fix a direct-FS swap of `manifest.toml`
+    // (which the lifecycle lock DOES NOT prevent — it only
+    // serializes API-mediated install / uninstall / start)
+    // returned new `config` / `ui` metadata alongside the
+    // registry row's old `plugin_id` and `version`.
+    let plugin_dir = installed.path.clone();
+    let (digest, manifest) = tokio::task::spawn_blocking(move || {
+        crate::state::recompute_digest_and_manifest(&plugin_dir)
     })
     .await
     .map_err(|err| PluginSchemaError::Internal(err.into()))?
     .map_err(PluginSchemaError::Internal)?;
+    if digest != *installed.content_digest {
+        return Err(PluginSchemaError::DigestMismatch {
+            plugin_id: (*installed.plugin_id).to_string(),
+            stored: installed.content_digest.to_string(),
+            current: digest,
+        });
+    }
     Ok(Json(PluginSchemaBody {
         plugin_id: (*installed.plugin_id).to_string(),
         version: installed.version,
@@ -1341,9 +1361,18 @@ async fn get_plugin_schema(
 /// vanished" (registry says installed, disk disagrees —
 /// a host-side integrity failure the operator needs to
 /// see logged) and "`spawn_blocking` panicked".
+/// `DigestMismatch` (round-8 F1) is separate so operators
+/// can tell "someone modified the package on disk since
+/// install" apart from generic 500s and act on it
+/// (reinstall via the API).
 enum PluginSchemaError {
     Scope(ScopeDenied),
     NotFound,
+    DigestMismatch {
+        plugin_id: String,
+        stored: String,
+        current: String,
+    },
     Internal(anyhow::Error),
 }
 
@@ -1358,6 +1387,24 @@ impl IntoResponse for PluginSchemaError {
         match self {
             Self::Scope(s) => s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            Self::DigestMismatch {
+                plugin_id,
+                stored,
+                current,
+            } => {
+                tracing::error!(
+                    target: "api.plugins.schema",
+                    plugin_id = %plugin_id,
+                    stored_digest = %stored,
+                    current_digest = %current,
+                    "installed package bytes have drifted from the persisted digest; refusing to serve schema"
+                );
+                (
+                    StatusCode::CONFLICT,
+                    "installed package contents have been modified since install; reinstall via the API to re-issue the grant + digest",
+                )
+                    .into_response()
+            }
             Self::Internal(err) => {
                 tracing::error!(target: "api.plugins.schema", error = %err, "manifest re-read failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

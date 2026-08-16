@@ -48,7 +48,8 @@ pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicM
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
     InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, any_grant_matches,
-    content_digest, effective_capabilities, read_installed_bytes, recompute_installed_digest,
+    content_digest, effective_capabilities, read_installed_bytes, recompute_digest_and_manifest,
+    recompute_installed_digest,
 };
 pub(crate) use kv::stored_value_size;
 pub use kv::{KvError, KvStore};
