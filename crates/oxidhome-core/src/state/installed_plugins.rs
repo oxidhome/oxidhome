@@ -288,6 +288,23 @@ pub fn recompute_installed_digest(
 /// pattern; Windows symlinks require admin/dev-mode to create,
 /// so the race is a lower-priority concern.
 fn read_no_follow_within(root: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
+    read_no_follow_within_bounded(root, path, None)
+}
+
+/// Bounded variant of [`read_no_follow_within`]. When
+/// `max_bytes` is `Some(n)`, the read is capped at `n + 1`
+/// bytes via `Read::take`; if the file yields more than `n`
+/// it returns `InvalidInput` with a diagnostic instead of
+/// growing the buffer. UI-asset reads use this to enforce
+/// per-file caps (round-4 F4); manifest / wasm reads keep
+/// the unbounded shape (`None`) so a legitimate large wasm
+/// component isn't rejected — the wasmtime instantiator
+/// applies its own limits downstream.
+fn read_no_follow_within_bounded(
+    root: &Path,
+    path: &Path,
+    max_bytes: Option<usize>,
+) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     #[cfg(unix)]
     let mut file = {
@@ -347,7 +364,26 @@ fn read_no_follow_within(root: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
         ));
     }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    if let Some(max) = max_bytes {
+        // Round-4 F4: cap at `max + 1` so an overrun yields a
+        // deterministic `InvalidInput` (not a silent truncation
+        // that would then flip the digest). `Read::take` limits
+        // the underlying read; we don't preallocate to `max`
+        // because most files are far smaller.
+        let cap = max.saturating_add(1);
+        file.take(cap as u64).read_to_end(&mut buf)?;
+        if buf.len() > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to read {}: file exceeds the per-file cap of {max} bytes",
+                    path.display(),
+                ),
+            ));
+        }
+    } else {
+        file.read_to_end(&mut buf)?;
+    }
     Ok(buf)
 }
 
@@ -838,16 +874,21 @@ impl InstalledPluginRegistry {
                     "installed dir name disagrees with manifest plugin.id; indexing by manifest id",
                 );
             }
-            // Phase 13 round-3 F2: run the same UI-package
-            // validator install runs, so a declared UI asset
-            // that was deleted (or a config-schema whose JSON
-            // was corrupted) after install doesn't re-appear
-            // as an indexed live plugin after a restart. On
-            // failure, defer the orphan sweep and skip
-            // indexing — the operator sees the tracing::warn
-            // and resolves via uninstall + reinstall. We do
-            // NOT tombstone here: identity stays intact so
-            // a fix + restart re-indexes cleanly.
+            // Phase 13 round-3 F2 + round-4 F1: run the same
+            // UI-package validator install runs, so a declared
+            // UI asset that was deleted (or a config-schema
+            // whose JSON was corrupted) after install doesn't
+            // re-appear as an indexed live plugin after a
+            // restart. Round-4 F1 refinement: if there IS a
+            // live SQL row for this `plugin_id`, add it to the
+            // quarantined registry with the live row's
+            // installation UUID. Pre-fix the scan just
+            // `continue`d, which left `is_quarantined()`
+            // returning false for the id — a raw-path
+            // `LoadMode::Dev` load then fell through to
+            // synthetic identity + manifest-requested
+            // capabilities, silently bypassing the persisted
+            // grant boundary the digest was supposed to guard.
             if let Some(ui) = manifest.ui.as_ref()
                 && let Err(reason) = validate_ui_package(ui, &path)
             {
@@ -857,6 +898,21 @@ impl InstalledPluginRegistry {
                     reason = %reason,
                     "skipping installed dir with invalid UI package — deferring orphan-live-row sweep this boot",
                 );
+                if let Some(live) = live_rows.get(&manifest_id) {
+                    let id_arc: Arc<str> = Arc::from(manifest_id.as_str());
+                    quarantined_registry.insert(
+                        id_arc,
+                        QuarantineEntry {
+                            installation_uuid: Arc::clone(&live.installation_uuid),
+                            paths: vec![path.clone()],
+                        },
+                    );
+                    // Same-boot suppression: keep the id off the
+                    // orphan-sweep target list so the row isn't
+                    // tombstoned before the operator gets a chance
+                    // to repair.
+                    observed_manifest_ids.insert(manifest_id.clone(), path.clone());
+                }
                 defer_orphan_sweep = true;
                 continue;
             }
@@ -988,11 +1044,62 @@ impl InstalledPluginRegistry {
             let (installation_uuid, granted_capabilities, content_digest_arc) = if let Some(live) =
                 live_rows.get(&*id_arc)
             {
-                (
-                    Arc::clone(&live.installation_uuid),
-                    Arc::clone(&live.granted_capabilities),
-                    Arc::clone(&live.content_digest),
-                )
+                // Phase 13 round-4 F3: recompute the digest
+                // over the current on-disk state and compare
+                // with the persisted `live.content_digest`.
+                // Pre-fix the scan blindly trusted the stored
+                // digest — a syntactically-valid JS replacement
+                // (which validate_ui_package accepts by design;
+                // JS bytes are opaque to the host) stayed
+                // indexed as live until `start-instance` later
+                // recomputed and rejected. Boot is the cheaper
+                // moment to catch this and the correct one for
+                // the operator: the row shows up as
+                // quarantined instead of appearing healthy and
+                // then failing on the first start attempt.
+                // Same fix covers pre-v3 (v2-tagged) digests
+                // whose UI bytes never contributed to the
+                // hash — they mismatch as soon as v3 lands.
+                match read_installed_bytes(&path, &manifest.runtime.wasm, manifest.ui.as_ref()) {
+                    Ok((current_digest, _, _)) if current_digest == *live.content_digest => (
+                        Arc::clone(&live.installation_uuid),
+                        Arc::clone(&live.granted_capabilities),
+                        Arc::clone(&live.content_digest),
+                    ),
+                    Ok((current_digest, _, _)) => {
+                        tracing::warn!(
+                            plugin_id = %manifest_id,
+                            path = %path.display(),
+                            stored_digest = %live.content_digest,
+                            current_digest = %current_digest,
+                            "content digest mismatch during scan — quarantining until reinstall",
+                        );
+                        quarantined_registry.insert(
+                            Arc::clone(&id_arc),
+                            QuarantineEntry {
+                                installation_uuid: Arc::clone(&live.installation_uuid),
+                                paths: vec![path.clone()],
+                            },
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            plugin_id = %manifest_id,
+                            path = %path.display(),
+                            %err,
+                            "scan-time digest recomputation failed — quarantining until reinstall",
+                        );
+                        quarantined_registry.insert(
+                            Arc::clone(&id_arc),
+                            QuarantineEntry {
+                                installation_uuid: Arc::clone(&live.installation_uuid),
+                                paths: vec![path.clone()],
+                            },
+                        );
+                        continue;
+                    }
+                }
             } else {
                 // FS entry with no live SQL row — mint one.
                 // Under the FS-first uninstall order, an
@@ -1300,15 +1407,17 @@ impl InstalledPluginRegistry {
             });
         }
 
-        // Phase 13 round-2 F5 + round-3 F1/F2: package-aware
-        // UI validation over the staged tree.
+        // Phase 13 round-2 F5 + round-3 F1/F2 + round-4 F2:
+        // package-aware UI validation over the staged tree.
         // `validate_ui_package` verifies every declared asset
         // exists as a regular file (F5), meta-validates the
         // JSON-Schema files as draft 2020-12 (round-3 F1),
         // and returns the exact bytes we feed to the digest
-        // below (round-3 F2) — install and boot-scan agree
-        // byte-for-byte because both compute the digest from
-        // this same reader.
+        // below (round-3 F2, round-4 F2). Round-4 F2: the
+        // bytes returned here are the SAME bytes hashed into
+        // the digest — no re-read between validation and
+        // digest, so a swap can't validate a good schema and
+        // then commit a replacement as authoritative.
         let staged_ui_assets = match staged_manifest.ui.as_ref() {
             Some(ui) => match validate_ui_package(ui, &staging) {
                 Ok(assets) => Some(assets),
@@ -1323,27 +1432,36 @@ impl InstalledPluginRegistry {
             None => None,
         };
 
-        // C5 review F3 + round-4 F2 + round-3 F2: compute the
-        // content digest over the staged package's
-        // `manifest.toml` + wasm bytes + declared UI assets.
-        // The loader recomputes from the SAME in-memory bytes
-        // it uses to instantiate wasmtime; the boot scan
-        // recomputes over the same on-disk tree, so a mid-load
-        // or post-install rewrite of the manifest, wasm, OR
-        // declared UI assets flips the digest and quarantines
-        // the row.
-        let staged_digest = match read_installed_bytes(
-            &staging,
-            &staged_manifest.runtime.wasm,
-            staged_manifest.ui.as_ref(),
-        ) {
-            Ok((d, _, _)) => d,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(InstallError::Io(err));
-            }
-        };
-        drop(staged_ui_assets); // bytes-only inspection; digest is authoritative
+        // C5 review F3 + round-4 F2 (Phase 13): compute the
+        // content digest from bytes we already own — manifest
+        // and wasm are read here via the same TOCTOU-safe
+        // `read_no_follow_within` used elsewhere, and UI
+        // assets are the exact `ValidatedUiAssets` returned
+        // above (round-4 F2: no second read).
+        let staged_manifest_bytes =
+            match read_no_follow_within(&staging, &staging.join("manifest.toml")) {
+                Ok(b) => b,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(InstallError::Io(err));
+                }
+            };
+        let staged_wasm_bytes =
+            match read_no_follow_within(&staging, &staging.join(&staged_manifest.runtime.wasm)) {
+                Ok(b) => b,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(InstallError::Io(err));
+                }
+            };
+        let ui_frames = staged_ui_assets
+            .as_ref()
+            .map(ui_asset_digest_frames)
+            .unwrap_or_default();
+        let staged_digest = content_digest(&staged_manifest_bytes, &staged_wasm_bytes, &ui_frames);
+        drop(staged_manifest_bytes);
+        drop(staged_wasm_bytes);
+        drop(staged_ui_assets);
 
         let row = InstalledPlugin {
             plugin_id: Arc::clone(&id_arc),
@@ -1906,10 +2024,23 @@ pub(crate) fn read_declared_ui_asset_bytes(
         ("commands-schema", ui.commands_schema.as_ref()),
     ];
 
+    let mut total: usize = 0;
     let mut items: Vec<(&'static str, Vec<u8>)> = Vec::new();
     for (field, path) in scalar_assets {
         let Some(rel) = path else { continue };
         let bytes = read_ui_asset_file(field, base_dir, rel)?;
+        total = total.checked_add(bytes.len()).ok_or_else(|| {
+            format!(
+                "ui.{field} `{}` overflowed the aggregate UI-asset byte counter",
+                rel.display(),
+            )
+        })?;
+        if total > MAX_UI_TOTAL_BYTES {
+            return Err(format!(
+                "ui.{field} `{}` pushes the aggregate declared-UI-asset size over the cap ({total} > {MAX_UI_TOTAL_BYTES} bytes)",
+                rel.display(),
+            ));
+        }
         items.push((field, bytes));
     }
 
@@ -1917,6 +2048,18 @@ pub(crate) fn read_declared_ui_asset_bytes(
     for (index, rel) in ui.widgets.iter().enumerate() {
         let label = format!("widgets[{index}]");
         let bytes = read_ui_asset_file(&label, base_dir, rel)?;
+        total = total.checked_add(bytes.len()).ok_or_else(|| {
+            format!(
+                "ui.{label} `{}` overflowed the aggregate UI-asset byte counter",
+                rel.display(),
+            )
+        })?;
+        if total > MAX_UI_TOTAL_BYTES {
+            return Err(format!(
+                "ui.{label} `{}` pushes the aggregate declared-UI-asset size over the cap ({total} > {MAX_UI_TOTAL_BYTES} bytes)",
+                rel.display(),
+            ));
+        }
         widgets.push((label, bytes));
     }
 
@@ -1941,15 +2084,49 @@ pub(crate) fn ui_asset_digest_frames<'a>(
     frames
 }
 
-/// Read a declared UI asset via [`read_no_follow_within`]
-/// — same TOCTOU-safe path as manifest / wasm reads. The
-/// returned bytes are what the digest hashes, so the read
-/// **has** to be the same call the validator saw; a
+/// Round-4 F4: per-file cap on non-schema UI assets
+/// (`config`, `device-config`, `commands`, each widget
+/// bundle). Bundled JS + declarative JSON stays well under
+/// this in practice; a truly gigantic asset is either an
+/// authoring mistake or a denial-of-service attempt.
+pub(crate) const MAX_UI_ASSET_BYTES: usize = 1_048_576; // 1 MiB
+
+/// Round-4 F4: tighter per-file cap on JSON-Schema files
+/// (`config-schema`, `commands-schema`). Schemas describing
+/// operator-visible forms are small; a 128 KiB schema is
+/// already unusually large. Keeping this tight bounds the
+/// `serde_json::from_slice` + `jsonschema::draft202012::new`
+/// work per install.
+pub(crate) const MAX_UI_SCHEMA_BYTES: usize = 131_072; // 128 KiB
+
+/// Round-4 F4: aggregate cap across every declared UI
+/// asset in one package. Bounds the total memory install
+/// holds while reading + validating + hashing the UI set.
+/// At the manifest widget cap (`MAX_UI_WIDGETS = 32`) plus
+/// the five scalar entries, this leaves ~110 KiB/entry
+/// headroom on average — still generous for real UI
+/// bundles.
+pub(crate) const MAX_UI_TOTAL_BYTES: usize = 4 * 1_048_576; // 4 MiB
+
+/// Read a declared UI asset via [`read_no_follow_within_bounded`]
+/// — same TOCTOU-safe path as manifest / wasm reads, but
+/// with a per-file byte cap (round-4 F4). Schemas get a
+/// tighter cap than executable bundles; both prevent an
+/// unbounded `read_to_end` from exhausting memory on the install /
+/// scan on a malicious package.
+///
+/// The returned bytes are what the digest hashes, so the
+/// read **has** to be the same call the validator saw; a
 /// separate stat-then-read would race a swap between the
 /// two syscalls.
 fn read_ui_asset_file(field_label: &str, base_dir: &Path, rel: &Path) -> Result<Vec<u8>, String> {
     let full = base_dir.join(rel);
-    read_no_follow_within(base_dir, &full).map_err(|err| {
+    let per_file_cap = if field_label == "config-schema" || field_label == "commands-schema" {
+        MAX_UI_SCHEMA_BYTES
+    } else {
+        MAX_UI_ASSET_BYTES
+    };
+    read_no_follow_within_bounded(base_dir, &full, Some(per_file_cap)).map_err(|err| {
         format!(
             "ui.{field_label} `{}` is not a readable regular file in the plugin package: {err}",
             rel.display(),
@@ -3425,15 +3602,19 @@ config-schema = "ui/config.schema.json"
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Phase 13 round-3 F2: boot-scan validates declared UI
-    /// assets the same way install does. If an operator (or
-    /// a malicious FS write) deletes `ui/config.schema.json`
-    /// after install, the next scan refuses to index the dir
-    /// as a live plugin — the plugin_id doesn't reappear in
-    /// the registry and the row is neither auto-tombstoned
-    /// nor silently activated.
+    /// Phase 13 round-3 F2 + round-4 F1: boot-scan validates
+    /// declared UI assets the same way install does. If an
+    /// operator (or a malicious FS write) deletes
+    /// `ui/config.schema.json` after install, the next scan
+    /// refuses to index the dir as a live plugin AND enters
+    /// the quarantine registry so a raw-path `LoadMode::Dev`
+    /// load with the same `plugin_id` refuses too — pre-fix
+    /// the scan skipped without quarantining, letting a dev
+    /// load fall through to synthetic identity plus the
+    /// manifest's requested capabilities and bypass the
+    /// persisted grant boundary.
     #[test]
-    fn scan_refuses_to_index_dir_whose_declared_ui_asset_is_missing() {
+    fn scan_quarantines_live_row_when_declared_ui_asset_is_missing() {
         let root = tempdir("boot-missing-ui");
         let plugins_root = root.join("plugins");
         let db = fresh_db();
@@ -3455,9 +3636,126 @@ config-schema = "ui/config.schema.json"
             "dir with a missing declared UI asset must not appear in the live registry",
         );
         assert!(
-            !reg2.is_quarantined("example.missingui"),
-            "the row stays live (identity intact); operator resolves via uninstall + reinstall",
+            reg2.is_quarantined("example.missingui"),
+            "round-4 F1: the live row must be quarantined so dev-load falls closed",
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-4 F3: mutating a declared UI asset
+    /// after install causes the next boot scan to detect a
+    /// content-digest mismatch and quarantine the row —
+    /// pre-fix the scan trusted the stored digest and the
+    /// mismatch surfaced only at start-instance time, long
+    /// after the row had already been indexed as healthy.
+    #[test]
+    fn scan_quarantines_live_row_when_content_digest_no_longer_matches() {
+        let root = tempdir("boot-digest-mismatch");
+        let plugins_root = root.join("plugins");
+        let db = fresh_db();
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).expect("scan");
+        let source = write_plugin_dir_with_ui(&root, "example.mutated", &[]);
+        reg.install(&source).expect("install");
+        drop(reg);
+
+        // Swap the UI JS with a syntactically-different but
+        // still-syntactically-valid replacement. The manifest
+        // validator + UI validator both accept it (JS bytes
+        // are opaque); only the digest catches the swap.
+        std::fs::write(
+            plugins_root.join("example.mutated/ui/config.js"),
+            b"export default { swapped: true };",
+        )
+        .unwrap();
+
+        let reg2 = InstalledPluginRegistry::scan(plugins_root, db).expect("second scan");
+        assert!(
+            reg2.list()
+                .iter()
+                .all(|p| &*p.plugin_id != "example.mutated"),
+            "round-4 F3: mismatched-digest dir must not appear in the live registry",
+        );
+        assert!(
+            reg2.is_quarantined("example.mutated"),
+            "round-4 F3: mismatched-digest dir must land in the quarantine registry",
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-4 F4: install refuses a UI asset whose
+    /// bytes exceed the per-file cap.
+    #[test]
+    fn install_refuses_ui_asset_exceeding_per_file_cap() {
+        let root = tempdir("cap-per-file");
+        let plugins_root = root.join("plugins");
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).expect("scan empty");
+        // Non-schema per-file cap is 1 MiB; write 1 MiB + 1.
+        let oversize = vec![b'a'; MAX_UI_ASSET_BYTES + 1];
+        let source =
+            write_plugin_dir_with_ui(&root, "example.bigconfig", &[("ui/config.js", &oversize)]);
+        let err = reg.install(&source).expect_err("install must refuse");
+        match err {
+            InstallError::BadManifest { reason, .. } => {
+                assert!(
+                    reason.contains("per-file cap"),
+                    "reason should mention per-file cap; got: {reason}",
+                );
+            }
+            other => panic!("expected BadManifest; got {other:?}"),
+        }
+        assert!(!plugins_root.join("example.bigconfig").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase 13 round-4 F4: install refuses a package whose
+    /// declared UI assets pass each per-file cap but sum
+    /// past the aggregate cap.
+    #[test]
+    fn install_refuses_ui_assets_exceeding_aggregate_cap() {
+        let root = tempdir("cap-aggregate");
+        let plugins_root = root.join("plugins");
+        let reg =
+            InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).expect("scan empty");
+        // Each widget sits under the per-file cap (1 MiB) but
+        // 5 * 1 MiB = 5 MiB > MAX_UI_TOTAL_BYTES (4 MiB).
+        let dir = root.join("source-example.bigtotal");
+        std::fs::create_dir_all(dir.join("ui")).unwrap();
+        let widget_bytes = vec![b'x'; MAX_UI_ASSET_BYTES - 1024];
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("ui/w{i}.js")), &widget_bytes).unwrap();
+        }
+        std::fs::write(
+            dir.join("manifest.toml"),
+            r#"manifest_version = 1
+[plugin]
+id = "example.bigtotal"
+name = "Big"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+[ui]
+widgets = ["ui/w0.js","ui/w1.js","ui/w2.js","ui/w3.js","ui/w4.js"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+
+        let err = reg
+            .install(&dir)
+            .expect_err("install must refuse aggregate");
+        match err {
+            InstallError::BadManifest { reason, .. } => {
+                assert!(
+                    reason.contains("aggregate"),
+                    "reason should mention aggregate cap; got: {reason}",
+                );
+            }
+            other => panic!("expected BadManifest; got {other:?}"),
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

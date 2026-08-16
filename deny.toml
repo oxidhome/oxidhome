@@ -101,6 +101,12 @@ ignore = [
 # permissive license, OSI-approved, FSF-Free, attribution-only.
 allow = [
   "MIT",
+  # `MIT-0` (aka "MIT No Attribution") is `MIT` minus the attribution
+  # clause — strictly more permissive than `MIT` (no notice/copy
+  # requirement at all). Comes in via `borrow-or-share` (→ `fluent-uri`
+  # → `referencing` → `jsonschema`, added for Phase 13 UI-schema
+  # meta-validation).
+  "MIT-0",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "BSD-3-Clause",
