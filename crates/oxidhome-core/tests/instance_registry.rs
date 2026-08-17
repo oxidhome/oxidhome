@@ -265,6 +265,59 @@ async fn start_instance_refuses_raw_path_downgrade_of_installed_singleton() {
     installed_handle.stop().await.expect("stop installed");
 }
 
+/// Round-2 F1 mirror: a running singleton instance for
+/// `plugin_id` must refuse a subsequent NON-singleton
+/// start of the same `plugin_id`. Singleton means
+/// exclusive; a non-singleton coexisting with a running
+/// singleton violates the same invariant from the other
+/// direction.
+///
+/// Reproduced against a dev-only engine so the caller's
+/// flag is authoritative (no
+/// `InstalledPluginRegistry`-override): first start
+/// declares `singleton = true`, second declares
+/// `singleton = false`.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_singleton_start_refused_when_singleton_instance_already_running() {
+    let wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let singleton_src = support::stage_plugin(
+        "singleton-first-src",
+        &wasm,
+        "simulated_switch.wasm",
+        &switch_manifest(true),
+    );
+    let non_singleton_src = support::stage_plugin(
+        "non-singleton-second-src",
+        &wasm,
+        "simulated_switch.wasm",
+        &switch_manifest(false),
+    );
+    let engine = Engine::new().expect("engine");
+
+    let singleton_handle = engine
+        .start_instance(singleton_src.path().to_path_buf(), "single-a", None)
+        .await
+        .expect("singleton start");
+    singleton_handle
+        .wait_for_running()
+        .await
+        .expect("singleton Running");
+
+    let err = engine
+        .start_instance(non_singleton_src.path().to_path_buf(), "ns-b", None)
+        .await
+        .expect_err(
+            "non-singleton start must be refused when a same-plugin_id singleton is already running",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("singleton") && msg.contains("example.simulated-switch"),
+        "expected SingletonInUse naming the plugin: {msg}",
+    );
+
+    singleton_handle.stop().await.expect("stop singleton");
+}
+
 /// Round-2 F1: a running non-singleton instance for
 /// `plugin_id` must refuse a subsequent singleton start
 /// of the same `plugin_id`. Pre-fix the check walked only
