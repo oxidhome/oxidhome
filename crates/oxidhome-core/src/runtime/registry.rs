@@ -142,13 +142,19 @@ impl InstanceRegistry {
         if guard.instances.contains_key(&instance_id) {
             return Err(RegistryError::DuplicateInstanceId { instance_id });
         }
-        // TODO(phase 7+): `singleton` is read from the *caller's*
-        // manifest, but a different install dir with the same
-        // `plugin_id` could carry `singleton = false`. That would let
-        // a non-singleton instance coexist with a singleton one. The
-        // host-side plugin ledger Phase 7+ adds is where the canonical
-        // per-`plugin_id` singleton flag belongs; for now Phase 6
-        // accepts the per-instance reading.
+        // Phase-6 leftover fix: `singleton` is now the
+        // AUTHORITATIVE value from the InstalledPluginRegistry
+        // when the plugin_id is installed (see
+        // `Engine::start_instance_with_tuning`), and falls
+        // back to the caller's manifest only when there's
+        // no install record (dev-only Engine / raw-path
+        // load with an unknown id). Two install dirs with
+        // the same manifest.plugin.id are prevented by
+        // H8's install-time refusal + scan-time quarantine,
+        // so the "different install dirs disagreeing on
+        // the flag" scenario the earlier TODO warned about
+        // is now closed at both the install boundary and
+        // the start boundary.
         if singleton && let Some(existing) = guard.singletons.get(&plugin_id) {
             return Err(RegistryError::SingletonInUse {
                 plugin_id,
