@@ -122,6 +122,128 @@ async fn on_trap_restarts_a_tick_trap_until_the_cap() {
     }
 }
 
+/// Phase-6 leftover integration coverage — the
+/// `healthy_reset` window resets the consecutive-restart
+/// counter, so an instance that runs healthy longer than
+/// `healthy_reset` before each crash can restart
+/// indefinitely without hitting `max_restarts`. Unit
+/// coverage of the reset decision already existed; this
+/// test proves the reset is observably wired through the
+/// supervisor loop end-to-end.
+///
+/// Setup: `max_restarts = 1`, `healthy_reset = 50ms`,
+/// crasher `tick_interval_ms = 200ms` (well past
+/// `healthy_reset`). Every life stays Running for
+/// ~200ms before its first tick trap, which exceeds the
+/// 50ms healthy window, so the counter resets to 0 on
+/// each crash.
+///
+/// Round-2 (PR #116) — the test observes THREE distinct
+/// Running states, separated by two crash cycles. With
+/// `max_restarts = 1`:
+///
+/// - Post-fix: every life exceeds `healthy_reset` before
+///   its trap, so `ran_healthy = true` resets `restarts`
+///   to 0 on each crash; `restart_decision` never
+///   `GiveUps` and the third Running is reachable.
+/// - Pre-fix (hypothetical regression that drops the
+///   reset): life 1 crashes, `restarts` becomes 1; life
+///   2 crashes, `restarts >= max_restarts` triggers
+///   `GiveUp`; supervisor transitions to Failed and the
+///   third `wait_for_running` returns Err.
+#[tokio::test(flavor = "multi_thread")]
+async fn healthy_reset_resets_consecutive_restart_counter() {
+    let wasm = support::build_example("crasher", "crasher.wasm");
+    let plugin = support::stage_plugin(
+        "healthy-reset",
+        &wasm,
+        "crasher.wasm",
+        // tick_interval_ms > healthy_reset so every life
+        // exceeds the healthy window before crashing.
+        r#"manifest_version = 1
+[plugin]
+id = "example.crasher"
+name = "Crasher"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "crasher.wasm"
+tick_interval_ms = 200
+restart = "on-trap"
+"#,
+    );
+    let engine = Engine::new().expect("engine");
+    let tuning = SupervisorTuning {
+        backoff_base: std::time::Duration::from_millis(10),
+        backoff_max: std::time::Duration::from_millis(20),
+        // Low cap — pre-fix, we'd Failed after the second
+        // crash. Post-fix, the counter resets each life
+        // and we keep going indefinitely.
+        max_restarts: 1,
+        // Small window; the 200ms tick interval guarantees
+        // every life stays Running past this before its
+        // trap.
+        healthy_reset: std::time::Duration::from_millis(50),
+        ..SupervisorTuning::default()
+    };
+
+    let handle = supervise_with_tuning(
+        engine,
+        plugin.path().to_path_buf(),
+        "crasher-healthy-reset",
+        "example.crasher",
+        None,
+        tuning,
+    );
+    // Round-3 F1: each phase gets its own generous
+    // timeout instead of sharing a single 15s budget.
+    // Wasmtime component load / recompile can take
+    // several seconds under CI load — especially with
+    // coverage instrumentation — and blocking a Tokio
+    // worker on that call delays the timer itself. 60s
+    // per phase is comfortably above realistic reload
+    // latency but still bounds a genuine hang.
+    let phase_timeout = std::time::Duration::from_mins(1);
+    for life_ix in 1..=3u32 {
+        // Wait for this life's Running. On pre-fix at
+        // life 3, this returns Err(Failed) — the test
+        // panics with a message pointing at the reset.
+        tokio::time::timeout(phase_timeout, handle.wait_for_running())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for life {life_ix} to reach Running"))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "life {life_ix} never reached Running (pre-fix: healthy_reset didn't fire, supervisor gave up); err: {err}",
+                )
+            });
+        if life_ix == 3 {
+            break;
+        }
+        // Wait for this life to leave Running (crash
+        // starts). `watch` keeps only the latest value,
+        // so we poll — the observable is "state != Running",
+        // which covers every intermediate cycle state
+        // even if we miss the exact Crashed→Restarting
+        // transition. Bounded by its own phase deadline.
+        let phase_deadline = std::time::Instant::now() + phase_timeout;
+        while matches!(handle.state(), InstanceState::Running) {
+            assert!(
+                std::time::Instant::now() < phase_deadline,
+                "life {life_ix} never left Running — the crasher didn't fire, so the reset property wasn't exercised",
+            );
+            if let InstanceState::Failed { error } = handle.state() {
+                panic!(
+                    "supervisor Failed while waiting for life {life_ix} to crash — pre-fix regression: {error}",
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    handle.stop().await.expect("stop");
+}
+
 /// Under `restart = "on-trap"`, a clean `init` failure is *not* a trap
 /// — retrying a deterministic config error won't help, so it's
 /// terminal. The crasher's `crash_on = "init"` override fails `init`.
