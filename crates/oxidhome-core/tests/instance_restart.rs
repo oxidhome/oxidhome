@@ -145,11 +145,11 @@ async fn on_trap_restarts_a_tick_trap_until_the_cap() {
 /// - Post-fix: every life exceeds `healthy_reset` before
 ///   its trap, so `ran_healthy = true` resets `restarts`
 ///   to 0 on each crash; `restart_decision` never
-///   GiveUps and the third Running is reachable.
+///   `GiveUps` and the third Running is reachable.
 /// - Pre-fix (hypothetical regression that drops the
 ///   reset): life 1 crashes, `restarts` becomes 1; life
 ///   2 crashes, `restarts >= max_restarts` triggers
-///   GiveUp; supervisor transitions to Failed and the
+///   `GiveUp`; supervisor transitions to Failed and the
 ///   third `wait_for_running` returns Err.
 #[tokio::test(flavor = "multi_thread")]
 async fn healthy_reset_resets_consecutive_restart_counter() {
@@ -204,12 +204,12 @@ restart = "on-trap"
     // worker on that call delays the timer itself. 60s
     // per phase is comfortably above realistic reload
     // latency but still bounds a genuine hang.
-    const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let phase_timeout = std::time::Duration::from_mins(1);
     for life_ix in 1..=3u32 {
         // Wait for this life's Running. On pre-fix at
         // life 3, this returns Err(Failed) — the test
         // panics with a message pointing at the reset.
-        tokio::time::timeout(PHASE_TIMEOUT, handle.wait_for_running())
+        tokio::time::timeout(phase_timeout, handle.wait_for_running())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for life {life_ix} to reach Running"))
             .unwrap_or_else(|err| {
@@ -226,7 +226,7 @@ restart = "on-trap"
         // which covers every intermediate cycle state
         // even if we miss the exact Crashed→Restarting
         // transition. Bounded by its own phase deadline.
-        let phase_deadline = std::time::Instant::now() + PHASE_TIMEOUT;
+        let phase_deadline = std::time::Instant::now() + phase_timeout;
         while matches!(handle.state(), InstanceState::Running) {
             assert!(
                 std::time::Instant::now() < phase_deadline,
