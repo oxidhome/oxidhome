@@ -335,7 +335,97 @@ async fn shutdown_trap_is_terminal_not_a_restart() {
     }
 }
 
-/// Round-7 F1: `stop_all_supervised_instances` flips a
+/// Round-8 F1: even a `start_instance` that races the
+/// shutdown gate — clearing the outer `AtomicBool`
+/// fast-path, then suspending on manifest I/O while
+/// `stop_all` fires and snapshots the registry — cannot
+/// slip a fresh entry past the snapshot. The registry's
+/// own inner shutdown flag (set by `begin_shutdown()`
+/// under the same mutex the register step uses) is the
+/// authoritative gate: register runs entirely before
+/// `begin_shutdown` (insert visible in snapshot) OR
+/// entirely after (register refuses with
+/// `RegistryError::ShuttingDown`).
+///
+/// This test spawns many concurrent starts alongside
+/// `stop_all` and asserts the invariant that MATTERS: no
+/// live supervisor exists in the registry after `stop_all`
+/// returns. If any start had leaked past the snapshot,
+/// `engine.instance(id)` for its id would be `Some`.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_start_cannot_leak_past_stop_all_snapshot() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+
+    // Fire many concurrent starts. Their manifest reads
+    // yield on tokio::fs I/O — under a multi-thread
+    // runtime the race with `stop_all` is real.
+    let mut start_tasks = Vec::new();
+    for i in 0..8 {
+        let engine = engine.clone();
+        let dir = switch_dir.clone();
+        start_tasks.push(tokio::spawn(async move {
+            let id = format!("race-{i}");
+            let result = engine.start_instance(dir, &id, None).await;
+            (id, result)
+        }));
+    }
+    // Small yield so at least some starts have begun their
+    // manifest reads before `stop_all` fires.
+    tokio::task::yield_now().await;
+
+    let report = engine
+        .stop_all_supervised_instances(Duration::from_secs(5))
+        .await;
+    assert!(
+        report.all_stopped(),
+        "supervisors in the `stop_all` snapshot must all reach terminal; got {report:?}",
+    );
+
+    // Now collect every start result. Each must either
+    // have failed (refused by the gate) OR succeeded and
+    // been in the snapshot (so its supervisor has already
+    // been stopped by `stop_all`). Anything else means a
+    // start leaked a live supervisor past the snapshot.
+    for handle in start_tasks {
+        let (id, result) = handle.await.expect("start task panicked");
+        match result {
+            Ok(inst_handle) => {
+                // The supervisor was in the snapshot;
+                // `stop_all` sent it Shutdown. Wait for it
+                // to reach terminal and check the registry
+                // is clean.
+                let _ = inst_handle.wait_terminal().await;
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("shutting down"),
+                    "start failure other than shutdown gate: id={id}, err={msg}",
+                );
+            }
+        }
+    }
+
+    // Round-8 F1 core assertion: after `stop_all`, no live
+    // supervisor exists — pre-fix a race-started supervisor
+    // could have registered after the snapshot and would
+    // still appear here.
+    for i in 0..8 {
+        let id = format!("race-{i}");
+        // Give reapers a beat to run.
+        wait_until_unregistered(&engine, &id).await;
+        assert!(
+            engine.instance(&id).is_none(),
+            "round-8 F1: no supervisor may survive `stop_all` — id={id}",
+        );
+    }
+}
+
+/// Round-7 F1: ``stop_all`_supervised_instances` flips a
 /// shutdown gate so a concurrent `start_instance` can't
 /// slip a fresh supervisor into the registry between the
 /// stop's snapshot and the caller's follow-up drain.
@@ -362,13 +452,13 @@ async fn start_instance_refused_after_stop_all() {
         .await;
     assert!(report.all_stopped(), "all supervisors reached terminal");
 
-    // Round-7 F1: a fresh start after stop_all must be
+    // Round-7 F1: a fresh start after `stop_all` must be
     // refused, so the caller's follow-up unbounded drain
     // can't observe a race-started reaper.
     let err = engine
         .start_instance(switch_dir, "gate-2", None)
         .await
-        .expect_err("start after stop_all must be refused");
+        .expect_err("start after `stop_all` must be refused");
     let msg = err.to_string();
     assert!(
         msg.contains("shutting down"),

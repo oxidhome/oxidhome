@@ -1064,18 +1064,29 @@ impl Engine {
         &self,
         per_stop_timeout: std::time::Duration,
     ) -> StopAllReport {
-        // Round-7 F1: flip the shutdown gate BEFORE
-        // snapshotting the registry so any start_instance
-        // that races us either lands in the snapshot (we
-        // stop it) or is refused with `EngineShuttingDown`
-        // (never starts). Without this the caller's
-        // follow-up unbounded drain could observe a fresh
-        // reaper spawned after our snapshot and wait on
-        // it forever. `AtomicBool` (not lock) — no `.await`
-        // between set and snapshot, so no reordering
-        // concern beyond the release/acquire below.
+        // Round-7 F1 + round-8 F1: two-level shutdown gate.
+        //
+        // - Outer `AtomicBool` for the fast-path check at
+        //   the top of `start_instance_with_tuning` — lets
+        //   a start that hasn't yet done its manifest read
+        //   bail out immediately without wasted I/O.
+        //
+        // - Inner `InstanceRegistry::begin_shutdown()`
+        //   flag protected by the SAME mutex the register
+        //   step uses to insert. This is the
+        //   AUTHORITATIVE gate: a start that cleared the
+        //   fast-path but was mid-await when the outer
+        //   flag was set is still caught here — its
+        //   register call either runs before our
+        //   `begin_shutdown` (insert visible in the
+        //   snapshot below) or after (register refuses
+        //   with `RegistryError::ShuttingDown`). The
+        //   round-7 F1 fix without this inner check left
+        //   a TOCTOU: fast-path clear → await → register
+        //   AFTER stop_all's snapshot.
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        self.instances.begin_shutdown();
         let handles = self.instances.list();
         // Fire every stop in parallel so total wall-clock is
         // bounded by `per_stop_timeout`, not
