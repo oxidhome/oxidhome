@@ -138,14 +138,19 @@ async fn on_trap_restarts_a_tick_trap_until_the_cap() {
 /// 50ms healthy window, so the counter resets to 0 on
 /// each crash.
 ///
-/// - Post-fix: the instance is still in the crash/restart
-///   loop after 1s. State is one of Running / Crashed /
-///   Restarting / Loading / Inited — NEVER Failed.
-/// - Pre-fix (hypothetical regression where the reset is
-///   dropped): after 1 crash the counter would be 1;
-///   the second crash would hit `restarts >= max_restarts`
-///   and Fail immediately. `Failed` would be observable
-///   well within 1s.
+/// Round-2 (PR #116) — the test observes THREE distinct
+/// Running states, separated by two crash cycles. With
+/// `max_restarts = 1`:
+///
+/// - Post-fix: every life exceeds `healthy_reset` before
+///   its trap, so `ran_healthy = true` resets `restarts`
+///   to 0 on each crash; `restart_decision` never
+///   GiveUps and the third Running is reachable.
+/// - Pre-fix (hypothetical regression that drops the
+///   reset): life 1 crashes, `restarts` becomes 1; life
+///   2 crashes, `restarts >= max_restarts` triggers
+///   GiveUp; supervisor transitions to Failed and the
+///   third `wait_for_running` returns Err.
 #[tokio::test(flavor = "multi_thread")]
 async fn healthy_reset_resets_consecutive_restart_counter() {
     let wasm = support::build_example("crasher", "crasher.wasm");
@@ -191,36 +196,27 @@ restart = "on-trap"
         None,
         tuning,
     );
-    // Round-2 F: observe THREE distinct Running states,
-    // separated by two crash cycles. Pre-fix (no reset)
-    // would Failed at the second crash (counter reaches
-    // max_restarts=1) — the third `wait_for_running`
-    // call would return Err instead of reaching Running.
-    // Post-fix, every life resets the counter, so the
-    // instance keeps cycling.
-    //
-    // Uses `tokio::time::timeout` on each phase so a
-    // wedged test doesn't hang CI. Each life's Running
-    // lasts ~200ms (tick_interval); reload + backoff
-    // is small; 15s covers three lives plus the
-    // instrumentation overhead comfortably.
-    let overall = std::time::Duration::from_secs(15);
-    let start = std::time::Instant::now();
+    // Round-3 F1: each phase gets its own generous
+    // timeout instead of sharing a single 15s budget.
+    // Wasmtime component load / recompile can take
+    // several seconds under CI load — especially with
+    // coverage instrumentation — and blocking a Tokio
+    // worker on that call delays the timer itself. 60s
+    // per phase is comfortably above realistic reload
+    // latency but still bounds a genuine hang.
+    const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     for life_ix in 1..=3u32 {
         // Wait for this life's Running. On pre-fix at
         // life 3, this returns Err(Failed) — the test
         // panics with a message pointing at the reset.
-        tokio::time::timeout(
-            overall.saturating_sub(start.elapsed()),
-            handle.wait_for_running(),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for life {life_ix} to reach Running"))
-        .unwrap_or_else(|err| {
-            panic!(
-                "life {life_ix} never reached Running (pre-fix: healthy_reset didn't fire, supervisor gave up); err: {err}",
-            )
-        });
+        tokio::time::timeout(PHASE_TIMEOUT, handle.wait_for_running())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for life {life_ix} to reach Running"))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "life {life_ix} never reached Running (pre-fix: healthy_reset didn't fire, supervisor gave up); err: {err}",
+                )
+            });
         if life_ix == 3 {
             break;
         }
@@ -229,8 +225,8 @@ restart = "on-trap"
         // so we poll — the observable is "state != Running",
         // which covers every intermediate cycle state
         // even if we miss the exact Crashed→Restarting
-        // transition. Bounded by the overall deadline.
-        let phase_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // transition. Bounded by its own phase deadline.
+        let phase_deadline = std::time::Instant::now() + PHASE_TIMEOUT;
         while matches!(handle.state(), InstanceState::Running) {
             assert!(
                 std::time::Instant::now() < phase_deadline,
