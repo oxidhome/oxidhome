@@ -182,28 +182,30 @@ async fn wait_until_unregistered(engine: &Engine, instance_id: &str) {
     panic!("instance `{instance_id}` not unregistered within 5s");
 }
 
-/// Phase-6 leftover fix: when the plugin is installed,
-/// the `runtime.singleton` flag comes from the INSTALLED
-/// manifest — not whatever manifest the raw-path caller
-/// happens to present. Pre-fix, a raw-path start with
-/// `singleton = false` (while the install declared
-/// `singleton = true`) would register as non-singleton,
-/// silently defeating the singleton slot.
+/// Phase-6 leftover fix + round-2 F1/F3: when the plugin
+/// is installed, the `runtime.singleton` flag comes from
+/// the INSTALLED manifest — not whatever manifest the
+/// raw-path caller happens to present. And singleton
+/// enforcement is by `plugin_id`, not by the incoming
+/// caller's flag: a raw-path start with `singleton =
+/// false` must still be refused when the installed
+/// package holds the singleton slot.
 ///
-/// Test installs a plugin with `singleton = true`, then
-/// stages a SEPARATE dir with the same `plugin_id` and
-/// `singleton = false`, and calls `start_instance` on
-/// that separate dir. The registration must use the
-/// installed value (`true`), so a subsequent start for
-/// a different `instance_id` is rejected with
-/// `SingletonInUse` — proving the raw-path caller can't
-/// downgrade the singleton flag.
+/// Test flow (round-2 F3: no race on a failing
+/// supervisor's reaper):
+///
+/// 1. Install a plugin with `singleton = true`.
+/// 2. Start it via the installed path, wait for
+///    Running — the singleton slot is stably held.
+/// 3. Stage a SEPARATE raw dir with the same
+///    `plugin_id` and `singleton = false`.
+/// 4. Attempt `start_instance` on the raw dir.
+/// 5. Assert rejection — `SingletonInUse` — regardless of
+///    the raw caller's flag.
 #[tokio::test(flavor = "multi_thread")]
-async fn start_instance_uses_installed_singleton_flag_not_callers_manifest() {
+async fn start_instance_refuses_raw_path_downgrade_of_installed_singleton() {
     let state_dir = support::tempdir("singleton-install-auth");
     let wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
-    // Install the singleton=true version through the
-    // InstalledPluginRegistry.
     let installed_source = support::stage_plugin(
         "singleton-install-src",
         &wasm,
@@ -217,9 +219,28 @@ async fn start_instance_uses_installed_singleton_flag_not_callers_manifest() {
         .expect("install");
     assert!(installed.singleton, "installed plugin declared singleton");
 
-    // Stage a SEPARATE raw dir with the SAME plugin_id
-    // but `singleton = false`. This is what an operator
-    // could invoke via a hypothetical dev-load surface.
+    // Start the installed instance and wait for Running
+    // so the singleton slot is stably held BEFORE the
+    // raw-path attempt. Round-2 F3: without this, the
+    // raw-path start's LoadFailed could unregister first
+    // and the second raw-path start would succeed.
+    let installed_uuid = std::sync::Arc::clone(&installed.installation_uuid);
+    let installed_handle = engine
+        .start_installed_instance(
+            installed.path.clone(),
+            "installed-primary",
+            None,
+            installed_uuid,
+        )
+        .await
+        .expect("start installed");
+    installed_handle
+        .wait_for_running()
+        .await
+        .expect("installed reaches Running");
+
+    // Stage a separate raw dir declaring
+    // `singleton = false` for the same plugin_id.
     let raw_source = support::stage_plugin(
         "singleton-raw-src",
         &wasm,
@@ -227,36 +248,78 @@ async fn start_instance_uses_installed_singleton_flag_not_callers_manifest() {
         &switch_manifest(false),
     );
 
-    // Fire the raw-path start. Register consults the
-    // InstalledPluginRegistry, sees singleton=true, and
-    // holds the singleton slot even though the caller's
-    // manifest says false. The supervisor may later
-    // Failed-load (H11 refuses raw-path w/ mismatched
-    // install path), but that happens AFTER the register
-    // — the singleton slot has already been held.
-    let raw_handle = engine
-        .start_instance(raw_source.path().to_path_buf(), "raw-a", None)
-        .await
-        .expect("start raw-path");
-
-    // Attempt a second start (any different id) — must
-    // be rejected as SingletonInUse because register was
-    // told singleton=true.
+    // Round-2 F1: singleton enforcement is by plugin_id;
+    // the incoming caller's flag doesn't matter — the
+    // installed singleton slot must refuse ANY new
+    // same-plugin_id start.
     let err = engine
-        .start_instance(raw_source.path().to_path_buf(), "raw-b", None)
+        .start_instance(raw_source.path().to_path_buf(), "raw-attempt", None)
         .await
-        .expect_err("second start must be rejected as SingletonInUse");
+        .expect_err("raw-path start must be refused because installed singleton is running");
     let msg = err.to_string();
     assert!(
         msg.contains("singleton") && msg.contains("example.simulated-switch"),
         "expected SingletonInUse: {msg}",
     );
 
-    // Cleanup: stop the first raw-path handle so the
-    // supervisor's LoadFailed (H11) finishes and the
-    // reaper unregisters.
-    let _ = raw_handle.stop().await;
-    let _ = raw_handle.wait_terminal().await;
+    installed_handle.stop().await.expect("stop installed");
+}
+
+/// Round-2 F1: a running non-singleton instance for
+/// `plugin_id` must refuse a subsequent singleton start
+/// of the same `plugin_id`. Pre-fix the check walked only
+/// the `singletons` map (which non-singleton starts
+/// don't populate), so this scenario let the singleton
+/// start register alongside the existing non-singleton —
+/// two supervisors under one identity.
+///
+/// Reproduced against a dev-only engine (no
+/// `InstalledPluginRegistry` entry, so caller's-manifest
+/// flag is authoritative): first start declares
+/// `singleton = false`, second declares
+/// `singleton = true`.
+#[tokio::test(flavor = "multi_thread")]
+async fn singleton_start_refused_when_non_singleton_instance_already_running() {
+    let wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let non_singleton = support::stage_plugin(
+        "non-singleton-src",
+        &wasm,
+        "simulated_switch.wasm",
+        &switch_manifest(false),
+    );
+    let singleton_src = support::stage_plugin(
+        "singleton-src",
+        &wasm,
+        "simulated_switch.wasm",
+        &switch_manifest(true),
+    );
+    let engine = Engine::new().expect("engine");
+
+    let non_singleton_handle = engine
+        .start_instance(non_singleton.path().to_path_buf(), "ns-a", None)
+        .await
+        .expect("non-singleton start");
+    non_singleton_handle
+        .wait_for_running()
+        .await
+        .expect("non-singleton Running");
+
+    let err = engine
+        .start_instance(singleton_src.path().to_path_buf(), "singleton-b", None)
+        .await
+        .expect_err(
+            "singleton start must be refused when a same-plugin_id instance is already running",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("singleton") && msg.contains("example.simulated-switch"),
+        "expected SingletonInUse naming the plugin: {msg}",
+    );
+
+    non_singleton_handle
+        .stop()
+        .await
+        .expect("stop non-singleton");
 }
 
 /// Phase 6 leftover: `Engine::drain_supervised_instances`
