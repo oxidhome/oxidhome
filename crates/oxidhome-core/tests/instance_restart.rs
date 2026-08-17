@@ -191,37 +191,59 @@ restart = "on-trap"
         None,
         tuning,
     );
-    handle.wait_for_running().await.expect("first Running");
-
-    // Poll state during a 1s window that's long enough
-    // that a pre-fix (no-reset) supervisor would have
-    // Failed inside it (two 200ms ticks + tiny backoff
-    // ~= 500ms to hit the cap). Track whether we ever
-    // observed a non-Running non-terminal state — proves
-    // the restart cycle actually fired. `watch` keeps
-    // only the latest value so we can miss individual
-    // Crashed→Restarting transitions, but Loading /
-    // Inited / Crashed / Restarting between two Running
-    // observations all imply "a restart happened".
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    let mut saw_restart_cycle = false;
-    while std::time::Instant::now() < deadline {
-        match handle.state() {
-            InstanceState::Failed { error } => panic!(
-                "supervisor Failed within the healthy-reset window; the counter reset didn't fire — pre-fix regression. error: {error}",
-            ),
-            InstanceState::Loading
-            | InstanceState::Inited
-            | InstanceState::Crashed { .. }
-            | InstanceState::Restarting { .. } => saw_restart_cycle = true,
-            InstanceState::Running | InstanceState::Stopping | InstanceState::Stopped => {}
+    // Round-2 F: observe THREE distinct Running states,
+    // separated by two crash cycles. Pre-fix (no reset)
+    // would Failed at the second crash (counter reaches
+    // max_restarts=1) — the third `wait_for_running`
+    // call would return Err instead of reaching Running.
+    // Post-fix, every life resets the counter, so the
+    // instance keeps cycling.
+    //
+    // Uses `tokio::time::timeout` on each phase so a
+    // wedged test doesn't hang CI. Each life's Running
+    // lasts ~200ms (tick_interval); reload + backoff
+    // is small; 15s covers three lives plus the
+    // instrumentation overhead comfortably.
+    let overall = std::time::Duration::from_secs(15);
+    let start = std::time::Instant::now();
+    for life_ix in 1..=3u32 {
+        // Wait for this life's Running. On pre-fix at
+        // life 3, this returns Err(Failed) — the test
+        // panics with a message pointing at the reset.
+        tokio::time::timeout(
+            overall.saturating_sub(start.elapsed()),
+            handle.wait_for_running(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for life {life_ix} to reach Running"))
+        .unwrap_or_else(|err| {
+            panic!(
+                "life {life_ix} never reached Running (pre-fix: healthy_reset didn't fire, supervisor gave up); err: {err}",
+            )
+        });
+        if life_ix == 3 {
+            break;
         }
-        tokio::task::yield_now().await;
+        // Wait for this life to leave Running (crash
+        // starts). `watch` keeps only the latest value,
+        // so we poll — the observable is "state != Running",
+        // which covers every intermediate cycle state
+        // even if we miss the exact Crashed→Restarting
+        // transition. Bounded by the overall deadline.
+        let phase_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while matches!(handle.state(), InstanceState::Running) {
+            assert!(
+                std::time::Instant::now() < phase_deadline,
+                "life {life_ix} never left Running — the crasher didn't fire, so the reset property wasn't exercised",
+            );
+            if let InstanceState::Failed { error } = handle.state() {
+                panic!(
+                    "supervisor Failed while waiting for life {life_ix} to crash — pre-fix regression: {error}",
+                );
+            }
+            tokio::task::yield_now().await;
+        }
     }
-    assert!(
-        saw_restart_cycle,
-        "test setup issue: never observed a restart-cycle state (Crashed/Restarting/Loading/Inited); the crasher didn't actually fire, so the healthy-reset property wasn't exercised",
-    );
 
     handle.stop().await.expect("stop");
 }
