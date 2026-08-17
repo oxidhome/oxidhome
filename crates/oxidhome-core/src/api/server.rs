@@ -171,11 +171,23 @@ pub fn build_router(engine: Engine) -> Router {
             get(get_plugin_ui_frame),
         );
 
+    // Phase 14.1 — mount the MCP streamable-HTTP endpoint on the
+    // same listener as REST/Connect. The MCP router carries its
+    // own state (session store + handler) and its own 404
+    // fallback for the MCP subtree, so it goes on via
+    // [`axum::Router::nest`] under
+    // [`super::mcp::MCP_ENDPOINT`] rather than `.merge` (axum
+    // refuses to merge two routers with fallbacks). Auth (14.4)
+    // will wrap this nested router in our bearer layer once the
+    // token-scope policy shape is stable.
+    let mcp = super::mcp::mount_routes(engine.clone());
+
     public
         .merge(authenticated)
         .merge(ticket_gated)
         .fallback_service(connect_service)
         .with_state(ApiState { engine })
+        .nest(super::mcp::MCP_ENDPOINT, mcp)
 }
 
 /// `GET /api/v1/readyz` — anonymous JSON readiness probe. Same body
