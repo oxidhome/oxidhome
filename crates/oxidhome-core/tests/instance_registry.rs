@@ -335,23 +335,25 @@ async fn shutdown_trap_is_terminal_not_a_restart() {
     }
 }
 
-/// Round-8 F1: even a `start_instance` that races the
-/// shutdown gate — clearing the outer `AtomicBool`
-/// fast-path, then suspending on manifest I/O while
-/// `stop_all` fires and snapshots the registry — cannot
-/// slip a fresh entry past the snapshot. The registry's
-/// own inner shutdown flag (set by `begin_shutdown()`
-/// under the same mutex the register step uses) is the
-/// authoritative gate: register runs entirely before
-/// `begin_shutdown` (insert visible in snapshot) OR
-/// entirely after (register refuses with
-/// `RegistryError::ShuttingDown`).
-///
-/// This test spawns many concurrent starts alongside
+/// Round-8 F1 / round-9 F1 concurrent smoke test —
+/// spawns many concurrent `start_instance`s alongside
 /// `stop_all` and asserts the invariant that MATTERS: no
-/// live supervisor exists in the registry after `stop_all`
-/// returns. If any start had leaked past the snapshot,
-/// `engine.instance(id)` for its id would be `Some`.
+/// live supervisor exists in the registry after
+/// `stop_all` returns. Complements the DETERMINISTIC
+/// unit test in `runtime::registry::tests` (which
+/// asserts the inner gate directly against the registry
+/// API and would fail without racing anything); this one
+/// exercises the end-to-end Engine path under real
+/// tokio scheduling.
+///
+/// Not a deterministic race regression on its own —
+/// `yield_now()` doesn't guarantee any start suspends
+/// during manifest I/O — but a leaked supervisor on any
+/// run would fail the post-loop assertion, and the CI
+/// re-runs give the test many opportunities to hit the
+/// window over time. The property being tested is that
+/// `start_instance` and `stop_all` are safe to call
+/// concurrently, not that a specific interleaving fires.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_start_cannot_leak_past_stop_all_snapshot() {
     let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
@@ -401,10 +403,16 @@ async fn concurrent_start_cannot_leak_past_stop_all_snapshot() {
                 let _ = inst_handle.wait_terminal().await;
             }
             Err(err) => {
-                let msg = err.to_string();
+                // Round-9 F1: both the fast-path and the
+                // authoritative inner gate surface as
+                // `EngineShuttingDown` — assert on the
+                // downcasted type, not just the message,
+                // so a divergent error variant regresses
+                // the test.
                 assert!(
-                    msg.contains("shutting down"),
-                    "start failure other than shutdown gate: id={id}, err={msg}",
+                    err.downcast_ref::<oxidhome_core::EngineShuttingDown>()
+                        .is_some(),
+                    "expected EngineShuttingDown for {id}, got {err:#}",
                 );
             }
         }
@@ -459,10 +467,10 @@ async fn start_instance_refused_after_stop_all() {
         .start_instance(switch_dir, "gate-2", None)
         .await
         .expect_err("start after `stop_all` must be refused");
-    let msg = err.to_string();
     assert!(
-        msg.contains("shutting down"),
-        "expected EngineShuttingDown error, got: {msg}",
+        err.downcast_ref::<oxidhome_core::EngineShuttingDown>()
+            .is_some(),
+        "expected EngineShuttingDown, got {err:#}",
     );
 
     // Follow-up unbounded drain terminates promptly

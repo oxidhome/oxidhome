@@ -208,6 +208,26 @@ pub struct InstanceHandle {
 }
 
 impl InstanceHandle {
+    /// Round-9 F2: test-only constructor for
+    /// `runtime::registry::tests`, which needs a plausible
+    /// `InstanceHandle` to feed into `InstanceRegistry::register`
+    /// without actually spinning up a supervisor. The
+    /// control / state channels have no attached peer, so
+    /// `stop` / `wait_terminal` / `execute_command` on the
+    /// returned handle will error / hang — the test never
+    /// exercises those paths.
+    #[cfg(test)]
+    pub(crate) fn for_registry_test(instance_id: &str, plugin_id: &str) -> Self {
+        let (control, _rx) = tokio::sync::mpsc::channel(1);
+        let (_tx, state) = tokio::sync::watch::channel(InstanceState::Loading);
+        Self {
+            instance_id: Arc::from(instance_id),
+            plugin_id: Arc::from(plugin_id),
+            control,
+            state,
+        }
+    }
+
     /// The instance id this supervisor was started with.
     #[must_use]
     pub fn instance_id(&self) -> &str {

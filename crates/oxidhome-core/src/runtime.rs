@@ -874,7 +874,21 @@ impl Engine {
                 }
                 handle
             })
-            .map_err(anyhow::Error::from)
+            .map_err(|err| match err {
+                // Round-9 F1: normalize the shutdown-gate
+                // refusal so callers see the SAME error
+                // type regardless of which gate caught the
+                // race — the fast-path outer atomic and the
+                // authoritative inner registry flag now
+                // both surface as `EngineShuttingDown`.
+                // Pre-fix, callers who wanted to
+                // distinguish shutdown from other start
+                // failures had to downcast BOTH types.
+                crate::runtime::RegistryError::ShuttingDown => {
+                    anyhow::Error::from(EngineShuttingDown)
+                }
+                other => anyhow::Error::from(other),
+            })
     }
 
     /// Phase 6 leftover: await every supervised instance's
