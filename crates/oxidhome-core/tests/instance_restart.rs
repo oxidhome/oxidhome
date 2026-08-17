@@ -122,6 +122,110 @@ async fn on_trap_restarts_a_tick_trap_until_the_cap() {
     }
 }
 
+/// Phase-6 leftover integration coverage — the
+/// `healthy_reset` window resets the consecutive-restart
+/// counter, so an instance that runs healthy longer than
+/// `healthy_reset` before each crash can restart
+/// indefinitely without hitting `max_restarts`. Unit
+/// coverage of the reset decision already existed; this
+/// test proves the reset is observably wired through the
+/// supervisor loop end-to-end.
+///
+/// Setup: `max_restarts = 1`, `healthy_reset = 50ms`,
+/// crasher `tick_interval_ms = 200ms` (well past
+/// `healthy_reset`). Every life stays Running for
+/// ~200ms before its first tick trap, which exceeds the
+/// 50ms healthy window, so the counter resets to 0 on
+/// each crash.
+///
+/// - Post-fix: the instance is still in the crash/restart
+///   loop after 1s. State is one of Running / Crashed /
+///   Restarting / Loading / Inited — NEVER Failed.
+/// - Pre-fix (hypothetical regression where the reset is
+///   dropped): after 1 crash the counter would be 1;
+///   the second crash would hit `restarts >= max_restarts`
+///   and Fail immediately. `Failed` would be observable
+///   well within 1s.
+#[tokio::test(flavor = "multi_thread")]
+async fn healthy_reset_resets_consecutive_restart_counter() {
+    let wasm = support::build_example("crasher", "crasher.wasm");
+    let plugin = support::stage_plugin(
+        "healthy-reset",
+        &wasm,
+        "crasher.wasm",
+        // tick_interval_ms > healthy_reset so every life
+        // exceeds the healthy window before crashing.
+        r#"manifest_version = 1
+[plugin]
+id = "example.crasher"
+name = "Crasher"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "crasher.wasm"
+tick_interval_ms = 200
+restart = "on-trap"
+"#,
+    );
+    let engine = Engine::new().expect("engine");
+    let tuning = SupervisorTuning {
+        backoff_base: std::time::Duration::from_millis(10),
+        backoff_max: std::time::Duration::from_millis(20),
+        // Low cap — pre-fix, we'd Failed after the second
+        // crash. Post-fix, the counter resets each life
+        // and we keep going indefinitely.
+        max_restarts: 1,
+        // Small window; the 200ms tick interval guarantees
+        // every life stays Running past this before its
+        // trap.
+        healthy_reset: std::time::Duration::from_millis(50),
+        ..SupervisorTuning::default()
+    };
+
+    let handle = supervise_with_tuning(
+        engine,
+        plugin.path().to_path_buf(),
+        "crasher-healthy-reset",
+        "example.crasher",
+        None,
+        tuning,
+    );
+    handle.wait_for_running().await.expect("first Running");
+
+    // Poll state during a 1s window that's long enough
+    // that a pre-fix (no-reset) supervisor would have
+    // Failed inside it (two 200ms ticks + tiny backoff
+    // ~= 500ms to hit the cap). Track whether we ever
+    // observed a non-Running non-terminal state — proves
+    // the restart cycle actually fired. `watch` keeps
+    // only the latest value so we can miss individual
+    // Crashed→Restarting transitions, but Loading /
+    // Inited / Crashed / Restarting between two Running
+    // observations all imply "a restart happened".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut saw_restart_cycle = false;
+    while std::time::Instant::now() < deadline {
+        match handle.state() {
+            InstanceState::Failed { error } => panic!(
+                "supervisor Failed within the healthy-reset window; the counter reset didn't fire — pre-fix regression. error: {error}",
+            ),
+            InstanceState::Loading
+            | InstanceState::Inited
+            | InstanceState::Crashed { .. }
+            | InstanceState::Restarting { .. } => saw_restart_cycle = true,
+            InstanceState::Running | InstanceState::Stopping | InstanceState::Stopped => {}
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        saw_restart_cycle,
+        "test setup issue: never observed a restart-cycle state (Crashed/Restarting/Loading/Inited); the crasher didn't actually fire, so the healthy-reset property wasn't exercised",
+    );
+
+    handle.stop().await.expect("stop");
+}
+
 /// Under `restart = "on-trap"`, a clean `init` failure is *not* a trap
 /// — retrying a deterministic config error won't help, so it's
 /// terminal. The crasher's `crash_on = "init"` override fails `init`.
