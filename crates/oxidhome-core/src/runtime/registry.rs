@@ -142,14 +142,48 @@ impl InstanceRegistry {
         if guard.instances.contains_key(&instance_id) {
             return Err(RegistryError::DuplicateInstanceId { instance_id });
         }
-        // TODO(phase 7+): `singleton` is read from the *caller's*
-        // manifest, but a different install dir with the same
-        // `plugin_id` could carry `singleton = false`. That would let
-        // a non-singleton instance coexist with a singleton one. The
-        // host-side plugin ledger Phase 7+ adds is where the canonical
-        // per-`plugin_id` singleton flag belongs; for now Phase 6
-        // accepts the per-instance reading.
-        if singleton && let Some(existing) = guard.singletons.get(&plugin_id) {
+        // Phase-6 leftover fix + round-2 F1: singleton
+        // enforcement has two rules, both keyed on
+        // `plugin_id` regardless of the callers' declared
+        // flags:
+        //
+        // 1. An incoming singleton start must find NO
+        //    existing instance of the same `plugin_id`,
+        //    even if that existing instance was itself
+        //    registered with `singleton = false`.
+        //    Pre-fix, the check only walked the
+        //    `singletons` map (which is populated only
+        //    when `singleton = true`), so a dev instance
+        //    registered as non-singleton could coexist
+        //    with a newly-started singleton — two
+        //    supervisors under one identity, defeating
+        //    singleton semantics.
+        //
+        // 2. If a singleton slot for `plugin_id` already
+        //    exists, every new start of that `plugin_id`
+        //    is refused — regardless of whether the new
+        //    start's flag is singleton. Singleton means
+        //    exclusive; a non-singleton coexisting with
+        //    a running singleton violates the same
+        //    invariant from the other direction.
+        //
+        // Both rules find every existing instance under
+        // `plugin_id` by scanning `instances.values()`
+        // once (bounded by the total instance count —
+        // small in practice, and we already hold the
+        // registry lock).
+        if singleton {
+            if let Some(existing) = guard
+                .instances
+                .values()
+                .find(|h| h.plugin_id() == plugin_id)
+            {
+                return Err(RegistryError::SingletonInUse {
+                    plugin_id,
+                    existing_instance_id: existing.instance_id().to_string(),
+                });
+            }
+        } else if let Some(existing) = guard.singletons.get(&plugin_id) {
             return Err(RegistryError::SingletonInUse {
                 plugin_id,
                 existing_instance_id: existing.clone(),

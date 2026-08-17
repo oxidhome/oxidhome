@@ -777,7 +777,36 @@ impl Engine {
         // with a fresh pin.
         let (manifest_bytes, manifest) = instance::read_manifest_with_bytes(&plugin_dir).await?;
         let plugin_id = manifest.plugin.id.clone();
-        let singleton = manifest.runtime.singleton;
+        // Phase-6 leftover fix (Phase 6 hook 4): the
+        // authoritative singleton flag comes from the
+        // INSTALLED package's manifest, not from whatever
+        // manifest the caller happens to present here.
+        // Pre-fix a raw-path dev load could pass
+        // `singleton = false` while the installed
+        // package declared `singleton = true`, letting a
+        // dev instance coexist with the installed
+        // singleton and defeat the slot.
+        //
+        // If the plugin isn't installed at all (dev-only
+        // engine, or a raw-path plugin_id the registry
+        // doesn't know about), fall back to the caller's
+        // manifest — H11 already refuses raw-path loads
+        // of installed plugin_ids from mismatched paths,
+        // so the fallback is safe.
+        let singleton = match self.installed_plugins.get(&plugin_id) {
+            Some(installed) => {
+                if installed.singleton != manifest.runtime.singleton {
+                    tracing::warn!(
+                        plugin_id = %plugin_id,
+                        caller_singleton = manifest.runtime.singleton,
+                        installed_singleton = installed.singleton,
+                        "singleton flag on the caller's manifest disagrees with the installed manifest; using installed value as authoritative",
+                    );
+                }
+                installed.singleton
+            }
+            None => manifest.runtime.singleton,
+        };
         let pinned_manifest = Some((manifest_bytes, manifest));
 
         // Atomic check + spawn-supervisor + spawn-reaper + insert.

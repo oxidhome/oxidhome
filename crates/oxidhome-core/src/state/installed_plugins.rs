@@ -119,6 +119,24 @@ pub struct InstalledPlugin {
     /// [`Self::granted_capabilities`] to a load whose bytes
     /// disagree with the stored digest.
     pub content_digest: Arc<str>,
+    /// Phase-6 leftover fix: the manifest's
+    /// `runtime.singleton` flag, captured at install time
+    /// so `Engine::start_instance` can use the INSTALLED
+    /// package's authoritative value rather than trusting
+    /// whatever manifest the caller happens to present at
+    /// start time. Pre-fix a raw-path dev load whose
+    /// manifest declared `singleton = false` could
+    /// register alongside an already-running instance of
+    /// the singleton-installed package, silently
+    /// defeating the singleton slot.
+    ///
+    /// Populated at install (from the staged manifest)
+    /// and at scan / backfill (from the scanned manifest).
+    /// Not persisted to SQL — it's a rehydratable
+    /// property of the on-disk manifest, and the
+    /// `content_digest` check catches any post-install
+    /// mutation of that manifest.
+    pub singleton: bool,
 }
 
 /// C5 review F3 + round-4 F2 + Phase 13 round-3 F2: compute a
@@ -1406,6 +1424,7 @@ impl InstalledPluginRegistry {
                     path: path.clone(),
                     granted_capabilities: Arc::clone(&grant_arc),
                     content_digest: Arc::clone(&digest),
+                    singleton: manifest.runtime.singleton,
                 });
                 (uuid, grant_arc, digest)
             };
@@ -1418,6 +1437,7 @@ impl InstalledPluginRegistry {
                     path,
                     granted_capabilities,
                     content_digest: content_digest_arc,
+                    singleton: manifest.runtime.singleton,
                 },
             );
         }
@@ -1674,16 +1694,36 @@ impl InstalledPluginRegistry {
             });
         }
         let staged_manifest_path = staging.join("manifest.toml");
-        let staged_manifest = match read_manifest_sync(&staged_manifest_path) {
-            Ok(m) => m,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(InstallError::BadManifest {
-                    path: staged_manifest_path,
-                    reason: err.to_string(),
-                });
-            }
-        };
+        // Round-2 F2: capture the manifest bytes at the
+        // SAME read that produces the parsed manifest, so
+        // every downstream property derived from the
+        // parse (row.singleton, row.version, granted
+        // capabilities) comes from the same snapshot that
+        // the digest below hashes. Pre-fix, install
+        // called `read_manifest_sync` here for the parse
+        // and then `read_no_follow_within` below for the
+        // digest bytes — two separate reads. Between them
+        // an attacker could swap the staged manifest
+        // from `singleton = false` to `singleton = true`
+        // (or vice versa), producing a digest-valid
+        // installed package whose row's
+        // `InstalledPlugin.singleton` disagreed with what
+        // the loader would later see on-disk. The
+        // start-instance path (which uses row.singleton
+        // as authoritative) would then either wrongly
+        // reject or wrongly accept a same-plugin_id
+        // start.
+        let (staged_manifest, staged_manifest_bytes) =
+            match read_manifest_sync_capturing_bytes(&staging) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(InstallError::BadManifest {
+                        path: staged_manifest_path,
+                        reason: err.to_string(),
+                    });
+                }
+            };
         // Belt and suspenders: refuse if the staged manifest
         // declares a different `plugin_id` than the source.
         // Without this a source rewritten mid-install could
@@ -1725,20 +1765,13 @@ impl InstalledPluginRegistry {
             None => None,
         };
 
-        // C5 review F3 + round-4 F2 (Phase 13): compute the
-        // content digest from bytes we already own — manifest
-        // and wasm are read here via the same TOCTOU-safe
-        // `read_no_follow_within` used elsewhere, and UI
-        // assets are the exact `ValidatedUiAssets` returned
-        // above (round-4 F2: no second read).
-        let staged_manifest_bytes =
-            match read_no_follow_within(&staging, &staging.join("manifest.toml")) {
-                Ok(b) => b,
-                Err(err) => {
-                    let _ = std::fs::remove_dir_all(&staging);
-                    return Err(InstallError::Io(err));
-                }
-            };
+        // C5 review F3 + round-4 F2 (Phase 13) + round-2
+        // F2 (singleton fix): compute the content digest
+        // from bytes we already own — manifest bytes came
+        // from the SAME read that produced the parse
+        // (above), UI assets are the exact
+        // `ValidatedUiAssets` returned above (round-4 F2:
+        // no second read), and only the wasm is read here.
         let staged_wasm_bytes =
             match read_no_follow_within(&staging, &staging.join(&staged_manifest.runtime.wasm)) {
                 Ok(b) => b,
@@ -1765,6 +1798,7 @@ impl InstalledPluginRegistry {
             // **staged** manifest / staged bytes, not the source.
             granted_capabilities: Arc::new(staged_manifest.capabilities.clone()),
             content_digest: Arc::from(staged_digest),
+            singleton: staged_manifest.runtime.singleton,
         };
         if let Some(db) = &self.db
             && let Err(err) = insert_installation_row(db, &row)
@@ -3727,6 +3761,7 @@ wasm = "plugin.wasm"
             path: plugins_root.join("example.ghost"),
             granted_capabilities: Arc::new(CapabilitiesSection::default()),
             content_digest: Arc::from("0".repeat(64)),
+            singleton: false,
         };
         insert_installation_row(&db, &ghost).unwrap();
         let ghost_uuid = Arc::clone(&ghost.installation_uuid);
@@ -3818,6 +3853,7 @@ wasm = "plugin.wasm"
             path: plugins_root.join("example.ghost"),
             granted_capabilities: Arc::new(CapabilitiesSection::default()),
             content_digest: Arc::from("0".repeat(64)),
+            singleton: false,
         };
         insert_installation_row(&db, &ghost).unwrap();
 
@@ -4726,6 +4762,7 @@ config-schema = "ui/config.schema.json"
             path: plugins_root.join("example.ghost"),
             granted_capabilities: Arc::new(CapabilitiesSection::default()),
             content_digest: Arc::from("0".repeat(64)),
+            singleton: false,
         };
         insert_installation_row(&db, &ghost).unwrap();
         let ghost_uuid = Arc::clone(&ghost.installation_uuid);
