@@ -2211,7 +2211,7 @@ fn load_live_installation_uuid_for(
 }
 
 /// Sync `manifest.toml` reader. The async variant in
-/// `runtime::instance::read_manifest` is used on the start-instance
+/// `runtime::instance::read_manifest_with_bytes` is used on the start-instance
 /// hot path; install / scan run on the operator-initiated cold path
 /// and don't need to be async.
 ///

@@ -105,7 +105,118 @@ pub struct Engine {
     /// verifies against it. Rotated on daemon restart —
     /// nobody's ticket survives a restart.
     ui_ticket_secret: Arc<[u8; 32]>,
+    /// Phase 6 leftover: tracked reaper `JoinHandle`s so
+    /// `Engine::drain_supervised_instances` can await
+    /// per-instance cleanup (device / service registry
+    /// eviction, device-state stale marking,
+    /// `instances.unregister`) on daemon shutdown. Keyed
+    /// by `instance_id`; each entry carries a monotonic
+    /// `generation` token minted at spawn time.
+    ///
+    /// Round-2 F2: the reaper's self-removal is
+    /// conditional — it removes only if the map still
+    /// carries ITS generation. That prevents an old
+    /// reaper from clobbering a fresh entry whose
+    /// `instance_id` was recycled after unregister and
+    /// registered again before the old reaper completed
+    /// its cleanup. Without the guard the drain would
+    /// silently skip the replacement's reaper.
+    reapers: Reapers,
+    /// Round-2 F2: monotonic generation counter for
+    /// reaper-tracker entries. Bumped once per spawn.
+    reaper_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Round-7 F1: shutdown gate. Set by
+    /// [`Self::stop_all_supervised_instances`] BEFORE it
+    /// snapshots the instance registry — once set,
+    /// [`Self::start_instance`] and its variants refuse
+    /// with a `EngineShuttingDown` error, so a concurrent
+    /// start can't slip a fresh supervisor into the
+    /// registry between the snapshot and the caller's
+    /// follow-up unbounded drain (which would then wait
+    /// on the fresh supervisor's reaper forever, defeating
+    /// the strong-cleanup recipe).
+    ///
+    /// One-way latch: never cleared. The intended lifecycle
+    /// is `main` (or a test) creates an `Engine`, runs it,
+    /// eventually calls `stop_all_supervised_instances`
+    /// during shutdown; the engine value is dropped
+    /// shortly after. Long-lived Engine users who want to
+    /// restart the engine's plugin activity build a fresh
+    /// `Engine`.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Round-7 F1: error returned by
+/// [`Engine::start_instance`] / friends after
+/// [`Engine::stop_all_supervised_instances`] has been
+/// called. Prevents a concurrent start from slipping a
+/// fresh supervisor into the registry between the stop's
+/// snapshot and the caller's follow-up drain.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "engine is shutting down: no new supervised instances may be started (stop_all_supervised_instances was called)"
+)]
+pub struct EngineShuttingDown;
+
+/// Round-6 F2: outcome of [`Engine::stop_all_supervised_instances`].
+/// Callers who follow the "stop then unbounded drain"
+/// recipe MUST inspect `timed_out` — an unbounded drain
+/// following a partial stop waits forever on the
+/// timed-out supervisor's reaper. `main.rs` skips the
+/// inspection because it uses the bounded drain, which
+/// handles both subsets uniformly by detaching stragglers.
+#[derive(Debug, Default)]
+pub struct StopAllReport {
+    /// Number of supervisors that reached a terminal state
+    /// within `per_stop_timeout`.
+    pub stopped: usize,
+    /// `instance_id`s whose `stop` returned an error (rare
+    /// — the current `stop` implementation is infallible
+    /// on the happy path).
+    pub errored: Vec<Arc<str>>,
+    /// `instance_id`s whose `stop` didn't return within
+    /// `per_stop_timeout` — their supervisor task is still
+    /// running.
+    pub timed_out: Vec<Arc<str>>,
+    /// Round-7 F2: number of per-instance stop tasks whose
+    /// tokio `JoinHandle` returned `JoinError` (panicked
+    /// or was cancelled). We can't recover the
+    /// `instance_id` from a `JoinError`, so we count them
+    /// separately — but they still block
+    /// `all_stopped()` because the panicked instance's
+    /// supervisor state is unknown (may or may not have
+    /// stopped) and the follow-up unbounded drain must
+    /// not assume it did.
+    pub panicked: usize,
+}
+
+impl StopAllReport {
+    /// True when every supervisor reached a terminal
+    /// state — safe to follow with the unbounded
+    /// [`Engine::drain_supervised_instances`].
+    #[must_use]
+    pub fn all_stopped(&self) -> bool {
+        self.errored.is_empty() && self.timed_out.is_empty() && self.panicked == 0
+    }
+}
+
+/// Internal per-instance stop outcome, folded into
+/// `StopAllReport` in the `JoinSet` loop.
+enum StopOne {
+    Stopped,
+    Errored(Arc<str>),
+    TimedOut(Arc<str>),
+}
+
+/// Phase 6 leftover: shared map of per-instance reaper
+/// `JoinHandle`s + their generation tokens.
+/// `std::sync::Mutex` (not `tokio::sync`) because insertion
+/// / removal is short and synchronous — no `await` inside
+/// the guard. `drain_supervised_instances` snapshots the
+/// map under the lock and awaits the handles OUTSIDE the
+/// guard.
+type Reapers =
+    Arc<std::sync::Mutex<std::collections::HashMap<Arc<str>, (u64, tokio::task::JoinHandle<()>)>>>;
 
 /// H2 round-2 F1: shared, lazily-populated map of per-`plugin_id`
 /// async mutexes. Held under an outer sync `Mutex` for the map
@@ -261,6 +372,9 @@ impl Engine {
                 std::collections::HashMap::new(),
             )),
             ui_ticket_secret: Arc::new(mint_ui_ticket_secret()),
+            reapers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            reaper_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -527,13 +641,26 @@ impl Engine {
     /// removes the entry once the supervisor reaches a terminal
     /// state, so the slot frees up for a fresh start.
     ///
-    /// **Manifest immutability assumption.** This call reads the
-    /// manifest once for the singleton / `plugin_id` check, then the
-    /// supervisor's load path reads it again to instantiate. The two
-    /// reads are *not* atomic against an on-disk edit between them; a
-    /// manifest swap mid-call could let a singleton coexist with a
-    /// non-singleton or unregister the wrong slot on terminal. Live-
-    /// reload (Phase 7+) needs a re-register through this method.
+    /// **Manifest immutability guarantee (Phase-6 leftover
+    /// TOCTOU fix + round-2 F3).** The manifest is read
+    /// ONCE at pre-flight via
+    /// [`crate::runtime::instance::read_manifest_with_bytes`],
+    /// yielding the parsed manifest AND the raw bytes. That
+    /// snapshot is pinned into the supervisor and used on
+    /// **every** load attempt (first load and every
+    /// restart) via [`PluginInstance::load_with_pinned_manifest`],
+    /// so the manifest whose singleton / `plugin_id`
+    /// decided the registry slot is the manifest that
+    /// gets instantiated for the lifetime of this
+    /// supervisor. A manifest swap during startup or
+    /// restart backoff can no longer sneak a mismatched
+    /// identity or capability set past the registry.
+    ///
+    /// A legitimate reinstall between crashes goes through
+    /// the install/uninstall API path (stop → uninstall →
+    /// install → start), which holds the per-plugin
+    /// lifecycle lock and starts a fresh supervisor with
+    /// a fresh pin.
     ///
     /// # Errors
     ///
@@ -602,6 +729,22 @@ impl Engine {
         mode: LoadMode,
         tuning: SupervisorTuning,
     ) -> anyhow::Result<InstanceHandle> {
+        // Round-7 F1: refuse new starts once shutdown has
+        // begun. `stop_all_supervised_instances` sets this
+        // flag before snapshotting the instance registry —
+        // without the check, a concurrent start could slip
+        // a fresh supervisor into the registry between the
+        // snapshot and the caller's follow-up unbounded
+        // drain, and the drain would wait on that fresh
+        // reaper forever, defeating the strong-cleanup
+        // recipe advertised on the bounded drain's
+        // docstring.
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(anyhow::Error::from(EngineShuttingDown));
+        }
         let plugin_dir = plugin_dir.into();
         let instance_id = instance_id.into();
         // H10 round-3 finding 3 + H1: refuse structurally-unsafe
@@ -616,14 +759,26 @@ impl Engine {
                  (reserved wildcard, path separator, empty, or too long)"
             ));
         }
-        // Pre-flight: parse + validate the manifest so we know the
-        // plugin id + singleton flag before spawning. The supervisor's
-        // load path re-reads + re-validates — small redundancy, but it
-        // keeps the supervisor self-contained for the test_host crate.
-        // See the immutability note on `start_instance`.
-        let manifest = instance::read_manifest(&plugin_dir).await?;
+        // Pre-flight: parse + validate the manifest so we
+        // know the plugin id + singleton flag before
+        // spawning. Phase 6 leftover TOCTOU fix + round-2
+        // F3: capture the raw bytes alongside the parsed
+        // manifest and pin them into the supervisor for its
+        // ENTIRE lifetime. The snapshot that decided the
+        // singleton slot / plugin_id is the manifest that
+        // gets instantiated on the first load AND on every
+        // restart — an atomic replace of `manifest.toml`
+        // during startup or restart backoff can no longer
+        // swap a different plugin under a mismatched
+        // registry slot. A legitimate reinstall between
+        // crashes goes through the install/uninstall API's
+        // per-plugin lifecycle lock (stop → uninstall →
+        // install → start), which mints a fresh supervisor
+        // with a fresh pin.
+        let (manifest_bytes, manifest) = instance::read_manifest_with_bytes(&plugin_dir).await?;
         let plugin_id = manifest.plugin.id.clone();
         let singleton = manifest.runtime.singleton;
+        let pinned_manifest = Some((manifest_bytes, manifest));
 
         // Atomic check + spawn-supervisor + spawn-reaper + insert.
         // `register` only calls the factory after the singleton /
@@ -639,9 +794,11 @@ impl Engine {
         let plugin_id_for_spawn = plugin_id.clone();
         let plugin_id_for_reaper = plugin_id.clone();
         let instance_id_for_reaper = instance_id.clone();
+        let reapers_for_spawn = Arc::clone(&self.reapers);
+        let reaper_gen_counter = Arc::clone(&self.reaper_gen);
         self.instances
             .register(instance_id, plugin_id, singleton, || {
-                let handle = crate::runtime::lifecycle::supervise_with_tuning_and_mode(
+                let handle = crate::runtime::lifecycle::supervise_with_tuning_mode_and_pin(
                     engine_for_spawn,
                     plugin_dir_for_spawn,
                     instance_id_for_spawn,
@@ -649,9 +806,24 @@ impl Engine {
                     overrides,
                     mode,
                     tuning,
+                    pinned_manifest,
                 );
                 let reaper_handle = handle.clone();
-                tokio::spawn(async move {
+                let reapers_for_reaper = Arc::clone(&reapers_for_spawn);
+                let reaper_key: Arc<str> = Arc::from(instance_id_for_reaper.as_str());
+                let reaper_key_for_task = Arc::clone(&reaper_key);
+                // Round-2 F2: mint a monotonic generation
+                // for THIS reaper spawn. The reaper carries
+                // the gen with it and only removes its
+                // tracker entry if the map's stored gen
+                // still matches — so a fresh start that
+                // reuses the same `instance_id` (after the
+                // registry unregister a moment ago) can't
+                // have its brand-new tracker entry
+                // silently clobbered by the old reaper's
+                // key-only remove.
+                let my_gen = reaper_gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reaper_join = tokio::spawn(async move {
                     let _ = reaper_handle.wait_terminal().await;
                     // Drop any device/service registry entries the
                     // instance left behind. The supervisor sweeps at
@@ -677,10 +849,312 @@ impl Engine {
                         .device_state()
                         .mark_instance_stale(&instance_id_for_reaper);
                     registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
+                    // Round-2 F2: conditional remove —
+                    // don't yank a replacement reaper's
+                    // entry that happens to share the same
+                    // `instance_id`.
+                    if let Ok(mut guard) = reapers_for_reaper.lock()
+                        && let std::collections::hash_map::Entry::Occupied(entry) =
+                            guard.entry(reaper_key_for_task)
+                        && entry.get().0 == my_gen
+                    {
+                        entry.remove();
+                    }
                 });
+                // Track the reaper handle keyed by `(gen,
+                // JoinHandle)`. If a same-instance entry is
+                // somehow already present, its
+                // JoinHandle is dropped — that detaches the
+                // old reaper but leaves its work scheduled;
+                // the conditional remove above still keys off
+                // gen, so the drop doesn't race the fresh
+                // reaper's cleanup.
+                if let Ok(mut guard) = reapers_for_spawn.lock() {
+                    guard.insert(reaper_key, (my_gen, reaper_join));
+                }
                 handle
             })
-            .map_err(anyhow::Error::from)
+            .map_err(|err| match err {
+                // Round-9 F1: normalize the shutdown-gate
+                // refusal so callers see the SAME error
+                // type regardless of which gate caught the
+                // race — the fast-path outer atomic and the
+                // authoritative inner registry flag now
+                // both surface as `EngineShuttingDown`.
+                // Pre-fix, callers who wanted to
+                // distinguish shutdown from other start
+                // failures had to downcast BOTH types.
+                crate::runtime::RegistryError::ShuttingDown => {
+                    anyhow::Error::from(EngineShuttingDown)
+                }
+                other => anyhow::Error::from(other),
+            })
+    }
+
+    /// Phase 6 leftover: await every supervised instance's
+    /// reaper to completion. Called on graceful daemon
+    /// shutdown so per-instance cleanup (device / service
+    /// registry eviction, device-state stale marking,
+    /// `instances.unregister`) finishes before the process
+    /// exits — pre-fix reapers were fire-and-forget
+    /// `tokio::spawn`s whose `JoinHandle` was discarded, so
+    /// a shutdown could observe partially-cleaned state
+    /// (e.g. `DeviceRegistry` entries surviving into the
+    /// next scan).
+    ///
+    /// This method does NOT itself send `shutdown` to the
+    /// running supervisors — the caller is expected to
+    /// have already asked each `InstanceHandle` to stop
+    /// (or aborted them via task cancellation). Reapers
+    /// wait on the supervisor's `state` watch reaching a
+    /// terminal state; a still-running supervisor never
+    /// reaches one, so awaiting its reaper would block
+    /// forever. Post-shutdown, this drains the cleanup
+    /// tail.
+    ///
+    /// Idempotent: reapers self-remove from the tracker as
+    /// their final step, so calling this twice on a settled
+    /// engine just returns a no-op the second time.
+    ///
+    /// Round-3 F1: this is the **unbounded** variant —
+    /// callers who need a bounded shutdown must go through
+    /// [`Self::drain_supervised_instances_with_timeout`].
+    /// The unbounded variant stays available for tests that
+    /// want deterministic post-shutdown assertions on a
+    /// settled engine.
+    pub async fn drain_supervised_instances(&self) {
+        let handles = self.take_reaper_handles();
+        for jh in handles {
+            let _ = jh.await;
+        }
+    }
+
+    /// Round-3 F1 + round-6 F1/F2/F3: **best-effort**
+    /// bounded reaper drain. Awaits up to `deadline` for
+    /// every outstanding reaper to complete naturally
+    /// (each reaper's own cleanup runs the
+    /// `remove_by_owner` / `unregister` chain — a handful
+    /// of hashmap ops that finish in milliseconds under
+    /// normal load). If the deadline elapses, aborts the
+    /// wrapper tasks — the underlying real reaper tasks
+    /// are **detached** (dropping a `JoinHandle` doesn't
+    /// cancel the task) — and returns `Err(count)` with a
+    /// warn log. The tokio runtime teardown at process
+    /// exit aborts the detached reapers alongside
+    /// everything else, so on the daemon shutdown path
+    /// the leak is process-lifetime bounded.
+    ///
+    /// **Do not use this when you need strong post-drain
+    /// state invariants on a LONG-LIVED [`Engine`]**
+    /// (tests, embedding). Callers who need that must
+    /// first stop every supervisor via
+    /// [`Self::stop_all_supervised_instances`] AND check
+    /// its [`StopAllReport::all_stopped`] return; only
+    /// then is the unbounded
+    /// [`Self::drain_supervised_instances`] safe. A
+    /// supervisor that timed out on stop still has its
+    /// reaper blocked on `wait_terminal`, and an unbounded
+    /// drain would await it forever (round-6 F2).
+    ///
+    /// Trying to clean up on behalf of a wedged reaper
+    /// here would either (a) unregister a still-running
+    /// supervisor (freeing its singleton slot for a
+    /// duplicate to start under the same id), (b) mis-
+    /// target cleanup against a reaper generation that
+    /// had already been recycled, or (c) deadlock on
+    /// whichever lock wedged the reaper in the first
+    /// place.
+    ///
+    /// Returns `Ok(())` if every reaper completed within
+    /// the deadline; `Err(count)` — the number of reapers
+    /// still outstanding at deadline — if any timed out.
+    /// Both paths log.
+    pub async fn drain_supervised_instances_with_timeout(
+        &self,
+        deadline: std::time::Duration,
+    ) -> Result<(), usize> {
+        let handles = self.take_reaper_handles();
+        if handles.is_empty() {
+            return Ok(());
+        }
+        let mut js = tokio::task::JoinSet::new();
+        for jh in handles {
+            js.spawn(async move {
+                let _ = jh.await;
+            });
+        }
+        // Wait up to `deadline` for every reaper to
+        // complete naturally. Each reaper's own cleanup
+        // (device / service eviction, device-state stale
+        // marking, `instances.unregister`) is a handful of
+        // hashmap operations — a well-behaved shutdown
+        // finishes here in milliseconds.
+        let result =
+            tokio::time::timeout(deadline, async { while js.join_next().await.is_some() {} }).await;
+        if result.is_ok() {
+            return Ok(());
+        }
+        let remaining = js.len();
+        // Round-6 F1/F2/F3 — DELIBERATELY DETACH on
+        // timeout. Aborting the real reapers or running
+        // their cleanup ourselves both introduce sharper
+        // bugs than the detachment they replace:
+        //
+        // - Unregistering an instance whose supervisor is
+        //   still running (i.e. why its reaper hadn't
+        //   fired) would free the singleton slot; a
+        //   subsequent `start_instance` for the same id
+        //   would coexist with the still-running
+        //   supervisor — two supervisors under one
+        //   identity, bypassing singleton enforcement
+        //   (round-5 F1).
+        // - Matching cleanup to a still-pending reaper
+        //   requires distinguishing its generation from a
+        //   fresh reaper whose `instance_id` was recycled
+        //   after some earlier reaper completed; getting
+        //   that wrong evicts the replacement's state
+        //   (round-5 F2).
+        // - The reaper's cleanup IS the same
+        //   `remove_by_owner` / `unregister` chain we'd
+        //   run inline. If the reaper was blocked on a
+        //   contended / poisoned lock in that chain,
+        //   running the same ops inline would deadlock on
+        //   the same lock — the shutdown deadline would
+        //   not bind (round-5 F3).
+        //
+        // On timeout we abort ONLY the wrapper tasks
+        // (which detaches the real reapers) and return
+        // `Err(count)`. On the daemon shutdown path, tokio
+        // runtime teardown at process exit aborts the
+        // detached tasks alongside everything else, so the
+        // leak is process-lifetime bounded. Long-lived
+        // Engine callers that need strong post-drain
+        // invariants must stop every supervisor first
+        // (`stop_all_supervised_instances`) then use the
+        // UNBOUNDED [`Self::drain_supervised_instances`] —
+        // the bounded variant is best-effort by
+        // construction, and its contract makes that
+        // explicit.
+        js.abort_all();
+        while js.join_next().await.is_some() {}
+        tracing::warn!(
+            remaining,
+            deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            "reaper drain deadline exceeded; wrapper tasks aborted, real reapers detached (best-effort: daemon shutdown relies on runtime teardown to catch the tail; long-lived Engine users should stop every supervisor first, then use the unbounded drain)",
+        );
+        Err(remaining)
+    }
+
+    /// Round-3 F1 helper: atomically drain the reaper map
+    /// under the sync mutex so the caller can await the
+    /// snapshot outside the lock.
+    fn take_reaper_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut guard = self
+            .reapers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.drain().map(|(_, (_gen, jh))| jh).collect()
+    }
+
+    /// Round-2 F1 + round-6 F2: request every supervised
+    /// instance to stop, giving each one up to
+    /// `per_stop_timeout` to reach a terminal state.
+    /// Returns a [`StopAllReport`] naming every supervisor
+    /// that DIDN'T reach terminal — pre-round-6 the method
+    /// returned `()` and swallowed timeouts, which meant
+    /// the "stop-then-unbounded-drain" recipe in the
+    /// bounded drain's docstring silently hung forever
+    /// when even one supervisor timed out (its reaper
+    /// stays blocked on `wait_terminal` and an unbounded
+    /// drain awaits it indefinitely).
+    ///
+    /// Called from `main.rs`'s shutdown path so a SIGTERM /
+    /// Ctrl-C stops supervisors cleanly instead of relying
+    /// on runtime teardown to abort them mid-`init`.
+    /// `main` doesn't inspect the report — the subsequent
+    /// bounded drain handles both the healthy and the
+    /// timed-out subsets uniformly.
+    pub async fn stop_all_supervised_instances(
+        &self,
+        per_stop_timeout: std::time::Duration,
+    ) -> StopAllReport {
+        // Round-7 F1 + round-8 F1: two-level shutdown gate.
+        //
+        // - Outer `AtomicBool` for the fast-path check at
+        //   the top of `start_instance_with_tuning` — lets
+        //   a start that hasn't yet done its manifest read
+        //   bail out immediately without wasted I/O.
+        //
+        // - Inner `InstanceRegistry::begin_shutdown()`
+        //   flag protected by the SAME mutex the register
+        //   step uses to insert. This is the
+        //   AUTHORITATIVE gate: a start that cleared the
+        //   fast-path but was mid-await when the outer
+        //   flag was set is still caught here — its
+        //   register call either runs before our
+        //   `begin_shutdown` (insert visible in the
+        //   snapshot below) or after (register refuses
+        //   with `RegistryError::ShuttingDown`). The
+        //   round-7 F1 fix without this inner check left
+        //   a TOCTOU: fast-path clear → await → register
+        //   AFTER stop_all's snapshot.
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.instances.begin_shutdown();
+        let handles = self.instances.list();
+        // Fire every stop in parallel so total wall-clock is
+        // bounded by `per_stop_timeout`, not
+        // `N * per_stop_timeout`.
+        let mut js = tokio::task::JoinSet::new();
+        for handle in handles {
+            let instance_id: Arc<str> = Arc::from(handle.instance_id());
+            let per = per_stop_timeout;
+            js.spawn(async move {
+                match tokio::time::timeout(per, handle.stop()).await {
+                    Ok(Ok(())) => {
+                        tracing::info!(instance_id = %instance_id, "supervised instance stopped");
+                        StopOne::Stopped
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            instance_id = %instance_id,
+                            %err,
+                            "supervised instance stop returned error",
+                        );
+                        StopOne::Errored(instance_id)
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            instance_id = %instance_id,
+                            timeout_ms =
+                                u64::try_from(per.as_millis()).unwrap_or(u64::MAX),
+                            "supervised instance did not stop within per-instance deadline",
+                        );
+                        StopOne::TimedOut(instance_id)
+                    }
+                }
+            });
+        }
+        let mut report = StopAllReport::default();
+        while let Some(res) = js.join_next().await {
+            match res {
+                Ok(StopOne::Stopped) => report.stopped += 1,
+                Ok(StopOne::Errored(id)) => report.errored.push(id),
+                Ok(StopOne::TimedOut(id)) => report.timed_out.push(id),
+                Err(join_err) => {
+                    // Round-7 F2: count panics so
+                    // `all_stopped()` returns false and
+                    // the caller doesn't advance to the
+                    // unbounded drain (which would wait
+                    // forever if the panicked stop
+                    // corresponded to a still-running
+                    // supervisor).
+                    report.panicked += 1;
+                    tracing::error!(%join_err, "stop task panicked");
+                }
+            }
+        }
+        report
     }
 
     /// Look up a running instance by id. `None` if no such

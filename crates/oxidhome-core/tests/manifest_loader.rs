@@ -328,6 +328,80 @@ declares_devices = ["switch"]
     );
 }
 
+/// Phase 6 leftover TOCTOU fix: `Engine::start_instance` reads
+/// the manifest once at pre-flight and passes the parsed
+/// snapshot into `PluginInstance::load_with_pinned_manifest`;
+/// the loader MUST use those bytes and NOT re-read
+/// `manifest.toml`. Test proves the invariant directly by
+/// writing an "on-disk" manifest that differs from the pinned
+/// one — the loaded instance's manifest must reflect the
+/// pinned bytes.
+#[tokio::test(flavor = "current_thread")]
+async fn load_with_pinned_manifest_uses_pinned_bytes_not_disk() {
+    let wasm_src = support::build_example("simulated-switch", "simulated_switch.wasm");
+    assert!(wasm_src.is_file(), "missing build artifact: {wasm_src:?}");
+
+    let dir = tempdir();
+    let wasm_dst = dir.path().join("simulated_switch.wasm");
+    std::fs::copy(&wasm_src, &wasm_dst).expect("copy wasm");
+
+    // The on-disk manifest declares plugin_id = example.on-disk.
+    // If the loader re-reads (pre-fix), that's the id it'll use.
+    let on_disk_manifest = r#"manifest_version = 1
+[plugin]
+id = "example.on-disk"
+name = "On Disk"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "simulated_switch.wasm"
+[capabilities]
+declares_devices = ["switch"]
+"#;
+    std::fs::write(dir.path().join("manifest.toml"), on_disk_manifest)
+        .expect("write on-disk manifest");
+
+    // The pinned manifest bytes declare plugin_id = example.pinned.
+    // Post-fix, `load_with_pinned_manifest` uses these bytes and
+    // ignores what's on disk — so the loaded instance's manifest
+    // reports the pinned id.
+    let pinned_bytes = br#"manifest_version = 1
+[plugin]
+id = "example.pinned"
+name = "Pinned"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "simulated_switch.wasm"
+[capabilities]
+declares_devices = ["switch"]
+"#
+    .to_vec();
+    let pinned_manifest: oxidhome_manifest::PluginManifest =
+        toml::from_str(std::str::from_utf8(&pinned_bytes).unwrap()).expect("parse pinned");
+
+    let engine = Engine::new().expect("engine");
+    let instance = PluginInstance::load_with_pinned_manifest(
+        &engine,
+        dir.path(),
+        "pinned-instance",
+        None,
+        oxidhome_core::runtime::LoadMode::Dev,
+        pinned_bytes,
+        pinned_manifest,
+    )
+    .await
+    .expect("pinned load succeeds");
+
+    assert_eq!(
+        instance.manifest().plugin.id,
+        "example.pinned",
+        "loaded manifest must reflect the pinned bytes, not the on-disk manifest",
+    );
+}
+
 /// Tiny tempdir helper. The integration tests already use
 /// `tokio::fs` indirectly via the loader; using std `tempfile`-style
 /// scratch here keeps the dep surface small.

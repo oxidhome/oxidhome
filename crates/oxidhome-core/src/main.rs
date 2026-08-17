@@ -47,6 +47,36 @@ use tracing_subscriber::{EnvFilter, fmt};
 /// exit.
 const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 
+/// Round-2 F1: per-instance stop deadline on daemon
+/// shutdown. Stops fire in parallel, so total wall-clock
+/// is bounded by this (not `N * this`). Long enough for
+/// a well-behaved plugin's `shutdown` handler to run;
+/// short enough that a hung plugin doesn't wedge the
+/// daemon indefinitely. A timed-out stop is logged; that
+/// supervisor is left running (its reaper is still blocked
+/// on the terminal transition) and the subsequent bounded
+/// drain will eventually detach it — the tokio runtime
+/// teardown that follows process exit aborts every
+/// detached task.
+const SHUTDOWN_STOP_PER_INSTANCE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Round-3 F1 + round-6 F1/F2/F3: bounded reaper-drain
+/// deadline for daemon shutdown. Best-effort: reapers that
+/// don't complete inside this window get detached (their
+/// wrapper tasks are aborted; the real reaper tasks stay
+/// running). On process exit the tokio runtime teardown
+/// aborts the detached tasks, so any post-deadline leak
+/// is process-lifetime bounded. Round-5 tried to abort
+/// the real reapers + perform equivalent cleanup inline
+/// on timeout, but every version of that hit a sharper
+/// bug (unregistering a still-running supervisor,
+/// mis-targeting recycled generations, deadlocking on
+/// the very lock that had wedged the reaper). Best-effort
+/// is the correct contract here — see the docstring on
+/// [`oxidhome_core::Engine::drain_supervised_instances_with_timeout`]
+/// for the full rationale.
+const SHUTDOWN_REAPER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Loopback-only by default — the API isn't meant to face the
 /// open network. Operators who want a different listen address
 /// set `OXIDHOME_BIND`; the daemon parses the value as a
@@ -156,14 +186,55 @@ async fn main() -> anyhow::Result<()> {
     // incident, since for a home hub a missed actuation response
     // is recoverable from the audit log + state, and a wedged
     // shutdown is not.
-    tokio::select! {
+    // Round-6 F1: capture the serve error (if any)
+    // instead of propagating with `?` inside the select —
+    // the propagation used to skip stop / drain / log
+    // flush on an accept-loop failure. Cleanup still runs,
+    // then we return the deferred error at the bottom of
+    // main.
+    let serve_error: Option<anyhow::Error> = tokio::select! {
         result = serve(engine.clone(), listener) => {
-            result.context("api server stopped unexpectedly")?;
+            match result {
+                Ok(()) => None,
+                Err(err) => Some(err.context("api server stopped unexpectedly")),
+            }
         }
         signal = shutdown_signal() => {
             tracing::info!(signal = signal, "shutdown signal received; draining");
+            None
         }
-    }
+    };
+
+    // Round-2 F1 + round-3 F1 + round-7 F3: BEST-EFFORT
+    // bounded shutdown of every supervised instance.
+    // `stop_all_supervised_instances` gives each supervisor
+    // `SHUTDOWN_STOP_PER_INSTANCE_DEADLINE` to reach a
+    // terminal state; the subsequent bounded reaper drain
+    // gives their cleanup tasks (device / service
+    // eviction, `instances.unregister`) up to
+    // `SHUTDOWN_REAPER_DRAIN_DEADLINE` to complete. Any
+    // reaper still pending at that deadline is DETACHED —
+    // the tokio runtime teardown that follows process
+    // exit aborts the tail alongside everything else, so
+    // per-instance cleanup is process-lifetime bounded but
+    // NOT guaranteed to have run before we return here.
+    // Pre-round-2 `main` skipped this entire sequence and
+    // relied on runtime teardown for every supervisor +
+    // reaper, so mid-`init` aborts left partially-cleaned
+    // state; this recovers the common case (well-behaved
+    // plugins) without wedging the daemon.
+    //
+    // Round-6 F2: the stop report names any supervisor
+    // that didn't reach terminal within the deadline; we
+    // don't inspect it here because the bounded drain
+    // handles the timed-out subset uniformly (by
+    // detaching).
+    let _ = engine
+        .stop_all_supervised_instances(SHUTDOWN_STOP_PER_INSTANCE_DEADLINE)
+        .await;
+    let _ = engine
+        .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
+        .await;
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s
@@ -179,6 +250,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Round-6 F1: propagate the serve error (if any) AFTER
+    // running the full shutdown-cleanup sequence, so
+    // systemd / runit still see a non-zero exit and can
+    // restart.
+    if let Some(err) = serve_error {
+        return Err(err);
+    }
     Ok(())
 }
 

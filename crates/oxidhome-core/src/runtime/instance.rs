@@ -56,27 +56,34 @@ fn loaded_dir_matches_registry(wasm_path: &Path, registry_path: &Path) -> bool {
     loaded.starts_with(&root)
 }
 
-/// Read + validate the manifest at `<plugin_dir>/manifest.toml`
-/// without instantiating the wasm component. Used by the Phase-6
-/// registry's pre-flight singleton check; the full load path
-/// re-reads + re-validates inside [`PluginInstance::load`].
+/// Phase 6 leftover TOCTOU fix: bytes-capturing manifest read.
+/// Returns both the raw manifest bytes and the parsed
+/// `PluginManifest`, so [`crate::Engine::start_instance`] can
+/// pin the pre-flight snapshot and hand it to the supervisor's
+/// first load without a second read from disk. The
+/// bytes-discarding wrapper (`read_manifest`) that used to sit
+/// alongside this function was removed once its sole caller
+/// switched over — the parsed-only variant added zero value
+/// beyond the tuple destructure.
 ///
-/// `pub(crate)` for now — only [`crate::Engine::start_instance`]
-/// needs the pre-flight parse. The Phase-12 CLI's manifest-validation
-/// command will likely want a public variant; that can lift the
-/// visibility when it lands.
-pub(crate) async fn read_manifest(plugin_dir: &Path) -> anyhow::Result<PluginManifest> {
+/// The bytes come back as `Vec<u8>` (not `String`) because the
+/// downstream `PluginInstance::load_with_mode` path already works
+/// in `&[u8]` — feeding them straight through avoids a re-UTF-8
+/// check.
+pub(crate) async fn read_manifest_with_bytes(
+    plugin_dir: &Path,
+) -> anyhow::Result<(Vec<u8>, PluginManifest)> {
     let manifest_path = plugin_dir.join("manifest.toml");
-    let text = tokio::fs::read_to_string(&manifest_path)
-        .await
-        .with_context(|| {
-            format!(
-                "reading manifest from {} (does the plugin dir contain manifest.toml?)",
-                manifest_path.display(),
-            )
-        })?;
+    let bytes = tokio::fs::read(&manifest_path).await.with_context(|| {
+        format!(
+            "reading manifest from {} (does the plugin dir contain manifest.toml?)",
+            manifest_path.display(),
+        )
+    })?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("manifest {} is not UTF-8", manifest_path.display()))?;
     let manifest: PluginManifest =
-        toml::from_str(&text).with_context(|| format!("parsing {}", manifest_path.display()))?;
+        toml::from_str(text).with_context(|| format!("parsing {}", manifest_path.display()))?;
     if let Err(errors) = oxidhome_manifest::validate(&manifest) {
         return Err(anyhow!(
             "manifest {} is invalid:\n  - {}",
@@ -88,7 +95,7 @@ pub(crate) async fn read_manifest(plugin_dir: &Path) -> anyhow::Result<PluginMan
                 .join("\n  - "),
         ));
     }
-    Ok(manifest)
+    Ok((bytes, manifest))
 }
 
 /// One loaded `plugin`-world component, ready to drive through its
@@ -226,6 +233,59 @@ impl PluginInstance {
         overrides: Option<&toml::Value>,
         mode: LoadMode,
     ) -> anyhow::Result<Self> {
+        Self::load_with_optional_pinned_manifest(
+            engine,
+            plugin_dir,
+            instance_id,
+            overrides,
+            mode,
+            None,
+        )
+        .await
+    }
+
+    /// Phase 6 leftover TOCTOU fix + round-2 F3: like
+    /// [`Self::load_with_mode`], but skips the on-disk
+    /// manifest read and uses the supplied pre-parsed
+    /// `(manifest_bytes, manifest)` instead. Used on every
+    /// load attempt inside `run_supervisor` (first load
+    /// AND every restart), so `start_instance`'s
+    /// pre-flight parse — which decided the singleton slot
+    /// + `plugin_id` — is the same manifest that
+    /// instantiates for the supervisor's lifetime. A
+    /// legitimate reinstall between crashes goes through
+    /// the install/uninstall API path (per-plugin
+    /// lifecycle lock), which starts a fresh supervisor
+    /// with a fresh pin.
+    #[doc(hidden)]
+    pub async fn load_with_pinned_manifest(
+        engine: &Engine,
+        plugin_dir: &Path,
+        instance_id: impl Into<String>,
+        overrides: Option<&toml::Value>,
+        mode: LoadMode,
+        manifest_bytes: Vec<u8>,
+        manifest: PluginManifest,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_optional_pinned_manifest(
+            engine,
+            plugin_dir,
+            instance_id,
+            overrides,
+            mode,
+            Some((manifest_bytes, manifest)),
+        )
+        .await
+    }
+
+    async fn load_with_optional_pinned_manifest(
+        engine: &Engine,
+        plugin_dir: &Path,
+        instance_id: impl Into<String>,
+        overrides: Option<&toml::Value>,
+        mode: LoadMode,
+        pinned: Option<(Vec<u8>, PluginManifest)>,
+    ) -> anyhow::Result<Self> {
         let plugin_dir = plugin_dir.to_path_buf();
         let instance_id = instance_id.into();
         // `plugin_id = Empty` declares the field up-front so it
@@ -245,38 +305,56 @@ impl PluginInstance {
         );
         async move {
             let manifest_path = plugin_dir.join("manifest.toml");
-            // C5 review F3 round-4 F2: read the manifest as
-            // **raw bytes** so the same buffer feeds both parse
-            // and the load-time digest check further down.
-            // Reading as `String` and then re-reading for the
-            // hash would reintroduce the TOCTOU window this fix
-            // exists to close.
-            let manifest_bytes = tokio::fs::read(&manifest_path).await.with_context(|| {
-                format!(
-                    "reading manifest from {} (does the plugin dir contain manifest.toml?)",
-                    manifest_path.display(),
-                )
-            })?;
-            let manifest_text = std::str::from_utf8(&manifest_bytes)
-                .with_context(|| format!("manifest {} is not UTF-8", manifest_path.display()))?;
-            let manifest: PluginManifest = toml::from_str(manifest_text)
-                .with_context(|| format!("parsing {}", manifest_path.display()))?;
+            // Phase 6 leftover TOCTOU fix + round-2 F3:
+            // if the caller passed a pre-parsed manifest
+            // snapshot, use those exact bytes rather than
+            // re-reading. The supervisor supplies the
+            // pre-flight snapshot on EVERY load attempt so
+            // the manifest whose `plugin_id` / `singleton`
+            // flag decided the registry slot is the manifest
+            // that instantiates for the supervisor's
+            // lifetime. `None` reaches this branch only via
+            // the un-pinned test-suite paths (`supervise` /
+            // `supervise_with_tuning`); those re-read from
+            // disk on every attempt.
+            let (manifest_bytes, manifest) = if let Some((bytes, manifest)) = pinned {
+                (bytes, manifest)
+            } else {
+                // C5 review F3 round-4 F2: read the manifest
+                // as **raw bytes** so the same buffer feeds
+                // both parse and the load-time digest check
+                // further down. Reading as `String` and then
+                // re-reading for the hash would reintroduce
+                // the TOCTOU window this fix exists to close.
+                let manifest_bytes = tokio::fs::read(&manifest_path).await.with_context(|| {
+                    format!(
+                        "reading manifest from {} (does the plugin dir contain manifest.toml?)",
+                        manifest_path.display(),
+                    )
+                })?;
+                let manifest_text = std::str::from_utf8(&manifest_bytes).with_context(|| {
+                    format!("manifest {} is not UTF-8", manifest_path.display())
+                })?;
+                let manifest: PluginManifest = toml::from_str(manifest_text)
+                    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+                if let Err(errors) = oxidhome_manifest::validate(&manifest) {
+                    return Err(anyhow!(
+                        "manifest {} is invalid:\n  - {}",
+                        manifest_path.display(),
+                        errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n  - "),
+                    ));
+                }
+                (manifest_bytes, manifest)
+            };
             // Record the plugin id onto the active span as soon as
             // it's known. Validation, compatibility-check, and
             // instantiate-time events below will all attribute to
             // it via the Layer's `on_record` hook.
             tracing::Span::current().record("plugin_id", manifest.plugin.id.as_str());
-            if let Err(errors) = oxidhome_manifest::validate(&manifest) {
-                return Err(anyhow!(
-                    "manifest {} is invalid:\n  - {}",
-                    manifest_path.display(),
-                    errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n  - "),
-                ));
-            }
 
             // SDK compatibility preflight.
             let core_sdk = OXIDHOME_SDK_VERSION

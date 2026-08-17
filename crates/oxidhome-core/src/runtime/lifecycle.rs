@@ -208,6 +208,40 @@ pub struct InstanceHandle {
 }
 
 impl InstanceHandle {
+    /// Round-9 F2: test-only constructor for
+    /// `runtime::registry::tests`, which needs a plausible
+    /// `InstanceHandle` to feed into `InstanceRegistry::register`
+    /// without actually spinning up a supervisor. The
+    /// control channel has no attached receiver, so any
+    /// `execute_command` call on the returned handle will
+    /// fail (the send errors and the handler surfaces
+    /// that). Round-11 F3 correction: `stop()` on this
+    /// handle returns `Ok(())` — its implementation
+    /// deliberately treats a closed control channel as
+    /// "already Stopped or Failed" (idempotent), so it
+    /// does NOT fail here; it just doesn't do anything.
+    /// The registry test never exercises either path.
+    ///
+    /// Round-10 F3: the watch is seeded with `Stopped` (a
+    /// terminal state) instead of `Loading`, so
+    /// [`Self::wait_terminal`]'s contract holds — a
+    /// caller who happens to await terminal on this
+    /// handle sees `Stopped` immediately rather than
+    /// getting back the non-terminal `Loading` value the
+    /// receiver would otherwise borrow after the sender's
+    /// drop wakes `changed()` with `Err`.
+    #[cfg(test)]
+    pub(crate) fn for_registry_test(instance_id: &str, plugin_id: &str) -> Self {
+        let (control, _rx) = tokio::sync::mpsc::channel(1);
+        let (_tx, state) = tokio::sync::watch::channel(InstanceState::Stopped);
+        Self {
+            instance_id: Arc::from(instance_id),
+            plugin_id: Arc::from(plugin_id),
+            control,
+            state,
+        }
+    }
+
     /// The instance id this supervisor was started with.
     #[must_use]
     pub fn instance_id(&self) -> &str {
@@ -460,6 +494,22 @@ pub fn supervise_with_tuning(
 /// paths and dev-load path both route through with their chosen
 /// mode). `supervise` / `supervise_with_tuning` above are the
 /// `LoadMode::Dev` sugar for tests.
+///
+/// Phase 6 leftover TOCTOU fix + round-2 F3:
+/// `first_load_pinned_manifest` is the pre-parsed manifest
+/// snapshot that pre-flight used to decide the singleton
+/// slot / `plugin_id`. When present, the supervisor uses
+/// those exact bytes on **every** load attempt (first load
+/// and every restart) — the manifest is treated as
+/// immutable for the supervisor's lifetime. An atomic
+/// replace of `manifest.toml` during startup or restart
+/// backoff can no longer sneak a mismatched identity or
+/// capability set past the registry.
+///
+/// `None` is the test-suite entry (`supervise` /
+/// `supervise_with_tuning`) that spawns without a
+/// pre-flight step; those tests re-read the manifest on
+/// every attempt (their pin is deliberately absent).
 #[doc(hidden)]
 #[must_use]
 pub fn supervise_with_tuning_and_mode(
@@ -470,6 +520,31 @@ pub fn supervise_with_tuning_and_mode(
     overrides: Option<toml::Value>,
     mode: crate::runtime::LoadMode,
     tuning: SupervisorTuning,
+) -> InstanceHandle {
+    supervise_with_tuning_mode_and_pin(
+        engine,
+        plugin_dir,
+        instance_id,
+        plugin_id,
+        overrides,
+        mode,
+        tuning,
+        None,
+    )
+}
+
+#[doc(hidden)]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn supervise_with_tuning_mode_and_pin(
+    engine: Engine,
+    plugin_dir: PathBuf,
+    instance_id: impl Into<String>,
+    plugin_id: impl Into<String>,
+    overrides: Option<toml::Value>,
+    mode: crate::runtime::LoadMode,
+    tuning: SupervisorTuning,
+    first_load_pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) -> InstanceHandle {
     let instance_id: Arc<str> = Arc::from(instance_id.into());
     let plugin_id: Arc<str> = Arc::from(plugin_id.into());
@@ -490,6 +565,7 @@ pub fn supervise_with_tuning_and_mode(
         mode,
         control_rx,
         state_tx,
+        first_load_pinned_manifest,
     ));
     handle
 }
@@ -500,6 +576,14 @@ enum LoopAction {
     Continue,
     /// `shutdown` ran — leave the loop with a clean `Stopped`.
     Stop,
+    /// Round-3 F1: operator-requested shutdown that trapped
+    /// mid-teardown. Terminal (never restarts, even under
+    /// `on-trap`) — the operator asked to stop, and the
+    /// stop request must be honoured regardless of guest
+    /// shutdown failure. The reason string is logged and
+    /// surfaces on the `Failed` transition so the audit
+    /// row records the trap.
+    StopFailed(String),
 }
 
 /// Publish a state transition: log it under `runtime.lifecycle` and
@@ -591,6 +675,11 @@ fn restart_decision(
 enum LifecycleOutcome {
     /// A clean `shutdown` ran — the supervisor should exit.
     Stopped,
+    /// Round-3 F1: operator-requested shutdown that trapped
+    /// mid-teardown. Terminal — the supervisor MUST NOT
+    /// restart, even under `on-trap` policy. Transitions
+    /// to `Failed` with the trap reason.
+    StoppedFailed(String),
     /// `load` itself failed; there's no manifest, so no policy — the
     /// supervisor must treat this as terminal.
     LoadFailed(String),
@@ -610,6 +699,11 @@ enum LifecycleOutcome {
 enum ServeOutcome {
     /// A clean `shutdown` ran.
     Stopped,
+    /// Round-3 F1: operator-requested shutdown that
+    /// trapped mid-teardown. Terminal (never restarts) —
+    /// carries the trap reason for the `Failed` transition
+    /// in the outer supervisor.
+    StoppedFailed(String),
     /// The instance trapped.
     Crashed(TrapReason),
 }
@@ -635,6 +729,26 @@ async fn run_supervisor(
     mode: crate::runtime::LoadMode,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     state_tx: watch::Sender<InstanceState>,
+    // Phase 6 leftover TOCTOU fix + review F3: when
+    // `Some`, the supervisor uses this snapshot on EVERY
+    // load attempt (first load AND every restart) — the
+    // manifest is treated as immutable for the supervisor's
+    // lifetime. A first cut of this fix only used the
+    // snapshot on the first attempt and re-read on
+    // restarts; reviewers flagged that as reopening the
+    // identity race during backoff (a dev-mode manifest
+    // could change plugin_id / singleton / capabilities
+    // between crashes while the registry stayed registered
+    // as the pre-change identity). A legitimate reinstall
+    // between crashes now requires the operator to stop
+    // and re-start (the install/uninstall API's per-plugin
+    // lifecycle lock enforces that path).
+    //
+    // `None` is the test-suite entry (`supervise` /
+    // `supervise_with_tuning`) — those still re-read on
+    // every attempt because there's no pre-flight parse
+    // to pin.
+    pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) {
     // C2d — the pre-C2d supervisor eagerly subscribed to
     // `subscribe_all()` so every published event woke every
@@ -651,6 +765,14 @@ async fn run_supervisor(
     let mut restarts: u32 = 0;
 
     loop {
+        // Round-2 F3: clone the pinned snapshot for THIS
+        // attempt, keeping the original held on the
+        // supervisor stack so every subsequent restart
+        // uses the same bytes. Cloning the manifest is
+        // cheap — small TOML in memory. `None` means "no
+        // pin was supplied at spawn"; the loader will
+        // re-read on every attempt (test-suite path only).
+        let pinned = pinned_manifest.clone();
         let outcome = run_one_lifecycle(
             &engine,
             &plugin_dir,
@@ -661,11 +783,22 @@ async fn run_supervisor(
             &mode,
             &mut control_rx,
             &state_tx,
+            pinned,
         )
         .await;
 
         match outcome {
             LifecycleOutcome::Stopped => return,
+            LifecycleOutcome::StoppedFailed(reason) => {
+                // Round-3 F1: operator asked to stop; the guest
+                // shutdown trapped. Terminal — no restart, ever.
+                transition(
+                    &state_tx,
+                    &instance_id,
+                    InstanceState::Failed { error: reason },
+                );
+                return;
+            }
             LifecycleOutcome::LoadFailed(msg) => {
                 transition(
                     &state_tx,
@@ -745,6 +878,15 @@ async fn run_one_lifecycle(
     mode: &crate::runtime::LoadMode,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     state_tx: &watch::Sender<InstanceState>,
+    // Phase 6 leftover TOCTOU fix + round-2 F3: the
+    // supervisor's pinned manifest snapshot, cloned by
+    // `run_supervisor` for every attempt (first load AND
+    // every restart), so the manifest is treated as
+    // immutable for the supervisor's lifetime. `None`
+    // only reaches this helper via the un-pinned
+    // test-suite paths; those re-read from disk on every
+    // attempt.
+    pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) -> LifecycleOutcome {
     // Sweep any device/service registry entries this instance left
     // behind on a previous life. First load is a no-op; on a restart
@@ -769,15 +911,31 @@ async fn run_one_lifecycle(
 
     transition(state_tx, instance_id, InstanceState::Loading);
 
-    let mut instance = match PluginInstance::load_with_mode(
-        engine,
-        plugin_dir,
-        instance_id.to_string(),
-        overrides,
-        mode.clone(),
-    )
-    .await
-    {
+    let load_result = match pinned_manifest {
+        Some((bytes, manifest)) => {
+            PluginInstance::load_with_pinned_manifest(
+                engine,
+                plugin_dir,
+                instance_id.to_string(),
+                overrides,
+                mode.clone(),
+                bytes,
+                manifest,
+            )
+            .await
+        }
+        None => {
+            PluginInstance::load_with_mode(
+                engine,
+                plugin_dir,
+                instance_id.to_string(),
+                overrides,
+                mode.clone(),
+            )
+            .await
+        }
+    };
+    let mut instance = match load_result {
         Ok(instance) => instance,
         Err(e) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
     };
@@ -831,6 +989,7 @@ async fn run_one_lifecycle(
     .await
     {
         ServeOutcome::Stopped => LifecycleOutcome::Stopped,
+        ServeOutcome::StoppedFailed(reason) => LifecycleOutcome::StoppedFailed(reason),
         ServeOutcome::Crashed(reason) => LifecycleOutcome::Crashed {
             policy,
             reason,
@@ -895,6 +1054,14 @@ async fn serve_loop(
             Ok(LoopAction::Stop) => {
                 transition(state_tx, instance_id, InstanceState::Stopped);
                 return ServeOutcome::Stopped;
+            }
+            Ok(LoopAction::StopFailed(reason)) => {
+                tracing::warn!(
+                    instance_id,
+                    reason = %reason,
+                    "operator-requested shutdown trapped — refusing to restart",
+                );
+                return ServeOutcome::StoppedFailed(reason);
             }
             Err(e) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),
         }
@@ -963,11 +1130,23 @@ async fn handle_control(
         Some(ControlCommand::Shutdown { reply }) => {
             transition(state_tx, instance_id, InstanceState::Stopping);
             let result = instance.shutdown().await;
-            // Ack the caller whether or not `shutdown` trapped — the
-            // `?` below still surfaces a trap as `Failed`.
+            // Ack the caller whether or not `shutdown` trapped so
+            // they aren't left waiting on the reply channel.
             let _ = reply.send(());
-            result?;
-            Ok(LoopAction::Stop)
+            // Round-3 F1: an operator-requested shutdown MUST be
+            // terminal, regardless of whether the guest's
+            // teardown ran cleanly. Pre-fix, propagating the trap
+            // via `?` funneled the outcome into
+            // `ServeOutcome::Crashed` and the outer supervisor
+            // then applied the `on-trap` restart policy —
+            // silently restarting an instance the operator asked
+            // to stop. Now a shutdown trap goes to `StopFailed`,
+            // which the outer supervisor treats as terminal
+            // (Failed state, no restart).
+            match result {
+                Ok(()) => Ok(LoopAction::Stop),
+                Err(err) => Ok(LoopAction::StopFailed(format!("shutdown trapped: {err:#}"))),
+            }
         }
         Some(ControlCommand::Execute { device, cmd, reply }) => {
             match instance.execute_command(device, cmd).await {

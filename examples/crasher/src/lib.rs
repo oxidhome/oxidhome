@@ -5,7 +5,12 @@
 //! - `"tick"` (default) — `init` succeeds, then the first lifecycle
 //!   `tick()` panics, which the host catches as a Wasmtime trap;
 //! - `"init"` — `init` returns `Err`, a clean deterministic startup
-//!   failure.
+//!   failure;
+//! - `"shutdown"` — `init` + `tick` succeed, but the guest's
+//!   `shutdown` handler panics. Used by the round-3 F1 supervisor
+//!   test to verify an operator-requested shutdown that traps is
+//!   terminal (never restarted) regardless of the manifest's
+//!   restart policy.
 //!
 //! It exists purely as the fixture for the Phase-6 supervisor's
 //! restart-policy and backoff tests — `on-trap` restarts the tick
@@ -26,17 +31,32 @@ impl Plugin for Crasher {
         if mode == "init" {
             return Err("crasher: deliberate init failure".to_string());
         }
-        oxidhome_sdk::tracing::info!("crasher ready — will trap on first tick");
+        oxidhome_sdk::tracing::info!("crasher ready — mode: {mode}");
         Ok(())
     }
 
     fn tick(&mut self) {
-        // A guest panic unwinds to a Wasmtime trap, which the host
-        // catches and classifies as `TrapReason::Trap`.
-        panic!("crasher: deliberate tick trap");
+        let mode = host::config::get_typed::<String>("crash_on")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "tick".to_string());
+        if mode == "tick" {
+            // A guest panic unwinds to a Wasmtime trap, which
+            // the host catches and classifies as
+            // `TrapReason::Trap`.
+            panic!("crasher: deliberate tick trap");
+        }
     }
 
-    fn shutdown(&mut self) {}
+    fn shutdown(&mut self) {
+        let mode = host::config::get_typed::<String>("crash_on")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "tick".to_string());
+        if mode == "shutdown" {
+            panic!("crasher: deliberate shutdown trap");
+        }
+    }
 }
 
 oxidhome_sdk::plugin!(Crasher);

@@ -29,6 +29,20 @@ struct RegistryInner {
     /// `plugin_id` → the `instance_id` currently holding its
     /// singleton slot. Only `singleton = true` plugins appear.
     singletons: HashMap<String, String>,
+    /// Round-8 F1: shutdown gate protected by the SAME
+    /// mutex as `instances`. Set by
+    /// [`InstanceRegistry::begin_shutdown`] (called from
+    /// [`Engine::stop_all_supervised_instances`] before
+    /// its snapshot); checked inside
+    /// [`InstanceRegistry::register`] under the same lock,
+    /// so a `start_instance` that clears the outer
+    /// `Engine::shutting_down` fast-path but is still
+    /// mid-flight when shutdown begins can't slip a fresh
+    /// supervisor into the registry after the shutdown
+    /// snapshot. The outer `AtomicBool` remains for
+    /// fail-fast before the manifest read; this inner
+    /// bool is the authoritative gate.
+    shutting_down: bool,
 }
 
 /// Per-`Engine` registry of supervised instances.
@@ -53,6 +67,17 @@ pub enum RegistryError {
         plugin_id: String,
         existing_instance_id: String,
     },
+    /// Round-8 F1: engine is shutting down. Set by
+    /// [`InstanceRegistry::begin_shutdown`] under the
+    /// registry lock, checked inside
+    /// [`InstanceRegistry::register`] under the same
+    /// lock — an in-flight start that raced shutdown past
+    /// the outer `AtomicBool` fast-path lands here rather
+    /// than slipping a supervisor into the registry.
+    #[error(
+        "engine is shutting down: no new supervised instances may be started (stop_all_supervised_instances was called)"
+    )]
+    ShuttingDown,
 }
 
 impl InstanceRegistry {
@@ -98,6 +123,22 @@ impl InstanceRegistry {
         F: FnOnce() -> InstanceHandle,
     {
         let mut guard = self.inner.lock().expect("instance registry mutex poisoned");
+        // Round-8 F1: authoritative shutdown gate check
+        // under the SAME lock as the insert. Closes the
+        // TOCTOU where a start_instance cleared the outer
+        // `AtomicBool` fast-path, then awaited manifest I/O
+        // while `stop_all_supervised_instances` set the
+        // flag and snapshotted the registry, then resumed
+        // and inserted a fresh entry the snapshot had
+        // missed. The Engine's `stop_all` calls
+        // `begin_shutdown` (which takes this same lock)
+        // BEFORE snapshotting, so either this register
+        // runs entirely before shutdown-set (insert is
+        // visible in the snapshot) or entirely after
+        // (this branch refuses).
+        if guard.shutting_down {
+            return Err(RegistryError::ShuttingDown);
+        }
         if guard.instances.contains_key(&instance_id) {
             return Err(RegistryError::DuplicateInstanceId { instance_id });
         }
@@ -141,6 +182,23 @@ impl InstanceRegistry {
         }
     }
 
+    /// Round-8 F1: flip the shutdown gate under the
+    /// registry lock. Called from
+    /// [`Engine::stop_all_supervised_instances`] BEFORE
+    /// its snapshot. Combined with the paired flag-check
+    /// inside [`Self::register`] (which acquires the same
+    /// lock), this closes the interleaving where a
+    /// mid-flight start that had cleared the outer
+    /// `AtomicBool` fast-path could still slip a fresh
+    /// entry into the registry after the shutdown
+    /// snapshot.
+    ///
+    /// [`Engine::stop_all_supervised_instances`]: crate::Engine::stop_all_supervised_instances
+    pub(crate) fn begin_shutdown(&self) {
+        let mut guard = self.inner.lock().expect("instance registry mutex poisoned");
+        guard.shutting_down = true;
+    }
+
     /// Lookup by `instance_id`. Returns a clone of the handle.
     #[must_use]
     pub fn get(&self, instance_id: &str) -> Option<InstanceHandle> {
@@ -163,5 +221,54 @@ impl InstanceRegistry {
             .values()
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-9 F2: deterministic regression for the inner
+    /// shutdown gate. Once `begin_shutdown` has run,
+    /// every subsequent `register` returns
+    /// `RegistryError::ShuttingDown` — regardless of
+    /// singleton flag / prior registrations / any race
+    /// with the caller's `.await` timing. This is the
+    /// property the concurrent integration test only
+    /// samples probabilistically; this unit test asserts
+    /// it directly against the registry API and would
+    /// fail deterministically if the flag check or its
+    /// lock ordering were dropped.
+    #[test]
+    fn register_after_begin_shutdown_returns_shutting_down() {
+        let reg = InstanceRegistry::new();
+        // Pre-shutdown register succeeds.
+        reg.register("a".into(), "plugin".into(), false, || {
+            InstanceHandle::for_registry_test("a", "plugin")
+        })
+        .expect("pre-shutdown register");
+        // Flip the gate.
+        reg.begin_shutdown();
+        // Post-shutdown register (fresh id, no duplicate
+        // /singleton conflict possible) must be refused
+        // with ShuttingDown — no factory should even run.
+        let called_factory = std::sync::atomic::AtomicBool::new(false);
+        let err = reg
+            .register("b".into(), "plugin-b".into(), false, || {
+                called_factory.store(true, std::sync::atomic::Ordering::Relaxed);
+                InstanceHandle::for_registry_test("b", "plugin-b")
+            })
+            .expect_err("post-shutdown register must refuse");
+        assert!(
+            matches!(err, RegistryError::ShuttingDown),
+            "expected RegistryError::ShuttingDown, got {err:?}",
+        );
+        assert!(
+            !called_factory.load(std::sync::atomic::Ordering::Relaxed),
+            "factory must not run when the shutdown gate refuses",
+        );
+        // The pre-shutdown entry stays intact (shutdown
+        // doesn't retroactively evict).
+        assert!(reg.get("a").is_some());
     }
 }
