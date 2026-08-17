@@ -212,9 +212,15 @@ impl InstanceHandle {
     /// `runtime::registry::tests`, which needs a plausible
     /// `InstanceHandle` to feed into `InstanceRegistry::register`
     /// without actually spinning up a supervisor. The
-    /// control channel has no attached receiver so
-    /// `stop` / `execute_command` on the returned handle
-    /// will fail — the test never exercises those paths.
+    /// control channel has no attached receiver, so any
+    /// `execute_command` call on the returned handle will
+    /// fail (the send errors and the handler surfaces
+    /// that). Round-11 F3 correction: `stop()` on this
+    /// handle returns `Ok(())` — its implementation
+    /// deliberately treats a closed control channel as
+    /// "already Stopped or Failed" (idempotent), so it
+    /// does NOT fail here; it just doesn't do anything.
+    /// The registry test never exercises either path.
     ///
     /// Round-10 F3: the watch is seeded with `Stopped` (a
     /// terminal state) instead of `Loading`, so
