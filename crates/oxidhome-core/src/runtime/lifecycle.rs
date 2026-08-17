@@ -212,14 +212,22 @@ impl InstanceHandle {
     /// `runtime::registry::tests`, which needs a plausible
     /// `InstanceHandle` to feed into `InstanceRegistry::register`
     /// without actually spinning up a supervisor. The
-    /// control / state channels have no attached peer, so
-    /// `stop` / `wait_terminal` / `execute_command` on the
-    /// returned handle will error / hang — the test never
-    /// exercises those paths.
+    /// control channel has no attached receiver so
+    /// `stop` / `execute_command` on the returned handle
+    /// will fail — the test never exercises those paths.
+    ///
+    /// Round-10 F3: the watch is seeded with `Stopped` (a
+    /// terminal state) instead of `Loading`, so
+    /// [`Self::wait_terminal`]'s contract holds — a
+    /// caller who happens to await terminal on this
+    /// handle sees `Stopped` immediately rather than
+    /// getting back the non-terminal `Loading` value the
+    /// receiver would otherwise borrow after the sender's
+    /// drop wakes `changed()` with `Err`.
     #[cfg(test)]
     pub(crate) fn for_registry_test(instance_id: &str, plugin_id: &str) -> Self {
         let (control, _rx) = tokio::sync::mpsc::channel(1);
-        let (_tx, state) = tokio::sync::watch::channel(InstanceState::Loading);
+        let (_tx, state) = tokio::sync::watch::channel(InstanceState::Stopped);
         Self {
             instance_id: Arc::from(instance_id),
             plugin_id: Arc::from(plugin_id),
