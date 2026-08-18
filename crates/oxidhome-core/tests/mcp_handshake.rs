@@ -53,6 +53,56 @@ fn initialize_body() -> String {
     .to_string()
 }
 
+/// Round-1 regression (PR #119 F3): the deferred SSE + messages
+/// endpoints are NOT mounted. A pre-fix build merged
+/// `rust-mcp-axum::mcp_routes(...)` wholesale, which unmounted
+/// GET `/api/v1/mcp/sse` (persistent session, unauthenticated)
+/// and POST `/api/v1/mcp/messages` (broken URL — advertised
+/// path didn't match the nesting prefix). This test proves
+/// both surfaces respond as if they don't exist. 14.5 will
+/// re-add them under the same bearer + scope guard as the
+/// streamable route.
+#[tokio::test(flavor = "current_thread")]
+async fn deferred_sse_and_messages_endpoints_are_not_mounted() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+
+    let sse = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/mcp/sse")
+                .header(header::ACCEPT, "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        sse.status(),
+        StatusCode::OK,
+        "SSE endpoint must not be reachable in the streamable-only 14.1 mount",
+    );
+
+    let messages = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/mcp/messages?sessionId=whatever")
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        messages.status(),
+        StatusCode::ACCEPTED,
+        "SSE `/messages` endpoint must not be reachable in the streamable-only 14.1 mount",
+    );
+}
+
 /// SDK contract: streamable-HTTP POST that doesn't accept both
 /// JSON and SSE returns 406.
 #[tokio::test(flavor = "current_thread")]

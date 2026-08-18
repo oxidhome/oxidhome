@@ -112,6 +112,21 @@ allow = [
   "BSD-3-Clause",
   "Zlib",
   "Unicode-3.0",
+  # `ISC` is a permissive attribution-only license, functionally
+  # equivalent to a simplified `MIT` — OSI-approved, FSF-Free. Enters
+  # via the rustls / webpki TLS stack (`ring`, `rustls-webpki`,
+  # `untrusted`), which is unconditional in any modern Rust HTTP
+  # client library. Phase 14 (MCP) pulled it in through
+  # `rust-mcp-transport`'s `streamable-http` feature (which itself
+  # requires `reqwest` with `rustls-tls`); prior to that we had no
+  # crate on this license.
+  "ISC",
+  # `CDLA-Permissive-2.0` (Community Data License Agreement,
+  # Permissive 2.0) covers `webpki-roots` — the certificate-root
+  # store shipped with `rustls`. Permissive attribution-only, FSF
+  # considers it Free. Same entry path as `ISC` above (rustls TLS
+  # chain via `rust-mcp-transport`'s `streamable-http` in Phase 14).
+  "CDLA-Permissive-2.0",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the

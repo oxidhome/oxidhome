@@ -138,7 +138,6 @@ jsonschema.workspace = true
 # `server`+`macros` only — transport lives on our existing
 # axum stack, auth reuses our token store.
 rust-mcp-sdk.workspace = true
-rust-mcp-axum.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "net", "time", "signal"] }
