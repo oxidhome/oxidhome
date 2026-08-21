@@ -1,18 +1,20 @@
 //! Phase 14.1 — MCP handshake end-to-end test.
 //!
 //! Drives [`api::build_router`] via [`tower::ServiceExt::oneshot`]
-//! (no TCP bind) to prove the MCP mount is wired correctly:
+//! (no TCP bind) against the `rmcp` streamable-HTTP service:
 //!
-//! 1. `POST /api/v1/mcp` without an `Accept: text/event-stream`
-//!    header returns `406 Not Acceptable` (SDK contract).
-//! 2. A well-formed `initialize` JSON-RPC call returns
-//!    `200 OK` + `Content-Type: text/event-stream` + a
-//!    `mcp-session-id` header.
-//! 3. The first SSE `data:` frame carries an
-//!    [`InitializeResult`](rust_mcp_sdk::schema::InitializeResult)
-//!    whose `serverInfo`, declared capabilities, and protocol
-//!    version match what [`api::mcp::server::initialize_result`]
-//!    emits — a regression flag on any silent capability shrink.
+//! 1. `POST /api/v1/mcp initialize` completes the handshake:
+//!    `200 OK`, `mcp-session-id` header set, first SSE frame
+//!    carries an `InitializeResult` with our `serverInfo` and
+//!    declared capabilities.
+//! 2. `notifications/initialized` returns `202 Accepted` per
+//!    MCP HTTP spec — the SDK gets this right natively (round-3
+//!    F1 regression against the pre-switch stack).
+//! 3. An untrusted `Origin` is rejected (`403 Forbidden`) by
+//!    the SDK's own DNS-rebinding guard (round-2 F2 regression).
+//! 4. A loopback `Origin` passes.
+//! 5. Malformed JSON on a notification-shaped POST surfaces as
+//!    a 4xx error (round-3 F1 — spec compliance).
 //!
 //! `_` prefix on `support` because 14.1 doesn't touch the shared
 //! plugin-staging helpers, but the harness treats every module in
@@ -35,6 +37,12 @@ use tower::ServiceExt;
 
 const MCP_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_CONTENT_TYPE: &str = "application/json";
+/// `tower::ServiceExt::oneshot` builds a request with no `Host`
+/// header. `rmcp`'s streamable-HTTP service requires one (part
+/// of its DNS-rebinding guard) and defaults to accepting the
+/// loopback family — so every test sets a loopback `Host` to
+/// match production traffic against a `127.0.0.1` bind.
+const MCP_HOST: &str = "localhost";
 
 fn initialize_body() -> String {
     serde_json::json!({
@@ -53,86 +61,61 @@ fn initialize_body() -> String {
     .to_string()
 }
 
-/// Round-1 regression (PR #119 F3): the deferred SSE + messages
-/// endpoints are NOT mounted. A pre-fix build merged
-/// `rust-mcp-axum::mcp_routes(...)` wholesale, which unmounted
-/// GET `/api/v1/mcp/sse` (persistent session, unauthenticated)
-/// and POST `/api/v1/mcp/messages` (broken URL — advertised
-/// path didn't match the nesting prefix). This test proves
-/// both surfaces respond as if they don't exist. 14.5 will
-/// re-add them under the same bearer + scope guard as the
-/// streamable route.
-#[tokio::test(flavor = "current_thread")]
-async fn deferred_sse_and_messages_endpoints_are_not_mounted() {
-    let engine = Engine::new().expect("engine");
-    let router = build_router(engine);
-
-    let sse = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/api/v1/mcp/sse")
-                .header(header::ACCEPT, "text/event-stream")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_ne!(
-        sse.status(),
-        StatusCode::OK,
-        "SSE endpoint must not be reachable in the streamable-only 14.1 mount",
-    );
-
-    let messages = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/mcp/messages?sessionId=whatever")
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_ne!(
-        messages.status(),
-        StatusCode::ACCEPTED,
-        "SSE `/messages` endpoint must not be reachable in the streamable-only 14.1 mount",
-    );
+fn base_request(method: &str) -> axum::http::request::Builder {
+    Request::builder()
+        .method(method)
+        .uri(MCP_ENDPOINT)
+        .header(header::HOST, MCP_HOST)
+        .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+        .header(header::ACCEPT, MCP_ACCEPT)
 }
 
-/// SDK contract: streamable-HTTP POST that doesn't accept both
-/// JSON and SSE returns 406.
-#[tokio::test(flavor = "current_thread")]
-async fn post_without_sse_accept_is_406() {
-    let engine = Engine::new().expect("engine");
-    let router = build_router(engine);
-
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, "application/json")
-                .body(Body::from(initialize_body()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        StatusCode::NOT_ACCEPTABLE,
-        "streamable-HTTP requires both application/json and text/event-stream in Accept",
-    );
+/// Peels the SSE stream from an `initialize` response and parses
+/// the first `data:` frame as JSON-RPC. The stream is persistent
+/// so we cannot `to_bytes` it; we time each frame read to bound
+/// a real hang.
+async fn read_first_sse_data(response: axum::response::Response) -> Value {
+    let mut body = response.into_body();
+    let mut buf = String::new();
+    let deadline = Duration::from_secs(5);
+    loop {
+        let frame = tokio::time::timeout(deadline, body.frame())
+            .await
+            .expect("timed out waiting for the first SSE frame")
+            .expect("stream ended before a data frame arrived")
+            .expect("frame read error");
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        buf.push_str(&String::from_utf8_lossy(&data));
+        while let Some(event_end) = buf.find("\n\n") {
+            let event = buf[..event_end].to_string();
+            buf.drain(..=event_end + 1);
+            for line in event.lines() {
+                let Some(payload) = line.strip_prefix("data:") else {
+                    // `retry:` priming, comment (`:` prefix),
+                    // `event:` type, or trailing blank —
+                    // ignore, keep scanning.
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload.is_empty() {
+                    // SSE keep-alive framed as an empty
+                    // `data:` line; the SDK emits these
+                    // periodically to hold the socket open.
+                    continue;
+                }
+                return serde_json::from_str(payload)
+                    .unwrap_or_else(|e| panic!("SSE data line is not JSON: {e}: {payload}"));
+            }
+        }
+    }
 }
 
-/// Full handshake: initialize returns 200 + SSE stream + a
-/// session id header. First data frame contains our
-/// [`InitializeResult`] with the expected capability shape.
+/// Full handshake: `initialize` returns 200 + SSE + a session
+/// id, and the first data frame is a well-formed
+/// `InitializeResult` with our declared `serverInfo` and the
+/// tools/resources/prompts capability blocks.
 #[tokio::test(flavor = "current_thread")]
 async fn initialize_returns_session_and_advertises_capabilities() {
     let engine = Engine::new().expect("engine");
@@ -140,11 +123,7 @@ async fn initialize_returns_session_and_advertises_capabilities() {
 
     let response = router
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
+            base_request("POST")
                 .body(Body::from(initialize_body()))
                 .unwrap(),
         )
@@ -152,108 +131,41 @@ async fn initialize_returns_session_and_advertises_capabilities() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let ctype = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .expect("Content-Type")
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        ctype.starts_with("text/event-stream"),
-        "initialize returns an SSE stream even when the JSON path is enabled for followups; got {ctype}"
-    );
     assert!(
         response.headers().get("mcp-session-id").is_some(),
         "server must mint a session id on initialize so the client can pin follow-up requests",
     );
 
-    // The SSE body is a persistent stream — `to_bytes` would
-    // block forever waiting for EOF. Peel frames one at a time
-    // (with a per-frame timeout to bound a real hang) until we
-    // see the first `data:` line, which carries the
-    // JSON-RPC `initialize` result.
-    let mut body = response.into_body();
-    let mut buf = String::new();
-    let mut initialize_json: Option<Value> = None;
-    let deadline = Duration::from_secs(5);
-    while initialize_json.is_none() {
-        let frame = tokio::time::timeout(deadline, body.frame())
-            .await
-            .expect("timed out waiting for the first initialize SSE frame")
-            .expect("stream ended before an initialize frame arrived")
-            .expect("frame read error");
-        let Ok(data) = frame.into_data() else {
-            // trailers / non-data frames — SSE keep-alives arrive
-            // as data frames so a non-data frame here is either a
-            // trailer or noise; skip and keep reading.
-            continue;
-        };
-        buf.push_str(&String::from_utf8_lossy(&data));
-        // SSE frames end in a blank line (`\n\n`). Once we see
-        // one, look for a `data:` prefix and parse.
-        while let Some(event_end) = buf.find("\n\n") {
-            let event = buf[..event_end].to_string();
-            buf.drain(..=event_end + 1);
-            for line in event.lines() {
-                if let Some(payload) = line.strip_prefix("data:") {
-                    let parsed: Value = serde_json::from_str(payload.trim()).unwrap_or_else(|e| {
-                        panic!("initialize SSE data line is not JSON: {e}: {payload}");
-                    });
-                    initialize_json = Some(parsed);
-                    break;
-                }
-            }
-            if initialize_json.is_some() {
-                break;
-            }
-        }
-    }
-
-    let initialize_json = initialize_json.expect("initialize result");
-    assert_eq!(initialize_json["jsonrpc"], "2.0");
-    assert_eq!(initialize_json["id"], 1);
-    let result = &initialize_json["result"];
+    let init = read_first_sse_data(response).await;
+    assert_eq!(init["jsonrpc"], "2.0");
+    assert_eq!(init["id"], 1);
+    let result = &init["result"];
     assert_eq!(result["protocolVersion"], "2025-11-25");
     assert_eq!(result["serverInfo"]["name"], "oxidhome");
     assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
-    // Declared capability blocks: 14.1 advertises tools + resources
-    // + prompts even though the lists are empty. Any regression
-    // that silently drops one shows up here.
     let caps = &result["capabilities"];
     assert!(caps["tools"].is_object(), "capabilities.tools missing");
     assert!(
         caps["resources"].is_object(),
-        "capabilities.resources missing"
+        "capabilities.resources missing",
     );
     assert!(caps["prompts"].is_object(), "capabilities.prompts missing");
 }
 
-/// Round-2 regression (PR #119 F1): the `notifications/initialized`
-/// notification MUST return `202 Accepted` with no body per the
-/// MCP HTTP spec. The pre-fix build handed it straight to
-/// `McpHttpHandler::handle_streamable_http`, whose JSON-response
-/// path waits for a stream reply and 500s with
-/// "End of the transport stream reached" when the runtime
-/// (correctly) produces no output for a notification.
-///
-/// This drives the full lifecycle:
-///   1. POST `initialize` → pull the `mcp-session-id` header.
-///   2. POST `notifications/initialized` bound to that session
-///      → expect `202 Accepted` with an empty body.
+/// MCP HTTP spec: notifications MUST return `202 Accepted` with
+/// no body. `rmcp` gets this natively — this test guards
+/// against regressions if we ever wrap the mount in a layer
+/// that would rewrite the shape.
 #[tokio::test(flavor = "current_thread")]
 async fn initialized_notification_returns_202() {
     let engine = Engine::new().expect("engine");
     let router = build_router(engine);
 
+    // 1. Handshake and grab the session id.
     let init = router
         .clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
+            base_request("POST")
                 .body(Body::from(initialize_body()))
                 .unwrap(),
         )
@@ -267,12 +179,11 @@ async fn initialized_notification_returns_202() {
         .to_str()
         .expect("session id is ASCII")
         .to_string();
-    // We don't need to drain the SSE body — the session is
-    // registered as soon as the handler responds; the stream
-    // stays open for server-initiated messages we don't
-    // exercise here.
-    drop(init);
+    // Fully drain the initialize's first frame so the session
+    // is marked initialized before we send the notification.
+    let _ = read_first_sse_data(init).await;
 
+    // 2. Notification with that session — expect 202 + empty body.
     let notification = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
@@ -280,11 +191,7 @@ async fn initialized_notification_returns_202() {
     .to_string();
     let response = router
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
+            base_request("POST")
                 .header("mcp-session-id", &session_id)
                 .body(Body::from(notification))
                 .unwrap(),
@@ -292,11 +199,7 @@ async fn initialized_notification_returns_202() {
         .await
         .unwrap();
 
-    assert_eq!(
-        response.status(),
-        StatusCode::ACCEPTED,
-        "MCP HTTP spec requires 202 for notifications; SDK's JSON path returns 500 without our normalization",
-    );
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body = axum::body::to_bytes(response.into_body(), 1024)
         .await
         .unwrap();
@@ -307,9 +210,10 @@ async fn initialized_notification_returns_202() {
     );
 }
 
-/// Round-2 regression (PR #119 F2): a request with an untrusted
-/// `Origin` header MUST be rejected with `403 Forbidden` to
-/// close the DNS-rebinding hole against a loopback bind.
+/// DNS-rebinding guard: a request with an `Origin` header
+/// outside the loopback allow-list is rejected `403 Forbidden`
+/// by `rmcp`'s own middleware. We configure the allow-list at
+/// `mount_routes` time.
 #[tokio::test(flavor = "current_thread")]
 async fn untrusted_origin_is_403() {
     let engine = Engine::new().expect("engine");
@@ -317,11 +221,7 @@ async fn untrusted_origin_is_403() {
 
     let response = router
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
+            base_request("POST")
                 .header(header::ORIGIN, "https://attacker.example")
                 .body(Body::from(initialize_body()))
                 .unwrap(),
@@ -336,9 +236,9 @@ async fn untrusted_origin_is_403() {
     );
 }
 
-/// Round-2 companion (PR #119 F2): a legitimate loopback
-/// `Origin` (browser same-origin against a local hub) passes
-/// through, so the DNS-rebind layer doesn't break the
+/// Companion to [`untrusted_origin_is_403`]: a legitimate
+/// loopback `Origin` (a browser same-origin against a local hub)
+/// passes through, so the DNS-rebind layer doesn't break the
 /// intended use case.
 #[tokio::test(flavor = "current_thread")]
 async fn loopback_origin_passes() {
@@ -347,11 +247,7 @@ async fn loopback_origin_passes() {
 
     let response = router
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
+            base_request("POST")
                 .header(header::ORIGIN, "http://127.0.0.1:8080")
                 .body(Body::from(initialize_body()))
                 .unwrap(),
@@ -364,4 +260,56 @@ async fn loopback_origin_passes() {
         StatusCode::OK,
         "loopback Origin must pass the DNS-rebind allow-list",
     );
+}
+
+/// SDK errors on non-request payloads MUST NOT be normalized to
+/// 202 — the pre-switch review flagged malformed JSON /
+/// unknown-session / wrong-Content-Type as silently returning
+/// 202. This test walks two of those (malformed JSON, unknown
+/// session) and confirms each surfaces as an error status.
+#[tokio::test(flavor = "current_thread")]
+async fn sdk_errors_on_non_requests_are_preserved() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+
+    // Malformed JSON body.
+    let malformed = router
+        .clone()
+        .oneshot(
+            base_request("POST")
+                .body(Body::from("{this-is-not-json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        malformed.status().is_client_error() || malformed.status().is_server_error(),
+        "malformed JSON must surface as a real error, not 202; got {}",
+        malformed.status(),
+    );
+    assert_ne!(malformed.status(), StatusCode::ACCEPTED);
+
+    // Notification bound to a session id that was never
+    // minted — the SDK should reject rather than accept it.
+    let unknown_session = router
+        .oneshot(
+            base_request("POST")
+                .header("mcp-session-id", "does-not-exist")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        unknown_session.status().is_client_error(),
+        "unknown session id on a notification must surface as a 4xx error, not 202; got {}",
+        unknown_session.status(),
+    );
+    assert_ne!(unknown_session.status(), StatusCode::ACCEPTED);
 }

@@ -57,29 +57,25 @@ serde_json = { version = "1.0.150", default-features = false, features = ["std"]
 # `resolve-http` + `reqwest` + TLS chain — meta-validation runs
 # against the bundled draft-2020-12 meta-schema, no network.
 jsonschema = { version = "0.49.9", default-features = false }
-# Phase 14 (MCP): the smallest SDK feature set that gives us a
-# working streamable-HTTP protocol handler. We hand-roll the
-# three axum routes (POST/GET/DELETE on `/api/v1/mcp`) rather
-# than pulling `rust-mcp-axum` because that adapter unconditionally
-# pulls the `auth` feature on the SDK, which chains
-# `jsonwebtoken` + a TLS/OAuth reqwest client into the graph
-# (rustls / webpki-roots — ISC + CDLA-Permissive-2.0 licences
-# that violate the workspace's `deny.toml`) and forces the SSE
-# + messages routes to mount even in a streamable-only build
-# (PR #119 review, F2 + F3). Auth (bearer + scope) lands via
-# our own middleware in 14.4; `stdio` follows in 14.5. `sse`
-# and `auth` remain deliberately off.
-rust-mcp-sdk = { version = "1.0.1", default-features = false, features = [
+# Phase 14 (MCP): official Rust SDK (`rmcp`, from
+# `github.com/modelcontextprotocol/rust-sdk`). We deliberately
+# split the server-side transport feature
+# (`transport-streamable-http-server`) from the client-side one
+# so `reqwest` + the whole rustls / webpki-roots TLS chain stays
+# out of the graph — that chain would drag `ISC` +
+# `CDLA-Permissive-2.0` licences that `deny.toml` doesn't allow.
+# The service is a `tower::Service`, mounted as
+# `axum::Router::new().nest_service(...)` on our existing
+# listener. `SessionManager` is a public trait with a public
+# `close_session`, so eviction actually terminates active
+# streams (round-3 F3). Auth + stdio remain follow-ups (14.4,
+# 14.5) but land on top of the same service without further
+# feature-flag churn.
+rmcp = { version = "3.1.4", default-features = false, features = [
     "server",
+    "transport-streamable-http-server",
     "macros",
-    "streamable-http",
 ] }
-# The MCP SDK's `ServerHandler` trait uses `#[async_trait]` on
-# every method — implementing it on our host handler needs the
-# same macro attached to the impl block. The SDK pulls this in
-# already; we pin the same version to keep the graph
-# single-copy.
-async-trait = "0.1.89"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "sync", "fs"] }
 toml = { version = "1.1.2", default-features = false, features = ["display", "parse", "serde", "std"] }

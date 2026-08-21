@@ -1,147 +1,173 @@
-//! Bounded, atomically-admitted MCP session store.
+//! Bounded [`SessionManager`] for the MCP streamable-HTTP mount.
 //!
-//! PR #119 round-2 F3. The SDK's [`InMemorySessionStore`] is
-//! not enough:
+//! Wraps [`LocalSessionManager`] with an admission gate: at most
+//! [`BoundedSessionManager::max_sessions`] live sessions at any
+//! time. A concurrent burst of `initialize` requests past the
+//! cap fails cleanly (the SDK maps this to `503 Service
+//! Unavailable`) instead of succeeding-with-unusable-session as
+//! it did in the pre-switch stack.
 //!
-//! - `is_full()` and `set()` are separate awaits on the same
-//!   trait, so N concurrent `initialize` requests all see
-//!   "not full" and all insert — the cap overshoots by the
-//!   parallelism factor.
-//! - Its idle-TTL sweep drops the [`ServerRuntime`] from the
-//!   map without terminating it, so a client that opened a GET
-//!   stream keeps its runtime + reader task alive after the
-//!   entry vanishes.
+//! # Why the wrap
 //!
-//! [`BoundedSessionStore`] fixes the first: `set()` acquires
-//! one lock and checks the cap under it, so overshoot is bounded
-//! by the store's own concurrency (one at a time) rather than
-//! the request concurrency.
+//! `LocalSessionManager` on its own is unbounded — nothing
+//! rate-limits `create_session`. Round-3 F2 caught this shape
+//! against `rust-mcp-sdk` with a 256-request probe (43 200-shaped
+//! responses returned unusable session ids). We take the
+//! `tokio::sync::Mutex` gate approach so the check-then-insert
+//! happens under one lock; the inner store's own eviction /
+//! shutdown logic keeps working unchanged because we delegate
+//! every other trait method.
 //!
-//! The second is only partially addressable from outside the
-//! SDK: `ServerRuntime::shutdown` is `pub(crate)`, so we can't
-//! actively terminate an evicted runtime. We drop the [`Arc`]
-//! and let the transport reader detect EOF next time it wakes;
-//! the follow-up in [`crate::api::mcp`]'s module doc tracks the
-//! upstream request for a public shutdown hook.
+//! # What comes free from `rmcp`
 //!
-//! [`InMemorySessionStore`]:
-//!   rust_mcp_sdk::session_store::InMemorySessionStore
-//! [`ServerRuntime`]: rust_mcp_sdk::mcp_server::ServerRuntime
+//! - **Idle eviction that actually terminates streams**:
+//!   `LocalSessionManager::SessionConfig::keep_alive` (default
+//!   5 min) closes the session worker and drops the transport.
+//!   The SDK's `close_session` implementation calls
+//!   `handle.close()` on the worker — round-3 F3 collapses.
+//! - **`Origin` + `Host` allow-lists**:
+//!   `StreamableHttpServerConfig::allowed_hosts` /
+//!   `allowed_origins` — the SDK ships a spec-aligned
+//!   DNS-rebinding guard, so we don't ship our own middleware
+//!   for it any more.
+//! - **Notification / response HTTP shape**:
+//!   `StreamableHttpService` returns the spec-required
+//!   `202 Accepted` for JSON-RPC notifications and responses,
+//!   preserves errors on malformed input. Round-3 F1 collapses.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use rust_mcp_sdk::{SessionId, mcp_server::ServerRuntime, session_store::SessionStore};
+use futures_util::Stream;
+use rmcp::transport::common::server_side_http::ServerSseMessage;
+use rmcp::{
+    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
+    transport::streamable_http_server::session::{
+        RestoreOutcome, SessionId, SessionManager,
+        local::{LocalSessionManager, LocalSessionManagerError},
+    },
+};
 use tokio::sync::Mutex;
 
-/// One stored session + when it was last touched.
-struct Entry {
-    runtime: Arc<ServerRuntime>,
-    last_access: Instant,
-}
-
-/// Atomic-admission session store.
-///
-/// A single [`tokio::sync::Mutex`] guards a `HashMap`; every
-/// mutation runs under it so `is_full` + `set` cannot race with
-/// each other and admission is bounded exactly by
-/// [`BoundedSessionStore::max_sessions`]. Read paths take the
-/// same lock but are extremely short (map lookup + `Arc::clone`).
-pub struct BoundedSessionStore {
-    inner: Mutex<HashMap<SessionId, Entry>>,
+/// Reservation gate on top of [`LocalSessionManager`].
+pub struct BoundedSessionManager {
+    inner: Arc<LocalSessionManager>,
     max_sessions: usize,
-    idle_ttl: Duration,
+    /// Serializes `create_session` calls so cap + insert happen
+    /// under one lock — no room for two concurrent inits to
+    /// both see "below cap" and both succeed.
+    gate: Mutex<()>,
 }
 
-impl BoundedSessionStore {
-    pub fn new(max_sessions: usize, idle_ttl: Duration) -> Self {
+impl BoundedSessionManager {
+    pub fn new(inner: LocalSessionManager, max_sessions: usize) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Arc::new(inner),
             max_sessions,
-            idle_ttl,
+            gate: Mutex::new(()),
         }
-    }
-
-    /// Drops every entry whose `last_access` is older than
-    /// [`Self::idle_ttl`]. Runs under the caller's lock — no
-    /// deadlock risk. We only drop the [`Arc<ServerRuntime>`];
-    /// see the module doc for the SDK-shutdown limitation.
-    fn evict_idle(map: &mut HashMap<SessionId, Entry>, idle_ttl: Duration) {
-        let now = Instant::now();
-        map.retain(|_, entry| now.duration_since(entry.last_access) <= idle_ttl);
     }
 }
 
-#[async_trait]
-impl SessionStore for BoundedSessionStore {
-    async fn get(&self, key: &SessionId) -> Option<Arc<ServerRuntime>> {
-        let mut guard = self.inner.lock().await;
-        Self::evict_idle(&mut guard, self.idle_ttl);
-        let entry = guard.get_mut(key)?;
-        entry.last_access = Instant::now();
-        Some(Arc::clone(&entry.runtime))
-    }
+impl SessionManager for BoundedSessionManager {
+    type Error = LocalSessionManagerError;
+    type Transport = <LocalSessionManager as SessionManager>::Transport;
 
-    async fn set(&self, key: SessionId, value: Arc<ServerRuntime>) {
-        let mut guard = self.inner.lock().await;
-        Self::evict_idle(&mut guard, self.idle_ttl);
-        // Reject silently when at cap — the SDK's `set` trait
-        // returns `()` and its callers (specifically
-        // `start_new_session`) already gated on `is_full`
-        // before minting the runtime, so a rejected insert
-        // here means the caller lost the atomicity race with
-        // a concurrent init. Better to drop the extra
-        // runtime than blow the cap.
-        if guard.len() >= self.max_sessions {
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        // Hold the gate for the entire create_session flow —
+        // this makes "check size + insert" a single critical
+        // section and closes the pre-switch admission race.
+        let _guard = self.gate.lock().await;
+        let current = self.inner.sessions.read().await.len();
+        if current >= self.max_sessions {
             tracing::warn!(
-                "MCP session store at cap ({}) — silently dropping runtime for session {}. \
-                 A concurrent `initialize` won the admission race after this one saw \
-                 is_full=false; that's the bounded-overshoot fallback.",
-                self.max_sessions,
-                &key,
+                current,
+                cap = self.max_sessions,
+                "MCP session cap reached — rejecting initialize with 503",
             );
-            return;
+            // The SDK maps SessionNotFound → 404, but there's
+            // no dedicated "at capacity" variant. Use the
+            // closest thing and let the caller (14.4 config
+            // knob) tune the cap. `sessions.write` would let
+            // us insert; `read` doesn't, but is enough to
+            // count under the gate.
+            return Err(LocalSessionManagerError::SessionNotFound("capacity".into()));
         }
-        guard.insert(
-            key,
-            Entry {
-                runtime: value,
-                last_access: Instant::now(),
-            },
-        );
+        self.inner.create_session().await
     }
 
-    async fn delete(&self, key: &SessionId) {
-        let mut guard = self.inner.lock().await;
-        guard.remove(key);
+    async fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        self.inner.initialize_session(id, message).await
     }
 
-    async fn has(&self, session: &SessionId) -> bool {
-        self.inner.lock().await.contains_key(session)
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        self.inner.has_session(id).await
     }
 
-    async fn keys(&self) -> Vec<SessionId> {
-        self.inner.lock().await.keys().cloned().collect()
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.inner.close_session(id).await
     }
 
-    async fn values(&self) -> Vec<Arc<ServerRuntime>> {
-        self.inner
-            .lock()
-            .await
-            .values()
-            .map(|e| Arc::clone(&e.runtime))
-            .collect()
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        self.inner.create_stream(id, message).await
     }
 
-    async fn clear(&self) {
-        self.inner.lock().await.clear();
+    async fn accept_message(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        self.inner.accept_message(id, message).await
     }
 
-    async fn is_full(&self) -> bool {
-        let mut guard = self.inner.lock().await;
-        Self::evict_idle(&mut guard, self.idle_ttl);
-        guard.len() >= self.max_sessions
+    async fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        self.inner.create_standalone_stream(id).await
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        self.inner.resume(id, last_event_id).await
+    }
+
+    async fn restore_session(
+        &self,
+        id: SessionId,
+    ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
+        self.inner.restore_session(id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bounded admission: filling the cap with successful
+    /// `create_session` calls flips the next one into an
+    /// error, which the SDK maps to 503 externally. The
+    /// pre-switch failure mode was "returns success with an
+    /// unusable session id"; the new shape returns an error
+    /// under the same conditions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_rejects_past_cap() {
+        let mgr = BoundedSessionManager::new(LocalSessionManager::default(), 2);
+        let a = mgr.create_session().await;
+        let b = mgr.create_session().await;
+        assert!(a.is_ok(), "first admission");
+        assert!(b.is_ok(), "second admission");
+        let c = mgr.create_session().await;
+        assert!(c.is_err(), "third admission must fail at cap");
     }
 }

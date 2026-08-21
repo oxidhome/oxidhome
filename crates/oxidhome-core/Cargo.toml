@@ -137,8 +137,7 @@ jsonschema.workspace = true
 # Phase 14: MCP server (built-in surface for LLM agents).
 # `server`+`macros` only — transport lives on our existing
 # axum stack, auth reuses our token store.
-rust-mcp-sdk.workspace = true
-async-trait.workspace = true
+rmcp.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "fs", "net", "time", "signal"] }
 toml.workspace = true

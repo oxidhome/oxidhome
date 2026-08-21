@@ -1,25 +1,27 @@
 //! Phase 14 — Model Context Protocol server.
 //!
-//! Built-in surface for LLM agents: mounts the [MCP] protocol on the
-//! same axum listener that carries the REST + Connect APIs so a
-//! client can talk to the hub over a single well-known URL. See
+//! Built-in surface for LLM agents. Mounts the official
+//! [`rmcp`] SDK's streamable-HTTP transport on the same axum
+//! listener that carries REST + Connect, so a client can talk
+//! to the hub over one well-known URL. See
 //! [`.claude/docs/10_mcp.md`](../../../../../.claude/docs/10_mcp.md)
 //! for the phase plan and design rationale.
 //!
 //! # Layout
 //!
-//! - [`server`] — construction of the MCP `Router` mount and the
-//!   [`rust_mcp_sdk`] `InitializeResult` (server info + declared
-//!   capabilities).
-//! - [`handler`] — the [`rust_mcp_sdk::mcp_server::ServerHandler`]
-//!   impl that answers `initialize`, `tools/list`, `resources/list`,
-//!   and `prompts/list`. This 14.1 slice returns empty lists;
-//!   14.2/14.3/14.6 fill them in.
+//! - [`server`] — [`rmcp::transport::streamable_http_server::StreamableHttpService`]
+//!   construction + axum mount.
+//! - [`handler`] — the [`rmcp::ServerHandler`] impl that
+//!   answers `initialize` and (via the trait defaults) returns
+//!   empty tools / resources / prompts lists.
+//! - [`session_store`] — [`BoundedSessionManager`], a
+//!   `LocalSessionManager` wrapper with an admission cap that
+//!   closes the concurrent-init overshoot the reviewer flagged
+//!   in R3 F2 (against the previous SDK).
 //!
-//! [MCP]: https://modelcontextprotocol.io/
+//! [`BoundedSessionManager`]: session_store::BoundedSessionManager
 
 mod handler;
-mod origin;
 mod server;
 mod session_store;
 

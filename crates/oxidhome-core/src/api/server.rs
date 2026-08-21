@@ -172,13 +172,12 @@ pub fn build_router(engine: Engine) -> Router {
         );
 
     // Phase 14.1 — mount the MCP streamable-HTTP endpoint on the
-    // same listener as REST/Connect. The MCP router owns its
-    // own state (session store + handler); PR #119 review pruned
-    // the `rust-mcp-axum` adapter, so no MCP-side fallback
-    // exists and a plain `.merge` is enough. Auth (14.4) will
-    // wrap this router in our bearer layer once the
-    // token-scope policy shape is stable.
-    let mcp = super::mcp::mount_routes(engine.clone());
+    // same listener as REST/Connect. `rmcp`'s
+    // `StreamableHttpService` is a `tower::Service` nested at
+    // [`super::mcp::MCP_ENDPOINT`]; auth (14.4) will wrap the
+    // nested router in our bearer layer once the token-scope
+    // policy shape is stable.
+    let mcp = super::mcp::mount_routes(&engine);
 
     public
         .merge(authenticated)
