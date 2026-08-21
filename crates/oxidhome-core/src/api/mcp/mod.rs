@@ -19,6 +19,8 @@
 //! [MCP]: https://modelcontextprotocol.io/
 
 mod handler;
+mod origin;
 mod server;
+mod session_store;
 
 pub use server::{MCP_ENDPOINT, mount_routes};

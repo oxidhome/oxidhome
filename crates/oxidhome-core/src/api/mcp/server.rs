@@ -29,6 +29,21 @@
 //! (no `sse`, no `auth`), matches the SDK's own
 //! `hello-world-server-streamable-http-core.rs` walkthrough, and
 //! keeps the SSE + `/messages` mounts on the shelf for 14.5.
+//!
+//! # MCP spec compliance layers
+//!
+//! Round-2 review of PR #119 surfaced three transport-spec gaps
+//! that the SDK does not close for a BYO-server mount:
+//!
+//! - [F1](super::server::streamable_http_post) — notifications
+//!   and responses (JSON-RPC messages with no request id) must
+//!   return `202 Accepted` with no body. The SDK's JSON-response
+//!   path returns `500` because it waits for a stream reply that
+//!   never comes; we peek at the body and normalize.
+//! - [F2](super::origin) — `Origin` allow-list against DNS
+//!   rebinding.
+//! - [F3](super::session_store) — atomic-admission session
+//!   store to bound overshoot.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +53,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, Method, StatusCode, Uri},
+    middleware::from_fn,
     response::IntoResponse,
     routing::{delete, get, post},
 };
@@ -49,12 +65,13 @@ use rust_mcp_sdk::{
         Implementation, InitializeResult, ProtocolVersion, ServerCapabilities,
         ServerCapabilitiesPrompts, ServerCapabilitiesResources, ServerCapabilitiesTools,
     },
-    session_store::InMemorySessionStore,
 };
 
 use crate::Engine;
 
 use super::handler::OxidHomeMcpHandler;
+use super::origin::require_local_origin;
+use super::session_store::BoundedSessionStore;
 
 /// Public URL prefix the MCP surface is nested under. Callers
 /// POST/GET/DELETE this exact path for the streamable-HTTP
@@ -66,20 +83,17 @@ pub const MCP_ENDPOINT: &str = "/api/v1/mcp";
 /// Maximum concurrent MCP sessions retained in memory. Well
 /// below the SDK's 10 000 default because on a small home hub
 /// with one operator, more than a handful of live agent
-/// sessions is a bug (or an abuser); the reduced cap keeps the
-/// tail of Finding 1's admission race short — an attacker who
-/// wins the check-to-register window on the SDK's admission
-/// path can only over-shoot by a few sessions before the next
-/// insert trips the cap. Bumps land as a config knob when 14.4
+/// sessions is a bug (or an abuser); the reduced cap plus
+/// [`BoundedSessionStore`]'s single-lock admission bounds
+/// overshoot to zero. Bumps land as a config knob when 14.4
 /// wires per-token limits.
 const MAX_SESSIONS: usize = 128;
 
 /// Sessions the client has abandoned (browser tab closed, agent
 /// process killed) are evicted after this idle window. Without
 /// it the store fills forever because clients rarely send the
-/// spec-optional DELETE (PR #119 review, F1). 30 min matches
-/// the typical agent-idle window observed on Claude Desktop
-/// and Cursor.
+/// spec-optional DELETE. 30 min matches the typical agent-idle
+/// window observed on Claude Desktop and Cursor.
 const SESSION_IDLE_TTL: Duration = Duration::from_mins(30);
 
 /// Server-side "who we are" + declared capabilities. Kept in a
@@ -133,20 +147,20 @@ pub(super) fn initialize_result() -> InitializeResult {
 ///   path. SSE + stdio adapters land in 14.5, deliberately
 ///   held back so an unauthenticated GET `/api/v1/mcp/sse`
 ///   can't open a persistent session.
-/// - No auth guard — 14.4 wraps the mount in our bearer layer
-///   so the same token store gates MCP + REST.
-/// - Session store is [`InMemorySessionStore`] with a modest
-///   cap ([`MAX_SESSIONS`]) and a 30-minute idle TTL
+/// - No bearer guard — 14.4 wraps the mount in our token layer
+///   so the same token store gates MCP + REST. The
+///   [`require_local_origin`] middleware is on today so DNS
+///   rebinding can't ride the browser's ambient auth against a
+///   loopback bind.
+/// - Session store is [`BoundedSessionStore`] with a modest cap
+///   ([`MAX_SESSIONS`]) and a 30-minute idle TTL
 ///   ([`SESSION_IDLE_TTL`]) so abandoned clients release
 ///   resources without an explicit DELETE. Redis / `SQLite`
 ///   backing is a 14.7 polish item.
 pub fn mount_routes(engine: Engine) -> Router {
     let handler = OxidHomeMcpHandler::new(engine).to_mcp_server_handler();
     let state = Arc::new(McpAppState {
-        session_store: Arc::new(InMemorySessionStore::with_limits(
-            Some(MAX_SESSIONS),
-            Some(SESSION_IDLE_TTL),
-        )),
+        session_store: Arc::new(BoundedSessionStore::new(MAX_SESSIONS, SESSION_IDLE_TTL)),
         id_generator: Arc::new(UuidGenerator),
         stream_id_gen: Arc::new(FastIdGenerator::new(Some("s_"))),
         server_details: Arc::new(initialize_result()),
@@ -157,10 +171,11 @@ pub fn mount_routes(engine: Engine) -> Router {
         // request/response calls.
         ping_interval: Duration::from_secs(12),
         transport_options: Arc::default(),
-        // JSON responses on the streamable-HTTP path — matches
-        // what the CLI walkthrough (`curl -X POST /api/v1/mcp`)
-        // and the integration test drive. SSE upgrade lands in
-        // 14.5 together with stdio.
+        // JSON responses on the streamable-HTTP path for real
+        // requests. Notifications and responses are peeled off
+        // in `streamable_http_post` before they reach the SDK
+        // (the SDK's JSON path hangs / 500s on them — see the
+        // module doc F1 note).
         enable_json_response: true,
         event_store: None,
         task_store: None,
@@ -179,6 +194,7 @@ pub fn mount_routes(engine: Engine) -> Router {
         .route(MCP_ENDPOINT, delete(streamable_http_delete))
         .with_state(state)
         .layer(Extension(http_handler))
+        .layer(from_fn(require_local_origin))
 }
 
 /// GET forwards the resumable stream request. Axum doesn't
@@ -196,9 +212,19 @@ async fn streamable_http_get(
 }
 
 /// POST carries a JSON-RPC payload. UTF-8 validation up front
-/// so a bogus body fails cheap instead of paying the SDK's
-/// parse cost. See the module doc for why we don't route this
-/// through `rust-mcp-axum`.
+/// so a bogus body fails cheap; we then classify the payload
+/// per MCP HTTP spec (2025-11-25):
+///
+/// - **Request** (has `method` + `id`): forward to the SDK,
+///   return its response as-is (200 JSON or 200 SSE).
+/// - **Notification / response** (no request id): forward to
+///   the SDK so the runtime dispatches `on_initialized` and
+///   friends, but drop the SDK's response body and answer
+///   `202 Accepted` — the SDK's JSON path returns `500 "End of
+///   the transport stream reached"` on notifications because it
+///   waits for a stream reply that never comes.
+///
+/// See the module doc F1 note.
 async fn streamable_http_post(
     State(state): State<Arc<McpAppState>>,
     Extension(http_handler): Extension<Arc<McpHttpHandler>>,
@@ -209,7 +235,16 @@ async fn streamable_http_post(
     let Ok(body) = std::str::from_utf8(&payload) else {
         return (StatusCode::BAD_REQUEST, "Request body must be valid UTF-8").into_response();
     };
-    forward(&http_handler, state, Method::POST, uri, headers, Some(body)).await
+    let is_request = payload_contains_request(body);
+    let response = forward(&http_handler, state, Method::POST, uri, headers, Some(body)).await;
+    if is_request {
+        response
+    } else {
+        // MCP HTTP spec: notifications and responses always
+        // 202, no body. We already awaited the SDK call so
+        // the runtime has processed the message.
+        (StatusCode::ACCEPTED, ()).into_response()
+    }
 }
 
 /// DELETE tears down a session the client no longer needs. The
@@ -249,5 +284,99 @@ async fn forward(
             tracing::warn!(error = %err, "MCP handler error");
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
+    }
+}
+
+/// JSON-RPC classification: `true` when the payload is a
+/// request (or a batch containing at least one request) — i.e.
+/// something the server MUST answer with a real response. `false`
+/// for notifications, responses, and unparseable JSON (the SDK
+/// will reject those with its own 400 which we forward via the
+/// 202 path — non-requests never get a real body).
+///
+/// A JSON-RPC 2.0 **request** carries both a `method` string and
+/// a non-null `id`. A **notification** carries `method` with no
+/// `id`. A **response** carries `result` or `error` and its
+/// `id`, but no `method`. Batches (arrays) count as requests if
+/// any entry is a request.
+fn payload_contains_request(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    match value {
+        serde_json::Value::Object(map) => object_is_request(&map),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| item.as_object().is_some_and(object_is_request)),
+        _ => false,
+    }
+}
+
+fn object_is_request(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_method = map.contains_key("method");
+    let has_id = map.get("id").is_some_and(|v| !v.is_null());
+    has_method && has_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::payload_contains_request;
+    use serde_json::json;
+
+    #[test]
+    fn requests_are_classified() {
+        assert!(payload_contains_request(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string()
+        ));
+        assert!(payload_contains_request(
+            &json!({"jsonrpc":"2.0","id":"abc","method":"initialize","params":{}}).to_string()
+        ));
+    }
+
+    #[test]
+    fn notifications_are_not_requests() {
+        // No id at all → notification.
+        assert!(!payload_contains_request(
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string()
+        ));
+        // Explicit null id (some clients send this) →
+        // still a notification per JSON-RPC 2.0.
+        assert!(!payload_contains_request(
+            &json!({"jsonrpc":"2.0","id":null,"method":"notifications/cancelled"}).to_string()
+        ));
+    }
+
+    #[test]
+    fn responses_are_not_requests() {
+        // Client's answer to a server-initiated call — no
+        // `method`, has `result` + `id`. MCP spec: server MUST
+        // return 202 for these.
+        assert!(!payload_contains_request(
+            &json!({"jsonrpc":"2.0","id":42,"result":{}}).to_string()
+        ));
+    }
+
+    #[test]
+    fn garbage_is_not_a_request() {
+        assert!(!payload_contains_request("not json"));
+        assert!(!payload_contains_request("null"));
+        assert!(!payload_contains_request("42"));
+    }
+
+    #[test]
+    fn batch_with_any_request_counts_as_request() {
+        // Mixed batch: one notification + one request → the
+        // batch as a whole demands a response body.
+        let batch = json!([
+            {"jsonrpc":"2.0","method":"notifications/initialized"},
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"}
+        ]);
+        assert!(payload_contains_request(&batch.to_string()));
+        // All-notifications batch → no response demanded.
+        let batch = json!([
+            {"jsonrpc":"2.0","method":"notifications/initialized"},
+            {"jsonrpc":"2.0","method":"notifications/roots/list_changed"}
+        ]);
+        assert!(!payload_contains_request(&batch.to_string()));
     }
 }

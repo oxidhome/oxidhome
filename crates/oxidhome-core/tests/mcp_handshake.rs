@@ -228,3 +228,140 @@ async fn initialize_returns_session_and_advertises_capabilities() {
     );
     assert!(caps["prompts"].is_object(), "capabilities.prompts missing");
 }
+
+/// Round-2 regression (PR #119 F1): the `notifications/initialized`
+/// notification MUST return `202 Accepted` with no body per the
+/// MCP HTTP spec. The pre-fix build handed it straight to
+/// `McpHttpHandler::handle_streamable_http`, whose JSON-response
+/// path waits for a stream reply and 500s with
+/// "End of the transport stream reached" when the runtime
+/// (correctly) produces no output for a notification.
+///
+/// This drives the full lifecycle:
+///   1. POST `initialize` → pull the `mcp-session-id` header.
+///   2. POST `notifications/initialized` bound to that session
+///      → expect `202 Accepted` with an empty body.
+#[tokio::test(flavor = "current_thread")]
+async fn initialized_notification_returns_202() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+
+    let init = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(init.status(), StatusCode::OK);
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .expect("session id on initialize")
+        .to_str()
+        .expect("session id is ASCII")
+        .to_string();
+    // We don't need to drain the SSE body — the session is
+    // registered as soon as the handler responds; the stream
+    // stays open for server-initiated messages we don't
+    // exercise here.
+    drop(init);
+
+    let notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    })
+    .to_string();
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .header("mcp-session-id", &session_id)
+                .body(Body::from(notification))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "MCP HTTP spec requires 202 for notifications; SDK's JSON path returns 500 without our normalization",
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert!(
+        body.is_empty(),
+        "notification response must have no body; got {:?}",
+        String::from_utf8_lossy(&body),
+    );
+}
+
+/// Round-2 regression (PR #119 F2): a request with an untrusted
+/// `Origin` header MUST be rejected with `403 Forbidden` to
+/// close the DNS-rebinding hole against a loopback bind.
+#[tokio::test(flavor = "current_thread")]
+async fn untrusted_origin_is_403() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .header(header::ORIGIN, "https://attacker.example")
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "MCP transport spec: reject requests with untrusted Origin",
+    );
+}
+
+/// Round-2 companion (PR #119 F2): a legitimate loopback
+/// `Origin` (browser same-origin against a local hub) passes
+/// through, so the DNS-rebind layer doesn't break the
+/// intended use case.
+#[tokio::test(flavor = "current_thread")]
+async fn loopback_origin_passes() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .header(header::ORIGIN, "http://127.0.0.1:8080")
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "loopback Origin must pass the DNS-rebind allow-list",
+    );
+}
