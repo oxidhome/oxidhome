@@ -463,35 +463,61 @@ async fn slow_body_returns_408_without_holding_a_slot() {
     );
 }
 
-/// Round-6 F1: unauthenticated clients can otherwise open
-/// arbitrary concurrent POSTs and force the middleware to
-/// allocate a full 4 MiB body buffer each. The pending-body
-/// semaphore caps concurrent buffering so worst-case memory is
-/// bounded to `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES`.
-/// This test wires a mount at `pending_body_gate = 1`, ties up
-/// that permit with a never-finishing body, and asserts the
-/// next POST 503s at the pending gate — proving the cap is
-/// real and enforced before buffering.
+/// Body that emits `Poll::Pending` forever AND fires a
+/// [`tokio::sync::Notify`] on its first poll. Used by
+/// [`pending_body_gate_bounds_concurrent_buffering`] as a
+/// deterministic barrier: once the middleware's
+/// `axum::body::to_bytes` polls this body for the first
+/// frame, we know it has already acquired the pending
+/// permit — no scheduler guessing.
+struct SignalingPendingBody {
+    notify: std::sync::Arc<tokio::sync::Notify>,
+    polled: bool,
+}
+
+impl futures_util::Stream for SignalingPendingBody {
+    type Item = Result<axum::body::Bytes, std::io::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if !self.polled {
+            self.polled = true;
+            self.notify.notify_one();
+        }
+        std::task::Poll::Pending
+    }
+}
+
+/// Round-6 F1 / round-7 F2: caps concurrent buffering so
+/// worst-case memory is bounded to
+/// `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES`. The test
+/// wires a mount at `pending_body_gate = 1`, ties up that
+/// permit with a [`SignalingPendingBody`], and only then
+/// fires the overflow request — no `yield_now` scheduler
+/// assumptions (round-7 F2 rewrite: `yield_now` gave no
+/// guarantee that the spawned task had grabbed the permit).
 #[tokio::test(flavor = "current_thread")]
 async fn pending_body_gate_bounds_concurrent_buffering() {
+    use std::sync::Arc;
+
     use oxidhome_core::api::mcp::mount_routes_with_all_limits;
+    use tokio::sync::Notify;
 
     let engine = Engine::new().expect("engine");
-    // Deadline long enough for the second POST to slip in
-    // while the first is still holding the permit; pending
-    // gate = 1 so the second is forced to compete for it.
+    // Deadline long enough for the overflow POST to slip in
+    // while the holder is still parked on its body; pending
+    // gate = 1 so the overflow is forced to compete for it.
     let router =
         mount_routes_with_all_limits(&engine, MAX_SESSIONS_FOR_TESTS, Duration::from_secs(5), 1);
 
-    let never_ending_body = || {
-        Body::from_stream(futures_util::stream::pending::<
-            Result<axum::body::Bytes, std::io::Error>,
-        >())
-    };
+    let notify = Arc::new(Notify::new());
+    let notify_for_body = notify.clone();
 
-    // Fire the pending-permit-holding request but DON'T await
-    // it — its body never finishes, so the middleware sits in
-    // the buffering step holding the permit.
+    // Fire the pending-permit-holding request but DON'T
+    // await it — its body never emits a frame, so the
+    // middleware sits inside `to_bytes` holding the permit
+    // until the deadline fires or the task is aborted.
     let hold = tokio::spawn({
         let router = router.clone();
         async move {
@@ -503,7 +529,10 @@ async fn pending_body_gate_bounds_concurrent_buffering() {
                         .header(header::HOST, MCP_HOST)
                         .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
                         .header(header::ACCEPT, MCP_ACCEPT)
-                        .body(never_ending_body())
+                        .body(Body::from_stream(SignalingPendingBody {
+                            notify: notify_for_body,
+                            polled: false,
+                        }))
                         .unwrap(),
                 )
                 .await
@@ -511,17 +540,14 @@ async fn pending_body_gate_bounds_concurrent_buffering() {
         }
     });
 
-    // Yield so the holder actually enters the middleware and
-    // grabs the permit before we probe.
-    tokio::task::yield_now().await;
-    // The holder is inside `to_bytes(pending)` awaiting its
-    // first frame; two more yields make sure the permit is
-    // acquired on any scheduler.
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
+    // Deterministic barrier: the body's first poll fires
+    // the notifier, and the middleware has by then acquired
+    // the semaphore permit. Any pending permit read from
+    // this point is guaranteed to see cap = 0.
+    notify.notified().await;
 
-    // Second POST — same mount, real body. Pending gate is at
-    // cap = 1, so this MUST reject before allocating anything.
+    // Overflow POST — same mount, real body. Pending gate
+    // is exhausted, so this MUST reject at the gate.
     let overflow = router
         .clone()
         .oneshot(
@@ -542,8 +568,8 @@ async fn pending_body_gate_bounds_concurrent_buffering() {
         "pending-body gate at cap must reply 503 without allocating a buffer",
     );
 
-    // Let the first request time out so the test doesn't
-    // leak the join handle.
+    // Cancel the holder so the test doesn't leak the join
+    // handle waiting for its body deadline.
     hold.abort();
 }
 
@@ -553,19 +579,19 @@ async fn pending_body_gate_bounds_concurrent_buffering() {
 /// slips in.
 const MAX_SESSIONS_FOR_TESTS: usize = 16;
 
-/// Round-6 F2: bodies larger than [`MAX_REQUEST_BODY_BYTES`]
-/// MUST return `413 Payload Too Large` — not `400`, which
-/// misclassifies the failure as malformed input. The pre-fix
-/// middleware lumped `LengthLimitError` into the generic
-/// bad-request path.
+/// Round-6 F2: bodies larger than
+/// [`api::mcp::MAX_REQUEST_BODY_BYTES`] MUST return `413
+/// Payload Too Large` — not `400`, which misclassifies the
+/// failure as malformed input. Pulls the constant from the
+/// module so this test tracks a config change (round-7 F1
+/// tightened it from 4 MiB to 1 MiB).
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_body_returns_413() {
     let engine = Engine::new().expect("engine");
     let router = build_router(engine);
 
-    // 4 MiB + 1 byte — the smallest payload that exceeds the
-    // production cap.
-    let oversized = vec![b'x'; (4 * 1024 * 1024) + 1];
+    // Smallest payload that exceeds the middleware cap.
+    let oversized = vec![b'x'; oxidhome_core::api::mcp::MAX_REQUEST_BODY_BYTES + 1];
     let response = router
         .oneshot(base_request("POST").body(Body::from(oversized)).unwrap())
         .await

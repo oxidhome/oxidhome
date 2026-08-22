@@ -78,16 +78,17 @@ pub const MCP_ENDPOINT: &str = "/api/v1/mcp";
 /// which point this becomes a config knob.
 pub(super) const MAX_SESSIONS: usize = 128;
 
-/// Maximum concurrent POST bodies being buffered by the
-/// admission middleware. Sized above [`MAX_SESSIONS`] so a
-/// bursty legitimate client that follow-up-POSTs a live
-/// session doesn't compete with new-init traffic, but tight
-/// enough to bound worst-case buffering memory to
-/// `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES` (round-6 F1
-/// — the pre-fix middleware had no upper bound on concurrent
-/// buffers, so an attacker could allocate arbitrary RSS just
-/// by opening sockets).
-pub(super) const PENDING_BODY_GATE: usize = MAX_SESSIONS * 2;
+/// Maximum concurrent POST bodies being buffered plus in
+/// flight downstream at any moment. Sized to a small home-hub
+/// memory budget: `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES`
+/// bounds worst-case middleware-owned memory to a single
+/// digit of MiB — well within what a Raspberry Pi-class hub
+/// can spare, and low enough that the SDK's own re-parse of
+/// the same buffer doesn't push the peak into critical range
+/// (round-7 F1). The gate covers the whole downstream call
+/// (see [`admission_gate`]), not just the buffering step, so
+/// this cap directly limits concurrent MCP POSTs on the wire.
+pub(super) const PENDING_BODY_GATE: usize = 16;
 
 /// Maximum time we will wait for the client to finish sending
 /// its request body before returning `408 Request Timeout`.
@@ -99,10 +100,15 @@ pub(super) const PENDING_BODY_GATE: usize = MAX_SESSIONS * 2;
 pub(super) const REQUEST_BODY_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Maximum accepted request-body size before we return
-/// `413 Payload Too Large`. Mirrors `rmcp`'s own default
-/// (`DEFAULT_MAX_REQUEST_BODY_BYTES`) so a body the middleware
-/// accepts won't be rejected downstream on size grounds.
-pub(super) const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// `413 Payload Too Large`. MCP JSON-RPC messages are tiny
+/// (the largest realistic payload is a `resources/read`
+/// response, which flows the *other* way anyway); 1 MiB is
+/// still an order of magnitude above what any published tool
+/// or resource dispatch produces on the request side, and it
+/// caps the memory bill under [`PENDING_BODY_GATE`] to
+/// `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES` (round-7 F1
+/// — rmcp's own default is 4 MiB, more than we need).
+pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 /// Header the SDK's streamable-HTTP transport uses to
 /// address existing sessions (request in), and to advertise a
@@ -267,10 +273,22 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
                 .into_response();
         }
     };
-    // Body is now in RSS — drop the pending permit so a
-    // long-lived downstream response (SSE stream) doesn't
-    // hold it for its whole lifetime.
-    drop(pending_permit);
+
+    // The pending permit is deliberately held across
+    // `next.run` below. `axum::body::to_bytes` gives us the
+    // buffered `Bytes`, but the SDK's `expect_json` re-parses
+    // it into a `ClientJsonRpcMessage`, and both objects are
+    // resident until the response future returns — so peak
+    // middleware-owned memory per request is (roughly) twice
+    // `buffered.len()`, not once. Releasing the permit at
+    // the end of buffering would let another N requests
+    // start allocating while the SDK still holds the earlier
+    // buffers — the effective peak would exceed the cap
+    // (round-7 F1). `next.run` returns as soon as the
+    // response object (including the streaming SSE body) is
+    // constructed, not when the SSE stream finishes, so
+    // holding the permit until then does NOT wedge on
+    // long-lived subscriptions.
 
     // Tier 3: live-session gate. Only POSTs that could mint
     // a new session (no `mcp-session-id` header) reserve one
@@ -279,7 +297,9 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
     let is_new_session = !parts.headers.contains_key(SESSION_ID_HEADER);
     let request = Request::from_parts(parts, Body::from(buffered));
     if !is_new_session {
-        return next.run(request).await;
+        let response = next.run(request).await;
+        drop(pending_permit);
+        return response;
     }
 
     let Some(admission) = state.manager.try_admit() else {
@@ -309,6 +329,11 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
     {
         admission.commit(id.into());
     }
+    // Pending permit outlives the response construction so
+    // the SDK's re-parse of the buffered body counts against
+    // the same cap; released here, before the returned SSE
+    // stream can start ticking (round-7 F1).
+    drop(pending_permit);
     response
 }
 

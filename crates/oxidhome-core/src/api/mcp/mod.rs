@@ -26,6 +26,6 @@ mod server;
 mod session_store;
 
 pub use server::{
-    MCP_ENDPOINT, mount_routes, mount_routes_with_all_limits, mount_routes_with_cap,
-    mount_routes_with_limits,
+    MAX_REQUEST_BODY_BYTES, MCP_ENDPOINT, mount_routes, mount_routes_with_all_limits,
+    mount_routes_with_cap, mount_routes_with_limits,
 };
