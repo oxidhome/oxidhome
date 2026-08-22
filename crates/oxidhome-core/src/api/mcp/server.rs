@@ -3,22 +3,33 @@
 //! Builds an [`rmcp`] [`StreamableHttpService`] with a bounded
 //! [`BoundedSessionManager`], mounts it at exactly
 //! [`MCP_ENDPOINT`] (no subtree), and wraps the mount in an
-//! [`admission_gate`] axum layer that returns `503 Service
-//! Unavailable` before the SDK sees a request when the session
-//! cap is reached.
+//! [`admission_gate`] axum layer that:
+//!
+//! 1. Buffers the request body under a bounded deadline so a
+//!    slow-stream attacker cannot hold session slots by never
+//!    finishing their `initialize` body (round-5 F2). Only
+//!    once the body is fully in memory do we…
+//! 2. …try to reserve a live-session permit. At cap the mount
+//!    returns `503 Service Unavailable` before the SDK sees
+//!    the request — no ERROR log, no half-created session.
+//! 3. Commits the permit to the session id the SDK returned in
+//!    the response header, so
+//!    [`SessionManager::close_session`] can release exactly
+//!    that session's slot later (round-5 F1 is enforced by
+//!    the store, but the middleware supplies the id here).
 //!
 //! # Two things this module owns
 //!
-//! - **Exact-path mount.** `axum::Router::route_service`
-//!   (round-4 F1) — the earlier `nest_service` matched every
-//!   descendant path, which reintroduced the deferred SSE +
-//!   messages endpoints the SDK does not expose here.
-//! - **Admission gate.** Pre-request 503 for new-session POSTs
-//!   past cap (round-4 F2). The SDK would otherwise map a
-//!   `SessionManager` error to `500 Internal Server Error` and
-//!   log an ERROR line for every overload — both wrong: 503 is
-//!   the spec-shaped overload signal, and expected overload
-//!   shouldn't hit ERROR.
+//! - **Exact-path mount.** `axum::Router::route_service` —
+//!   `nest_service` matched every descendant path, which
+//!   would reintroduce the deferred SSE + messages endpoints
+//!   the SDK does not expose here.
+//! - **Admission gate.** Pre-request body deadline + 503 for
+//!   new-session POSTs past cap. The SDK would otherwise map
+//!   a `SessionManager` error to `500 Internal Server Error`
+//!   and log an ERROR line for every overload — both wrong:
+//!   `503` is the spec-shaped overload signal, and expected
+//!   overload shouldn't hit ERROR.
 //!
 //! # What `rmcp` gives us for free
 //!
@@ -32,6 +43,7 @@
 //!   `LocalSessionManager`'s 5-minute idle keep-alive.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -61,15 +73,30 @@ pub const MCP_ENDPOINT: &str = "/api/v1/mcp";
 /// which point this becomes a config knob.
 pub(super) const MAX_SESSIONS: usize = 128;
 
+/// Maximum time we will wait for the client to finish sending
+/// its request body before returning `408 Request Timeout`.
+/// Legitimate `initialize` bodies complete in single-digit
+/// milliseconds; the deadline exists to prevent a slow-stream
+/// attacker from holding admission slots by never finishing
+/// their body (round-5 F2). 5 seconds is far above realistic
+/// client latency and below any operator patience threshold.
+pub(super) const REQUEST_BODY_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Maximum accepted request-body size before we return
+/// `413 Payload Too Large`. Mirrors `rmcp`'s own default
+/// (`DEFAULT_MAX_REQUEST_BODY_BYTES`) so a body the middleware
+/// accepts won't be rejected downstream on size grounds.
+pub(super) const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 /// Header the SDK's streamable-HTTP transport uses to
 /// address existing sessions (request in), and to advertise a
 /// freshly-minted session (response out).
 const SESSION_ID_HEADER: &str = "mcp-session-id";
 
-/// Build the MCP mount. Ready to `.merge` into the main
-/// [`crate::api::build_router`].
+/// Build the MCP mount with production defaults. Ready to
+/// `.merge` into the main [`crate::api::build_router`].
 pub fn mount_routes(engine: &Engine) -> Router {
-    mount_routes_with_cap(engine, MAX_SESSIONS)
+    mount_routes_with_limits(engine, MAX_SESSIONS, REQUEST_BODY_DEADLINE)
 }
 
 /// Variant of [`mount_routes`] with an explicit session cap.
@@ -77,6 +104,18 @@ pub fn mount_routes(engine: &Engine) -> Router {
 /// admission gate without spinning up 128 real sessions.
 /// Production callers stick with [`mount_routes`].
 pub fn mount_routes_with_cap(engine: &Engine, cap: usize) -> Router {
+    mount_routes_with_limits(engine, cap, REQUEST_BODY_DEADLINE)
+}
+
+/// Full-control variant — cap AND request-body deadline
+/// exposed. Public because the F2 regression test needs a
+/// short deadline to run in reasonable time; production
+/// callers use [`mount_routes`].
+pub fn mount_routes_with_limits(
+    engine: &Engine,
+    cap: usize,
+    request_body_deadline: Duration,
+) -> Router {
     let session_manager = Arc::new(BoundedSessionManager::new(
         LocalSessionManager::default(),
         cap,
@@ -100,33 +139,48 @@ pub fn mount_routes_with_cap(engine: &Engine, cap: usize) -> Router {
         config,
     );
 
+    let state = GateState {
+        manager: session_manager,
+        body_deadline: request_body_deadline,
+    };
+
     // `route_service` — the exact `/api/v1/mcp` path only, no
     // subtree. `nest_service` would match `/api/v1/mcp/sse`,
     // `/api/v1/mcp/messages`, and every other descendant, and
     // `StreamableHttpService` happily starts sessions on all
-    // of them, which reintroduces the deferred-endpoints
-    // exposure (round-4 F1).
+    // of them (round-4 F1).
     Router::new()
         .route_service(MCP_ENDPOINT, service)
-        .layer(from_fn_with_state(session_manager, admission_gate))
+        .layer(from_fn_with_state(state, admission_gate))
 }
 
-/// Middleware: reserve an admission slot before requests that
-/// could create a new session reach the SDK. Emits
-/// `503 Service Unavailable` at cap so the SDK never has to
-/// error out via its 500-shaped `internal_error_response`
-/// path (which also logs at ERROR level).
+/// Shared state the [`admission_gate`] middleware pulls out
+/// via `State`. Keeps the manager + deadline together so a
+/// per-mount test can drive both.
+#[derive(Clone)]
+struct GateState {
+    manager: Arc<BoundedSessionManager>,
+    body_deadline: Duration,
+}
+
+/// Middleware: on a new-session POST, buffer the body first
+/// (bounded by [`Self::body_deadline`] + [`MAX_REQUEST_BODY_BYTES`]),
+/// then reserve an admission slot. Any other request shape
+/// passes through untouched.
+///
+/// Body-first ordering (round-5 F2) means a slow-stream
+/// attacker cannot hold a session permit while they trickle
+/// bytes: their read hits the deadline, we return
+/// `408 Request Timeout`, and no admission slot was ever
+/// reserved on their behalf.
 ///
 /// The reservation lives across the response. If the response
 /// header carries [`SESSION_ID_HEADER`], the SDK really did
-/// admit a session and the slot is committed via
-/// [`super::session_store::Admission::commit`]; otherwise the
-/// `Admission` handle drops and returns the slot to the pool.
-async fn admission_gate(
-    State(mgr): State<Arc<BoundedSessionManager>>,
-    request: Request,
-    next: Next,
-) -> Response {
+/// admit a session and the slot is committed to that specific
+/// id via [`super::session_store::Admission::commit`];
+/// otherwise the `Admission` handle drops and returns the slot
+/// to the pool.
+async fn admission_gate(State(state): State<GateState>, request: Request, next: Next) -> Response {
     // Only POST-without-session-id can drive
     // `SessionManager::create_session`. Every other shape
     // either targets an existing session or is rejected by
@@ -136,9 +190,40 @@ async fn admission_gate(
     if !is_new_session {
         return next.run(request).await;
     }
-    let Some(admission) = mgr.try_admit() else {
+
+    // Body first, then admit. A slow-stream attacker never
+    // gets to reserve a slot; a legitimate init's body is in
+    // memory within ms.
+    let (parts, body) = request.into_parts();
+    let buffered = match tokio::time::timeout(
+        state.body_deadline,
+        axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) => {
+            // `to_bytes` returns Err on both size-cap and
+            // read errors; both surface as a client bug.
+            tracing::warn!(%err, "MCP init: failed to read request body");
+            return (StatusCode::BAD_REQUEST, "Failed to read MCP request body").into_response();
+        }
+        Err(_) => {
+            tracing::warn!(
+                deadline_ms = u64::try_from(state.body_deadline.as_millis()).unwrap_or(u64::MAX),
+                "MCP init: request body exceeded deadline",
+            );
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                "MCP init: request body deadline exceeded",
+            )
+                .into_response();
+        }
+    };
+
+    let Some(admission) = state.manager.try_admit() else {
         tracing::warn!(
-            cap = mgr.cap(),
+            cap = state.manager.cap(),
             "MCP session cap reached — replying 503 Service Unavailable",
         );
         return (
@@ -148,13 +233,21 @@ async fn admission_gate(
         )
             .into_response();
     };
+
+    let request = Request::from_parts(parts, Body::from(buffered));
     let response = next.run(request).await;
-    if response.status().is_success() && response.headers().contains_key(SESSION_ID_HEADER) {
-        // Real session admitted — commit the slot to it.
-        // Anything else (SDK rejected, discover-style
-        // request that produces no session) leaves the
-        // `Admission` to drop and auto-release.
-        admission.commit();
+
+    // Commit the admission to the concrete session id the SDK
+    // returned. Any non-success response (or a success that
+    // didn't mint a session — e.g. a `discover` shape) drops
+    // the `Admission`, auto-releasing the permit.
+    if response.status().is_success()
+        && let Some(id) = response
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+    {
+        admission.commit(id.into());
     }
     response
 }

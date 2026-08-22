@@ -390,6 +390,79 @@ async fn initialize_past_cap_returns_503() {
     drop(sessions);
 }
 
+/// Round-5 F2: a client that opens a request but never
+/// finishes sending its body MUST NOT be able to hold an
+/// admission slot. The middleware buffers the body under a
+/// deadline before reserving a slot, so a slow-stream attacker
+/// (or a legitimately-broken client) gets `408 Request Timeout`
+/// while every admission slot stays available for real clients.
+///
+/// The test uses a body backed by a `pending` stream that never
+/// yields; without the body-first ordering, this would tie up
+/// a session slot until the SDK's own timeouts fire (if any).
+#[tokio::test(flavor = "current_thread")]
+async fn slow_body_returns_408_without_holding_a_slot() {
+    use oxidhome_core::api::mcp::mount_routes_with_limits;
+
+    let engine = Engine::new().expect("engine");
+    // Cap = 1 so any "held" slot from the slow request would
+    // immediately cause the follow-up init to 503. Short
+    // body deadline so the test finishes fast.
+    let router = mount_routes_with_limits(&engine, 1, Duration::from_millis(200));
+
+    // Body backed by a `pending` stream — never emits a frame
+    // or ends, so `axum::body::to_bytes` would await forever
+    // without the middleware's `tokio::time::timeout`.
+    let never_ending_body = || {
+        Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >())
+    };
+
+    let slow = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .body(never_ending_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        slow.status(),
+        StatusCode::REQUEST_TIMEOUT,
+        "slow-body init must surface as 408 Request Timeout, not hang",
+    );
+
+    // Slot must have stayed available — a fresh init succeeds
+    // even at cap = 1 because the slow request never reserved
+    // a permit.
+    let fresh = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh.status(),
+        StatusCode::OK,
+        "cap=1 mount must still admit a real init after a slow-body attacker times out — \
+         admission must NOT have been reserved before the body finished",
+    );
+}
+
 /// SDK errors on non-request payloads MUST NOT be normalized to
 /// 202 — the pre-switch review flagged malformed JSON /
 /// unknown-session / wrong-Content-Type as silently returning

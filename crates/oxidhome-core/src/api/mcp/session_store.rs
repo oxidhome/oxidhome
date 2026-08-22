@@ -7,30 +7,42 @@
 //! [`super::server`]), so a burst of concurrent `initialize`
 //! requests past the cap replies `503 Service Unavailable`
 //! with no SDK ERROR log, no half-created session, and no
-//! client-visible "200 but 404 on follow-ups" (round-4 F2 —
-//! resolved).
+//! client-visible "200 but 404 on follow-ups".
 //!
 //! # Permit lifecycle
 //!
 //! 1. Middleware calls [`BoundedSessionManager::try_admit`]
 //!    for every POST that could be an `initialize` (no
-//!    `mcp-session-id` header). If a permit is available, it
-//!    reserves one slot; if not, the middleware returns 503
-//!    before the SDK sees the request.
+//!    `mcp-session-id` header, body already buffered under
+//!    the middleware's body-deadline). If a permit is
+//!    available, it reserves one slot; if not, the middleware
+//!    returns 503 before the SDK sees the request.
 //! 2. If the response carries a session id header ⇒ the SDK
 //!    admitted a real session ⇒ middleware calls
-//!    [`Admission::commit`], which forgets the permit and
-//!    bumps [`Self::live`].
+//!    [`Admission::commit`] with that id, which forgets the
+//!    permit and records the id in [`Self::live`].
 //! 3. On session teardown — client DELETE, worker exit, idle
 //!    keep-alive — the SDK calls
 //!    [`SessionManager::close_session`] on this wrapper, which
-//!    returns the slot to the pool via [`Self::release`].
+//!    removes the id from [`Self::live`] and returns the slot
+//!    to the pool.
 //!
-//! The `live` counter guards against double-releases: the SDK
-//! can invoke `close_session` twice for one session (worker
-//! exit + client DELETE), but [`Self::release`] uses
-//! `fetch_update` with `checked_sub`, so a second call for the
-//! same session is a no-op.
+//! # Why per-`SessionId` tracking (not a global counter)
+//!
+//! PR #119 R5 F1. The SDK's `spawn_session_worker` calls
+//! `close_session` when the worker exits; the same session can
+//! also receive a client `DELETE`, which calls `close_session`
+//! again. Two concurrent close paths for the same session both
+//! read `sessions.contains_key(id) == true` (the inner map
+//! removal is atomic — only one physically removes). A prior
+//! shape used a global `AtomicUsize` and both close paths
+//! would decrement + release — an extra permit escaped for
+//! every double-close, and with N doubles the effective cap
+//! grew to `cap + N`. Recording admissions in a
+//! `HashSet<SessionId>` and releasing only when
+//! [`HashSet::remove`] actually removed the id makes the
+//! release exactly-once per session, regardless of how many
+//! close paths race.
 //!
 //! # What comes free from `rmcp`
 //!
@@ -42,8 +54,9 @@
 //! - Spec-compliant `202 Accepted` for notifications /
 //!   responses.
 
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use futures_util::Stream;
 use rmcp::transport::common::server_side_http::ServerSseMessage;
@@ -63,11 +76,12 @@ pub struct BoundedSessionManager {
     /// One permit per admission slot. `add_permits(1)` returns
     /// a slot to the pool when a live session is torn down.
     permits: Arc<Semaphore>,
-    /// Count of admissions currently attached to live sessions.
-    /// Guards [`Self::release`] against double-decrements
-    /// (worker-exit + client DELETE for the same session both
-    /// route through `close_session`).
-    live: AtomicUsize,
+    /// Sessions that currently hold a committed admission
+    /// permit. Keyed by id so [`SessionManager::close_session`]
+    /// releases exactly-once per session even when the SDK's
+    /// worker-exit and client-DELETE paths race for the same
+    /// id.
+    live: Mutex<HashSet<SessionId>>,
     cap: usize,
 }
 
@@ -76,7 +90,7 @@ impl BoundedSessionManager {
         Self {
             inner: Arc::new(inner),
             permits: Arc::new(Semaphore::new(cap)),
-            live: AtomicUsize::new(0),
+            live: Mutex::new(HashSet::new()),
             cap,
         }
     }
@@ -98,20 +112,6 @@ impl BoundedSessionManager {
             mgr: self.clone(),
         })
     }
-
-    /// Release one admission slot back to the pool if there's
-    /// a live one to release. `fetch_update` with `checked_sub`
-    /// makes this safe against double-calls (see the module
-    /// doc's Permit lifecycle notes).
-    fn release(&self) {
-        let did = self
-            .live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
-        if did {
-            self.permits.add_permits(1);
-        }
-    }
 }
 
 /// RAII-style handle for a reserved admission slot. Dropping
@@ -123,12 +123,18 @@ pub struct Admission {
 
 impl Admission {
     /// The SDK admitted a real session — attach the reserved
-    /// slot to it. The permit is deliberately forgotten so it
-    /// stays out of the pool until the session closes.
-    pub fn commit(mut self) {
+    /// slot to it by id. The permit is deliberately forgotten
+    /// so it stays out of the pool until
+    /// [`SessionManager::close_session`] removes the id from
+    /// [`BoundedSessionManager::live`].
+    pub fn commit(mut self, session_id: SessionId) {
         if let Some(permit) = self.permit.take() {
             permit.forget();
-            self.mgr.live.fetch_add(1, Ordering::SeqCst);
+            self.mgr
+                .live
+                .lock()
+                .expect("live-session set is not poisoned")
+                .insert(session_id);
         }
     }
 }
@@ -156,15 +162,17 @@ impl SessionManager for BoundedSessionManager {
     }
 
     async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
-        // Snapshot presence before delegating so we only
-        // release the admission slot for sessions the wrapper
-        // knows about. `release` is idempotent per session via
-        // `live`, so a concurrent close_session pair on the
-        // same id still nets to one release.
-        let was_present = self.inner.sessions.read().await.contains_key(id);
         self.inner.close_session(id).await?;
-        if was_present {
-            self.release();
+        // `remove` returns `true` only for the caller that
+        // physically removed the id — a second close for the
+        // same session sees `false` and skips `add_permits`.
+        let removed = self
+            .live
+            .lock()
+            .expect("live-session set is not poisoned")
+            .remove(id);
+        if removed {
+            self.permits.add_permits(1);
         }
         Ok(())
     }
@@ -224,17 +232,56 @@ mod tests {
         let b = mgr.try_admit().expect("second admission");
         assert!(mgr.try_admit().is_none(), "third admission must fail");
 
-        a.commit();
-        b.commit();
-        assert_eq!(mgr.live.load(Ordering::SeqCst), 2);
-        // Still no room — committed permits are attached to
-        // "live" sessions until `release` fires.
-        assert!(mgr.try_admit().is_none());
+        a.commit(SessionId::from("A"));
+        b.commit(SessionId::from("B"));
+        assert!(mgr.try_admit().is_none(), "committed slots still hold cap");
 
-        mgr.release();
+        // Simulate the SDK closing session A.
+        mgr.close_session(&SessionId::from("A"))
+            .await
+            .expect("close");
         assert!(
             mgr.try_admit().is_some(),
-            "release must re-open a slot in the semaphore",
+            "close must return the slot for that session id to the pool",
+        );
+    }
+
+    /// R5 F1: two concurrent close paths for the same session
+    /// (worker-exit + client-DELETE) must release exactly one
+    /// permit. Prior shape used a global counter and released
+    /// twice — with cap 2 and one session double-closed, an
+    /// attacker could grow the effective cap to 3.
+    #[tokio::test(flavor = "current_thread")]
+    async fn double_close_releases_exactly_one_permit() {
+        let mgr = Arc::new(BoundedSessionManager::new(
+            LocalSessionManager::default(),
+            2,
+        ));
+        // Both slots committed.
+        mgr.try_admit()
+            .expect("admit A")
+            .commit(SessionId::from("A"));
+        mgr.try_admit()
+            .expect("admit B")
+            .commit(SessionId::from("B"));
+
+        // Two `close_session` calls for A — the worker-exit
+        // and client-DELETE shape from the SDK.
+        mgr.close_session(&SessionId::from("A"))
+            .await
+            .expect("close A #1");
+        mgr.close_session(&SessionId::from("A"))
+            .await
+            .expect("close A #2");
+
+        // Exactly one permit should have come back — B is
+        // still live, so at most one admission is possible.
+        let one = mgr.try_admit();
+        assert!(one.is_some(), "one permit returned for A");
+        let none = mgr.try_admit();
+        assert!(
+            none.is_none(),
+            "double-close of A must NOT release B's permit — effective cap must stay at 2",
         );
     }
 
@@ -257,28 +304,29 @@ mod tests {
         );
     }
 
-    /// `release` is idempotent per admitted session so the
-    /// SDK's worker-exit + client-DELETE double-call for the
-    /// same session doesn't over-release.
+    /// Closing an id that was never admitted (a restore-store
+    /// path we don't use today, or a spurious DELETE from a
+    /// client with a stale id) must not release a permit.
     #[tokio::test(flavor = "current_thread")]
-    async fn release_is_idempotent_per_session() {
+    async fn close_of_unknown_id_is_a_noop() {
         let mgr = Arc::new(BoundedSessionManager::new(
             LocalSessionManager::default(),
             1,
         ));
-        mgr.try_admit().expect("admission").commit();
-        assert_eq!(mgr.live.load(Ordering::SeqCst), 1);
+        mgr.try_admit()
+            .expect("admit A")
+            .commit(SessionId::from("A"));
 
-        mgr.release();
-        assert_eq!(mgr.live.load(Ordering::SeqCst), 0);
-        // Second release for the same session — must not
-        // grant an extra permit.
-        mgr.release();
-        assert_eq!(mgr.live.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            mgr.permits.available_permits(),
-            1,
-            "cap must remain at 1 after a double-release",
+        // Close a session id we never admitted.
+        mgr.close_session(&SessionId::from("ghost"))
+            .await
+            .expect("close ghost");
+
+        // A's slot must still be reserved — no admission
+        // should succeed until A itself is closed.
+        assert!(
+            mgr.try_admit().is_none(),
+            "close of unknown id must NOT free A's slot",
         );
     }
 }
