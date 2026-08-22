@@ -36,7 +36,7 @@ use rmcp::model::{
 use serde::Serialize;
 
 use crate::Engine;
-use crate::api::scopes::{DEVICES_LIST, DEVICES_READ, PLUGINS_LIST, Scope, require_scope};
+use crate::api::scopes::{DEVICES_LIST, PLUGINS_LIST, Scope, require_scope};
 use crate::auth::Actor;
 use crate::state::audit_log::AuditEntry;
 
@@ -259,7 +259,22 @@ fn read_inner(engine: &Engine, uri: &str, actor: &Actor) -> (&'static str, ReadO
             ("devices", None) => ("devices", DEVICES_LIST, Box::new(|| devices_list(engine))),
             ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => (
                 "devices.detail",
-                DEVICES_READ,
+                // Device-detail carries registration
+                // metadata (owner, name, manufacturer,
+                // model, capabilities) — the same shape
+                // `oxidhome://devices` returns per row,
+                // just filtered to one id. It shares the
+                // `devices:list` scope with the collection
+                // read (round-2 F1 on PR #120 originally
+                // gated this under `devices:read`, which is
+                // reserved for the H9 device-state
+                // projection — `GET /api/v1/devices/{id}/state`
+                // and `state/changes`. Handing metadata
+                // access to `devices:read` tokens while
+                // withholding it from `devices:list` tokens
+                // was the opposite of the intended
+                // boundary — round-3 F1 fix).
+                DEVICES_LIST,
                 Box::new(|| devices_detail(engine, id)),
             ),
             ("plugins", None) => ("plugins", PLUGINS_LIST, Box::new(|| plugins_list(engine))),

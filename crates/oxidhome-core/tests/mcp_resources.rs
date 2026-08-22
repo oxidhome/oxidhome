@@ -543,6 +543,61 @@ async fn per_resource_scopes_enforce_boundaries() {
     );
 }
 
+/// Round-3 F1 on PR #120 regression: the device-detail
+/// resource returns registration metadata (owner, name,
+/// manufacturer, model, capabilities). It shares the
+/// `devices:list` scope with the collection read — a bearer
+/// that can list devices must be able to follow any listed id
+/// into its detail resource, and a `devices:read` bearer
+/// (reserved for the H9 device-state projection) must NOT
+/// gain metadata access it wasn't granted.
+#[tokio::test(flavor = "current_thread")]
+async fn device_detail_uses_devices_list_scope_not_devices_read() {
+    // Bearer with ONLY `devices:list` must reach the detail
+    // URI (unknown device id => 404, but scope check must
+    // succeed first). If the detail were still gated on
+    // `devices:read`, this would return `-32001` instead.
+    let engine = Engine::new().expect("engine");
+    let list_bearer = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &list_bearer).await;
+
+    let response = call(
+        &router,
+        &list_bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://devices/dev-notexist"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32002,
+        "devices:list bearer must reach device-detail dispatch (unknown id → -32002 \
+         resource-not-found), NOT the scope-denied -32001; got {response}",
+    );
+
+    // Companion: a bearer with only `devices:read` must be
+    // REFUSED metadata access — that scope is reserved for
+    // the state projection, not registration data.
+    let engine = Engine::new().expect("engine");
+    let read_bearer = mint_bearer_with_scopes(&engine, "devices-read-only", &["devices:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &read_bearer).await;
+
+    let response = call(
+        &router,
+        &read_bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://devices/dev-notexist"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:read alone must NOT satisfy the device-detail metadata scope; got {response}",
+    );
+}
+
 /// Round-1 F3 on PR #120 regression: the plugin-detail
 /// resource must include the manifest `content_digest` and
 /// `installation_uuid` fields the template's description
