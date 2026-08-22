@@ -171,11 +171,20 @@ pub fn build_router(engine: Engine) -> Router {
             get(get_plugin_ui_frame),
         );
 
+    // Phase 14.1 — mount the MCP streamable-HTTP endpoint on the
+    // same listener as REST/Connect. `rmcp`'s
+    // `StreamableHttpService` is a `tower::Service` nested at
+    // [`super::mcp::MCP_ENDPOINT`]; auth (14.4) will wrap the
+    // nested router in our bearer layer once the token-scope
+    // policy shape is stable.
+    let mcp = super::mcp::mount_routes(&engine);
+
     public
         .merge(authenticated)
         .merge(ticket_gated)
         .fallback_service(connect_service)
         .with_state(ApiState { engine })
+        .merge(mcp)
 }
 
 /// `GET /api/v1/readyz` — anonymous JSON readiness probe. Same body

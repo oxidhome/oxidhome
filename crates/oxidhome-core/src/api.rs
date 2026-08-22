@@ -22,11 +22,13 @@
 mod auth;
 mod bootstrap;
 mod connect_rpc;
+pub mod mcp;
 mod scopes;
 mod server;
 mod ui_ticket;
 
 pub use bootstrap::ensure_admin_token;
+pub use mcp::MCP_ENDPOINT;
 pub use server::{ApiConfig, bind, build_router, serve};
 
 #[cfg(test)]
