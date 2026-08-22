@@ -182,14 +182,46 @@ pub fn mount_routes_with_all_limits(
         body_deadline: request_body_deadline,
     };
 
+    // Bearer-auth layer — the same `require_token` middleware
+    // the JSON / Connect surfaces already wear. Wraps the
+    // whole MCP mount so an unauthenticated caller can't
+    // enumerate devices / plugins / instances (round-1 F1
+    // on PR #120). The middleware also inserts the resolved
+    // [`Actor`](crate::auth::Actor) into the request
+    // extensions, which the resource dispatch pulls back out
+    // via `RequestContext.extensions.get::<Parts>()`. 14.4
+    // adds per-token scope enforcement on top of this basic
+    // "must have a valid token" check.
+    let auth_state = super::super::auth::AuthState {
+        tokens: engine.auth_tokens(),
+        audit_log: engine.audit_log(),
+    };
+
     // `route_service` — the exact `/api/v1/mcp` path only, no
     // subtree. `nest_service` would match `/api/v1/mcp/sse`,
     // `/api/v1/mcp/messages`, and every other descendant, and
     // `StreamableHttpService` happily starts sessions on all
     // of them (round-4 F1).
+    //
+    // Outer to inner: bearer auth → admission gate → MCP
+    // service. Layers are applied bottom-up per axum's
+    // ordering, so the LAST `.layer(...)` runs first —
+    // `require_token` sees the raw request and rejects
+    // unauthenticated callers with 401 before the admission
+    // gate ever buffers a body. That closes the round-2 F2
+    // starvation vector: 16 unauthenticated slow POSTs
+    // otherwise held the pending-body permits for the full
+    // `REQUEST_BODY_DEADLINE`, blocking legitimate clients.
+    // The token-store lookup cost per request is the price
+    // of that safety; on a home hub with one operator it's
+    // trivial.
     Router::new()
         .route_service(MCP_ENDPOINT, service)
         .layer(from_fn_with_state(state, admission_gate))
+        .layer(from_fn_with_state(
+            auth_state,
+            super::super::auth::require_token,
+        ))
 }
 
 /// Shared state the [`admission_gate`] middleware pulls out

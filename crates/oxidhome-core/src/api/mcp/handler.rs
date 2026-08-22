@@ -1,35 +1,38 @@
 //! MCP [`ServerHandler`] for `OxidHome`.
 //!
-//! Phase 14.1 ships the minimum handler that answers a real MCP
-//! handshake: `initialize` + capability negotiation, and the
-//! three discovery calls (`tools/list`, `resources/list`,
-//! `prompts/list`) return **empty** results (the `rmcp` trait
-//! defaults already do this, so we only need to override
-//! [`ServerHandler::get_info`] to declare which capability
-//! blocks we advertise). 14.2 / 14.3 / 14.6 fill in the actual
-//! resources, tools, and prompts.
+//! Currently answers `initialize`, exposes the resource
+//! catalogue built in [`super::resources`], and lets the SDK's
+//! default `tools/list` + `prompts/list` return empty lists
+//! (14.3 / 14.6 fill those in).
 //!
-//! The [`Engine`] handle is stashed on the struct so the read
-//! resource handlers (14.2) and action tools (14.3) can reach
-//! the device registry, log store, event log, blob index, etc.,
-//! without a second dependency-injection scheme. 14.1 doesn't
-//! consume it — it's parked here to keep the follow-up slice a
-//! pure additive change.
+//! The [`Engine`] handle is stashed on the struct so every
+//! resource / tool handler can reach the device registry, log
+//! store, event log, blob index, etc., without a second
+//! dependency-injection scheme. Clone is required because
+//! `StreamableHttpService` builds a fresh handler per session
+//! via its `service_factory`; `Engine` is `Arc`-backed so the
+//! clone is cheap.
+
+use std::future::Future;
 
 use rmcp::{
-    ServerHandler,
-    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
+    RoleServer, ServerHandler,
+    model::{
+        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
+        ServerInfo,
+    },
+    service::{MaybeSendFuture, RequestContext},
 };
 
 use crate::Engine;
+use crate::auth::Actor;
 
-/// `OxidHome`'s MCP server handler. `Clone` is required because
-/// `StreamableHttpService` builds a fresh handler per session
-/// via its `service_factory`; `Engine` is `Arc`-backed so the
-/// clone is cheap.
+use super::resources;
+
+/// `OxidHome`'s MCP server handler.
 #[derive(Clone)]
 pub(super) struct OxidHomeMcpHandler {
-    #[allow(dead_code)] // wired for 14.2/14.3
     engine: Engine,
 }
 
@@ -68,4 +71,62 @@ impl ServerHandler for OxidHomeMcpHandler {
              safe; action tools carry an `oxidhome.audit` note when they mutate host state.",
         )
     }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        std::future::ready(Ok(ListResourcesResult {
+            resources: resources::list_resources(),
+            ..Default::default()
+        }))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        std::future::ready(Ok(ListResourceTemplatesResult {
+            resource_templates: resources::list_resource_templates(),
+            ..Default::default()
+        }))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        let engine = self.engine.clone();
+        let actor = resolve_actor(&context);
+        async move {
+            let result = resources::read(engine, &request.uri, &actor).await?;
+            Ok(result.into())
+        }
+    }
+}
+
+/// Pull the [`Actor`] off the request. The bearer middleware
+/// ([`crate::api::auth::require_token`]) puts an `Actor` on
+/// the HTTP request's `Extensions`; `rmcp`'s tower service
+/// forwards the surviving `http::request::Parts` (which still
+/// owns those extensions) onto [`RequestContext::extensions`].
+///
+/// Missing at either hop means something upstream skipped the
+/// auth layer — synthesize a **no-scope anonymous actor** so
+/// every subsequent `require_scope` check fails closed. This
+/// protects against a future mis-wire (e.g. someone removing
+/// the `require_token` layer): the resource dispatch still
+/// refuses every read, records `decision = deny`, and the
+/// audit ledger surfaces the anomaly instead of silently
+/// serving requests as some ambiguous "trusted" caller.
+fn resolve_actor(context: &RequestContext<RoleServer>) -> Actor {
+    let parts = context.extensions.get::<axum::http::request::Parts>();
+    let actor = parts.and_then(|p| p.extensions.get::<Actor>()).cloned();
+    actor.unwrap_or_else(|| Actor::api(resources::UNAUTHENTICATED_TOKEN_ID, Vec::new()))
 }

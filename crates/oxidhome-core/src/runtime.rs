@@ -26,6 +26,7 @@ pub use lifecycle::{
 };
 pub use registry::{InstanceRegistry, RegistryError};
 pub use state::PluginState;
+pub(crate) use state::capability_name;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
