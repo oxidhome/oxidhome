@@ -42,13 +42,29 @@ const MCP_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_CONTENT_TYPE: &str = "application/json";
 const MCP_HOST: &str = "localhost";
 
-fn base_request(method: &str) -> axum::http::request::Builder {
+fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
     Request::builder()
         .method(method)
         .uri(MCP_ENDPOINT)
         .header(header::HOST, MCP_HOST)
         .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
         .header(header::ACCEPT, MCP_ACCEPT)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+}
+
+/// Mints a wildcard-scope test bearer against an engine's
+/// token store and returns its plaintext. The MCP mount now
+/// (round-1 F1 on PR #120) sits behind
+/// `crate::api::auth::require_token`, so every integration
+/// test needs to authenticate. Wildcard scope keeps the tests
+/// focused on the resource surface itself; per-resource scope
+/// enforcement lands in 14.4.
+fn mint_bearer(engine: &Engine) -> String {
+    engine
+        .auth_tokens()
+        .create("test", b"[\"*\"]")
+        .expect("mint bearer")
+        .plaintext
 }
 
 fn initialize_body() -> String {
@@ -106,11 +122,11 @@ async fn read_first_sse_data(response: axum::response::Response) -> Value {
 
 /// Complete the handshake and return the router + minted
 /// session id. Every test starts here.
-async fn handshake(router: axum::Router) -> (axum::Router, String) {
+async fn handshake(router: axum::Router, bearer: &str) -> (axum::Router, String) {
     let init = router
         .clone()
         .oneshot(
-            base_request("POST")
+            base_request("POST", bearer)
                 .body(Body::from(initialize_body()))
                 .unwrap(),
         )
@@ -132,7 +148,7 @@ async fn handshake(router: axum::Router) -> (axum::Router, String) {
     let notified = router
         .clone()
         .oneshot(
-            base_request("POST")
+            base_request("POST", bearer)
                 .header("mcp-session-id", &session_id)
                 .body(Body::from(
                     json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
@@ -148,11 +164,17 @@ async fn handshake(router: axum::Router) -> (axum::Router, String) {
 
 /// Send a JSON-RPC method call on the given session and
 /// return its parsed response body.
-async fn call(router: &axum::Router, session_id: &str, method: &str, params: Value) -> Value {
+async fn call(
+    router: &axum::Router,
+    bearer: &str,
+    session_id: &str,
+    method: &str,
+    params: Value,
+) -> Value {
     let response = router
         .clone()
         .oneshot(
-            base_request("POST")
+            base_request("POST", bearer)
                 .header("mcp-session-id", session_id)
                 .body(Body::from(
                     json!({
@@ -187,10 +209,11 @@ fn rand_id() -> u64 {
 #[tokio::test(flavor = "current_thread")]
 async fn list_resources_advertises_devices_and_plugins() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
-    let (router, session) = handshake(router).await;
+    let (router, session) = handshake(router, &bearer).await;
 
-    let response = call(&router, &session, "resources/list", json!({})).await;
+    let response = call(&router, &bearer, &session, "resources/list", json!({})).await;
     let resources = response["result"]["resources"]
         .as_array()
         .expect("resources array");
@@ -224,10 +247,18 @@ async fn list_resources_advertises_devices_and_plugins() {
 #[tokio::test(flavor = "current_thread")]
 async fn list_resource_templates_advertises_detail_shapes() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
-    let (router, session) = handshake(router).await;
+    let (router, session) = handshake(router, &bearer).await;
 
-    let response = call(&router, &session, "resources/templates/list", json!({})).await;
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/templates/list",
+        json!({}),
+    )
+    .await;
     let templates = response["result"]["resourceTemplates"]
         .as_array()
         .expect("resourceTemplates array");
@@ -250,11 +281,13 @@ async fn list_resource_templates_advertises_detail_shapes() {
 #[tokio::test(flavor = "current_thread")]
 async fn read_devices_returns_json_list_on_fresh_engine() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
-    let (router, session) = handshake(router).await;
+    let (router, session) = handshake(router, &bearer).await;
 
     let response = call(
         &router,
+        &bearer,
         &session,
         "resources/read",
         json!({"uri": "oxidhome://devices"}),
@@ -280,11 +313,13 @@ async fn read_devices_returns_json_list_on_fresh_engine() {
 #[tokio::test(flavor = "current_thread")]
 async fn read_plugins_returns_json_list_on_fresh_engine() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
-    let (router, session) = handshake(router).await;
+    let (router, session) = handshake(router, &bearer).await;
 
     let response = call(
         &router,
+        &bearer,
         &session,
         "resources/read",
         json!({"uri": "oxidhome://plugins"}),
@@ -309,11 +344,13 @@ async fn read_plugins_returns_json_list_on_fresh_engine() {
 #[tokio::test(flavor = "current_thread")]
 async fn unknown_uri_returns_resource_not_found() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
-    let (router, session) = handshake(router).await;
+    let (router, session) = handshake(router, &bearer).await;
 
     let response = call(
         &router,
+        &bearer,
         &session,
         "resources/read",
         json!({"uri": "oxidhome://plugins/definitely-not-a-plugin"}),
@@ -327,6 +364,118 @@ async fn unknown_uri_returns_resource_not_found() {
     );
 }
 
+/// Round-1 F1 on PR #120 regression: the MCP mount MUST NOT
+/// serve requests without a bearer token. Pre-fix, anyone
+/// reaching the listener could enumerate the resource catalog
+/// (and by extension, every device / plugin id).
+#[tokio::test(flavor = "current_thread")]
+async fn missing_bearer_is_401() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+
+    // Deliberately skip `mint_bearer` + skip the AUTHORIZATION
+    // header — the mount MUST refuse before it hits the SDK.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "MCP mount must require a bearer — no anonymous inventory access",
+    );
+}
+
+/// Round-1 F3 on PR #120 regression: the plugin-detail
+/// resource must include the manifest `content_digest` and
+/// `installation_uuid` fields the template's description
+/// promises. Pre-fix, the wire shape silently dropped both
+/// even though `InstalledPlugin` carries them.
+///
+/// This test installs one plugin so the detail path finds an
+/// entry, then reads the detail resource and asserts the
+/// digest is a non-empty string.
+#[tokio::test(flavor = "current_thread")]
+async fn plugin_detail_includes_content_digest_and_installation_uuid() {
+    // Stage + install the simulated-switch example so
+    // `plugins/{plugin_id}` has an installed row to detail.
+    // Same pattern as `manifest_loader.rs::installed_load_refused_*`.
+    let wasm_src = _support::build_example("simulated-switch", "simulated_switch.wasm");
+    let state_dir = _support::tempdir("mcp-plugin-detail-state");
+    let source = _support::tempdir("mcp-plugin-detail-src");
+    std::fs::copy(&wasm_src, source.path().join("simulated_switch.wasm"))
+        .expect("copy wasm to source");
+    std::fs::write(
+        source.path().join("manifest.toml"),
+        r#"manifest_version = 1
+[plugin]
+id = "example.mcp-plugin-detail"
+name = "MCP plugin detail test"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "simulated_switch.wasm"
+[capabilities]
+declares_devices = ["switch"]
+"#,
+    )
+    .expect("write source manifest");
+
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let installed = engine
+        .installed_plugins()
+        .install(source.path())
+        .expect("install plugin");
+    let plugin_id = installed.plugin_id.to_string();
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": format!("oxidhome://plugins/{plugin_id}")}),
+    )
+    .await;
+    let body: Value = serde_json::from_str(
+        response["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("text payload"),
+    )
+    .expect("plugin detail must be JSON");
+
+    // `content_digest` is the SHA-256 of the installed
+    // bytes; hex-encoded, so at least 32 hex chars.
+    let digest = body["content_digest"]
+        .as_str()
+        .expect("content_digest missing");
+    assert!(
+        !digest.is_empty(),
+        "content_digest must be non-empty for an installed plugin; got {body}",
+    );
+
+    let uuid = body["installation_uuid"]
+        .as_str()
+        .expect("installation_uuid missing");
+    assert!(
+        uuid.starts_with("inst-"),
+        "installation_uuid must use the `inst-` prefix; got {uuid}",
+    );
+}
+
 /// Every resource read (success + failure) records one audit
 /// row with `path = "mcp.resource.<family>"`. This test
 /// walks devices → plugins → unknown and asserts three
@@ -334,13 +483,15 @@ async fn unknown_uri_returns_resource_not_found() {
 #[tokio::test(flavor = "current_thread")]
 async fn resource_reads_land_in_the_audit_log() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let audit = engine.audit_log();
     let router = build_router(engine);
-    let (router, session) = handshake(router).await;
+    let (router, session) = handshake(router, &bearer).await;
 
     // Reads:
     let _ = call(
         &router,
+        &bearer,
         &session,
         "resources/read",
         json!({"uri": "oxidhome://devices"}),
@@ -348,6 +499,7 @@ async fn resource_reads_land_in_the_audit_log() {
     .await;
     let _ = call(
         &router,
+        &bearer,
         &session,
         "resources/read",
         json!({"uri": "oxidhome://plugins"}),
@@ -355,6 +507,7 @@ async fn resource_reads_land_in_the_audit_log() {
     .await;
     let _ = call(
         &router,
+        &bearer,
         &session,
         "resources/read",
         json!({"uri": "oxidhome://plugins/ghost"}),

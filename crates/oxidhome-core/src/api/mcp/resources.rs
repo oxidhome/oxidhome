@@ -99,13 +99,17 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
 }
 
 /// Dispatch a concrete resource URI. Records one audit row
-/// per read regardless of outcome.
+/// per read regardless of outcome — **fail-closed**: if the
+/// audit ledger write fails, the read is refused with an
+/// internal error rather than served without an audit trail
+/// (round-1 F2 on PR #120, matching the same rule the REST
+/// middleware in [`crate::api::auth::require_token`] applies).
 ///
-/// `token_id` is the auth token id resolved by the middleware
-/// (14.4). Today the mount has no bearer layer, so every
-/// call passes [`UNAUTHENTICATED_TOKEN_ID`]; when 14.4 wires
-/// auth, the middleware extracts the real id and hands it in
-/// here.
+/// `token_id` is the auth token id resolved by the bearer
+/// middleware. The unauthenticated sentinel
+/// [`UNAUTHENTICATED_TOKEN_ID`] only reaches this fn when the
+/// middleware has been misconfigured — the mount always sits
+/// behind `require_token` in production.
 pub(super) async fn read(
     engine: Engine,
     uri: &str,
@@ -114,15 +118,31 @@ pub(super) async fn read(
     let (family, outcome) = read_inner(&engine, uri);
     // Audit-log every read. The audit call is synchronous and
     // takes the shared `Db` mutex — spawn_blocking so it can't
-    // park the tokio worker under a slow disk.
+    // park the tokio worker under a slow disk. Fail-closed:
+    // both the join error (task panicked) and the audit error
+    // (ledger unreachable, disk full, read-only DB, …) refuse
+    // the read.
     let audit_log = engine.audit_log();
     let audit_entry = new_audit_entry(token_id, family, &outcome);
-    let _ = tokio::task::spawn_blocking(move || audit_log.record_completed(&audit_entry))
-        .await
-        .map_err(|join_err| {
-            tracing::warn!(%join_err, "MCP resource audit task panicked");
-        });
-    outcome.into_result(uri)
+    let audit_result =
+        tokio::task::spawn_blocking(move || audit_log.record_completed(&audit_entry)).await;
+    match audit_result {
+        Ok(Ok(_row_id)) => outcome.into_result(uri),
+        Ok(Err(err)) => {
+            tracing::error!(%err, uri, "MCP resource audit write failed — refusing read");
+            Err(McpError::internal_error(
+                "audit-log write failed; MCP resource read refused",
+                None,
+            ))
+        }
+        Err(join_err) => {
+            tracing::error!(%join_err, uri, "MCP resource audit task panicked — refusing read");
+            Err(McpError::internal_error(
+                "audit-log write task panicked; MCP resource read refused",
+                None,
+            ))
+        }
+    }
 }
 
 /// Outcome shape for a single resource-read attempt. Kept as
@@ -341,6 +361,19 @@ struct PluginDetail {
     installed: bool,
     version: Option<String>,
     singleton: Option<bool>,
+    /// SHA-256 hex of the installed plugin's on-disk contents
+    /// (manifest + wasm + assets). `None` when the plugin
+    /// is running-but-not-installed (dev-time argv-driven
+    /// start path — no `plugin_installation` row exists).
+    /// Round-1 F3 on PR #120: the template's documented
+    /// contract promised this field; the pre-fix shape
+    /// silently dropped it.
+    content_digest: Option<String>,
+    /// C1b host-minted per-install UUID (`inst-<32 hex>`).
+    /// Uninstall + reinstall of the same `plugin_id`
+    /// produces a different UUID. `None` alongside
+    /// `content_digest` on the not-installed path.
+    installation_uuid: Option<String>,
     instances: Vec<PluginInstanceDetail>,
 }
 
@@ -365,6 +398,8 @@ fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
         installed: installed.is_some(),
         version: installed.as_ref().map(|p| p.version.clone()),
         singleton: installed.as_ref().map(|p| p.singleton),
+        content_digest: installed.as_ref().map(|p| p.content_digest.to_string()),
+        installation_uuid: installed.as_ref().map(|p| p.installation_uuid.to_string()),
         instances,
     };
     encode(&detail, "plugin detail")

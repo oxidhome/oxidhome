@@ -182,6 +182,21 @@ pub fn mount_routes_with_all_limits(
         body_deadline: request_body_deadline,
     };
 
+    // Bearer-auth layer — the same `require_token` middleware
+    // the JSON / Connect surfaces already wear. Wraps the
+    // whole MCP mount so an unauthenticated caller can't
+    // enumerate devices / plugins / instances (round-1 F1
+    // on PR #120). The middleware also inserts the resolved
+    // [`Actor`](crate::auth::Actor) into the request
+    // extensions, which the resource dispatch pulls back out
+    // via `RequestContext.extensions.get::<Parts>()`. 14.4
+    // adds per-token scope enforcement on top of this basic
+    // "must have a valid token" check.
+    let auth_state = super::super::auth::AuthState {
+        tokens: engine.auth_tokens(),
+        audit_log: engine.audit_log(),
+    };
+
     // `route_service` — the exact `/api/v1/mcp` path only, no
     // subtree. `nest_service` would match `/api/v1/mcp/sse`,
     // `/api/v1/mcp/messages`, and every other descendant, and
@@ -189,6 +204,15 @@ pub fn mount_routes_with_all_limits(
     // of them (round-4 F1).
     Router::new()
         .route_service(MCP_ENDPOINT, service)
+        // Outer to inner: admission gate → bearer auth →
+        // MCP service. Layers are applied bottom-up per
+        // axum's ordering, so `admission_gate` sees the raw
+        // request before auth (cheap check first, no need
+        // to consult the token store for over-cap 503s).
+        .layer(from_fn_with_state(
+            auth_state,
+            super::super::auth::require_token,
+        ))
         .layer(from_fn_with_state(state, admission_gate))
 }
 

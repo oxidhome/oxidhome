@@ -61,13 +61,30 @@ fn initialize_body() -> String {
     .to_string()
 }
 
-fn base_request(method: &str) -> axum::http::request::Builder {
+fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
     Request::builder()
         .method(method)
         .uri(MCP_ENDPOINT)
         .header(header::HOST, MCP_HOST)
         .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
         .header(header::ACCEPT, MCP_ACCEPT)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+}
+
+/// Mints a wildcard-scope test bearer against an engine's
+/// token store and returns its plaintext. The MCP mount now
+/// (round-1 F1 on PR #120) sits behind
+/// `crate::api::auth::require_token`, so every integration
+/// test needs to authenticate. Wildcard scope keeps the tests
+/// focused on the transport / resource shape rather than
+/// per-scope policy (14.4 lands the scope-per-resource
+/// gates).
+fn mint_bearer(engine: &Engine) -> String {
+    engine
+        .auth_tokens()
+        .create("test", b"[\"*\"]")
+        .expect("mint bearer")
+        .plaintext
 }
 
 /// Peels the SSE stream from an `initialize` response and parses
@@ -119,11 +136,12 @@ async fn read_first_sse_data(response: axum::response::Response) -> Value {
 #[tokio::test(flavor = "current_thread")]
 async fn initialize_returns_session_and_advertises_capabilities() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
 
     let response = router
         .oneshot(
-            base_request("POST")
+            base_request("POST", &bearer)
                 .body(Body::from(initialize_body()))
                 .unwrap(),
         )
@@ -159,13 +177,14 @@ async fn initialize_returns_session_and_advertises_capabilities() {
 #[tokio::test(flavor = "current_thread")]
 async fn initialized_notification_returns_202() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
 
     // 1. Handshake and grab the session id.
     let init = router
         .clone()
         .oneshot(
-            base_request("POST")
+            base_request("POST", &bearer)
                 .body(Body::from(initialize_body()))
                 .unwrap(),
         )
@@ -191,7 +210,7 @@ async fn initialized_notification_returns_202() {
     .to_string();
     let response = router
         .oneshot(
-            base_request("POST")
+            base_request("POST", &bearer)
                 .header("mcp-session-id", &session_id)
                 .body(Body::from(notification))
                 .unwrap(),
@@ -217,11 +236,12 @@ async fn initialized_notification_returns_202() {
 #[tokio::test(flavor = "current_thread")]
 async fn untrusted_origin_is_403() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
 
     let response = router
         .oneshot(
-            base_request("POST")
+            base_request("POST", &bearer)
                 .header(header::ORIGIN, "https://attacker.example")
                 .body(Body::from(initialize_body()))
                 .unwrap(),
@@ -243,11 +263,12 @@ async fn untrusted_origin_is_403() {
 #[tokio::test(flavor = "current_thread")]
 async fn loopback_origin_passes() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
 
     let response = router
         .oneshot(
-            base_request("POST")
+            base_request("POST", &bearer)
                 .header(header::ORIGIN, "http://127.0.0.1:8080")
                 .body(Body::from(initialize_body()))
                 .unwrap(),
@@ -271,10 +292,14 @@ async fn loopback_origin_passes() {
 #[tokio::test(flavor = "current_thread")]
 async fn descendant_paths_are_not_mounted() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
 
     for suffix in ["/sse", "/messages", "/arbitrary", "/"] {
         let uri = format!("{MCP_ENDPOINT}{suffix}");
+        // Bearer set so the assertion is meaningful — if we
+        // sent no auth, every descendant would 401 for the
+        // wrong reason and the test would trivially pass.
         let response = router
             .clone()
             .oneshot(
@@ -284,6 +309,7 @@ async fn descendant_paths_are_not_mounted() {
                     .header(header::HOST, MCP_HOST)
                     .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
                     .header(header::ACCEPT, MCP_ACCEPT)
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
                     .body(Body::from(initialize_body()))
                     .unwrap(),
             )
@@ -312,6 +338,7 @@ async fn initialize_past_cap_returns_503() {
     use oxidhome_core::api::mcp::mount_routes_with_cap;
 
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = mount_routes_with_cap(&engine, 3);
 
     let post_init = || {
@@ -322,6 +349,7 @@ async fn initialize_past_cap_returns_503() {
                 .header(header::HOST, MCP_HOST)
                 .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
                 .header(header::ACCEPT, MCP_ACCEPT)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
                 .body(Body::from(initialize_body()))
                 .unwrap(),
         )
@@ -365,7 +393,11 @@ async fn initialize_past_cap_returns_503() {
     );
 
     // Sanity: unrelated paths on the mount aren't 503'd —
-    // only *new session* POSTs go through the gate.
+    // only *new session* POSTs go through the gate. (This
+    // GET now also carries a bearer since the mount sits
+    // behind `require_token`; without it the request 401s
+    // before the admission gate even runs, which would tell
+    // us the wrong thing about the pending semaphore.)
     let get = router
         .clone()
         .oneshot(
@@ -374,6 +406,7 @@ async fn initialize_past_cap_returns_503() {
                 .uri(MCP_ENDPOINT)
                 .header(header::HOST, MCP_HOST)
                 .header(header::ACCEPT, MCP_ACCEPT)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -405,6 +438,7 @@ async fn slow_body_returns_408_without_holding_a_slot() {
     use oxidhome_core::api::mcp::mount_routes_with_limits;
 
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     // Cap = 1 so any "held" slot from the slow request would
     // immediately cause the follow-up init to 503. Short
     // body deadline so the test finishes fast.
@@ -422,12 +456,7 @@ async fn slow_body_returns_408_without_holding_a_slot() {
     let slow = router
         .clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::HOST, MCP_HOST)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
+            base_request("POST", &bearer)
                 .body(never_ending_body())
                 .unwrap(),
         )
@@ -444,12 +473,7 @@ async fn slow_body_returns_408_without_holding_a_slot() {
     // a permit.
     let fresh = router
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::HOST, MCP_HOST)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
+            base_request("POST", &bearer)
                 .body(Body::from(initialize_body()))
                 .unwrap(),
         )
@@ -505,6 +529,7 @@ async fn pending_body_gate_bounds_concurrent_buffering() {
     use tokio::sync::Notify;
 
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     // Deadline long enough for the overflow POST to slip in
     // while the holder is still parked on its body; pending
     // gate = 1 so the overflow is forced to compete for it.
@@ -520,15 +545,11 @@ async fn pending_body_gate_bounds_concurrent_buffering() {
     // until the deadline fires or the task is aborted.
     let hold = tokio::spawn({
         let router = router.clone();
+        let bearer = bearer.clone();
         async move {
             router
                 .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(MCP_ENDPOINT)
-                        .header(header::HOST, MCP_HOST)
-                        .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                        .header(header::ACCEPT, MCP_ACCEPT)
+                    base_request("POST", &bearer)
                         .body(Body::from_stream(SignalingPendingBody {
                             notify: notify_for_body,
                             polled: false,
@@ -551,12 +572,7 @@ async fn pending_body_gate_bounds_concurrent_buffering() {
     let overflow = router
         .clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(MCP_ENDPOINT)
-                .header(header::HOST, MCP_HOST)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
+            base_request("POST", &bearer)
                 .body(Body::from(initialize_body()))
                 .unwrap(),
         )
@@ -588,12 +604,17 @@ const MAX_SESSIONS_FOR_TESTS: usize = 16;
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_body_returns_413() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
 
     // Smallest payload that exceeds the middleware cap.
     let oversized = vec![b'x'; oxidhome_core::api::mcp::MAX_REQUEST_BODY_BYTES + 1];
     let response = router
-        .oneshot(base_request("POST").body(Body::from(oversized)).unwrap())
+        .oneshot(
+            base_request("POST", &bearer)
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -612,13 +633,14 @@ async fn oversized_body_returns_413() {
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_errors_on_non_requests_are_preserved() {
     let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
     let router = build_router(engine);
 
     // Malformed JSON body.
     let malformed = router
         .clone()
         .oneshot(
-            base_request("POST")
+            base_request("POST", &bearer)
                 .body(Body::from("{this-is-not-json"))
                 .unwrap(),
         )
@@ -635,7 +657,7 @@ async fn sdk_errors_on_non_requests_are_preserved() {
     // minted — the SDK should reject rather than accept it.
     let unknown_session = router
         .oneshot(
-            base_request("POST")
+            base_request("POST", &bearer)
                 .header("mcp-session-id", "does-not-exist")
                 .body(Body::from(
                     serde_json::json!({

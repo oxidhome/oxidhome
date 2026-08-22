@@ -26,6 +26,7 @@ use rmcp::{
 };
 
 use crate::Engine;
+use crate::auth::Actor;
 
 use super::resources;
 
@@ -98,18 +99,33 @@ impl ServerHandler for OxidHomeMcpHandler {
     fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
     {
         let engine = self.engine.clone();
+        let token_id = actor_token_id(&context);
         async move {
-            // 14.1 mount has no bearer layer yet — every read
-            // is unauthenticated. 14.4 will replace
-            // `UNAUTHENTICATED_TOKEN_ID` with the token id
-            // resolved from the request extensions.
-            let result =
-                resources::read(engine, &request.uri, resources::UNAUTHENTICATED_TOKEN_ID).await?;
+            let result = resources::read(engine, &request.uri, &token_id).await?;
             Ok(result.into())
         }
     }
+}
+
+/// Pull the [`Actor`]-shaped token id off the request. The
+/// bearer middleware ([`crate::api::auth::require_token`]) puts
+/// an `Actor` on the HTTP request's `Extensions`; `rmcp`'s
+/// tower service forwards the surviving `http::request::Parts`
+/// (which still owns those extensions) onto
+/// [`RequestContext::extensions`]. Missing at either hop means
+/// something upstream skipped the auth layer — treat that as
+/// [`resources::UNAUTHENTICATED_TOKEN_ID`] rather than
+/// panicking, since a mis-wire would otherwise break every
+/// resource read at once with no useful signal.
+fn actor_token_id(context: &RequestContext<RoleServer>) -> String {
+    let parts = context.extensions.get::<axum::http::request::Parts>();
+    let actor = parts.and_then(|p| p.extensions.get::<Actor>());
+    actor.map_or_else(
+        || resources::UNAUTHENTICATED_TOKEN_ID.to_string(),
+        |a| a.id().to_string(),
+    )
 }
