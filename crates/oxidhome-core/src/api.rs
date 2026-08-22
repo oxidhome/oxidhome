@@ -22,7 +22,7 @@
 mod auth;
 mod bootstrap;
 mod connect_rpc;
-mod mcp;
+pub mod mcp;
 mod scopes;
 mod server;
 mod ui_ticket;

@@ -262,6 +262,134 @@ async fn loopback_origin_passes() {
     );
 }
 
+/// Round-4 F1: the earlier `nest_service` mount matched every
+/// descendant path (`/api/v1/mcp/sse`, `/messages`,
+/// `/arbitrary`), and `StreamableHttpService` happily started
+/// sessions on all of them. The exact-path `route_service`
+/// mount closes that hole — any path deeper than
+/// `/api/v1/mcp` must NOT return `200`.
+#[tokio::test(flavor = "current_thread")]
+async fn descendant_paths_are_not_mounted() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+
+    for suffix in ["/sse", "/messages", "/arbitrary", "/"] {
+        let uri = format!("{MCP_ENDPOINT}{suffix}");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header(header::HOST, MCP_HOST)
+                    .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                    .header(header::ACCEPT, MCP_ACCEPT)
+                    .body(Body::from(initialize_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "descendant path {uri} must NOT be reachable — `route_service` mounts an exact path only",
+        );
+    }
+}
+
+/// Round-4 F2: initialize past the cap MUST return
+/// `503 Service Unavailable`, not the SDK's default `500`.
+/// The admission middleware short-circuits before the SDK
+/// runs, so this path is exercised without any SDK ERROR log
+/// or half-created session leaking to the client.
+#[tokio::test(flavor = "current_thread")]
+async fn initialize_past_cap_returns_503() {
+    // Filling the production cap (128) here would slow the
+    // suite for no coverage gain — the semaphore semantics
+    // are the same at 128 as at 3. Drop `build_router` and
+    // exercise a small-cap mount directly against the MCP
+    // module.
+    use oxidhome_core::api::mcp::mount_routes_with_cap;
+
+    let engine = Engine::new().expect("engine");
+    let router = mount_routes_with_cap(&engine, 3);
+
+    let post_init = || {
+        router.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+    };
+
+    let sessions: Vec<_> = {
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let response = post_init().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "under-cap admissions");
+            let session_id = response
+                .headers()
+                .get("mcp-session-id")
+                .expect("session id on init")
+                .to_str()
+                .unwrap()
+                .to_string();
+            // Drain the first frame so the session flips to
+            // initialized before the next probe.
+            let _ = read_first_sse_data(response).await;
+            out.push(session_id);
+        }
+        out
+    };
+
+    // Cap = 3, three admitted. The next init must 503.
+    let overflow = post_init().await.unwrap();
+    assert_eq!(
+        overflow.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "over-cap init must reply 503 (admission middleware), not the SDK's default 500",
+    );
+    assert_eq!(
+        overflow
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After header on 503")
+            .to_str()
+            .unwrap(),
+        "30",
+    );
+
+    // Sanity: unrelated paths on the mount aren't 503'd —
+    // only *new session* POSTs go through the gate.
+    let get = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        get.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "GET with no session id is not an init, admission gate must pass through",
+    );
+
+    // Explicitly hold the session ids across the block so
+    // the SDK doesn't reap them before the overflow probe.
+    drop(sessions);
+}
+
 /// SDK errors on non-request payloads MUST NOT be normalized to
 /// 202 — the pre-switch review flagged malformed JSON /
 /// unknown-session / wrong-Content-Type as silently returning

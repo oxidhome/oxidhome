@@ -25,4 +25,4 @@ mod handler;
 mod server;
 mod session_store;
 
-pub use server::{MCP_ENDPOINT, mount_routes};
+pub use server::{MCP_ENDPOINT, mount_routes, mount_routes_with_cap};
