@@ -103,29 +103,30 @@ impl ServerHandler for OxidHomeMcpHandler {
     ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
     {
         let engine = self.engine.clone();
-        let token_id = actor_token_id(&context);
+        let actor = resolve_actor(&context);
         async move {
-            let result = resources::read(engine, &request.uri, &token_id).await?;
+            let result = resources::read(engine, &request.uri, &actor).await?;
             Ok(result.into())
         }
     }
 }
 
-/// Pull the [`Actor`]-shaped token id off the request. The
-/// bearer middleware ([`crate::api::auth::require_token`]) puts
-/// an `Actor` on the HTTP request's `Extensions`; `rmcp`'s
-/// tower service forwards the surviving `http::request::Parts`
-/// (which still owns those extensions) onto
-/// [`RequestContext::extensions`]. Missing at either hop means
-/// something upstream skipped the auth layer — treat that as
-/// [`resources::UNAUTHENTICATED_TOKEN_ID`] rather than
-/// panicking, since a mis-wire would otherwise break every
-/// resource read at once with no useful signal.
-fn actor_token_id(context: &RequestContext<RoleServer>) -> String {
+/// Pull the [`Actor`] off the request. The bearer middleware
+/// ([`crate::api::auth::require_token`]) puts an `Actor` on
+/// the HTTP request's `Extensions`; `rmcp`'s tower service
+/// forwards the surviving `http::request::Parts` (which still
+/// owns those extensions) onto [`RequestContext::extensions`].
+///
+/// Missing at either hop means something upstream skipped the
+/// auth layer — synthesize a **no-scope anonymous actor** so
+/// every subsequent `require_scope` check fails closed. This
+/// protects against a future mis-wire (e.g. someone removing
+/// the `require_token` layer): the resource dispatch still
+/// refuses every read, records `decision = deny`, and the
+/// audit ledger surfaces the anomaly instead of silently
+/// serving requests as some ambiguous "trusted" caller.
+fn resolve_actor(context: &RequestContext<RoleServer>) -> Actor {
     let parts = context.extensions.get::<axum::http::request::Parts>();
-    let actor = parts.and_then(|p| p.extensions.get::<Actor>());
-    actor.map_or_else(
-        || resources::UNAUTHENTICATED_TOKEN_ID.to_string(),
-        |a| a.id().to_string(),
-    )
+    let actor = parts.and_then(|p| p.extensions.get::<Actor>()).cloned();
+    actor.unwrap_or_else(|| Actor::api(resources::UNAUTHENTICATED_TOKEN_ID, Vec::new()))
 }

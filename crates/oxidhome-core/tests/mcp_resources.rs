@@ -52,17 +52,22 @@ fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
         .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
 }
 
-/// Mints a wildcard-scope test bearer against an engine's
-/// token store and returns its plaintext. The MCP mount now
-/// (round-1 F1 on PR #120) sits behind
-/// `crate::api::auth::require_token`, so every integration
-/// test needs to authenticate. Wildcard scope keeps the tests
-/// focused on the resource surface itself; per-resource scope
-/// enforcement lands in 14.4.
+/// Mints a wildcard-scope test bearer — satisfies every
+/// per-resource scope check (round-2 F1). Tests that need
+/// to exercise scope-denial paths call
+/// [`mint_bearer_with_scopes`] instead.
 fn mint_bearer(engine: &Engine) -> String {
+    mint_bearer_with_scopes(engine, "wildcard", &["*"])
+}
+
+/// Mints a bearer with a specific scope list. Scopes are
+/// stored as a JSON array on the token record, so we render
+/// them here rather than in every caller.
+fn mint_bearer_with_scopes(engine: &Engine, id: &str, scopes: &[&str]) -> String {
+    let scope_json = serde_json::to_vec(scopes).expect("scopes serialize");
     engine
         .auth_tokens()
-        .create("test", b"[\"*\"]")
+        .create(id, &scope_json)
         .expect("mint bearer")
         .plaintext
 }
@@ -393,6 +398,148 @@ async fn missing_bearer_is_401() {
         response.status(),
         StatusCode::UNAUTHORIZED,
         "MCP mount must require a bearer — no anonymous inventory access",
+    );
+}
+
+/// Round-2 F1 on PR #120 regression: a valid token with an
+/// empty scope list MUST NOT be able to read the devices or
+/// plugins resources. Pre-fix, the handler only checked
+/// authentication (any valid bearer) and ignored scopes.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_scope_bearer_is_denied_on_resource_read() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "no-scopes", &[]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://devices"}),
+    )
+    .await;
+
+    let error = &response["error"];
+    assert_eq!(
+        error["code"], -32001,
+        "empty-scope bearer must be refused with the scope-denied code",
+    );
+}
+
+/// Round-2 F1 on PR #120 regression: a token holding an
+/// unrelated scope (`logs:read`) MUST NOT enumerate devices
+/// or plugins.
+#[tokio::test(flavor = "current_thread")]
+async fn unrelated_scope_bearer_is_denied_on_resource_read() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://plugins"}),
+    )
+    .await;
+
+    let error = &response["error"];
+    assert_eq!(
+        error["code"], -32001,
+        "logs:read alone must not satisfy plugins:list; got {response}",
+    );
+    // Response body must not name the required scope — the
+    // audit row does, but leaking it here would let a
+    // probing caller enumerate the scope map.
+    assert!(
+        !error["message"]
+            .as_str()
+            .expect("error message")
+            .contains("plugins:list"),
+        "scope-denied message must not name the required scope; got {}",
+        error["message"],
+    );
+}
+
+/// Round-2 F1 companion: the scope-deny audit row records
+/// `decision = deny`, `status = 403`, AND the required scope
+/// (so a forensic sweep can distinguish "logs-only token
+/// probed devices resource" from other 403 paths).
+#[tokio::test(flavor = "current_thread")]
+async fn scope_denied_row_records_required_scope() {
+    use oxidhome_core::state::AuditQuery;
+
+    let engine = Engine::new().expect("engine");
+    let audit = engine.audit_log();
+    let bearer = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://devices"}),
+    )
+    .await;
+
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 256))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let denied = rows
+        .iter()
+        .find(|r| r.path == "mcp.resource.devices" && r.decision == "deny")
+        .expect("scope-denied audit row on devices read");
+    assert_eq!(denied.status, 403);
+    assert_eq!(
+        denied.required_scope.as_deref(),
+        Some("devices:list"),
+        "required_scope column must name the missing scope",
+    );
+}
+
+/// Round-2 F1 companion: a bearer with only `devices:list`
+/// can read `oxidhome://devices` but is denied
+/// `oxidhome://plugins` (which requires `plugins:list`).
+/// Proves scope enforcement is per-resource, not
+/// all-or-nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn per_resource_scopes_enforce_boundaries() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let devices = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://devices"}),
+    )
+    .await;
+    assert!(
+        devices["result"]["contents"].is_array(),
+        "devices:list bearer must read the devices resource; got {devices}",
+    );
+
+    let plugins = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://plugins"}),
+    )
+    .await;
+    assert_eq!(
+        plugins["error"]["code"], -32001,
+        "devices:list bearer must be refused plugins:list; got {plugins}",
     );
 }
 

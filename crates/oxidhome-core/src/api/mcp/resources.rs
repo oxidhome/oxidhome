@@ -30,17 +30,36 @@
 //! `_meta` payload the SDK carries on the response).
 
 use rmcp::model::{
-    ErrorData as McpError, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+    ErrorCode, ErrorData as McpError, ReadResourceResult, Resource, ResourceContents,
+    ResourceTemplate,
 };
 use serde::Serialize;
 
 use crate::Engine;
+use crate::api::scopes::{DEVICES_LIST, DEVICES_READ, PLUGINS_LIST, Scope, require_scope};
+use crate::auth::Actor;
 use crate::state::audit_log::AuditEntry;
 
-/// Sentinel `token_id` recorded on the audit row while the MCP
-/// mount is still unauthenticated. 14.4 will replace this with
-/// the token id resolved by the (future) bearer layer.
+/// Sentinel `token_id` recorded on the audit row when the
+/// bearer middleware is somehow missing (only a mis-wired
+/// mount can hit this — production always sits behind
+/// `require_token`). Kept as a distinct constant so the
+/// audit row identifies the miswire rather than pretending
+/// a real token id was resolved.
 pub(super) const UNAUTHENTICATED_TOKEN_ID: &str = "anonymous";
+
+/// JSON-RPC error code for "the token doesn't hold the scope
+/// this resource requires." MCP has no canonical
+/// permission-denied code, so we pick from the
+/// `-32000..=-32099` implementation-defined server-error
+/// range (matches how OAuth's `403 Forbidden` maps into
+/// JSON-RPC error surfaces elsewhere). The response message
+/// deliberately does NOT name the required scope — the
+/// audit row records that for forensic use — so a probing
+/// caller can't enumerate the scope map by trial-and-error
+/// (mirrors [`crate::api::scopes::ScopeDenied`]'s
+/// deliberate silence on the response body).
+pub(super) const SCOPE_DENIED_CODE: ErrorCode = ErrorCode(-32001);
 
 /// [`AuditEntry::actor_kind`] value we stamp on every MCP row.
 /// Matches [`crate::auth::ActorKind::Mcp`]'s `as_str()` — kept
@@ -105,17 +124,18 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
 /// (round-1 F2 on PR #120, matching the same rule the REST
 /// middleware in [`crate::api::auth::require_token`] applies).
 ///
-/// `token_id` is the auth token id resolved by the bearer
-/// middleware. The unauthenticated sentinel
-/// [`UNAUTHENTICATED_TOKEN_ID`] only reaches this fn when the
-/// middleware has been misconfigured — the mount always sits
-/// behind `require_token` in production.
+/// `actor` carries the bearer's resolved [`Actor::id`] AND
+/// [`Actor::scopes`]. Round-2 F1: enforce the per-resource
+/// scope up front (mirrors the REST endpoints' `require_scope`
+/// gates), so a token holding e.g. `logs:read` can't enumerate
+/// devices just by hitting the MCP mount.
 pub(super) async fn read(
     engine: Engine,
     uri: &str,
-    token_id: &str,
+    actor: &Actor,
 ) -> Result<ReadResourceResult, McpError> {
-    let (family, outcome) = read_inner(&engine, uri);
+    let token_id = actor.id().to_string();
+    let (family, outcome) = read_inner(&engine, uri, actor);
     // Audit-log every read. The audit call is synchronous and
     // takes the shared `Db` mutex — spawn_blocking so it can't
     // park the tokio worker under a slow disk. Fail-closed:
@@ -123,7 +143,7 @@ pub(super) async fn read(
     // (ledger unreachable, disk full, read-only DB, …) refuse
     // the read.
     let audit_log = engine.audit_log();
-    let audit_entry = new_audit_entry(token_id, family, &outcome);
+    let audit_entry = new_audit_entry(&token_id, family, &outcome);
     let audit_result =
         tokio::task::spawn_blocking(move || audit_log.record_completed(&audit_entry)).await;
     match audit_result {
@@ -147,10 +167,17 @@ pub(super) async fn read(
 
 /// Outcome shape for a single resource-read attempt. Kept as
 /// a separate enum so the audit path can look at the shape
-/// (status, decision) without re-parsing an SDK-shaped error.
+/// (status, decision, required scope) without re-parsing an
+/// SDK-shaped error.
 enum ReadOutcome {
     Ok(String),
     NotFound(String),
+    /// Bearer resolved, but its scope list does not include
+    /// [`Self::Denied::required`]. Carried through so the
+    /// audit row can name the scope that was missing.
+    Denied {
+        required: &'static str,
+    },
     Internal(String),
 }
 
@@ -161,6 +188,13 @@ impl ReadOutcome {
                 ResourceContents::text(body, uri).with_mime_type("application/json"),
             ])),
             Self::NotFound(reason) => Err(McpError::resource_not_found(reason, None)),
+            Self::Denied { required: _ } => Err(McpError::new(
+                SCOPE_DENIED_CODE,
+                // Deliberately omits the scope name; see
+                // `SCOPE_DENIED_CODE`'s doc.
+                "scope denied for MCP resource",
+                None,
+            )),
             Self::Internal(reason) => Err(McpError::internal_error(reason, None)),
         }
     }
@@ -169,6 +203,7 @@ impl ReadOutcome {
         match self {
             Self::Ok(_) => 200,
             Self::NotFound(_) => 404,
+            Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
     }
@@ -176,19 +211,32 @@ impl ReadOutcome {
     fn decision(&self) -> &'static str {
         match self {
             Self::Ok(_) => "allow",
-            Self::NotFound(_) => "deny",
+            Self::NotFound(_) | Self::Denied { .. } => "deny",
             Self::Internal(_) => "error",
+        }
+    }
+
+    /// Scope name to record on the audit row's
+    /// `required_scope` column. `Some` only for
+    /// [`Self::Denied`] — every other outcome leaves the
+    /// column NULL (matches how the REST middleware only
+    /// populates the field on scope-deny 403s).
+    fn required_scope(&self) -> Option<&'static str> {
+        match self {
+            Self::Denied { required } => Some(required),
+            _ => None,
         }
     }
 }
 
-/// Route a URI to its family + build the body. Returns the
-/// audit-family slug alongside the outcome so [`read`] can log
-/// without re-parsing. Sync today — kept as a plain fn so
-/// dispatch is trivially inlineable; the outer [`read`] is
-/// async only because the audit-log write goes through
-/// `spawn_blocking`.
-fn read_inner(engine: &Engine, uri: &str) -> (&'static str, ReadOutcome) {
+/// Route a URI to its family, check the family's required
+/// scope against the actor, and build the body if allowed.
+/// Returns the audit-family slug alongside the outcome so
+/// [`read`] can log without re-parsing. Sync today — kept as
+/// a plain fn so dispatch is trivially inlineable; the outer
+/// [`read`] is async only because the audit-log write goes
+/// through `spawn_blocking`.
+fn read_inner(engine: &Engine, uri: &str, actor: &Actor) -> (&'static str, ReadOutcome) {
     let Some(rest) = uri.strip_prefix(SCHEME) else {
         return (
             "unknown",
@@ -202,20 +250,42 @@ fn read_inner(engine: &Engine, uri: &str) -> (&'static str, ReadOutcome) {
         None => (rest, None),
     };
 
-    match (family_seg, id_seg) {
-        ("devices", None) => ("devices", devices_list(engine)),
-        ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => {
-            ("devices.detail", devices_detail(engine, id))
-        }
-        ("plugins", None) => ("plugins", plugins_list(engine)),
-        ("plugins", Some(id)) if !id.is_empty() && !id.contains('/') => {
-            ("plugins.detail", plugins_detail(engine, id))
-        }
-        _ => (
-            "unknown",
-            ReadOutcome::NotFound(format!("no MCP resource is registered for {uri}")),
-        ),
+    // Match resolves (family slug, required scope, body
+    // builder). Scope check happens uniformly below so
+    // every routed URI wears the same enforcement — no
+    // way to accidentally add a family that skips it.
+    let (family, required, build): (&'static str, Scope, Box<dyn FnOnce() -> ReadOutcome + '_>) =
+        match (family_seg, id_seg) {
+            ("devices", None) => ("devices", DEVICES_LIST, Box::new(|| devices_list(engine))),
+            ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => (
+                "devices.detail",
+                DEVICES_READ,
+                Box::new(|| devices_detail(engine, id)),
+            ),
+            ("plugins", None) => ("plugins", PLUGINS_LIST, Box::new(|| plugins_list(engine))),
+            ("plugins", Some(id)) if !id.is_empty() && !id.contains('/') => (
+                "plugins.detail",
+                PLUGINS_LIST,
+                Box::new(|| plugins_detail(engine, id)),
+            ),
+            _ => {
+                return (
+                    "unknown",
+                    ReadOutcome::NotFound(format!("no MCP resource is registered for {uri}")),
+                );
+            }
+        };
+
+    if require_scope(actor, required).is_err() {
+        return (
+            family,
+            ReadOutcome::Denied {
+                required: required.name(),
+            },
+        );
     }
+
+    (family, build())
 }
 
 fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> AuditEntry {
@@ -229,7 +299,7 @@ fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> Audit
         path: format!("mcp.resource.{family}"),
         status: outcome.status(),
         decision: outcome.decision().into(),
-        required_scope: None,
+        required_scope: outcome.required_scope().map(str::to_string),
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
