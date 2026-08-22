@@ -1,35 +1,37 @@
 //! MCP [`ServerHandler`] for `OxidHome`.
 //!
-//! Phase 14.1 ships the minimum handler that answers a real MCP
-//! handshake: `initialize` + capability negotiation, and the
-//! three discovery calls (`tools/list`, `resources/list`,
-//! `prompts/list`) return **empty** results (the `rmcp` trait
-//! defaults already do this, so we only need to override
-//! [`ServerHandler::get_info`] to declare which capability
-//! blocks we advertise). 14.2 / 14.3 / 14.6 fill in the actual
-//! resources, tools, and prompts.
+//! Currently answers `initialize`, exposes the resource
+//! catalogue built in [`super::resources`], and lets the SDK's
+//! default `tools/list` + `prompts/list` return empty lists
+//! (14.3 / 14.6 fill those in).
 //!
-//! The [`Engine`] handle is stashed on the struct so the read
-//! resource handlers (14.2) and action tools (14.3) can reach
-//! the device registry, log store, event log, blob index, etc.,
-//! without a second dependency-injection scheme. 14.1 doesn't
-//! consume it — it's parked here to keep the follow-up slice a
-//! pure additive change.
+//! The [`Engine`] handle is stashed on the struct so every
+//! resource / tool handler can reach the device registry, log
+//! store, event log, blob index, etc., without a second
+//! dependency-injection scheme. Clone is required because
+//! `StreamableHttpService` builds a fresh handler per session
+//! via its `service_factory`; `Engine` is `Arc`-backed so the
+//! clone is cheap.
+
+use std::future::Future;
 
 use rmcp::{
-    ServerHandler,
-    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
+    RoleServer, ServerHandler,
+    model::{
+        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
+        ServerInfo,
+    },
+    service::{MaybeSendFuture, RequestContext},
 };
 
 use crate::Engine;
 
-/// `OxidHome`'s MCP server handler. `Clone` is required because
-/// `StreamableHttpService` builds a fresh handler per session
-/// via its `service_factory`; `Engine` is `Arc`-backed so the
-/// clone is cheap.
+use super::resources;
+
+/// `OxidHome`'s MCP server handler.
 #[derive(Clone)]
 pub(super) struct OxidHomeMcpHandler {
-    #[allow(dead_code)] // wired for 14.2/14.3
     engine: Engine,
 }
 
@@ -67,5 +69,47 @@ impl ServerHandler for OxidHomeMcpHandler {
             "Discover data with `resources/list`, actions with `tools/list`. Read tools are \
              safe; action tools carry an `oxidhome.audit` note when they mutate host state.",
         )
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        std::future::ready(Ok(ListResourcesResult {
+            resources: resources::list_resources(),
+            ..Default::default()
+        }))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        std::future::ready(Ok(ListResourceTemplatesResult {
+            resource_templates: resources::list_resource_templates(),
+            ..Default::default()
+        }))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        let engine = self.engine.clone();
+        async move {
+            // 14.1 mount has no bearer layer yet — every read
+            // is unauthenticated. 14.4 will replace
+            // `UNAUTHENTICATED_TOKEN_ID` with the token id
+            // resolved from the request extensions.
+            let result =
+                resources::read(engine, &request.uri, resources::UNAUTHENTICATED_TOKEN_ID).await?;
+            Ok(result.into())
+        }
     }
 }
