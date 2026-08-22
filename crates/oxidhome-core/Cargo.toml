@@ -168,14 +168,20 @@ oxidhome-proto.workspace = true
 # so the dep moves up to a regular dep. Still one lockfile copy —
 # the dev tests keep pulling it via this same workspace pin.
 futures-util.workspace = true
+# The MCP admission middleware calls `axum::body::to_bytes` with a
+# size cap and needs to distinguish "hit the cap → 413 Payload Too
+# Large" from other body-read failures. `to_bytes` sets a
+# `LengthLimitError` on the error's `source()`; this dep lets the
+# middleware downcast to it. `http-body-util` is already in the
+# lockfile via `axum`, so lifting it to a workspace dep here
+# doesn't grow the dep graph.
+http-body-util.workspace = true
 
 [dev-dependencies]
 # 12-API-e — real WS round-trip test. Already in the dep graph via
 # `axum`'s `ws` feature, pinned to the same version so the lockfile
 # stays single-copy.
 tokio-tungstenite.workspace = true
-# 15-e — the Connect server-streaming integration test uses
-# `BodyExt::frame()` to peel one Connect-JSON envelope frame off
-# the response body without waiting for the (never-ending) stream
-# to close.
-http-body-util.workspace = true
+# `http-body-util` is now a regular dep (see above); the 15-e
+# Connect server-streaming test and the 14.1 MCP handshake test
+# both use `BodyExt::frame()` off it.

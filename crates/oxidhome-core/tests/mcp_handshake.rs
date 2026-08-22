@@ -463,6 +463,121 @@ async fn slow_body_returns_408_without_holding_a_slot() {
     );
 }
 
+/// Round-6 F1: unauthenticated clients can otherwise open
+/// arbitrary concurrent POSTs and force the middleware to
+/// allocate a full 4 MiB body buffer each. The pending-body
+/// semaphore caps concurrent buffering so worst-case memory is
+/// bounded to `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES`.
+/// This test wires a mount at `pending_body_gate = 1`, ties up
+/// that permit with a never-finishing body, and asserts the
+/// next POST 503s at the pending gate — proving the cap is
+/// real and enforced before buffering.
+#[tokio::test(flavor = "current_thread")]
+async fn pending_body_gate_bounds_concurrent_buffering() {
+    use oxidhome_core::api::mcp::mount_routes_with_all_limits;
+
+    let engine = Engine::new().expect("engine");
+    // Deadline long enough for the second POST to slip in
+    // while the first is still holding the permit; pending
+    // gate = 1 so the second is forced to compete for it.
+    let router =
+        mount_routes_with_all_limits(&engine, MAX_SESSIONS_FOR_TESTS, Duration::from_secs(5), 1);
+
+    let never_ending_body = || {
+        Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >())
+    };
+
+    // Fire the pending-permit-holding request but DON'T await
+    // it — its body never finishes, so the middleware sits in
+    // the buffering step holding the permit.
+    let hold = tokio::spawn({
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(MCP_ENDPOINT)
+                        .header(header::HOST, MCP_HOST)
+                        .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                        .header(header::ACCEPT, MCP_ACCEPT)
+                        .body(never_ending_body())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    });
+
+    // Yield so the holder actually enters the middleware and
+    // grabs the permit before we probe.
+    tokio::task::yield_now().await;
+    // The holder is inside `to_bytes(pending)` awaiting its
+    // first frame; two more yields make sure the permit is
+    // acquired on any scheduler.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Second POST — same mount, real body. Pending gate is at
+    // cap = 1, so this MUST reject before allocating anything.
+    let overflow = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        overflow.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "pending-body gate at cap must reply 503 without allocating a buffer",
+    );
+
+    // Let the first request time out so the test doesn't
+    // leak the join handle.
+    hold.abort();
+}
+
+/// A safe default for tests that don't want to exhaust the
+/// live-session cap — well above what any single test asks
+/// for, but a real number so no accidental unbounded behaviour
+/// slips in.
+const MAX_SESSIONS_FOR_TESTS: usize = 16;
+
+/// Round-6 F2: bodies larger than [`MAX_REQUEST_BODY_BYTES`]
+/// MUST return `413 Payload Too Large` — not `400`, which
+/// misclassifies the failure as malformed input. The pre-fix
+/// middleware lumped `LengthLimitError` into the generic
+/// bad-request path.
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_body_returns_413() {
+    let engine = Engine::new().expect("engine");
+    let router = build_router(engine);
+
+    // 4 MiB + 1 byte — the smallest payload that exceeds the
+    // production cap.
+    let oversized = vec![b'x'; (4 * 1024 * 1024) + 1];
+    let response = router
+        .oneshot(base_request("POST").body(Body::from(oversized)).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "over-cap body must be 413 Payload Too Large, not 400 (round-6 F2)",
+    );
+}
+
 /// SDK errors on non-request payloads MUST NOT be normalized to
 /// 202 — the pre-switch review flagged malformed JSON /
 /// unknown-session / wrong-Content-Type as silently returning

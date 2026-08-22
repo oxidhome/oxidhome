@@ -3,33 +3,37 @@
 //! Builds an [`rmcp`] [`StreamableHttpService`] with a bounded
 //! [`BoundedSessionManager`], mounts it at exactly
 //! [`MCP_ENDPOINT`] (no subtree), and wraps the mount in an
-//! [`admission_gate`] axum layer that:
+//! [`admission_gate`] axum layer with three tiers of protection:
 //!
-//! 1. Buffers the request body under a bounded deadline so a
-//!    slow-stream attacker cannot hold session slots by never
-//!    finishing their `initialize` body (round-5 F2). Only
-//!    once the body is fully in memory do we…
-//! 2. …try to reserve a live-session permit. At cap the mount
-//!    returns `503 Service Unavailable` before the SDK sees
-//!    the request — no ERROR log, no half-created session.
-//! 3. Commits the permit to the session id the SDK returned in
-//!    the response header, so
-//!    [`SessionManager::close_session`] can release exactly
-//!    that session's slot later (round-5 F1 is enforced by
-//!    the store, but the middleware supplies the id here).
+//! 1. **Pending-body gate** — every POST first tries to acquire
+//!    one of [`PENDING_BODY_GATE`] concurrent-body permits. This
+//!    caps memory allocated for buffering (`≤ PENDING_BODY_GATE *
+//!    MAX_REQUEST_BODY_BYTES`) so an unauthenticated client
+//!    can't blow the RSS budget just by opening enough sockets
+//!    (round-6 F1). Held for the buffering step only, then
+//!    released.
+//! 2. **Body deadline + size cap** — inside the pending gate we
+//!    buffer the body under [`REQUEST_BODY_DEADLINE`] and
+//!    [`MAX_REQUEST_BODY_BYTES`]. Deadline miss ⇒ `408`, size
+//!    miss ⇒ `413` (round-6 F2 — the pre-fix path lumped size
+//!    into `400`).
+//! 3. **Live-session gate** — only new-session POSTs (no
+//!    `mcp-session-id` header) then try to reserve one of
+//!    [`MAX_SESSIONS`] live-session permits. Existing-session
+//!    POSTs skip this tier (they don't create a session) but
+//!    still go through the first two.
 //!
-//! # Two things this module owns
+//! # Two things this module owns beyond the SDK
 //!
 //! - **Exact-path mount.** `axum::Router::route_service` —
 //!   `nest_service` matched every descendant path, which
 //!   would reintroduce the deferred SSE + messages endpoints
 //!   the SDK does not expose here.
-//! - **Admission gate.** Pre-request body deadline + 503 for
-//!   new-session POSTs past cap. The SDK would otherwise map
-//!   a `SessionManager` error to `500 Internal Server Error`
-//!   and log an ERROR line for every overload — both wrong:
-//!   `503` is the spec-shaped overload signal, and expected
-//!   overload shouldn't hit ERROR.
+//! - **Admission gate.** Pre-request body deadline, size cap,
+//!   pending-body gate, and 503 for new-session POSTs past cap.
+//!   The SDK would otherwise map a `SessionManager` error to
+//!   `500 Internal Server Error` and log an ERROR line for
+//!   every overload — both wrong for expected overload.
 //!
 //! # What `rmcp` gives us for free
 //!
@@ -56,6 +60,7 @@ use axum::{
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use tokio::sync::Semaphore;
 
 use crate::Engine;
 
@@ -73,12 +78,23 @@ pub const MCP_ENDPOINT: &str = "/api/v1/mcp";
 /// which point this becomes a config knob.
 pub(super) const MAX_SESSIONS: usize = 128;
 
+/// Maximum concurrent POST bodies being buffered by the
+/// admission middleware. Sized above [`MAX_SESSIONS`] so a
+/// bursty legitimate client that follow-up-POSTs a live
+/// session doesn't compete with new-init traffic, but tight
+/// enough to bound worst-case buffering memory to
+/// `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES` (round-6 F1
+/// — the pre-fix middleware had no upper bound on concurrent
+/// buffers, so an attacker could allocate arbitrary RSS just
+/// by opening sockets).
+pub(super) const PENDING_BODY_GATE: usize = MAX_SESSIONS * 2;
+
 /// Maximum time we will wait for the client to finish sending
 /// its request body before returning `408 Request Timeout`.
-/// Legitimate `initialize` bodies complete in single-digit
-/// milliseconds; the deadline exists to prevent a slow-stream
-/// attacker from holding admission slots by never finishing
-/// their body (round-5 F2). 5 seconds is far above realistic
+/// Legitimate MCP bodies complete in single-digit milliseconds;
+/// the deadline exists to prevent a slow-stream attacker from
+/// holding a pending-body permit or a live-session slot by
+/// never finishing their body. 5 seconds is far above realistic
 /// client latency and below any operator patience threshold.
 pub(super) const REQUEST_BODY_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -108,13 +124,28 @@ pub fn mount_routes_with_cap(engine: &Engine, cap: usize) -> Router {
 }
 
 /// Full-control variant — cap AND request-body deadline
-/// exposed. Public because the F2 regression test needs a
+/// exposed. Public because the R5 F2 regression test needs a
 /// short deadline to run in reasonable time; production
-/// callers use [`mount_routes`].
+/// callers use [`mount_routes`]. Uses the production
+/// [`PENDING_BODY_GATE`] cap; see
+/// [`mount_routes_with_all_limits`] to override that too.
 pub fn mount_routes_with_limits(
     engine: &Engine,
     cap: usize,
     request_body_deadline: Duration,
+) -> Router {
+    mount_routes_with_all_limits(engine, cap, request_body_deadline, PENDING_BODY_GATE)
+}
+
+/// Fully-parametrized mount — session cap, body deadline, AND
+/// concurrent-body-buffer permits. Public so the R6 F1
+/// regression test can exhaust the pending-body gate without
+/// firing 256 requests.
+pub fn mount_routes_with_all_limits(
+    engine: &Engine,
+    cap: usize,
+    request_body_deadline: Duration,
+    pending_body_gate: usize,
 ) -> Router {
     let session_manager = Arc::new(BoundedSessionManager::new(
         LocalSessionManager::default(),
@@ -141,6 +172,7 @@ pub fn mount_routes_with_limits(
 
     let state = GateState {
         manager: session_manager,
+        pending: Arc::new(Semaphore::new(pending_body_gate)),
         body_deadline: request_body_deadline,
     };
 
@@ -155,45 +187,47 @@ pub fn mount_routes_with_limits(
 }
 
 /// Shared state the [`admission_gate`] middleware pulls out
-/// via `State`. Keeps the manager + deadline together so a
-/// per-mount test can drive both.
+/// via `State`. Keeps the manager, pending-body gate, and
+/// deadline together so a per-mount test can drive all three.
 #[derive(Clone)]
 struct GateState {
     manager: Arc<BoundedSessionManager>,
+    /// Bounded concurrent-body-buffer permits. See
+    /// [`PENDING_BODY_GATE`].
+    pending: Arc<Semaphore>,
     body_deadline: Duration,
 }
 
-/// Middleware: on a new-session POST, buffer the body first
-/// (bounded by [`Self::body_deadline`] + [`MAX_REQUEST_BODY_BYTES`]),
-/// then reserve an admission slot. Any other request shape
-/// passes through untouched.
-///
-/// Body-first ordering (round-5 F2) means a slow-stream
-/// attacker cannot hold a session permit while they trickle
-/// bytes: their read hits the deadline, we return
-/// `408 Request Timeout`, and no admission slot was ever
-/// reserved on their behalf.
-///
-/// The reservation lives across the response. If the response
-/// header carries [`SESSION_ID_HEADER`], the SDK really did
-/// admit a session and the slot is committed to that specific
-/// id via [`super::session_store::Admission::commit`];
-/// otherwise the `Admission` handle drops and returns the slot
-/// to the pool.
+/// Middleware: enforces the three tiers described in the
+/// module doc. GET / DELETE (no bodies) pass through
+/// untouched.
 async fn admission_gate(State(state): State<GateState>, request: Request, next: Next) -> Response {
-    // Only POST-without-session-id can drive
-    // `SessionManager::create_session`. Every other shape
-    // either targets an existing session or is rejected by
-    // the SDK before it touches the manager.
-    let is_new_session =
-        request.method() == Method::POST && !request.headers().contains_key(SESSION_ID_HEADER);
-    if !is_new_session {
+    // GET / DELETE have no body to buffer or account for.
+    if request.method() != Method::POST {
         return next.run(request).await;
     }
 
-    // Body first, then admit. A slow-stream attacker never
-    // gets to reserve a slot; a legitimate init's body is in
-    // memory within ms.
+    // Tier 1: pending-body permit. Bounds worst-case memory
+    // allocated for buffering across ALL concurrent MCP
+    // POSTs (round-6 F1). Held only across the buffering
+    // step below — dropped before the potentially long-lived
+    // downstream response.
+    let Ok(pending_permit) = state.pending.clone().try_acquire_owned() else {
+        tracing::warn!(
+            cap = PENDING_BODY_GATE,
+            "MCP pending-body gate full — replying 503 Service Unavailable",
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "5")],
+            Body::from(r#"{"error":"MCP is at concurrent-request capacity; retry shortly"}"#),
+        )
+            .into_response();
+    };
+
+    // Tier 2: body deadline + size cap. Distinguishes
+    // "too big" (413) from "malformed / read error" (400)
+    // from "deadline exceeded" (408) — round-6 F2.
     let (parts, body) = request.into_parts();
     let buffered = match tokio::time::timeout(
         state.body_deadline,
@@ -203,23 +237,50 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
     {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(err)) => {
-            // `to_bytes` returns Err on both size-cap and
-            // read errors; both surface as a client bug.
-            tracing::warn!(%err, "MCP init: failed to read request body");
+            // `to_bytes` sets a `LengthLimitError` on the
+            // error's `source()` when the size cap is hit;
+            // anything else is a genuine read failure.
+            let hit_size_cap = is_length_limit_error(&err);
+            if hit_size_cap {
+                tracing::warn!(
+                    limit = MAX_REQUEST_BODY_BYTES,
+                    "MCP request body exceeded size cap — replying 413 Payload Too Large",
+                );
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "MCP request body exceeded size cap",
+                )
+                    .into_response();
+            }
+            tracing::warn!(%err, "MCP: failed to read request body");
             return (StatusCode::BAD_REQUEST, "Failed to read MCP request body").into_response();
         }
         Err(_) => {
             tracing::warn!(
                 deadline_ms = u64::try_from(state.body_deadline.as_millis()).unwrap_or(u64::MAX),
-                "MCP init: request body exceeded deadline",
+                "MCP request body exceeded deadline — replying 408 Request Timeout",
             );
             return (
                 StatusCode::REQUEST_TIMEOUT,
-                "MCP init: request body deadline exceeded",
+                "MCP request body deadline exceeded",
             )
                 .into_response();
         }
     };
+    // Body is now in RSS — drop the pending permit so a
+    // long-lived downstream response (SSE stream) doesn't
+    // hold it for its whole lifetime.
+    drop(pending_permit);
+
+    // Tier 3: live-session gate. Only POSTs that could mint
+    // a new session (no `mcp-session-id` header) reserve one
+    // of MAX_SESSIONS permits. Existing-session POSTs go
+    // straight through — they don't create sessions.
+    let is_new_session = !parts.headers.contains_key(SESSION_ID_HEADER);
+    let request = Request::from_parts(parts, Body::from(buffered));
+    if !is_new_session {
+        return next.run(request).await;
+    }
 
     let Some(admission) = state.manager.try_admit() else {
         tracing::warn!(
@@ -234,7 +295,6 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
             .into_response();
     };
 
-    let request = Request::from_parts(parts, Body::from(buffered));
     let response = next.run(request).await;
 
     // Commit the admission to the concrete session id the SDK
@@ -250,4 +310,20 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
         admission.commit(id.into());
     }
     response
+}
+
+/// True if the error surfaced from
+/// [`axum::body::to_bytes`] is `axum`'s size-cap signal
+/// (`http_body_util::LengthLimitError` on the error source).
+/// See the `to_bytes` doc example.
+fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> =
+        std::error::Error::source(err as &dyn std::error::Error);
+    while let Some(source) = current {
+        if source.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
 }
