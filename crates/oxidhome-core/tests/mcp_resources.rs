@@ -245,6 +245,158 @@ async fn list_resources_advertises_devices_and_plugins() {
             .as_str()
             .is_some_and(|s| !s.is_empty())
     );
+
+    // 14.2b adds events + logs to the same catalog.
+    assert!(
+        uris.contains(&"oxidhome://events"),
+        "resources/list missing oxidhome://events (14.2b); got {uris:?}",
+    );
+    assert!(
+        uris.contains(&"oxidhome://logs"),
+        "resources/list missing oxidhome://logs (14.2b); got {uris:?}",
+    );
+}
+
+/// 14.2b — `oxidhome://events` on a fresh engine returns an
+/// empty JSON list under the expected mime type. Confirms the
+/// resource is dispatched (scope + audit paths run) and the
+/// wire body matches the REST `GET /api/v1/events` shape.
+#[tokio::test(flavor = "current_thread")]
+async fn read_events_returns_empty_list_on_fresh_engine() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://events"}),
+    )
+    .await;
+    let body: Value = serde_json::from_str(
+        response["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("text payload"),
+    )
+    .expect("events resource body must be JSON");
+    assert!(
+        body["events"].as_array().is_some_and(Vec::is_empty),
+        "fresh engine must return an empty events list; got {body}",
+    );
+}
+
+/// 14.2b — same shape for logs.
+#[tokio::test(flavor = "current_thread")]
+async fn read_logs_returns_empty_list_on_fresh_engine() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://logs"}),
+    )
+    .await;
+    let body: Value = serde_json::from_str(
+        response["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("text payload"),
+    )
+    .expect("logs resource body must be JSON");
+    assert!(
+        body["logs"].as_array().is_some_and(Vec::is_empty),
+        "fresh engine must return an empty logs list; got {body}",
+    );
+}
+
+/// 14.2b — `oxidhome://events` requires `events:read`; a
+/// bearer with a wildcard-adjacent-but-wrong scope
+/// (`devices:list`) is refused. Mirrors the REST
+/// `GET /api/v1/events` gate.
+#[tokio::test(flavor = "current_thread")]
+async fn events_resource_requires_events_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://events"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:list must not satisfy events:read; got {response}",
+    );
+}
+
+/// 14.2b — companion for logs.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_resource_requires_logs_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "events-only", &["events:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://logs"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "events:read must not satisfy logs:read; got {response}",
+    );
+}
+
+/// 14.2b — a bogus `min_level` on the logs resource surfaces
+/// as a 4xx-shaped error (`-32002 resource-not-found` here —
+/// the closest MCP error code, since JSON-RPC doesn't have a
+/// dedicated "bad param value"). Prevents a client-side typo
+/// from silently dropping the filter and returning
+/// unfiltered rows.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_resource_rejects_unknown_min_level() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://logs?min_level=Verbose"}),
+    )
+    .await;
+    let error = &response["error"];
+    assert_ne!(
+        error["code"],
+        json!(null),
+        "bad min_level must surface as an MCP error, not a filtered success; got {response}",
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("error message")
+            .contains("Verbose"),
+        "error must name the bad value so the client can correct it; got {error}",
+    );
 }
 
 /// `resources/templates/list` advertises the parametric

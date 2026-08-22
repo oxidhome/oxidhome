@@ -9,13 +9,18 @@
 //!
 //! # Layout
 //!
-//! - [`list_resources`] — the fixed-URI catalog (`oxidhome://devices`,
-//!   `oxidhome://plugins`).
+//! - [`list_resources`] — the fixed-URI catalog
+//!   (`oxidhome://devices`, `oxidhome://plugins`,
+//!   `oxidhome://events`, `oxidhome://logs`).
 //! - [`list_resource_templates`] — parametric families
 //!   (`oxidhome://devices/{device_id}`, `oxidhome://plugins/{plugin_id}`).
 //! - [`read`] — dispatch on a concrete URI. Returns
 //!   [`ErrorData::resource_not_found`] for anything we don't
 //!   recognize; the SDK maps it to the spec `-32002`.
+//! - Query-string filters (`?since_ms=…&device_id=…&topic=…`)
+//!   on `oxidhome://events` and `oxidhome://logs` mirror the
+//!   REST endpoint parameters 1:1 — same names, same
+//!   semantics.
 //!
 //! # Audit
 //!
@@ -23,11 +28,13 @@
 //! [`AuditLog::record_completed`] row with
 //! `path = "mcp.resource.<name>"`. The `<name>` is the resource
 //! family (`devices`, `devices.detail`, `plugins`,
-//! `plugins.detail`), NOT the concrete URI — a device id can
-//! appear thousands of times in log-tail traffic and a
-//! per-URI path would make the audit index churn without
-//! adding forensic value (the resolved URI is already in the
-//! `_meta` payload the SDK carries on the response).
+//! `plugins.detail`, `events`, `logs`), NOT the concrete URI —
+//! a device id can appear thousands of times in log-tail
+//! traffic and a per-URI path would make the audit index churn
+//! without adding forensic value (the resolved URI is already
+//! in the `_meta` payload the SDK carries on the response).
+
+use std::collections::HashMap;
 
 use rmcp::model::{
     ErrorCode, ErrorData as McpError, ReadResourceResult, Resource, ResourceContents,
@@ -36,9 +43,12 @@ use rmcp::model::{
 use serde::Serialize;
 
 use crate::Engine;
-use crate::api::scopes::{DEVICES_LIST, PLUGINS_LIST, Scope, require_scope};
+use crate::api::scopes::{
+    DEVICES_LIST, EVENTS_READ, LOGS_READ, PLUGINS_LIST, Scope, require_scope,
+};
 use crate::auth::Actor;
 use crate::state::audit_log::AuditEntry;
+use crate::state::{EventQuery, LogLevel, LogQuery, TopicMatch};
 
 /// Sentinel `token_id` recorded on the audit row when the
 /// bearer middleware is somehow missing (only a mis-wired
@@ -88,6 +98,26 @@ pub(super) fn list_resources() -> Vec<Resource> {
                 "JSON list of every plugin known to the host: installed manifests \
                  plus running-but-not-installed instances, each with its live \
                  instance count. Mirrors `oxidhome plugin list`.",
+            )
+            .with_mime_type("application/json"),
+        Resource::new("oxidhome://events", "events")
+            .with_title("Event history")
+            .with_description(
+                "JSON list of historical events — capability changes, button presses, \
+                 inference results, custom plugin events. Accepts URI-query filters: \
+                 `?since_ms=<i64>&until_ms=<i64>&device_id=<id>&instance_id=<id>&plugin_id=<id>\
+                 &topic=<exact>&topic_prefix=<prefix>&after_id=<u64>&before_id=<u64>&limit=<u32>`. \
+                 Mirrors `GET /api/v1/events`.",
+            )
+            .with_mime_type("application/json"),
+        Resource::new("oxidhome://logs", "logs")
+            .with_title("Log history")
+            .with_description(
+                "JSON list of historical log rows from the durable `LogStore`. Accepts \
+                 URI-query filters: `?since_ms=<i64>&until_ms=<i64>&min_level=<Trace|Debug|Info\
+                 |Warn|Error>&instance_id=<id>&plugin_id=<id>&device_id=<id>&target=<exact>\
+                 &target_prefix=<prefix>&span_path_prefix=<prefix>&limit=<u32>`. \
+                 Mirrors `GET /api/v1/logs`.",
             )
             .with_mime_type("application/json"),
     ]
@@ -243,11 +273,19 @@ fn read_inner(engine: &Engine, uri: &str, actor: &Actor) -> (&'static str, ReadO
             ReadOutcome::NotFound(format!("URI {uri} does not use the oxidhome:// scheme")),
         );
     };
+    // Peel the optional query string first so path-splitting
+    // (`/` separator) only walks the authority + id — a caller
+    // hitting `oxidhome://events?since_ms=…` would otherwise
+    // land in the "unknown" arm because `events?since_ms=…`
+    // isn't a registered family.
+    let (path, query_str) = rest.split_once('?').map_or((rest, ""), |(p, q)| (p, q));
+    let query = parse_query(query_str);
     // Path split: `authority[/tail]`. Authority is the family
-    // (`devices`, `plugins`); tail (if any) is the id.
-    let (family_seg, id_seg) = match rest.split_once('/') {
+    // (`devices`, `plugins`, `events`, `logs`); tail (if any)
+    // is the id.
+    let (family_seg, id_seg) = match path.split_once('/') {
         Some((head, tail)) => (head, Some(tail)),
-        None => (rest, None),
+        None => (path, None),
     };
 
     // Match resolves (family slug, required scope, body
@@ -283,6 +321,12 @@ fn read_inner(engine: &Engine, uri: &str, actor: &Actor) -> (&'static str, ReadO
                 PLUGINS_LIST,
                 Box::new(|| plugins_detail(engine, id)),
             ),
+            ("events", None) => (
+                "events",
+                EVENTS_READ,
+                Box::new(|| events_read(engine, &query)),
+            ),
+            ("logs", None) => ("logs", LOGS_READ, Box::new(|| logs_read(engine, &query))),
             _ => {
                 return (
                     "unknown",
@@ -490,7 +534,164 @@ fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
     encode(&detail, "plugin detail")
 }
 
+// ── Events ────────────────────────────────────────────────────────
+
+/// Default `limit` when the caller omits one. Matches the
+/// REST `/api/v1/events` endpoint so a client that pins the
+/// same page size cross-transport sees identical pagination.
+const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
+/// Ceiling on a single events query — same value the REST
+/// handler enforces. Bounds a misbehaving client from
+/// pulling the whole `event_log` table in one shot.
+const EVENTS_QUERY_MAX_LIMIT: u32 = 1_000;
+
+/// Default / ceiling for `logs`. Mirrors the REST constants
+/// in `api::server` for the same reason as the events pair.
+const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
+const LOGS_QUERY_MAX_LIMIT: u32 = 1_000;
+
+#[derive(Serialize)]
+struct EventsBody {
+    events: Vec<super::super::server::WireHistoricalEvent>,
+}
+
+fn events_read(engine: &Engine, query: &HashMap<String, String>) -> ReadOutcome {
+    let limit = clamp_limit(query, EVENTS_QUERY_DEFAULT_LIMIT, EVENTS_QUERY_MAX_LIMIT);
+    // `topic` (exact) and `topic_prefix` are mutually
+    // exclusive — same policy as REST: prefer prefix when
+    // both are set and warn so an operator can spot the
+    // ambiguous client.
+    let topic = match (
+        query.get("topic").cloned(),
+        query.get("topic_prefix").cloned(),
+    ) {
+        (topic_exact, Some(p)) => {
+            if let Some(exact) = &topic_exact {
+                tracing::warn!(
+                    target: "mcp.events",
+                    topic_exact = %exact,
+                    topic_prefix = %p,
+                    "MCP oxidhome://events: both `topic` and `topic_prefix` supplied — using `topic_prefix`",
+                );
+            }
+            Some((p, TopicMatch::Prefix))
+        }
+        (Some(t), None) => Some((t, TopicMatch::Exact)),
+        (None, None) => None,
+    };
+    let event_query = EventQuery {
+        since_ms: parse_opt_i64(query, "since_ms"),
+        until_ms: parse_opt_i64(query, "until_ms"),
+        device_id: query.get("device_id").cloned(),
+        instance_id: query.get("instance_id").cloned(),
+        plugin_id: query.get("plugin_id").cloned(),
+        topic,
+        after_id: parse_opt_u64(query, "after_id"),
+        before_id: parse_opt_u64(query, "before_id"),
+    };
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let rows = match engine.event_log().query(&event_query, limit_usize) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(%err, "MCP events query failed");
+            return ReadOutcome::Internal("event query failed".into());
+        }
+    };
+    let events: Vec<_> = rows
+        .into_iter()
+        .map(super::super::server::WireHistoricalEvent::from_row)
+        .collect();
+    encode(&EventsBody { events }, "events")
+}
+
+// ── Logs ──────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct LogsBody<'a> {
+    logs: &'a [crate::state::HistoricalLogEvent],
+}
+
+fn logs_read(engine: &Engine, query: &HashMap<String, String>) -> ReadOutcome {
+    let limit = clamp_limit(query, LOGS_QUERY_DEFAULT_LIMIT, LOGS_QUERY_MAX_LIMIT);
+    let min_level = match query.get("min_level").map(String::as_str) {
+        Some("Trace") => Some(LogLevel::Trace),
+        Some("Debug") => Some(LogLevel::Debug),
+        Some("Info") => Some(LogLevel::Info),
+        Some("Warn") => Some(LogLevel::Warn),
+        Some("Error") => Some(LogLevel::Error),
+        // A bogus min_level is a client bug — refusing the
+        // read with a 400 shape is friendlier than silently
+        // dropping the filter.
+        Some(unknown) => {
+            return ReadOutcome::NotFound(format!(
+                "unknown min_level `{unknown}`; expected Trace|Debug|Info|Warn|Error",
+            ));
+        }
+        None => None,
+    };
+    let log_query = LogQuery {
+        since_ms: parse_opt_i64(query, "since_ms"),
+        until_ms: parse_opt_i64(query, "until_ms"),
+        min_level,
+        instance_id: query.get("instance_id").cloned(),
+        plugin_id: query.get("plugin_id").cloned(),
+        device_id: query.get("device_id").cloned(),
+        target: query.get("target").cloned(),
+        target_prefix: query.get("target_prefix").cloned(),
+        span_path_prefix: query.get("span_path_prefix").cloned(),
+    };
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let rows = match engine.log_store().query(&log_query, limit_usize) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(%err, "MCP logs query failed");
+            return ReadOutcome::Internal("log query failed".into());
+        }
+    };
+    encode(&LogsBody { logs: &rows }, "logs")
+}
+
 // ── Helpers ───────────────────────────────────────────────────────
+
+/// Parse `?key=value&key=value` into a `HashMap`. Values are
+/// left as-is — no percent-decoding. MCP resource URIs are
+/// constructed by clients that don't need to embed special
+/// characters in filter values (device ids, plugin ids,
+/// integer strings). If a real user needs percent-decoding
+/// we'll add it under a `serde_urlencoded` dep; keeping it
+/// dep-free while the surface is tiny.
+fn parse_query(raw: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if raw.is_empty() {
+        return out;
+    }
+    for pair in raw.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k.is_empty() {
+            continue;
+        }
+        out.insert(k.to_string(), v.to_string());
+    }
+    out
+}
+
+fn parse_opt_i64(query: &HashMap<String, String>, key: &str) -> Option<i64> {
+    query.get(key).and_then(|v| v.parse().ok())
+}
+
+fn parse_opt_u64(query: &HashMap<String, String>, key: &str) -> Option<u64> {
+    query.get(key).and_then(|v| v.parse().ok())
+}
+
+fn clamp_limit(query: &HashMap<String, String>, default: u32, max: u32) -> u32 {
+    let raw = query
+        .get("limit")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default);
+    raw.clamp(1, max)
+}
 
 fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     match serde_json::to_string(value) {

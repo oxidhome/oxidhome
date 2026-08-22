@@ -978,7 +978,7 @@ struct CommandBody {
 /// reuses this in `WireEventPayload::StateChanged.fields` for
 /// history + tail wire projection.
 #[derive(Debug, Serialize, Deserialize)]
-struct WireKeyValue {
+pub(crate) struct WireKeyValue {
     key: String,
     value: WireValue,
 }
@@ -2442,7 +2442,7 @@ async fn tail_events_loop(mut socket: WebSocket, mut sub: crate::state::EventSub
 /// regenerates without breaking external clients) and from the
 /// `event_log` storage shape (which is private to that module).
 #[derive(Serialize)]
-struct WireEvent {
+pub(crate) struct WireEvent {
     /// H5: the durable `event_log` row id assigned when this event
     /// was persisted. `None` for events published via a code path
     /// that doesn't hit `event_log` (host-side simulators,
@@ -2483,7 +2483,7 @@ struct WireEvent {
 /// two `StateChanged("switch")` publishes with different values.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum WireEventPayload {
+pub(crate) enum WireEventPayload {
     StateChanged {
         capability: String,
         /// Partial-state key/value pairs the plugin supplied
@@ -2860,7 +2860,7 @@ struct EventsBody {
 /// are the host-owned metadata the durable log tracks that the
 /// live wire shape doesn't.
 #[derive(Serialize)]
-struct WireHistoricalEvent {
+pub(crate) struct WireHistoricalEvent {
     id: u64,
     received_ms: i64,
     payload_ms: u64,
@@ -2872,7 +2872,7 @@ struct WireHistoricalEvent {
 }
 
 impl WireHistoricalEvent {
-    fn from_row(row: HistoricalEvent) -> Self {
+    pub(crate) fn from_row(row: HistoricalEvent) -> Self {
         // Build a scratch `Event` so `WireEvent::from_host`'s
         // payload-projection logic can be reused. The event's
         // `origin_*` / `timestamp` fields are populated from
