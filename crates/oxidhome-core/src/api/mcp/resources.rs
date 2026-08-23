@@ -146,11 +146,12 @@ pub(super) fn list_resources() -> Vec<Resource> {
         Resource::new("oxidhome://status", "status")
             .with_title("Host status")
             .with_description(
-                "JSON snapshot of host readiness: crate version, whether the shared \
-                 `SQLite` handle answers a ping (`ok`), plus counts of installed \
-                 plugins, running instances, and registered devices. Callers wanting \
-                 a plain HTTP probe should hit `GET /api/v1/readyz`; this resource is \
-                 the MCP-agent-friendly equivalent with a broader body.",
+                "JSON snapshot of host readiness: crate `version`, `uptime_ms` since \
+                 the Engine was constructed (monotonic), whether the shared `SQLite` \
+                 handle answers a ping (`ok`), plus counts of installed plugins, \
+                 running instances, and registered devices. Callers wanting a plain \
+                 HTTP probe should hit `GET /api/v1/readyz`; this resource is the \
+                 MCP-agent-friendly equivalent with a broader body.",
             )
             .with_mime_type("application/json"),
     ]
@@ -256,16 +257,14 @@ enum ReadOutcome {
     /// tokio worker never sees the raw payload — the enum
     /// carries only the ready-to-serialize string.
     ///
-    /// `_permit` holds an [`OwnedSemaphorePermit`] against the
-    /// concurrent-blob semaphore for the lifetime of this
-    /// outcome. It is released when the outcome is dropped —
-    /// which happens as soon as [`Self::into_result`] finishes
-    /// building the [`ReadResourceResult`], so a stuck client
-    /// consuming an SSE frame doesn't hold a slot forever.
+    /// Transmission-phase memory is bounded by the mount's
+    /// [`PENDING_BODY_GATE`]-holding [`PermitBody`] wrapper
+    /// (round-4 F1 on PR #122); the earlier per-outcome permit
+    /// was released too early to cover the SSE transmission
+    /// window and is gone.
     OkBlob {
         blob_b64: String,
         mime: Option<String>,
-        _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     NotFound(String),
     /// Client supplied a malformed / unknown / typed-parse
@@ -297,19 +296,12 @@ impl ReadOutcome {
             Self::OkText { body, mime } => Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(body, uri).with_mime_type(mime),
             ])),
-            Self::OkBlob {
-                blob_b64,
-                mime,
-                _permit,
-            } => {
+            Self::OkBlob { blob_b64, mime } => {
                 let mut contents = ResourceContents::blob(blob_b64, uri);
                 if let Some(m) = mime {
                     contents = contents.with_mime_type(m);
                 }
                 Ok(ReadResourceResult::new(vec![contents]))
-                // `_permit` drops here — one concurrent-blob
-                // slot returns to the pool now that the
-                // response object is fully constructed.
             }
             Self::NotFound(reason) => Err(McpError::resource_not_found(reason, None)),
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
@@ -905,6 +897,13 @@ struct StatusBody {
     /// its 200 vs. 503; keeping them aligned means an MCP agent
     /// and an orchestrator's HTTP probe agree on "up."
     ok: bool,
+    /// Milliseconds since the Engine was constructed. Sourced
+    /// from a monotonic clock (`Instant::elapsed`), so a
+    /// wall-clock adjustment during the process's lifetime
+    /// can't produce a negative or jumping value. Round-4 F3
+    /// on PR #122; the design doc's `oxidhome://status`
+    /// contract listed uptime among the required fields.
+    uptime_ms: u64,
     installed_plugins: usize,
     running_instances: usize,
     devices: usize,
@@ -932,6 +931,7 @@ async fn status_read(engine: Engine) -> ReadOutcome {
     let body = StatusBody {
         version: env!("CARGO_PKG_VERSION"),
         ok,
+        uptime_ms: engine.uptime_ms(),
         installed_plugins: engine.installed_plugins().list().len(),
         running_instances: engine.instances().list().len(),
         devices: engine.devices().list().len(),
@@ -942,37 +942,46 @@ async fn status_read(engine: Engine) -> ReadOutcome {
 // ── Blobs ─────────────────────────────────────────────────────────
 
 /// Inline-response ceiling for a single `oxidhome://blobs/...`
-/// read. Blobs are base64-encoded into the JSON-RPC response
-/// body, so per-request memory is `~size + ~4/3 * size` during
-/// processing (raw + encoded live briefly together) and
-/// `~4/3 * size` while the response frame is being written to
-/// the SSE stream. 8 MiB matches typical smart-home artifact
-/// sizes (camera snapshots, short audio clips) while capping
-/// a run-away caller. Combined with
-/// [`BLOB_CONCURRENT_READS`], per-processing memory is bounded
-/// (round-3 F1 on PR #122).
-const BLOB_INLINE_MAX_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Concurrency cap on in-flight blob READ+ENCODE cycles. Bounds
-/// the phase where raw bytes and the base64 string coexist in
-/// memory (round-3 F1 on PR #122). A permit is acquired before
-/// the read/encode blocking task runs and lives on the
-/// resulting [`ReadOutcome::OkBlob`] value; it drops the moment
-/// [`ReadOutcome::into_result`] finishes building the
-/// [`ReadResourceResult`] — after which point the encoded
-/// string is owned by the SDK response layer and the
-/// transmission-phase memory is bounded by the transport
-/// stack's own buffers, not by us.
+/// read. Blobs are base64-encoded (`ceil(4/3 * raw)` bytes)
+/// into the JSON-RPC response body, so a single request holds
+/// two allocations briefly during processing (raw ≤ 4 MiB +
+/// encoded ≤ ~5.4 MiB ≈ 9.4 MiB per slot) and ~5.4 MiB while
+/// the response frame streams. 4 MiB matches typical
+/// smart-home artifact sizes (a ~4 MP JPEG, a short WAV clip)
+/// while keeping the aggregate memory bill in the two-digit
+/// MiB range under the mount's concurrency caps.
 ///
-/// A ceiling of 4 processing slots × ~14 MiB peak per slot
-/// caps this phase at ~56 MiB — a defensible budget for a hub
-/// host.
+/// Peak processing memory is bounded by
+/// [`BLOB_CONCURRENT_READS`]; peak transmission memory is
+/// bounded by
+/// [`crate::api::mcp::server::PENDING_BODY_GATE`] (round-4 F1
+/// on PR #122 attached the request permit to the response
+/// body, so the slot doesn't release until the SSE frame is
+/// fully sent).
+const BLOB_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Concurrency cap on in-flight blob READ+ENCODE cycles.
+/// Bounds the phase where raw bytes and the base64 string
+/// coexist in memory (round-3 F1 on PR #122; math corrected
+/// in round-4 F2).
+///
+/// - Per slot peak: `BLOB_INLINE_MAX_BYTES` (4 MiB) +
+///   `ceil(4/3 * BLOB_INLINE_MAX_BYTES)` (~5.4 MiB) ≈ 9.4 MiB
+///   during the `BASE64.encode(&bytes)` call where both live.
+/// - 4 slots × 9.4 MiB ≈ 37 MiB processing peak.
+///
+/// The permit is a plain local binding in [`blob_read`] and
+/// drops when the async function returns — right after
+/// encoding finishes and the raw `Vec<u8>` has already been
+/// dropped inside the blocking task. This gate does NOT bound
+/// transmission memory; that's the mount's
+/// [`crate::api::mcp::server::PENDING_BODY_GATE`]'s job.
 const BLOB_CONCURRENT_READS: usize = 4;
 
 /// Global semaphore backing [`BLOB_CONCURRENT_READS`]. Kept
 /// `static` so the state doesn't have to thread through the
-/// SDK's `ServerHandler` trait; the read handler and the
-/// `OkBlob` outcome are the only two touchpoints.
+/// SDK's `ServerHandler` trait; the only touchpoint is
+/// [`blob_read`].
 static BLOB_READ_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| {
         std::sync::Arc::new(tokio::sync::Semaphore::new(BLOB_CONCURRENT_READS))
@@ -1019,13 +1028,13 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
             "instance `{instance_id}` is not yet loaded; retry once its state is `Running`"
         ));
     };
-    // Round-3 F1 on PR #122: acquire one of the
-    // `BLOB_CONCURRENT_READS` slots BEFORE we start the read.
-    // A backlogged caller waits here rather than piling bytes
-    // into memory; the permit rides on the resulting
-    // `OkBlob` outcome and drops when `into_result` finishes
-    // building the SDK response.
-    let permit = match std::sync::Arc::clone(&BLOB_READ_SEMAPHORE)
+    // Acquire a processing slot BEFORE we start the read
+    // (round-3 F1 on PR #122). The permit is a local binding;
+    // it drops when this async fn returns — right after the
+    // spawn_blocking task completes and its raw `Vec<u8>` has
+    // been dropped, so the peak-processing math in
+    // `BLOB_CONCURRENT_READS`' doc holds.
+    let _permit = match std::sync::Arc::clone(&BLOB_READ_SEMAPHORE)
         .acquire_owned()
         .await
     {
@@ -1042,9 +1051,9 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
     };
     // Round-2 F4 on PR #122: `read_with_info` returns bytes +
     // metadata belonging to the same blob version. Round-3
-    // F3: base64-encode INSIDE the same blocking task, so the
-    // 8-MiB Vec drops before we return to the tokio worker and
-    // the worker never sees CPU-bound encoding work.
+    // F3: base64-encode INSIDE the same blocking task so the
+    // raw Vec drops before we hand back to the tokio worker
+    // and the worker never sees CPU-bound encoding work.
     let blobs = engine.blobs();
     let uuid_for_task = installation_uuid.clone();
     let instance_for_task = instance_id.clone();
@@ -1067,7 +1076,6 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
         Ok(Ok((info, blob_b64))) => ReadOutcome::OkBlob {
             blob_b64,
             mime: info.mime,
-            _permit: Some(permit),
         },
         Ok(Err(crate::state::blobs::BlobError::NotFound { what })) => {
             ReadOutcome::NotFound(format!("blob not found: {what}"))

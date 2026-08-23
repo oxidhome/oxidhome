@@ -126,6 +126,14 @@ pub struct Engine {
     /// Round-2 F2: monotonic generation counter for
     /// reaper-tracker entries. Bumped once per spawn.
     reaper_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Monotonic instant the Engine was constructed. Used by
+    /// operational surfaces (`oxidhome://status`,
+    /// `GET /api/v1/readyz`) to report host uptime. `Instant`
+    /// rather than `SystemTime` so a wall-clock adjustment
+    /// during the process's lifetime can't produce a negative
+    /// uptime; the reporting surface converts to milliseconds
+    /// via `Instant::elapsed()` on demand.
+    started_at: std::time::Instant,
     /// Round-7 F1: shutdown gate. Set by
     /// [`Self::stop_all_supervised_instances`] BEFORE it
     /// snapshots the instance registry — once set,
@@ -375,6 +383,7 @@ impl Engine {
             ui_ticket_secret: Arc::new(mint_ui_ticket_secret()),
             reapers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             reaper_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            started_at: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -399,6 +408,16 @@ impl Engine {
     /// audit-ledger writes, KV, blob-index, event-log, and
     /// log-store readiness in one shot.
     ///
+    /// Milliseconds since the Engine was constructed. Sourced
+    /// from a monotonic `Instant`, so wall-clock adjustments
+    /// during the process's lifetime can't produce a negative
+    /// or jumping value. Used by operational surfaces
+    /// (`oxidhome://status`) to report host uptime.
+    #[must_use]
+    pub fn uptime_ms(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// # Errors
     ///
     /// Forwards any `rusqlite` failure.

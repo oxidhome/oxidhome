@@ -1044,6 +1044,18 @@ async fn read_status_returns_json_snapshot_on_fresh_engine() {
     assert_eq!(body["installed_plugins"], 0);
     assert_eq!(body["running_instances"], 0);
     assert_eq!(body["devices"], 0);
+    // 14.2c round-4 F3: uptime is a required field on the
+    // status body. On a fresh engine the value is small but
+    // non-negative; we don't pin the exact number because
+    // wall-clock between `Engine::new` and this assertion
+    // varies with test-runner load.
+    let uptime = body["uptime_ms"]
+        .as_u64()
+        .expect("uptime_ms must be a non-negative integer");
+    assert!(
+        uptime < 60_000,
+        "fresh-engine uptime unexpectedly large: {uptime}"
+    );
 }
 
 /// A token without `status:read` cannot read the status

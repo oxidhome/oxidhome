@@ -10,8 +10,13 @@
 //!    caps memory allocated for buffering (`≤ PENDING_BODY_GATE *
 //!    MAX_REQUEST_BODY_BYTES`) so an unauthenticated client
 //!    can't blow the RSS budget just by opening enough sockets
-//!    (round-6 F1). Held for the buffering step only, then
-//!    released.
+//!    (round-6 F1). Round-4 F1 on PR #122 extended the permit's
+//!    lifetime: the permit rides on the response body via a
+//!    [`PermitBody`] wrapper, so it isn't released until the
+//!    SSE / JSON body has actually been sent to the client. That
+//!    caps in-transit response memory the same way it caps
+//!    request-buffer memory — a slow client accepting a blob
+//!    response holds a slot until it finishes reading.
 //! 2. **Body deadline + size cap** — inside the pending gate we
 //!    buffer the body under [`REQUEST_BODY_DEADLINE`] and
 //!    [`MAX_REQUEST_BODY_BYTES`]. Deadline miss ⇒ `408`, size
@@ -78,16 +83,24 @@ pub const MCP_ENDPOINT: &str = "/api/v1/mcp";
 /// which point this becomes a config knob.
 pub(super) const MAX_SESSIONS: usize = 128;
 
-/// Maximum concurrent POST bodies being buffered plus in
-/// flight downstream at any moment. Sized to a small home-hub
-/// memory budget: `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES`
-/// bounds worst-case middleware-owned memory to a single
-/// digit of MiB — well within what a Raspberry Pi-class hub
-/// can spare, and low enough that the SDK's own re-parse of
-/// the same buffer doesn't push the peak into critical range
-/// (round-7 F1). The gate covers the whole downstream call
-/// (see [`admission_gate`]), not just the buffering step, so
-/// this cap directly limits concurrent MCP POSTs on the wire.
+/// Maximum concurrent POST bodies alive on the mount at any
+/// moment — from the moment the request enters the middleware
+/// until the response body finishes streaming (round-4 F1 on
+/// PR #122 attached the permit to the response body). Sized to
+/// a small home-hub memory budget:
+///
+/// - **Request-buffering:** `PENDING_BODY_GATE *
+///   MAX_REQUEST_BODY_BYTES` = 16 MiB worst-case buffered.
+/// - **Response-transmission:** dominated by blob-carrying
+///   responses. With [`crate::api::mcp::resources`]'s
+///   `BLOB_INLINE_MAX_BYTES` (4 MiB → ~5.4 MiB base64) each
+///   in-transit blob response is ≤ ~5.4 MiB; the gate caps
+///   aggregate to `PENDING_BODY_GATE * 5.4 MiB` ≈ 85 MiB.
+///
+/// Small JSON responses (all non-blob resources) barely
+/// register against this budget; the 85 MiB figure is a
+/// worst-case where every gated request happens to be a blob
+/// read.
 pub(super) const PENDING_BODY_GATE: usize = 16;
 
 /// Maximum time we will wait for the client to finish sending
@@ -306,21 +319,12 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
         }
     };
 
-    // The pending permit is deliberately held across
-    // `next.run` below. `axum::body::to_bytes` gives us the
-    // buffered `Bytes`, but the SDK's `expect_json` re-parses
-    // it into a `ClientJsonRpcMessage`, and both objects are
-    // resident until the response future returns — so peak
-    // middleware-owned memory per request is (roughly) twice
-    // `buffered.len()`, not once. Releasing the permit at
-    // the end of buffering would let another N requests
-    // start allocating while the SDK still holds the earlier
-    // buffers — the effective peak would exceed the cap
-    // (round-7 F1). `next.run` returns as soon as the
-    // response object (including the streaming SSE body) is
-    // constructed, not when the SSE stream finishes, so
-    // holding the permit until then does NOT wedge on
-    // long-lived subscriptions.
+    // The pending permit rides through `next.run` (bounds the
+    // SDK's re-parse) and then onto the response body via
+    // [`attach_permit_to_body`] (bounds transmission-phase
+    // memory — round-4 F1 on PR #122). A slow client accepting
+    // an SSE frame keeps its slot until the connection drains
+    // or drops, which is what we want the cap to reflect.
 
     // Tier 3: live-session gate. Only POSTs that could mint
     // a new session (no `mcp-session-id` header) reserve one
@@ -330,8 +334,15 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
     let request = Request::from_parts(parts, Body::from(buffered));
     if !is_new_session {
         let response = next.run(request).await;
-        drop(pending_permit);
-        return response;
+        // Round-4 F1 on PR #122: hand the pending permit off
+        // to the response body so the slot doesn't release
+        // until the SSE stream is fully consumed (or the
+        // client disconnects). Pre-fix, the permit dropped
+        // as soon as `next.run` returned, letting a slow
+        // client accumulate arbitrarily many in-transit blob
+        // response bodies while fresh POSTs kept taking
+        // permits.
+        return attach_permit_to_body(response, pending_permit);
     }
 
     let Some(admission) = state.manager.try_admit() else {
@@ -361,12 +372,77 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
     {
         admission.commit(id.into());
     }
-    // Pending permit outlives the response construction so
-    // the SDK's re-parse of the buffered body counts against
-    // the same cap; released here, before the returned SSE
-    // stream can start ticking (round-7 F1).
-    drop(pending_permit);
-    response
+    // Same body wrap as the existing-session path — the
+    // pending permit rides on the response body until it's
+    // fully sent (round-4 F1 on PR #122).
+    attach_permit_to_body(response, pending_permit)
+}
+
+/// Wrap the response body with a [`PermitBody`] that owns the
+/// caller's [`OwnedSemaphorePermit`] — the permit drops when
+/// axum/hyper finishes writing the body OR the client
+/// disconnects, whichever happens first. This is the mechanism
+/// that gives [`PENDING_BODY_GATE`] a transmission-lifetime
+/// bound rather than a handler-lifetime one.
+fn attach_permit_to_body(
+    response: Response,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let wrapped = Body::new(PermitBody {
+        inner: body,
+        _permit: permit,
+    });
+    Response::from_parts(parts, wrapped)
+}
+
+/// [`http_body::Body`] wrapper that keeps an
+/// [`tokio::sync::OwnedSemaphorePermit`] alive for the full
+/// lifetime of the response body. Delegates every trait method
+/// to `inner`; the permit is released when the wrapper drops
+/// (either the body is fully consumed OR the axum/hyper layer
+/// drops the response because the connection went away).
+///
+/// The wrapper carries `Bytes` as its data type because that's
+/// the frame shape `axum::body::Body` yields; the trait's error
+/// type is `axum::Error` for the same reason. Every downstream
+/// consumer of an axum `Response` handles those exact types
+/// already, so wrapping is transparent.
+struct PermitBody {
+    inner: Body,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+// Both `Body` and `OwnedSemaphorePermit` are `Unpin`, so the
+// wrapper is `Unpin` too — the auto-derive kicks in, and the
+// `poll_frame` impl below uses `Pin::new` on the field without
+// any unsafe. Explicit assertion so a future field addition
+// that isn't `Unpin` fails at compile time here rather than
+// at some downstream `poll_frame` call.
+const _: fn() = || {
+    fn assert_unpin<T: Unpin>() {}
+    assert_unpin::<PermitBody>();
+};
+
+impl http_body::Body for PermitBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// True if the error surfaced from
