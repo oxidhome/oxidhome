@@ -92,6 +92,16 @@ pub(super) const SCOPE_DENIED_CODE: ErrorCode = ErrorCode(-32001);
 /// apart from "bad input." Round-3 F4 on PR #122.
 pub(super) const RESOURCE_TOO_LARGE_CODE: ErrorCode = ErrorCode(-32003);
 
+/// JSON-RPC error code for "the server is transiently at
+/// capacity for this resource family." Round-6 F4 on PR #122
+/// split this out of [`RESOURCE_TOO_LARGE_CODE`] because a
+/// full concurrency semaphore (blob-read gate, audit-write
+/// gate) is a transient overload — a well-behaved client
+/// should retry, and an operator scanning the audit ledger
+/// wants to see it as `503 Service Unavailable`, not as a
+/// permanent `413` on this particular resource.
+pub(super) const RESOURCE_BUSY_CODE: ErrorCode = ErrorCode(-32004);
+
 /// [`AuditEntry::actor_kind`] value we stamp on every MCP row.
 /// Matches [`crate::auth::ActorKind::Mcp`]'s `as_str()` — kept
 /// as a literal here to avoid a cross-module dep just for the
@@ -206,6 +216,36 @@ pub(super) async fn read(
     uri: &str,
     actor: &Actor,
 ) -> Result<ReadResourceResult, McpError> {
+    // Round-6 F3 on PR #122: bound the concurrent audit-write
+    // tasks. `try_acquire_owned` refuses immediately when the
+    // queue is at [`AUDIT_QUEUE_MAX`], so a disconnect-flooded
+    // client — whose rmcp handler tasks keep running past the
+    // client disconnect and whose earlier permit-drop released
+    // the mount's pending-body slot — can't pile up unbounded
+    // `spawn_blocking(record_completed)` tasks behind the
+    // shared `SQLite` mutex.
+    //
+    // The refusal itself is NOT audited (that would defeat the
+    // bound). It's logged at warn level via `tracing`, which
+    // the durable `LogStore` captures — so an operator's
+    // ledger scan still sees the overload signal, just not
+    // the per-request audit row. The `RESOURCE_BUSY_CODE`
+    // client response makes the transient-overload semantics
+    // explicit; a well-behaved client retries.
+    let Ok(audit_permit) = std::sync::Arc::clone(&AUDIT_QUEUE_SEMAPHORE).try_acquire_owned()
+    else {
+        tracing::warn!(
+            cap = AUDIT_QUEUE_MAX,
+            uri,
+            "MCP audit-write queue saturated — refusing read without audit",
+        );
+        return Err(McpError::new(
+            RESOURCE_BUSY_CODE,
+            "MCP audit-write queue saturated; retry shortly",
+            None,
+        ));
+    };
+
     let token_id = actor.id().to_string();
     let (family, outcome) = read_inner(engine.clone(), uri, actor).await;
     // Audit-log every read. The audit call is synchronous and
@@ -216,8 +256,14 @@ pub(super) async fn read(
     // the read.
     let audit_log = engine.audit_log();
     let audit_entry = new_audit_entry(&token_id, family, &outcome);
-    let audit_result =
-        tokio::task::spawn_blocking(move || audit_log.record_completed(&audit_entry)).await;
+    let audit_result = tokio::task::spawn_blocking(move || {
+        // Move the permit into the closure so it drops when
+        // the actual audit write completes — not when the
+        // outer `read` future returns.
+        let _guard = audit_permit;
+        audit_log.record_completed(&audit_entry)
+    })
+    .await;
     match audit_result {
         Ok(Ok(_row_id)) => outcome.into_result(uri),
         Ok(Err(err)) => {
@@ -236,6 +282,22 @@ pub(super) async fn read(
         }
     }
 }
+
+/// Maximum concurrent MCP audit-write tasks. Bounds the size
+/// of the `spawn_blocking` queue backed up behind the shared
+/// `SQLite` mutex (round-6 F3 on PR #122). Sized to comfortably
+/// exceed the mount's [`crate::api::mcp::server::PENDING_BODY_GATE`]
+/// (16) so a fully-utilised mount never hits the audit gate,
+/// while capping the runaway path (rmcp handler tasks that
+/// outlive their originating request future).
+pub(super) const AUDIT_QUEUE_MAX: usize = 32;
+
+/// Global semaphore backing [`AUDIT_QUEUE_MAX`]. `static` for
+/// the same reason as [`BLOB_READ_SEMAPHORE`] — no need to
+/// thread through the SDK's `ServerHandler` trait, and only
+/// touched from [`read`].
+static AUDIT_QUEUE_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(AUDIT_QUEUE_MAX)));
 
 /// Outcome shape for a single resource-read attempt. Kept as
 /// a separate enum so the audit path can look at the shape
@@ -281,6 +343,15 @@ enum ReadOutcome {
     /// (round-3 F4 on PR #122). Reported to the client as
     /// [`RESOURCE_TOO_LARGE_CODE`]; audited as HTTP 413.
     TooLarge(String),
+    /// Server is transiently at capacity for this resource
+    /// family — a concurrency semaphore (blob-read gate,
+    /// audit-write gate) had no permits available. Round-6 F4
+    /// on PR #122 split this out of [`Self::TooLarge`] because
+    /// they mean different things to the client (retry vs.
+    /// reduce the request) and to an operator scanning the
+    /// audit ledger. Reported as [`RESOURCE_BUSY_CODE`] and
+    /// audited as HTTP 503.
+    Busy(String),
     /// Bearer resolved, but its scope list does not include
     /// [`Self::Denied::required`]. Carried through so the
     /// audit row can name the scope that was missing.
@@ -306,6 +377,7 @@ impl ReadOutcome {
             Self::NotFound(reason) => Err(McpError::resource_not_found(reason, None)),
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
+            Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
             Self::Denied { required: _ } => Err(McpError::new(
                 SCOPE_DENIED_CODE,
                 // Deliberately omits the scope name; see
@@ -323,6 +395,7 @@ impl ReadOutcome {
             Self::NotFound(_) => 404,
             Self::InvalidParams(_) => 400,
             Self::TooLarge(_) => 413,
+            Self::Busy(_) => 503,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -334,7 +407,8 @@ impl ReadOutcome {
             Self::NotFound(_)
             | Self::Denied { .. }
             | Self::InvalidParams(_)
-            | Self::TooLarge(_) => "deny",
+            | Self::TooLarge(_)
+            | Self::Busy(_) => "deny",
             Self::Internal(_) => "error",
         }
     }
@@ -1060,7 +1134,10 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
                 cap = BLOB_CONCURRENT_READS,
                 "MCP blob concurrency cap reached — refusing read",
             );
-            return ReadOutcome::TooLarge(format!(
+            // Round-6 F4 on PR #122: `Busy` (503) not
+            // `TooLarge` (413). The URI is fine; server is
+            // just transiently saturated. Client should retry.
+            return ReadOutcome::Busy(format!(
                 "MCP blob concurrency cap reached ({BLOB_CONCURRENT_READS} in-flight reads); retry shortly"
             ));
         }
@@ -1095,10 +1172,33 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
     })
     .await;
     match join {
-        Ok(Ok((info, blob_b64))) => ReadOutcome::OkBlob {
-            blob_b64,
-            mime: info.mime,
-        },
+        Ok(Ok((info, blob_b64))) => {
+            // Round-6 F1 on PR #122: the store-side cap
+            // ([`BLOB_INLINE_MAX_BYTES`]) already ceilings the
+            // RAW blob at 4 MiB, so the encoded string can't
+            // exceed `ceil(4/3 * 4 MiB)` ≈ 5.4 MiB — well
+            // under `MAX_RESOURCE_BODY_BYTES` (6 MiB). Check
+            // anyway as belt-and-suspenders so any future
+            // change to `BLOB_INLINE_MAX_BYTES` trips this
+            // guard (audited as 413) instead of the
+            // middleware's stream-terminate path (looks like
+            // a network error to the client).
+            if blob_b64.len() > MAX_RESOURCE_BODY_BYTES {
+                tracing::warn!(
+                    size = blob_b64.len(),
+                    cap = MAX_RESOURCE_BODY_BYTES,
+                    "MCP blob b64 body exceeded pre-serialization cap — refusing read",
+                );
+                return ReadOutcome::TooLarge(format!(
+                    "encoded blob is {} bytes; the per-response cap is {MAX_RESOURCE_BODY_BYTES}",
+                    blob_b64.len(),
+                ));
+            }
+            ReadOutcome::OkBlob {
+                blob_b64,
+                mime: info.mime,
+            }
+        }
         Ok(Err(crate::state::blobs::BlobError::NotFound { what })) => {
             ReadOutcome::NotFound(format!("blob not found: {what}"))
         }
@@ -1412,7 +1512,7 @@ mod percent_decode_tests {
 
 #[cfg(test)]
 mod outcome_tests {
-    use super::{RESOURCE_TOO_LARGE_CODE, ReadOutcome};
+    use super::{RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, ReadOutcome};
 
     /// Round-3 F4 on PR #122: `ReadOutcome::TooLarge` maps to a
     /// dedicated JSON-RPC error code (not the -32602
@@ -1438,6 +1538,58 @@ mod outcome_tests {
             "reason must reach the caller: {err:?}",
         );
     }
+
+    /// Round-6 F4 on PR #122: `ReadOutcome::Busy` is
+    /// deliberately distinct from `TooLarge`. Saturation of a
+    /// concurrency semaphore is a transient overload, so the
+    /// client sees `RESOURCE_BUSY_CODE` (retry) and the audit
+    /// ledger records HTTP 503, not 413.
+    #[test]
+    fn busy_maps_to_503_and_dedicated_code() {
+        let outcome = ReadOutcome::Busy("too many concurrent reads".into());
+        assert_eq!(outcome.status(), 503);
+        assert_eq!(outcome.decision(), "deny");
+        assert!(outcome.required_scope().is_none());
+
+        let err = outcome
+            .into_result("oxidhome://blobs/foo/bar")
+            .expect_err("Busy must surface as an Err");
+        assert_eq!(err.code, RESOURCE_BUSY_CODE);
+        assert!(
+            err.message.contains("too many concurrent reads"),
+            "reason must reach the caller: {err:?}",
+        );
+    }
+
+    /// Round-6 F1 on PR #122: `encode` refuses bodies past
+    /// [`super::MAX_RESOURCE_BODY_BYTES`] BEFORE returning
+    /// `OkText`, so the reviewer's inflation vector (inner JSON
+    /// re-escaped by rmcp's outer envelope) can't push a
+    /// nominal 6 MiB response past the transport cap.
+    #[test]
+    fn encode_refuses_oversize_body() {
+        use serde::Serialize;
+        // A one-field wrapper around a `String` serializes to
+        // ~= `size + 6` bytes (opening / closing braces, key,
+        // colon, quotes). Passing a raw string just past the
+        // cap generates a body just past the cap without
+        // allocating hundreds of MiB in the test itself.
+        #[derive(Serialize)]
+        struct Big<'a>(&'a str);
+        let payload = "x".repeat(super::MAX_RESOURCE_BODY_BYTES + 4);
+        let outcome = super::encode(&Big(&payload), "over-cap-test");
+        assert!(
+            matches!(&outcome, ReadOutcome::TooLarge(reason) if reason.contains("over-cap-test")),
+            "expected TooLarge naming the resource; got wrong outcome variant",
+        );
+        // And the outcome maps to the 413 audit status +
+        // dedicated JSON-RPC code end-to-end.
+        assert_eq!(outcome.status(), 413);
+        let err = outcome
+            .into_result("oxidhome://events")
+            .expect_err("must surface as Err");
+        assert_eq!(err.code, RESOURCE_TOO_LARGE_CODE);
+    }
 }
 
 fn parse_opt_u64(query: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String> {
@@ -1460,15 +1612,54 @@ fn clamp_limit(query: &HashMap<String, String>, default: u32, max: u32) -> Resul
     Ok(n.clamp(1, max))
 }
 
+/// Pre-serialization ceiling on a resource-read body — the
+/// JSON string this handler hands to rmcp as the
+/// [`ResourceContents::text`] payload. Rmcp then embeds that
+/// string in an outer JSON-RPC envelope (which re-escapes every
+/// `"`, `\`, and control byte in our JSON), and wraps the whole
+/// thing in SSE framing before it hits the wire.
+///
+/// The transport-level ceiling
+/// ([`crate::api::mcp::server::MAX_RESPONSE_BODY_BYTES`]) is
+/// 8 MiB. This inner cap is set to 6 MiB so the worst-case
+/// escape inflation (`"` → `\"`, `\` → `\\`, ~2× on a
+/// quote/backslash-heavy JSON payload — round-6 F2 on
+/// PR #122) plus SSE framing stays under the transport cap,
+/// AND so the caller sees a valid JSON-RPC error (`-32003`
+/// audited as 413) instead of a truncated SSE stream.
+const MAX_RESOURCE_BODY_BYTES: usize = 6 * 1024 * 1024;
+
 fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     match serde_json::to_string(value) {
-        Ok(body) => ReadOutcome::OkText {
-            body,
-            mime: "application/json",
-        },
+        Ok(body) => guard_body_size(body, what, "application/json"),
         Err(err) => {
             tracing::error!(%err, what, "MCP resource serialization failed");
             ReadOutcome::Internal(format!("failed to serialize {what}"))
         }
     }
+}
+
+/// Refuse a body whose serialized size exceeds
+/// [`MAX_RESOURCE_BODY_BYTES`] BEFORE rmcp gets a chance to
+/// re-serialize it into the JSON-RPC envelope. The client
+/// gets a well-shaped `-32003` "resource too large" error,
+/// the audit ledger sees `413`, and the transport wrapper
+/// ([`crate::api::mcp::server::PermitBody`]) never has to
+/// terminate the stream (which would look like a network
+/// error to the client). Round-6 F1 on PR #122.
+fn guard_body_size(body: String, what: &'static str, mime: &'static str) -> ReadOutcome {
+    if body.len() > MAX_RESOURCE_BODY_BYTES {
+        tracing::warn!(
+            what,
+            size = body.len(),
+            cap = MAX_RESOURCE_BODY_BYTES,
+            "MCP resource body exceeded pre-serialization cap — refusing read",
+        );
+        return ReadOutcome::TooLarge(format!(
+            "MCP `{what}` body is {} bytes; the per-response cap is {MAX_RESOURCE_BODY_BYTES}. \
+             Narrow the query (smaller `limit`, tighter filter) and retry.",
+            body.len(),
+        ));
+    }
+    ReadOutcome::OkText { body, mime }
 }
