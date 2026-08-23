@@ -129,7 +129,13 @@ pub enum LogLevel {
 }
 
 /// One row from `log_event`, decoded back into typed Rust.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` is derived so callers that need a JSON wire
+/// shape can render the row directly (the REST + MCP surfaces
+/// use the same field layout; if either diverges, wrap in a
+/// dedicated wire struct at THAT surface instead of forking
+/// this one).
+#[derive(Debug, Clone, Serialize)]
 pub struct HistoricalLogEvent {
     pub id: u64,
     pub ts_unix_ms: i64,

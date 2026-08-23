@@ -9,13 +9,21 @@
 //!
 //! # Layout
 //!
-//! - [`list_resources`] — the fixed-URI catalog (`oxidhome://devices`,
-//!   `oxidhome://plugins`).
+//! - [`list_resources`] — the fixed-URI catalog
+//!   (`oxidhome://devices`, `oxidhome://plugins`,
+//!   `oxidhome://events`, `oxidhome://logs`).
 //! - [`list_resource_templates`] — parametric families
 //!   (`oxidhome://devices/{device_id}`, `oxidhome://plugins/{plugin_id}`).
 //! - [`read`] — dispatch on a concrete URI. Returns
 //!   [`ErrorData::resource_not_found`] for anything we don't
 //!   recognize; the SDK maps it to the spec `-32002`.
+//! - Query-string filters (`?since=1h&device=…&topic=…`) on
+//!   `oxidhome://events` and `oxidhome://logs` follow the
+//!   stable contract in `.claude/docs/10_mcp.md` — short
+//!   names (`since`, `until`, `device`, `plugin`, `instance`,
+//!   `level`, …) and relative durations (`10s`, `5m`, `2h`,
+//!   `1d`), not REST's absolute `_ms` epochs. Unknown keys
+//!   are rejected with `INVALID_PARAMS`.
 //!
 //! # Audit
 //!
@@ -23,11 +31,13 @@
 //! [`AuditLog::record_completed`] row with
 //! `path = "mcp.resource.<name>"`. The `<name>` is the resource
 //! family (`devices`, `devices.detail`, `plugins`,
-//! `plugins.detail`), NOT the concrete URI — a device id can
-//! appear thousands of times in log-tail traffic and a
-//! per-URI path would make the audit index churn without
-//! adding forensic value (the resolved URI is already in the
-//! `_meta` payload the SDK carries on the response).
+//! `plugins.detail`, `events`, `logs`), NOT the concrete URI —
+//! a device id can appear thousands of times in log-tail
+//! traffic and a per-URI path would make the audit index churn
+//! without adding forensic value (the resolved URI is already
+//! in the `_meta` payload the SDK carries on the response).
+
+use std::collections::HashMap;
 
 use rmcp::model::{
     ErrorCode, ErrorData as McpError, ReadResourceResult, Resource, ResourceContents,
@@ -36,9 +46,13 @@ use rmcp::model::{
 use serde::Serialize;
 
 use crate::Engine;
-use crate::api::scopes::{DEVICES_LIST, PLUGINS_LIST, Scope, require_scope};
+use crate::api::scopes::{
+    DEVICES_LIST, EVENTS_READ, LOGS_READ, PLUGINS_LIST, Scope, require_scope,
+};
 use crate::auth::Actor;
 use crate::state::audit_log::AuditEntry;
+use crate::state::event_log::now_unix_ms;
+use crate::state::{EventQuery, LogLevel, LogQuery, TopicMatch};
 
 /// Sentinel `token_id` recorded on the audit row when the
 /// bearer middleware is somehow missing (only a mis-wired
@@ -90,6 +104,28 @@ pub(super) fn list_resources() -> Vec<Resource> {
                  instance count. Mirrors `oxidhome plugin list`.",
             )
             .with_mime_type("application/json"),
+        Resource::new("oxidhome://events", "events")
+            .with_title("Event history")
+            .with_description(
+                "JSON list of historical events — capability changes, button presses, \
+                 inference results, custom plugin events. Accepts URI-query filters: \
+                 `?since=<duration>&until=<duration>&device=<id>&instance=<id>&plugin=<id>\
+                 &topic=<exact>&topic_prefix=<prefix>&after_id=<u64>&before_id=<u64>&limit=<u32>`. \
+                 Durations use `Ns|Nm|Nh|Nd` suffixes (`60s`, `5m`, `2h`, `1d`) and \
+                 resolve relative to `now`. Mirrors `GET /api/v1/events` semantically.",
+            )
+            .with_mime_type("application/json"),
+        Resource::new("oxidhome://logs", "logs")
+            .with_title("Log history")
+            .with_description(
+                "JSON list of historical log rows from the durable `LogStore`. Accepts \
+                 URI-query filters: `?since=<duration>&until=<duration>&level=<Trace|Debug|Info\
+                 |Warn|Error>&instance=<id>&plugin=<id>&device=<id>&target=<exact>\
+                 &target_prefix=<prefix>&span_path_prefix=<prefix>&limit=<u32>`. \
+                 Durations use `Ns|Nm|Nh|Nd` suffixes and resolve relative to `now`. \
+                 Mirrors `GET /api/v1/logs` semantically.",
+            )
+            .with_mime_type("application/json"),
     ]
 }
 
@@ -135,7 +171,7 @@ pub(super) async fn read(
     actor: &Actor,
 ) -> Result<ReadResourceResult, McpError> {
     let token_id = actor.id().to_string();
-    let (family, outcome) = read_inner(&engine, uri, actor);
+    let (family, outcome) = read_inner(engine.clone(), uri, actor).await;
     // Audit-log every read. The audit call is synchronous and
     // takes the shared `Db` mutex — spawn_blocking so it can't
     // park the tokio worker under a slow disk. Fail-closed:
@@ -172,6 +208,13 @@ pub(super) async fn read(
 enum ReadOutcome {
     Ok(String),
     NotFound(String),
+    /// Client supplied a malformed / unknown / typed-parse
+    /// failure on a query-string filter. Maps to JSON-RPC
+    /// `INVALID_PARAMS` (-32602) — the closest MCP code for
+    /// "the request shape was wrong." Round-1 F4 on PR #121:
+    /// pre-fix, bad `since_ms=oops` was silently treated as
+    /// absent and the query broadened.
+    InvalidParams(String),
     /// Bearer resolved, but its scope list does not include
     /// [`Self::Denied::required`]. Carried through so the
     /// audit row can name the scope that was missing.
@@ -188,6 +231,7 @@ impl ReadOutcome {
                 ResourceContents::text(body, uri).with_mime_type("application/json"),
             ])),
             Self::NotFound(reason) => Err(McpError::resource_not_found(reason, None)),
+            Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::Denied { required: _ } => Err(McpError::new(
                 SCOPE_DENIED_CODE,
                 // Deliberately omits the scope name; see
@@ -203,6 +247,7 @@ impl ReadOutcome {
         match self {
             Self::Ok(_) => 200,
             Self::NotFound(_) => 404,
+            Self::InvalidParams(_) => 400,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -211,7 +256,7 @@ impl ReadOutcome {
     fn decision(&self) -> &'static str {
         match self {
             Self::Ok(_) => "allow",
-            Self::NotFound(_) | Self::Denied { .. } => "deny",
+            Self::NotFound(_) | Self::Denied { .. } | Self::InvalidParams(_) => "deny",
             Self::Internal(_) => "error",
         }
     }
@@ -229,67 +274,86 @@ impl ReadOutcome {
     }
 }
 
+/// Dispatch target after scope enforcement. Named as an enum
+/// (rather than boxed closures) so [`read_inner`] can await
+/// the async family builders without heap-allocating a
+/// per-request `Box<dyn Future>`.
+enum Kind<'a> {
+    DevicesList,
+    DevicesDetail(&'a str),
+    PluginsList,
+    PluginsDetail(&'a str),
+    Events,
+    Logs,
+}
+
 /// Route a URI to its family, check the family's required
 /// scope against the actor, and build the body if allowed.
-/// Returns the audit-family slug alongside the outcome so
-/// [`read`] can log without re-parsing. Sync today — kept as
-/// a plain fn so dispatch is trivially inlineable; the outer
-/// [`read`] is async only because the audit-log write goes
-/// through `spawn_blocking`.
-fn read_inner(engine: &Engine, uri: &str, actor: &Actor) -> (&'static str, ReadOutcome) {
+/// Async because the events / logs families hit the shared
+/// `SQLite` mutex and must run under `spawn_blocking` to keep
+/// the tokio worker free (round-1 F1 on PR #121).
+async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, ReadOutcome) {
     let Some(rest) = uri.strip_prefix(SCHEME) else {
         return (
             "unknown",
             ReadOutcome::NotFound(format!("URI {uri} does not use the oxidhome:// scheme")),
         );
     };
+    // Peel the optional query string first so path-splitting
+    // (`/` separator) only walks the authority + id — a caller
+    // hitting `oxidhome://events?since=1h` would otherwise
+    // land in the "unknown" arm because `events?since=1h`
+    // isn't a registered family.
+    let (path, query_str) = rest.split_once('?').map_or((rest, ""), |(p, q)| (p, q));
     // Path split: `authority[/tail]`. Authority is the family
-    // (`devices`, `plugins`); tail (if any) is the id.
-    let (family_seg, id_seg) = match rest.split_once('/') {
+    // (`devices`, `plugins`, `events`, `logs`); tail (if any)
+    // is the id.
+    let (family_seg, id_seg) = match path.split_once('/') {
         Some((head, tail)) => (head, Some(tail)),
-        None => (rest, None),
+        None => (path, None),
     };
 
-    // Match resolves (family slug, required scope, body
-    // builder). Scope check happens uniformly below so
-    // every routed URI wears the same enforcement — no
-    // way to accidentally add a family that skips it.
-    let (family, required, build): (&'static str, Scope, Box<dyn FnOnce() -> ReadOutcome + '_>) =
-        match (family_seg, id_seg) {
-            ("devices", None) => ("devices", DEVICES_LIST, Box::new(|| devices_list(engine))),
-            ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => (
-                "devices.detail",
-                // Device-detail carries registration
-                // metadata (owner, name, manufacturer,
-                // model, capabilities) — the same shape
-                // `oxidhome://devices` returns per row,
-                // just filtered to one id. It shares the
-                // `devices:list` scope with the collection
-                // read (round-2 F1 on PR #120 originally
-                // gated this under `devices:read`, which is
-                // reserved for the H9 device-state
-                // projection — `GET /api/v1/devices/{id}/state`
-                // and `state/changes`. Handing metadata
-                // access to `devices:read` tokens while
-                // withholding it from `devices:list` tokens
-                // was the opposite of the intended
-                // boundary — round-3 F1 fix).
-                DEVICES_LIST,
-                Box::new(|| devices_detail(engine, id)),
-            ),
-            ("plugins", None) => ("plugins", PLUGINS_LIST, Box::new(|| plugins_list(engine))),
-            ("plugins", Some(id)) if !id.is_empty() && !id.contains('/') => (
-                "plugins.detail",
-                PLUGINS_LIST,
-                Box::new(|| plugins_detail(engine, id)),
-            ),
-            _ => {
-                return (
-                    "unknown",
-                    ReadOutcome::NotFound(format!("no MCP resource is registered for {uri}")),
-                );
-            }
-        };
+    // Route → (family slug, required scope). Scope check
+    // happens uniformly below so every routed URI wears the
+    // same enforcement — no way to accidentally add a family
+    // that skips it. `Kind` names the dispatch after scope
+    // succeeds; keeps the routing decision separate from the
+    // async body-build.
+    let (family, required, kind): (&'static str, Scope, Kind) = match (family_seg, id_seg) {
+        ("devices", None) => ("devices", DEVICES_LIST, Kind::DevicesList),
+        ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => (
+            "devices.detail",
+            // Device-detail carries registration
+            // metadata (owner, name, manufacturer,
+            // model, capabilities) — the same shape
+            // `oxidhome://devices` returns per row,
+            // just filtered to one id. It shares the
+            // `devices:list` scope with the collection
+            // read (round-2 F1 on PR #120 originally
+            // gated this under `devices:read`, which is
+            // reserved for the H9 device-state
+            // projection — `GET /api/v1/devices/{id}/state`
+            // and `state/changes`. Handing metadata
+            // access to `devices:read` tokens while
+            // withholding it from `devices:list` tokens
+            // was the opposite of the intended
+            // boundary — round-3 F1 fix).
+            DEVICES_LIST,
+            Kind::DevicesDetail(id),
+        ),
+        ("plugins", None) => ("plugins", PLUGINS_LIST, Kind::PluginsList),
+        ("plugins", Some(id)) if !id.is_empty() && !id.contains('/') => {
+            ("plugins.detail", PLUGINS_LIST, Kind::PluginsDetail(id))
+        }
+        ("events", None) => ("events", EVENTS_READ, Kind::Events),
+        ("logs", None) => ("logs", LOGS_READ, Kind::Logs),
+        _ => {
+            return (
+                "unknown",
+                ReadOutcome::NotFound(format!("no MCP resource is registered for {uri}")),
+            );
+        }
+    };
 
     if require_scope(actor, required).is_err() {
         return (
@@ -300,7 +364,17 @@ fn read_inner(engine: &Engine, uri: &str, actor: &Actor) -> (&'static str, ReadO
         );
     }
 
-    (family, build())
+    let outcome = match kind {
+        Kind::DevicesList => devices_list(&engine),
+        Kind::DevicesDetail(id) => devices_detail(&engine, id),
+        Kind::PluginsList => plugins_list(&engine),
+        Kind::PluginsDetail(id) => plugins_detail(&engine, id),
+        // Events + logs hit `SQLite`, so parse the query
+        // and run the read under `spawn_blocking`.
+        Kind::Events => events_read(engine, query_str).await,
+        Kind::Logs => logs_read(engine, query_str).await,
+    };
+    (family, outcome)
 }
 
 fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> AuditEntry {
@@ -490,7 +564,426 @@ fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
     encode(&detail, "plugin detail")
 }
 
+// ── Events ────────────────────────────────────────────────────────
+
+/// Default `limit` when the caller omits one. Matches the
+/// REST `/api/v1/events` endpoint so a client that pins the
+/// same page size cross-transport sees identical pagination.
+const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
+/// Ceiling on a single events query — same value the REST
+/// handler enforces. Bounds a misbehaving client from
+/// pulling the whole `event_log` table in one shot.
+const EVENTS_QUERY_MAX_LIMIT: u32 = 1_000;
+
+/// Default / ceiling for `logs`. Mirrors the REST constants
+/// in `api::server` for the same reason as the events pair.
+const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
+const LOGS_QUERY_MAX_LIMIT: u32 = 1_000;
+
+#[derive(Serialize)]
+struct EventsBody {
+    events: Vec<super::super::server::WireHistoricalEvent>,
+}
+
+/// Keys the `oxidhome://events` filter recognizes. Anything
+/// outside this set is rejected as `INVALID_PARAMS` so a typo
+/// or a made-up filter can't silently broaden the query
+/// (round-1 F2 on PR #121 — before the fix, an unknown key
+/// like `level` on `oxidhome://events` was ignored and the
+/// caller got an unfiltered result). Kept sorted alphabetically
+/// so a scan is easy to eyeball.
+const EVENTS_KNOWN_KEYS: &[&str] = &[
+    "after_id",
+    "before_id",
+    "device",
+    "instance",
+    "limit",
+    "plugin",
+    "since",
+    "topic",
+    "topic_prefix",
+    "until",
+];
+
+async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
+    let query = match parse_query(raw_query) {
+        Ok(q) => q,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    if let Err(err) = reject_unknown(&query, EVENTS_KNOWN_KEYS) {
+        return ReadOutcome::InvalidParams(err);
+    }
+    let limit = match clamp_limit(&query, EVENTS_QUERY_DEFAULT_LIMIT, EVENTS_QUERY_MAX_LIMIT) {
+        Ok(n) => n,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    let since_ms = match parse_since(&query, "since") {
+        Ok(v) => v,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    let until_ms = match parse_since(&query, "until") {
+        Ok(v) => v,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    let after_id = match parse_opt_u64(&query, "after_id") {
+        Ok(v) => v,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    let before_id = match parse_opt_u64(&query, "before_id") {
+        Ok(v) => v,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    // `topic` (exact) and `topic_prefix` are mutually
+    // exclusive — same policy as REST: prefer prefix when
+    // both are set and warn so an operator can spot the
+    // ambiguous client.
+    let topic = match (
+        query.get("topic").cloned(),
+        query.get("topic_prefix").cloned(),
+    ) {
+        (topic_exact, Some(p)) => {
+            if let Some(exact) = &topic_exact {
+                tracing::warn!(
+                    target: "mcp.events",
+                    topic_exact = %exact,
+                    topic_prefix = %p,
+                    "MCP oxidhome://events: both `topic` and `topic_prefix` supplied — using `topic_prefix`",
+                );
+            }
+            Some((p, TopicMatch::Prefix))
+        }
+        (Some(t), None) => Some((t, TopicMatch::Exact)),
+        (None, None) => None,
+    };
+    let event_query = EventQuery {
+        since_ms,
+        until_ms,
+        device_id: query.get("device").cloned(),
+        instance_id: query.get("instance").cloned(),
+        plugin_id: query.get("plugin").cloned(),
+        topic,
+        after_id,
+        before_id,
+    };
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    // The shared `SQLite` mutex is std, not tokio — running
+    // the query on the async worker would park it for the
+    // whole read. `spawn_blocking` moves it to the blocking
+    // pool (round-1 F1 on PR #121). Move the query in; the
+    // rows come back out.
+    let event_log = engine.event_log();
+    let join =
+        tokio::task::spawn_blocking(move || event_log.query(&event_query, limit_usize)).await;
+    let rows = match join {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            tracing::error!(%err, "MCP events query failed");
+            return ReadOutcome::Internal("event query failed".into());
+        }
+        Err(join_err) => {
+            tracing::error!(%join_err, "MCP events query task panicked");
+            return ReadOutcome::Internal("event query task panicked".into());
+        }
+    };
+    let events: Vec<_> = rows
+        .into_iter()
+        .map(super::super::server::WireHistoricalEvent::from_row)
+        .collect();
+    encode(&EventsBody { events }, "events")
+}
+
+// ── Logs ──────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct LogsBody<'a> {
+    logs: &'a [crate::state::HistoricalLogEvent],
+}
+
+/// Keys `oxidhome://logs` recognizes. See [`EVENTS_KNOWN_KEYS`].
+const LOGS_KNOWN_KEYS: &[&str] = &[
+    "device",
+    "instance",
+    "level",
+    "limit",
+    "plugin",
+    "since",
+    "span_path_prefix",
+    "target",
+    "target_prefix",
+    "until",
+];
+
+async fn logs_read(engine: Engine, raw_query: &str) -> ReadOutcome {
+    let query = match parse_query(raw_query) {
+        Ok(q) => q,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    if let Err(err) = reject_unknown(&query, LOGS_KNOWN_KEYS) {
+        return ReadOutcome::InvalidParams(err);
+    }
+    let limit = match clamp_limit(&query, LOGS_QUERY_DEFAULT_LIMIT, LOGS_QUERY_MAX_LIMIT) {
+        Ok(n) => n,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    let since_ms = match parse_since(&query, "since") {
+        Ok(v) => v,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    let until_ms = match parse_since(&query, "until") {
+        Ok(v) => v,
+        Err(err) => return ReadOutcome::InvalidParams(err),
+    };
+    let min_level = match query.get("level").map(String::as_str) {
+        Some("Trace") => Some(LogLevel::Trace),
+        Some("Debug") => Some(LogLevel::Debug),
+        Some("Info") => Some(LogLevel::Info),
+        Some("Warn") => Some(LogLevel::Warn),
+        Some("Error") => Some(LogLevel::Error),
+        // A bogus level is a client bug. Round-1 F4 on PR
+        // #121 routes this through `InvalidParams` (JSON-RPC
+        // `-32602`) instead of `NotFound` — malformed input,
+        // not a missing resource.
+        Some(unknown) => {
+            return ReadOutcome::InvalidParams(format!(
+                "unknown level `{unknown}`; expected Trace|Debug|Info|Warn|Error",
+            ));
+        }
+        None => None,
+    };
+    let log_query = LogQuery {
+        since_ms,
+        until_ms,
+        min_level,
+        instance_id: query.get("instance").cloned(),
+        plugin_id: query.get("plugin").cloned(),
+        device_id: query.get("device").cloned(),
+        target: query.get("target").cloned(),
+        target_prefix: query.get("target_prefix").cloned(),
+        span_path_prefix: query.get("span_path_prefix").cloned(),
+    };
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let log_store = engine.log_store();
+    let join = tokio::task::spawn_blocking(move || log_store.query(&log_query, limit_usize)).await;
+    let rows = match join {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            tracing::error!(%err, "MCP logs query failed");
+            return ReadOutcome::Internal("log query failed".into());
+        }
+        Err(join_err) => {
+            tracing::error!(%join_err, "MCP logs query task panicked");
+            return ReadOutcome::Internal("log query task panicked".into());
+        }
+    };
+    encode(&LogsBody { logs: &rows }, "logs")
+}
+
 // ── Helpers ───────────────────────────────────────────────────────
+
+/// Parse `?key=value&key=value` into a `HashMap`, percent-decoding
+/// values. `serde_urlencoded` is the same crate `axum`'s `Query`
+/// extractor uses, so the decode rules are identical between our
+/// REST and MCP surfaces (round-1 F3 on PR #121 — before the fix,
+/// a URI like `oxidhome://logs?plugin=oxidhome_core%3A%3Aruntime`
+/// queried `SQLite` for the raw `%3A%3A` bytes and matched nothing).
+///
+/// Duplicate keys keep the last value, matching the REST
+/// `Query<HashMap<...>>` behavior — MCP clients should not depend
+/// on either half of a duplicated key.
+fn parse_query(raw: &str) -> Result<HashMap<String, String>, String> {
+    if raw.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(raw).map_err(|e| format!("malformed URI query: {e}"))?;
+    let mut out = HashMap::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        if k.is_empty() {
+            continue;
+        }
+        out.insert(k, v);
+    }
+    Ok(out)
+}
+
+/// Refuse any key the family doesn't recognize. Rejecting
+/// unknowns rather than silently ignoring them means a doc
+/// change that renames a param surfaces immediately as a
+/// 400 instead of quietly broadening the result set.
+fn reject_unknown(query: &HashMap<String, String>, allowed: &[&str]) -> Result<(), String> {
+    for k in query.keys() {
+        if !allowed.contains(&k.as_str()) {
+            return Err(format!(
+                "unknown filter `{k}`; allowed: {}",
+                allowed.join(", "),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a relative duration (e.g. `1h`, `30m`, `60s`, `2d`)
+/// into an absolute epoch-ms timestamp — `now - duration`.
+/// Returns `Ok(None)` when the key is absent, `Err` on any
+/// malformed value.
+fn parse_since(query: &HashMap<String, String>, key: &str) -> Result<Option<i64>, String> {
+    let Some(raw) = query.get(key) else {
+        return Ok(None);
+    };
+    let ms = parse_duration_ms(raw).map_err(|e| format!("invalid `{key}` value: {e}"))?;
+    let now = now_unix_ms();
+    Ok(Some(now.saturating_sub(ms)))
+}
+
+/// Duration grammar: `<digits><unit>` where unit is one ASCII
+/// byte ∈ `{s, m, h, d}`. No compound values (`1h30m`) — the
+/// design doc lists only single-unit examples and keeping it
+/// simple keeps the surface predictable.
+///
+/// The percent-decoded query value can contain arbitrary UTF-8
+/// (e.g. `?since=%C3%A9` decodes to `é`), so byte-index
+/// splitting via `raw.len() - 1` would panic on a multi-byte
+/// final `char`. Round-2 F1 on PR #121: split on the last
+/// `char` boundary instead.
+fn parse_duration_ms(raw: &str) -> Result<i64, String> {
+    // Isolate the unit as the last char; everything before it
+    // is the digit portion. `char_indices` walks by scalar
+    // value, so `raw[i..]` always lands on a UTF-8 boundary.
+    let (unit_idx, unit_char) = raw
+        .char_indices()
+        .next_back()
+        .ok_or_else(|| "empty duration".to_string())?;
+    let unit = &raw[unit_idx..];
+    let num = &raw[..unit_idx];
+    // Refuse non-ASCII units up front so the error names the
+    // bad byte cleanly instead of falling through into "not a
+    // known unit."
+    if !unit_char.is_ascii() {
+        return Err(format!("`{raw}` — unknown unit `{unit}`; expected s|m|h|d"));
+    }
+    let n: i64 = num
+        .parse()
+        .map_err(|_| format!("`{raw}` — expected digits followed by s|m|h|d"))?;
+    if n < 0 {
+        return Err(format!("`{raw}` — duration must be non-negative"));
+    }
+    let per_unit_ms: i64 = match unit {
+        "s" => 1_000,
+        "m" => 60 * 1_000,
+        "h" => 60 * 60 * 1_000,
+        "d" => 24 * 60 * 60 * 1_000,
+        other => {
+            return Err(format!(
+                "`{raw}` — unknown unit `{other}`; expected s|m|h|d"
+            ));
+        }
+    };
+    n.checked_mul(per_unit_ms)
+        .ok_or_else(|| format!("`{raw}` — duration overflows i64 milliseconds"))
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::parse_duration_ms;
+
+    #[test]
+    fn accepts_all_known_units() {
+        assert_eq!(parse_duration_ms("30s").unwrap(), 30_000);
+        assert_eq!(parse_duration_ms("5m").unwrap(), 300_000);
+        assert_eq!(parse_duration_ms("2h").unwrap(), 7_200_000);
+        assert_eq!(parse_duration_ms("1d").unwrap(), 86_400_000);
+    }
+
+    #[test]
+    fn rejects_non_ascii_suffix_without_panicking() {
+        // Percent-decoded `?since=%C3%A9` reaches this parser
+        // as `é`. Pre-fix (round-2 F1 on PR #121), the byte-
+        // index split panicked at `raw.len() - 1` because that
+        // fell mid-way through `é`'s two UTF-8 bytes.
+        let err = parse_duration_ms("é").expect_err("must reject non-ASCII unit");
+        assert!(err.contains("é"), "error must name the bad unit; got {err}");
+    }
+
+    #[test]
+    fn rejects_multi_byte_unit_after_digits() {
+        // Same class of bug — `1é` used to panic at index 2.
+        let err = parse_duration_ms("1é").expect_err("must reject non-ASCII unit");
+        assert!(err.contains("é"), "error must name the bad unit; got {err}");
+    }
+}
+
+#[cfg(test)]
+mod parse_query_tests {
+    use super::parse_query;
+
+    /// The reason round-1 F3 was a bug: pre-fix, the hand-rolled
+    /// parser stored the raw bytes verbatim. Any downstream `SQLite`
+    /// comparison against the decoded value returned zero rows.
+    /// This test locks in the fix directly — no integration
+    /// scaffolding needed.
+    #[test]
+    fn percent_decodes_values() {
+        let q = parse_query("plugin=oxidhome_core%3A%3Aruntime").expect("parse ok");
+        assert_eq!(
+            q.get("plugin").map(String::as_str),
+            Some("oxidhome_core::runtime"),
+            "value must be percent-decoded before storage lookup; got {q:?}",
+        );
+    }
+
+    #[test]
+    fn percent_decodes_keys_too() {
+        // Round-trip protection: `serde_urlencoded` decodes keys as
+        // well as values. `%74` = `t`, so `%74opic` should land as
+        // the `topic` key.
+        let q = parse_query("%74opic=alarm").expect("parse ok");
+        assert_eq!(q.get("topic").map(String::as_str), Some("alarm"));
+    }
+
+    #[test]
+    fn plus_decodes_to_space() {
+        // `serde_urlencoded` follows the form-urlencoded rule where
+        // `+` = SPACE. Matches axum's `Query` extractor exactly,
+        // so an MCP client and a REST client see identical decode.
+        let q = parse_query("target=one+two").expect("parse ok");
+        assert_eq!(q.get("target").map(String::as_str), Some("one two"));
+    }
+
+    #[test]
+    fn multiple_values_last_wins() {
+        // Duplicate keys are silently collapsed to the last value —
+        // documented in `parse_query`'s doc-comment. Test locks
+        // that in so a future rewrite doesn't accidentally start
+        // returning the first value or a Vec.
+        let q = parse_query("device=a&device=b").expect("parse ok");
+        assert_eq!(q.get("device").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn empty_query_is_ok() {
+        assert!(parse_query("").expect("parse ok").is_empty());
+    }
+}
+
+fn parse_opt_u64(query: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String> {
+    match query.get(key) {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("invalid `{key}` value `{raw}`; expected unsigned integer")),
+    }
+}
+
+fn clamp_limit(query: &HashMap<String, String>, default: u32, max: u32) -> Result<u32, String> {
+    let Some(raw) = query.get("limit") else {
+        return Ok(default);
+    };
+    let n: u32 = raw
+        .parse()
+        .map_err(|_| format!("invalid `limit` value `{raw}`; expected unsigned integer"))?;
+    Ok(n.clamp(1, max))
+}
 
 fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     match serde_json::to_string(value) {

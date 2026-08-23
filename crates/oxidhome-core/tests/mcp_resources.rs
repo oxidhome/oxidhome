@@ -245,6 +245,234 @@ async fn list_resources_advertises_devices_and_plugins() {
             .as_str()
             .is_some_and(|s| !s.is_empty())
     );
+
+    // 14.2b adds events + logs to the same catalog.
+    assert!(
+        uris.contains(&"oxidhome://events"),
+        "resources/list missing oxidhome://events (14.2b); got {uris:?}",
+    );
+    assert!(
+        uris.contains(&"oxidhome://logs"),
+        "resources/list missing oxidhome://logs (14.2b); got {uris:?}",
+    );
+}
+
+/// 14.2b — `oxidhome://events` on a fresh engine returns an
+/// empty JSON list under the expected mime type. Confirms the
+/// resource is dispatched (scope + audit paths run) and the
+/// wire body matches the REST `GET /api/v1/events` shape.
+#[tokio::test(flavor = "current_thread")]
+async fn read_events_returns_empty_list_on_fresh_engine() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://events"}),
+    )
+    .await;
+    let body: Value = serde_json::from_str(
+        response["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("text payload"),
+    )
+    .expect("events resource body must be JSON");
+    assert!(
+        body["events"].as_array().is_some_and(Vec::is_empty),
+        "fresh engine must return an empty events list; got {body}",
+    );
+}
+
+/// 14.2b — same shape for logs.
+#[tokio::test(flavor = "current_thread")]
+async fn read_logs_returns_empty_list_on_fresh_engine() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://logs"}),
+    )
+    .await;
+    let body: Value = serde_json::from_str(
+        response["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("text payload"),
+    )
+    .expect("logs resource body must be JSON");
+    assert!(
+        body["logs"].as_array().is_some_and(Vec::is_empty),
+        "fresh engine must return an empty logs list; got {body}",
+    );
+}
+
+/// 14.2b — `oxidhome://events` requires `events:read`; a
+/// bearer with a wildcard-adjacent-but-wrong scope
+/// (`devices:list`) is refused. Mirrors the REST
+/// `GET /api/v1/events` gate.
+#[tokio::test(flavor = "current_thread")]
+async fn events_resource_requires_events_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://events"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:list must not satisfy events:read; got {response}",
+    );
+}
+
+/// 14.2b — companion for logs.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_resource_requires_logs_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "events-only", &["events:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://logs"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "events:read must not satisfy logs:read; got {response}",
+    );
+}
+
+/// 14.2b — a bogus `level` on the logs resource surfaces as
+/// `INVALID_PARAMS` (JSON-RPC `-32602`) and names the bad
+/// value so the client can correct it. Round-1 F4 on PR #121:
+/// pre-fix, this returned `-32002 resource-not-found`, which
+/// is the wrong error class for malformed input.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_resource_rejects_unknown_level() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://logs?level=Verbose"}),
+    )
+    .await;
+    let error = &response["error"];
+    assert_eq!(
+        error["code"], -32602,
+        "bad level must surface as INVALID_PARAMS, not NotFound or a filtered success; got {response}",
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("error message")
+            .contains("Verbose"),
+        "error must name the bad value so the client can correct it; got {error}",
+    );
+}
+
+/// Round-1 F2 on PR #121: any query key outside the family's
+/// documented set (e.g. `min_level` on logs or `since_ms` on
+/// events, both old REST-style names) is rejected as
+/// `INVALID_PARAMS`. Silently ignoring unknowns is what let a
+/// documented request like `?level=Error&device=front-door`
+/// return unfiltered rows before the fix (the impl only knew
+/// `min_level` + `device_id`).
+#[tokio::test(flavor = "current_thread")]
+async fn logs_resource_rejects_unknown_filter_key() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        // `min_level` is the pre-fix REST-style name; the
+        // documented MCP name is `level`. Refusing this
+        // catches clients still on the old contract.
+        json!({"uri": "oxidhome://logs?min_level=Info"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "unknown filter key must surface as INVALID_PARAMS; got {response}",
+    );
+}
+
+// Note: R1 F1 (spawn_blocking) and R1 F3 (percent-decoding)
+// used to have shallow integration tests here. Round-2 review
+// on PR #121 correctly pointed out neither test would fail
+// against the pre-fix implementation — a fresh in-memory store
+// returns zero rows whether the value is decoded or not, and
+// eight fast in-memory queries complete quickly whether the
+// SQLite call runs on the worker or the blocking pool. The
+// meaningful coverage lives with the parsers themselves:
+// `parse_query` percent-decoding is unit-tested inside
+// `resources.rs`, and `parse_duration_ms` UTF-8-safety is
+// unit-tested there too. Round-1 F1 remains enforced by the
+// code review of the events_read/logs_read call sites (they
+// visibly call `tokio::task::spawn_blocking`).
+
+/// Round-1 F4 on PR #121: malformed typed filters (bad
+/// `since`, bad `limit`, bad `after_id`) all surface as
+/// `INVALID_PARAMS`, not silently defaulted-away. Covers all
+/// three parse points in one test — one JSON-RPC call each,
+/// checked for the `-32602` code.
+#[tokio::test(flavor = "current_thread")]
+async fn events_resource_rejects_malformed_typed_filters() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for uri in [
+        "oxidhome://events?since=nope",
+        "oxidhome://events?since=99z",
+        "oxidhome://events?limit=oops",
+        "oxidhome://events?after_id=-1",
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "resources/read",
+            json!({"uri": uri}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "malformed typed filter in {uri} must surface as INVALID_PARAMS; got {response}",
+        );
+    }
 }
 
 /// `resources/templates/list` advertises the parametric
