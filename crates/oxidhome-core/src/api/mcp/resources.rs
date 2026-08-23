@@ -1085,18 +1085,15 @@ static BLOB_READ_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Sema
         std::sync::Arc::new(tokio::sync::Semaphore::new(BLOB_CONCURRENT_READS))
     });
 
-/// Ceiling on the mime string a plugin can attach to a blob
-/// and have surfaced on the MCP wire. The WIT contract on the
-/// blob store leaves mime as an unconstrained `option<string>`
-/// — a misbehaving plugin could push a 100 MiB mime blob into
-/// the store and drive a valid 4 MiB base64 body past the 8
-/// MiB transport ceiling on the read side (round-9 F1 on PR
-/// #122). 256 bytes is generous for real IANA types
-/// (the longest registered is ~80 chars; parameters like
-/// `charset=utf-8; boundary=...` are typically single-digit
-/// tens more). Over-cap mimes are dropped at read time and a
-/// warn line surfaces the misbehaving plugin.
-const MAX_BLOB_MIME_BYTES: usize = 256;
+/// Re-export of the blob store's per-mime cap so the local
+/// projection math ([`BLOB_ENVELOPE_OVERHEAD_BYTES`] +
+/// `MAX_BLOB_MIME_BYTES` + base64 body ≤ [`MAX_BLOB_BODY_BYTES`])
+/// can name a single source of truth. The write-time
+/// enforcement + SQL-side legacy filter live on the blob
+/// store side (round-10 F1 on PR #122); this constant is
+/// what MCP's projection uses so the two definitions can
+/// never drift.
+use crate::state::blobs::MAX_BLOB_MIME_BYTES;
 
 /// Conservative headroom for the `BlobResourceContents` JSON
 /// envelope + URI + JSON-RPC framing + SSE prefix around a
@@ -1241,31 +1238,22 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
             // escape-inflation headroom baked in — base64 has
             // no JSON-escape-worthy characters) so a valid
             // 3-MiB-raw blob doesn't hit the text cap.
-            // Round-9 F1 on PR #122: the mime string comes
-            // from the plugin at blob-write time and is NOT
-            // validated by the WIT contract — a plugin could
-            // set an arbitrarily long mime and push a valid
-            // 4 MiB blob response past the 8 MiB transport
-            // cap once base64 + envelope + framing land on the
-            // wire. Silently dropping an over-long mime keeps
-            // the read serving (the blob bytes are the useful
-            // payload; mime is a hint that the receiver can
-            // survive without), and the warn line surfaces
-            // the misbehaving plugin.
-            let mime = info.mime.and_then(|m| {
-                if m.len() > MAX_BLOB_MIME_BYTES {
-                    tracing::warn!(
-                        instance_id = %instance_id,
-                        name = %name,
-                        mime_len = m.len(),
-                        cap = MAX_BLOB_MIME_BYTES,
-                        "MCP blob mime exceeds cap — dropping",
-                    );
-                    None
-                } else {
-                    Some(m)
-                }
-            });
+            // Round-10 F1 on PR #122 moved the mime cap
+            // upstream: `BlobStore::write` refuses over-cap
+            // mimes, and `BlobStore::read_with_info`'s SQL
+            // projects NULL for legacy rows whose mime
+            // exceeds [`MAX_BLOB_MIME_BYTES`]. So by the
+            // time `info.mime` reaches us it's already
+            // known to fit — no per-read materialise-then-
+            // check pass. Belt-and-suspenders: still assert
+            // the invariant, so a future regression in the
+            // store's SQL trips this instead of pushing the
+            // response past `PermitBody`'s cap.
+            let mime = info.mime;
+            debug_assert!(
+                mime.as_ref().is_none_or(|m| m.len() <= MAX_BLOB_MIME_BYTES),
+                "read_with_info returned an over-cap mime; store invariant violated",
+            );
             // Belt-and-suspenders against the transport cap:
             // base64 body + mime + URI + a conservative
             // envelope-framing budget must fit under

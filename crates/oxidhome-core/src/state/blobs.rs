@@ -124,6 +124,16 @@ pub enum BlobError {
         cap: u64,
     },
 
+    /// Plugin passed a `mime` string longer than
+    /// [`MAX_BLOB_MIME_BYTES`]. Refused at
+    /// [`BlobStore::write`] before any filesystem or SQL work —
+    /// preventing an unbounded mime blob from being persisted
+    /// keeps downstream readers (MCP `blob_read` in
+    /// particular) from having to materialise 100+ MiB of
+    /// mime text just to reject it. Round-10 F1 on PR #122.
+    #[error("blob mime too large: {mime_len} bytes exceeds cap {cap}")]
+    MimeTooLarge { mime_len: usize, cap: usize },
+
     /// Filesystem operation (mkdir / write / fsync / rename / read /
     /// remove) failed. The host's blob root is the same FS as the
     /// `SQLite` DB, so most causes (full disk, permission denied) are
@@ -190,6 +200,22 @@ pub fn is_safe_instance_id(instance_id: &str) -> bool {
 /// Maximum permitted byte length of an `instance_id` — see the
 /// F1 comment on [`is_safe_instance_id`].
 pub const MAX_INSTANCE_ID_BYTES: usize = 128;
+
+/// Maximum permitted byte length of a blob's `mime` string.
+/// Enforced at [`BlobStore::write`] time (round-10 F1 on
+/// PR #122) so an unbounded plugin-supplied mime can't make
+/// it into the persisted `blob` row.
+/// [`BlobStore::read_with_info`] also filters legacy rows
+/// with over-cap mime at SQL-select time, so pre-cap rows
+/// don't force a materialise-then-drop dance either.
+///
+/// 256 bytes is generous for real IANA types (the longest
+/// registered is ~80 chars; parameters like
+/// `charset=utf-8; boundary=...` are typically single-digit
+/// tens more). Callers exceeding the cap should choose a
+/// shorter mime or write the extended metadata as a separate
+/// blob.
+pub const MAX_BLOB_MIME_BYTES: usize = 256;
 
 fn check_instance_id(instance_id: &str) -> Result<(), BlobError> {
     if is_safe_instance_id(instance_id) {
@@ -381,6 +407,20 @@ impl BlobStore {
     ) -> Result<String, BlobError> {
         check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
+        // Round-10 F1 on PR #122: cap mime at write time so
+        // an unbounded plugin-supplied string can't make it
+        // into the store. Downstream readers relying on the
+        // mime being small (MCP `blob_read`, WIT `get-info`)
+        // can then trust the row without a materialise-then-
+        // check dance on the hot path.
+        if let Some(m) = mime
+            && m.len() > MAX_BLOB_MIME_BYTES
+        {
+            return Err(BlobError::MimeTooLarge {
+                mime_len: m.len(),
+                cap: MAX_BLOB_MIME_BYTES,
+            });
+        }
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
         let install_dir = blobs_root.join(installation_uuid);
         let instance_dir = instance_dir_for(blobs_root, installation_uuid, instance_id);
@@ -680,11 +720,36 @@ impl BlobStore {
         // atomic-rename write path prevents the reader from
         // observing a partial write regardless of platform.
         let (info, mut file) = self.db.read(|conn| -> Result<_, BlobError> {
+            // Round-10 F1 on PR #122: filter out over-cap
+            // legacy mimes at select time. `length(mime)` is
+            // computed by `SQLite` without materialising the
+            // value in the Rust side, and the `CASE`
+            // substitutes NULL for a mime string longer than
+            // the cap — so a 100 MiB legacy mime row never
+            // becomes a 100 MiB `String` allocation in this
+            // process. Rows written after the R10 fix can't
+            // hit the fallback path because `write()` refuses
+            // them up front.
             let info: Option<BlobInfo> = conn
                 .query_row(
-                    "SELECT name, id, size_bytes, created_ms, mime FROM blob \
-                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
-                    params![installation_uuid, instance_id, name],
+                    "SELECT name, id, size_bytes, created_ms, \
+                            CASE WHEN mime IS NULL OR length(mime) <= ?4 \
+                                 THEN mime \
+                                 ELSE NULL \
+                            END \
+                     FROM blob \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    params![
+                        installation_uuid,
+                        instance_id,
+                        name,
+                        // `MAX_BLOB_MIME_BYTES` is 256 —
+                        // trivially fits in `i64`, but
+                        // `try_from` keeps the compiler
+                        // happy about `usize → i64` on
+                        // 64-bit targets.
+                        i64::try_from(MAX_BLOB_MIME_BYTES).expect("mime cap fits in i64"),
+                    ],
                     decode_blob_info,
                 )
                 .optional()?;
@@ -1674,5 +1739,78 @@ mod tests {
             }
             other => panic!("expected TooLarge; got {other:?}"),
         }
+    }
+
+    /// Round-10 F1 on PR #122: `write` refuses an over-cap
+    /// mime up front. Neither the filesystem nor the `SQLite`
+    /// `blob` row sees the oversized value, so downstream
+    /// readers (MCP, WIT `get-info`) never allocate it.
+    #[test]
+    fn write_refuses_over_cap_mime() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        let big_mime = "x".repeat(MAX_BLOB_MIME_BYTES + 1);
+        let err = store
+            .write(INST_A, "alpha", "snap", b"hi", Some(&big_mime))
+            .expect_err("write must refuse over-cap mime");
+        match err {
+            BlobError::MimeTooLarge { mime_len, cap } => {
+                assert_eq!(mime_len, MAX_BLOB_MIME_BYTES + 1);
+                assert_eq!(cap, MAX_BLOB_MIME_BYTES);
+            }
+            other => panic!("expected MimeTooLarge; got {other:?}"),
+        }
+        // And the blob row does NOT exist — the refusal is
+        // total, not "written without mime".
+        assert!(
+            store.get_info(INST_A, "alpha", "snap").is_err(),
+            "refused write must not leave a blob row behind",
+        );
+    }
+
+    /// Round-10 F1 on PR #122: a legacy row whose mime was
+    /// written before the R10 cap gets its mime projected to
+    /// NULL by the SQL in `read_with_info` — the oversized
+    /// value never becomes a Rust `String`. Simulated here by
+    /// bypassing the `write` API's cap check via a raw
+    /// `UPDATE` that installs an over-cap mime on an
+    /// already-written row.
+    #[test]
+    fn read_with_info_filters_legacy_over_cap_mime() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "snap", b"hi", Some("image/jpeg"))
+            .expect("write");
+        // Rewrite the mime column directly, bypassing the
+        // R10 write-time cap — this is the "legacy row"
+        // shape (a row from before the cap existed).
+        let legacy_mime = "y".repeat(MAX_BLOB_MIME_BYTES + 8);
+        store
+            .db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE blob SET mime = ?1 \
+                     WHERE installation_uuid = ?2 AND instance_id = ?3 AND name = ?4",
+                    params![legacy_mime, INST_A, "alpha", "snap"],
+                )
+            })
+            .expect("legacy update");
+
+        // The read path filters the mime at SQL-select time,
+        // so callers never see the over-cap string.
+        let (info, bytes) = store
+            .read_with_info(INST_A, "alpha", "snap", None)
+            .expect("read_with_info");
+        assert_eq!(bytes, b"hi");
+        assert!(
+            info.mime.is_none(),
+            "legacy over-cap mime must be filtered to None, not surfaced verbatim; got {:?}",
+            info.mime,
+        );
     }
 }

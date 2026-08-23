@@ -1828,6 +1828,15 @@ fn blob_error_to_wit(err: crate::state::BlobError) -> WitError {
         } => WitError::Internal(format!(
             "blob_store: size cap unexpectedly reached from WIT path — {what}, {size_bytes} bytes vs cap {cap} (host bug)"
         )),
+        // Round-10 F1 on PR #122: a plugin passed a mime
+        // string over `MAX_BLOB_MIME_BYTES`. That's a client
+        // (plugin) input problem — `permission-denied` is
+        // the closest WIT shape a plugin can act on (there's
+        // no `bad-input` variant), and mirrors how
+        // `QuotaExceeded` surfaces to the plugin side.
+        BlobError::MimeTooLarge { mime_len, cap } => WitError::PermissionDenied(format!(
+            "blob mime too large: {mime_len} bytes exceeds cap {cap}"
+        )),
     }
 }
 
