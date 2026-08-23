@@ -57,6 +57,13 @@ serde_json = { version = "1.0.150", default-features = false, features = ["std"]
 # extractor — lifting to a workspace dep keeps the graph
 # single-copy. Version tracks whatever `axum` pins.
 serde_urlencoded = "0.7.1"
+# 14.2c: base64-encode MCP `blob` resource bodies. The MCP
+# spec carries binary resource contents as base64 in the
+# `blob` field of `BlobResourceContents`. `rmcp` already
+# pulls `base64 0.22.1` transitively (via its own
+# transport/session plumbing), so pinning the same version
+# here keeps the graph single-copy.
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 # Phase 13 round-3 F1: meta-validate plugin `ui.config-schema` /
 # `ui.commands-schema` files as JSON Schema draft 2020-12 at
 # install and boot-scan. `default-features = false` drops the

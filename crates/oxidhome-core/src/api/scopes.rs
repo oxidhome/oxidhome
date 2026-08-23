@@ -197,6 +197,25 @@ pub(crate) const DASHBOARDS_READ: Scope = Scope::new("dashboards:read");
 /// grant.
 pub(crate) const DASHBOARDS_WRITE: Scope = Scope::new("dashboards:write");
 
+/// Phase 14.2c: `status:read` — see MCP `oxidhome://status`.
+/// Read-only host status snapshot (version, DB reachability,
+/// counts). No REST equivalent today; the resource was added
+/// for LLM agents that need a "is the hub up and how big is
+/// it" surface without pulling the full plugins/instances/
+/// devices lists.
+pub(crate) const STATUS_READ: Scope = Scope::new("status:read");
+
+/// Phase 14.2c: `blobs:read` — see MCP
+/// `oxidhome://blobs/{instance_id}/{name}`. Access to plugin-
+/// owned blob payloads (camera snapshots, inference outputs).
+/// Deliberately **not** paired with a `blobs:list` — the MCP
+/// surface doesn't advertise a blob catalog because that would
+/// leak the full per-instance name space to any caller with
+/// the scope; instead the plugin publishes named blobs via
+/// events + tools and the agent reads them by their known
+/// name.
+pub(crate) const BLOBS_READ: Scope = Scope::new("blobs:read");
+
 /// C6: `plugins:ui` — see `GET /api/v1/plugins/{plugin_id}/ui`.
 /// Gates the sandboxed-iframe wrapper endpoint that hosts the
 /// plugin's UI. The wrapper page mints a short-lived

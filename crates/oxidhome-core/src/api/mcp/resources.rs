@@ -11,9 +11,12 @@
 //!
 //! - [`list_resources`] — the fixed-URI catalog
 //!   (`oxidhome://devices`, `oxidhome://plugins`,
-//!   `oxidhome://events`, `oxidhome://logs`).
+//!   `oxidhome://events`, `oxidhome://logs`,
+//!   `oxidhome://status`).
 //! - [`list_resource_templates`] — parametric families
-//!   (`oxidhome://devices/{device_id}`, `oxidhome://plugins/{plugin_id}`).
+//!   (`oxidhome://devices/{device_id}`,
+//!   `oxidhome://plugins/{plugin_id}`,
+//!   `oxidhome://blobs/{instance_id}/{name}`).
 //! - [`read`] — dispatch on a concrete URI. Returns
 //!   [`ErrorData::resource_not_found`] for anything we don't
 //!   recognize; the SDK maps it to the spec `-32002`.
@@ -45,9 +48,13 @@ use rmcp::model::{
 };
 use serde::Serialize;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
 use crate::Engine;
 use crate::api::scopes::{
-    DEVICES_LIST, EVENTS_READ, LOGS_READ, PLUGINS_LIST, Scope, require_scope,
+    BLOBS_READ, DEVICES_LIST, EVENTS_READ, LOGS_READ, PLUGINS_LIST, STATUS_READ, Scope,
+    require_scope,
 };
 use crate::auth::Actor;
 use crate::state::audit_log::AuditEntry;
@@ -126,6 +133,16 @@ pub(super) fn list_resources() -> Vec<Resource> {
                  Mirrors `GET /api/v1/logs` semantically.",
             )
             .with_mime_type("application/json"),
+        Resource::new("oxidhome://status", "status")
+            .with_title("Host status")
+            .with_description(
+                "JSON snapshot of host readiness: crate version, whether the shared \
+                 `SQLite` handle answers a ping (`ok`), plus counts of installed \
+                 plugins, running instances, and registered devices. Callers wanting \
+                 a plain HTTP probe should hit `GET /api/v1/readyz`; this resource is \
+                 the MCP-agent-friendly equivalent with a broader body.",
+            )
+            .with_mime_type("application/json"),
     ]
 }
 
@@ -150,6 +167,14 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
                  `oxidhome plugin show <plugin-id>`.",
             )
             .with_mime_type("application/json"),
+        ResourceTemplate::new("oxidhome://blobs/{instance_id}/{name}", "blob")
+            .with_title("Plugin-owned blob")
+            .with_description(
+                "Raw bytes for a named blob owned by a running plugin instance \
+                 (e.g. `snapshot.jpg` under a camera instance). Response is a \
+                 base64-encoded `BlobResourceContents` with the mime type recorded \
+                 by the plugin at write time.",
+            ),
     ]
 }
 
@@ -206,7 +231,20 @@ pub(super) async fn read(
 /// (status, decision, required scope) without re-parsing an
 /// SDK-shaped error.
 enum ReadOutcome {
-    Ok(String),
+    /// Serialized text body + mime type. Every JSON resource
+    /// (devices, plugins, events, logs, status) rides this
+    /// variant with `application/json`.
+    OkText {
+        body: String,
+        mime: &'static str,
+    },
+    /// Raw binary body + mime type. The blobs resource is the
+    /// only user today. Mime comes from the blob index row so
+    /// the caller sees the same type the plugin wrote.
+    OkBlob {
+        bytes: Vec<u8>,
+        mime: Option<String>,
+    },
     NotFound(String),
     /// Client supplied a malformed / unknown / typed-parse
     /// failure on a query-string filter. Maps to JSON-RPC
@@ -227,9 +265,16 @@ enum ReadOutcome {
 impl ReadOutcome {
     fn into_result(self, uri: &str) -> Result<ReadResourceResult, McpError> {
         match self {
-            Self::Ok(body) => Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(body, uri).with_mime_type("application/json"),
+            Self::OkText { body, mime } => Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(body, uri).with_mime_type(mime),
             ])),
+            Self::OkBlob { bytes, mime } => {
+                let mut contents = ResourceContents::blob(BASE64.encode(&bytes), uri);
+                if let Some(m) = mime {
+                    contents = contents.with_mime_type(m);
+                }
+                Ok(ReadResourceResult::new(vec![contents]))
+            }
             Self::NotFound(reason) => Err(McpError::resource_not_found(reason, None)),
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::Denied { required: _ } => Err(McpError::new(
@@ -245,7 +290,7 @@ impl ReadOutcome {
 
     fn status(&self) -> u16 {
         match self {
-            Self::Ok(_) => 200,
+            Self::OkText { .. } | Self::OkBlob { .. } => 200,
             Self::NotFound(_) => 404,
             Self::InvalidParams(_) => 400,
             Self::Denied { .. } => 403,
@@ -255,7 +300,7 @@ impl ReadOutcome {
 
     fn decision(&self) -> &'static str {
         match self {
-            Self::Ok(_) => "allow",
+            Self::OkText { .. } | Self::OkBlob { .. } => "allow",
             Self::NotFound(_) | Self::Denied { .. } | Self::InvalidParams(_) => "deny",
             Self::Internal(_) => "error",
         }
@@ -285,6 +330,12 @@ enum Kind<'a> {
     PluginsDetail(&'a str),
     Events,
     Logs,
+    Status,
+    /// `(instance_id, name)`. Both segments are already validated
+    /// by the routing match — non-empty and, for `instance_id`,
+    /// slash-free. `name` may contain further path segments; the
+    /// blob store treats it as an opaque name.
+    Blob(&'a str, &'a str),
 }
 
 /// Route a URI to its family, check the family's required
@@ -347,6 +398,26 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         }
         ("events", None) => ("events", EVENTS_READ, Kind::Events),
         ("logs", None) => ("logs", LOGS_READ, Kind::Logs),
+        ("status", None) => ("status", STATUS_READ, Kind::Status),
+        // Blobs URI: `oxidhome://blobs/<instance_id>/<name>`.
+        // Split the tail on the *first* `/` — instance ids are
+        // slash-free (validated by the blob store's
+        // `check_instance_id`) so anything after the first `/`
+        // belongs to `name`. Empty either side is a
+        // path-shape error, not a not-found.
+        ("blobs", Some(tail)) => match tail.split_once('/') {
+            Some((instance, name)) if !instance.is_empty() && !name.is_empty() => {
+                ("blobs", BLOBS_READ, Kind::Blob(instance, name))
+            }
+            _ => {
+                return (
+                    "blobs",
+                    ReadOutcome::NotFound(format!(
+                        "blobs URI must be oxidhome://blobs/<instance_id>/<name>; got {uri}",
+                    )),
+                );
+            }
+        },
         _ => {
             return (
                 "unknown",
@@ -373,6 +444,11 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         // and run the read under `spawn_blocking`.
         Kind::Events => events_read(engine, query_str).await,
         Kind::Logs => logs_read(engine, query_str).await,
+        Kind::Status => status_read(&engine),
+        // Blob reads also hit `SQLite` (the blob index) plus
+        // a filesystem `read()`, so run under `spawn_blocking`
+        // like the events / logs paths.
+        Kind::Blob(instance, name) => blob_read(engine, instance, name).await,
     };
     (family, outcome)
 }
@@ -778,6 +854,97 @@ async fn logs_read(engine: Engine, raw_query: &str) -> ReadOutcome {
     encode(&LogsBody { logs: &rows }, "logs")
 }
 
+// ── Status ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct StatusBody {
+    version: &'static str,
+    /// `true` iff the shared `SQLite` handle answered a ping.
+    /// The REST `/api/v1/readyz` probe uses the same signal for
+    /// its 200 vs. 503; keeping them aligned means an MCP agent
+    /// and an orchestrator's HTTP probe agree on "up."
+    ok: bool,
+    installed_plugins: usize,
+    running_instances: usize,
+    devices: usize,
+}
+
+fn status_read(engine: &Engine) -> ReadOutcome {
+    let ok = match engine.db_ping() {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(target: "mcp.status", %err, "db ping failed while serving oxidhome://status");
+            false
+        }
+    };
+    let body = StatusBody {
+        version: env!("CARGO_PKG_VERSION"),
+        ok,
+        installed_plugins: engine.installed_plugins().list().len(),
+        running_instances: engine.instances().list().len(),
+        devices: engine.devices().list().len(),
+    };
+    encode(&body, "status")
+}
+
+// ── Blobs ─────────────────────────────────────────────────────────
+
+async fn blob_read(engine: Engine, instance_id: &str, name: &str) -> ReadOutcome {
+    // Resolve the instance's plugin_id → installation_uuid.
+    // The blob index is keyed by (installation_uuid,
+    // instance_id, name), and looking up `installation_uuid`
+    // via the `InstalledPluginRegistry` is the only place we
+    // can get it — instance handles carry `plugin_id` but not
+    // the per-install UUID.
+    let Some(handle) = engine.instances().get(instance_id) else {
+        return ReadOutcome::NotFound(format!("instance `{instance_id}` is not running"));
+    };
+    let plugin_id = handle.plugin_id().to_string();
+    let Some(installed) = engine.installed_plugins().get(&plugin_id) else {
+        // Reachable when the instance was started outside the
+        // install path (dev / argv boot); those instances have
+        // no blob store keyed by installation UUID, so the blob
+        // simply does not exist from this surface's point of
+        // view.
+        return ReadOutcome::NotFound(format!(
+            "plugin `{plugin_id}` is running but not installed; blob `{name}` is not reachable via MCP"
+        ));
+    };
+    let installation_uuid = installed.installation_uuid.to_string();
+    let instance_id_owned = instance_id.to_string();
+    let name_owned = name.to_string();
+    // Blob read touches the blob index (`SQLite`) then the
+    // filesystem — both blocking. `spawn_blocking` keeps the
+    // async worker free (same rule as events/logs).
+    let blobs = engine.blobs();
+    let uuid_for_task = installation_uuid.clone();
+    let inst_for_task = instance_id_owned.clone();
+    let name_for_task = name_owned.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let info = blobs.get_info(&uuid_for_task, &inst_for_task, &name_for_task)?;
+        let bytes = blobs.read_by_name(&uuid_for_task, &inst_for_task, &name_for_task)?;
+        Ok::<_, crate::state::blobs::BlobError>((info, bytes))
+    })
+    .await;
+    match join {
+        Ok(Ok((info, bytes))) => ReadOutcome::OkBlob {
+            bytes,
+            mime: info.mime,
+        },
+        Ok(Err(crate::state::blobs::BlobError::NotFound { what })) => {
+            ReadOutcome::NotFound(format!("blob not found: {what}"))
+        }
+        Ok(Err(err)) => {
+            tracing::error!(%err, instance_id = %instance_id_owned, name = %name_owned, "MCP blob read failed");
+            ReadOutcome::Internal("blob read failed".into())
+        }
+        Err(join_err) => {
+            tracing::error!(%join_err, "MCP blob read task panicked");
+            ReadOutcome::Internal("blob read task panicked".into())
+        }
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────
 
 /// Parse `?key=value&key=value` into a `HashMap`, percent-decoding
@@ -987,7 +1154,10 @@ fn clamp_limit(query: &HashMap<String, String>, default: u32, max: u32) -> Resul
 
 fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     match serde_json::to_string(value) {
-        Ok(body) => ReadOutcome::Ok(body),
+        Ok(body) => ReadOutcome::OkText {
+            body,
+            mime: "application/json",
+        },
         Err(err) => {
             tracing::error!(%err, what, "MCP resource serialization failed");
             ReadOutcome::Internal(format!("failed to serialize {what}"))
