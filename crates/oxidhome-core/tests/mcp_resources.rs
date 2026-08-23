@@ -363,14 +363,13 @@ async fn logs_resource_requires_logs_read_scope() {
     );
 }
 
-/// 14.2b — a bogus `min_level` on the logs resource surfaces
-/// as a 4xx-shaped error (`-32002 resource-not-found` here —
-/// the closest MCP error code, since JSON-RPC doesn't have a
-/// dedicated "bad param value"). Prevents a client-side typo
-/// from silently dropping the filter and returning
-/// unfiltered rows.
+/// 14.2b — a bogus `level` on the logs resource surfaces as
+/// `INVALID_PARAMS` (JSON-RPC `-32602`) and names the bad
+/// value so the client can correct it. Round-1 F4 on PR #121:
+/// pre-fix, this returned `-32002 resource-not-found`, which
+/// is the wrong error class for malformed input.
 #[tokio::test(flavor = "current_thread")]
-async fn logs_resource_rejects_unknown_min_level() {
+async fn logs_resource_rejects_unknown_level() {
     let engine = Engine::new().expect("engine");
     let bearer = mint_bearer(&engine);
     let router = build_router(engine);
@@ -381,14 +380,13 @@ async fn logs_resource_rejects_unknown_min_level() {
         &bearer,
         &session,
         "resources/read",
-        json!({"uri": "oxidhome://logs?min_level=Verbose"}),
+        json!({"uri": "oxidhome://logs?level=Verbose"}),
     )
     .await;
     let error = &response["error"];
-    assert_ne!(
-        error["code"],
-        json!(null),
-        "bad min_level must surface as an MCP error, not a filtered success; got {response}",
+    assert_eq!(
+        error["code"], -32602,
+        "bad level must surface as INVALID_PARAMS, not NotFound or a filtered success; got {response}",
     );
     assert!(
         error["message"]
@@ -397,6 +395,136 @@ async fn logs_resource_rejects_unknown_min_level() {
             .contains("Verbose"),
         "error must name the bad value so the client can correct it; got {error}",
     );
+}
+
+/// Round-1 F2 on PR #121: any query key outside the family's
+/// documented set (e.g. `min_level` on logs or `since_ms` on
+/// events, both old REST-style names) is rejected as
+/// `INVALID_PARAMS`. Silently ignoring unknowns is what let a
+/// documented request like `?level=Error&device=front-door`
+/// return unfiltered rows before the fix (the impl only knew
+/// `min_level` + `device_id`).
+#[tokio::test(flavor = "current_thread")]
+async fn logs_resource_rejects_unknown_filter_key() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        // `min_level` is the pre-fix REST-style name; the
+        // documented MCP name is `level`. Refusing this
+        // catches clients still on the old contract.
+        json!({"uri": "oxidhome://logs?min_level=Info"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "unknown filter key must surface as INVALID_PARAMS; got {response}",
+    );
+}
+
+/// Round-1 F1 on PR #121: with `spawn_blocking` around the
+/// `SQLite` reads, concurrent MCP log-history calls no longer
+/// starve the tokio worker pool. Fan out 8 concurrent reads
+/// on a `current_thread` runtime (below the mount's 16-slot
+/// pending-body gate); each completes with a 200 shape.
+/// Pre-fix (sync read on the worker), a call that held the
+/// store mutex would park the single-thread runtime and the
+/// `join_all` would never resolve.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_resource_concurrent_reads_do_not_starve_runtime() {
+    use futures_util::future::join_all;
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let calls = (0..8).map(|_| {
+        call(
+            &router,
+            &bearer,
+            &session,
+            "resources/read",
+            json!({"uri": "oxidhome://logs?since=1h"}),
+        )
+    });
+    let responses = join_all(calls).await;
+    for r in &responses {
+        assert!(
+            r["result"]["contents"].is_array(),
+            "each concurrent read must return a 200-shaped result; got {r}",
+        );
+    }
+}
+
+/// Round-1 F3 on PR #121: URI query values are percent-decoded
+/// before hitting the store. Pre-fix, a client that sent
+/// `plugin=oxidhome_core%3A%3Aruntime` (any generic URI
+/// builder that percent-encodes colons — RFC 3986 lets clients
+/// encode `:` since it's `reserved` outside authority /
+/// path) queried `SQLite` for the raw `%3A%3A` bytes and got
+/// zero rows. This test only checks the parse doesn't reject
+/// the value and the read succeeds — no rows exist on a fresh
+/// engine, so the meaningful assertion is "no `INVALID_PARAMS`
+/// on a valid percent-encoded value."
+#[tokio::test(flavor = "current_thread")]
+async fn logs_resource_percent_decodes_query_values() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        // `%3A` → `:`. Decoded, this is `oxidhome_core::runtime`.
+        json!({"uri": "oxidhome://logs?plugin=oxidhome_core%3A%3Aruntime"}),
+    )
+    .await;
+    assert!(
+        response["result"]["contents"].is_array(),
+        "percent-encoded plugin id must decode + query cleanly; got {response}",
+    );
+}
+
+/// Round-1 F4 on PR #121: malformed typed filters (bad
+/// `since`, bad `limit`, bad `after_id`) all surface as
+/// `INVALID_PARAMS`, not silently defaulted-away. Covers all
+/// three parse points in one test — one JSON-RPC call each,
+/// checked for the `-32602` code.
+#[tokio::test(flavor = "current_thread")]
+async fn events_resource_rejects_malformed_typed_filters() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for uri in [
+        "oxidhome://events?since=nope",
+        "oxidhome://events?since=99z",
+        "oxidhome://events?limit=oops",
+        "oxidhome://events?after_id=-1",
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "resources/read",
+            json!({"uri": uri}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "malformed typed filter in {uri} must surface as INVALID_PARAMS; got {response}",
+        );
+    }
 }
 
 /// `resources/templates/list` advertises the parametric

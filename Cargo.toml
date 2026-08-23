@@ -51,6 +51,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 # we don't use here; the `std` feature is on so plugin authors get the
 # normal `serde_json` API.
 serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
+# 14.2b: percent-decode MCP resource URI query strings
+# (`oxidhome://logs?plugin=oxidhome_core%3A%3Aruntime` etc.).
+# `axum` already pulls this transitively for its `Query`
+# extractor — lifting to a workspace dep keeps the graph
+# single-copy. Version tracks whatever `axum` pins.
+serde_urlencoded = "0.7.1"
 # Phase 13 round-3 F1: meta-validate plugin `ui.config-schema` /
 # `ui.commands-schema` files as JSON Schema draft 2020-12 at
 # install and boot-scan. `default-features = false` drops the
