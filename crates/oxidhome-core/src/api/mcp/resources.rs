@@ -679,15 +679,28 @@ fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
 /// REST `/api/v1/events` endpoint so a client that pins the
 /// same page size cross-transport sees identical pagination.
 const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
-/// Ceiling on a single events query — same value the REST
-/// handler enforces. Bounds a misbehaving client from
-/// pulling the whole `event_log` table in one shot.
-const EVENTS_QUERY_MAX_LIMIT: u32 = 1_000;
+/// Ceiling on a single events query. Deliberately tighter
+/// than the REST endpoint's `1_000` — an event payload is
+/// capped at [`crate::runtime::state::MAX_EVENT_PAYLOAD_BYTES`]
+/// (64 KiB), so `1_000` records × 64 KiB = ~62.5 MiB of
+/// serialized JSON per response; combined with the mount's
+/// 16-slot response gate, aggregate transmission memory would
+/// approach 1 GiB (round-5 F1 on PR #122). `100` records ×
+/// 64 KiB = ~6.4 MiB per response is a defensible ceiling
+/// that still delivers plenty of pagination granularity for
+/// LLM agents (which usually iterate in pages of tens rather
+/// than thousands).
+const EVENTS_QUERY_MAX_LIMIT: u32 = 100;
 
-/// Default / ceiling for `logs`. Mirrors the REST constants
-/// in `api::server` for the same reason as the events pair.
+/// Default / ceiling for `logs`. Same reasoning as
+/// [`EVENTS_QUERY_MAX_LIMIT`]: a log row's `message` +
+/// `fields` are unbounded by the WIT contract, and a
+/// misbehaving plugin could easily push individual rows into
+/// the tens of KiB. Capping at 100 rows per query keeps
+/// worst-case serialized response under the mount's
+/// transmission-body ceiling.
 const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
-const LOGS_QUERY_MAX_LIMIT: u32 = 1_000;
+const LOGS_QUERY_MAX_LIMIT: u32 = 100;
 
 #[derive(Serialize)]
 struct EventsBody {
@@ -1029,23 +1042,32 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
         ));
     };
     // Acquire a processing slot BEFORE we start the read
-    // (round-3 F1 on PR #122). The permit is a local binding;
-    // it drops when this async fn returns — right after the
-    // spawn_blocking task completes and its raw `Vec<u8>` has
-    // been dropped, so the peak-processing math in
-    // `BLOB_CONCURRENT_READS`' doc holds.
-    let _permit = match std::sync::Arc::clone(&BLOB_READ_SEMAPHORE)
-        .acquire_owned()
-        .await
-    {
+    // (round-3 F1 on PR #122). Round-4 F2 on PR #122 swapped
+    // `acquire_owned().await` (unbounded wait) for
+    // `try_acquire_owned()` — a client that disconnects
+    // mid-response causes axum to drop the request future,
+    // but rmcp's handler task keeps running on its own tokio
+    // task, so an `.await` here would let waiters pile up on
+    // a client that repeatedly submits and disconnects.
+    // Refusing immediately with `TooLarge` (client sees a
+    // dedicated 413-shaped error and can retry) bounds the
+    // handler-task count to the semaphore's own permit
+    // count.
+    let _permit = match std::sync::Arc::clone(&BLOB_READ_SEMAPHORE).try_acquire_owned() {
         Ok(p) => p,
-        Err(err) => {
-            // `Semaphore::close` is the only way `acquire`
-            // errors; we never call it on the static, so this
-            // is unreachable in practice — but if it ever
-            // happens, treat it as a server error rather than
-            // panicking inside a handler.
-            tracing::error!(%err, "MCP blob semaphore closed unexpectedly");
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            tracing::warn!(
+                cap = BLOB_CONCURRENT_READS,
+                "MCP blob concurrency cap reached — refusing read",
+            );
+            return ReadOutcome::TooLarge(format!(
+                "MCP blob concurrency cap reached ({BLOB_CONCURRENT_READS} in-flight reads); retry shortly"
+            ));
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            // Semaphore is never closed in practice, but the
+            // panic-free path still costs nothing.
+            tracing::error!("MCP blob semaphore closed unexpectedly");
             return ReadOutcome::Internal("blob concurrency gate closed".into());
         }
     };

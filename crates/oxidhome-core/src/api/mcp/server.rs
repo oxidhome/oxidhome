@@ -13,10 +13,15 @@
 //!    (round-6 F1). Round-4 F1 on PR #122 extended the permit's
 //!    lifetime: the permit rides on the response body via a
 //!    [`PermitBody`] wrapper, so it isn't released until the
-//!    SSE / JSON body has actually been sent to the client. That
-//!    caps in-transit response memory the same way it caps
-//!    request-buffer memory — a slow client accepting a blob
-//!    response holds a slot until it finishes reading.
+//!    SSE / JSON body has actually been sent to the client.
+//!    Round-5 F1 on PR #122 added a per-response byte cap
+//!    ([`MAX_RESPONSE_BODY_BYTES`]) enforced by the same
+//!    wrapper: a runaway serializer terminates the stream
+//!    rather than pushing arbitrarily many MiB through a slot.
+//!    That caps in-transit response memory to
+//!    `PENDING_BODY_GATE * MAX_RESPONSE_BODY_BYTES` — a slow
+//!    client accepting a blob response holds a slot until it
+//!    finishes reading, but the slot's cost is bounded.
 //! 2. **Body deadline + size cap** — inside the pending gate we
 //!    buffer the body under [`REQUEST_BODY_DEADLINE`] and
 //!    [`MAX_REQUEST_BODY_BYTES`]. Deadline miss ⇒ `408`, size
@@ -91,16 +96,13 @@ pub(super) const MAX_SESSIONS: usize = 128;
 ///
 /// - **Request-buffering:** `PENDING_BODY_GATE *
 ///   MAX_REQUEST_BODY_BYTES` = 16 MiB worst-case buffered.
-/// - **Response-transmission:** dominated by blob-carrying
-///   responses. With [`crate::api::mcp::resources`]'s
-///   `BLOB_INLINE_MAX_BYTES` (4 MiB → ~5.4 MiB base64) each
-///   in-transit blob response is ≤ ~5.4 MiB; the gate caps
-///   aggregate to `PENDING_BODY_GATE * 5.4 MiB` ≈ 85 MiB.
-///
-/// Small JSON responses (all non-blob resources) barely
-/// register against this budget; the 85 MiB figure is a
-/// worst-case where every gated request happens to be a blob
-/// read.
+/// - **Response-transmission:** each response is capped at
+///   [`MAX_RESPONSE_BODY_BYTES`] by the [`PermitBody`]
+///   byte-count wrapper (round-5 F1 on PR #122 — before that,
+///   `resources/read` on `oxidhome://events?limit=1000` could
+///   serialize ~62 MiB per response). Aggregate:
+///   `PENDING_BODY_GATE * MAX_RESPONSE_BODY_BYTES` = 128 MiB
+///   worst-case in-transit response memory.
 pub(super) const PENDING_BODY_GATE: usize = 16;
 
 /// Maximum time we will wait for the client to finish sending
@@ -378,6 +380,28 @@ async fn admission_gate(State(state): State<GateState>, request: Request, next: 
     attach_permit_to_body(response, pending_permit)
 }
 
+/// Per-response ceiling on serialized body bytes for the MCP
+/// mount. Round-5 F1 on PR #122: without a per-response cap,
+/// the reviewer showed how a `resources/read` on
+/// `oxidhome://events?limit=1000` could serialize ~62 MiB
+/// (`1_000` event rows × 64 KiB payload each) and 16 concurrent such
+/// responses could approach 1 GiB. The source-level query caps
+/// were tightened to make normal responses fit; this cap is the
+/// defense-in-depth backstop that terminates the stream if a
+/// response somehow exceeds it.
+///
+/// Sized to comfortably fit the tightest source-level cap:
+/// events at 100 records × 64 KiB per payload + framing ≈
+/// 6.5 MiB, blobs at 4 MiB base64 ≈ 5.4 MiB. 8 MiB gives
+/// headroom for wire framing (SSE `data:` prefix, JSON-RPC
+/// envelope, `_meta`) without allowing a run-away serializer
+/// to burn through host RAM.
+///
+/// Aggregate bound: `PENDING_BODY_GATE * MAX_RESPONSE_BODY_BYTES`
+/// = 16 × 8 MiB = 128 MiB worst-case in-transit response
+/// memory across the whole mount.
+pub(super) const MAX_RESPONSE_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Wrap the response body with a [`PermitBody`] that owns the
 /// caller's [`OwnedSemaphorePermit`] — the permit drops when
 /// axum/hyper finishes writing the body OR the client
@@ -392,16 +416,32 @@ fn attach_permit_to_body(
     let wrapped = Body::new(PermitBody {
         inner: body,
         _permit: permit,
+        bytes_seen: 0,
+        max_bytes: MAX_RESPONSE_BODY_BYTES,
+        truncated: false,
     });
     Response::from_parts(parts, wrapped)
 }
 
 /// [`http_body::Body`] wrapper that keeps an
 /// [`tokio::sync::OwnedSemaphorePermit`] alive for the full
-/// lifetime of the response body. Delegates every trait method
-/// to `inner`; the permit is released when the wrapper drops
-/// (either the body is fully consumed OR the axum/hyper layer
-/// drops the response because the connection went away).
+/// lifetime of the response body AND enforces a per-response
+/// byte ceiling ([`MAX_RESPONSE_BODY_BYTES`]).
+///
+/// The permit drops when the wrapper drops — either the body
+/// was fully consumed OR the axum/hyper layer dropped the
+/// response because the connection went away.
+///
+/// The byte ceiling is defense-in-depth: source-level query
+/// caps (see e.g. `EVENTS_QUERY_MAX_LIMIT` in
+/// [`crate::api::mcp::resources`]) are the primary bound;
+/// this wrapper catches any response that slips past them.
+/// On overflow we surface an [`axum::Error`] on the next
+/// `poll_frame`, which terminates the stream. The client
+/// sees a truncated body — worse UX than a clean 413, but
+/// there's no way to send a fresh HTTP response after headers
+/// have flushed. The tracing warn line at truncation time is
+/// the operator signal.
 ///
 /// The wrapper carries `Bytes` as its data type because that's
 /// the frame shape `axum::body::Body` yields; the trait's error
@@ -411,6 +451,9 @@ fn attach_permit_to_body(
 struct PermitBody {
     inner: Body,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    bytes_seen: u64,
+    max_bytes: u64,
+    truncated: bool,
 }
 
 // Both `Body` and `OwnedSemaphorePermit` are `Unpin`, so the
@@ -432,12 +475,50 @@ impl http_body::Body for PermitBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
         let this = self.get_mut();
-        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+        // Sticky truncation: once we've refused a frame, keep
+        // ending the stream so a well-behaved consumer stops
+        // polling instead of hitting the same error path
+        // repeatedly.
+        if this.truncated {
+            return Poll::Ready(None);
+        }
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Ok(frame))) => {
+                // Only data frames count toward the byte cap;
+                // trailer frames are tiny by construction and
+                // pass through unchanged.
+                if let Some(data) = frame.data_ref() {
+                    let n = data.len() as u64;
+                    let next = this.bytes_seen.saturating_add(n);
+                    if next > this.max_bytes {
+                        this.truncated = true;
+                        tracing::warn!(
+                            cap = this.max_bytes,
+                            seen = this.bytes_seen,
+                            frame = n,
+                            "MCP response body exceeded MAX_RESPONSE_BODY_BYTES — terminating stream",
+                        );
+                        return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::other(
+                            format!(
+                                "MCP response body exceeded per-response cap ({} bytes)",
+                                this.max_bytes,
+                            ),
+                        )))));
+                    }
+                    this.bytes_seen = next;
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+        }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.truncated || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
@@ -459,4 +540,75 @@ fn is_length_limit_error(err: &axum::Error) -> bool {
         current = source.source();
     }
     false
+}
+
+#[cfg(test)]
+mod permit_body_tests {
+    use super::{MAX_RESPONSE_BODY_BYTES, PermitBody};
+    use axum::body::Body;
+    use http_body_util::BodyExt as _;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// Build a `PermitBody` around a fixed-size body plus a
+    /// live semaphore permit. Every test does this dance;
+    /// helper keeps them focused on the byte-cap logic.
+    fn wrap(bytes: bytes::Bytes, cap: u64) -> PermitBody {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("permit available");
+        PermitBody {
+            inner: Body::from(bytes),
+            _permit: permit,
+            bytes_seen: 0,
+            max_bytes: cap,
+            truncated: false,
+        }
+    }
+
+    /// A response smaller than the cap streams through the
+    /// wrapper unchanged — the byte counter is defense-in-depth,
+    /// not a normal-path bottleneck.
+    #[tokio::test]
+    async fn body_under_cap_passes_through() {
+        let payload = vec![0u8; 1024];
+        let body = wrap(payload.clone().into(), 2 * 1024);
+        let collected = body
+            .collect()
+            .await
+            .expect("collect must succeed under cap")
+            .to_bytes();
+        assert_eq!(collected.len(), payload.len());
+    }
+
+    /// Round-5 F1 on PR #122: a body that pushes past the cap
+    /// terminates via an `axum::Error` on `poll_frame`. The
+    /// error's `Display` names the enforced cap so an operator
+    /// grepping logs can tell the wrapper triggered.
+    #[tokio::test]
+    async fn body_over_cap_is_terminated() {
+        // 4 KiB payload, 1 KiB cap: the very first data frame
+        // trips the limit.
+        let payload = vec![0u8; 4 * 1024];
+        let body = wrap(payload.into(), 1024);
+        let err = body
+            .collect()
+            .await
+            .expect_err("collect must surface the cap error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per-response cap") && msg.contains("1024"),
+            "error must name the enforced cap; got {msg}",
+        );
+    }
+
+    /// The mount's advertised cap value (a compile-time constant
+    /// so the doc math holds together) is exactly what the
+    /// wrapper enforces. Sanity check to keep the two in sync.
+    #[test]
+    fn max_response_body_bytes_is_advertised_value() {
+        assert_eq!(MAX_RESPONSE_BODY_BYTES, 8 * 1024 * 1024);
+    }
 }

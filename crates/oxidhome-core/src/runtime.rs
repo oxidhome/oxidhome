@@ -399,15 +399,6 @@ impl Engine {
         &self.inner
     }
 
-    /// Cheap `SELECT 1` against the shared `SQLite` connection —
-    /// the readiness probe for `GET /api/v1/readyz`. See
-    /// [`crate::state::Db::ping`] for the failure modes it
-    /// surfaces (mutex poisoning, disk I/O, connection loss).
-    /// Every persistent sub-store hangs off the same connection,
-    /// so a successful ping stands in for token verification,
-    /// audit-ledger writes, KV, blob-index, event-log, and
-    /// log-store readiness in one shot.
-    ///
     /// Milliseconds since the Engine was constructed. Sourced
     /// from a monotonic `Instant`, so wall-clock adjustments
     /// during the process's lifetime can't produce a negative
@@ -418,6 +409,15 @@ impl Engine {
         u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// Cheap `SELECT 1` against the shared `SQLite` connection —
+    /// the readiness probe for `GET /api/v1/readyz`. See
+    /// [`crate::state::Db::ping`] for the failure modes it
+    /// surfaces (mutex poisoning, disk I/O, connection loss).
+    /// Every persistent sub-store hangs off the same connection,
+    /// so a successful ping stands in for token verification,
+    /// audit-ledger writes, KV, blob-index, event-log, and
+    /// log-store readiness in one shot.
+    ///
     /// # Errors
     ///
     /// Forwards any `rusqlite` failure.
