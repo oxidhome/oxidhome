@@ -204,10 +204,10 @@ pub const MAX_INSTANCE_ID_BYTES: usize = 128;
 /// Maximum permitted byte length of a blob's `mime` string.
 /// Enforced at [`BlobStore::write`] time (round-10 F1 on
 /// PR #122) so an unbounded plugin-supplied mime can't make
-/// it into the persisted `blob` row.
-/// [`BlobStore::read_with_info`] also filters legacy rows
-/// with over-cap mime at SQL-select time, so pre-cap rows
-/// don't force a materialise-then-drop dance either.
+/// it into the persisted `blob` row. Every SQL query that
+/// projects `mime` (see [`BLOB_SELECT_COLUMNS`]) also filters
+/// legacy over-cap rows so pre-cap data doesn't force a
+/// materialise-then-drop dance either.
 ///
 /// 256 bytes is generous for real IANA types (the longest
 /// registered is ~80 chars; parameters like
@@ -216,6 +216,34 @@ pub const MAX_INSTANCE_ID_BYTES: usize = 128;
 /// shorter mime or write the extended metadata as a separate
 /// blob.
 pub const MAX_BLOB_MIME_BYTES: usize = 256;
+
+/// Column list every `blob`-row SELECT uses. Held in one
+/// place so the legacy-mime filter (round-10 F1 + F2 on PR
+/// #122) applies uniformly across `read_with_info`,
+/// `get_info`, and `list_blobs` — a future column addition
+/// or filter change only has to happen here.
+///
+/// The mime projection uses `length(CAST(mime AS BLOB))`
+/// rather than `length(mime)`. On a `SQLite` `TEXT` column
+/// `length()` counts Unicode code points, so 256 four-byte
+/// characters would slip past a 256-byte cap even though the
+/// underlying storage is 1024 bytes. Casting to `BLOB`
+/// forces `length()` to return the byte length, matching the
+/// write-time `str::len()` check exactly (round-10 F2 on PR
+/// #122). Bound in every call site via a `?N`-style parameter
+/// (`blob_mime_cap_param()` provides the value).
+const BLOB_SELECT_COLUMNS: &str = "name, id, size_bytes, created_ms, \
+     CASE WHEN mime IS NULL OR length(CAST(mime AS BLOB)) <= ?4 \
+          THEN mime ELSE NULL END";
+
+/// Value to bind to the last `?` placeholder of every SELECT
+/// built with [`BLOB_SELECT_COLUMNS`]. Kept as a function
+/// (not a `const`) so the `usize → i64` conversion is
+/// checked, even though `MAX_BLOB_MIME_BYTES` is well under
+/// `i64::MAX`.
+fn blob_mime_cap_param() -> i64 {
+    i64::try_from(MAX_BLOB_MIME_BYTES).expect("mime cap fits in i64")
+}
 
 fn check_instance_id(instance_id: &str) -> Result<(), BlobError> {
     if is_safe_instance_id(instance_id) {
@@ -721,35 +749,15 @@ impl BlobStore {
         // observing a partial write regardless of platform.
         let (info, mut file) = self.db.read(|conn| -> Result<_, BlobError> {
             // Round-10 F1 on PR #122: filter out over-cap
-            // legacy mimes at select time. `length(mime)` is
-            // computed by `SQLite` without materialising the
-            // value in the Rust side, and the `CASE`
-            // substitutes NULL for a mime string longer than
-            // the cap — so a 100 MiB legacy mime row never
-            // becomes a 100 MiB `String` allocation in this
-            // process. Rows written after the R10 fix can't
-            // hit the fallback path because `write()` refuses
-            // them up front.
+            // legacy mimes at select time — see
+            // [`BLOB_SELECT_COLUMNS`] for the projection.
             let info: Option<BlobInfo> = conn
                 .query_row(
-                    "SELECT name, id, size_bytes, created_ms, \
-                            CASE WHEN mime IS NULL OR length(mime) <= ?4 \
-                                 THEN mime \
-                                 ELSE NULL \
-                            END \
-                     FROM blob \
-                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
-                    params![
-                        installation_uuid,
-                        instance_id,
-                        name,
-                        // `MAX_BLOB_MIME_BYTES` is 256 —
-                        // trivially fits in `i64`, but
-                        // `try_from` keeps the compiler
-                        // happy about `usize → i64` on
-                        // 64-bit targets.
-                        i64::try_from(MAX_BLOB_MIME_BYTES).expect("mime cap fits in i64"),
-                    ],
+                    &format!(
+                        "SELECT {BLOB_SELECT_COLUMNS} FROM blob \
+                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    ),
+                    params![installation_uuid, instance_id, name, blob_mime_cap_param(),],
                     decode_blob_info,
                 )
                 .optional()?;
@@ -819,10 +827,16 @@ impl BlobStore {
         check_instance_id(instance_id)?;
         self.db
             .read(|conn| -> Result<_, BlobError> {
+                // Round-10 F2 on PR #122: same legacy-mime
+                // filter as [`Self::read_with_info`] — WIT
+                // metadata callers must not force a legacy
+                // over-cap mime into a Rust `String` either.
                 conn.query_row(
-                    "SELECT name, id, size_bytes, created_ms, mime FROM blob \
-                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
-                    params![installation_uuid, instance_id, name],
+                    &format!(
+                        "SELECT {BLOB_SELECT_COLUMNS} FROM blob \
+                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    ),
+                    params![installation_uuid, instance_id, name, blob_mime_cap_param()],
                     decode_blob_info,
                 )
                 .optional()
@@ -909,15 +923,25 @@ impl BlobStore {
         check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         self.db.read(|conn| -> Result<_, BlobError> {
-            let mut stmt = conn.prepare(
-                "SELECT name, id, size_bytes, created_ms, mime FROM blob \
+            // Round-10 F2 on PR #122: apply the legacy-mime
+            // filter to list_blobs too — otherwise a single
+            // over-cap legacy mime row in the returned set
+            // materialises the whole oversized string; N
+            // matching rows would multiply the exposure.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {BLOB_SELECT_COLUMNS} FROM blob \
                  WHERE installation_uuid = ?1 AND instance_id = ?2 \
                    AND substr(name, 1, length(?3)) = ?3 \
                  ORDER BY name",
-            )?;
+            ))?;
             let rows = stmt
                 .query_map(
-                    params![installation_uuid, instance_id, prefix],
+                    params![
+                        installation_uuid,
+                        instance_id,
+                        prefix,
+                        blob_mime_cap_param(),
+                    ],
                     decode_blob_info,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1786,20 +1810,7 @@ mod tests {
         store
             .write(INST_A, "alpha", "snap", b"hi", Some("image/jpeg"))
             .expect("write");
-        // Rewrite the mime column directly, bypassing the
-        // R10 write-time cap — this is the "legacy row"
-        // shape (a row from before the cap existed).
-        let legacy_mime = "y".repeat(MAX_BLOB_MIME_BYTES + 8);
-        store
-            .db
-            .write(|conn| {
-                conn.execute(
-                    "UPDATE blob SET mime = ?1 \
-                     WHERE installation_uuid = ?2 AND instance_id = ?3 AND name = ?4",
-                    params![legacy_mime, INST_A, "alpha", "snap"],
-                )
-            })
-            .expect("legacy update");
+        install_legacy_mime(&store, "snap", &"y".repeat(MAX_BLOB_MIME_BYTES + 8));
 
         // The read path filters the mime at SQL-select time,
         // so callers never see the over-cap string.
@@ -1812,5 +1823,118 @@ mod tests {
             "legacy over-cap mime must be filtered to None, not surfaced verbatim; got {:?}",
             info.mime,
         );
+    }
+
+    /// Round-11 F1 on PR #122: `get_info` (the WIT-side
+    /// metadata read) filters the same way — pre-fix it
+    /// `SELECT`ed `mime` verbatim, so a legacy over-cap row
+    /// forced a 100 MiB `String` on every `get-info` call.
+    #[test]
+    fn get_info_filters_legacy_over_cap_mime() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "snap", b"hi", Some("image/jpeg"))
+            .expect("write");
+        install_legacy_mime(&store, "snap", &"z".repeat(MAX_BLOB_MIME_BYTES + 4));
+
+        let info = store.get_info(INST_A, "alpha", "snap").expect("get_info");
+        assert!(
+            info.mime.is_none(),
+            "get_info must filter legacy over-cap mime"
+        );
+    }
+
+    /// Round-11 F1 on PR #122: `list_blobs` filters at select
+    /// time too — one over-cap legacy row alongside N
+    /// under-cap siblings must not materialise the oversized
+    /// string on every list call.
+    #[test]
+    fn list_blobs_filters_legacy_over_cap_mime() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "snap-a", b"a", Some("image/jpeg"))
+            .expect("write a");
+        store
+            .write(INST_A, "alpha", "snap-b", b"b", Some("image/png"))
+            .expect("write b");
+        install_legacy_mime(&store, "snap-a", &"w".repeat(MAX_BLOB_MIME_BYTES + 1));
+
+        let rows = store.list_blobs(INST_A, "alpha", "snap-").expect("list");
+        assert_eq!(rows.len(), 2, "both rows still present");
+        let by_name: std::collections::HashMap<_, _> =
+            rows.into_iter().map(|r| (r.name.clone(), r)).collect();
+        assert!(
+            by_name["snap-a"].mime.is_none(),
+            "snap-a's legacy over-cap mime must be filtered",
+        );
+        assert_eq!(
+            by_name["snap-b"].mime.as_deref(),
+            Some("image/png"),
+            "under-cap sibling must survive verbatim",
+        );
+    }
+
+    /// Round-11 F2 on PR #122: `SQLite` `length(mime)` on a
+    /// `TEXT` column counts Unicode code points, not bytes —
+    /// so `MAX_BLOB_MIME_BYTES` four-byte chars (1024 bytes)
+    /// would slip past a 256-*char* filter. The SQL projection
+    /// now casts to BLOB so `length()` counts bytes; this
+    /// test locks that in with a multibyte payload that's
+    /// under the code-point cap but over the byte cap.
+    #[test]
+    fn read_with_info_filters_multibyte_over_byte_cap() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "snap", b"hi", Some("image/jpeg"))
+            .expect("write");
+        // `😀` is a 4-byte UTF-8 emoji (1 code point). At the
+        // char-counting cap it would take `MAX_BLOB_MIME_BYTES`
+        // of them (~1 KiB of bytes) to trip the filter; with
+        // byte-accurate CAST-to-BLOB counting, we cross the
+        // cap far sooner. Repeat enough emojis to definitely
+        // exceed the 256-byte cap while staying under 256
+        // code points.
+        let bytes_per_emoji = "😀".len();
+        // 100 emojis = 400 bytes > 256; only 100 code points.
+        let mime = "😀".repeat(100);
+        assert!(mime.chars().count() < MAX_BLOB_MIME_BYTES);
+        assert!(mime.len() > MAX_BLOB_MIME_BYTES);
+        assert_eq!(mime.len(), 100 * bytes_per_emoji);
+        install_legacy_mime(&store, "snap", &mime);
+
+        let (info, _bytes) = store
+            .read_with_info(INST_A, "alpha", "snap", None)
+            .expect("read_with_info");
+        assert!(
+            info.mime.is_none(),
+            "multibyte mime past the BYTE cap must be filtered even though its CHAR count fits: {:?}",
+            info.mime,
+        );
+    }
+
+    fn install_legacy_mime(store: &BlobStore, name: &str, mime: &str) {
+        // Bypass the write-time cap by rewriting the mime
+        // column directly. Simulates a row written before
+        // the R10 cap existed (or any other path that
+        // sidesteps `write()`'s guard).
+        store
+            .db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE blob SET mime = ?1 \
+                     WHERE installation_uuid = ?2 AND instance_id = ?3 AND name = ?4",
+                    params![mime, INST_A, "alpha", name],
+                )
+            })
+            .expect("legacy update");
     }
 }
