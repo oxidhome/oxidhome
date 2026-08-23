@@ -1817,6 +1817,17 @@ fn blob_error_to_wit(err: crate::state::BlobError) -> WitError {
             "blob_store: commit-after-rename leaked to WIT layer at {}: {source}",
             final_path.display(),
         )),
+        // WIT paths never pass `size_bytes_max`, so this
+        // variant is unreachable from a plugin call — treat any
+        // leakage as a host bug the same way
+        // `CommitFailedAfterRename` above is treated.
+        BlobError::TooLarge {
+            what,
+            size_bytes,
+            cap,
+        } => WitError::Internal(format!(
+            "blob_store: size cap unexpectedly reached from WIT path — {what}, {size_bytes} bytes vs cap {cap} (host bug)"
+        )),
     }
 }
 

@@ -750,3 +750,45 @@ restart = "on-trap"
         other => panic!("expected Failed after the restart cap, got {other:?}"),
     }
 }
+
+/// Round-2 F2 on PR #122 (14.2c MCP blobs). `Engine::start_instance`
+/// is the dev / argv boot path — it does NOT go through the
+/// installed-plugin registry, so a running argv instance has NO
+/// `plugin_installation` row. Pre-fix, MCP blob reads for such
+/// instances looked up `installation_uuid` through the installed
+/// registry and always got `None`, making their blobs unreachable
+/// via `oxidhome://blobs/<instance>/<name>`.
+///
+/// After the fix, the supervisor pins the same
+/// `installation_uuid` it mints inside `PluginInstance::load` onto
+/// the `InstanceHandle`'s shared `OnceLock`. This test asserts that
+/// after `wait_for_running` the handle exposes a non-empty UUID.
+#[tokio::test(flavor = "multi_thread")]
+async fn installation_uuid_pinned_on_handle_for_argv_instance() {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+
+    let handle = engine
+        .start_instance(switch_dir, "switch-uuid", None)
+        .await
+        .expect("start_instance");
+    handle.wait_for_running().await.expect("reaches Running");
+
+    let uuid = handle
+        .installation_uuid()
+        .expect("supervisor must pin installation_uuid on the handle after load");
+    assert!(
+        !uuid.is_empty(),
+        "pinned installation_uuid must not be empty"
+    );
+    // The argv fallback shape used inside `PluginInstance::load`
+    // is `manifest.plugin.id`; the simulated-switch example
+    // declares `example.simulated-switch`. Belt-and-suspenders
+    // check: whatever it is, it's stable.
+    assert_eq!(handle.installation_uuid().expect("still set"), uuid);
+
+    handle.stop().await.expect("stop");
+}

@@ -444,7 +444,7 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         // and run the read under `spawn_blocking`.
         Kind::Events => events_read(engine, query_str).await,
         Kind::Logs => logs_read(engine, query_str).await,
-        Kind::Status => status_read(&engine),
+        Kind::Status => status_read(engine.clone()).await,
         // Blob reads also hit `SQLite` (the blob index) plus
         // a filesystem `read()`, so run under `spawn_blocking`
         // like the events / logs paths.
@@ -869,12 +869,23 @@ struct StatusBody {
     devices: usize,
 }
 
-fn status_read(engine: &Engine) -> ReadOutcome {
-    let ok = match engine.db_ping() {
-        Ok(()) => true,
-        Err(err) => {
+async fn status_read(engine: Engine) -> ReadOutcome {
+    // `db_ping` grabs the shared `SQLite` mutex and waits on
+    // whatever's holding it — same reason the events/logs
+    // families run under `spawn_blocking` (round-2 F5 on PR
+    // #122). Concurrent MCP status probes on a busy DB would
+    // otherwise park the tokio worker for the ping's duration.
+    let engine_for_ping = engine.clone();
+    let ping_join = tokio::task::spawn_blocking(move || engine_for_ping.db_ping()).await;
+    let ok = match ping_join {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
             tracing::warn!(target: "mcp.status", %err, "db ping failed while serving oxidhome://status");
             false
+        }
+        Err(join_err) => {
+            tracing::error!(target: "mcp.status", %join_err, "db ping task panicked while serving oxidhome://status");
+            return ReadOutcome::Internal("status db-ping task panicked".into());
         }
     };
     let body = StatusBody {
@@ -889,41 +900,78 @@ fn status_read(engine: &Engine) -> ReadOutcome {
 
 // ── Blobs ─────────────────────────────────────────────────────────
 
-async fn blob_read(engine: Engine, instance_id: &str, name: &str) -> ReadOutcome {
-    // Resolve the instance's plugin_id → installation_uuid.
-    // The blob index is keyed by (installation_uuid,
-    // instance_id, name), and looking up `installation_uuid`
-    // via the `InstalledPluginRegistry` is the only place we
-    // can get it — instance handles carry `plugin_id` but not
-    // the per-install UUID.
-    let Some(handle) = engine.instances().get(instance_id) else {
+/// Inline-response ceiling for `oxidhome://blobs/...`. Blobs are
+/// base64-encoded into the JSON-RPC response body, so the wire
+/// footprint is roughly `4/3 * size + audit + protocol framing`
+/// per request. 16 concurrent requests (the pending-body gate
+/// cap on the MCP mount) hitting this ceiling occupies
+/// ~256 MiB peak, which is a defensible budget for a hub host.
+///
+/// A ceiling that is too low forces a plugin publishing e.g. a
+/// 6-MP JPEG to break its output up; too high lets a single
+/// caller exhaust host memory. 16 MiB matches typical
+/// smart-home artifact sizes (camera snapshots, short audio
+/// clips) with headroom, while capping a run-away caller.
+/// Round-2 F1 on PR #122: pre-fix, there was no cap at all.
+const BLOB_INLINE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> ReadOutcome {
+    // Round-2 F3 on PR #122: percent-decode the URI path
+    // segments once before they hit the store. Blob names are
+    // arbitrary human-readable strings ("front door.jpg",
+    // "clip/segment-1.mp3"); a generic URI builder will encode
+    // spaces as `%20` and `/` as `%2F`, and querying `SQLite`
+    // for the raw encoded bytes returns nothing.
+    let instance_id = match percent_decode_segment(instance_id_raw) {
+        Ok(v) => v,
+        Err(err) => {
+            return ReadOutcome::InvalidParams(format!(
+                "malformed `instance_id` segment `{instance_id_raw}`: {err}",
+            ));
+        }
+    };
+    let name = match percent_decode_segment(name_raw) {
+        Ok(v) => v,
+        Err(err) => {
+            return ReadOutcome::InvalidParams(format!(
+                "malformed `name` segment `{name_raw}`: {err}",
+            ));
+        }
+    };
+    // Resolve `installation_uuid` off the running instance's
+    // handle — pinned by the supervisor after the first
+    // successful load (round-2 F2 on PR #122). Pre-fix this
+    // went through `InstalledPluginRegistry::get(plugin_id)`,
+    // which has no row for dev / argv instances, so their
+    // blobs were unreachable via MCP.
+    let Some(handle) = engine.instances().get(&instance_id) else {
         return ReadOutcome::NotFound(format!("instance `{instance_id}` is not running"));
     };
-    let plugin_id = handle.plugin_id().to_string();
-    let Some(installed) = engine.installed_plugins().get(&plugin_id) else {
-        // Reachable when the instance was started outside the
-        // install path (dev / argv boot); those instances have
-        // no blob store keyed by installation UUID, so the blob
-        // simply does not exist from this surface's point of
-        // view.
+    let Some(installation_uuid) = handle.installation_uuid().map(str::to_string) else {
+        // Instance is still `Loading` — the supervisor hasn't
+        // pinned the UUID yet. Treat as "not ready" via 404
+        // rather than 5xx; the client's natural retry is to
+        // wait for the state to advance and re-issue the read.
         return ReadOutcome::NotFound(format!(
-            "plugin `{plugin_id}` is running but not installed; blob `{name}` is not reachable via MCP"
+            "instance `{instance_id}` is not yet loaded; retry once its state is `Running`"
         ));
     };
-    let installation_uuid = installed.installation_uuid.to_string();
-    let instance_id_owned = instance_id.to_string();
-    let name_owned = name.to_string();
-    // Blob read touches the blob index (`SQLite`) then the
-    // filesystem — both blocking. `spawn_blocking` keeps the
-    // async worker free (same rule as events/logs).
+    // Blob fetch is one atomic (`SQLite` + filesystem) op that
+    // returns both the metadata and the bytes belonging to the
+    // same version (round-2 F4 on PR #122). Runs under
+    // `spawn_blocking` for the same reason events/logs do —
+    // shared std mutex + `std::fs::read`.
     let blobs = engine.blobs();
     let uuid_for_task = installation_uuid.clone();
-    let inst_for_task = instance_id_owned.clone();
-    let name_for_task = name_owned.clone();
+    let instance_for_task = instance_id.clone();
+    let name_for_task = name.clone();
     let join = tokio::task::spawn_blocking(move || {
-        let info = blobs.get_info(&uuid_for_task, &inst_for_task, &name_for_task)?;
-        let bytes = blobs.read_by_name(&uuid_for_task, &inst_for_task, &name_for_task)?;
-        Ok::<_, crate::state::blobs::BlobError>((info, bytes))
+        blobs.read_with_info(
+            &uuid_for_task,
+            &instance_for_task,
+            &name_for_task,
+            Some(BLOB_INLINE_MAX_BYTES),
+        )
     })
     .await;
     match join {
@@ -934,14 +982,74 @@ async fn blob_read(engine: Engine, instance_id: &str, name: &str) -> ReadOutcome
         Ok(Err(crate::state::blobs::BlobError::NotFound { what })) => {
             ReadOutcome::NotFound(format!("blob not found: {what}"))
         }
+        Ok(Err(crate::state::blobs::BlobError::TooLarge {
+            what,
+            size_bytes,
+            cap,
+        })) => ReadOutcome::InvalidParams(format!(
+            "blob {what} is {size_bytes} bytes; the MCP inline cap is {cap}. \
+             Reduce the blob size or fetch it via a plugin-owned tool that streams it."
+        )),
         Ok(Err(err)) => {
-            tracing::error!(%err, instance_id = %instance_id_owned, name = %name_owned, "MCP blob read failed");
+            tracing::error!(%err, instance_id = %instance_id, name = %name, "MCP blob read failed");
             ReadOutcome::Internal("blob read failed".into())
         }
         Err(join_err) => {
             tracing::error!(%join_err, "MCP blob read task panicked");
             ReadOutcome::Internal("blob read task panicked".into())
         }
+    }
+}
+
+/// Percent-decode one URI path segment, returning it as an
+/// owned `String`. `serde_urlencoded` decodes `application/
+/// x-www-form-urlencoded` (`+` → space); path segments follow
+/// RFC 3986 where `+` is a literal `+`, not a space — the
+/// query-string decoder is the wrong tool here. We hand-roll
+/// the tiny subset we need instead.
+///
+/// Rules:
+///
+/// - `%HH` (two ASCII hex digits) → the byte `0xHH`.
+/// - `+` → literal `+` (not space).
+/// - Any other byte → itself.
+///
+/// The final byte sequence must be valid UTF-8 — a
+/// percent-escape that resolves to a lone continuation byte
+/// is rejected.
+fn percent_decode_segment(raw: &str) -> Result<String, String> {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let Some(pair) = bytes.get(i + 1..i + 3) else {
+                    return Err("truncated %-escape".into());
+                };
+                let hi = decode_hex(pair[0])?;
+                let lo = decode_hex(pair[1])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|e| format!("decoded bytes are not valid UTF-8: {e}"))
+}
+
+fn decode_hex(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        other => Err(format!(
+            "invalid hex digit `{}` in %-escape",
+            other.escape_ascii()
+        )),
     }
 }
 
@@ -1129,6 +1237,56 @@ mod parse_query_tests {
     #[test]
     fn empty_query_is_ok() {
         assert!(parse_query("").expect("parse ok").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod percent_decode_tests {
+    use super::percent_decode_segment;
+
+    #[test]
+    fn decodes_space_and_slash() {
+        assert_eq!(
+            percent_decode_segment("front%20door.jpg").unwrap(),
+            "front door.jpg",
+        );
+        assert_eq!(
+            percent_decode_segment("folder%2Fsnap.jpg").unwrap(),
+            "folder/snap.jpg",
+        );
+    }
+
+    #[test]
+    fn plus_is_literal_not_space() {
+        // RFC 3986 path segments: `+` is a literal `+`, not a
+        // space. `serde_urlencoded` would decode this to a
+        // space — that's why we hand-roll the segment decoder
+        // instead of reusing it for blob paths.
+        assert_eq!(percent_decode_segment("a+b").unwrap(), "a+b");
+    }
+
+    #[test]
+    fn accepts_mixed_case_hex() {
+        assert_eq!(percent_decode_segment("%3a%3A").unwrap(), "::");
+    }
+
+    #[test]
+    fn rejects_truncated_escape() {
+        assert!(percent_decode_segment("bad%2").is_err());
+        assert!(percent_decode_segment("bad%").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_hex() {
+        assert!(percent_decode_segment("bad%GG").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_result() {
+        // `%FF` decoded is a lone byte that isn't valid UTF-8 —
+        // makes the segment unusable as a `String` key on
+        // downstream stores, so we reject at the decoder.
+        assert!(percent_decode_segment("bad%FF").is_err());
     }
 }
 

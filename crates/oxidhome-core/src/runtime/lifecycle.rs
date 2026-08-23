@@ -203,6 +203,14 @@ pub struct InstanceHandle {
     /// the registry / dispatcher can attribute work in audit logs by
     /// plugin without an extra lookup.
     plugin_id: Arc<str>,
+    /// Host-minted per-install UUID (`inst-<32 hex>`), pinned by the
+    /// supervisor after the first successful load. `None` while the
+    /// instance is still `Loading`. Shared with the supervisor task
+    /// via `Arc<OnceLock<_>>` so the handle and the task see the
+    /// same slot; the supervisor sets it exactly once (subsequent
+    /// restarts of the same install re-set to the same value and
+    /// `OnceLock::set` returns `Err`, which we swallow).
+    installation_uuid: Arc<std::sync::OnceLock<Arc<str>>>,
     control: mpsc::Sender<ControlCommand>,
     state: watch::Receiver<InstanceState>,
 }
@@ -237,6 +245,10 @@ impl InstanceHandle {
         Self {
             instance_id: Arc::from(instance_id),
             plugin_id: Arc::from(plugin_id),
+            // Registry-test handles never run a real load, so
+            // the cell stays unset — mirrors the `Loading` state
+            // that never advanced to a first successful load.
+            installation_uuid: Arc::new(std::sync::OnceLock::new()),
             control,
             state,
         }
@@ -254,6 +266,18 @@ impl InstanceHandle {
     #[must_use]
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+
+    /// Host-minted per-install UUID (`inst-<32 hex>`) pinned to
+    /// this instance's supervisor. `None` while the instance is
+    /// still `Loading` (the supervisor sets the slot after the
+    /// first successful component load). Callers keying store
+    /// operations by `(installation_uuid, instance_id)` — MCP
+    /// `oxidhome://blobs/<instance>/<name>` in particular —
+    /// should treat `None` as "instance is not yet ready."
+    #[must_use]
+    pub fn installation_uuid(&self) -> Option<&str> {
+        self.installation_uuid.get().map(Arc::as_ref)
     }
 
     /// A snapshot of the current [`InstanceState`].
@@ -550,9 +574,12 @@ pub fn supervise_with_tuning_mode_and_pin(
     let plugin_id: Arc<str> = Arc::from(plugin_id.into());
     let (control_tx, control_rx) = mpsc::channel(16);
     let (state_tx, state_rx) = watch::channel(InstanceState::Loading);
+    let installation_uuid: Arc<std::sync::OnceLock<Arc<str>>> =
+        Arc::new(std::sync::OnceLock::new());
     let handle = InstanceHandle {
         instance_id: Arc::clone(&instance_id),
         plugin_id: Arc::clone(&plugin_id),
+        installation_uuid: Arc::clone(&installation_uuid),
         control: control_tx,
         state: state_rx,
     };
@@ -565,6 +592,7 @@ pub fn supervise_with_tuning_mode_and_pin(
         mode,
         control_rx,
         state_tx,
+        installation_uuid,
         first_load_pinned_manifest,
     ));
     handle
@@ -729,6 +757,13 @@ async fn run_supervisor(
     mode: crate::runtime::LoadMode,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     state_tx: watch::Sender<InstanceState>,
+    // Pinned by the FIRST successful load and shared with the
+    // `InstanceHandle` this supervisor was spawned alongside.
+    // `run_one_lifecycle` sets it via `OnceLock::set` — the
+    // first successful attempt wins; every restart re-sets to
+    // the same value (same install) and the `.set()` returns
+    // `Err`, which is expected and ignored.
+    installation_uuid: Arc<std::sync::OnceLock<Arc<str>>>,
     // Phase 6 leftover TOCTOU fix + review F3: when
     // `Some`, the supervisor uses this snapshot on EVERY
     // load attempt (first load AND every restart) — the
@@ -783,6 +818,7 @@ async fn run_supervisor(
             &mode,
             &mut control_rx,
             &state_tx,
+            &installation_uuid,
             pinned,
         )
         .await;
@@ -878,6 +914,12 @@ async fn run_one_lifecycle(
     mode: &crate::runtime::LoadMode,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     state_tx: &watch::Sender<InstanceState>,
+    // Slot shared with the [`InstanceHandle`] this supervisor
+    // was spawned alongside — populated after the first
+    // successful load with the installation UUID pinned to the
+    // instance. See [`run_supervisor`] for the once-vs-restart
+    // note.
+    installation_uuid_cell: &Arc<std::sync::OnceLock<Arc<str>>>,
     // Phase 6 leftover TOCTOU fix + round-2 F3: the
     // supervisor's pinned manifest snapshot, cloned by
     // `run_supervisor` for every attempt (first load AND
@@ -939,6 +981,11 @@ async fn run_one_lifecycle(
         Ok(instance) => instance,
         Err(e) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
     };
+    // The installation UUID is now known and stable across
+    // every subsequent restart of this supervisor (same
+    // install ⇒ same UUID). Set once; ignore the `Err` on
+    // subsequent restarts.
+    let _ = installation_uuid_cell.set(instance.installation_uuid());
     instance.set_watchdog(watchdog);
     let policy = instance.manifest().runtime.restart;
 

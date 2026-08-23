@@ -112,6 +112,18 @@ pub enum BlobError {
     #[error("blob not found: {what}")]
     NotFound { what: String },
 
+    /// Caller passed a `size_bytes_max` cap to a fetch entry
+    /// (currently only [`BlobStore::read_with_info`]) and the
+    /// blob's recorded size exceeded it. Refused before the
+    /// filesystem read, so a caller can't OOM the host with a
+    /// large blob it doesn't intend to serve.
+    #[error("blob too large: {what} — recorded {size_bytes} bytes exceeds cap {cap}")]
+    TooLarge {
+        what: String,
+        size_bytes: u64,
+        cap: u64,
+    },
+
     /// Filesystem operation (mkdir / write / fsync / rename / read /
     /// remove) failed. The host's blob root is the same FS as the
     /// `SQLite` DB, so most causes (full disk, permission denied) are
@@ -610,6 +622,79 @@ impl BlobStore {
         let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&id);
         ensure_contained(blobs_root, &path)?;
         std::fs::read(&path).map_err(|source| BlobError::Io { path, source })
+    }
+
+    /// Atomic "metadata + bytes" fetch by user-chosen name.
+    /// The blob-index row is decoded and the file it points at
+    /// is read inside the same call, so callers see a
+    /// consistent view: the bytes returned are the bytes the
+    /// [`BlobInfo`] describes, and both belong to the same
+    /// version of that blob.
+    ///
+    /// The two-call shape (`get_info` + `read_by_name`) is
+    /// racy — a concurrent `write` can replace the blob
+    /// between the two queries, so the caller sees the old
+    /// `mime` and the new bytes, or `NotFound` when the
+    /// operator was expecting a valid response.
+    /// [`Self::read_with_info`] is the fix, added for the MCP
+    /// `oxidhome://blobs/<instance>/<name>` resource
+    /// (round-2 F4 on PR #122). `size_bytes_max`, when
+    /// `Some`, refuses blobs whose recorded size exceeds the
+    /// ceiling *before* the filesystem read runs — so a large
+    /// blob can't be forced into memory just to be rejected.
+    ///
+    /// # Errors
+    ///
+    /// - [`BlobError::NotFound`] if no blob with that name.
+    /// - [`BlobError::Unavailable`] on in-memory engines.
+    /// - [`BlobError::TooLarge`] when `size_bytes_max` is set
+    ///   and the recorded size exceeds it.
+    /// - [`BlobError::Io`] for filesystem failures.
+    /// - [`BlobError::Sql`] for index-read failures.
+    pub fn read_with_info(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        name: &str,
+        size_bytes_max: Option<u64>,
+    ) -> Result<(BlobInfo, Vec<u8>), BlobError> {
+        check_installation_uuid(installation_uuid)?;
+        check_instance_id(instance_id)?;
+        let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
+        let info: BlobInfo = self
+            .db
+            .read(|conn| -> Result<_, BlobError> {
+                conn.query_row(
+                    "SELECT name, id, size_bytes, created_ms, mime FROM blob \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    params![installation_uuid, instance_id, name],
+                    decode_blob_info,
+                )
+                .optional()
+                .map_err(BlobError::from)
+            })?
+            .ok_or_else(|| BlobError::NotFound {
+                what: format!(
+                    "name `{name}` for instance `{instance_id}` \
+                     (installation `{installation_uuid}`)"
+                ),
+            })?;
+        if let Some(cap) = size_bytes_max
+            && info.size_bytes > cap
+        {
+            return Err(BlobError::TooLarge {
+                what: format!(
+                    "name `{name}` for instance `{instance_id}` \
+                     (installation `{installation_uuid}`)"
+                ),
+                size_bytes: info.size_bytes,
+                cap,
+            });
+        }
+        let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id);
+        ensure_contained(blobs_root, &path)?;
+        let bytes = std::fs::read(&path).map_err(|source| BlobError::Io { path, source })?;
+        Ok((info, bytes))
     }
 
     /// Look up metadata without fetching bytes.
@@ -1481,5 +1566,67 @@ mod tests {
             "`prod*` is a normal identifier (only exact `*` is reserved)",
         );
         assert!(is_safe_instance_id("a*b"), "`a*b` is a normal identifier");
+    }
+
+    /// Round-2 F4 on PR #122: `read_with_info` returns metadata and
+    /// bytes belonging to the same blob version in one call. The
+    /// simplest proof is that the round-tripped payload matches
+    /// the size the returned info reports and the mime type
+    /// written at `write` time.
+    #[test]
+    fn read_with_info_round_trips_metadata_and_bytes() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(
+                INST_A,
+                "alpha",
+                "snap.jpg",
+                b"hello blob",
+                Some("image/jpeg"),
+            )
+            .expect("write");
+
+        let (info, bytes) = store
+            .read_with_info(INST_A, "alpha", "snap.jpg", None)
+            .expect("read_with_info");
+        assert_eq!(info.name, "snap.jpg");
+        assert_eq!(info.mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(usize::try_from(info.size_bytes).unwrap(), bytes.len());
+        assert_eq!(bytes, b"hello blob");
+    }
+
+    /// Round-2 F1 on PR #122: `size_bytes_max` refuses oversize
+    /// blobs BEFORE the filesystem read. The `Err` variant carries
+    /// the recorded size + the cap so the caller can shape a
+    /// meaningful error.
+    #[test]
+    fn read_with_info_refuses_over_size_cap() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        // 200-byte payload; the cap below is 100 → refuse.
+        store
+            .write(INST_A, "alpha", "big", &[0u8; 200], None)
+            .expect("write");
+
+        let err = store
+            .read_with_info(INST_A, "alpha", "big", Some(100))
+            .expect_err("must refuse over-cap");
+        match err {
+            BlobError::TooLarge {
+                what,
+                size_bytes,
+                cap,
+            } => {
+                assert_eq!(size_bytes, 200);
+                assert_eq!(cap, 100);
+                assert!(what.contains("big"), "message must name the blob: {what}");
+            }
+            other => panic!("expected TooLarge; got {other:?}"),
+        }
     }
 }
