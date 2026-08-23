@@ -1187,21 +1187,25 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
             // Round-6 F1 on PR #122: the store-side cap
             // ([`BLOB_INLINE_MAX_BYTES`]) already ceilings the
             // RAW blob at 4 MiB, so the encoded string can't
-            // exceed `ceil(4/3 * 4 MiB)` ≈ 5.4 MiB — well
-            // under `MAX_RESOURCE_BODY_BYTES` (6 MiB). Check
-            // anyway as belt-and-suspenders so any future
-            // change to `BLOB_INLINE_MAX_BYTES` trips this
-            // guard (audited as 413) instead of the
-            // middleware's stream-terminate path (looks like
-            // a network error to the client).
-            if blob_b64.len() > MAX_RESOURCE_BODY_BYTES {
+            // exceed `ceil(4/3 * 4 MiB)` ≈ 5.34 MiB — well
+            // under [`MAX_BLOB_BODY_BYTES`]. Check anyway as
+            // belt-and-suspenders so any future change to
+            // `BLOB_INLINE_MAX_BYTES` trips this guard
+            // (audited as 413) instead of the middleware's
+            // stream-terminate path (looks like a network
+            // error to the client). Round-8 F1 on PR #122
+            // switched to `MAX_BLOB_BODY_BYTES` (which has no
+            // escape-inflation headroom baked in — base64 has
+            // no JSON-escape-worthy characters) so a valid
+            // 3-MiB-raw blob doesn't hit the text cap.
+            if blob_b64.len() > MAX_BLOB_BODY_BYTES {
                 tracing::warn!(
                     size = blob_b64.len(),
-                    cap = MAX_RESOURCE_BODY_BYTES,
+                    cap = MAX_BLOB_BODY_BYTES,
                     "MCP blob b64 body exceeded pre-serialization cap — refusing read",
                 );
                 return ReadOutcome::TooLarge(format!(
-                    "encoded blob is {} bytes; the per-response cap is {MAX_RESOURCE_BODY_BYTES}",
+                    "encoded blob is {} bytes; the per-response cap is {MAX_BLOB_BODY_BYTES}",
                     blob_b64.len(),
                 ));
             }
@@ -1578,7 +1582,7 @@ mod outcome_tests {
     }
 
     /// Round-6 F1 on PR #122: `encode` refuses bodies past
-    /// [`super::MAX_RESOURCE_BODY_BYTES`] BEFORE returning
+    /// [`super::MAX_TEXT_BODY_BYTES`] BEFORE returning
     /// `OkText`, so the reviewer's inflation vector (inner JSON
     /// re-escaped by rmcp's outer envelope) can't push a
     /// nominal ceiling response past the transport cap.
@@ -1592,7 +1596,7 @@ mod outcome_tests {
         // of MiB in the test itself.
         #[derive(Serialize)]
         struct Big<'a>(&'a str);
-        let payload = "x".repeat(super::MAX_RESOURCE_BODY_BYTES + 4);
+        let payload = "x".repeat(super::MAX_TEXT_BODY_BYTES + 4);
         let outcome = super::encode(&Big(&payload), "over-cap-test");
         assert!(
             matches!(&outcome, ReadOutcome::TooLarge(reason) if reason.contains("over-cap-test")),
@@ -1628,6 +1632,42 @@ mod outcome_tests {
             "no bytes may be appended after the write that hit the cap",
         );
     }
+
+    /// Round-8 F1 on PR #122: the blob cap must comfortably
+    /// hold the base64 encoding of the maximum raw blob the
+    /// store admits. Base64 inflates raw bytes by a factor
+    /// of `ceil(4/3)` (padded to a multiple of 4). A 4 MiB
+    /// raw blob encodes to ~5.34 MiB — [`MAX_BLOB_BODY_BYTES`]
+    /// (5.5 MiB) must fit that, or else valid blobs allowed
+    /// by [`BLOB_INLINE_MAX_BYTES`] get refused after the
+    /// full read + encode has already run.
+    ///
+    /// Boundary check: encoded size of `BLOB_INLINE_MAX_BYTES`
+    /// must fit under the blob-response cap, and the blob-
+    /// response cap must fit under the transport-level cap.
+    #[test]
+    fn blob_cap_fits_max_raw_blob_encoded() {
+        let raw =
+            usize::try_from(super::BLOB_INLINE_MAX_BYTES).expect("cap fits in usize on this arch");
+        // base64 (no-newlines, padded) length formula:
+        // `4 * ceil(raw / 3)`
+        let encoded = 4 * raw.div_ceil(3);
+        assert!(
+            encoded <= super::MAX_BLOB_BODY_BYTES,
+            "encoded {encoded} B must fit under blob cap {} B (raw {raw} B)",
+            super::MAX_BLOB_BODY_BYTES,
+        );
+        // And the blob cap itself must fit under the
+        // transport-level ceiling (base64 has no
+        // JSON-escape inflation, so no headroom multiplier).
+        let transport = usize::try_from(crate::api::mcp::server::MAX_RESPONSE_BODY_BYTES)
+            .expect("transport cap fits in usize on this arch");
+        assert!(
+            super::MAX_BLOB_BODY_BYTES < transport,
+            "blob cap ({}) must fit under the transport cap ({transport})",
+            super::MAX_BLOB_BODY_BYTES,
+        );
+    }
 }
 
 fn parse_opt_u64(query: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String> {
@@ -1657,10 +1697,12 @@ fn clamp_limit(query: &HashMap<String, String>, default: u32, max: u32) -> Resul
 /// `"`, `\`, and control byte in our JSON), and wraps the whole
 /// thing in SSE framing before it hits the wire.
 ///
-/// The transport-level ceiling
+/// Pre-serialization ceiling for **text** resource bodies —
+/// JSON we hand to rmcp as the [`ResourceContents::text`]
+/// payload. The transport-level ceiling
 /// ([`crate::api::mcp::server::MAX_RESPONSE_BODY_BYTES`]) is
-/// 8 MiB. This inner cap is set to `3.5 MiB` so worst-case
-/// escape inflation stays under the transport cap:
+/// 8 MiB. This cap is set to `3.5 MiB` so worst-case escape
+/// inflation stays under the transport cap:
 ///
 /// - A byte that becomes `\uXXXX` after JSON escape (control
 ///   char, some non-ASCII) inflates 1 → 6, but such bytes
@@ -1676,7 +1718,25 @@ fn clamp_limit(query: &HashMap<String, String>, default: u32, max: u32) -> Resul
 /// past 8 MiB and force [`crate::api::mcp::server::PermitBody`]
 /// to truncate a response that had already been audited as
 /// a success.
-const MAX_RESOURCE_BODY_BYTES: usize = 3_670_016; // 3.5 * 1024 * 1024
+const MAX_TEXT_BODY_BYTES: usize = 3_670_016; // 3.5 * 1024 * 1024
+
+/// Pre-serialization ceiling for **blob** resource bodies —
+/// the base64-encoded string we hand to rmcp as the
+/// [`ResourceContents::blob`] payload. Distinct from
+/// [`MAX_TEXT_BODY_BYTES`] because base64's alphabet
+/// (`A-Za-z0-9+/=`) contains ZERO JSON-escape-worthy
+/// characters, so the outer JSON-RPC envelope inflates a
+/// base64 string 1× — no factor to reserve headroom for.
+///
+/// Sized to comfortably fit the store-side cap
+/// [`BLOB_INLINE_MAX_BYTES`] (4 MiB raw → `ceil(4/3 * 4 MiB)`
+/// ≈ 5.34 MiB base64) plus a small margin for the JSON-RPC
+/// envelope and SSE framing under the 8 MiB transport
+/// ceiling. Round-8 F1 on PR #122 split this out of
+/// [`MAX_TEXT_BODY_BYTES`] — pre-fix, a valid 3 MiB blob
+/// (base64 ≈ 4 MiB) hit the text cap and was refused with
+/// 413, contradicting the advertised 4 MiB blob range.
+const MAX_BLOB_BODY_BYTES: usize = 5_767_168; // 5.5 * 1024 * 1024
 
 fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     // Round-7 F2 on PR #122: `serde_json::to_string` allocates
@@ -1691,9 +1751,9 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     // The writer's buffer is what ends up in `OkText` — we
     // don't re-allocate after the cap check, and the peak
     // memory this handler holds is bounded by
-    // [`MAX_RESOURCE_BODY_BYTES`] + 1 byte (the byte that
+    // [`MAX_TEXT_BODY_BYTES`] + 1 byte (the byte that
     // tripped the cap).
-    let mut writer = CappedWriter::with_cap(MAX_RESOURCE_BODY_BYTES);
+    let mut writer = CappedWriter::with_cap(MAX_TEXT_BODY_BYTES);
     match serde_json::to_writer(&mut writer, value) {
         Ok(()) => match writer.into_string() {
             Ok(body) => ReadOutcome::OkText {
@@ -1708,11 +1768,11 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
         Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::WriteZero) => {
             tracing::warn!(
                 what,
-                cap = MAX_RESOURCE_BODY_BYTES,
+                cap = MAX_TEXT_BODY_BYTES,
                 "MCP resource body exceeded pre-serialization cap — refusing read",
             );
             ReadOutcome::TooLarge(format!(
-                "MCP `{what}` body exceeds the per-response cap ({MAX_RESOURCE_BODY_BYTES} bytes). \
+                "MCP `{what}` body exceeds the per-response cap ({MAX_TEXT_BODY_BYTES} bytes). \
                  Narrow the query (smaller `limit`, tighter filter) and retry.",
             ))
         }
@@ -1758,7 +1818,7 @@ impl std::io::Write for CappedWriter {
             // serializing, so no additional bytes accumulate.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
-                "resource body would exceed MAX_RESOURCE_BODY_BYTES",
+                "resource body would exceed MAX_TEXT_BODY_BYTES",
             ));
         }
         self.buf.extend_from_slice(chunk);
