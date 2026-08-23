@@ -1085,6 +1085,49 @@ static BLOB_READ_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Sema
         std::sync::Arc::new(tokio::sync::Semaphore::new(BLOB_CONCURRENT_READS))
     });
 
+/// Ceiling on the mime string a plugin can attach to a blob
+/// and have surfaced on the MCP wire. The WIT contract on the
+/// blob store leaves mime as an unconstrained `option<string>`
+/// — a misbehaving plugin could push a 100 MiB mime blob into
+/// the store and drive a valid 4 MiB base64 body past the 8
+/// MiB transport ceiling on the read side (round-9 F1 on PR
+/// #122). 256 bytes is generous for real IANA types
+/// (the longest registered is ~80 chars; parameters like
+/// `charset=utf-8; boundary=...` are typically single-digit
+/// tens more). Over-cap mimes are dropped at read time and a
+/// warn line surfaces the misbehaving plugin.
+const MAX_BLOB_MIME_BYTES: usize = 256;
+
+/// Conservative headroom for the `BlobResourceContents` JSON
+/// envelope + URI + JSON-RPC framing + SSE prefix around a
+/// blob response body. Used by [`blob_read`] to project the
+/// full serialized response against [`MAX_BLOB_BODY_BYTES`]
+/// (round-9 F1 on PR #122).
+///
+/// Rough breakdown at the worst case:
+///
+/// - `BlobResourceContents` JSON keys + punctuation ≈ 60 B
+/// - URI (`oxidhome://blobs/<instance>/<name>`): up to a few
+///   hundred bytes; 512 B ceiling covers pathological names.
+/// - `_meta`, JSON-RPC id + method + version wrapper ≈ 128 B.
+/// - SSE `data:` prefix + trailing `\n\n` ≈ 8 B.
+///
+/// A 1024-byte budget covers all of the above with room to
+/// spare. The projection is over-generous by design — we'd
+/// rather refuse a borderline response with a clean 413 than
+/// let one slip through and trip `PermitBody`'s stream
+/// terminator.
+const BLOB_ENVELOPE_OVERHEAD_BYTES: usize = 1024;
+
+// Every branch in this function is a distinct failure mode
+// (URI-decode error, unknown instance, unloaded instance,
+// concurrency-cap saturation, store errors, oversized
+// projected response). Splitting them into per-branch
+// helpers would spread the outcome shape across the module
+// without shortening any single decision — the function
+// stays as one linear match-and-return so the audit /
+// error mapping is easy to follow top-to-bottom.
+#[allow(clippy::too_many_lines)]
 async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> ReadOutcome {
     // Round-2 F3 on PR #122: percent-decode the URI path
     // segments once before they hit the store. Blob names are
@@ -1198,21 +1241,60 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
             // escape-inflation headroom baked in — base64 has
             // no JSON-escape-worthy characters) so a valid
             // 3-MiB-raw blob doesn't hit the text cap.
-            if blob_b64.len() > MAX_BLOB_BODY_BYTES {
+            // Round-9 F1 on PR #122: the mime string comes
+            // from the plugin at blob-write time and is NOT
+            // validated by the WIT contract — a plugin could
+            // set an arbitrarily long mime and push a valid
+            // 4 MiB blob response past the 8 MiB transport
+            // cap once base64 + envelope + framing land on the
+            // wire. Silently dropping an over-long mime keeps
+            // the read serving (the blob bytes are the useful
+            // payload; mime is a hint that the receiver can
+            // survive without), and the warn line surfaces
+            // the misbehaving plugin.
+            let mime = info.mime.and_then(|m| {
+                if m.len() > MAX_BLOB_MIME_BYTES {
+                    tracing::warn!(
+                        instance_id = %instance_id,
+                        name = %name,
+                        mime_len = m.len(),
+                        cap = MAX_BLOB_MIME_BYTES,
+                        "MCP blob mime exceeds cap — dropping",
+                    );
+                    None
+                } else {
+                    Some(m)
+                }
+            });
+            // Belt-and-suspenders against the transport cap:
+            // base64 body + mime + URI + a conservative
+            // envelope-framing budget must fit under
+            // [`MAX_BLOB_BODY_BYTES`]. `blob_b64.len()` alone
+            // is bounded by [`BLOB_INLINE_MAX_BYTES`] via the
+            // store's `read_with_info`; this arithmetic
+            // catches any future combination (e.g. a bumped
+            // raw cap paired with the max mime) that would
+            // slip past.
+            let mime_len = mime.as_deref().map_or(0, str::len);
+            let projected = blob_b64
+                .len()
+                .saturating_add(mime_len)
+                .saturating_add(BLOB_ENVELOPE_OVERHEAD_BYTES);
+            if projected > MAX_BLOB_BODY_BYTES {
                 tracing::warn!(
-                    size = blob_b64.len(),
+                    b64 = blob_b64.len(),
+                    mime = mime_len,
+                    projected,
                     cap = MAX_BLOB_BODY_BYTES,
-                    "MCP blob b64 body exceeded pre-serialization cap — refusing read",
+                    "MCP blob response projected size exceeds cap — refusing read",
                 );
                 return ReadOutcome::TooLarge(format!(
-                    "encoded blob is {} bytes; the per-response cap is {MAX_BLOB_BODY_BYTES}",
+                    "blob response ({projected} B projected: {} b64 + {mime_len} mime + framing) \
+                     exceeds the per-response cap ({MAX_BLOB_BODY_BYTES} B)",
                     blob_b64.len(),
                 ));
             }
-            ReadOutcome::OkBlob {
-                blob_b64,
-                mime: info.mime,
-            }
+            ReadOutcome::OkBlob { blob_b64, mime }
         }
         Ok(Err(crate::state::blobs::BlobError::NotFound { what })) => {
             ReadOutcome::NotFound(format!("blob not found: {what}"))
@@ -1643,8 +1725,14 @@ mod outcome_tests {
     /// full read + encode has already run.
     ///
     /// Boundary check: encoded size of `BLOB_INLINE_MAX_BYTES`
-    /// must fit under the blob-response cap, and the blob-
-    /// response cap must fit under the transport-level cap.
+    /// **plus** the max mime **plus** the envelope budget must
+    /// fit under the blob-response cap, and the blob-response
+    /// cap must fit under the transport-level cap.
+    ///
+    /// Round-9 F1 on PR #122 added the mime + envelope terms —
+    /// pre-fix, only the base64 body was checked, so a plugin
+    /// with an over-long mime could push a valid 4 MiB blob
+    /// past the transport ceiling and get truncated mid-stream.
     #[test]
     fn blob_cap_fits_max_raw_blob_encoded() {
         let raw =
@@ -1652,9 +1740,13 @@ mod outcome_tests {
         // base64 (no-newlines, padded) length formula:
         // `4 * ceil(raw / 3)`
         let encoded = 4 * raw.div_ceil(3);
+        let projected = encoded + super::MAX_BLOB_MIME_BYTES + super::BLOB_ENVELOPE_OVERHEAD_BYTES;
         assert!(
-            encoded <= super::MAX_BLOB_BODY_BYTES,
-            "encoded {encoded} B must fit under blob cap {} B (raw {raw} B)",
+            projected <= super::MAX_BLOB_BODY_BYTES,
+            "projected {projected} B (base64 {encoded} + mime {} + envelope {}) \
+             must fit under blob cap {} B (raw {raw} B)",
+            super::MAX_BLOB_MIME_BYTES,
+            super::BLOB_ENVELOPE_OVERHEAD_BYTES,
             super::MAX_BLOB_BODY_BYTES,
         );
         // And the blob cap itself must fit under the
