@@ -232,8 +232,7 @@ pub(super) async fn read(
     // the per-request audit row. The `RESOURCE_BUSY_CODE`
     // client response makes the transient-overload semantics
     // explicit; a well-behaved client retries.
-    let Ok(audit_permit) = std::sync::Arc::clone(&AUDIT_QUEUE_SEMAPHORE).try_acquire_owned()
-    else {
+    let Ok(audit_permit) = std::sync::Arc::clone(&AUDIT_QUEUE_SEMAPHORE).try_acquire_owned() else {
         tracing::warn!(
             cap = AUDIT_QUEUE_MAX,
             uri,
@@ -402,14 +401,26 @@ impl ReadOutcome {
     }
 
     fn decision(&self) -> &'static str {
+        // Match the REST auth-classifier's status→decision map
+        // in [`crate::api::auth`]: 2xx → "allow", 5xx →
+        // "error", 4xx → "deny". Keeping the two surfaces
+        // aligned means an operator's ledger scan can filter
+        // by `decision` alone without knowing which surface
+        // wrote the row.
+        //
+        // Round-7 F3 on PR #122: `Busy` is 503 (a server
+        // failure, not an authorization denial), so it maps
+        // to "error" alongside `Internal`. Pre-fix it fell
+        // through the `deny` bucket next to `Denied`, which
+        // conflated transient overload with permission
+        // problems.
         match self {
             Self::OkText { .. } | Self::OkBlob { .. } => "allow",
             Self::NotFound(_)
             | Self::Denied { .. }
             | Self::InvalidParams(_)
-            | Self::TooLarge(_)
-            | Self::Busy(_) => "deny",
-            Self::Internal(_) => "error",
+            | Self::TooLarge(_) => "deny",
+            Self::Internal(_) | Self::Busy(_) => "error",
         }
     }
 
@@ -1548,7 +1559,12 @@ mod outcome_tests {
     fn busy_maps_to_503_and_dedicated_code() {
         let outcome = ReadOutcome::Busy("too many concurrent reads".into());
         assert_eq!(outcome.status(), 503);
-        assert_eq!(outcome.decision(), "deny");
+        // Round-7 F3 on PR #122: 503 is a server failure, not
+        // an authorization denial. Aligned with the REST auth
+        // classifier's 5xx→"error" branch so operators can
+        // filter transient overload apart from permission
+        // problems on the same ledger.
+        assert_eq!(outcome.decision(), "error");
         assert!(outcome.required_scope().is_none());
 
         let err = outcome
@@ -1565,15 +1581,15 @@ mod outcome_tests {
     /// [`super::MAX_RESOURCE_BODY_BYTES`] BEFORE returning
     /// `OkText`, so the reviewer's inflation vector (inner JSON
     /// re-escaped by rmcp's outer envelope) can't push a
-    /// nominal 6 MiB response past the transport cap.
+    /// nominal ceiling response past the transport cap.
     #[test]
     fn encode_refuses_oversize_body() {
         use serde::Serialize;
-        // A one-field wrapper around a `String` serializes to
-        // ~= `size + 6` bytes (opening / closing braces, key,
-        // colon, quotes). Passing a raw string just past the
-        // cap generates a body just past the cap without
-        // allocating hundreds of MiB in the test itself.
+        // A tuple-struct wrapper around a `String` serializes
+        // to `size + 2` bytes (opening/closing quotes).
+        // Passing a raw string just past the cap generates a
+        // body just past the cap without allocating hundreds
+        // of MiB in the test itself.
         #[derive(Serialize)]
         struct Big<'a>(&'a str);
         let payload = "x".repeat(super::MAX_RESOURCE_BODY_BYTES + 4);
@@ -1589,6 +1605,28 @@ mod outcome_tests {
             .into_result("oxidhome://events")
             .expect_err("must surface as Err");
         assert_eq!(err.code, RESOURCE_TOO_LARGE_CODE);
+    }
+
+    /// Round-7 F2 on PR #122: `CappedWriter` refuses to grow
+    /// past its cap and reports `WriteZero` on the first
+    /// over-cap write. That's the mechanism that keeps
+    /// `serde_json::to_writer` from allocating the entire
+    /// response before the encode helper's gate can see it —
+    /// an unbounded per-row field can no longer let an
+    /// oversize body reach the `guard_body_size` shape.
+    #[test]
+    fn capped_writer_refuses_past_cap() {
+        use std::io::Write as _;
+        let mut w = super::CappedWriter::with_cap(8);
+        w.write_all(b"12345").expect("under cap");
+        // 5 + 4 > 8 → refused, and no bytes appended.
+        let err = w.write_all(b"6789").expect_err("past cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(
+            w.into_string().expect("valid utf8"),
+            "12345",
+            "no bytes may be appended after the write that hit the cap",
+        );
     }
 }
 
@@ -1621,17 +1659,63 @@ fn clamp_limit(query: &HashMap<String, String>, default: u32, max: u32) -> Resul
 ///
 /// The transport-level ceiling
 /// ([`crate::api::mcp::server::MAX_RESPONSE_BODY_BYTES`]) is
-/// 8 MiB. This inner cap is set to 6 MiB so the worst-case
-/// escape inflation (`"` → `\"`, `\` → `\\`, ~2× on a
-/// quote/backslash-heavy JSON payload — round-6 F2 on
-/// PR #122) plus SSE framing stays under the transport cap,
-/// AND so the caller sees a valid JSON-RPC error (`-32003`
-/// audited as 413) instead of a truncated SSE stream.
-const MAX_RESOURCE_BODY_BYTES: usize = 6 * 1024 * 1024;
+/// 8 MiB. This inner cap is set to `3.5 MiB` so worst-case
+/// escape inflation stays under the transport cap:
+///
+/// - A byte that becomes `\uXXXX` after JSON escape (control
+///   char, some non-ASCII) inflates 1 → 6, but such bytes
+///   are rare in practice.
+/// - The realistic worst case is `"` → `\"` and `\` → `\\`
+///   (1 → 2, i.e. `2×`) on a quote/backslash-heavy body.
+/// - `3.5 MiB × 2` = 7 MiB, leaves ~1 MiB headroom for the
+///   JSON-RPC envelope + SSE framing under the 8 MiB
+///   transport ceiling.
+///
+/// Round-7 F1 on PR #122 lowered this from 6 MiB after the
+/// reviewer showed a 6 MiB escape-heavy body could inflate
+/// past 8 MiB and force [`crate::api::mcp::server::PermitBody`]
+/// to truncate a response that had already been audited as
+/// a success.
+const MAX_RESOURCE_BODY_BYTES: usize = 3_670_016; // 3.5 * 1024 * 1024
 
 fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
-    match serde_json::to_string(value) {
-        Ok(body) => guard_body_size(body, what, "application/json"),
+    // Round-7 F2 on PR #122: `serde_json::to_string` allocates
+    // the ENTIRE body before we can measure it — so a single
+    // unbounded field on one row (a plugin's structured log
+    // `fields` blob, a custom event payload) can consume
+    // arbitrary memory even though the completed body would
+    // then be refused. `serde_json::to_writer` on a
+    // [`CappedWriter`] fails at the exact byte the cap is
+    // reached, before more bytes are appended.
+    //
+    // The writer's buffer is what ends up in `OkText` — we
+    // don't re-allocate after the cap check, and the peak
+    // memory this handler holds is bounded by
+    // [`MAX_RESOURCE_BODY_BYTES`] + 1 byte (the byte that
+    // tripped the cap).
+    let mut writer = CappedWriter::with_cap(MAX_RESOURCE_BODY_BYTES);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => match writer.into_string() {
+            Ok(body) => ReadOutcome::OkText {
+                body,
+                mime: "application/json",
+            },
+            Err(err) => {
+                tracing::error!(%err, what, "MCP resource body was not valid UTF-8");
+                ReadOutcome::Internal(format!("failed to serialize {what}"))
+            }
+        },
+        Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::WriteZero) => {
+            tracing::warn!(
+                what,
+                cap = MAX_RESOURCE_BODY_BYTES,
+                "MCP resource body exceeded pre-serialization cap — refusing read",
+            );
+            ReadOutcome::TooLarge(format!(
+                "MCP `{what}` body exceeds the per-response cap ({MAX_RESOURCE_BODY_BYTES} bytes). \
+                 Narrow the query (smaller `limit`, tighter filter) and retry.",
+            ))
+        }
         Err(err) => {
             tracing::error!(%err, what, "MCP resource serialization failed");
             ReadOutcome::Internal(format!("failed to serialize {what}"))
@@ -1639,27 +1723,49 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     }
 }
 
-/// Refuse a body whose serialized size exceeds
-/// [`MAX_RESOURCE_BODY_BYTES`] BEFORE rmcp gets a chance to
-/// re-serialize it into the JSON-RPC envelope. The client
-/// gets a well-shaped `-32003` "resource too large" error,
-/// the audit ledger sees `413`, and the transport wrapper
-/// ([`crate::api::mcp::server::PermitBody`]) never has to
-/// terminate the stream (which would look like a network
-/// error to the client). Round-6 F1 on PR #122.
-fn guard_body_size(body: String, what: &'static str, mime: &'static str) -> ReadOutcome {
-    if body.len() > MAX_RESOURCE_BODY_BYTES {
-        tracing::warn!(
-            what,
-            size = body.len(),
-            cap = MAX_RESOURCE_BODY_BYTES,
-            "MCP resource body exceeded pre-serialization cap — refusing read",
-        );
-        return ReadOutcome::TooLarge(format!(
-            "MCP `{what}` body is {} bytes; the per-response cap is {MAX_RESOURCE_BODY_BYTES}. \
-             Narrow the query (smaller `limit`, tighter filter) and retry.",
-            body.len(),
-        ));
+/// [`std::io::Write`] that refuses to grow past a byte
+/// ceiling — the exact machinery `encode` uses to keep an
+/// oversize row from allocating hundreds of MiB before the
+/// pre-serialization gate can see it (round-7 F2 on PR #122).
+/// The first write past the cap returns
+/// [`std::io::ErrorKind::WriteZero`], which `serde_json`
+/// propagates as an I/O error; the caller detects that kind
+/// and surfaces a clean [`ReadOutcome::TooLarge`].
+struct CappedWriter {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl CappedWriter {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+        }
     }
-    ReadOutcome::OkText { body, mime }
+
+    fn into_string(self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.buf)
+    }
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(chunk.len()) > self.cap {
+            // Signal "would grow past the cap" without
+            // partially appending — `serde_json::to_writer`
+            // treats `WriteZero` as a fatal error and stops
+            // serializing, so no additional bytes accumulate.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "resource body would exceed MAX_RESOURCE_BODY_BYTES",
+            ));
+        }
+        self.buf.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
