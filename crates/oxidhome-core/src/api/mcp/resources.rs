@@ -835,15 +835,32 @@ fn parse_since(query: &HashMap<String, String>, key: &str) -> Result<Option<i64>
     Ok(Some(now.saturating_sub(ms)))
 }
 
-/// Duration grammar: `<digits><unit>` where unit ∈
-/// `{s, m, h, d}`. No compound values (`1h30m`) — the design
-/// doc lists only single-unit examples and keeping it simple
-/// keeps the surface predictable.
+/// Duration grammar: `<digits><unit>` where unit is one ASCII
+/// byte ∈ `{s, m, h, d}`. No compound values (`1h30m`) — the
+/// design doc lists only single-unit examples and keeping it
+/// simple keeps the surface predictable.
+///
+/// The percent-decoded query value can contain arbitrary UTF-8
+/// (e.g. `?since=%C3%A9` decodes to `é`), so byte-index
+/// splitting via `raw.len() - 1` would panic on a multi-byte
+/// final `char`. Round-2 F1 on PR #121: split on the last
+/// `char` boundary instead.
 fn parse_duration_ms(raw: &str) -> Result<i64, String> {
-    if raw.is_empty() {
-        return Err("empty duration".into());
+    // Isolate the unit as the last char; everything before it
+    // is the digit portion. `char_indices` walks by scalar
+    // value, so `raw[i..]` always lands on a UTF-8 boundary.
+    let (unit_idx, unit_char) = raw
+        .char_indices()
+        .next_back()
+        .ok_or_else(|| "empty duration".to_string())?;
+    let unit = &raw[unit_idx..];
+    let num = &raw[..unit_idx];
+    // Refuse non-ASCII units up front so the error names the
+    // bad byte cleanly instead of falling through into "not a
+    // known unit."
+    if !unit_char.is_ascii() {
+        return Err(format!("`{raw}` — unknown unit `{unit}`; expected s|m|h|d"));
     }
-    let (num, unit) = raw.split_at(raw.len() - 1);
     let n: i64 = num
         .parse()
         .map_err(|_| format!("`{raw}` — expected digits followed by s|m|h|d"))?;
@@ -863,6 +880,89 @@ fn parse_duration_ms(raw: &str) -> Result<i64, String> {
     };
     n.checked_mul(per_unit_ms)
         .ok_or_else(|| format!("`{raw}` — duration overflows i64 milliseconds"))
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::parse_duration_ms;
+
+    #[test]
+    fn accepts_all_known_units() {
+        assert_eq!(parse_duration_ms("30s").unwrap(), 30_000);
+        assert_eq!(parse_duration_ms("5m").unwrap(), 300_000);
+        assert_eq!(parse_duration_ms("2h").unwrap(), 7_200_000);
+        assert_eq!(parse_duration_ms("1d").unwrap(), 86_400_000);
+    }
+
+    #[test]
+    fn rejects_non_ascii_suffix_without_panicking() {
+        // Percent-decoded `?since=%C3%A9` reaches this parser
+        // as `é`. Pre-fix (round-2 F1 on PR #121), the byte-
+        // index split panicked at `raw.len() - 1` because that
+        // fell mid-way through `é`'s two UTF-8 bytes.
+        let err = parse_duration_ms("é").expect_err("must reject non-ASCII unit");
+        assert!(err.contains("é"), "error must name the bad unit; got {err}");
+    }
+
+    #[test]
+    fn rejects_multi_byte_unit_after_digits() {
+        // Same class of bug — `1é` used to panic at index 2.
+        let err = parse_duration_ms("1é").expect_err("must reject non-ASCII unit");
+        assert!(err.contains("é"), "error must name the bad unit; got {err}");
+    }
+}
+
+#[cfg(test)]
+mod parse_query_tests {
+    use super::parse_query;
+
+    /// The reason round-1 F3 was a bug: pre-fix, the hand-rolled
+    /// parser stored the raw bytes verbatim. Any downstream `SQLite`
+    /// comparison against the decoded value returned zero rows.
+    /// This test locks in the fix directly — no integration
+    /// scaffolding needed.
+    #[test]
+    fn percent_decodes_values() {
+        let q = parse_query("plugin=oxidhome_core%3A%3Aruntime").expect("parse ok");
+        assert_eq!(
+            q.get("plugin").map(String::as_str),
+            Some("oxidhome_core::runtime"),
+            "value must be percent-decoded before storage lookup; got {q:?}",
+        );
+    }
+
+    #[test]
+    fn percent_decodes_keys_too() {
+        // Round-trip protection: `serde_urlencoded` decodes keys as
+        // well as values. `%74` = `t`, so `%74opic` should land as
+        // the `topic` key.
+        let q = parse_query("%74opic=alarm").expect("parse ok");
+        assert_eq!(q.get("topic").map(String::as_str), Some("alarm"));
+    }
+
+    #[test]
+    fn plus_decodes_to_space() {
+        // `serde_urlencoded` follows the form-urlencoded rule where
+        // `+` = SPACE. Matches axum's `Query` extractor exactly,
+        // so an MCP client and a REST client see identical decode.
+        let q = parse_query("target=one+two").expect("parse ok");
+        assert_eq!(q.get("target").map(String::as_str), Some("one two"));
+    }
+
+    #[test]
+    fn multiple_values_last_wins() {
+        // Duplicate keys are silently collapsed to the last value —
+        // documented in `parse_query`'s doc-comment. Test locks
+        // that in so a future rewrite doesn't accidentally start
+        // returning the first value or a Vec.
+        let q = parse_query("device=a&device=b").expect("parse ok");
+        assert_eq!(q.get("device").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn empty_query_is_ok() {
+        assert!(parse_query("").expect("parse ok").is_empty());
+    }
 }
 
 fn parse_opt_u64(query: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String> {

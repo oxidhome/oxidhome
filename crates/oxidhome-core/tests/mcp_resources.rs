@@ -428,71 +428,19 @@ async fn logs_resource_rejects_unknown_filter_key() {
     );
 }
 
-/// Round-1 F1 on PR #121: with `spawn_blocking` around the
-/// `SQLite` reads, concurrent MCP log-history calls no longer
-/// starve the tokio worker pool. Fan out 8 concurrent reads
-/// on a `current_thread` runtime (below the mount's 16-slot
-/// pending-body gate); each completes with a 200 shape.
-/// Pre-fix (sync read on the worker), a call that held the
-/// store mutex would park the single-thread runtime and the
-/// `join_all` would never resolve.
-#[tokio::test(flavor = "current_thread")]
-async fn logs_resource_concurrent_reads_do_not_starve_runtime() {
-    use futures_util::future::join_all;
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer(&engine);
-    let router = build_router(engine);
-    let (router, session) = handshake(router, &bearer).await;
-
-    let calls = (0..8).map(|_| {
-        call(
-            &router,
-            &bearer,
-            &session,
-            "resources/read",
-            json!({"uri": "oxidhome://logs?since=1h"}),
-        )
-    });
-    let responses = join_all(calls).await;
-    for r in &responses {
-        assert!(
-            r["result"]["contents"].is_array(),
-            "each concurrent read must return a 200-shaped result; got {r}",
-        );
-    }
-}
-
-/// Round-1 F3 on PR #121: URI query values are percent-decoded
-/// before hitting the store. Pre-fix, a client that sent
-/// `plugin=oxidhome_core%3A%3Aruntime` (any generic URI
-/// builder that percent-encodes colons — RFC 3986 lets clients
-/// encode `:` since it's `reserved` outside authority /
-/// path) queried `SQLite` for the raw `%3A%3A` bytes and got
-/// zero rows. This test only checks the parse doesn't reject
-/// the value and the read succeeds — no rows exist on a fresh
-/// engine, so the meaningful assertion is "no `INVALID_PARAMS`
-/// on a valid percent-encoded value."
-#[tokio::test(flavor = "current_thread")]
-async fn logs_resource_percent_decodes_query_values() {
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer(&engine);
-    let router = build_router(engine);
-    let (router, session) = handshake(router, &bearer).await;
-
-    let response = call(
-        &router,
-        &bearer,
-        &session,
-        "resources/read",
-        // `%3A` → `:`. Decoded, this is `oxidhome_core::runtime`.
-        json!({"uri": "oxidhome://logs?plugin=oxidhome_core%3A%3Aruntime"}),
-    )
-    .await;
-    assert!(
-        response["result"]["contents"].is_array(),
-        "percent-encoded plugin id must decode + query cleanly; got {response}",
-    );
-}
+// Note: R1 F1 (spawn_blocking) and R1 F3 (percent-decoding)
+// used to have shallow integration tests here. Round-2 review
+// on PR #121 correctly pointed out neither test would fail
+// against the pre-fix implementation — a fresh in-memory store
+// returns zero rows whether the value is decoded or not, and
+// eight fast in-memory queries complete quickly whether the
+// SQLite call runs on the worker or the blocking pool. The
+// meaningful coverage lives with the parsers themselves:
+// `parse_query` percent-decoding is unit-tested inside
+// `resources.rs`, and `parse_duration_ms` UTF-8-safety is
+// unit-tested there too. Round-1 F1 remains enforced by the
+// code review of the events_read/logs_read call sites (they
+// visibly call `tokio::task::spawn_blocking`).
 
 /// Round-1 F4 on PR #121: malformed typed filters (bad
 /// `since`, bad `limit`, bad `after_id`) all surface as
