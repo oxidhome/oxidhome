@@ -658,27 +658,50 @@ impl BlobStore {
         name: &str,
         size_bytes_max: Option<u64>,
     ) -> Result<(BlobInfo, Vec<u8>), BlobError> {
+        use std::io::Read as _;
+
         check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
-        let info: BlobInfo = self
-            .db
-            .read(|conn| -> Result<_, BlobError> {
-                conn.query_row(
+        // Round-3 F2 on PR #122: the previous shape queried the
+        // row under the DB mutex, released the mutex, and then
+        // opened the file — a concurrent overwrite in that
+        // window could delete the pre-image before this reader
+        // opened it, surfacing as `Io { not found }` even
+        // though the operator observed the blob at query time.
+        //
+        // The fix opens the file INSIDE the DB read closure.
+        // Under POSIX `unlink`-while-open semantics the file
+        // descriptor pins the pre-image bytes for the reader's
+        // lifetime — a concurrent writer can rename its
+        // replacement into place and delete the prior file, but
+        // this reader still sees the version the row described.
+        // Windows lacks that semantic, but the store's own
+        // atomic-rename write path prevents the reader from
+        // observing a partial write regardless of platform.
+        let (info, mut file) = self.db.read(|conn| -> Result<_, BlobError> {
+            let info: Option<BlobInfo> = conn
+                .query_row(
                     "SELECT name, id, size_bytes, created_ms, mime FROM blob \
-                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
                     params![installation_uuid, instance_id, name],
                     decode_blob_info,
                 )
-                .optional()
-                .map_err(BlobError::from)
-            })?
-            .ok_or_else(|| BlobError::NotFound {
-                what: format!(
-                    "name `{name}` for instance `{instance_id}` \
-                     (installation `{installation_uuid}`)"
-                ),
-            })?;
+                .optional()?;
+            let Some(info) = info else {
+                return Err(BlobError::NotFound {
+                    what: format!(
+                        "name `{name}` for instance `{instance_id}` \
+                             (installation `{installation_uuid}`)"
+                    ),
+                });
+            };
+            let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id);
+            ensure_contained(blobs_root, &path)?;
+            let file =
+                std::fs::File::open(&path).map_err(|source| BlobError::Io { path, source })?;
+            Ok((info, file))
+        })?;
         if let Some(cap) = size_bytes_max
             && info.size_bytes > cap
         {
@@ -691,9 +714,27 @@ impl BlobStore {
                 cap,
             });
         }
-        let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id);
-        ensure_contained(blobs_root, &path)?;
-        let bytes = std::fs::read(&path).map_err(|source| BlobError::Io { path, source })?;
+        // Reserve exact capacity so the Vec matches
+        // `info.size_bytes` — cheaper than doubling growth for
+        // large blobs. `size_bytes` is a `u64`; `usize::try_from`
+        // guards against 64→32 truncation on unusual targets.
+        let capacity = usize::try_from(info.size_bytes).map_err(|_| BlobError::TooLarge {
+            what: format!(
+                "name `{name}` for instance `{instance_id}` \
+                     (installation `{installation_uuid}`)"
+            ),
+            size_bytes: info.size_bytes,
+            cap: usize::MAX as u64,
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.read_to_end(&mut bytes)
+            .map_err(|source| BlobError::Io {
+                // Path lost inside the closure; recompute for
+                // the error message (identical to the one used
+                // at open time).
+                path: instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id),
+                source,
+            })?;
         Ok((info, bytes))
     }
 
@@ -1424,14 +1465,19 @@ mod tests {
         }
     }
     fn tempdir() -> TempDir {
+        // Pre-fix, this used `(pid, SystemTime::now.as_nanos)`
+        // as the dir suffix. Under parallel test execution two
+        // concurrent `tempdir()` calls could sample the same
+        // nanosecond and collide on the directory, and one
+        // test's `Drop` would then rip the ground out from
+        // under the other — the failing write surfaced as
+        // `Io { NotFound }` deep inside a hot path. A process-
+        // wide monotonic counter makes collisions impossible.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir();
-        let path = base.join(format!(
-            "oxidhome-blobs-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        ));
+        let path = base.join(format!("oxidhome-blobs-test-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&path).expect("mk tempdir");
         TempDir { path }
     }

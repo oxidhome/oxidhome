@@ -82,6 +82,16 @@ pub(super) const UNAUTHENTICATED_TOKEN_ID: &str = "anonymous";
 /// deliberate silence on the response body).
 pub(super) const SCOPE_DENIED_CODE: ErrorCode = ErrorCode(-32001);
 
+/// JSON-RPC error code for "the URI is valid and the caller
+/// is authorized, but serving its content would exceed the
+/// server's inline-response budget." Distinct from
+/// `INVALID_PARAMS` (`-32602`, "the request shape was wrong")
+/// because the request IS well-formed — server policy is
+/// what refuses it. Audited as HTTP `413 Payload Too Large`
+/// so an operator's ledger scan can tell "too big to serve"
+/// apart from "bad input." Round-3 F4 on PR #122.
+pub(super) const RESOURCE_TOO_LARGE_CODE: ErrorCode = ErrorCode(-32003);
+
 /// [`AuditEntry::actor_kind`] value we stamp on every MCP row.
 /// Matches [`crate::auth::ActorKind::Mcp`]'s `as_str()` — kept
 /// as a literal here to avoid a cross-module dep just for the
@@ -238,12 +248,24 @@ enum ReadOutcome {
         body: String,
         mime: &'static str,
     },
-    /// Raw binary body + mime type. The blobs resource is the
-    /// only user today. Mime comes from the blob index row so
-    /// the caller sees the same type the plugin wrote.
+    /// Base64-encoded binary body + mime type. The blobs
+    /// resource is the only user today; mime comes from the
+    /// blob index row so the caller sees the same type the
+    /// plugin wrote. Encoding runs inside the blocking task
+    /// that reads the bytes (round-3 F3 on PR #122) so the
+    /// tokio worker never sees the raw payload — the enum
+    /// carries only the ready-to-serialize string.
+    ///
+    /// `_permit` holds an [`OwnedSemaphorePermit`] against the
+    /// concurrent-blob semaphore for the lifetime of this
+    /// outcome. It is released when the outcome is dropped —
+    /// which happens as soon as [`Self::into_result`] finishes
+    /// building the [`ReadResourceResult`], so a stuck client
+    /// consuming an SSE frame doesn't hold a slot forever.
     OkBlob {
-        bytes: Vec<u8>,
+        blob_b64: String,
         mime: Option<String>,
+        _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     NotFound(String),
     /// Client supplied a malformed / unknown / typed-parse
@@ -253,6 +275,13 @@ enum ReadOutcome {
     /// pre-fix, bad `since_ms=oops` was silently treated as
     /// absent and the query broadened.
     InvalidParams(String),
+    /// URI is valid + caller is authorized, but the resource
+    /// content exceeds the server's inline-response budget.
+    /// Distinct from [`Self::InvalidParams`] so an audit sweep
+    /// can tell "too big to serve" apart from "bad input"
+    /// (round-3 F4 on PR #122). Reported to the client as
+    /// [`RESOURCE_TOO_LARGE_CODE`]; audited as HTTP 413.
+    TooLarge(String),
     /// Bearer resolved, but its scope list does not include
     /// [`Self::Denied::required`]. Carried through so the
     /// audit row can name the scope that was missing.
@@ -268,15 +297,23 @@ impl ReadOutcome {
             Self::OkText { body, mime } => Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(body, uri).with_mime_type(mime),
             ])),
-            Self::OkBlob { bytes, mime } => {
-                let mut contents = ResourceContents::blob(BASE64.encode(&bytes), uri);
+            Self::OkBlob {
+                blob_b64,
+                mime,
+                _permit,
+            } => {
+                let mut contents = ResourceContents::blob(blob_b64, uri);
                 if let Some(m) = mime {
                     contents = contents.with_mime_type(m);
                 }
                 Ok(ReadResourceResult::new(vec![contents]))
+                // `_permit` drops here — one concurrent-blob
+                // slot returns to the pool now that the
+                // response object is fully constructed.
             }
             Self::NotFound(reason) => Err(McpError::resource_not_found(reason, None)),
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
+            Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
             Self::Denied { required: _ } => Err(McpError::new(
                 SCOPE_DENIED_CODE,
                 // Deliberately omits the scope name; see
@@ -293,6 +330,7 @@ impl ReadOutcome {
             Self::OkText { .. } | Self::OkBlob { .. } => 200,
             Self::NotFound(_) => 404,
             Self::InvalidParams(_) => 400,
+            Self::TooLarge(_) => 413,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -301,7 +339,10 @@ impl ReadOutcome {
     fn decision(&self) -> &'static str {
         match self {
             Self::OkText { .. } | Self::OkBlob { .. } => "allow",
-            Self::NotFound(_) | Self::Denied { .. } | Self::InvalidParams(_) => "deny",
+            Self::NotFound(_)
+            | Self::Denied { .. }
+            | Self::InvalidParams(_)
+            | Self::TooLarge(_) => "deny",
             Self::Internal(_) => "error",
         }
     }
@@ -900,20 +941,42 @@ async fn status_read(engine: Engine) -> ReadOutcome {
 
 // ── Blobs ─────────────────────────────────────────────────────────
 
-/// Inline-response ceiling for `oxidhome://blobs/...`. Blobs are
-/// base64-encoded into the JSON-RPC response body, so the wire
-/// footprint is roughly `4/3 * size + audit + protocol framing`
-/// per request. 16 concurrent requests (the pending-body gate
-/// cap on the MCP mount) hitting this ceiling occupies
-/// ~256 MiB peak, which is a defensible budget for a hub host.
+/// Inline-response ceiling for a single `oxidhome://blobs/...`
+/// read. Blobs are base64-encoded into the JSON-RPC response
+/// body, so per-request memory is `~size + ~4/3 * size` during
+/// processing (raw + encoded live briefly together) and
+/// `~4/3 * size` while the response frame is being written to
+/// the SSE stream. 8 MiB matches typical smart-home artifact
+/// sizes (camera snapshots, short audio clips) while capping
+/// a run-away caller. Combined with
+/// [`BLOB_CONCURRENT_READS`], per-processing memory is bounded
+/// (round-3 F1 on PR #122).
+const BLOB_INLINE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Concurrency cap on in-flight blob READ+ENCODE cycles. Bounds
+/// the phase where raw bytes and the base64 string coexist in
+/// memory (round-3 F1 on PR #122). A permit is acquired before
+/// the read/encode blocking task runs and lives on the
+/// resulting [`ReadOutcome::OkBlob`] value; it drops the moment
+/// [`ReadOutcome::into_result`] finishes building the
+/// [`ReadResourceResult`] — after which point the encoded
+/// string is owned by the SDK response layer and the
+/// transmission-phase memory is bounded by the transport
+/// stack's own buffers, not by us.
 ///
-/// A ceiling that is too low forces a plugin publishing e.g. a
-/// 6-MP JPEG to break its output up; too high lets a single
-/// caller exhaust host memory. 16 MiB matches typical
-/// smart-home artifact sizes (camera snapshots, short audio
-/// clips) with headroom, while capping a run-away caller.
-/// Round-2 F1 on PR #122: pre-fix, there was no cap at all.
-const BLOB_INLINE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// A ceiling of 4 processing slots × ~14 MiB peak per slot
+/// caps this phase at ~56 MiB — a defensible budget for a hub
+/// host.
+const BLOB_CONCURRENT_READS: usize = 4;
+
+/// Global semaphore backing [`BLOB_CONCURRENT_READS`]. Kept
+/// `static` so the state doesn't have to thread through the
+/// SDK's `ServerHandler` trait; the read handler and the
+/// `OkBlob` outcome are the only two touchpoints.
+static BLOB_READ_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(BLOB_CONCURRENT_READS))
+    });
 
 async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> ReadOutcome {
     // Round-2 F3 on PR #122: percent-decode the URI path
@@ -956,28 +1019,55 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
             "instance `{instance_id}` is not yet loaded; retry once its state is `Running`"
         ));
     };
-    // Blob fetch is one atomic (`SQLite` + filesystem) op that
-    // returns both the metadata and the bytes belonging to the
-    // same version (round-2 F4 on PR #122). Runs under
-    // `spawn_blocking` for the same reason events/logs do —
-    // shared std mutex + `std::fs::read`.
+    // Round-3 F1 on PR #122: acquire one of the
+    // `BLOB_CONCURRENT_READS` slots BEFORE we start the read.
+    // A backlogged caller waits here rather than piling bytes
+    // into memory; the permit rides on the resulting
+    // `OkBlob` outcome and drops when `into_result` finishes
+    // building the SDK response.
+    let permit = match std::sync::Arc::clone(&BLOB_READ_SEMAPHORE)
+        .acquire_owned()
+        .await
+    {
+        Ok(p) => p,
+        Err(err) => {
+            // `Semaphore::close` is the only way `acquire`
+            // errors; we never call it on the static, so this
+            // is unreachable in practice — but if it ever
+            // happens, treat it as a server error rather than
+            // panicking inside a handler.
+            tracing::error!(%err, "MCP blob semaphore closed unexpectedly");
+            return ReadOutcome::Internal("blob concurrency gate closed".into());
+        }
+    };
+    // Round-2 F4 on PR #122: `read_with_info` returns bytes +
+    // metadata belonging to the same blob version. Round-3
+    // F3: base64-encode INSIDE the same blocking task, so the
+    // 8-MiB Vec drops before we return to the tokio worker and
+    // the worker never sees CPU-bound encoding work.
     let blobs = engine.blobs();
     let uuid_for_task = installation_uuid.clone();
     let instance_for_task = instance_id.clone();
     let name_for_task = name.clone();
     let join = tokio::task::spawn_blocking(move || {
-        blobs.read_with_info(
+        let (info, bytes) = blobs.read_with_info(
             &uuid_for_task,
             &instance_for_task,
             &name_for_task,
             Some(BLOB_INLINE_MAX_BYTES),
-        )
+        )?;
+        // Encode + drop raw bytes here — before the return
+        // hands control back to the async worker.
+        let blob_b64 = BASE64.encode(&bytes);
+        drop(bytes);
+        Ok::<_, crate::state::blobs::BlobError>((info, blob_b64))
     })
     .await;
     match join {
-        Ok(Ok((info, bytes))) => ReadOutcome::OkBlob {
-            bytes,
+        Ok(Ok((info, blob_b64))) => ReadOutcome::OkBlob {
+            blob_b64,
             mime: info.mime,
+            _permit: Some(permit),
         },
         Ok(Err(crate::state::blobs::BlobError::NotFound { what })) => {
             ReadOutcome::NotFound(format!("blob not found: {what}"))
@@ -986,7 +1076,7 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
             what,
             size_bytes,
             cap,
-        })) => ReadOutcome::InvalidParams(format!(
+        })) => ReadOutcome::TooLarge(format!(
             "blob {what} is {size_bytes} bytes; the MCP inline cap is {cap}. \
              Reduce the blob size or fetch it via a plugin-owned tool that streams it."
         )),
@@ -1287,6 +1377,36 @@ mod percent_decode_tests {
         // makes the segment unusable as a `String` key on
         // downstream stores, so we reject at the decoder.
         assert!(percent_decode_segment("bad%FF").is_err());
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::{RESOURCE_TOO_LARGE_CODE, ReadOutcome};
+
+    /// Round-3 F4 on PR #122: `ReadOutcome::TooLarge` maps to a
+    /// dedicated JSON-RPC error code (not the -32602
+    /// `INVALID_PARAMS` used for malformed input) and is
+    /// audited as HTTP 413 ("Payload Too Large"). Locks in
+    /// both wire mapping (client sees the right code) and
+    /// audit mapping (operator's ledger scan can tell "too big
+    /// to serve" apart from "bad input").
+    #[test]
+    fn too_large_maps_to_413_and_dedicated_code() {
+        let outcome = ReadOutcome::TooLarge("blob too big".into());
+        assert_eq!(outcome.status(), 413);
+        assert_eq!(outcome.decision(), "deny");
+        // `required_scope` is `Some` only for `Denied`.
+        assert!(outcome.required_scope().is_none());
+
+        let err = outcome
+            .into_result("oxidhome://blobs/foo/bar")
+            .expect_err("TooLarge must surface as an Err");
+        assert_eq!(err.code, RESOURCE_TOO_LARGE_CODE);
+        assert!(
+            err.message.contains("blob too big"),
+            "reason must reach the caller: {err:?}",
+        );
     }
 }
 
