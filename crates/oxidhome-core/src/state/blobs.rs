@@ -223,17 +223,27 @@ pub const MAX_BLOB_MIME_BYTES: usize = 256;
 /// `get_info`, and `list_blobs` — a future column addition
 /// or filter change only has to happen here.
 ///
-/// The mime projection uses `length(CAST(mime AS BLOB))`
-/// rather than `length(mime)`. On a `SQLite` `TEXT` column
-/// `length()` counts Unicode code points, so 256 four-byte
-/// characters would slip past a 256-byte cap even though the
-/// underlying storage is 1024 bytes. Casting to `BLOB`
-/// forces `length()` to return the byte length, matching the
-/// write-time `str::len()` check exactly (round-10 F2 on PR
-/// #122). Bound in every call site via a `?N`-style parameter
-/// (`blob_mime_cap_param()` provides the value).
+/// The mime projection uses `octet_length(mime)` rather than
+/// `length(mime)` or `length(CAST(mime AS BLOB))`:
+///
+/// - `length(mime)` on a `SQLite` `TEXT` column counts
+///   Unicode code points, so 256 four-byte characters would
+///   slip past a 256-byte cap (round-10 F2 on PR #122
+///   surfaced this).
+/// - `length(CAST(mime AS BLOB))` counts bytes correctly but
+///   forces `SQLite` to materialise the full value before
+///   applying the cast — a legacy 100 MiB mime becomes a
+///   100 MiB allocation inside `SQLite` even though the CASE
+///   would then return NULL (round-11 F1 on PR #122).
+/// - `octet_length(mime)` reads the byte length from `SQLite`
+///   record metadata without loading the value at all (see
+///   <https://sqlite.org/lang_corefunc.html#octet_length>),
+///   so a 100 MiB legacy mime never leaves the file.
+///
+/// Bound in every call site via a `?N`-style parameter
+/// ([`blob_mime_cap_param`] provides the value).
 const BLOB_SELECT_COLUMNS: &str = "name, id, size_bytes, created_ms, \
-     CASE WHEN mime IS NULL OR length(CAST(mime AS BLOB)) <= ?4 \
+     CASE WHEN mime IS NULL OR octet_length(mime) <= ?4 \
           THEN mime ELSE NULL END";
 
 /// Value to bind to the last `?` placeholder of every SELECT
