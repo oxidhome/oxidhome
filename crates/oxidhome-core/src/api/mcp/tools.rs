@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorData as McpError, Tool,
+    ToolAnnotations,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -54,7 +55,8 @@ use crate::host_impl::plugin::oxidhome::plugin::types::Value;
 use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
-    AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, MCP_ACTOR_KIND, RESOURCE_BUSY_CODE, SCOPE_DENIED_CODE,
+    AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, EncodedBody, MCP_ACTOR_KIND, RESOURCE_BUSY_CODE,
+    SCOPE_DENIED_CODE, STORE_QUERY_MAX, STORE_QUERY_SEMAPHORE,
 };
 
 /// Publicly-visible catalogue of tools this handler exposes.
@@ -86,7 +88,19 @@ pub(super) fn list_tools() -> Vec<Tool> {
              `limit` is clamped to 100 rows.",
             Arc::new(logs_query_schema()),
         )
-        .with_title("Query log history"),
+        .with_title("Query log history")
+        // Round-2 F4 on PR #124: machine-readable hints for
+        // planner-style clients. `logs.query` reads the
+        // durable `LogStore` and does not touch external
+        // state; all three defaults would misclassify it
+        // (`read_only_hint = false`, `destructive_hint = true`,
+        // `open_world_hint = true`).
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .open_world(false),
+        ),
     ]
 }
 
@@ -599,15 +613,35 @@ impl FinalizeInput {
         // Round-1 F3 shipped `"ok"` and stamped `"failed"`
         // on the unknown-device path too — both wrong per
         // the contract; corrected here.
+        // Round-2 F3 on PR #124: `"success"` is reserved for
+        // tools that reached a plugin (device.send_command
+        // Ok/OkWithState). Pure host-state reads
+        // (`logs.query`) leave execution_outcome NULL —
+        // matches how resource-side reads audit. Only
+        // `domain_kind = Some(_)` means the plugin was
+        // reached and reported an `Err`; the
+        // `domain_kind = None` shape (unknown device caught
+        // in the tool body before `execute_command`) falls
+        // through to the wildcard.
+        //
+        // `match_same_arms` fires on the read-Ok +
+        // wildcard pair (both map to `(None, None)`);
+        // suppressed because the explicit `plugin_reached:
+        // false` arm documents the read-tool case — the
+        // wildcard's job is to catch every other outcome
+        // (`InvalidParams`, `Denied`, `Internal`, etc.),
+        // not to double as the read-Ok arm.
+        #[allow(clippy::match_same_arms)]
         let (execution_outcome, domain_error): (Option<&'static str>, Option<String>) =
             match outcome {
-                ToolOutcome::Ok(_) => (Some("success"), None),
-                // Only `domain_kind = Some(_)` means the
-                // plugin was reached and reported an `Err`.
-                // `domain_kind = None` is the "reached tool
-                // body, refused before plugin" shape (unknown
-                // device); it falls into the wildcard below
-                // and stays as (None, None) per the contract.
+                ToolOutcome::Ok {
+                    plugin_reached: true,
+                    ..
+                } => (Some("success"), None),
+                ToolOutcome::Ok {
+                    plugin_reached: false,
+                    ..
+                } => (None, None),
                 ToolOutcome::ExecErr {
                     domain_kind: Some(kind),
                     ..
@@ -631,7 +665,19 @@ impl FinalizeInput {
 enum ToolOutcome {
     /// Tool completed successfully; the JSON value becomes
     /// the `structuredContent` of the [`CallToolResult`].
-    Ok(JsonValue),
+    /// `plugin_reached` says whether this success involved
+    /// dispatching to a plugin — `true` for
+    /// `device.send_command` returning Ok/OkWithState,
+    /// `false` for pure host-state reads like `logs.query`.
+    /// The audit ledger contract on
+    /// [`crate::state::audit_log::AuditEntry`] reserves
+    /// `execution_outcome = "success"` for plugin Ok, so
+    /// `plugin_reached = false` maps to `None` (round-2 F3
+    /// on PR #124).
+    Ok {
+        value: JsonValue,
+        plugin_reached: bool,
+    },
     /// Tool ran and produced a caller-visible failure (device
     /// not found, plugin returned `CommandResult::Err`, …).
     /// Not an authz problem — audited as `200` because the
@@ -662,7 +708,32 @@ enum ToolOutcome {
 impl ToolOutcome {
     fn into_result(self) -> Result<CallToolResult, McpError> {
         match self {
-            Self::Ok(value) => Ok(CallToolResult::structured(value)),
+            Self::Ok { value, .. } => {
+                // Round-1 F2 on PR #124: skip the text
+                // mirror `CallToolResult::structured` would
+                // add. `structured` builds
+                // `content: vec![text(value.to_string())]`
+                // — a second full copy of the serialised
+                // body on top of the structured value. We
+                // ship structured content only (empty
+                // `content` list), so peak memory per
+                // response stays bounded by the caller's
+                // `encode_body_capped` (~7 MiB max) instead
+                // of doubling for the mirror.
+                //
+                // `Default::default()` starts from
+                // `result_type = COMPLETE`, `content = []`,
+                // `structured_content = None`,
+                // `is_error = None`, `meta = None`
+                // (rmcp's `impl Default for CallToolResult`).
+                // Non-exhaustive struct literal ban means
+                // we can't build it inline, but the fields
+                // are `pub` and safe to overwrite.
+                let mut result = CallToolResult::default();
+                result.structured_content = Some(value);
+                result.is_error = Some(false);
+                Ok(result)
+            }
             Self::ExecErr {
                 message,
                 structured,
@@ -695,7 +766,7 @@ impl ToolOutcome {
             // the tool WAS invoked. Matches the REST
             // send-command path (`200` with a
             // `CommandResult::Err` in the body).
-            Self::Ok(_) | Self::ExecErr { .. } => 200,
+            Self::Ok { .. } | Self::ExecErr { .. } => 200,
             Self::UnknownTool(_) => 404,
             Self::InvalidParams(_) => 400,
             Self::Denied { .. } => 403,
@@ -705,7 +776,7 @@ impl ToolOutcome {
 
     fn decision(&self) -> &'static str {
         match self {
-            Self::Ok(_) | Self::ExecErr { .. } => "allow",
+            Self::Ok { .. } | Self::ExecErr { .. } => "allow",
             Self::UnknownTool(_) | Self::Denied { .. } | Self::InvalidParams(_) => "deny",
             Self::Internal(_) => "error",
         }
@@ -817,9 +888,12 @@ async fn device_send_command_call(
         }
     };
     match &wire {
-        WireCommandResult::Ok | WireCommandResult::OkWithState { .. } => {
-            ToolOutcome::Ok(structured)
-        }
+        WireCommandResult::Ok | WireCommandResult::OkWithState { .. } => ToolOutcome::Ok {
+            value: structured,
+            // Plugin was reached and returned Ok — audits
+            // as `execution_outcome = "success"`.
+            plugin_reached: true,
+        },
         WireCommandResult::Err { error } => {
             let domain_kind = wit_error_kind_of_wire(error);
             ToolOutcome::ExecErr {
@@ -1046,8 +1120,24 @@ async fn logs_query_call(
         span_path_prefix: args.span_path_prefix,
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    // Round-1 F1 on PR #124: bound the concurrent
+    // blocking-writer tasks via the shared
+    // `STORE_QUERY_SEMAPHORE`. Permit MOVES into the closure
+    // so a cancelled outer future (client disconnect) doesn't
+    // leave detached blocking tasks piled up on the mutex.
+    let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+        tracing::warn!(
+            cap = STORE_QUERY_MAX,
+            "MCP logs.query store-query saturated — refusing call",
+        );
+        return ToolOutcome::Internal("store-query queue saturated; retry shortly".into());
+    };
     let log_store = engine.log_store();
-    let join = tokio::task::spawn_blocking(move || log_store.query(&log_query, limit_usize)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        let _guard = query_permit;
+        log_store.query(&log_query, limit_usize)
+    })
+    .await;
     let rows = match join {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
@@ -1063,12 +1153,16 @@ async fn logs_query_call(
     // Reuse the resource-side wire shape so a client sees
     // the same JSON on `resources/read` and `tools/call`.
     let body = super::resources::LogsBody { logs: &rows };
-    match serde_json::to_value(&body) {
-        Ok(v) => ToolOutcome::Ok(v),
-        Err(err) => {
-            tracing::error!(target: "mcp.tool.logs.query", %err, "wire serialisation failed");
-            ToolOutcome::Internal("failed to serialise log rows".into())
-        }
+    match super::resources::encode_body_capped(&body, "logs.query") {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            // Pure host-state read — no plugin was reached,
+            // so `execution_outcome` stays `None` per the
+            // audit ledger contract.
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::InvalidParams(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
     }
 }
 

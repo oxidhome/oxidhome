@@ -300,6 +300,32 @@ pub(super) static AUDIT_QUEUE_SEMAPHORE: std::sync::LazyLock<
     std::sync::Arc<tokio::sync::Semaphore>,
 > = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(AUDIT_QUEUE_MAX)));
 
+/// Maximum concurrent MCP store-query blocking tasks
+/// (events and logs from both `resources/read` and
+/// `tools/call`).
+///
+/// Round-1 F1 on PR #124: a cancelled outer future — client
+/// disconnected while `spawn_blocking(log_store.query)` was
+/// running — drops any outer-scope permit but leaves the
+/// blocking task queued. Without a permit held inside the
+/// closure, repeat cancellations can pile up unbounded
+/// tasks behind the shared `SQLite` mutex.
+///
+/// Sized larger than [`AUDIT_QUEUE_MAX`] (8 vs 32) because
+/// each query holds the mutex only for the SELECT + row
+/// decode — much shorter than an audit write's INSERT +
+/// index maintenance. 8 concurrent SELECTs is a comfortable
+/// ceiling for a home hub; the mount's transmission gate
+/// (`PENDING_BODY_GATE = 16`) still caps total in-flight
+/// request work.
+pub(super) const STORE_QUERY_MAX: usize = 8;
+
+/// Global semaphore backing [`STORE_QUERY_MAX`]. Shared
+/// with [`super::tools`].
+pub(super) static STORE_QUERY_SEMAPHORE: std::sync::LazyLock<
+    std::sync::Arc<tokio::sync::Semaphore>,
+> = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(STORE_QUERY_MAX)));
+
 /// Outcome shape for a single resource-read attempt. Kept as
 /// a separate enum so the audit path can look at the shape
 /// (status, decision, required scope) without re-parsing an
@@ -878,11 +904,23 @@ async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
     // The shared `SQLite` mutex is std, not tokio — running
     // the query on the async worker would park it for the
     // whole read. `spawn_blocking` moves it to the blocking
-    // pool (round-1 F1 on PR #121). Move the query in; the
-    // rows come back out.
+    // pool (round-1 F1 on PR #121). Round-1 F1 on PR #124
+    // adds `STORE_QUERY_SEMAPHORE` — the permit MOVES into
+    // the closure so a cancelled outer future doesn't leave
+    // detached blocking tasks piled up on the mutex.
+    let Ok(permit) = std::sync::Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+        tracing::warn!(
+            cap = STORE_QUERY_MAX,
+            "MCP events store-query saturated — refusing read",
+        );
+        return ReadOutcome::Busy("MCP store-query queue saturated; retry shortly".into());
+    };
     let event_log = engine.event_log();
-    let join =
-        tokio::task::spawn_blocking(move || event_log.query(&event_query, limit_usize)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        let _guard = permit;
+        event_log.query(&event_query, limit_usize)
+    })
+    .await;
     let rows = match join {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
@@ -976,8 +1014,21 @@ async fn logs_read(engine: Engine, raw_query: &str) -> ReadOutcome {
         span_path_prefix: query.get("span_path_prefix").cloned(),
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    // Round-1 F1 on PR #124: bound concurrent store-query
+    // blocking tasks. See `events_read` for the rationale.
+    let Ok(permit) = std::sync::Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+        tracing::warn!(
+            cap = STORE_QUERY_MAX,
+            "MCP logs store-query saturated — refusing read",
+        );
+        return ReadOutcome::Busy("MCP store-query queue saturated; retry shortly".into());
+    };
     let log_store = engine.log_store();
-    let join = tokio::task::spawn_blocking(move || log_store.query(&log_query, limit_usize)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        let _guard = permit;
+        log_store.query(&log_query, limit_usize)
+    })
+    .await;
     let rows = match join {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
@@ -1870,6 +1921,63 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     }
 }
 
+/// Round-1 F2 on PR #124: tools/call reuse of the capped
+/// serialiser. The tool path needs the parsed [`JsonValue`]
+/// for `CallToolResult.structuredContent`, whereas
+/// [`encode`] delivers a raw JSON `String` bound for
+/// [`ResourceContents::text`]. `encode_body_capped` runs the
+/// same [`CappedWriter`]-bounded serialisation and returns
+/// one of three named shapes so the tool layer can map
+/// them to its own outcome enum without opening this
+/// module's `ReadOutcome` (which carries resource-side
+/// semantics the tool layer doesn't want).
+pub(super) enum EncodedBody {
+    Value(serde_json::Value),
+    /// Body exceeded [`MAX_TEXT_BODY_BYTES`]; the reason
+    /// string is caller-facing and names the tool.
+    TooLarge(String),
+    /// Serialisation failed for a reason other than the cap
+    /// (bad UTF-8, serde error). The reason is caller-facing
+    /// enough to identify the tool but hides the internal
+    /// error surface.
+    SerializeFailed(String),
+}
+
+pub(super) fn encode_body_capped<T: Serialize>(value: &T, what: &'static str) -> EncodedBody {
+    let mut writer = CappedWriter::with_cap(MAX_TEXT_BODY_BYTES);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => {
+            let bytes = writer.into_bytes();
+            // Parse-back to a `JsonValue`. Peak memory during
+            // this call is `bytes.len() + tree size` ≈ 2 ×
+            // MAX_TEXT_BODY_BYTES (7 MiB). Well under the
+            // mount's 128 MiB `PENDING_BODY_GATE * MAX` bound.
+            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(v) => EncodedBody::Value(v),
+                Err(err) => {
+                    tracing::error!(%err, what, "MCP tool body parse-back failed");
+                    EncodedBody::SerializeFailed(format!("failed to re-parse {what}"))
+                }
+            }
+        }
+        Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::WriteZero) => {
+            tracing::warn!(
+                what,
+                cap = MAX_TEXT_BODY_BYTES,
+                "MCP tool body exceeded pre-serialization cap — refusing call",
+            );
+            EncodedBody::TooLarge(format!(
+                "MCP `{what}` body exceeds the per-response cap ({MAX_TEXT_BODY_BYTES} bytes). \
+                 Narrow the query (smaller `limit`, tighter filter) and retry.",
+            ))
+        }
+        Err(err) => {
+            tracing::error!(%err, what, "MCP tool serialization failed");
+            EncodedBody::SerializeFailed(format!("failed to serialize {what}"))
+        }
+    }
+}
+
 /// [`std::io::Write`] that refuses to grow past a byte
 /// ceiling — the exact machinery `encode` uses to keep an
 /// oversize row from allocating hundreds of MiB before the
@@ -1893,6 +2001,14 @@ impl CappedWriter {
 
     fn into_string(self) -> Result<String, std::string::FromUtf8Error> {
         String::from_utf8(self.buf)
+    }
+
+    /// Return the raw bytes without a UTF-8 check. Callers
+    /// that immediately parse the buffer as JSON
+    /// (`serde_json::from_slice`) can skip the UTF-8 hop —
+    /// `serde_json` validates encoding itself.
+    fn into_bytes(self) -> Vec<u8> {
+        self.buf
     }
 }
 

@@ -753,7 +753,10 @@ async fn list_tools_advertises_logs_query() {
     assert_eq!(schema["type"], "object");
     // No required fields: an empty-arg call is valid.
     assert!(
-        schema["required"].is_null() || schema["required"].as_array().is_none_or(|r| r.is_empty()),
+        schema["required"].is_null()
+            || schema["required"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
         "logs.query must not require any fields; got {schema}",
     );
     // Level enum is present and complete.
@@ -774,8 +777,7 @@ async fn list_tools_advertises_logs_query() {
 #[tokio::test(flavor = "current_thread")]
 async fn logs_query_requires_logs_read_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer =
-        mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let bearer = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -838,10 +840,7 @@ async fn logs_query_rejects_malformed_filters() {
     for (label, arguments) in [
         ("bad since", json!({"since": "nope"})),
         ("bad level", json!({"level": "Verbose"})),
-        (
-            "unknown field",
-            json!({"since": "1h", "min_level": "Info"}),
-        ),
+        ("unknown field", json!({"since": "1h", "min_level": "Info"})),
     ] {
         let response = call(
             &router,
@@ -889,14 +888,41 @@ async fn logs_query_lands_in_the_audit_log() {
         .expect("logs.query row");
     assert_eq!(row.status, 200);
     assert_eq!(row.decision, "allow");
-    // Read tools that ran to completion stamp
-    // `execution_outcome = "success"` too — an operator's
-    // ledger scan wants to distinguish "the tool ran and
-    // returned rows" from "the tool trapped internally".
-    // `domain_error` stays None because there's no plugin
-    // to classify.
-    assert_eq!(row.execution_outcome.as_deref(), Some("success"));
+    // Round-2 F3 on PR #124: read tools (no plugin reached)
+    // leave `execution_outcome` NULL per the ledger
+    // contract — `"success"` is reserved for plugin
+    // Ok/OkWithState. `domain_error` stays None too.
+    assert!(
+        row.execution_outcome.is_none(),
+        "read tools must leave execution_outcome NULL; got {:?}",
+        row.execution_outcome,
+    );
     assert!(row.domain_error.is_none());
     assert!(row.finalized_ms.is_some(), "finalize must have landed");
     assert!(row.intent_ms <= row.finalized_ms.unwrap());
+}
+
+/// Round-2 F4 on PR #124: `logs.query` advertises
+/// `read_only_hint = true`, `destructive_hint = false`,
+/// `open_world_hint = false` — planner-style clients rely
+/// on these hints to decide whether they can call a tool
+/// speculatively.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_advertises_read_only_annotations() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tool = response["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "logs.query")
+        .expect("logs.query catalogued");
+    let annotations = &tool["annotations"];
+    assert_eq!(annotations["readOnlyHint"], true);
+    assert_eq!(annotations["destructiveHint"], false);
+    assert_eq!(annotations["openWorldHint"], false);
 }
