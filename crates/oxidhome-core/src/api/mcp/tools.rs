@@ -198,22 +198,28 @@ pub(super) async fn call(
         return finalize_synchronous(engine, &token_id, family, outcome, audit_permit).await;
     }
 
-    // Two-phase audit: record intent BEFORE dispatch.
+    // Two-phase audit: record intent BEFORE dispatch. Round-2
+    // F1 on PR #123: the permit MOVES into the blocking
+    // closure and is returned with the intent id, so a
+    // cancelled outer future (client disconnect while
+    // `record_intent` is blocked on the `SQLite` mutex) can't
+    // release the permit while the detached blocking task is
+    // still queued. Without this, a disconnect-flooded caller
+    // could enqueue unbounded writers even though the
+    // semaphore's `try_acquire` above returned successfully.
     let intent_entry = new_pending_audit_entry(&token_id, family);
-    let audit_log = engine.audit_log();
-    let intent_result = {
-        let audit_log = audit_log.clone();
-        tokio::task::spawn_blocking(move || audit_log.record_intent(&intent_entry)).await
-    };
-    let intent_id = match intent_result {
-        Ok(Ok(id)) => id,
-        Ok(Err(err)) => {
-            tracing::error!(%err, tool = %name, "MCP tool intent write failed — refusing dispatch");
-            return Err(McpError::internal_error(
-                "audit-log intent write failed; MCP tool call refused",
-                None,
-            ));
-        }
+    let audit_log_for_intent = engine.audit_log();
+    let intent_join = tokio::task::spawn_blocking(move || {
+        let result = audit_log_for_intent.record_intent(&intent_entry);
+        // Hand the permit back to the outer future so the
+        // finalize call below can hold it through its own
+        // blocking write. The `Result` return keeps a failed
+        // intent from leaking the permit either way.
+        (result, audit_permit)
+    })
+    .await;
+    let (intent_result, audit_permit) = match intent_join {
+        Ok((result, permit)) => (result, permit),
         Err(join_err) => {
             tracing::error!(%join_err, tool = %name, "MCP tool intent task panicked — refusing dispatch");
             return Err(McpError::internal_error(
@@ -222,10 +228,20 @@ pub(super) async fn call(
             ));
         }
     };
+    let intent_id = match intent_result {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::error!(%err, tool = %name, "MCP tool intent write failed — refusing dispatch");
+            return Err(McpError::internal_error(
+                "audit-log intent write failed; MCP tool call refused",
+                None,
+            ));
+        }
+    };
 
     // Actually dispatch.
     let outcome = match name {
-        "device.send_command" => device_send_command_call(engine, request.arguments).await,
+        "device.send_command" => device_send_command_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -235,10 +251,20 @@ pub(super) async fn call(
     };
 
     // Finalize — same audit permit covers this write.
-    let finalize_input = FinalizeInput::from_outcome(&outcome, required.name());
+    // Round-2 F2 on PR #123: a finalize failure MUST NOT
+    // replace the dispatch result with an internal error. The
+    // dispatch already ran; for non-idempotent tools (a
+    // `switch/toggle` in particular) the caller retrying on a
+    // spurious -32603 would flip the switch a second time.
+    // Finalize is best-effort once the intent row exists — a
+    // failed finalize leaves the pending row in place, and
+    // an operator's sweep for `decision = 'pending'` surfaces
+    // the anomaly.
+    let finalize_input = FinalizeInput::from_outcome(&outcome);
+    let audit_log_for_finalize = engine.audit_log();
     let audit_finalize = tokio::task::spawn_blocking(move || {
         let _guard = audit_permit;
-        audit_log.finalize(
+        audit_log_for_finalize.finalize(
             intent_id,
             finalize_input.status,
             &finalize_input.decision,
@@ -249,26 +275,27 @@ pub(super) async fn call(
     })
     .await;
     match audit_finalize {
-        Ok(Ok(())) => outcome.into_result(),
+        Ok(Ok(())) => {}
         Ok(Err(err)) => {
-            // Finalize failure leaves the pending row in place
-            // — an operator's sweep for `decision = 'pending'`
-            // still surfaces the actuation. Refuse the caller
-            // so it doesn't retry blindly.
-            tracing::error!(%err, tool = %name, intent_id, "MCP tool finalize failed — pending audit row remains");
-            Err(McpError::internal_error(
-                "audit-log finalize failed; MCP tool call refused",
-                None,
-            ))
+            tracing::error!(
+                target: "mcp.tool",
+                %err,
+                tool = %name,
+                intent_id,
+                "MCP tool finalize failed — pending audit row remains; returning original outcome",
+            );
         }
         Err(join_err) => {
-            tracing::error!(%join_err, tool = %name, intent_id, "MCP tool finalize task panicked");
-            Err(McpError::internal_error(
-                "audit-log finalize task panicked; MCP tool call refused",
-                None,
-            ))
+            tracing::error!(
+                target: "mcp.tool",
+                %join_err,
+                tool = %name,
+                intent_id,
+                "MCP tool finalize task panicked — pending audit row remains; returning original outcome",
+            );
         }
     }
+    outcome.into_result()
 }
 
 /// Single-shot audit path for outcomes decided BEFORE any
@@ -320,19 +347,37 @@ struct FinalizeInput {
 }
 
 impl FinalizeInput {
-    fn from_outcome(outcome: &ToolOutcome, _required: &str) -> Self {
-        // Round-1 F3 on PR #123: populate execution_outcome
-        // + domain_error so a successful actuation
-        // (`decision = allow`, `status = 200`) is
-        // distinguishable from a plugin-reported failure
-        // (same `decision`/`status`). Matches the REST
-        // send-command audit shape.
+    fn from_outcome(outcome: &ToolOutcome) -> Self {
+        // Round-2 F3 on PR #123: align with the audit
+        // ledger's contract as documented on
+        // [`crate::state::audit_log::AuditEntry`]:
+        //
+        // - `Some("success")` — plugin returned
+        //   `Ok`/`OkWithState`.
+        // - `Some("failed")` — plugin returned
+        //   `CommandResult::Err`, with `domain_error` naming
+        //   the WIT kind.
+        // - `None` — execution never reached the plugin
+        //   (unknown-device fell out inside the tool body
+        //   before `execute_command`; unknown-tool / bad
+        //   args / scope-denied never even enter here).
+        //
+        // Round-1 F3 shipped `"ok"` and stamped `"failed"`
+        // on the unknown-device path too — both wrong per
+        // the contract; corrected here.
         let (execution_outcome, domain_error): (Option<&'static str>, Option<String>) =
             match outcome {
-                ToolOutcome::Ok(_) => (Some("ok"), None),
-                ToolOutcome::ExecErr { domain_kind, .. } => {
-                    (Some("failed"), domain_kind.map(str::to_string))
-                }
+                ToolOutcome::Ok(_) => (Some("success"), None),
+                // Only `domain_kind = Some(_)` means the
+                // plugin was reached and reported an `Err`.
+                // `domain_kind = None` is the "reached tool
+                // body, refused before plugin" shape (unknown
+                // device); it falls into the wildcard below
+                // and stays as (None, None) per the contract.
+                ToolOutcome::ExecErr {
+                    domain_kind: Some(kind),
+                    ..
+                } => (Some("failed"), Some((*kind).to_string())),
                 _ => (None, None),
             };
         FinalizeInput {

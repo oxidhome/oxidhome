@@ -413,6 +413,30 @@ async fn device_send_command_end_to_end_toggles_a_switch() {
         "state.v must be a Bool; got {state_kv:?}",
     );
 
+    // Round-2 F3 on PR #123: a plugin-reached
+    // success stamps `execution_outcome = "success"` on
+    // the audit row.
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let toggle_row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.device.send_command" && r.status == 200)
+        .expect("toggle audit row");
+    assert_eq!(
+        toggle_row.execution_outcome.as_deref(),
+        Some("success"),
+        "plugin-reached success must stamp execution_outcome=success (contract per audit_log.rs docs); got {:?}",
+        toggle_row.execution_outcome,
+    );
+    assert!(
+        toggle_row.domain_error.is_none(),
+        "success has no domain_error; got {:?}",
+        toggle_row.domain_error,
+    );
+
     handle.stop().await.expect("stop");
     // Prove PluginInstance::load isn't accidentally
     // imported unused (compiler check).
@@ -523,15 +547,22 @@ async fn tool_calls_land_in_the_audit_log() {
     }
 }
 
-/// Round-1 F3 on PR #123: successful actuation stamps
-/// `execution_outcome = "ok"`; plugin-reported errors stamp
-/// `"failed"` + the WIT error kind. Both audit as
-/// `decision = "allow"` + `status = 200`, so this column is
-/// what distinguishes them for an operator's ledger scan.
-/// The unknown-device path exercises the "failed +
-/// not-found" branch without spinning up a plugin.
+/// Round-2 F3 on PR #123: audit `execution_outcome` matches
+/// the ledger contract on
+/// [`crate::state::audit_log::AuditEntry`]:
+///
+/// - `Some("success")` — plugin returned `Ok`/`OkWithState`.
+/// - `Some("failed")` — plugin returned `CommandResult::Err`,
+///   with `domain_error` naming the WIT kind.
+/// - `None` — execution never reached the plugin (e.g.
+///   unknown device: the tool body refused before
+///   `execute_command`).
+///
+/// The unknown-device path never invokes the plugin, so
+/// this test asserts `execution_outcome = None` +
+/// `domain_error = None` on that path.
 #[tokio::test(flavor = "multi_thread")]
-async fn tool_audit_row_records_execution_outcome() {
+async fn tool_audit_row_execution_outcome_null_when_plugin_not_reached() {
     let engine = Engine::new().expect("engine");
     let bearer = mint_bearer(&engine);
     let router = build_router(engine.clone());
@@ -562,18 +593,16 @@ async fn tool_audit_row_records_execution_outcome() {
         .iter()
         .find(|r| r.path == "mcp.tool.device.send_command")
         .expect("tool row");
-    assert_eq!(row.status, 200, "unknown-device runs to a domain error");
-    assert_eq!(row.decision, "allow", "the tool ran");
     assert_eq!(
-        row.execution_outcome.as_deref(),
-        Some("failed"),
-        "unknown-device is a domain failure",
+        row.status, 200,
+        "unknown-device still audits as 200 (tool body ran)"
     );
-    // The unknown-device path is caught inside `blob_read`
-    // BEFORE the plugin is contacted, so `domain_error` on
-    // the audit row stays `None` — the failure isn't a
-    // plugin-reported WIT kind. Only plugin-reported
-    // `CommandResult::Err` rows carry `domain_error`.
+    assert_eq!(row.decision, "allow", "the tool ran");
+    assert!(
+        row.execution_outcome.is_none(),
+        "unknown-device never reached the plugin — execution_outcome must be NULL; got {:?}",
+        row.execution_outcome,
+    );
     assert!(
         row.domain_error.is_none(),
         "unknown-device is not a plugin-classified error; got {:?}",
