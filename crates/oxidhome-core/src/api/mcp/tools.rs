@@ -101,17 +101,77 @@ fn device_send_command_schema() -> serde_json::Map<String, JsonValue> {
                     "additionalProperties": false,
                     "properties": {
                         "key": { "type": "string" },
+                        // Round-3 F1 on PR #123: enumerate the
+                        // per-tag types instead of `"v": {}`
+                        // (which accepted any type — the
+                        // serde deserializer then rejected
+                        // mismatches at runtime, but the
+                        // published contract lied). `oneOf`
+                        // is the direct JSON Schema shape for
+                        // the WIT `value` variant.
                         "value": {
-                            "type": "object",
-                            "required": ["t", "v"],
-                            "additionalProperties": false,
-                            "properties": {
-                                "t": {
-                                    "type": "string",
-                                    "enum": ["Bool", "Int", "Float", "String", "Bytes", "Json"],
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["t", "v"],
+                                    "properties": {
+                                        "t": { "const": "Bool" },
+                                        "v": { "type": "boolean" }
+                                    }
                                 },
-                                "v": {}
-                            }
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["t", "v"],
+                                    "properties": {
+                                        "t": { "const": "Int" },
+                                        "v": { "type": "integer" }
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["t", "v"],
+                                    "properties": {
+                                        "t": { "const": "Float" },
+                                        "v": { "type": "number" }
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["t", "v"],
+                                    "properties": {
+                                        "t": { "const": "String" },
+                                        "v": { "type": "string" }
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["t", "v"],
+                                    "properties": {
+                                        "t": { "const": "Bytes" },
+                                        // `serde_json` serialises `Vec<u8>` as an
+                                        // array of integers — that's the wire shape
+                                        // clients must send.
+                                        "v": {
+                                            "type": "array",
+                                            "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+                                        }
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["t", "v"],
+                                    "properties": {
+                                        "t": { "const": "Json" },
+                                        "v": { "type": "string", "description": "Pre-serialised JSON payload as a string." }
+                                    }
+                                }
+                            ]
                         }
                     }
                 }
@@ -124,7 +184,15 @@ fn device_send_command_schema() -> serde_json::Map<String, JsonValue> {
     }
 }
 
+/// Round-3 F1 on PR #123: `deny_unknown_fields` mirrors the
+/// `additionalProperties: false` in
+/// [`device_send_command_schema`], so a client can't slip an
+/// unknown top-level key (`dry_run: true`, `simulate: 1`, …)
+/// past serde's default lenience and have the tool actuate
+/// the device anyway. `WireKeyValue` + `WireValue` carry
+/// `deny_unknown_fields` for the same reason.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeviceSendCommandArgs {
     device_id: String,
     capability: String,
@@ -295,7 +363,33 @@ pub(super) async fn call(
             );
         }
     }
-    outcome.into_result()
+    // Round-3 F2 on PR #123: attach the `oxidhome.audit` note
+    // the `initialize` instructions promise. Carries the
+    // audit-row id + path so a client that reads the ledger
+    // (or a support engineer eyeballing an SSE trace) can
+    // correlate this response with the row it wrote. Only
+    // attached on `CallToolResult` success/error responses —
+    // JSON-RPC protocol errors (`Err(McpError)`) are
+    // untouched.
+    let mut result = outcome.into_result()?;
+    attach_audit_meta(&mut result, intent_id, family);
+    Ok(result)
+}
+
+/// Attach the `oxidhome.audit` metadata note to a
+/// [`CallToolResult`]. Preserves any existing keys the SDK
+/// or the tool body may have set on `_meta` (we only insert
+/// our own namespaced key).
+fn attach_audit_meta(result: &mut CallToolResult, intent_id: u64, family: &str) {
+    let mut meta = result.meta.take().unwrap_or_default();
+    meta.0.insert(
+        "oxidhome.audit".to_string(),
+        serde_json::json!({
+            "intent_id": intent_id,
+            "path": format!("mcp.tool.{family}"),
+        }),
+    );
+    result.meta = Some(meta);
 }
 
 /// Single-shot audit path for outcomes decided BEFORE any

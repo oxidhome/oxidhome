@@ -609,3 +609,123 @@ async fn tool_audit_row_execution_outcome_null_when_plugin_not_reached() {
         row.domain_error,
     );
 }
+
+/// Round-3 F1 on PR #123: the input schema declares
+/// `additionalProperties: false`, so unknown top-level
+/// fields (e.g. a made-up `dry_run: true` safety modifier)
+/// must be rejected with `-32602 INVALID_PARAMS` — not
+/// silently swallowed by serde while the tool still
+/// actuates the device.
+#[tokio::test(flavor = "current_thread")]
+async fn device_send_command_rejects_unknown_top_level_field() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": "d1",
+                "capability": "switch",
+                "action": "toggle",
+                // No such field on `DeviceSendCommandArgs`.
+                "dry_run": true,
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "unknown top-level field must surface as INVALID_PARAMS; got {response}",
+    );
+}
+
+/// Same round-3 F1 story for the nested `WireValue` shape —
+/// a stray field inside `{t, v}` (or the outer key/value
+/// wrapper) must fail deserialisation.
+#[tokio::test(flavor = "current_thread")]
+async fn device_send_command_rejects_unknown_value_field() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": "d1",
+                "capability": "dimmer",
+                "action": "set",
+                "args": [
+                    {
+                        "key": "level",
+                        "value": {
+                            "t": "Int",
+                            "v": 50,
+                            // Not a field on WireValue.
+                            "hint": "percent",
+                        }
+                    }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "stray value field must be rejected; got {response}",
+    );
+}
+
+/// Round-3 F2 on PR #123: the `initialize` instructions
+/// promise that mutating tools carry an `oxidhome.audit`
+/// note. `device.send_command` must attach `_meta` with
+/// `intent_id` + audit `path` so clients can correlate the
+/// response to the row it wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn device_send_command_response_carries_audit_meta() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": "ghost-meta",
+                "capability": "switch",
+                "action": "toggle",
+            }
+        }),
+    )
+    .await;
+    let audit = &response["result"]["_meta"]["oxidhome.audit"];
+    assert!(
+        audit.is_object(),
+        "response must carry an `oxidhome.audit` meta note; got {response}",
+    );
+    assert_eq!(
+        audit["path"], "mcp.tool.device.send_command",
+        "audit meta must include the ledger path; got {audit}",
+    );
+    let intent_id = audit["intent_id"]
+        .as_u64()
+        .expect("audit meta must include a numeric intent_id");
+    assert!(intent_id > 0, "intent_id must be a real row id");
+}
