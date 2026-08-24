@@ -39,10 +39,11 @@ use serde_json::{Value as JsonValue, json};
 use crate::Engine;
 use crate::api::auth::wit_error_kind;
 use crate::api::scopes::{DEVICES_COMMAND, require_scope};
-use crate::api::server::{WireCommandResult, WireKeyValue, command_result_to_wire};
+use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::types::KeyValue;
+use crate::host_impl::plugin::oxidhome::plugin::types::Value;
 use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
@@ -126,7 +127,21 @@ fn device_send_command_schema() -> serde_json::Map<String, JsonValue> {
                                     "required": ["t", "v"],
                                     "properties": {
                                         "t": { "const": "Int" },
-                                        "v": { "type": "integer" }
+                                        // Round-4 F2 on PR #123: bound to
+                                        // `i64` so schema validation and
+                                        // serde deserialization agree.
+                                        // JSON Schema `integer` alone is
+                                        // unbounded and would accept
+                                        // `2^63`, which serde then
+                                        // rejects — a client trusting the
+                                        // schema would send valid-per-
+                                        // schema payloads that fail on
+                                        // the wire.
+                                        "v": {
+                                            "type": "integer",
+                                            "minimum": i64::MIN,
+                                            "maximum": i64::MAX
+                                        }
                                     }
                                 },
                                 {
@@ -189,8 +204,14 @@ fn device_send_command_schema() -> serde_json::Map<String, JsonValue> {
 /// [`device_send_command_schema`], so a client can't slip an
 /// unknown top-level key (`dry_run: true`, `simulate: 1`, …)
 /// past serde's default lenience and have the tool actuate
-/// the device anyway. `WireKeyValue` + `WireValue` carry
-/// `deny_unknown_fields` for the same reason.
+/// the device anyway.
+///
+/// Round-4 F1 on PR #123: MCP-local strict wire types
+/// ([`McpKeyValue`] / [`McpValue`]) instead of tightening
+/// the shared REST types — the REST send-command endpoint's
+/// wire contract stays lenient (its own history + tests
+/// depend on that), and MCP gets stricter parsing scoped to
+/// the surface this PR opens.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceSendCommandArgs {
@@ -198,7 +219,51 @@ struct DeviceSendCommandArgs {
     capability: String,
     action: String,
     #[serde(default)]
-    args: Vec<WireKeyValue>,
+    args: Vec<McpKeyValue>,
+}
+
+/// MCP-local strict counterpart to
+/// [`crate::api::server::WireKeyValue`] — same wire shape
+/// (`{"key": …, "value": {"t": …, "v": …}}`), but rejects
+/// unknown fields at the outer key/value wrapper. Bound-in
+/// by [`DeviceSendCommandArgs`] so its `deny_unknown_fields`
+/// applies to nested structures too.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpKeyValue {
+    key: String,
+    value: McpValue,
+}
+
+/// MCP-local strict counterpart to
+/// [`crate::api::server::WireValue`] — same
+/// `tag = "t", content = "v"` layout, but rejects any extra
+/// key alongside `t` / `v`. `From<McpValue>` bridges to the
+/// WIT `Value` variant, so the tool body converts to the
+/// exact type the plugin's `execute-command` handler
+/// receives via REST.
+#[derive(Deserialize)]
+#[serde(tag = "t", content = "v", deny_unknown_fields)]
+enum McpValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    Json(String),
+}
+
+impl From<McpValue> for Value {
+    fn from(v: McpValue) -> Self {
+        match v {
+            McpValue::Bool(b) => Value::BoolVal(b),
+            McpValue::Int(i) => Value::IntVal(i),
+            McpValue::Float(f) => Value::FloatVal(f),
+            McpValue::String(s) => Value::StringVal(s),
+            McpValue::Bytes(b) => Value::BytesVal(b),
+            McpValue::Json(j) => Value::JsonVal(j),
+        }
+    }
 }
 
 /// Dispatch a concrete `tools/call` request.
@@ -224,6 +289,13 @@ struct DeviceSendCommandArgs {
 /// blocking-writer tasks (round-6 F3 on PR #122). One
 /// permit covers both the intent write and the finalize
 /// write for this call.
+// One linear match-and-return function so the audit /
+// dispatch / finalize / meta-attachment order is easy to
+// follow top-to-bottom; splitting into helpers would spread
+// the audit invariant across the module without shortening
+// any decision. Same reasoning as `blob_read` on the
+// resources side (PR #122).
+#[allow(clippy::too_many_lines)]
 pub(super) async fn call(
     engine: Engine,
     request: CallToolRequestParams,
@@ -367,13 +439,27 @@ pub(super) async fn call(
     // the `initialize` instructions promise. Carries the
     // audit-row id + path so a client that reads the ledger
     // (or a support engineer eyeballing an SSE trace) can
-    // correlate this response with the row it wrote. Only
-    // attached on `CallToolResult` success/error responses —
-    // JSON-RPC protocol errors (`Err(McpError)`) are
-    // untouched.
-    let mut result = outcome.into_result()?;
-    attach_audit_meta(&mut result, intent_id, family);
-    Ok(result)
+    // correlate this response with the row it wrote.
+    //
+    // Round-4 F3 on PR #123: even a `ToolOutcome::Internal`
+    // that surfaces as `Err(McpError)` must carry the
+    // correlation — a plugin can trap AFTER performing an
+    // external action (physical actuation, network call, …)
+    // and that trap becomes an `Internal` outcome. The
+    // client's -32603 must still name the audit row so a
+    // support engineer can find "what happened" in the
+    // ledger instead of hunting through logs. Attached to
+    // `McpError.data`; the client SDK forwards it verbatim.
+    match outcome.into_result() {
+        Ok(mut result) => {
+            attach_audit_meta(&mut result, intent_id, family);
+            Ok(result)
+        }
+        Err(mut err) => {
+            attach_audit_meta_to_error(&mut err, intent_id, family);
+            Err(err)
+        }
+    }
 }
 
 /// Attach the `oxidhome.audit` metadata note to a
@@ -384,12 +470,44 @@ fn attach_audit_meta(result: &mut CallToolResult, intent_id: u64, family: &str) 
     let mut meta = result.meta.take().unwrap_or_default();
     meta.0.insert(
         "oxidhome.audit".to_string(),
-        serde_json::json!({
-            "intent_id": intent_id,
-            "path": format!("mcp.tool.{family}"),
-        }),
+        audit_meta_value(intent_id, family),
     );
     result.meta = Some(meta);
+}
+
+/// Attach the `oxidhome.audit` correlation object to an
+/// [`McpError`]'s `data` field. Preserves any existing `data`
+/// payload by nesting the correlation under an
+/// `oxidhome.audit` key inside a fresh object — matches the
+/// shape [`attach_audit_meta`] uses for successful results.
+fn attach_audit_meta_to_error(err: &mut McpError, intent_id: u64, family: &str) {
+    let audit = audit_meta_value(intent_id, family);
+    let data = match err.data.take() {
+        Some(JsonValue::Object(mut map)) => {
+            // Preserve whatever the outcome already stashed
+            // (`invalid_params` / `resource_not_found` etc.
+            // don't set `data` today, but a future variant
+            // might).
+            map.insert("oxidhome.audit".to_string(), audit);
+            JsonValue::Object(map)
+        }
+        Some(existing) => JsonValue::Object(serde_json::Map::from_iter([
+            ("oxidhome.audit".to_string(), audit),
+            ("previous".to_string(), existing),
+        ])),
+        None => JsonValue::Object(serde_json::Map::from_iter([(
+            "oxidhome.audit".to_string(),
+            audit,
+        )])),
+    };
+    err.data = Some(data);
+}
+
+fn audit_meta_value(intent_id: u64, family: &str) -> JsonValue {
+    serde_json::json!({
+        "intent_id": intent_id,
+        "path": format!("mcp.tool.{family}"),
+    })
 }
 
 /// Single-shot audit path for outcomes decided BEFORE any
@@ -850,5 +968,61 @@ mod message_cap_tests {
         let out = cap_message(big);
         assert!(out.is_char_boundary(out.len() - "… [truncated by host]".len()));
         assert!(out.ends_with("[truncated by host]"));
+    }
+}
+
+#[cfg(test)]
+mod error_meta_tests {
+    use super::{McpError, attach_audit_meta_to_error};
+    use rmcp::model::ErrorCode;
+    use serde_json::json;
+
+    /// Round-4 F3 on PR #123: an `McpError` produced AFTER
+    /// the intent row was written carries the audit
+    /// correlation on its `data` field, so a client seeing a
+    /// -32603 can still find the ledger row the tool wrote
+    /// before it trapped.
+    #[test]
+    fn attaches_audit_correlation_when_data_is_absent() {
+        let mut err = McpError::internal_error("plugin trapped after actuation", None);
+        attach_audit_meta_to_error(&mut err, 42, "device.send_command");
+        let data = err.data.expect("audit meta must land on data");
+        assert_eq!(
+            data["oxidhome.audit"]["intent_id"], 42,
+            "intent id must reach the client",
+        );
+        assert_eq!(
+            data["oxidhome.audit"]["path"],
+            "mcp.tool.device.send_command",
+        );
+    }
+
+    #[test]
+    fn preserves_existing_object_data() {
+        // A future outcome could set `data` via
+        // `McpError::new(code, msg, Some(obj))` — the helper
+        // must merge rather than clobber.
+        let mut err = McpError::new(
+            ErrorCode::INTERNAL_ERROR,
+            "trapped",
+            Some(json!({"trace_id": "abc"})),
+        );
+        attach_audit_meta_to_error(&mut err, 7, "device.send_command");
+        let data = err.data.expect("data must remain");
+        assert_eq!(data["trace_id"], "abc", "pre-existing keys must survive");
+        assert_eq!(data["oxidhome.audit"]["intent_id"], 7);
+    }
+
+    #[test]
+    fn wraps_non_object_data_under_previous_key() {
+        let mut err = McpError::new(
+            ErrorCode::INTERNAL_ERROR,
+            "trapped",
+            Some(json!("opaque string payload")),
+        );
+        attach_audit_meta_to_error(&mut err, 3, "device.send_command");
+        let data = err.data.expect("data must remain");
+        assert_eq!(data["previous"], "opaque string payload");
+        assert_eq!(data["oxidhome.audit"]["intent_id"], 3);
     }
 }

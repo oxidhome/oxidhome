@@ -978,7 +978,6 @@ struct CommandBody {
 /// reuses this in `WireEventPayload::StateChanged.fields` for
 /// history + tail wire projection.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct WireKeyValue {
     pub(crate) key: String,
     pub(crate) value: WireValue,
@@ -994,7 +993,7 @@ pub(crate) struct WireKeyValue {
 /// `OkWithState` state map. Drop the round-trip and a client
 /// can't tell `Int(5)` from `Float(5.0)`.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "t", content = "v", deny_unknown_fields)]
+#[serde(tag = "t", content = "v")]
 pub(crate) enum WireValue {
     Bool(bool),
     Int(i64),
