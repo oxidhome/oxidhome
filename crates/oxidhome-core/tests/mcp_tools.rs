@@ -504,5 +504,79 @@ async fn tool_calls_land_in_the_audit_log() {
     for row in &tool_rows {
         assert_eq!(row.actor_kind, "mcp");
         assert_eq!(row.method, "MCP");
+        // Round-1 F1 on PR #123: every finalize-path row has
+        // `finalized_ms` set. Rows that took the two-phase
+        // dispatch path also have `intent_ms < finalized_ms`
+        // (monotonic host clock, ms-resolution — the write
+        // path stamps two separate `now_unix_ms()` calls).
+        if row.status == 200 {
+            let finalized = row
+                .finalized_ms
+                .expect("dispatch rows must be finalized after intent");
+            assert!(
+                row.intent_ms <= finalized,
+                "intent_ms ({}) must be ≤ finalized_ms ({}); intent should come first",
+                row.intent_ms,
+                finalized,
+            );
+        }
     }
+}
+
+/// Round-1 F3 on PR #123: successful actuation stamps
+/// `execution_outcome = "ok"`; plugin-reported errors stamp
+/// `"failed"` + the WIT error kind. Both audit as
+/// `decision = "allow"` + `status = 200`, so this column is
+/// what distinguishes them for an operator's ledger scan.
+/// The unknown-device path exercises the "failed +
+/// not-found" branch without spinning up a plugin.
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_audit_row_records_execution_outcome() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": "ghost-exec",
+                "capability": "switch",
+                "action": "toggle",
+            }
+        }),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.device.send_command")
+        .expect("tool row");
+    assert_eq!(row.status, 200, "unknown-device runs to a domain error");
+    assert_eq!(row.decision, "allow", "the tool ran");
+    assert_eq!(
+        row.execution_outcome.as_deref(),
+        Some("failed"),
+        "unknown-device is a domain failure",
+    );
+    // The unknown-device path is caught inside `blob_read`
+    // BEFORE the plugin is contacted, so `domain_error` on
+    // the audit row stays `None` — the failure isn't a
+    // plugin-reported WIT kind. Only plugin-reported
+    // `CommandResult::Err` rows carry `domain_error`.
+    assert!(
+        row.domain_error.is_none(),
+        "unknown-device is not a plugin-classified error; got {:?}",
+        row.domain_error,
+    );
 }

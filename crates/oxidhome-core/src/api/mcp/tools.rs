@@ -41,7 +41,7 @@ use crate::api::auth::wit_error_kind;
 use crate::api::scopes::{DEVICES_COMMAND, require_scope};
 use crate::api::server::{WireCommandResult, WireKeyValue, command_result_to_wire};
 use crate::auth::Actor;
-use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
+use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::types::KeyValue;
 use crate::state::audit_log::AuditEntry;
 
@@ -133,20 +133,34 @@ struct DeviceSendCommandArgs {
     args: Vec<WireKeyValue>,
 }
 
-/// Dispatch a concrete `tools/call` request. Mirrors
-/// [`super::resources::read`] shape: acquire an audit-queue
-/// permit up front, dispatch to the tool, then run the audit
-/// write under the same permit.
+/// Dispatch a concrete `tools/call` request.
+///
+/// Round-1 F1 on PR #123: uses the two-phase
+/// [`AuditLog::record_intent`] + [`AuditLog::finalize`]
+/// pattern rather than a single `record_completed` after
+/// dispatch. `device.send_command` physically actuates
+/// devices (locks, garage doors, alarms); recording the
+/// intent BEFORE the dispatch guarantees a forensic row
+/// exists even if:
+///
+/// - The process is signalled and killed mid-dispatch.
+/// - The finalize write fails (disk full, mutex poison, …).
+/// - The rmcp handler task is dropped after the physical
+///   effect has landed but before we get to finalize.
+///
+/// A pending row is strictly better than no row: the
+/// operator sees `mcp.tool.<name>`, the token id, and the
+/// intent timestamp — enough to reconstruct what happened.
+///
+/// The audit-queue [`Semaphore`] still bounds concurrent
+/// blocking-writer tasks (round-6 F3 on PR #122). One
+/// permit covers both the intent write and the finalize
+/// write for this call.
 pub(super) async fn call(
     engine: Engine,
     request: CallToolRequestParams,
     actor: &Actor,
 ) -> Result<CallToolResult, McpError> {
-    // Round-6 F3 (PR #122) audit-queue bound covers tools
-    // too — a disconnect-flooded caller whose rmcp handler
-    // tasks outlive the response future can't pile up
-    // unbounded `spawn_blocking(record_completed)` tasks
-    // behind the shared `SQLite` mutex.
     let Ok(audit_permit) = Arc::clone(&AUDIT_QUEUE_SEMAPHORE).try_acquire_owned() else {
         tracing::warn!(
             cap = AUDIT_QUEUE_MAX,
@@ -161,10 +175,115 @@ pub(super) async fn call(
     };
 
     let token_id = actor.id().to_string();
-    let (family, outcome) = call_inner(engine.clone(), request, actor).await;
+    let name = request.name.as_ref();
 
+    // Route → (family, required scope). Scope + tool-name
+    // problems land here without the tool ever executing;
+    // no reason to write an intent row for them. They're
+    // audited as single-shot `record_completed` rows below.
+    // Kept as `match` (not `if`) because every follow-up
+    // tool will land as another arm here.
+    #[allow(clippy::single_match_else)]
+    let (family, required) = match name {
+        "device.send_command" => ("device.send_command", DEVICES_COMMAND),
+        _ => {
+            let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
+            return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
+        }
+    };
+    if require_scope(actor, required).is_err() {
+        let outcome = ToolOutcome::Denied {
+            required: required.name(),
+        };
+        return finalize_synchronous(engine, &token_id, family, outcome, audit_permit).await;
+    }
+
+    // Two-phase audit: record intent BEFORE dispatch.
+    let intent_entry = new_pending_audit_entry(&token_id, family);
     let audit_log = engine.audit_log();
-    let audit_entry = new_audit_entry(&token_id, family, &outcome);
+    let intent_result = {
+        let audit_log = audit_log.clone();
+        tokio::task::spawn_blocking(move || audit_log.record_intent(&intent_entry)).await
+    };
+    let intent_id = match intent_result {
+        Ok(Ok(id)) => id,
+        Ok(Err(err)) => {
+            tracing::error!(%err, tool = %name, "MCP tool intent write failed — refusing dispatch");
+            return Err(McpError::internal_error(
+                "audit-log intent write failed; MCP tool call refused",
+                None,
+            ));
+        }
+        Err(join_err) => {
+            tracing::error!(%join_err, tool = %name, "MCP tool intent task panicked — refusing dispatch");
+            return Err(McpError::internal_error(
+                "audit-log intent task panicked; MCP tool call refused",
+                None,
+            ));
+        }
+    };
+
+    // Actually dispatch.
+    let outcome = match name {
+        "device.send_command" => device_send_command_call(engine, request.arguments).await,
+        // Unreachable — every routed tool above has a body
+        // arm here. If a future addition to the routing
+        // table forgets to add one, surface it as a
+        // finalize-visible internal error rather than
+        // silently mis-routing.
+        _ => ToolOutcome::Internal(format!("MCP tool `{name}` routed without a body impl")),
+    };
+
+    // Finalize — same audit permit covers this write.
+    let finalize_input = FinalizeInput::from_outcome(&outcome, required.name());
+    let audit_finalize = tokio::task::spawn_blocking(move || {
+        let _guard = audit_permit;
+        audit_log.finalize(
+            intent_id,
+            finalize_input.status,
+            &finalize_input.decision,
+            finalize_input.required_scope.as_deref(),
+            finalize_input.execution_outcome.as_deref(),
+            finalize_input.domain_error.as_deref(),
+        )
+    })
+    .await;
+    match audit_finalize {
+        Ok(Ok(())) => outcome.into_result(),
+        Ok(Err(err)) => {
+            // Finalize failure leaves the pending row in place
+            // — an operator's sweep for `decision = 'pending'`
+            // still surfaces the actuation. Refuse the caller
+            // so it doesn't retry blindly.
+            tracing::error!(%err, tool = %name, intent_id, "MCP tool finalize failed — pending audit row remains");
+            Err(McpError::internal_error(
+                "audit-log finalize failed; MCP tool call refused",
+                None,
+            ))
+        }
+        Err(join_err) => {
+            tracing::error!(%join_err, tool = %name, intent_id, "MCP tool finalize task panicked");
+            Err(McpError::internal_error(
+                "audit-log finalize task panicked; MCP tool call refused",
+                None,
+            ))
+        }
+    }
+}
+
+/// Single-shot audit path for outcomes decided BEFORE any
+/// dispatch — unknown-tool, scope-denied. Uses
+/// `record_completed` (`intent_ms == finalized_ms`) since
+/// there's no physical actuation to protect against.
+async fn finalize_synchronous(
+    engine: Engine,
+    token_id: &str,
+    family: &str,
+    outcome: ToolOutcome,
+    audit_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<CallToolResult, McpError> {
+    let audit_log = engine.audit_log();
+    let audit_entry = new_completed_audit_entry(token_id, family, &outcome);
     let audit_result = tokio::task::spawn_blocking(move || {
         let _guard = audit_permit;
         audit_log.record_completed(&audit_entry)
@@ -189,46 +308,41 @@ pub(super) async fn call(
     }
 }
 
-/// Route a `tools/call` request to its tool implementation
-/// after scope enforcement. Returns the audit-family slug
-/// alongside the outcome so [`call`] can log without
-/// re-parsing.
-async fn call_inner(
-    engine: Engine,
-    request: CallToolRequestParams,
-    actor: &Actor,
-) -> (&'static str, ToolOutcome) {
-    let name = request.name.as_ref();
-    let (family, required) = match name {
-        "device.send_command" => ("device.send_command", DEVICES_COMMAND),
-        _ => {
-            return (
-                "unknown",
-                ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`")),
-            );
+/// What [`AuditLog::finalize`] needs from the outcome. Built
+/// once so the finalize `spawn_blocking` closure captures only
+/// owned strings — no cross-boundary lifetimes.
+struct FinalizeInput {
+    status: u16,
+    decision: String,
+    required_scope: Option<String>,
+    execution_outcome: Option<String>,
+    domain_error: Option<String>,
+}
+
+impl FinalizeInput {
+    fn from_outcome(outcome: &ToolOutcome, _required: &str) -> Self {
+        // Round-1 F3 on PR #123: populate execution_outcome
+        // + domain_error so a successful actuation
+        // (`decision = allow`, `status = 200`) is
+        // distinguishable from a plugin-reported failure
+        // (same `decision`/`status`). Matches the REST
+        // send-command audit shape.
+        let (execution_outcome, domain_error): (Option<&'static str>, Option<String>) =
+            match outcome {
+                ToolOutcome::Ok(_) => (Some("ok"), None),
+                ToolOutcome::ExecErr { domain_kind, .. } => {
+                    (Some("failed"), domain_kind.map(str::to_string))
+                }
+                _ => (None, None),
+            };
+        FinalizeInput {
+            status: outcome.status(),
+            decision: outcome.decision().to_string(),
+            required_scope: outcome.required_scope().map(str::to_string),
+            execution_outcome: execution_outcome.map(str::to_string),
+            domain_error,
         }
-    };
-
-    if require_scope(actor, required).is_err() {
-        return (
-            family,
-            ToolOutcome::Denied {
-                required: required.name(),
-            },
-        );
     }
-
-    let outcome = match name {
-        "device.send_command" => device_send_command_call(engine, request.arguments).await,
-        // Unknown-tool falls out of the routing match above;
-        // this arm exists so a future tool addition to the
-        // routing table can't skip the scope check by
-        // omission — the `unreachable!` fails a debug build,
-        // and a release build gets an audit-visible internal
-        // error instead of silently mis-routing.
-        _ => ToolOutcome::Internal(format!("MCP tool `{name}` routed without a body impl")),
-    };
-    (family, outcome)
 }
 
 /// Outcome shape for a single `tools/call`. Mirrors
@@ -246,9 +360,14 @@ enum ToolOutcome {
     /// client. Optional `structured` mirrors the shape a
     /// successful call would return so clients that parse
     /// structured content on both paths get one code path.
+    /// `domain_kind` populates the audit row's `domain_error`
+    /// column when this outcome is a plugin-reported WIT
+    /// error (`not-found` / `invalid-argument` / … — the
+    /// same tag REST stamps via `wit_error_kind`).
     ExecErr {
         message: String,
         structured: Option<JsonValue>,
+        domain_kind: Option<&'static str>,
     },
     /// Client sent bad arguments. Maps to `-32602`.
     InvalidParams(String),
@@ -268,6 +387,7 @@ impl ToolOutcome {
             Self::ExecErr {
                 message,
                 structured,
+                domain_kind: _,
             } => Ok(match structured {
                 Some(v) => CallToolResult::structured_error(v),
                 None => CallToolResult::error(vec![ContentBlock::text(message)]),
@@ -325,6 +445,18 @@ impl ToolOutcome {
 
 // ── device.send_command ─────────────────────────────────────────
 
+/// Cap on the plugin-supplied error message before we let it
+/// enter any JSON serialisation. The WIT contract lets a
+/// plugin's `command-result::err` payload carry an
+/// unconstrained string — a misbehaving guest could push
+/// close to its 128 MiB memory ceiling of text and drive the
+/// host into two full copies (once through
+/// `serde_json::to_value`, once through
+/// `CallToolResult::structured_error`) before any downstream
+/// bound sees it. 4 KiB is generous for a real error message
+/// while capping the runaway path (round-1 F2 on PR #123).
+const MAX_PLUGIN_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
+
 async fn device_send_command_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
@@ -353,12 +485,14 @@ async fn device_send_command_call(
         return ToolOutcome::ExecErr {
             message: format!("device `{}` not found or not running", args.device_id),
             structured: None,
+            domain_kind: None,
         };
     };
     let Some(handle) = engine.instances().get(&owner) else {
         return ToolOutcome::ExecErr {
             message: format!("device `{}` not found or not running", args.device_id),
             structured: None,
+            domain_kind: None,
         };
     };
 
@@ -383,6 +517,13 @@ async fn device_send_command_call(
         }
     };
 
+    // Round-1 F2 on PR #123: truncate the plugin-supplied
+    // error message BEFORE conversion to `WireCommandResult`
+    // + `serde_json::Value`. Both those steps make a full
+    // copy of the string, and a misbehaving plugin can push
+    // arbitrarily many bytes into the WIT error variant.
+    let result = truncate_plugin_error(result);
+
     // Match REST's shape: the plugin-visible response carries
     // the `CommandResult` verbatim; a `CommandResult::Err`
     // rides on the `is_error: true` branch so clients see the
@@ -400,20 +541,62 @@ async fn device_send_command_call(
         WireCommandResult::Ok | WireCommandResult::OkWithState { .. } => {
             ToolOutcome::Ok(structured)
         }
-        WireCommandResult::Err { error } => ToolOutcome::ExecErr {
-            // The `wit_error_kind` function is what REST uses
-            // to stamp the audit ledger's `domain_error`
-            // column; reusing it here means the MCP surface
-            // and the REST surface classify plugin errors
-            // identically.
-            message: format!(
-                "device.send_command failed: {} — {}",
-                wit_error_kind_of_wire(error),
-                message_of_wire_error(error),
-            ),
-            structured: Some(structured),
-        },
+        WireCommandResult::Err { error } => {
+            let domain_kind = wit_error_kind_of_wire(error);
+            ToolOutcome::ExecErr {
+                message: format!(
+                    "device.send_command failed: {} — {}",
+                    domain_kind,
+                    message_of_wire_error(error),
+                ),
+                structured: Some(structured),
+                domain_kind: Some(domain_kind),
+            }
+        }
     }
+}
+
+/// Truncate a plugin-supplied WIT `error` message to
+/// [`MAX_PLUGIN_ERROR_MESSAGE_BYTES`] BEFORE it reaches the
+/// wire-conversion helpers. `truncate` operates on UTF-8
+/// char boundaries, so we back the cap off to the largest
+/// char boundary that's ≤ the cap — avoids splitting a
+/// multi-byte character. Only touches `CommandResult::Err`;
+/// other variants pass through.
+fn truncate_plugin_error(result: CommandResult) -> CommandResult {
+    use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
+    let CommandResult::Err(err) = result else {
+        return result;
+    };
+    let truncated = match err {
+        WitError::NotFound(m) => WitError::NotFound(cap_message(m)),
+        WitError::InvalidArgument(m) => WitError::InvalidArgument(cap_message(m)),
+        WitError::PermissionDenied(m) => WitError::PermissionDenied(cap_message(m)),
+        WitError::Unavailable(m) => WitError::Unavailable(cap_message(m)),
+        WitError::Internal(m) => WitError::Internal(cap_message(m)),
+    };
+    CommandResult::Err(truncated)
+}
+
+fn cap_message(mut m: String) -> String {
+    if m.len() > MAX_PLUGIN_ERROR_MESSAGE_BYTES {
+        // Walk back to the largest char boundary ≤ cap so
+        // `truncate` doesn't panic on multi-byte characters.
+        let mut cap = MAX_PLUGIN_ERROR_MESSAGE_BYTES;
+        while !m.is_char_boundary(cap) {
+            cap -= 1;
+        }
+        let original_len = m.len();
+        m.truncate(cap);
+        tracing::warn!(
+            target: "mcp.tool.device.send_command",
+            original_len,
+            cap = MAX_PLUGIN_ERROR_MESSAGE_BYTES,
+            "plugin error message exceeded cap — truncated",
+        );
+        m.push_str("… [truncated by host]");
+    }
+    m
 }
 
 fn wit_error_kind_of_wire(err: &crate::api::server::WireWitError) -> &'static str {
@@ -445,7 +628,36 @@ fn message_of_wire_error(err: &crate::api::server::WireWitError) -> &str {
 
 // ── Audit ───────────────────────────────────────────────────────
 
-fn new_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome) -> AuditEntry {
+/// [`AuditEntry`] for [`AuditLog::record_intent`] — status /
+/// decision fields are placeholders (`AuditLog::record_intent`
+/// ignores them; the SQL INSERT stamps `status = 0`,
+/// `decision = 'pending'`). Only `token_id`, `actor_kind`,
+/// `method`, `path`, and `credential_fp` reach the row.
+fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
+    AuditEntry {
+        id: 0,
+        intent_ms: 0,
+        finalized_ms: None,
+        token_id: token_id.to_string(),
+        actor_kind: MCP_ACTOR_KIND.to_string(),
+        method: "MCP".into(),
+        path: format!("mcp.tool.{family}"),
+        // These fields are ignored by `record_intent`.
+        status: 0,
+        decision: "pending".into(),
+        required_scope: None,
+        execution_outcome: None,
+        domain_error: None,
+        credential_fp: None,
+    }
+}
+
+/// [`AuditEntry`] for [`AuditLog::record_completed`] — used
+/// on outcomes decided BEFORE any dispatch (unknown tool,
+/// scope-denied). Populates status + decision from the
+/// outcome; `execution_outcome` / `domain_error` stay `None`
+/// because no tool body ran.
+fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome) -> AuditEntry {
     AuditEntry {
         id: 0,
         intent_ms: 0,
@@ -460,5 +672,44 @@ fn new_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome) -> Audit
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+    }
+}
+
+#[cfg(test)]
+mod message_cap_tests {
+    use super::{MAX_PLUGIN_ERROR_MESSAGE_BYTES, cap_message};
+
+    #[test]
+    fn passes_through_short_messages_unchanged() {
+        let short = "brief plugin error".to_string();
+        assert_eq!(cap_message(short.clone()), short);
+    }
+
+    #[test]
+    fn truncates_over_cap_ascii_message() {
+        let big = "x".repeat(MAX_PLUGIN_ERROR_MESSAGE_BYTES + 100);
+        let out = cap_message(big);
+        assert!(
+            out.len() <= MAX_PLUGIN_ERROR_MESSAGE_BYTES + 32,
+            "capped output {} B must fit within cap + suffix; got {}",
+            MAX_PLUGIN_ERROR_MESSAGE_BYTES,
+            out.len(),
+        );
+        assert!(out.ends_with("[truncated by host]"));
+    }
+
+    #[test]
+    fn truncation_respects_utf8_char_boundaries() {
+        // Fill the message with 4-byte emojis so a naïve
+        // byte truncation at exactly the cap would split a
+        // scalar. `cap_message` walks back to the largest
+        // safe boundary — the output is always valid UTF-8.
+        let emoji = "😀";
+        assert_eq!(emoji.len(), 4);
+        let big: String = emoji.repeat((MAX_PLUGIN_ERROR_MESSAGE_BYTES / 4) + 100);
+        assert!(big.len() > MAX_PLUGIN_ERROR_MESSAGE_BYTES);
+        let out = cap_message(big);
+        assert!(out.is_char_boundary(out.len() - "… [truncated by host]".len()));
+        assert!(out.ends_with("[truncated by host]"));
     }
 }
