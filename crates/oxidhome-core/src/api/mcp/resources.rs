@@ -293,10 +293,12 @@ pub(super) const AUDIT_QUEUE_MAX: usize = 32;
 
 /// Global semaphore backing [`AUDIT_QUEUE_MAX`]. `static` for
 /// the same reason as [`BLOB_READ_SEMAPHORE`] — no need to
-/// thread through the SDK's `ServerHandler` trait, and only
-/// touched from [`read`].
-static AUDIT_QUEUE_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(AUDIT_QUEUE_MAX)));
+/// thread through the SDK's `ServerHandler` trait. Shared
+/// with [`super::tools`] (14.3) so a single mount-wide bound
+/// covers audit writes from both surfaces.
+pub(super) static AUDIT_QUEUE_SEMAPHORE: std::sync::LazyLock<
+    std::sync::Arc<tokio::sync::Semaphore>,
+> = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(AUDIT_QUEUE_MAX)));
 
 /// Outcome shape for a single resource-read attempt. Kept as
 /// a separate enum so the audit path can look at the shape

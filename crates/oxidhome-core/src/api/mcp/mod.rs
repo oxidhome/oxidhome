@@ -18,6 +18,9 @@
 //!   `LocalSessionManager` wrapper with an admission cap that
 //!   closes the concurrent-init overshoot the reviewer flagged
 //!   in R3 F2 (against the previous SDK).
+//! - [`tools`] — 14.3 tools registry. Starts with
+//!   `device.send_command`; more tools land per the design
+//!   doc's ordering.
 //!
 //! [`BoundedSessionManager`]: session_store::BoundedSessionManager
 
@@ -25,6 +28,7 @@ mod handler;
 mod resources;
 mod server;
 mod session_store;
+mod tools;
 
 pub use server::{
     MAX_REQUEST_BODY_BYTES, MCP_ENDPOINT, mount_routes, mount_routes_with_all_limits,
