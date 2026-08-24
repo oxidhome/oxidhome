@@ -979,8 +979,8 @@ struct CommandBody {
 /// history + tail wire projection.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct WireKeyValue {
-    key: String,
-    value: WireValue,
+    pub(crate) key: String,
+    pub(crate) value: WireValue,
 }
 
 /// JSON wire mirror of the WIT `value` variant — same tag/content
@@ -994,7 +994,7 @@ pub(crate) struct WireKeyValue {
 /// can't tell `Int(5)` from `Float(5.0)`.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "t", content = "v")]
-enum WireValue {
+pub(crate) enum WireValue {
     Bool(bool),
     Int(i64),
     Float(f64),
@@ -1040,7 +1040,7 @@ impl From<Value> for WireValue {
 /// `{kind, message}` shape.
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum WireCommandResult {
+pub(crate) enum WireCommandResult {
     Ok,
     OkWithState { state: HashMap<String, WireValue> },
     Err { error: WireWitError },
@@ -1050,7 +1050,7 @@ enum WireCommandResult {
 /// already see on other endpoints' error responses.
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum WireWitError {
+pub(crate) enum WireWitError {
     NotFound { message: String },
     InvalidArgument { message: String },
     PermissionDenied { message: String },
@@ -1070,7 +1070,7 @@ impl From<WitError> for WireWitError {
     }
 }
 
-fn command_result_to_wire(r: CommandResult) -> WireCommandResult {
+pub(crate) fn command_result_to_wire(r: CommandResult) -> WireCommandResult {
     match r {
         CommandResult::Ok => WireCommandResult::Ok,
         CommandResult::OkWithState(kvs) => WireCommandResult::OkWithState {

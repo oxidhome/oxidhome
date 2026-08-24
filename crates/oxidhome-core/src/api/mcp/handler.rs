@@ -1,9 +1,8 @@
 //! MCP [`ServerHandler`] for `OxidHome`.
 //!
-//! Currently answers `initialize`, exposes the resource
-//! catalogue built in [`super::resources`], and lets the SDK's
-//! default `tools/list` + `prompts/list` return empty lists
-//! (14.3 / 14.6 fill those in).
+//! Answers `initialize`, serves the resource catalogue built
+//! in [`super::resources`], and the tool catalogue built in
+//! [`super::tools`] (14.3). Prompts land at 14.6.
 //!
 //! The [`Engine`] handle is stashed on the struct so every
 //! resource / tool handler can reach the device registry, log
@@ -18,9 +17,9 @@ use std::future::Future;
 use rmcp::{
     RoleServer, ServerHandler,
     model::{
-        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-        ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
-        ServerInfo,
+        CallToolRequestParams, Implementation, ListResourceTemplatesResult, ListResourcesResult,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+        ReadResourceResponse, ServerCapabilities, ServerInfo,
     },
     service::{MaybeSendFuture, RequestContext},
 };
@@ -28,7 +27,7 @@ use rmcp::{
 use crate::Engine;
 use crate::auth::Actor;
 
-use super::resources;
+use super::{resources, tools};
 
 /// `OxidHome`'s MCP server handler.
 #[derive(Clone)]
@@ -106,6 +105,32 @@ impl ServerHandler for OxidHomeMcpHandler {
         let actor = resolve_actor(&context);
         async move {
             let result = resources::read(engine, &request.uri, &actor).await?;
+            Ok(result.into())
+        }
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(Ok(ListToolsResult {
+            tools: tools::list_tools(),
+            ..Default::default()
+        }))
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>
+    + MaybeSendFuture
+    + '_ {
+        let engine = self.engine.clone();
+        let actor = resolve_actor(&context);
+        async move {
+            let result = tools::call(engine, request, &actor).await?;
             Ok(result.into())
         }
     }
