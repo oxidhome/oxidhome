@@ -130,6 +130,7 @@ semver.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 serde_urlencoded.workspace = true
+base64.workspace = true
 # Phase 13 round-3 F1: meta-validate a plugin's declared
 # `ui.config-schema` / `ui.commands-schema` files as JSON Schema
 # draft 2020-12 at install and boot-scan. The manifest validator
@@ -181,6 +182,13 @@ futures-util.workspace = true
 # lockfile via `axum`, so lifting it to a workspace dep here
 # doesn't grow the dep graph.
 http-body-util.workspace = true
+# 14.2c round-4 F1: the MCP admission gate wraps every
+# response body with a `PermitBody` type that impls
+# `http_body::Body` directly. `http-body-util` re-exports the
+# trait but not by path we can name; lift the trait crate to
+# a workspace dep so the impl compiles.
+http-body.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 # 12-API-e — real WS round-trip test. Already in the dep graph via

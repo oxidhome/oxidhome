@@ -57,6 +57,13 @@ serde_json = { version = "1.0.150", default-features = false, features = ["std"]
 # extractor — lifting to a workspace dep keeps the graph
 # single-copy. Version tracks whatever `axum` pins.
 serde_urlencoded = "0.7.1"
+# 14.2c: base64-encode MCP `blob` resource bodies. The MCP
+# spec carries binary resource contents as base64 in the
+# `blob` field of `BlobResourceContents`. `rmcp` already
+# pulls `base64 0.22.1` transitively (via its own
+# transport/session plumbing), so pinning the same version
+# here keeps the graph single-copy.
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 # Phase 13 round-3 F1: meta-validate plugin `ui.config-schema` /
 # `ui.commands-schema` files as JSON Schema draft 2020-12 at
 # install and boot-scan. `default-features = false` drops the
@@ -133,6 +140,19 @@ futures-util = { version = "0.3.32", default-features = false, features = ["sink
 # integration test in 15-e can read one frame off the response
 # body via `BodyExt::frame()` without pulling in a second copy.
 http-body-util = "0.1.3"
+# 14.2c round-4 F1: the MCP admission gate wraps every
+# response body in a `PermitBody` that keeps the pending
+# permit alive for the transmission phase. That impl targets
+# the `http_body::Body` trait directly, so lift the crate to
+# a workspace dep (already in the graph via `axum` /
+# `http-body-util`; same version pin keeps the graph
+# single-copy).
+http-body = "1.0.1"
+# Companion to the `http-body` pin above — `bytes::Bytes` is
+# the frame data type our `PermitBody::poll_frame` yields.
+# Already in the graph via axum/hyper/rmcp; same pin keeps
+# a single lockfile copy.
+bytes = "1.11.1"
 # `rand` and `sha2` versions match what wasmtime / wasmtime-wasi
 # pull in transitively so the dep graph contains exactly one copy
 # of each. Bumping our pin past wasmtime's would double-count both

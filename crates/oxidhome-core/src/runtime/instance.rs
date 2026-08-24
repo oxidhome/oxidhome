@@ -1223,6 +1223,21 @@ impl PluginInstance {
         &self.store.data().instance_id
     }
 
+    /// The host-minted installation UUID this instance was
+    /// loaded against — the same `inst-<32 hex>` value the
+    /// installed-plugin registry pinned at install time (dev /
+    /// argv loads mint a synthetic one at load time). Held on
+    /// [`PluginState`] as an `Arc<str>` so cloning is cheap;
+    /// the supervisor grabs a clone after each successful load
+    /// so [`InstanceHandle::installation_uuid`] can hand it
+    /// back to callers (e.g. MCP `oxidhome://blobs/...` reads)
+    /// without going through the installed-plugin registry
+    /// (which doesn't have a row for dev / argv instances).
+    #[must_use]
+    pub fn installation_uuid(&self) -> Arc<str> {
+        Arc::clone(&self.store.data().installation_uuid)
+    }
+
     /// The resolved manifest this instance was loaded from. The
     /// Phase-6 supervisor reads `runtime.tick_interval_ms` and
     /// `runtime.restart` off this to decide its tick cadence and

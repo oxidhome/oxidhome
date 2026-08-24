@@ -255,6 +255,12 @@ async fn list_resources_advertises_devices_and_plugins() {
         uris.contains(&"oxidhome://logs"),
         "resources/list missing oxidhome://logs (14.2b); got {uris:?}",
     );
+
+    // 14.2c adds status.
+    assert!(
+        uris.contains(&"oxidhome://status"),
+        "resources/list missing oxidhome://status (14.2c); got {uris:?}",
+    );
 }
 
 /// 14.2b — `oxidhome://events` on a fresh engine returns an
@@ -506,6 +512,11 @@ async fn list_resource_templates_advertises_detail_shapes() {
     assert!(
         uris.contains(&"oxidhome://plugins/{plugin_id}"),
         "missing plugin detail template; got {uris:?}",
+    );
+    // 14.2c: blobs template.
+    assert!(
+        uris.contains(&"oxidhome://blobs/{instance_id}/{name}"),
+        "missing blob template (14.2c); got {uris:?}",
     );
 }
 
@@ -992,4 +1003,172 @@ async fn resource_reads_land_in_the_audit_log() {
         );
         assert_eq!(row.method, "MCP", "audit rows must stamp method=MCP");
     }
+}
+
+// ── 14.2c: status + blobs ──────────────────────────────────────
+
+/// `oxidhome://status` on a fresh in-memory engine returns a
+/// well-shaped JSON body: crate version, `ok=true` from the
+/// in-memory `SQLite` handle, and zeros for every count. Also
+/// asserts the mime type + successful decode of the inline
+/// `text` payload — the same pattern the other JSON resources
+/// use.
+#[tokio::test(flavor = "current_thread")]
+async fn read_status_returns_json_snapshot_on_fresh_engine() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "status-only", &["status:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://status"}),
+    )
+    .await;
+    let contents = &response["result"]["contents"][0];
+    assert_eq!(
+        contents["mimeType"], "application/json",
+        "status must be JSON; got {response}",
+    );
+    let body: Value = serde_json::from_str(contents["text"].as_str().expect("text"))
+        .expect("status body decodes as JSON");
+    assert_eq!(
+        body["version"],
+        env!("CARGO_PKG_VERSION"),
+        "status must carry the crate version",
+    );
+    assert_eq!(body["ok"], true, "fresh in-memory db must ping ok");
+    assert_eq!(body["installed_plugins"], 0);
+    assert_eq!(body["running_instances"], 0);
+    assert_eq!(body["devices"], 0);
+    // 14.2c round-4 F3: uptime is a required field on the
+    // status body. On a fresh engine the value is small but
+    // non-negative; we don't pin the exact number because
+    // wall-clock between `Engine::new` and this assertion
+    // varies with test-runner load.
+    let uptime = body["uptime_ms"]
+        .as_u64()
+        .expect("uptime_ms must be a non-negative integer");
+    assert!(
+        uptime < 60_000,
+        "fresh-engine uptime unexpectedly large: {uptime}"
+    );
+}
+
+/// A token without `status:read` cannot read the status
+/// resource. Same enforcement pattern as the other
+/// per-resource scopes in 14.2a/b.
+#[tokio::test(flavor = "current_thread")]
+async fn status_resource_requires_status_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://status"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:list must not satisfy status:read; got {response}",
+    );
+}
+
+/// A malformed blobs URI (missing the `<name>` half) surfaces
+/// as `-32002 resource-not-found` with a message that names
+/// the expected shape — helps a client repair the URI without
+/// having to grep the design doc.
+#[tokio::test(flavor = "current_thread")]
+async fn blobs_uri_without_name_returns_not_found() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://blobs/inst-abc"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32002,
+        "path-shape error must surface as resource_not_found; got {response}",
+    );
+    let msg = response["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        msg.contains("<instance_id>/<name>"),
+        "error must describe the expected URI shape; got {msg}",
+    );
+}
+
+/// A blobs URI for an instance that isn't running returns
+/// resource-not-found with a message naming the instance id.
+/// The scope check has already succeeded here (the token
+/// carries `blobs:read`), so this is the not-found path — not
+/// the deny path.
+#[tokio::test(flavor = "current_thread")]
+async fn blobs_uri_for_unknown_instance_returns_not_found() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "blobs-only", &["blobs:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://blobs/inst-nope/snap.jpg"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32002,
+        "unknown instance must surface as resource_not_found; got {response}",
+    );
+    let msg = response["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        msg.contains("inst-nope"),
+        "error must name the missing instance id; got {msg}",
+    );
+}
+
+/// A token without `blobs:read` cannot reach the blobs
+/// resource, even for an unknown instance — the scope check
+/// runs before the not-found dispatch so a probing caller
+/// can't enumerate live instances by the difference between
+/// `-32001` and `-32002`.
+#[tokio::test(flavor = "current_thread")]
+async fn blobs_resource_requires_blobs_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://blobs/inst-abc/snap.jpg"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:list must not satisfy blobs:read; got {response}",
+    );
 }

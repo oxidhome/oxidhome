@@ -112,6 +112,28 @@ pub enum BlobError {
     #[error("blob not found: {what}")]
     NotFound { what: String },
 
+    /// Caller passed a `size_bytes_max` cap to a fetch entry
+    /// (currently only [`BlobStore::read_with_info`]) and the
+    /// blob's recorded size exceeded it. Refused before the
+    /// filesystem read, so a caller can't OOM the host with a
+    /// large blob it doesn't intend to serve.
+    #[error("blob too large: {what} — recorded {size_bytes} bytes exceeds cap {cap}")]
+    TooLarge {
+        what: String,
+        size_bytes: u64,
+        cap: u64,
+    },
+
+    /// Plugin passed a `mime` string longer than
+    /// [`MAX_BLOB_MIME_BYTES`]. Refused at
+    /// [`BlobStore::write`] before any filesystem or SQL work —
+    /// preventing an unbounded mime blob from being persisted
+    /// keeps downstream readers (MCP `blob_read` in
+    /// particular) from having to materialise 100+ MiB of
+    /// mime text just to reject it. Round-10 F1 on PR #122.
+    #[error("blob mime too large: {mime_len} bytes exceeds cap {cap}")]
+    MimeTooLarge { mime_len: usize, cap: usize },
+
     /// Filesystem operation (mkdir / write / fsync / rename / read /
     /// remove) failed. The host's blob root is the same FS as the
     /// `SQLite` DB, so most causes (full disk, permission denied) are
@@ -178,6 +200,60 @@ pub fn is_safe_instance_id(instance_id: &str) -> bool {
 /// Maximum permitted byte length of an `instance_id` — see the
 /// F1 comment on [`is_safe_instance_id`].
 pub const MAX_INSTANCE_ID_BYTES: usize = 128;
+
+/// Maximum permitted byte length of a blob's `mime` string.
+/// Enforced at [`BlobStore::write`] time (round-10 F1 on
+/// PR #122) so an unbounded plugin-supplied mime can't make
+/// it into the persisted `blob` row. Every SQL query that
+/// projects `mime` (see [`BLOB_SELECT_COLUMNS`]) also filters
+/// legacy over-cap rows so pre-cap data doesn't force a
+/// materialise-then-drop dance either.
+///
+/// 256 bytes is generous for real IANA types (the longest
+/// registered is ~80 chars; parameters like
+/// `charset=utf-8; boundary=...` are typically single-digit
+/// tens more). Callers exceeding the cap should choose a
+/// shorter mime or write the extended metadata as a separate
+/// blob.
+pub const MAX_BLOB_MIME_BYTES: usize = 256;
+
+/// Column list every `blob`-row SELECT uses. Held in one
+/// place so the legacy-mime filter (round-10 F1 + F2 on PR
+/// #122) applies uniformly across `read_with_info`,
+/// `get_info`, and `list_blobs` — a future column addition
+/// or filter change only has to happen here.
+///
+/// The mime projection uses `octet_length(mime)` rather than
+/// `length(mime)` or `length(CAST(mime AS BLOB))`:
+///
+/// - `length(mime)` on a `SQLite` `TEXT` column counts
+///   Unicode code points, so 256 four-byte characters would
+///   slip past a 256-byte cap (round-10 F2 on PR #122
+///   surfaced this).
+/// - `length(CAST(mime AS BLOB))` counts bytes correctly but
+///   forces `SQLite` to materialise the full value before
+///   applying the cast — a legacy 100 MiB mime becomes a
+///   100 MiB allocation inside `SQLite` even though the CASE
+///   would then return NULL (round-11 F1 on PR #122).
+/// - `octet_length(mime)` reads the byte length from `SQLite`
+///   record metadata without loading the value at all (see
+///   <https://sqlite.org/lang_corefunc.html#octet_length>),
+///   so a 100 MiB legacy mime never leaves the file.
+///
+/// Bound in every call site via a `?N`-style parameter
+/// ([`blob_mime_cap_param`] provides the value).
+const BLOB_SELECT_COLUMNS: &str = "name, id, size_bytes, created_ms, \
+     CASE WHEN mime IS NULL OR octet_length(mime) <= ?4 \
+          THEN mime ELSE NULL END";
+
+/// Value to bind to the last `?` placeholder of every SELECT
+/// built with [`BLOB_SELECT_COLUMNS`]. Kept as a function
+/// (not a `const`) so the `usize → i64` conversion is
+/// checked, even though `MAX_BLOB_MIME_BYTES` is well under
+/// `i64::MAX`.
+fn blob_mime_cap_param() -> i64 {
+    i64::try_from(MAX_BLOB_MIME_BYTES).expect("mime cap fits in i64")
+}
 
 fn check_instance_id(instance_id: &str) -> Result<(), BlobError> {
     if is_safe_instance_id(instance_id) {
@@ -369,6 +445,20 @@ impl BlobStore {
     ) -> Result<String, BlobError> {
         check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
+        // Round-10 F1 on PR #122: cap mime at write time so
+        // an unbounded plugin-supplied string can't make it
+        // into the store. Downstream readers relying on the
+        // mime being small (MCP `blob_read`, WIT `get-info`)
+        // can then trust the row without a materialise-then-
+        // check dance on the hot path.
+        if let Some(m) = mime
+            && m.len() > MAX_BLOB_MIME_BYTES
+        {
+            return Err(BlobError::MimeTooLarge {
+                mime_len: m.len(),
+                cap: MAX_BLOB_MIME_BYTES,
+            });
+        }
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
         let install_dir = blobs_root.join(installation_uuid);
         let instance_dir = instance_dir_for(blobs_root, installation_uuid, instance_id);
@@ -612,6 +702,125 @@ impl BlobStore {
         std::fs::read(&path).map_err(|source| BlobError::Io { path, source })
     }
 
+    /// Atomic "metadata + bytes" fetch by user-chosen name.
+    /// The blob-index row is decoded and the file it points at
+    /// is read inside the same call, so callers see a
+    /// consistent view: the bytes returned are the bytes the
+    /// [`BlobInfo`] describes, and both belong to the same
+    /// version of that blob.
+    ///
+    /// The two-call shape (`get_info` + `read_by_name`) is
+    /// racy — a concurrent `write` can replace the blob
+    /// between the two queries, so the caller sees the old
+    /// `mime` and the new bytes, or `NotFound` when the
+    /// operator was expecting a valid response.
+    /// [`Self::read_with_info`] is the fix, added for the MCP
+    /// `oxidhome://blobs/<instance>/<name>` resource
+    /// (round-2 F4 on PR #122). `size_bytes_max`, when
+    /// `Some`, refuses blobs whose recorded size exceeds the
+    /// ceiling *before* the filesystem read runs — so a large
+    /// blob can't be forced into memory just to be rejected.
+    ///
+    /// # Errors
+    ///
+    /// - [`BlobError::NotFound`] if no blob with that name.
+    /// - [`BlobError::Unavailable`] on in-memory engines.
+    /// - [`BlobError::TooLarge`] when `size_bytes_max` is set
+    ///   and the recorded size exceeds it.
+    /// - [`BlobError::Io`] for filesystem failures.
+    /// - [`BlobError::Sql`] for index-read failures.
+    pub fn read_with_info(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        name: &str,
+        size_bytes_max: Option<u64>,
+    ) -> Result<(BlobInfo, Vec<u8>), BlobError> {
+        use std::io::Read as _;
+
+        check_installation_uuid(installation_uuid)?;
+        check_instance_id(instance_id)?;
+        let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
+        // Round-3 F2 on PR #122: the previous shape queried the
+        // row under the DB mutex, released the mutex, and then
+        // opened the file — a concurrent overwrite in that
+        // window could delete the pre-image before this reader
+        // opened it, surfacing as `Io { not found }` even
+        // though the operator observed the blob at query time.
+        //
+        // The fix opens the file INSIDE the DB read closure.
+        // Under POSIX `unlink`-while-open semantics the file
+        // descriptor pins the pre-image bytes for the reader's
+        // lifetime — a concurrent writer can rename its
+        // replacement into place and delete the prior file, but
+        // this reader still sees the version the row described.
+        // Windows lacks that semantic, but the store's own
+        // atomic-rename write path prevents the reader from
+        // observing a partial write regardless of platform.
+        let (info, mut file) = self.db.read(|conn| -> Result<_, BlobError> {
+            // Round-10 F1 on PR #122: filter out over-cap
+            // legacy mimes at select time — see
+            // [`BLOB_SELECT_COLUMNS`] for the projection.
+            let info: Option<BlobInfo> = conn
+                .query_row(
+                    &format!(
+                        "SELECT {BLOB_SELECT_COLUMNS} FROM blob \
+                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    ),
+                    params![installation_uuid, instance_id, name, blob_mime_cap_param(),],
+                    decode_blob_info,
+                )
+                .optional()?;
+            let Some(info) = info else {
+                return Err(BlobError::NotFound {
+                    what: format!(
+                        "name `{name}` for instance `{instance_id}` \
+                             (installation `{installation_uuid}`)"
+                    ),
+                });
+            };
+            let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id);
+            ensure_contained(blobs_root, &path)?;
+            let file =
+                std::fs::File::open(&path).map_err(|source| BlobError::Io { path, source })?;
+            Ok((info, file))
+        })?;
+        if let Some(cap) = size_bytes_max
+            && info.size_bytes > cap
+        {
+            return Err(BlobError::TooLarge {
+                what: format!(
+                    "name `{name}` for instance `{instance_id}` \
+                     (installation `{installation_uuid}`)"
+                ),
+                size_bytes: info.size_bytes,
+                cap,
+            });
+        }
+        // Reserve exact capacity so the Vec matches
+        // `info.size_bytes` — cheaper than doubling growth for
+        // large blobs. `size_bytes` is a `u64`; `usize::try_from`
+        // guards against 64→32 truncation on unusual targets.
+        let capacity = usize::try_from(info.size_bytes).map_err(|_| BlobError::TooLarge {
+            what: format!(
+                "name `{name}` for instance `{instance_id}` \
+                     (installation `{installation_uuid}`)"
+            ),
+            size_bytes: info.size_bytes,
+            cap: usize::MAX as u64,
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.read_to_end(&mut bytes)
+            .map_err(|source| BlobError::Io {
+                // Path lost inside the closure; recompute for
+                // the error message (identical to the one used
+                // at open time).
+                path: instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id),
+                source,
+            })?;
+        Ok((info, bytes))
+    }
+
     /// Look up metadata without fetching bytes.
     ///
     /// # Errors
@@ -628,10 +837,16 @@ impl BlobStore {
         check_instance_id(instance_id)?;
         self.db
             .read(|conn| -> Result<_, BlobError> {
+                // Round-10 F2 on PR #122: same legacy-mime
+                // filter as [`Self::read_with_info`] — WIT
+                // metadata callers must not force a legacy
+                // over-cap mime into a Rust `String` either.
                 conn.query_row(
-                    "SELECT name, id, size_bytes, created_ms, mime FROM blob \
-                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
-                    params![installation_uuid, instance_id, name],
+                    &format!(
+                        "SELECT {BLOB_SELECT_COLUMNS} FROM blob \
+                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    ),
+                    params![installation_uuid, instance_id, name, blob_mime_cap_param()],
                     decode_blob_info,
                 )
                 .optional()
@@ -718,15 +933,25 @@ impl BlobStore {
         check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         self.db.read(|conn| -> Result<_, BlobError> {
-            let mut stmt = conn.prepare(
-                "SELECT name, id, size_bytes, created_ms, mime FROM blob \
+            // Round-10 F2 on PR #122: apply the legacy-mime
+            // filter to list_blobs too — otherwise a single
+            // over-cap legacy mime row in the returned set
+            // materialises the whole oversized string; N
+            // matching rows would multiply the exposure.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {BLOB_SELECT_COLUMNS} FROM blob \
                  WHERE installation_uuid = ?1 AND instance_id = ?2 \
                    AND substr(name, 1, length(?3)) = ?3 \
                  ORDER BY name",
-            )?;
+            ))?;
             let rows = stmt
                 .query_map(
-                    params![installation_uuid, instance_id, prefix],
+                    params![
+                        installation_uuid,
+                        instance_id,
+                        prefix,
+                        blob_mime_cap_param(),
+                    ],
                     decode_blob_info,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1339,14 +1564,19 @@ mod tests {
         }
     }
     fn tempdir() -> TempDir {
+        // Pre-fix, this used `(pid, SystemTime::now.as_nanos)`
+        // as the dir suffix. Under parallel test execution two
+        // concurrent `tempdir()` calls could sample the same
+        // nanosecond and collide on the directory, and one
+        // test's `Drop` would then rip the ground out from
+        // under the other — the failing write surfaced as
+        // `Io { NotFound }` deep inside a hot path. A process-
+        // wide monotonic counter makes collisions impossible.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir();
-        let path = base.join(format!(
-            "oxidhome-blobs-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        ));
+        let path = base.join(format!("oxidhome-blobs-test-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&path).expect("mk tempdir");
         TempDir { path }
     }
@@ -1481,5 +1711,240 @@ mod tests {
             "`prod*` is a normal identifier (only exact `*` is reserved)",
         );
         assert!(is_safe_instance_id("a*b"), "`a*b` is a normal identifier");
+    }
+
+    /// Round-2 F4 on PR #122: `read_with_info` returns metadata and
+    /// bytes belonging to the same blob version in one call. The
+    /// simplest proof is that the round-tripped payload matches
+    /// the size the returned info reports and the mime type
+    /// written at `write` time.
+    #[test]
+    fn read_with_info_round_trips_metadata_and_bytes() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(
+                INST_A,
+                "alpha",
+                "snap.jpg",
+                b"hello blob",
+                Some("image/jpeg"),
+            )
+            .expect("write");
+
+        let (info, bytes) = store
+            .read_with_info(INST_A, "alpha", "snap.jpg", None)
+            .expect("read_with_info");
+        assert_eq!(info.name, "snap.jpg");
+        assert_eq!(info.mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(usize::try_from(info.size_bytes).unwrap(), bytes.len());
+        assert_eq!(bytes, b"hello blob");
+    }
+
+    /// Round-2 F1 on PR #122: `size_bytes_max` refuses oversize
+    /// blobs BEFORE the filesystem read. The `Err` variant carries
+    /// the recorded size + the cap so the caller can shape a
+    /// meaningful error.
+    #[test]
+    fn read_with_info_refuses_over_size_cap() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        // 200-byte payload; the cap below is 100 → refuse.
+        store
+            .write(INST_A, "alpha", "big", &[0u8; 200], None)
+            .expect("write");
+
+        let err = store
+            .read_with_info(INST_A, "alpha", "big", Some(100))
+            .expect_err("must refuse over-cap");
+        match err {
+            BlobError::TooLarge {
+                what,
+                size_bytes,
+                cap,
+            } => {
+                assert_eq!(size_bytes, 200);
+                assert_eq!(cap, 100);
+                assert!(what.contains("big"), "message must name the blob: {what}");
+            }
+            other => panic!("expected TooLarge; got {other:?}"),
+        }
+    }
+
+    /// Round-10 F1 on PR #122: `write` refuses an over-cap
+    /// mime up front. Neither the filesystem nor the `SQLite`
+    /// `blob` row sees the oversized value, so downstream
+    /// readers (MCP, WIT `get-info`) never allocate it.
+    #[test]
+    fn write_refuses_over_cap_mime() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        let big_mime = "x".repeat(MAX_BLOB_MIME_BYTES + 1);
+        let err = store
+            .write(INST_A, "alpha", "snap", b"hi", Some(&big_mime))
+            .expect_err("write must refuse over-cap mime");
+        match err {
+            BlobError::MimeTooLarge { mime_len, cap } => {
+                assert_eq!(mime_len, MAX_BLOB_MIME_BYTES + 1);
+                assert_eq!(cap, MAX_BLOB_MIME_BYTES);
+            }
+            other => panic!("expected MimeTooLarge; got {other:?}"),
+        }
+        // And the blob row does NOT exist — the refusal is
+        // total, not "written without mime".
+        assert!(
+            store.get_info(INST_A, "alpha", "snap").is_err(),
+            "refused write must not leave a blob row behind",
+        );
+    }
+
+    /// Round-10 F1 on PR #122: a legacy row whose mime was
+    /// written before the R10 cap gets its mime projected to
+    /// NULL by the SQL in `read_with_info` — the oversized
+    /// value never becomes a Rust `String`. Simulated here by
+    /// bypassing the `write` API's cap check via a raw
+    /// `UPDATE` that installs an over-cap mime on an
+    /// already-written row.
+    #[test]
+    fn read_with_info_filters_legacy_over_cap_mime() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "snap", b"hi", Some("image/jpeg"))
+            .expect("write");
+        install_legacy_mime(&store, "snap", &"y".repeat(MAX_BLOB_MIME_BYTES + 8));
+
+        // The read path filters the mime at SQL-select time,
+        // so callers never see the over-cap string.
+        let (info, bytes) = store
+            .read_with_info(INST_A, "alpha", "snap", None)
+            .expect("read_with_info");
+        assert_eq!(bytes, b"hi");
+        assert!(
+            info.mime.is_none(),
+            "legacy over-cap mime must be filtered to None, not surfaced verbatim; got {:?}",
+            info.mime,
+        );
+    }
+
+    /// Round-11 F1 on PR #122: `get_info` (the WIT-side
+    /// metadata read) filters the same way — pre-fix it
+    /// `SELECT`ed `mime` verbatim, so a legacy over-cap row
+    /// forced a 100 MiB `String` on every `get-info` call.
+    #[test]
+    fn get_info_filters_legacy_over_cap_mime() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "snap", b"hi", Some("image/jpeg"))
+            .expect("write");
+        install_legacy_mime(&store, "snap", &"z".repeat(MAX_BLOB_MIME_BYTES + 4));
+
+        let info = store.get_info(INST_A, "alpha", "snap").expect("get_info");
+        assert!(
+            info.mime.is_none(),
+            "get_info must filter legacy over-cap mime"
+        );
+    }
+
+    /// Round-11 F1 on PR #122: `list_blobs` filters at select
+    /// time too — one over-cap legacy row alongside N
+    /// under-cap siblings must not materialise the oversized
+    /// string on every list call.
+    #[test]
+    fn list_blobs_filters_legacy_over_cap_mime() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "snap-a", b"a", Some("image/jpeg"))
+            .expect("write a");
+        store
+            .write(INST_A, "alpha", "snap-b", b"b", Some("image/png"))
+            .expect("write b");
+        install_legacy_mime(&store, "snap-a", &"w".repeat(MAX_BLOB_MIME_BYTES + 1));
+
+        let rows = store.list_blobs(INST_A, "alpha", "snap-").expect("list");
+        assert_eq!(rows.len(), 2, "both rows still present");
+        let by_name: std::collections::HashMap<_, _> =
+            rows.into_iter().map(|r| (r.name.clone(), r)).collect();
+        assert!(
+            by_name["snap-a"].mime.is_none(),
+            "snap-a's legacy over-cap mime must be filtered",
+        );
+        assert_eq!(
+            by_name["snap-b"].mime.as_deref(),
+            Some("image/png"),
+            "under-cap sibling must survive verbatim",
+        );
+    }
+
+    /// Round-11 F2 on PR #122: `SQLite` `length(mime)` on a
+    /// `TEXT` column counts Unicode code points, not bytes —
+    /// so `MAX_BLOB_MIME_BYTES` four-byte chars (1024 bytes)
+    /// would slip past a 256-*char* filter. The SQL projection
+    /// now casts to BLOB so `length()` counts bytes; this
+    /// test locks that in with a multibyte payload that's
+    /// under the code-point cap but over the byte cap.
+    #[test]
+    fn read_with_info_filters_multibyte_over_byte_cap() {
+        let (store, _dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 64 * 1024)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "snap", b"hi", Some("image/jpeg"))
+            .expect("write");
+        // `😀` is a 4-byte UTF-8 emoji (1 code point). At the
+        // char-counting cap it would take `MAX_BLOB_MIME_BYTES`
+        // of them (~1 KiB of bytes) to trip the filter; with
+        // byte-accurate CAST-to-BLOB counting, we cross the
+        // cap far sooner. Repeat enough emojis to definitely
+        // exceed the 256-byte cap while staying under 256
+        // code points.
+        let bytes_per_emoji = "😀".len();
+        // 100 emojis = 400 bytes > 256; only 100 code points.
+        let mime = "😀".repeat(100);
+        assert!(mime.chars().count() < MAX_BLOB_MIME_BYTES);
+        assert!(mime.len() > MAX_BLOB_MIME_BYTES);
+        assert_eq!(mime.len(), 100 * bytes_per_emoji);
+        install_legacy_mime(&store, "snap", &mime);
+
+        let (info, _bytes) = store
+            .read_with_info(INST_A, "alpha", "snap", None)
+            .expect("read_with_info");
+        assert!(
+            info.mime.is_none(),
+            "multibyte mime past the BYTE cap must be filtered even though its CHAR count fits: {:?}",
+            info.mime,
+        );
+    }
+
+    fn install_legacy_mime(store: &BlobStore, name: &str, mime: &str) {
+        // Bypass the write-time cap by rewriting the mime
+        // column directly. Simulates a row written before
+        // the R10 cap existed (or any other path that
+        // sidesteps `write()`'s guard).
+        store
+            .db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE blob SET mime = ?1 \
+                     WHERE installation_uuid = ?2 AND instance_id = ?3 AND name = ?4",
+                    params![mime, INST_A, "alpha", name],
+                )
+            })
+            .expect("legacy update");
     }
 }
