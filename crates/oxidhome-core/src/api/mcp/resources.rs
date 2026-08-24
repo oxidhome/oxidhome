@@ -311,13 +311,17 @@ pub(super) static AUDIT_QUEUE_SEMAPHORE: std::sync::LazyLock<
 /// closure, repeat cancellations can pile up unbounded
 /// tasks behind the shared `SQLite` mutex.
 ///
-/// Sized larger than [`AUDIT_QUEUE_MAX`] (8 vs 32) because
-/// each query holds the mutex only for the SELECT + row
-/// decode — much shorter than an audit write's INSERT +
-/// index maintenance. 8 concurrent SELECTs is a comfortable
-/// ceiling for a home hub; the mount's transmission gate
-/// (`PENDING_BODY_GATE = 16`) still caps total in-flight
-/// request work.
+/// Sized TIGHTER than [`AUDIT_QUEUE_MAX`] (8 vs. 32):
+/// a query holds the shared `SQLite` mutex for a SELECT +
+/// row decode — cheap and short — while an audit write is
+/// an INSERT + index maintenance. Neither operation
+/// benefits from unbounded parallelism (the mutex serialises
+/// them anyway), so the tighter cap here is a
+/// defense-in-depth choice for the disconnect-flood path,
+/// not a throughput bound. 8 concurrent SELECTs is a
+/// comfortable ceiling for a home hub; the mount's
+/// transmission gate (`PENDING_BODY_GATE = 16`) still caps
+/// total in-flight request work.
 pub(super) const STORE_QUERY_MAX: usize = 8;
 
 /// Global semaphore backing [`STORE_QUERY_MAX`]. Shared

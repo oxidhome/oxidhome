@@ -753,10 +753,7 @@ async fn list_tools_advertises_logs_query() {
     assert_eq!(schema["type"], "object");
     // No required fields: an empty-arg call is valid.
     assert!(
-        schema["required"].is_null()
-            || schema["required"]
-                .as_array()
-                .is_none_or(Vec::is_empty),
+        schema["required"].is_null() || schema["required"].as_array().is_none_or(Vec::is_empty),
         "logs.query must not require any fields; got {schema}",
     );
     // Level enum is present and complete.
@@ -900,6 +897,104 @@ async fn logs_query_lands_in_the_audit_log() {
     assert!(row.domain_error.is_none());
     assert!(row.finalized_ms.is_some(), "finalize must have landed");
     assert!(row.intent_ms <= row.finalized_ms.unwrap());
+}
+
+/// Round-2 F1 on PR #124: the successful
+/// `device.send_command` response keeps `CallToolResult`'s
+/// text mirror alongside `structuredContent`. Backward-
+/// compatible clients that only consume `content[0].text`
+/// still see the wire `command-result`. Only read tools
+/// (whose responses can grow) drop the mirror to avoid
+/// duplicating a large payload.
+#[tokio::test(flavor = "multi_thread")]
+async fn device_send_command_success_keeps_text_mirror() {
+    let _wasm = _support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = _support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+
+    let handle = engine
+        .start_instance(switch_dir, "switch-mirror", None)
+        .await
+        .expect("start_instance");
+    handle.wait_for_running().await.expect("running");
+
+    let device_id = engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|d| d.owner_instance == "switch-mirror")
+        .expect("switch registered a device")
+        .id
+        .clone();
+
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": device_id,
+                "capability": "switch",
+                "action": "toggle",
+            }
+        }),
+    )
+    .await;
+    let result = &response["result"];
+    let content = result["content"].as_array().expect("content array");
+    assert!(
+        !content.is_empty(),
+        "plugin-reaching successes must keep the text mirror; got {response}",
+    );
+    let text = content[0]["text"].as_str().expect("text content");
+    let parsed: Value = serde_json::from_str(text).expect("text mirror is JSON");
+    assert_eq!(parsed["kind"], "ok_with_state");
+
+    handle.stop().await.expect("stop");
+}
+
+/// Round-2 F1 on PR #124: `logs.query` responses skip the
+/// text mirror — its payload can grow to ~7 MiB in the
+/// worst case, doubling that through `content[0].text`
+/// would push the transport bound. Verified by asserting
+/// the successful response's `content` array is empty.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_response_omits_text_mirror() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "logs.query", "arguments": {}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(result["isError"], true);
+    let content = result["content"]
+        .as_array()
+        .expect("content is an array even when empty");
+    assert!(
+        content.is_empty(),
+        "read-tool successes drop the text mirror to keep peak memory bounded; got {content:?}",
+    );
+    assert!(
+        result["structuredContent"]["logs"].is_array(),
+        "structuredContent must still carry the parsed body; got {response}",
+    );
 }
 
 /// Round-2 F4 on PR #124: `logs.query` advertises

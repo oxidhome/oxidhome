@@ -56,7 +56,7 @@ use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
     AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, EncodedBody, MCP_ACTOR_KIND, RESOURCE_BUSY_CODE,
-    SCOPE_DENIED_CODE, STORE_QUERY_MAX, STORE_QUERY_SEMAPHORE,
+    RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, STORE_QUERY_MAX, STORE_QUERY_SEMAPHORE,
 };
 
 /// Publicly-visible catalogue of tools this handler exposes.
@@ -696,6 +696,19 @@ enum ToolOutcome {
     },
     /// Client sent bad arguments. Maps to `-32602`.
     InvalidParams(String),
+    /// URI/arguments are valid, but the response would
+    /// exceed the per-response size budget (`logs.query`
+    /// with too many matching rows, etc.). Maps to
+    /// [`RESOURCE_TOO_LARGE_CODE`] (`-32003`) and audits
+    /// as HTTP 413 — mirrors the resource-side outcome
+    /// shape (round-2 F2 on PR #124).
+    TooLarge(String),
+    /// Server is transiently at capacity — a concurrency
+    /// semaphore (audit queue, store-query queue) had no
+    /// permits. Maps to [`RESOURCE_BUSY_CODE`] (`-32004`)
+    /// and audits as HTTP 503, matching the resource-side
+    /// outcome (round-2 F3 on PR #124).
+    Busy(String),
     /// Tool name isn't in the catalogue. Maps to `-32601`
     /// method-not-found.
     UnknownTool(String),
@@ -708,31 +721,41 @@ enum ToolOutcome {
 impl ToolOutcome {
     fn into_result(self) -> Result<CallToolResult, McpError> {
         match self {
-            Self::Ok { value, .. } => {
-                // Round-1 F2 on PR #124: skip the text
-                // mirror `CallToolResult::structured` would
-                // add. `structured` builds
-                // `content: vec![text(value.to_string())]`
-                // — a second full copy of the serialised
-                // body on top of the structured value. We
-                // ship structured content only (empty
-                // `content` list), so peak memory per
-                // response stays bounded by the caller's
-                // `encode_body_capped` (~7 MiB max) instead
-                // of doubling for the mirror.
+            Self::Ok {
+                value,
+                plugin_reached,
+            } => {
+                // Round-2 F1 on PR #124: keep
+                // `CallToolResult::structured`'s text mirror
+                // for plugin-reaching successes so backward-
+                // compatible clients that only read
+                // `content[0].text` still see the command
+                // result. `device.send_command`'s response
+                // is small (`Ok` / `OkWithState` with a
+                // handful of fields), so the mirror's
+                // ~2× duplication is bounded.
                 //
-                // `Default::default()` starts from
-                // `result_type = COMPLETE`, `content = []`,
-                // `structured_content = None`,
-                // `is_error = None`, `meta = None`
-                // (rmcp's `impl Default for CallToolResult`).
-                // Non-exhaustive struct literal ban means
-                // we can't build it inline, but the fields
-                // are `pub` and safe to overwrite.
-                let mut result = CallToolResult::default();
-                result.structured_content = Some(value);
-                result.is_error = Some(false);
-                Ok(result)
+                // For read tools whose responses can grow
+                // (`logs.query` returning up to 100 rows),
+                // skip the mirror — the caller already
+                // capped the payload via
+                // `encode_body_capped`; adding another full
+                // copy through `content` would double the
+                // peak memory bound.
+                if plugin_reached {
+                    Ok(CallToolResult::structured(value))
+                } else {
+                    // `Default::default()` = `result_type = COMPLETE`,
+                    // `content = []`, `structured_content = None`,
+                    // `is_error = None`, `meta = None`. Non-exhaustive
+                    // struct literal ban means we can't build it
+                    // inline, but the fields are `pub` and safe to
+                    // overwrite.
+                    let mut result = CallToolResult::default();
+                    result.structured_content = Some(value);
+                    result.is_error = Some(false);
+                    Ok(result)
+                }
             }
             Self::ExecErr {
                 message,
@@ -743,6 +766,8 @@ impl ToolOutcome {
                 None => CallToolResult::error(vec![ContentBlock::text(message)]),
             }),
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
+            Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
+            Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
             Self::UnknownTool(reason) => Err(McpError::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 reason,
@@ -769,6 +794,8 @@ impl ToolOutcome {
             Self::Ok { .. } | Self::ExecErr { .. } => 200,
             Self::UnknownTool(_) => 404,
             Self::InvalidParams(_) => 400,
+            Self::TooLarge(_) => 413,
+            Self::Busy(_) => 503,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -777,8 +804,13 @@ impl ToolOutcome {
     fn decision(&self) -> &'static str {
         match self {
             Self::Ok { .. } | Self::ExecErr { .. } => "allow",
-            Self::UnknownTool(_) | Self::Denied { .. } | Self::InvalidParams(_) => "deny",
-            Self::Internal(_) => "error",
+            Self::UnknownTool(_)
+            | Self::Denied { .. }
+            | Self::InvalidParams(_)
+            | Self::TooLarge(_) => "deny",
+            // Match the REST auth classifier: 5xx → "error"
+            // (Busy is 503; Internal is 500).
+            Self::Internal(_) | Self::Busy(_) => "error",
         }
     }
 
@@ -1125,12 +1157,18 @@ async fn logs_query_call(
     // `STORE_QUERY_SEMAPHORE`. Permit MOVES into the closure
     // so a cancelled outer future (client disconnect) doesn't
     // leave detached blocking tasks piled up on the mutex.
+    // Round-2 F3 on PR #124: saturation surfaces as
+    // `ToolOutcome::Busy` (`-32004` / 503) — retriable —
+    // instead of a bare `Internal` (500). Matches the
+    // resource-side outcome for the same signal.
     let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
         tracing::warn!(
             cap = STORE_QUERY_MAX,
             "MCP logs.query store-query saturated — refusing call",
         );
-        return ToolOutcome::Internal("store-query queue saturated; retry shortly".into());
+        return ToolOutcome::Busy(format!(
+            "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
+        ));
     };
     let log_store = engine.log_store();
     let join = tokio::task::spawn_blocking(move || {
@@ -1161,7 +1199,12 @@ async fn logs_query_call(
             // audit ledger contract.
             plugin_reached: false,
         },
-        EncodedBody::TooLarge(reason) => ToolOutcome::InvalidParams(reason),
+        // Round-2 F2 on PR #124: oversized responses map to
+        // `TooLarge` (`-32003` / 413), NOT `InvalidParams`
+        // (`-32602` / 400). Arguments were fine; the
+        // response is too large. Matches the resource-side
+        // outcome shape.
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
         EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
     }
 }
