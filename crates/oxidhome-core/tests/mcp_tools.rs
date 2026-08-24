@@ -729,3 +729,174 @@ async fn device_send_command_response_carries_audit_meta() {
         .expect("audit meta must include a numeric intent_id");
     assert!(intent_id > 0, "intent_id must be a real row id");
 }
+
+// ── 14.3b — logs.query ──────────────────────────────────────────
+
+/// `tools/list` advertises `logs.query` with its input
+/// schema. Locks in the tool's advertised name, title, and
+/// the fact that `since` is optional (no `required` array).
+#[tokio::test(flavor = "current_thread")]
+async fn list_tools_advertises_logs_query() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "logs.query")
+        .expect("logs.query in the catalogue");
+    assert_eq!(tool["title"], "Query log history");
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["type"], "object");
+    // No required fields: an empty-arg call is valid.
+    assert!(
+        schema["required"].is_null() || schema["required"].as_array().is_none_or(|r| r.is_empty()),
+        "logs.query must not require any fields; got {schema}",
+    );
+    // Level enum is present and complete.
+    let level_enum = schema["properties"]["level"]["enum"]
+        .as_array()
+        .expect("level.enum array");
+    for want in ["Trace", "Debug", "Info", "Warn", "Error"] {
+        assert!(
+            level_enum.iter().any(|v| v == want),
+            "logs.query level enum must include `{want}`; got {level_enum:?}",
+        );
+    }
+}
+
+/// A token without `logs:read` cannot invoke `logs.query`.
+/// Mirrors the resource-side scope check on
+/// `oxidhome://logs`.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_requires_logs_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer =
+        mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "logs.query", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:list must not satisfy logs:read; got {response}",
+    );
+}
+
+/// Empty-arg `logs.query` on a fresh engine returns
+/// `structuredContent = {"logs": []}` — proves the tool
+/// dispatches, the wire body has the resource-side shape,
+/// and the outcome maps to `structured` (not `error`).
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_empty_engine_returns_empty_list() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "logs.query", "arguments": {}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "empty engine + empty filter must succeed; got {response}",
+    );
+    let structured = &result["structuredContent"];
+    let logs = structured["logs"]
+        .as_array()
+        .expect("structuredContent.logs must be an array");
+    assert!(logs.is_empty(), "fresh engine has no rows; got {logs:?}");
+}
+
+/// Malformed typed filters land as `-32602 INVALID_PARAMS` —
+/// a bogus `since` value, unknown `level`, and unknown
+/// top-level field are all rejected without touching the
+/// store.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_rejects_malformed_filters() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("bad since", json!({"since": "nope"})),
+        ("bad level", json!({"level": "Verbose"})),
+        (
+            "unknown field",
+            json!({"since": "1h", "min_level": "Info"}),
+        ),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "logs.query", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// A `logs.query` call lands in the audit ledger as
+/// `mcp.tool.logs.query` with `decision = "allow"`, no
+/// `execution_outcome` (reads don't fill it), and the audit
+/// row's finalize is complete (`finalized_ms >= intent_ms`).
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_query_lands_in_the_audit_log() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "logs.query", "arguments": {"level": "Info"}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.logs.query")
+        .expect("logs.query row");
+    assert_eq!(row.status, 200);
+    assert_eq!(row.decision, "allow");
+    // Read tools that ran to completion stamp
+    // `execution_outcome = "success"` too — an operator's
+    // ledger scan wants to distinguish "the tool ran and
+    // returned rows" from "the tool trapped internally".
+    // `domain_error` stays None because there's no plugin
+    // to classify.
+    assert_eq!(row.execution_outcome.as_deref(), Some("success"));
+    assert!(row.domain_error.is_none());
+    assert!(row.finalized_ms.is_some(), "finalize must have landed");
+    assert!(row.intent_ms <= row.finalized_ms.unwrap());
+}

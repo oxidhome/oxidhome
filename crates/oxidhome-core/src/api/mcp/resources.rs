@@ -786,8 +786,8 @@ const EVENTS_QUERY_MAX_LIMIT: u32 = 100;
 /// the tens of KiB. Capping at 100 rows per query keeps
 /// worst-case serialized response under the mount's
 /// transmission-body ceiling.
-const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
-const LOGS_QUERY_MAX_LIMIT: u32 = 100;
+pub(super) const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
+pub(super) const LOGS_QUERY_MAX_LIMIT: u32 = 100;
 
 #[derive(Serialize)]
 struct EventsBody {
@@ -903,9 +903,14 @@ async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
 
 // ── Logs ──────────────────────────────────────────────────────────
 
+/// Wire body for both the `oxidhome://logs` resource read
+/// and the `logs.query` tool (14.3b). Shared so both surfaces
+/// serialise the same shape — a client reading the ledger
+/// gets the same JSON whether they went through
+/// `resources/read` or `tools/call`.
 #[derive(Serialize)]
-struct LogsBody<'a> {
-    logs: &'a [crate::state::HistoricalLogEvent],
+pub(super) struct LogsBody<'a> {
+    pub(super) logs: &'a [crate::state::HistoricalLogEvent],
 }
 
 /// Keys `oxidhome://logs` recognizes. See [`EVENTS_KNOWN_KEYS`].
@@ -1427,7 +1432,7 @@ fn parse_since(query: &HashMap<String, String>, key: &str) -> Result<Option<i64>
 /// splitting via `raw.len() - 1` would panic on a multi-byte
 /// final `char`. Round-2 F1 on PR #121: split on the last
 /// `char` boundary instead.
-fn parse_duration_ms(raw: &str) -> Result<i64, String> {
+pub(super) fn parse_duration_ms(raw: &str) -> Result<i64, String> {
     // Isolate the unit as the last char; everything before it
     // is the digit portion. `char_indices` walks by scalar
     // value, so `raw[i..]` always lands on a UTF-8 boundary.

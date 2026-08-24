@@ -6,8 +6,15 @@
 //! device command, mutate config, install a plugin, …)
 //! rather than to read state. See
 //! [`.claude/docs/10_mcp.md`](../../../../../.claude/docs/10_mcp.md)
-//! `§ Tools` for the full catalogue plan; this module ships
-//! the first entry: `device.send_command`.
+//! `§ Tools` for the full catalogue plan.
+//!
+//! Tools shipped so far:
+//!
+//! - `device.send_command` (14.3a — sensitive, gated on
+//!   `devices:command`; runs two-phase audit for forensic
+//!   protection).
+//! - `logs.query` (14.3b — read-only, gated on `logs:read`;
+//!   tool-shape of the `oxidhome://logs` resource).
 //!
 //! # Layout
 //!
@@ -38,7 +45,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::Engine;
 use crate::api::auth::wit_error_kind;
-use crate::api::scopes::{DEVICES_COMMAND, require_scope};
+use crate::api::scopes::{DEVICES_COMMAND, LOGS_READ, require_scope};
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
@@ -67,6 +74,19 @@ pub(super) fn list_tools() -> Vec<Tool> {
             Arc::new(device_send_command_schema()),
         )
         .with_title("Send device command"),
+        Tool::new(
+            "logs.query",
+            "Historical log query against the durable `LogStore`. Returns a JSON list of \
+             `HistoricalLogEvent` rows matching the filters. Read-only; gated on \
+             `logs:read`. Same wire shape as `oxidhome://logs` — a client that reads the \
+             resource and one that calls this tool see identical row bodies. Durations \
+             (`since`, `until`) use `Ns|Nm|Nh|Nd` suffixes (`60s`, `5m`, `2h`, `1d`) and \
+             resolve relative to `now`. `level` filters to entries at or above the named \
+             level (`Trace|Debug|Info|Warn|Error`). Response size is bounded server-side; \
+             `limit` is clamped to 100 rows.",
+            Arc::new(logs_query_schema()),
+        )
+        .with_title("Query log history"),
     ]
 }
 
@@ -326,6 +346,7 @@ pub(super) async fn call(
     #[allow(clippy::single_match_else)]
     let (family, required) = match name {
         "device.send_command" => ("device.send_command", DEVICES_COMMAND),
+        "logs.query" => ("logs.query", LOGS_READ),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -382,6 +403,7 @@ pub(super) async fn call(
     // Actually dispatch.
     let outcome = match name {
         "device.send_command" => device_send_command_call(engine.clone(), request.arguments).await,
+        "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -880,6 +902,173 @@ fn message_of_wire_error(err: &crate::api::server::WireWitError) -> &str {
         | W::PermissionDenied { message }
         | W::Unavailable { message }
         | W::Internal { message } => message,
+    }
+}
+
+// ── logs.query ──────────────────────────────────────────────────
+
+fn logs_query_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "since": {
+                "type": "string",
+                "description": "Relative duration: `Ns|Nm|Nh|Nd`. Resolves to `now - since`. e.g. `10m`, `2h`.",
+            },
+            "until": {
+                "type": "string",
+                "description": "Relative duration (same grammar as `since`). Resolves to `now - until`.",
+            },
+            "level": {
+                "type": "string",
+                "enum": ["Trace", "Debug", "Info", "Warn", "Error"],
+                "description": "Minimum level. `Info` includes Info, Warn, Error.",
+            },
+            "instance": { "type": "string", "description": "Filter by owning instance id." },
+            "plugin":   { "type": "string", "description": "Filter by owning plugin id." },
+            "device":   { "type": "string", "description": "Filter by device id (for device-scoped log rows)." },
+            "target":   { "type": "string", "description": "Exact-match `tracing` target." },
+            "target_prefix":    { "type": "string", "description": "Prefix-match on `tracing` target (e.g. `oxidhome_core::runtime`)." },
+            "span_path_prefix": { "type": "string", "description": "Prefix-match on the row's span path (e.g. `plugin.`)." },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": i64::from(crate::api::mcp::resources::LOGS_QUERY_MAX_LIMIT),
+                "description": "Max rows to return (default 100, cap 100).",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+/// Deserialisable name of a log level. Serde derives a
+/// unit-variant deserializer that accepts `"Trace"`,
+/// `"Debug"`, etc. — the same tokens the resource-side
+/// `oxidhome://logs?level=…` query parser accepts.
+#[derive(Deserialize)]
+enum LogLevelName {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevelName> for crate::state::LogLevel {
+    fn from(v: LogLevelName) -> Self {
+        use crate::state::LogLevel as L;
+        match v {
+            LogLevelName::Trace => L::Trace,
+            LogLevelName::Debug => L::Debug,
+            LogLevelName::Info => L::Info,
+            LogLevelName::Warn => L::Warn,
+            LogLevelName::Error => L::Error,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogsQueryArgs {
+    since: Option<String>,
+    until: Option<String>,
+    level: Option<LogLevelName>,
+    instance: Option<String>,
+    plugin: Option<String>,
+    device: Option<String>,
+    target: Option<String>,
+    target_prefix: Option<String>,
+    span_path_prefix: Option<String>,
+    limit: Option<u32>,
+}
+
+async fn logs_query_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    // `arguments = None` is fine here — `logs.query` has no
+    // required fields, so an empty call means "give me the
+    // latest 100 rows across everything." Deserialise from
+    // an empty object in that case so the same code path
+    // covers both shapes.
+    let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
+    let args: LogsQueryArgs = match serde_json::from_value(args_value) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "logs.query arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+
+    let now = crate::state::event_log::now_unix_ms();
+    let since_ms = match args
+        .since
+        .as_deref()
+        .map(super::resources::parse_duration_ms)
+        .transpose()
+    {
+        Ok(v) => v.map(|d| now.saturating_sub(d)),
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!("invalid `since` value: {err}"));
+        }
+    };
+    let until_ms = match args
+        .until
+        .as_deref()
+        .map(super::resources::parse_duration_ms)
+        .transpose()
+    {
+        Ok(v) => v.map(|d| now.saturating_sub(d)),
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!("invalid `until` value: {err}"));
+        }
+    };
+
+    let limit = args
+        .limit
+        .unwrap_or(super::resources::LOGS_QUERY_DEFAULT_LIMIT)
+        .clamp(1, super::resources::LOGS_QUERY_MAX_LIMIT);
+
+    let log_query = crate::state::LogQuery {
+        since_ms,
+        until_ms,
+        min_level: args.level.map(Into::into),
+        instance_id: args.instance,
+        plugin_id: args.plugin,
+        device_id: args.device,
+        target: args.target,
+        target_prefix: args.target_prefix,
+        span_path_prefix: args.span_path_prefix,
+    };
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let log_store = engine.log_store();
+    let join = tokio::task::spawn_blocking(move || log_store.query(&log_query, limit_usize)).await;
+    let rows = match join {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            tracing::error!(target: "mcp.tool.logs.query", %err, "log query failed");
+            return ToolOutcome::Internal("log query failed".into());
+        }
+        Err(join_err) => {
+            tracing::error!(target: "mcp.tool.logs.query", %join_err, "log query task panicked");
+            return ToolOutcome::Internal("log query task panicked".into());
+        }
+    };
+
+    // Reuse the resource-side wire shape so a client sees
+    // the same JSON on `resources/read` and `tools/call`.
+    let body = super::resources::LogsBody { logs: &rows };
+    match serde_json::to_value(&body) {
+        Ok(v) => ToolOutcome::Ok(v),
+        Err(err) => {
+            tracing::error!(target: "mcp.tool.logs.query", %err, "wire serialisation failed");
+            ToolOutcome::Internal("failed to serialise log rows".into())
+        }
     }
 }
 
