@@ -55,8 +55,9 @@ use crate::host_impl::plugin::oxidhome::plugin::types::Value;
 use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
-    AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, EncodedBody, MCP_ACTOR_KIND, RESOURCE_BUSY_CODE,
-    RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, STORE_QUERY_MAX, STORE_QUERY_SEMAPHORE,
+    AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, EncodedBody, MAX_TOOL_BODY_BYTES, MCP_ACTOR_KIND,
+    RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, STORE_QUERY_MAX,
+    STORE_QUERY_SEMAPHORE,
 };
 
 /// Publicly-visible catalogue of tools this handler exposes.
@@ -721,41 +722,26 @@ enum ToolOutcome {
 impl ToolOutcome {
     fn into_result(self) -> Result<CallToolResult, McpError> {
         match self {
-            Self::Ok {
-                value,
-                plugin_reached,
-            } => {
-                // Round-2 F1 on PR #124: keep
+            Self::Ok { value, .. } => {
+                // Round-3 F1 on PR #124: always keep
                 // `CallToolResult::structured`'s text mirror
-                // for plugin-reaching successes so backward-
-                // compatible clients that only read
-                // `content[0].text` still see the command
-                // result. `device.send_command`'s response
-                // is small (`Ok` / `OkWithState` with a
-                // handful of fields), so the mirror's
-                // ~2× duplication is bounded.
+                // — legacy MCP clients that predate
+                // `structuredContent` still get the result
+                // via `content[0].text`. Peak memory is
+                // bounded by [`MAX_TOOL_BODY_BYTES`]
+                // (2.5 MiB) which reserves room for the 3×
+                // wire footprint (`structuredContent` +
+                // escaped text mirror + framing) under the
+                // 8 MiB transport cap.
                 //
-                // For read tools whose responses can grow
-                // (`logs.query` returning up to 100 rows),
-                // skip the mirror — the caller already
-                // capped the payload via
-                // `encode_body_capped`; adding another full
-                // copy through `content` would double the
-                // peak memory bound.
-                if plugin_reached {
-                    Ok(CallToolResult::structured(value))
-                } else {
-                    // `Default::default()` = `result_type = COMPLETE`,
-                    // `content = []`, `structured_content = None`,
-                    // `is_error = None`, `meta = None`. Non-exhaustive
-                    // struct literal ban means we can't build it
-                    // inline, but the fields are `pub` and safe to
-                    // overwrite.
-                    let mut result = CallToolResult::default();
-                    result.structured_content = Some(value);
-                    result.is_error = Some(false);
-                    Ok(result)
-                }
+                // The `plugin_reached` field on `Ok` is
+                // now only consulted by
+                // `FinalizeInput::from_outcome` to decide
+                // whether `execution_outcome` gets stamped
+                // `"success"` (plugin reached) or `NULL`
+                // (pure host-state read); it no longer
+                // gates the text-mirror shape.
+                Ok(CallToolResult::structured(value))
             }
             Self::ExecErr {
                 message,
@@ -1190,8 +1176,13 @@ async fn logs_query_call(
 
     // Reuse the resource-side wire shape so a client sees
     // the same JSON on `resources/read` and `tools/call`.
+    // Round-3 F1 on PR #124: use `MAX_TOOL_BODY_BYTES`
+    // (2.5 MiB) not `MAX_TEXT_BODY_BYTES` — a
+    // `CallToolResult` ships the body twice on the wire
+    // (`structuredContent` + escaped `content[0].text`),
+    // so the per-body cap has to leave room for both.
     let body = super::resources::LogsBody { logs: &rows };
-    match super::resources::encode_body_capped(&body, "logs.query") {
+    match super::resources::encode_body_capped(&body, "logs.query", MAX_TOOL_BODY_BYTES) {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
             // Pure host-state read — no plugin was reached,

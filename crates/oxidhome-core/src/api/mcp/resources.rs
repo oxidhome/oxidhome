@@ -1937,7 +1937,7 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
 /// semantics the tool layer doesn't want).
 pub(super) enum EncodedBody {
     Value(serde_json::Value),
-    /// Body exceeded [`MAX_TEXT_BODY_BYTES`]; the reason
+    /// Body exceeded the caller-supplied cap; the reason
     /// string is caller-facing and names the tool.
     TooLarge(String),
     /// Serialisation failed for a reason other than the cap
@@ -1947,15 +1947,39 @@ pub(super) enum EncodedBody {
     SerializeFailed(String),
 }
 
-pub(super) fn encode_body_capped<T: Serialize>(value: &T, what: &'static str) -> EncodedBody {
-    let mut writer = CappedWriter::with_cap(MAX_TEXT_BODY_BYTES);
+/// Pre-serialisation ceiling for a **tool** response body
+/// (in JSON bytes, before any envelope). Tighter than
+/// [`MAX_TEXT_BODY_BYTES`] because a `CallToolResult`
+/// carries the serialised body TWICE on the wire:
+///
+/// - `structuredContent` — the parsed body as a JSON value
+///   (native representation, ~1× serialised size).
+/// - `content[0].text` — the same body as a JSON string,
+///   with every `"` and `\` escaped inside the outer JSON.
+///   On quote/backslash-heavy JSON this doubles the size.
+///
+/// So `1× + 2× ≈ 3×` peak wire footprint per response. For
+/// the mount's 8 MiB transport cap, `3× ≤ 8 MiB` gives a
+/// per-body ceiling ≈ 2.5 MiB. Round-3 F1 on PR #124 chose
+/// this so `logs.query` keeps the legacy `content[0].text`
+/// mirror alongside `structuredContent` without pushing the
+/// response past the transport bound — legacy MCP clients
+/// that only read the text mirror still get results.
+pub(super) const MAX_TOOL_BODY_BYTES: usize = 2_621_440; // 2.5 * 1024 * 1024
+
+pub(super) fn encode_body_capped<T: Serialize>(
+    value: &T,
+    what: &'static str,
+    cap: usize,
+) -> EncodedBody {
+    let mut writer = CappedWriter::with_cap(cap);
     match serde_json::to_writer(&mut writer, value) {
         Ok(()) => {
             let bytes = writer.into_bytes();
             // Parse-back to a `JsonValue`. Peak memory during
-            // this call is `bytes.len() + tree size` ≈ 2 ×
-            // MAX_TEXT_BODY_BYTES (7 MiB). Well under the
-            // mount's 128 MiB `PENDING_BODY_GATE * MAX` bound.
+            // this call is `bytes.len() + tree size` ≈ 2×
+            // `cap`. Well under the mount's 128 MiB
+            // `PENDING_BODY_GATE * MAX` bound.
             match serde_json::from_slice::<serde_json::Value>(&bytes) {
                 Ok(v) => EncodedBody::Value(v),
                 Err(err) => {
@@ -1967,11 +1991,11 @@ pub(super) fn encode_body_capped<T: Serialize>(value: &T, what: &'static str) ->
         Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::WriteZero) => {
             tracing::warn!(
                 what,
-                cap = MAX_TEXT_BODY_BYTES,
+                cap,
                 "MCP tool body exceeded pre-serialization cap — refusing call",
             );
             EncodedBody::TooLarge(format!(
-                "MCP `{what}` body exceeds the per-response cap ({MAX_TEXT_BODY_BYTES} bytes). \
+                "MCP `{what}` body exceeds the per-response cap ({cap} bytes). \
                  Narrow the query (smaller `limit`, tighter filter) and retry.",
             ))
         }

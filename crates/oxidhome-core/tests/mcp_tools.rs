@@ -962,13 +962,16 @@ async fn device_send_command_success_keeps_text_mirror() {
     handle.stop().await.expect("stop");
 }
 
-/// Round-2 F1 on PR #124: `logs.query` responses skip the
-/// text mirror — its payload can grow to ~7 MiB in the
-/// worst case, doubling that through `content[0].text`
-/// would push the transport bound. Verified by asserting
-/// the successful response's `content` array is empty.
+/// Round-3 F1 on PR #124: `logs.query` responses keep the
+/// text mirror for legacy MCP clients that predate
+/// `structuredContent`. The per-body cap
+/// (`MAX_TOOL_BODY_BYTES` = 2.5 MiB) is sized so the
+/// mirror + structured + framing still fit under the 8 MiB
+/// transport ceiling. Round-2 F1's optimisation to skip
+/// the mirror on read tools broke supported legacy clients
+/// — restored here.
 #[tokio::test(flavor = "current_thread")]
-async fn logs_query_response_omits_text_mirror() {
+async fn logs_query_response_keeps_text_mirror_for_legacy_clients() {
     let engine = Engine::new().expect("engine");
     let bearer = mint_bearer(&engine);
     let router = build_router(engine);
@@ -984,13 +987,19 @@ async fn logs_query_response_omits_text_mirror() {
     .await;
     let result = &response["result"];
     assert_ne!(result["isError"], true);
-    let content = result["content"]
-        .as_array()
-        .expect("content is an array even when empty");
+    let content = result["content"].as_array().expect("content array");
     assert!(
-        content.is_empty(),
-        "read-tool successes drop the text mirror to keep peak memory bounded; got {content:?}",
+        !content.is_empty(),
+        "legacy clients must receive `content[0].text` too; got {content:?}",
     );
+    let text = content[0]["text"].as_str().expect("text content");
+    let parsed: Value = serde_json::from_str(text).expect("text mirror is JSON");
+    assert!(
+        parsed["logs"].is_array(),
+        "text mirror must carry the same body as structuredContent; got {text}",
+    );
+    // And structuredContent still carries the parsed body
+    // for modern clients.
     assert!(
         result["structuredContent"]["logs"].is_array(),
         "structuredContent must still carry the parsed body; got {response}",
