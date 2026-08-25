@@ -729,3 +729,308 @@ async fn device_send_command_response_carries_audit_meta() {
         .expect("audit meta must include a numeric intent_id");
     assert!(intent_id > 0, "intent_id must be a real row id");
 }
+
+// ── 14.3b — logs.query ──────────────────────────────────────────
+
+/// `tools/list` advertises `logs.query` with its input
+/// schema. Locks in the tool's advertised name, title, and
+/// the fact that `since` is optional (no `required` array).
+#[tokio::test(flavor = "current_thread")]
+async fn list_tools_advertises_logs_query() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "logs.query")
+        .expect("logs.query in the catalogue");
+    assert_eq!(tool["title"], "Query log history");
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["type"], "object");
+    // No required fields: an empty-arg call is valid.
+    assert!(
+        schema["required"].is_null() || schema["required"].as_array().is_none_or(Vec::is_empty),
+        "logs.query must not require any fields; got {schema}",
+    );
+    // Level enum is present and complete.
+    let level_enum = schema["properties"]["level"]["enum"]
+        .as_array()
+        .expect("level.enum array");
+    for want in ["Trace", "Debug", "Info", "Warn", "Error"] {
+        assert!(
+            level_enum.iter().any(|v| v == want),
+            "logs.query level enum must include `{want}`; got {level_enum:?}",
+        );
+    }
+}
+
+/// A token without `logs:read` cannot invoke `logs.query`.
+/// Mirrors the resource-side scope check on
+/// `oxidhome://logs`.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_requires_logs_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "logs.query", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:list must not satisfy logs:read; got {response}",
+    );
+}
+
+/// Empty-arg `logs.query` on a fresh engine returns
+/// `structuredContent = {"logs": []}` — proves the tool
+/// dispatches, the wire body has the resource-side shape,
+/// and the outcome maps to `structured` (not `error`).
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_empty_engine_returns_empty_list() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "logs.query", "arguments": {}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "empty engine + empty filter must succeed; got {response}",
+    );
+    let structured = &result["structuredContent"];
+    let logs = structured["logs"]
+        .as_array()
+        .expect("structuredContent.logs must be an array");
+    assert!(logs.is_empty(), "fresh engine has no rows; got {logs:?}");
+}
+
+/// Malformed typed filters land as `-32602 INVALID_PARAMS` —
+/// a bogus `since` value, unknown `level`, and unknown
+/// top-level field are all rejected without touching the
+/// store.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_rejects_malformed_filters() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("bad since", json!({"since": "nope"})),
+        ("bad level", json!({"level": "Verbose"})),
+        ("unknown field", json!({"since": "1h", "min_level": "Info"})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "logs.query", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// A `logs.query` call lands in the audit ledger as
+/// `mcp.tool.logs.query` with `decision = "allow"`, no
+/// `execution_outcome` (reads don't fill it), and the audit
+/// row's finalize is complete (`finalized_ms >= intent_ms`).
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_query_lands_in_the_audit_log() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "logs.query", "arguments": {"level": "Info"}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.logs.query")
+        .expect("logs.query row");
+    assert_eq!(row.status, 200);
+    assert_eq!(row.decision, "allow");
+    // Round-2 F3 on PR #124: read tools (no plugin reached)
+    // leave `execution_outcome` NULL per the ledger
+    // contract — `"success"` is reserved for plugin
+    // Ok/OkWithState. `domain_error` stays None too.
+    assert!(
+        row.execution_outcome.is_none(),
+        "read tools must leave execution_outcome NULL; got {:?}",
+        row.execution_outcome,
+    );
+    assert!(row.domain_error.is_none());
+    assert!(row.finalized_ms.is_some(), "finalize must have landed");
+    assert!(row.intent_ms <= row.finalized_ms.unwrap());
+}
+
+/// Round-2 F1 + round-3 F1 on PR #124: every successful
+/// tool response keeps `CallToolResult`'s text mirror
+/// alongside `structuredContent`. Round-2 originally
+/// dropped the mirror on read tools to save memory; round-3
+/// restored it universally (with a tighter
+/// `MAX_TOOL_BODY_BYTES`) because legacy MCP clients that
+/// predate `structuredContent` still consume
+/// `content[0].text`. This test proves the mirror is
+/// present for the mutating path (`device.send_command`);
+/// [`logs_query_response_keeps_text_mirror_for_legacy_clients`]
+/// covers the read path.
+#[tokio::test(flavor = "multi_thread")]
+async fn device_send_command_success_keeps_text_mirror() {
+    let _wasm = _support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = _support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+
+    let handle = engine
+        .start_instance(switch_dir, "switch-mirror", None)
+        .await
+        .expect("start_instance");
+    handle.wait_for_running().await.expect("running");
+
+    let device_id = engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|d| d.owner_instance == "switch-mirror")
+        .expect("switch registered a device")
+        .id
+        .clone();
+
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": device_id,
+                "capability": "switch",
+                "action": "toggle",
+            }
+        }),
+    )
+    .await;
+    let result = &response["result"];
+    let content = result["content"].as_array().expect("content array");
+    assert!(
+        !content.is_empty(),
+        "plugin-reaching successes must keep the text mirror; got {response}",
+    );
+    let text = content[0]["text"].as_str().expect("text content");
+    let parsed: Value = serde_json::from_str(text).expect("text mirror is JSON");
+    assert_eq!(parsed["kind"], "ok_with_state");
+
+    handle.stop().await.expect("stop");
+}
+
+/// Round-3 F1 on PR #124: `logs.query` responses keep the
+/// text mirror for legacy MCP clients that predate
+/// `structuredContent`. The per-body cap
+/// (`MAX_TOOL_BODY_BYTES` = 2.5 MiB) is sized so the
+/// mirror + structured + framing still fit under the 8 MiB
+/// transport ceiling. Round-2 F1's optimisation to skip
+/// the mirror on read tools broke supported legacy clients
+/// — restored here.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_response_keeps_text_mirror_for_legacy_clients() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "logs.query", "arguments": {}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(result["isError"], true);
+    let content = result["content"].as_array().expect("content array");
+    assert!(
+        !content.is_empty(),
+        "legacy clients must receive `content[0].text` too; got {content:?}",
+    );
+    let text = content[0]["text"].as_str().expect("text content");
+    let parsed: Value = serde_json::from_str(text).expect("text mirror is JSON");
+    assert!(
+        parsed["logs"].is_array(),
+        "text mirror must carry the same body as structuredContent; got {text}",
+    );
+    // And structuredContent still carries the parsed body
+    // for modern clients.
+    assert!(
+        result["structuredContent"]["logs"].is_array(),
+        "structuredContent must still carry the parsed body; got {response}",
+    );
+}
+
+/// Round-2 F4 on PR #124: `logs.query` advertises
+/// `read_only_hint = true`, `destructive_hint = false`,
+/// `open_world_hint = false` — planner-style clients rely
+/// on these hints to decide whether they can call a tool
+/// speculatively.
+#[tokio::test(flavor = "current_thread")]
+async fn logs_query_advertises_read_only_annotations() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tool = response["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "logs.query")
+        .expect("logs.query catalogued");
+    let annotations = &tool["annotations"];
+    assert_eq!(annotations["readOnlyHint"], true);
+    assert_eq!(annotations["destructiveHint"], false);
+    assert_eq!(annotations["openWorldHint"], false);
+}

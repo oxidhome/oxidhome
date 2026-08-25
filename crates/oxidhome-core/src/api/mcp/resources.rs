@@ -300,6 +300,36 @@ pub(super) static AUDIT_QUEUE_SEMAPHORE: std::sync::LazyLock<
     std::sync::Arc<tokio::sync::Semaphore>,
 > = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(AUDIT_QUEUE_MAX)));
 
+/// Maximum concurrent MCP store-query blocking tasks
+/// (events and logs from both `resources/read` and
+/// `tools/call`).
+///
+/// Round-1 F1 on PR #124: a cancelled outer future — client
+/// disconnected while `spawn_blocking(log_store.query)` was
+/// running — drops any outer-scope permit but leaves the
+/// blocking task queued. Without a permit held inside the
+/// closure, repeat cancellations can pile up unbounded
+/// tasks behind the shared `SQLite` mutex.
+///
+/// Sized TIGHTER than [`AUDIT_QUEUE_MAX`] (8 vs. 32):
+/// a query holds the shared `SQLite` mutex for a SELECT +
+/// row decode — cheap and short — while an audit write is
+/// an INSERT + index maintenance. Neither operation
+/// benefits from unbounded parallelism (the mutex serialises
+/// them anyway), so the tighter cap here is a
+/// defense-in-depth choice for the disconnect-flood path,
+/// not a throughput bound. 8 concurrent SELECTs is a
+/// comfortable ceiling for a home hub; the mount's
+/// transmission gate (`PENDING_BODY_GATE = 16`) still caps
+/// total in-flight request work.
+pub(super) const STORE_QUERY_MAX: usize = 8;
+
+/// Global semaphore backing [`STORE_QUERY_MAX`]. Shared
+/// with [`super::tools`].
+pub(super) static STORE_QUERY_SEMAPHORE: std::sync::LazyLock<
+    std::sync::Arc<tokio::sync::Semaphore>,
+> = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(STORE_QUERY_MAX)));
+
 /// Outcome shape for a single resource-read attempt. Kept as
 /// a separate enum so the audit path can look at the shape
 /// (status, decision, required scope) without re-parsing an
@@ -786,8 +816,8 @@ const EVENTS_QUERY_MAX_LIMIT: u32 = 100;
 /// the tens of KiB. Capping at 100 rows per query keeps
 /// worst-case serialized response under the mount's
 /// transmission-body ceiling.
-const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
-const LOGS_QUERY_MAX_LIMIT: u32 = 100;
+pub(super) const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
+pub(super) const LOGS_QUERY_MAX_LIMIT: u32 = 100;
 
 #[derive(Serialize)]
 struct EventsBody {
@@ -878,11 +908,23 @@ async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
     // The shared `SQLite` mutex is std, not tokio — running
     // the query on the async worker would park it for the
     // whole read. `spawn_blocking` moves it to the blocking
-    // pool (round-1 F1 on PR #121). Move the query in; the
-    // rows come back out.
+    // pool (round-1 F1 on PR #121). Round-1 F1 on PR #124
+    // adds `STORE_QUERY_SEMAPHORE` — the permit MOVES into
+    // the closure so a cancelled outer future doesn't leave
+    // detached blocking tasks piled up on the mutex.
+    let Ok(permit) = std::sync::Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+        tracing::warn!(
+            cap = STORE_QUERY_MAX,
+            "MCP events store-query saturated — refusing read",
+        );
+        return ReadOutcome::Busy("MCP store-query queue saturated; retry shortly".into());
+    };
     let event_log = engine.event_log();
-    let join =
-        tokio::task::spawn_blocking(move || event_log.query(&event_query, limit_usize)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        let _guard = permit;
+        event_log.query(&event_query, limit_usize)
+    })
+    .await;
     let rows = match join {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
@@ -903,9 +945,14 @@ async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
 
 // ── Logs ──────────────────────────────────────────────────────────
 
+/// Wire body for both the `oxidhome://logs` resource read
+/// and the `logs.query` tool (14.3b). Shared so both surfaces
+/// serialise the same shape — a client reading the ledger
+/// gets the same JSON whether they went through
+/// `resources/read` or `tools/call`.
 #[derive(Serialize)]
-struct LogsBody<'a> {
-    logs: &'a [crate::state::HistoricalLogEvent],
+pub(super) struct LogsBody<'a> {
+    pub(super) logs: &'a [crate::state::HistoricalLogEvent],
 }
 
 /// Keys `oxidhome://logs` recognizes. See [`EVENTS_KNOWN_KEYS`].
@@ -971,8 +1018,21 @@ async fn logs_read(engine: Engine, raw_query: &str) -> ReadOutcome {
         span_path_prefix: query.get("span_path_prefix").cloned(),
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    // Round-1 F1 on PR #124: bound concurrent store-query
+    // blocking tasks. See `events_read` for the rationale.
+    let Ok(permit) = std::sync::Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+        tracing::warn!(
+            cap = STORE_QUERY_MAX,
+            "MCP logs store-query saturated — refusing read",
+        );
+        return ReadOutcome::Busy("MCP store-query queue saturated; retry shortly".into());
+    };
     let log_store = engine.log_store();
-    let join = tokio::task::spawn_blocking(move || log_store.query(&log_query, limit_usize)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        let _guard = permit;
+        log_store.query(&log_query, limit_usize)
+    })
+    .await;
     let rows = match join {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
@@ -1427,7 +1487,7 @@ fn parse_since(query: &HashMap<String, String>, key: &str) -> Result<Option<i64>
 /// splitting via `raw.len() - 1` would panic on a multi-byte
 /// final `char`. Round-2 F1 on PR #121: split on the last
 /// `char` boundary instead.
-fn parse_duration_ms(raw: &str) -> Result<i64, String> {
+pub(super) fn parse_duration_ms(raw: &str) -> Result<i64, String> {
     // Isolate the unit as the last char; everything before it
     // is the digit portion. `char_indices` walks by scalar
     // value, so `raw[i..]` always lands on a UTF-8 boundary.
@@ -1865,6 +1925,145 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     }
 }
 
+/// Round-1 F2 on PR #124: tools/call reuse of the capped
+/// serialiser. The tool path needs the parsed [`JsonValue`]
+/// for `CallToolResult.structuredContent`, whereas
+/// [`encode`] delivers a raw JSON `String` bound for
+/// [`ResourceContents::text`]. `encode_body_capped` runs the
+/// same [`CappedWriter`]-bounded serialisation and returns
+/// one of three named shapes so the tool layer can map
+/// them to its own outcome enum without opening this
+/// module's `ReadOutcome` (which carries resource-side
+/// semantics the tool layer doesn't want).
+pub(super) enum EncodedBody {
+    Value(serde_json::Value),
+    /// Body exceeded the caller-supplied cap; the reason
+    /// string is caller-facing and names the tool.
+    TooLarge(String),
+    /// Serialisation failed for a reason other than the cap
+    /// (bad UTF-8, serde error). The reason is caller-facing
+    /// enough to identify the tool but hides the internal
+    /// error surface.
+    SerializeFailed(String),
+}
+
+/// Envelope headroom for the JSON-RPC wrapper, SSE
+/// framing, `_meta.oxidhome.audit` note, and the surrounding
+/// `CallToolResult` fields (`result_type`, `is_error`, …).
+/// 256 KiB is well above the ≈ 200 B those actually occupy;
+/// held generous so a future addition (a small structured
+/// error, an extra meta key) doesn't force a re-derivation
+/// of the cap.
+pub(super) const TOOL_ENVELOPE_HEADROOM_BYTES: usize = 256 * 1024;
+
+/// Pre-serialisation ceiling for a **tool** response body
+/// (in JSON bytes, before any envelope). Derived — not
+/// hand-picked — so the calculation stays honest if
+/// [`crate::api::mcp::server::MAX_RESPONSE_BODY_BYTES`] or
+/// [`crate::api::mcp::server::MAX_REQUEST_BODY_BYTES`]
+/// change.
+///
+/// A `CallToolResult` ships the body TWICE on the wire:
+///
+/// - `structuredContent` — the parsed body as a JSON value
+///   (native representation, ~1× serialised size).
+/// - `content[0].text` — the same body as a JSON string,
+///   with every `"` and `\` escaped inside the outer JSON.
+///   On quote/backslash-heavy JSON this doubles the size.
+///
+/// So `1× + 2× ≈ 3×` peak wire footprint from the body
+/// itself. Round-4 F1 on PR #124 added the ID-echo term:
+/// JSON-RPC servers echo the request `id` verbatim in the
+/// response envelope, and the mount admits request bodies
+/// up to [`crate::api::mcp::server::MAX_REQUEST_BODY_BYTES`]
+/// (1 MiB) — nearly all of which could be a string `id`.
+/// The formula is
+///
+/// ```text
+/// 3 * MAX_TOOL_BODY_BYTES + MAX_REQUEST_BODY_BYTES
+///     + TOOL_ENVELOPE_HEADROOM_BYTES ≤ MAX_RESPONSE_BODY_BYTES
+/// ```
+///
+/// Solving for `MAX_TOOL_BODY_BYTES` with
+/// `MAX_RESPONSE_BODY_BYTES = 8 MiB`,
+/// `MAX_REQUEST_BODY_BYTES = 1 MiB`, and
+/// `TOOL_ENVELOPE_HEADROOM_BYTES = 256 KiB` gives
+/// `(8 - 1 - 0.25) / 3 ≈ 2.25 MiB`. A compile-time
+/// assertion (`const _: () = assert!(...)`) locks the
+/// invariant in — a future change to any of the four
+/// constants that violates it fails at build time.
+pub(super) const MAX_TOOL_BODY_BYTES: usize = {
+    // Both casts are `const`-context conversions from `u64`
+    // to `usize`. On 32-bit targets a `u64` value greater
+    // than `u32::MAX` would silently truncate — but
+    // `MAX_RESPONSE_BODY_BYTES` (8 MiB) trivially fits, and
+    // a compile-time `assert!` below re-derives the peak
+    // from the same constants, so a future change that
+    // makes them overflow `usize` would fail the build
+    // rather than silently miscompute. `try_from` isn't
+    // available in `const fn` context yet, so the lint is
+    // knowingly suppressed for both this and the assertion.
+    #[allow(clippy::cast_possible_truncation)]
+    let transport = super::server::MAX_RESPONSE_BODY_BYTES as usize;
+    let request = super::server::MAX_REQUEST_BODY_BYTES;
+    let headroom = TOOL_ENVELOPE_HEADROOM_BYTES;
+    (transport - request - headroom) / 3
+};
+
+// Compile-time proof that the derived cap actually
+// satisfies the invariant it was derived from. `assert!`
+// in `const` context fails the build with the caller's
+// message if the arithmetic ever stops holding.
+const _: () = {
+    #[allow(clippy::cast_possible_truncation)]
+    let transport = super::server::MAX_RESPONSE_BODY_BYTES as usize;
+    let request = super::server::MAX_REQUEST_BODY_BYTES;
+    let peak = 3 * MAX_TOOL_BODY_BYTES + request + TOOL_ENVELOPE_HEADROOM_BYTES;
+    assert!(
+        peak <= transport,
+        "MCP tool response bound violated: 3× body + request + envelope > transport ceiling",
+    );
+};
+
+pub(super) fn encode_body_capped<T: Serialize>(
+    value: &T,
+    what: &'static str,
+    cap: usize,
+) -> EncodedBody {
+    let mut writer = CappedWriter::with_cap(cap);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => {
+            let bytes = writer.into_bytes();
+            // Parse-back to a `JsonValue`. Peak memory during
+            // this call is `bytes.len() + tree size` ≈ 2×
+            // `cap`. Well under the mount's 128 MiB
+            // `PENDING_BODY_GATE * MAX` bound.
+            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(v) => EncodedBody::Value(v),
+                Err(err) => {
+                    tracing::error!(%err, what, "MCP tool body parse-back failed");
+                    EncodedBody::SerializeFailed(format!("failed to re-parse {what}"))
+                }
+            }
+        }
+        Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::WriteZero) => {
+            tracing::warn!(
+                what,
+                cap,
+                "MCP tool body exceeded pre-serialization cap — refusing call",
+            );
+            EncodedBody::TooLarge(format!(
+                "MCP `{what}` body exceeds the per-response cap ({cap} bytes). \
+                 Narrow the query (smaller `limit`, tighter filter) and retry.",
+            ))
+        }
+        Err(err) => {
+            tracing::error!(%err, what, "MCP tool serialization failed");
+            EncodedBody::SerializeFailed(format!("failed to serialize {what}"))
+        }
+    }
+}
+
 /// [`std::io::Write`] that refuses to grow past a byte
 /// ceiling — the exact machinery `encode` uses to keep an
 /// oversize row from allocating hundreds of MiB before the
@@ -1888,6 +2087,14 @@ impl CappedWriter {
 
     fn into_string(self) -> Result<String, std::string::FromUtf8Error> {
         String::from_utf8(self.buf)
+    }
+
+    /// Return the raw bytes without a UTF-8 check. Callers
+    /// that immediately parse the buffer as JSON
+    /// (`serde_json::from_slice`) can skip the UTF-8 hop —
+    /// `serde_json` validates encoding itself.
+    fn into_bytes(self) -> Vec<u8> {
+        self.buf
     }
 }
 

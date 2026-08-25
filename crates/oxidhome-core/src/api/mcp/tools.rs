@@ -6,8 +6,15 @@
 //! device command, mutate config, install a plugin, …)
 //! rather than to read state. See
 //! [`.claude/docs/10_mcp.md`](../../../../../.claude/docs/10_mcp.md)
-//! `§ Tools` for the full catalogue plan; this module ships
-//! the first entry: `device.send_command`.
+//! `§ Tools` for the full catalogue plan.
+//!
+//! Tools shipped so far:
+//!
+//! - `device.send_command` (14.3a — sensitive, gated on
+//!   `devices:command`; runs two-phase audit for forensic
+//!   protection).
+//! - `logs.query` (14.3b — read-only, gated on `logs:read`;
+//!   tool-shape of the `oxidhome://logs` resource).
 //!
 //! # Layout
 //!
@@ -32,13 +39,14 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorData as McpError, Tool,
+    ToolAnnotations,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::Engine;
 use crate::api::auth::wit_error_kind;
-use crate::api::scopes::{DEVICES_COMMAND, require_scope};
+use crate::api::scopes::{DEVICES_COMMAND, LOGS_READ, require_scope};
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
@@ -47,7 +55,9 @@ use crate::host_impl::plugin::oxidhome::plugin::types::Value;
 use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
-    AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, MCP_ACTOR_KIND, RESOURCE_BUSY_CODE, SCOPE_DENIED_CODE,
+    AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, EncodedBody, MAX_TOOL_BODY_BYTES, MCP_ACTOR_KIND,
+    RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, STORE_QUERY_MAX,
+    STORE_QUERY_SEMAPHORE,
 };
 
 /// Publicly-visible catalogue of tools this handler exposes.
@@ -67,6 +77,31 @@ pub(super) fn list_tools() -> Vec<Tool> {
             Arc::new(device_send_command_schema()),
         )
         .with_title("Send device command"),
+        Tool::new(
+            "logs.query",
+            "Historical log query against the durable `LogStore`. Returns a JSON list of \
+             `HistoricalLogEvent` rows matching the filters. Read-only; gated on \
+             `logs:read`. Same wire shape as `oxidhome://logs` — a client that reads the \
+             resource and one that calls this tool see identical row bodies. Durations \
+             (`since`, `until`) use `Ns|Nm|Nh|Nd` suffixes (`60s`, `5m`, `2h`, `1d`) and \
+             resolve relative to `now`. `level` filters to entries at or above the named \
+             level (`Trace|Debug|Info|Warn|Error`). Response size is bounded server-side; \
+             `limit` is clamped to 100 rows.",
+            Arc::new(logs_query_schema()),
+        )
+        .with_title("Query log history")
+        // Round-2 F4 on PR #124: machine-readable hints for
+        // planner-style clients. `logs.query` reads the
+        // durable `LogStore` and does not touch external
+        // state; all three defaults would misclassify it
+        // (`read_only_hint = false`, `destructive_hint = true`,
+        // `open_world_hint = true`).
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .open_world(false),
+        ),
     ]
 }
 
@@ -326,6 +361,7 @@ pub(super) async fn call(
     #[allow(clippy::single_match_else)]
     let (family, required) = match name {
         "device.send_command" => ("device.send_command", DEVICES_COMMAND),
+        "logs.query" => ("logs.query", LOGS_READ),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -382,6 +418,7 @@ pub(super) async fn call(
     // Actually dispatch.
     let outcome = match name {
         "device.send_command" => device_send_command_call(engine.clone(), request.arguments).await,
+        "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -577,15 +614,35 @@ impl FinalizeInput {
         // Round-1 F3 shipped `"ok"` and stamped `"failed"`
         // on the unknown-device path too — both wrong per
         // the contract; corrected here.
+        // Round-2 F3 on PR #124: `"success"` is reserved for
+        // tools that reached a plugin (device.send_command
+        // Ok/OkWithState). Pure host-state reads
+        // (`logs.query`) leave execution_outcome NULL —
+        // matches how resource-side reads audit. Only
+        // `domain_kind = Some(_)` means the plugin was
+        // reached and reported an `Err`; the
+        // `domain_kind = None` shape (unknown device caught
+        // in the tool body before `execute_command`) falls
+        // through to the wildcard.
+        //
+        // `match_same_arms` fires on the read-Ok +
+        // wildcard pair (both map to `(None, None)`);
+        // suppressed because the explicit `plugin_reached:
+        // false` arm documents the read-tool case — the
+        // wildcard's job is to catch every other outcome
+        // (`InvalidParams`, `Denied`, `Internal`, etc.),
+        // not to double as the read-Ok arm.
+        #[allow(clippy::match_same_arms)]
         let (execution_outcome, domain_error): (Option<&'static str>, Option<String>) =
             match outcome {
-                ToolOutcome::Ok(_) => (Some("success"), None),
-                // Only `domain_kind = Some(_)` means the
-                // plugin was reached and reported an `Err`.
-                // `domain_kind = None` is the "reached tool
-                // body, refused before plugin" shape (unknown
-                // device); it falls into the wildcard below
-                // and stays as (None, None) per the contract.
+                ToolOutcome::Ok {
+                    plugin_reached: true,
+                    ..
+                } => (Some("success"), None),
+                ToolOutcome::Ok {
+                    plugin_reached: false,
+                    ..
+                } => (None, None),
                 ToolOutcome::ExecErr {
                     domain_kind: Some(kind),
                     ..
@@ -609,7 +666,19 @@ impl FinalizeInput {
 enum ToolOutcome {
     /// Tool completed successfully; the JSON value becomes
     /// the `structuredContent` of the [`CallToolResult`].
-    Ok(JsonValue),
+    /// `plugin_reached` says whether this success involved
+    /// dispatching to a plugin — `true` for
+    /// `device.send_command` returning Ok/OkWithState,
+    /// `false` for pure host-state reads like `logs.query`.
+    /// The audit ledger contract on
+    /// [`crate::state::audit_log::AuditEntry`] reserves
+    /// `execution_outcome = "success"` for plugin Ok, so
+    /// `plugin_reached = false` maps to `None` (round-2 F3
+    /// on PR #124).
+    Ok {
+        value: JsonValue,
+        plugin_reached: bool,
+    },
     /// Tool ran and produced a caller-visible failure (device
     /// not found, plugin returned `CommandResult::Err`, …).
     /// Not an authz problem — audited as `200` because the
@@ -628,6 +697,19 @@ enum ToolOutcome {
     },
     /// Client sent bad arguments. Maps to `-32602`.
     InvalidParams(String),
+    /// URI/arguments are valid, but the response would
+    /// exceed the per-response size budget (`logs.query`
+    /// with too many matching rows, etc.). Maps to
+    /// [`RESOURCE_TOO_LARGE_CODE`] (`-32003`) and audits
+    /// as HTTP 413 — mirrors the resource-side outcome
+    /// shape (round-2 F2 on PR #124).
+    TooLarge(String),
+    /// Server is transiently at capacity — a concurrency
+    /// semaphore (audit queue, store-query queue) had no
+    /// permits. Maps to [`RESOURCE_BUSY_CODE`] (`-32004`)
+    /// and audits as HTTP 503, matching the resource-side
+    /// outcome (round-2 F3 on PR #124).
+    Busy(String),
     /// Tool name isn't in the catalogue. Maps to `-32601`
     /// method-not-found.
     UnknownTool(String),
@@ -640,7 +722,27 @@ enum ToolOutcome {
 impl ToolOutcome {
     fn into_result(self) -> Result<CallToolResult, McpError> {
         match self {
-            Self::Ok(value) => Ok(CallToolResult::structured(value)),
+            Self::Ok { value, .. } => {
+                // Round-3 F1 on PR #124: always keep
+                // `CallToolResult::structured`'s text mirror
+                // — legacy MCP clients that predate
+                // `structuredContent` still get the result
+                // via `content[0].text`. Peak memory is
+                // bounded by [`MAX_TOOL_BODY_BYTES`]
+                // (2.5 MiB) which reserves room for the 3×
+                // wire footprint (`structuredContent` +
+                // escaped text mirror + framing) under the
+                // 8 MiB transport cap.
+                //
+                // The `plugin_reached` field on `Ok` is
+                // now only consulted by
+                // `FinalizeInput::from_outcome` to decide
+                // whether `execution_outcome` gets stamped
+                // `"success"` (plugin reached) or `NULL`
+                // (pure host-state read); it no longer
+                // gates the text-mirror shape.
+                Ok(CallToolResult::structured(value))
+            }
             Self::ExecErr {
                 message,
                 structured,
@@ -650,6 +752,8 @@ impl ToolOutcome {
                 None => CallToolResult::error(vec![ContentBlock::text(message)]),
             }),
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
+            Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
+            Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
             Self::UnknownTool(reason) => Err(McpError::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 reason,
@@ -673,9 +777,11 @@ impl ToolOutcome {
             // the tool WAS invoked. Matches the REST
             // send-command path (`200` with a
             // `CommandResult::Err` in the body).
-            Self::Ok(_) | Self::ExecErr { .. } => 200,
+            Self::Ok { .. } | Self::ExecErr { .. } => 200,
             Self::UnknownTool(_) => 404,
             Self::InvalidParams(_) => 400,
+            Self::TooLarge(_) => 413,
+            Self::Busy(_) => 503,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -683,9 +789,14 @@ impl ToolOutcome {
 
     fn decision(&self) -> &'static str {
         match self {
-            Self::Ok(_) | Self::ExecErr { .. } => "allow",
-            Self::UnknownTool(_) | Self::Denied { .. } | Self::InvalidParams(_) => "deny",
-            Self::Internal(_) => "error",
+            Self::Ok { .. } | Self::ExecErr { .. } => "allow",
+            Self::UnknownTool(_)
+            | Self::Denied { .. }
+            | Self::InvalidParams(_)
+            | Self::TooLarge(_) => "deny",
+            // Match the REST auth classifier: 5xx → "error"
+            // (Busy is 503; Internal is 500).
+            Self::Internal(_) | Self::Busy(_) => "error",
         }
     }
 
@@ -795,9 +906,12 @@ async fn device_send_command_call(
         }
     };
     match &wire {
-        WireCommandResult::Ok | WireCommandResult::OkWithState { .. } => {
-            ToolOutcome::Ok(structured)
-        }
+        WireCommandResult::Ok | WireCommandResult::OkWithState { .. } => ToolOutcome::Ok {
+            value: structured,
+            // Plugin was reached and returned Ok — audits
+            // as `execution_outcome = "success"`.
+            plugin_reached: true,
+        },
         WireCommandResult::Err { error } => {
             let domain_kind = wit_error_kind_of_wire(error);
             ToolOutcome::ExecErr {
@@ -880,6 +994,209 @@ fn message_of_wire_error(err: &crate::api::server::WireWitError) -> &str {
         | W::PermissionDenied { message }
         | W::Unavailable { message }
         | W::Internal { message } => message,
+    }
+}
+
+// ── logs.query ──────────────────────────────────────────────────
+
+fn logs_query_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "since": {
+                "type": "string",
+                "description": "Relative duration: `Ns|Nm|Nh|Nd`. Resolves to `now - since`. e.g. `10m`, `2h`.",
+            },
+            "until": {
+                "type": "string",
+                "description": "Relative duration (same grammar as `since`). Resolves to `now - until`.",
+            },
+            "level": {
+                "type": "string",
+                "enum": ["Trace", "Debug", "Info", "Warn", "Error"],
+                "description": "Minimum level. `Info` includes Info, Warn, Error.",
+            },
+            "instance": { "type": "string", "description": "Filter by owning instance id." },
+            "plugin":   { "type": "string", "description": "Filter by owning plugin id." },
+            "device":   { "type": "string", "description": "Filter by device id (for device-scoped log rows)." },
+            "target":   { "type": "string", "description": "Exact-match `tracing` target." },
+            "target_prefix":    { "type": "string", "description": "Prefix-match on `tracing` target (e.g. `oxidhome_core::runtime`)." },
+            "span_path_prefix": { "type": "string", "description": "Prefix-match on the row's span path (e.g. `plugin.`)." },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": i64::from(crate::api::mcp::resources::LOGS_QUERY_MAX_LIMIT),
+                "description": "Max rows to return (default 100, cap 100).",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+/// Deserialisable name of a log level. Serde derives a
+/// unit-variant deserializer that accepts `"Trace"`,
+/// `"Debug"`, etc. — the same tokens the resource-side
+/// `oxidhome://logs?level=…` query parser accepts.
+#[derive(Deserialize)]
+enum LogLevelName {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevelName> for crate::state::LogLevel {
+    fn from(v: LogLevelName) -> Self {
+        use crate::state::LogLevel as L;
+        match v {
+            LogLevelName::Trace => L::Trace,
+            LogLevelName::Debug => L::Debug,
+            LogLevelName::Info => L::Info,
+            LogLevelName::Warn => L::Warn,
+            LogLevelName::Error => L::Error,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogsQueryArgs {
+    since: Option<String>,
+    until: Option<String>,
+    level: Option<LogLevelName>,
+    instance: Option<String>,
+    plugin: Option<String>,
+    device: Option<String>,
+    target: Option<String>,
+    target_prefix: Option<String>,
+    span_path_prefix: Option<String>,
+    limit: Option<u32>,
+}
+
+async fn logs_query_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    // `arguments = None` is fine here — `logs.query` has no
+    // required fields, so an empty call means "give me the
+    // latest 100 rows across everything." Deserialise from
+    // an empty object in that case so the same code path
+    // covers both shapes.
+    let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
+    let args: LogsQueryArgs = match serde_json::from_value(args_value) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "logs.query arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+
+    let now = crate::state::event_log::now_unix_ms();
+    let since_ms = match args
+        .since
+        .as_deref()
+        .map(super::resources::parse_duration_ms)
+        .transpose()
+    {
+        Ok(v) => v.map(|d| now.saturating_sub(d)),
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!("invalid `since` value: {err}"));
+        }
+    };
+    let until_ms = match args
+        .until
+        .as_deref()
+        .map(super::resources::parse_duration_ms)
+        .transpose()
+    {
+        Ok(v) => v.map(|d| now.saturating_sub(d)),
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!("invalid `until` value: {err}"));
+        }
+    };
+
+    let limit = args
+        .limit
+        .unwrap_or(super::resources::LOGS_QUERY_DEFAULT_LIMIT)
+        .clamp(1, super::resources::LOGS_QUERY_MAX_LIMIT);
+
+    let log_query = crate::state::LogQuery {
+        since_ms,
+        until_ms,
+        min_level: args.level.map(Into::into),
+        instance_id: args.instance,
+        plugin_id: args.plugin,
+        device_id: args.device,
+        target: args.target,
+        target_prefix: args.target_prefix,
+        span_path_prefix: args.span_path_prefix,
+    };
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    // Round-1 F1 on PR #124: bound the concurrent
+    // blocking-writer tasks via the shared
+    // `STORE_QUERY_SEMAPHORE`. Permit MOVES into the closure
+    // so a cancelled outer future (client disconnect) doesn't
+    // leave detached blocking tasks piled up on the mutex.
+    // Round-2 F3 on PR #124: saturation surfaces as
+    // `ToolOutcome::Busy` (`-32004` / 503) — retriable —
+    // instead of a bare `Internal` (500). Matches the
+    // resource-side outcome for the same signal.
+    let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+        tracing::warn!(
+            cap = STORE_QUERY_MAX,
+            "MCP logs.query store-query saturated — refusing call",
+        );
+        return ToolOutcome::Busy(format!(
+            "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
+        ));
+    };
+    let log_store = engine.log_store();
+    let join = tokio::task::spawn_blocking(move || {
+        let _guard = query_permit;
+        log_store.query(&log_query, limit_usize)
+    })
+    .await;
+    let rows = match join {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            tracing::error!(target: "mcp.tool.logs.query", %err, "log query failed");
+            return ToolOutcome::Internal("log query failed".into());
+        }
+        Err(join_err) => {
+            tracing::error!(target: "mcp.tool.logs.query", %join_err, "log query task panicked");
+            return ToolOutcome::Internal("log query task panicked".into());
+        }
+    };
+
+    // Reuse the resource-side wire shape so a client sees
+    // the same JSON on `resources/read` and `tools/call`.
+    // Round-3 F1 on PR #124: use `MAX_TOOL_BODY_BYTES`
+    // (2.5 MiB) not `MAX_TEXT_BODY_BYTES` — a
+    // `CallToolResult` ships the body twice on the wire
+    // (`structuredContent` + escaped `content[0].text`),
+    // so the per-body cap has to leave room for both.
+    let body = super::resources::LogsBody { logs: &rows };
+    match super::resources::encode_body_capped(&body, "logs.query", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            // Pure host-state read — no plugin was reached,
+            // so `execution_outcome` stays `None` per the
+            // audit ledger contract.
+            plugin_reached: false,
+        },
+        // Round-2 F2 on PR #124: oversized responses map to
+        // `TooLarge` (`-32003` / 413), NOT `InvalidParams`
+        // (`-32602` / 400). Arguments were fine; the
+        // response is too large. Matches the resource-side
+        // outcome shape.
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
     }
 }
 
