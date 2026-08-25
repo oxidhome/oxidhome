@@ -899,13 +899,17 @@ async fn logs_query_lands_in_the_audit_log() {
     assert!(row.intent_ms <= row.finalized_ms.unwrap());
 }
 
-/// Round-2 F1 on PR #124: the successful
-/// `device.send_command` response keeps `CallToolResult`'s
-/// text mirror alongside `structuredContent`. Backward-
-/// compatible clients that only consume `content[0].text`
-/// still see the wire `command-result`. Only read tools
-/// (whose responses can grow) drop the mirror to avoid
-/// duplicating a large payload.
+/// Round-2 F1 + round-3 F1 on PR #124: every successful
+/// tool response keeps `CallToolResult`'s text mirror
+/// alongside `structuredContent`. Round-2 originally
+/// dropped the mirror on read tools to save memory; round-3
+/// restored it universally (with a tighter
+/// `MAX_TOOL_BODY_BYTES`) because legacy MCP clients that
+/// predate `structuredContent` still consume
+/// `content[0].text`. This test proves the mirror is
+/// present for the mutating path (`device.send_command`);
+/// [`logs_query_response_keeps_text_mirror_for_legacy_clients`]
+/// covers the read path.
 #[tokio::test(flavor = "multi_thread")]
 async fn device_send_command_success_keeps_text_mirror() {
     let _wasm = _support::build_example("simulated-switch", "simulated_switch.wasm");
