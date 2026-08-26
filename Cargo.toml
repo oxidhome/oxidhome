@@ -63,13 +63,13 @@ serde_urlencoded = "0.7.1"
 # pulls `base64 0.22.1` transitively (via its own
 # transport/session plumbing), so pinning the same version
 # here keeps the graph single-copy.
-base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 # Phase 13 round-3 F1: meta-validate plugin `ui.config-schema` /
 # `ui.commands-schema` files as JSON Schema draft 2020-12 at
 # install and boot-scan. `default-features = false` drops the
 # `resolve-http` + `reqwest` + TLS chain — meta-validation runs
 # against the bundled draft-2020-12 meta-schema, no network.
-jsonschema = { version = "0.49.9", default-features = false }
+jsonschema = { version = "0.51.0", default-features = false }
 # Phase 14 (MCP): official Rust SDK (`rmcp`, from
 # `github.com/modelcontextprotocol/rust-sdk`). We deliberately
 # split the server-side transport feature
