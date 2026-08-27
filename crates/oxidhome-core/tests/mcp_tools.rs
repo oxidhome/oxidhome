@@ -80,7 +80,12 @@ fn initialize_body() -> String {
 async fn read_first_sse_data(response: axum::response::Response) -> Value {
     let mut body = response.into_body();
     let mut buf = String::new();
-    let deadline = Duration::from_secs(5);
+    // 30 s covers the worst-case end-to-end plugin-supervised
+    // boot on a busy CI host — several boot-a-real-plugin
+    // tests (14.3e/f) run concurrently under cargo test, and
+    // wasmtime instantiation can contend under parallel load
+    // even when each individual test is quick in isolation.
+    let deadline = Duration::from_secs(30);
     loop {
         let frame = tokio::time::timeout(deadline, body.frame())
             .await
@@ -2077,4 +2082,219 @@ async fn plugins_stop_rejects_explicit_null_instance_id() {
         ok["result"]["isError"], true,
         "omitted instance_id must still work; got {ok}"
     );
+}
+
+// ── 14.3f — plugins.start ───────────────────────────────────────
+
+/// 14.3f: `plugins.start` is catalogued with `destructive`
+/// annotations, requires `plugin_id`, and accepts optional
+/// `instance_id` + `config_overrides`.
+#[tokio::test(flavor = "current_thread")]
+async fn list_tools_advertises_plugins_start_with_destructive_annotations() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "plugins.start")
+        .expect("plugins.start in the catalogue");
+    assert_eq!(tool["title"], "Start plugin instance");
+    assert_eq!(tool["annotations"]["readOnlyHint"], false);
+    assert_eq!(tool["annotations"]["destructiveHint"], true);
+    assert_eq!(tool["annotations"]["openWorldHint"], false);
+    let required = tool["inputSchema"]["required"]
+        .as_array()
+        .expect("required array");
+    assert!(
+        required.iter().any(|v| v == "plugin_id"),
+        "plugins.start must require plugin_id; got {required:?}",
+    );
+}
+
+/// 14.3f: `plugins.start` requires `plugins:start`.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_start_requires_plugins_start_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "stop-only", &["plugins:stop"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.start", "arguments": {"plugin_id": "example.no-scope"}}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "plugins:stop must not satisfy plugins:start; got {response}",
+    );
+}
+
+/// 14.3f: `plugins.start` rejects malformed argument shapes —
+/// missing / empty `plugin_id`, unknown fields, an explicit
+/// `null` on the optional `instance_id`, and unsafe FS-segment
+/// `instance_id`s (path traversal, absolute paths).
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_start_rejects_malformed_arguments() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("missing plugin_id", json!({})),
+        ("empty plugin_id", json!({"plugin_id": ""})),
+        (
+            "empty instance_id",
+            json!({"plugin_id": "x", "instance_id": ""}),
+        ),
+        (
+            "null instance_id",
+            json!({"plugin_id": "x", "instance_id": null}),
+        ),
+        (
+            "path traversal",
+            json!({"plugin_id": "x", "instance_id": "../escape"}),
+        ),
+        (
+            "absolute path",
+            json!({"plugin_id": "x", "instance_id": "/etc/passwd"}),
+        ),
+        ("unknown field", json!({"plugin_id": "x", "extra": 1})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "plugins.start", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// 14.3f: `plugins.start` on a not-installed plugin surfaces
+/// as an application-level `isError: true` with structured
+/// `kind = "not_installed"` — same shape the read tools use for
+/// missing plugins.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_start_unknown_plugin_returns_tool_level_error() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.start", "arguments": {"plugin_id": "example.absent-start"}}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "not-found is tool-level; got {response}"
+    );
+    let result = &response["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["kind"], "not_installed");
+    assert_eq!(
+        result["structuredContent"]["plugin_id"],
+        "example.absent-start"
+    );
+}
+
+/// 14.3f: `plugins.start` end-to-end — install a plugin, start
+/// it via the tool, verify the response's shape and that the
+/// instance reached `Running` in the registry.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_start_end_to_end_boots_an_installed_plugin() {
+    let plugin_id = "example.mcp-start-e2e";
+    let source = stage_switch_source("mcp-start-e2e-src", plugin_id);
+    let state_dir = _support::tempdir("mcp-start-e2e-state");
+
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let _installed = engine
+        .installed_plugins()
+        .install(source.path())
+        .expect("install plugin");
+
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.start", "arguments": {
+            "plugin_id": plugin_id,
+            "instance_id": "switch-start-e2e",
+        }}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "start must succeed; got {response}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["plugin_id"], plugin_id);
+    assert_eq!(structured["instance_id"], "switch-start-e2e");
+    // `state` should reflect that we reached Running.
+    assert_eq!(structured["state"], "Running");
+
+    // Sanity: the registry has the fresh handle.
+    let handle = engine
+        .instances()
+        .get("switch-start-e2e")
+        .expect("registry has the started instance");
+    handle.stop().await.expect("stop");
+}
+
+/// 14.3f + Round-1 P2 lessons: `plugins.start` lands in the
+/// audit ledger with `execution_outcome` + `domain_error` NULL
+/// — host lifecycle actions, no plugin `execute-command`
+/// invocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_start_not_installed_leaves_audit_taxonomy_clean() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.start", "arguments": {"plugin_id": "example.absent-audit-start"}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.plugins.start")
+        .expect("plugins.start row");
+    assert_eq!(row.decision, "allow");
+    assert!(row.execution_outcome.is_none());
+    assert!(row.domain_error.is_none());
 }
