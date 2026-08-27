@@ -1716,11 +1716,29 @@ fn plugins_stop_schema() -> serde_json::Map<String, JsonValue> {
     }
 }
 
+/// Round-1 P1 on PR #132: `instance_id` is optional but must
+/// NEVER be an explicit JSON `null`. The default
+/// `#[serde(default)] Option<String>` accepts both "absent"
+/// and `null` as `None` — the latter would silently widen a
+/// targeted stop into a bulk stop-all when the caller
+/// intended to send a value but mis-serialised it (client bug,
+/// codegen glitch). Deserialising through a string-only helper
+/// with `#[serde(default)]` keeps "absent → None" while making
+/// `null` a schema-violating input that lands as
+/// `INVALID_PARAMS`.
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(Some(s))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PluginsStopArgs {
     plugin_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
     instance_id: Option<String>,
 }
 
@@ -1789,11 +1807,16 @@ async fn plugins_stop_call(
     match super::resources::encode_body_capped(&body, "plugins.stop", MAX_TOOL_BODY_BYTES) {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
-            // We call `handle.stop()` on the plugin's
-            // supervisor task — a plugin-reaching action, so
-            // the audit row's `execution_outcome` reflects
-            // "we drove the plugin's lifecycle."
-            plugin_reached: true,
+            // Round-1 P2 on PR #132: `execution_outcome` is a
+            // plugin-command taxonomy field (`"success"` for
+            // plugin Ok, `"failed"` for plugin Err). Stopping
+            // a supervisor is a host-state lifecycle action,
+            // not a plugin invocation — the plugin never runs
+            // an `execute-command` handler here. Keep the
+            // slot NULL to avoid corrupting a downstream
+            // consumer's plugin-outcome analytics. Same rule
+            // the read tools follow.
+            plugin_reached: false,
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
         EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
@@ -1891,6 +1914,15 @@ async fn plugins_uninstall_call(
         .filter(|h| h.plugin_id() == args.plugin_id)
         .map(|h| h.instance_id().to_string())
         .collect();
+    // Round-1 P2 on PR #132: `domain_kind` populates the
+    // ledger's `domain_error` column, documented as "the WIT
+    // error kind a plugin returned." Uninstall preconditions
+    // (instances-running, not-installed, no-plugins-root) are
+    // host-state conditions — no plugin was ever invoked, no
+    // WIT error was raised — so `domain_kind` stays `None`
+    // even on the ExecErr paths. The `structured.kind` field
+    // still gives clients a machine-readable tag; only the
+    // audit slot is unpolluted.
     if !running.is_empty() {
         let structured = json!({
             "kind": "instances_running",
@@ -1904,7 +1936,7 @@ async fn plugins_uninstall_call(
                 running.join(", "),
             ),
             structured: Some(structured),
-            domain_kind: Some("instances_running"),
+            domain_kind: None,
         };
     }
 
@@ -1924,7 +1956,7 @@ async fn plugins_uninstall_call(
                     "kind": "not_installed",
                     "plugin_id": args.plugin_id,
                 })),
-                domain_kind: Some("not_installed"),
+                domain_kind: None,
             };
         }
         Ok(Err(crate::state::UninstallError::NoPluginsRoot)) => {
@@ -1936,15 +1968,25 @@ async fn plugins_uninstall_call(
                     "kind": "no_plugins_root",
                     "plugin_id": args.plugin_id,
                 })),
-                domain_kind: Some("no_plugins_root"),
+                domain_kind: None,
             };
         }
         Ok(Err(err)) => {
-            tracing::error!(target: "mcp.tool.plugins.uninstall", %err, "uninstall failed");
-            return ToolOutcome::Internal(format!(
-                "uninstall of `{}` failed: {err}",
-                args.plugin_id
-            ));
+            // Round-1 P2 on PR #132: `UninstallError::Io` can
+            // carry absolute filesystem paths and
+            // `UninstallError::Persistence` can carry SQLite
+            // internals. Log the full error server-side; hand
+            // the caller a generic message so a hostile client
+            // can't probe host layout via crafted `plugin_id`
+            // values. Matches REST + Connect-RPC's opaque 500
+            // response for the same conditions.
+            tracing::error!(
+                target: "mcp.tool.plugins.uninstall",
+                plugin_id = %args.plugin_id,
+                %err,
+                "uninstall failed",
+            );
+            return ToolOutcome::Internal("uninstall failed; see server logs".into());
         }
         Err(join_err) => {
             tracing::error!(target: "mcp.tool.plugins.uninstall", %join_err, "uninstall task panicked");
@@ -1958,11 +2000,12 @@ async fn plugins_uninstall_call(
     match super::resources::encode_body_capped(&body, "plugins.uninstall", MAX_TOOL_BODY_BYTES) {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
-            // Uninstall touches the plugin's on-disk footprint
-            // + per-instance KV/blob state; audit as
-            // plugin-reaching so the ledger row records
-            // `execution_outcome = "success"` on the happy path.
-            plugin_reached: true,
+            // Round-1 P2 on PR #132: `execution_outcome` is a
+            // plugin-invocation taxonomy field. Uninstall
+            // manipulates host state (FS + SQL registry rows)
+            // — no plugin `execute-command` runs. Leave the
+            // slot NULL, same as the read tools.
+            plugin_reached: false,
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
         EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),

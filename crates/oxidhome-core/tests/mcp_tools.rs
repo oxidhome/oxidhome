@@ -1952,21 +1952,20 @@ async fn plugins_uninstall_refuses_with_running_instances() {
     handle.stop().await.expect("stop");
 }
 
-/// 14.3e: mutating admin tools land in the audit ledger under
-/// `mcp.tool.plugins.<action>` with `decision = "allow"` and
-/// `execution_outcome = "success"` (plugin-reaching action —
-/// distinct from the read tools' NULL outcome).
+/// 14.3e + Round-1 P2 on PR #132: mutating admin tools land in
+/// the audit ledger under `mcp.tool.plugins.<action>` with
+/// `decision = "allow"`. `execution_outcome` and `domain_error`
+/// are plugin-command taxonomy fields — stop / uninstall
+/// manipulate host state (supervisor lifecycle, FS + SQL
+/// registry rows), no plugin `execute-command` runs, so both
+/// slots stay NULL to keep the audit taxonomy uncorrupted.
 #[tokio::test(flavor = "multi_thread")]
-async fn plugins_stop_lands_in_the_audit_log_with_success_outcome() {
+async fn plugins_stop_lands_in_the_audit_log_with_null_execution_outcome() {
     let engine = Engine::new().expect("engine");
     let bearer = mint_bearer(&engine);
     let router = build_router(engine.clone());
     let (router, session) = handshake(router, &bearer).await;
 
-    // No-op stop is enough: the tool records
-    // `execution_outcome = "success"` because it drove the
-    // (empty) supervisor loop, not because it observed a
-    // plugin Ok/OkWithState.
     let _ = call(
         &router,
         &bearer,
@@ -1987,7 +1986,95 @@ async fn plugins_stop_lands_in_the_audit_log_with_success_outcome() {
         .expect("plugins.stop row");
     assert_eq!(row.status, 200);
     assert_eq!(row.decision, "allow");
-    assert_eq!(row.execution_outcome.as_deref(), Some("success"));
+    assert!(
+        row.execution_outcome.is_none(),
+        "host lifecycle op must leave execution_outcome NULL; got {:?}",
+        row.execution_outcome,
+    );
     assert!(row.domain_error.is_none());
     assert!(row.finalized_ms.is_some());
+}
+
+/// Round-1 P2 on PR #132: uninstall's tool-level error paths
+/// (instances-running, not-installed, no-plugins-root) are
+/// host-state conditions — no plugin was invoked — so
+/// `domain_error` stays NULL. The clients still get
+/// `structuredContent.kind` for a machine-readable tag; only
+/// the audit slot is uncorrupted.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_uninstall_not_installed_leaves_domain_error_null() {
+    let state_dir = _support::tempdir("mcp-uninstall-audit-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.uninstall", "arguments": {"plugin_id": "example.audit-nf-uninstall"}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.plugins.uninstall")
+        .expect("plugins.uninstall row");
+    assert_eq!(row.decision, "allow");
+    assert!(
+        row.domain_error.is_none(),
+        "host lifecycle preconditions must not populate domain_error; got {:?}",
+        row.domain_error,
+    );
+}
+
+/// Round-1 P1 on PR #132: explicit JSON `null` on
+/// `instance_id` must be rejected, not silently coerced to
+/// `None` (which would widen a targeted stop into stop-all
+/// and bypass the caller's intent).
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_stop_rejects_explicit_null_instance_id() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.stop", "arguments": {
+            "plugin_id": "example.null-guard",
+            "instance_id": null,
+        }}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "explicit null must surface as INVALID_PARAMS; got {response}",
+    );
+
+    // Sanity: the same call with `instance_id` OMITTED still
+    // succeeds (default → None → stop-all), so the fix only
+    // shuts down the ambiguous null case.
+    let ok = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.stop", "arguments": {"plugin_id": "example.null-guard"}}),
+    )
+    .await;
+    assert_ne!(
+        ok["result"]["isError"], true,
+        "omitted instance_id must still work; got {ok}"
+    );
 }
