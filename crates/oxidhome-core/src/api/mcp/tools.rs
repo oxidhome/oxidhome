@@ -22,6 +22,12 @@
 //!   gated on `plugins:list`; tool-shape of the
 //!   `oxidhome://plugins` + `oxidhome://plugins/{id}`
 //!   resources).
+//! - `plugins.stop` (14.3e — mutating admin, gated on
+//!   `plugins:stop`; tool-shape of `POST
+//!   /api/v1/plugins/{id}/stop`).
+//! - `plugins.uninstall` (14.3e — mutating admin,
+//!   destructive, gated on `plugins:uninstall`; tool-shape
+//!   of `DELETE /api/v1/plugins/{id}`).
 //!
 //! # Layout
 //!
@@ -48,12 +54,15 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorData as McpError, Tool,
     ToolAnnotations,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::Engine;
 use crate::api::auth::wit_error_kind;
-use crate::api::scopes::{DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_LIST, require_scope};
+use crate::api::scopes::{
+    DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_LIST, PLUGINS_STOP, PLUGINS_UNINSTALL,
+    require_scope,
+};
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
@@ -72,6 +81,11 @@ use super::resources::{
 /// definitions carry a JSON Schema so clients can validate
 /// input before hitting the wire (and so an LLM planner sees
 /// the argument shape without a separate probe).
+// One `Tool::new(...).annotate(...)` entry per tool — the
+// function grows linearly with the catalogue. Splitting into
+// per-tool builder helpers would hide the flat list from a
+// grep; keep as one function.
+#[allow(clippy::too_many_lines)]
 pub(super) fn list_tools() -> Vec<Tool> {
     vec![
         Tool::new(
@@ -147,6 +161,46 @@ pub(super) fn list_tools() -> Vec<Tool> {
             ToolAnnotations::new()
                 .read_only(true)
                 .destructive(false)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.stop",
+            "Stop one or all supervised instances of an installed plugin. Idempotent — \
+             if the plugin has no running instances, the tool returns success with an \
+             empty `stopped` list. If `instance_id` is supplied, only that one instance \
+             is stopped; otherwise every instance of `plugin_id` is stopped. Waits for \
+             the supervisor's shutdown ack + a brief registry-clear poll so a follow-up \
+             call sees a consistent post-stop state. SENSITIVE: gated on `plugins:stop` \
+             — a plugin driving physical actuation (locks, alarms) rides this same \
+             lifecycle.",
+            Arc::new(plugins_stop_schema()),
+        )
+        .with_title("Stop plugin instance(s)")
+        .annotate(
+            ToolAnnotations::new()
+                // Mutates host runtime state.
+                .read_only(false)
+                // Reversible via `plugins.start`, but the observable
+                // side effect (halted supervision) is real and can
+                // interrupt in-flight commands — flag as destructive.
+                .destructive(true)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.uninstall",
+            "Uninstall a plugin: remove `<plugins_root>/<plugin_id>/` recursively, purge \
+             every per-instance KV row + blob for the plugin, and tombstone the \
+             `plugin_installation` registry row. REFUSES if any supervised instance is \
+             still running — call `plugins.stop` first. SENSITIVE + DESTRUCTIVE: gated \
+             on `plugins:uninstall`; reinstall of the same `plugin_id` starts with an \
+             empty per-instance keyspace and a fresh `installation_uuid`.",
+            Arc::new(plugins_uninstall_schema()),
+        )
+        .with_title("Uninstall plugin")
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(true)
                 .open_world(false),
         ),
         Tool::new(
@@ -433,6 +487,8 @@ pub(super) async fn call(
         "events.history" => ("events.history", EVENTS_READ),
         "plugins.list" => ("plugins.list", PLUGINS_LIST),
         "plugins.show" => ("plugins.show", PLUGINS_LIST),
+        "plugins.stop" => ("plugins.stop", PLUGINS_STOP),
+        "plugins.uninstall" => ("plugins.uninstall", PLUGINS_UNINSTALL),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -493,6 +549,8 @@ pub(super) async fn call(
         "events.history" => events_history_call(engine.clone(), request.arguments).await,
         "plugins.list" => plugins_list_call(&engine, request.arguments),
         "plugins.show" => plugins_show_call(&engine, request.arguments),
+        "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments).await,
+        "plugins.uninstall" => plugins_uninstall_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -1625,6 +1683,328 @@ fn plugins_show_call(
     match super::resources::encode_body_capped(&body, "plugins.show", MAX_TOOL_BODY_BYTES) {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+// ── plugins.stop ────────────────────────────────────────────────
+
+fn plugins_stop_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id"],
+        "properties": {
+            "plugin_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Installed `plugin_id` whose instances to stop.",
+            },
+            "instance_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional: stop only this specific instance. If omitted, every supervised instance of `plugin_id` is stopped.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+/// Round-1 P1 on PR #132: `instance_id` is optional but must
+/// NEVER be an explicit JSON `null`. The default
+/// `#[serde(default)] Option<String>` accepts both "absent"
+/// and `null` as `None` — the latter would silently widen a
+/// targeted stop into a bulk stop-all when the caller
+/// intended to send a value but mis-serialised it (client bug,
+/// codegen glitch). Deserialising through a string-only helper
+/// with `#[serde(default)]` keeps "absent → None" while making
+/// `null` a schema-violating input that lands as
+/// `INVALID_PARAMS`.
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(Some(s))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsStopArgs {
+    plugin_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    instance_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PluginsStopBody {
+    stopped: Vec<String>,
+}
+
+async fn plugins_stop_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    let Some(arguments) = arguments else {
+        return ToolOutcome::InvalidParams("plugins.stop requires a `plugin_id` argument".into());
+    };
+    let args: PluginsStopArgs = match serde_json::from_value(JsonValue::Object(arguments)) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "plugins.stop arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+    if args.plugin_id.is_empty() {
+        return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
+    }
+    if args.instance_id.as_ref().is_some_and(String::is_empty) {
+        return ToolOutcome::InvalidParams(
+            "`instance_id`, when supplied, must not be empty".into(),
+        );
+    }
+
+    // Mirror the REST handler: iterate the registry, filter to
+    // matching plugin_id (+ optional instance_id), stop each
+    // and wait for the reaper to clear the entry so a follow-up
+    // caller sees consistent post-stop state. Idempotent — an
+    // empty `stopped` list is a valid success (nothing was
+    // running that matched).
+    let registry = engine.instances();
+    let mut stopped = Vec::new();
+    for handle in registry.list() {
+        if handle.plugin_id() != args.plugin_id {
+            continue;
+        }
+        if let Some(want) = &args.instance_id
+            && handle.instance_id() != want
+        {
+            continue;
+        }
+        let id = handle.instance_id().to_string();
+        if let Err(err) = handle.stop().await {
+            tracing::warn!(
+                target: "mcp.tool.plugins.stop",
+                instance_id = %id,
+                error = %err,
+                "stop instance failed; continuing with siblings",
+            );
+            continue;
+        }
+        let _ = handle.wait_terminal().await;
+        wait_for_registry_clear(&registry, &id).await;
+        stopped.push(id);
+    }
+
+    let body = PluginsStopBody { stopped };
+    match super::resources::encode_body_capped(&body, "plugins.stop", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            // Round-1 P2 on PR #132: `execution_outcome` is a
+            // plugin-command taxonomy field (`"success"` for
+            // plugin Ok, `"failed"` for plugin Err). Stopping
+            // a supervisor is a host-state lifecycle action,
+            // not a plugin invocation — the plugin never runs
+            // an `execute-command` handler here. Keep the
+            // slot NULL to avoid corrupting a downstream
+            // consumer's plugin-outcome analytics. Same rule
+            // the read tools follow.
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+/// Bounded poll for the instance to leave the registry after
+/// its supervisor reached a terminal state. Same rationale as
+/// the REST-side [`crate::api::server::wait_for_registry_clear`]:
+/// the reaper runs on a separately-spawned tokio task, so
+/// there's a brief window where the terminal state is
+/// observable but the registry entry is still present. 5 s is
+/// comfortably above any plausible reaper-scheduling latency.
+async fn wait_for_registry_clear(registry: &crate::InstanceRegistry, instance_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while registry.get(instance_id).is_some() {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: "mcp.tool.plugins.stop",
+                instance_id = %instance_id,
+                "instance registry didn't clear after 5s — reaper task lagging?",
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+// ── plugins.uninstall ───────────────────────────────────────────
+
+fn plugins_uninstall_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id"],
+        "properties": {
+            "plugin_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Installed `plugin_id` to uninstall. Refuses if any supervised instance is still running — call `plugins.stop` first.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsUninstallArgs {
+    plugin_id: String,
+}
+
+#[derive(Serialize)]
+struct PluginsUninstallBody {
+    plugin_id: String,
+}
+
+async fn plugins_uninstall_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    let Some(arguments) = arguments else {
+        return ToolOutcome::InvalidParams(
+            "plugins.uninstall requires a `plugin_id` argument".into(),
+        );
+    };
+    let args: PluginsUninstallArgs = match serde_json::from_value(JsonValue::Object(arguments)) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "plugins.uninstall arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+    if args.plugin_id.is_empty() {
+        return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
+    }
+
+    // Mirror REST's uninstall: hold the per-plugin_id
+    // lifecycle lock across the running-instances check + the
+    // compose uninstall, and MOVE the guard into the
+    // `spawn_blocking` closure so a cancelled MCP request
+    // (client disconnect mid-uninstall) can't race a concurrent
+    // `plugins.start` re-acquiring the mutex while the FS/SQL
+    // steps are still running.
+    let lifecycle_lock = engine.plugin_lifecycle_lock(&args.plugin_id);
+    let guard = lifecycle_lock.lock_owned().await;
+    let running: Vec<String> = engine
+        .instances()
+        .list()
+        .into_iter()
+        .filter(|h| h.plugin_id() == args.plugin_id)
+        .map(|h| h.instance_id().to_string())
+        .collect();
+    // Round-1 P2 on PR #132: `domain_kind` populates the
+    // ledger's `domain_error` column, documented as "the WIT
+    // error kind a plugin returned." Uninstall preconditions
+    // (instances-running, not-installed, no-plugins-root) are
+    // host-state conditions — no plugin was ever invoked, no
+    // WIT error was raised — so `domain_kind` stays `None`
+    // even on the ExecErr paths. The `structured.kind` field
+    // still gives clients a machine-readable tag; only the
+    // audit slot is unpolluted.
+    if !running.is_empty() {
+        let structured = json!({
+            "kind": "instances_running",
+            "plugin_id": args.plugin_id,
+            "running": running,
+        });
+        return ToolOutcome::ExecErr {
+            message: format!(
+                "plugin `{}` has running instances: {} — call plugins.stop first",
+                args.plugin_id,
+                running.join(", "),
+            ),
+            structured: Some(structured),
+            domain_kind: None,
+        };
+    }
+
+    let engine_for_blocking = engine.clone();
+    let plugin_id_for_blocking = args.plugin_id.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        engine_for_blocking.uninstall_plugin(&plugin_id_for_blocking)
+    })
+    .await;
+    match join {
+        Ok(Ok(())) => {}
+        Ok(Err(crate::state::UninstallError::NotInstalled(_))) => {
+            return ToolOutcome::ExecErr {
+                message: format!("plugin `{}` is not installed", args.plugin_id),
+                structured: Some(json!({
+                    "kind": "not_installed",
+                    "plugin_id": args.plugin_id,
+                })),
+                domain_kind: None,
+            };
+        }
+        Ok(Err(crate::state::UninstallError::NoPluginsRoot)) => {
+            // In-memory engine: uninstall isn't supported. Mirrors
+            // REST's 503 shape.
+            return ToolOutcome::ExecErr {
+                message: "uninstall requires a state-dir-backed engine".into(),
+                structured: Some(json!({
+                    "kind": "no_plugins_root",
+                    "plugin_id": args.plugin_id,
+                })),
+                domain_kind: None,
+            };
+        }
+        Ok(Err(err)) => {
+            // Round-1 P2 on PR #132: `UninstallError::Io` can
+            // carry absolute filesystem paths and
+            // `UninstallError::Persistence` can carry SQLite
+            // internals. Log the full error server-side; hand
+            // the caller a generic message so a hostile client
+            // can't probe host layout via crafted `plugin_id`
+            // values. Matches REST + Connect-RPC's opaque 500
+            // response for the same conditions.
+            tracing::error!(
+                target: "mcp.tool.plugins.uninstall",
+                plugin_id = %args.plugin_id,
+                %err,
+                "uninstall failed",
+            );
+            return ToolOutcome::Internal("uninstall failed; see server logs".into());
+        }
+        Err(join_err) => {
+            tracing::error!(target: "mcp.tool.plugins.uninstall", %join_err, "uninstall task panicked");
+            return ToolOutcome::Internal("uninstall task panicked".into());
+        }
+    }
+
+    let body = PluginsUninstallBody {
+        plugin_id: args.plugin_id,
+    };
+    match super::resources::encode_body_capped(&body, "plugins.uninstall", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            // Round-1 P2 on PR #132: `execution_outcome` is a
+            // plugin-invocation taxonomy field. Uninstall
+            // manipulates host state (FS + SQL registry rows)
+            // — no plugin `execute-command` runs. Leave the
+            // slot NULL, same as the read tools.
             plugin_reached: false,
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
