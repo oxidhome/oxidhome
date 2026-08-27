@@ -18,6 +18,10 @@
 //! - `events.history` (14.3c — read-only, gated on
 //!   `events:read`; tool-shape of the `oxidhome://events`
 //!   resource).
+//! - `plugins.list` + `plugins.show` (14.3d — read-only,
+//!   gated on `plugins:list`; tool-shape of the
+//!   `oxidhome://plugins` + `oxidhome://plugins/{id}`
+//!   resources).
 //!
 //! # Layout
 //!
@@ -49,7 +53,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::Engine;
 use crate::api::auth::wit_error_kind;
-use crate::api::scopes::{DEVICES_COMMAND, EVENTS_READ, LOGS_READ, require_scope};
+use crate::api::scopes::{DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_LIST, require_scope};
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
@@ -99,6 +103,46 @@ pub(super) fn list_tools() -> Vec<Tool> {
         // state; all three defaults would misclassify it
         // (`read_only_hint = false`, `destructive_hint = true`,
         // `open_world_hint = true`).
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.list",
+            "List all plugins currently known to the host — both installed \
+             (via `plugins install`) and running-only (dev-time argv-driven \
+             starts with no `plugin_installation` row). Each entry carries \
+             `plugin_id`, `installed`, `version` (when installed), and \
+             `instance_count`. Read-only; gated on `plugins:list`. Same wire \
+             shape as `oxidhome://plugins` — a client that reads the resource \
+             and one that calls this tool see identical row bodies.",
+            Arc::new(plugins_list_schema()),
+        )
+        .with_title("List plugins")
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.show",
+            "Show detail for a single plugin: `plugin_id`, `installed`, \
+             `version`, `singleton`, `content_digest` (SHA-256 of the \
+             installed contents), `installation_uuid` (host-minted per-install \
+             identity — a reinstall of the same `plugin_id` produces a \
+             different UUID), and the list of currently-running instances \
+             with their state. `content_digest` + `installation_uuid` are \
+             `None` for a dev-time argv-driven start with no installation \
+             row. Read-only; gated on `plugins:list`. Same wire shape as \
+             `oxidhome://plugins/{plugin_id}`. Returns `INVALID_PARAMS` if \
+             `plugin_id` is missing and an application-level error if the \
+             plugin is neither installed nor running.",
+            Arc::new(plugins_show_schema()),
+        )
+        .with_title("Show plugin detail")
         .annotate(
             ToolAnnotations::new()
                 .read_only(true)
@@ -387,6 +431,8 @@ pub(super) async fn call(
         "device.send_command" => ("device.send_command", DEVICES_COMMAND),
         "logs.query" => ("logs.query", LOGS_READ),
         "events.history" => ("events.history", EVENTS_READ),
+        "plugins.list" => ("plugins.list", PLUGINS_LIST),
+        "plugins.show" => ("plugins.show", PLUGINS_LIST),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -445,6 +491,8 @@ pub(super) async fn call(
         "device.send_command" => device_send_command_call(engine.clone(), request.arguments).await,
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => events_history_call(engine.clone(), request.arguments).await,
+        "plugins.list" => plugins_list_call(&engine),
+        "plugins.show" => plugins_show_call(&engine, request.arguments),
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -1449,6 +1497,112 @@ async fn events_history_call(
             // Pure host-state read — plugin was never reached,
             // so `execution_outcome` stays `None` per the
             // audit ledger contract.
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+// ── plugins.list ────────────────────────────────────────────────
+
+fn plugins_list_schema() -> serde_json::Map<String, JsonValue> {
+    // Deliberately no filter fields for the initial cut: the
+    // resource-side counterpart takes none either, and any
+    // filter added later must arrive on both surfaces in
+    // lockstep so their wire contracts stay identical.
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+fn plugins_list_call(engine: &Engine) -> ToolOutcome {
+    let body = super::resources::plugins_list_body(engine);
+    match super::resources::encode_body_capped(&body, "plugins.list", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            // Pure host-state read — no plugin was reached,
+            // so `execution_outcome` stays `None` per the
+            // audit ledger contract.
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+// ── plugins.show ────────────────────────────────────────────────
+
+fn plugins_show_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id"],
+        "properties": {
+            "plugin_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Plugin id (`net.example.foo`) to look up. Must match an installed plugin or a currently-running instance's owning plugin.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsShowArgs {
+    plugin_id: String,
+}
+
+fn plugins_show_call(
+    engine: &Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    let Some(arguments) = arguments else {
+        return ToolOutcome::InvalidParams("plugins.show requires a `plugin_id` argument".into());
+    };
+    let args: PluginsShowArgs = match serde_json::from_value(JsonValue::Object(arguments)) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "plugins.show arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+    if args.plugin_id.is_empty() {
+        return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
+    }
+
+    let Some(body) = super::resources::plugins_detail_body(engine, &args.plugin_id) else {
+        // Not-found is an application-level error carried as a
+        // `CallToolResult { isError: true }` — mirrors the
+        // resource-side `NotFound` outcome shape. `ExecErr` is
+        // the tool-outcome slot for it; the audit row still
+        // records `decision = "allow"` (the caller was
+        // authorised; the target just didn't exist). No plugin
+        // WIT error involved, so `domain_kind` stays `None`.
+        return ToolOutcome::ExecErr {
+            message: format!(
+                "plugin `{}` is not installed and has no running instances",
+                args.plugin_id,
+            ),
+            structured: None,
+            domain_kind: None,
+        };
+    };
+    match super::resources::encode_body_capped(&body, "plugins.show", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
             plugin_reached: false,
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),

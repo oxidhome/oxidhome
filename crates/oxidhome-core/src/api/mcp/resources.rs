@@ -693,20 +693,28 @@ fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
 
 // ── Plugins ───────────────────────────────────────────────────────
 
+/// Wire body shared between the `oxidhome://plugins`
+/// resource read and the `plugins.list` tool (14.3d). Both
+/// surfaces serialise the same shape so a client sees the
+/// same JSON regardless of transport.
 #[derive(Serialize)]
-struct PluginListEntry {
-    plugin_id: String,
-    installed: bool,
-    version: Option<String>,
-    instance_count: u32,
+pub(super) struct PluginListEntry {
+    pub(super) plugin_id: String,
+    pub(super) installed: bool,
+    pub(super) version: Option<String>,
+    pub(super) instance_count: u32,
 }
 
 #[derive(Serialize)]
-struct PluginListBody {
-    plugins: Vec<PluginListEntry>,
+pub(super) struct PluginListBody {
+    pub(super) plugins: Vec<PluginListEntry>,
 }
 
-fn plugins_list(engine: &Engine) -> ReadOutcome {
+/// Build the `oxidhome://plugins` wire body without encoding.
+/// Extracted so the `plugins.list` tool can reuse the exact
+/// data-shaping the resource applies (installed + running
+/// merge, sorted by plugin id).
+pub(super) fn plugins_list_body(engine: &Engine) -> PluginListBody {
     let mut by_plugin: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for handle in engine.instances().list() {
         *by_plugin.entry(handle.plugin_id().to_string()).or_default() += 1;
@@ -731,21 +739,25 @@ fn plugins_list(engine: &Engine) -> ReadOutcome {
         });
     }
     plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
-    encode(&PluginListBody { plugins }, "plugins list")
+    PluginListBody { plugins }
+}
+
+fn plugins_list(engine: &Engine) -> ReadOutcome {
+    encode(&plugins_list_body(engine), "plugins list")
 }
 
 #[derive(Serialize)]
-struct PluginInstanceDetail {
-    instance_id: String,
-    state: String,
+pub(super) struct PluginInstanceDetail {
+    pub(super) instance_id: String,
+    pub(super) state: String,
 }
 
 #[derive(Serialize)]
-struct PluginDetail {
-    plugin_id: String,
-    installed: bool,
-    version: Option<String>,
-    singleton: Option<bool>,
+pub(super) struct PluginDetail {
+    pub(super) plugin_id: String,
+    pub(super) installed: bool,
+    pub(super) version: Option<String>,
+    pub(super) singleton: Option<bool>,
     /// SHA-256 hex of the installed plugin's on-disk contents
     /// (manifest + wasm + assets). `None` when the plugin
     /// is running-but-not-installed (dev-time argv-driven
@@ -753,16 +765,20 @@ struct PluginDetail {
     /// Round-1 F3 on PR #120: the template's documented
     /// contract promised this field; the pre-fix shape
     /// silently dropped it.
-    content_digest: Option<String>,
+    pub(super) content_digest: Option<String>,
     /// C1b host-minted per-install UUID (`inst-<32 hex>`).
     /// Uninstall + reinstall of the same `plugin_id`
     /// produces a different UUID. `None` alongside
     /// `content_digest` on the not-installed path.
-    installation_uuid: Option<String>,
-    instances: Vec<PluginInstanceDetail>,
+    pub(super) installation_uuid: Option<String>,
+    pub(super) instances: Vec<PluginInstanceDetail>,
 }
 
-fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
+/// Build the `oxidhome://plugins/{id}` wire body without
+/// encoding. Returns `None` when the plugin is neither
+/// installed nor running — the caller maps `None` to the
+/// surface-appropriate "not found" outcome.
+pub(super) fn plugins_detail_body(engine: &Engine, id: &str) -> Option<PluginDetail> {
     let installed = engine.installed_plugins().get(id);
     let mut instances = Vec::new();
     for handle in engine.instances().list() {
@@ -774,11 +790,9 @@ fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
         }
     }
     if installed.is_none() && instances.is_empty() {
-        return ReadOutcome::NotFound(format!(
-            "plugin {id} is not installed and has no running instances",
-        ));
+        return None;
     }
-    let detail = PluginDetail {
+    Some(PluginDetail {
         plugin_id: id.into(),
         installed: installed.is_some(),
         version: installed.as_ref().map(|p| p.version.clone()),
@@ -786,8 +800,16 @@ fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
         content_digest: installed.as_ref().map(|p| p.content_digest.to_string()),
         installation_uuid: installed.as_ref().map(|p| p.installation_uuid.to_string()),
         instances,
-    };
-    encode(&detail, "plugin detail")
+    })
+}
+
+fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
+    match plugins_detail_body(engine, id) {
+        Some(detail) => encode(&detail, "plugin detail"),
+        None => ReadOutcome::NotFound(format!(
+            "plugin {id} is not installed and has no running instances",
+        )),
+    }
 }
 
 // ── Events ────────────────────────────────────────────────────────

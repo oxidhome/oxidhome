@@ -1305,3 +1305,284 @@ async fn events_history_response_keeps_text_mirror_for_legacy_clients() {
         "structuredContent must still carry the parsed body; got {response}",
     );
 }
+
+// ── 14.3d — plugins.list + plugins.show ─────────────────────────
+
+/// 14.3d: both plugin tools are catalogued with read-only
+/// annotations and appropriate schemas — `plugins.list` takes
+/// no arguments, `plugins.show` requires `plugin_id`.
+#[tokio::test(flavor = "current_thread")]
+async fn list_tools_advertises_plugins_list_and_show() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+
+    let list = tools
+        .iter()
+        .find(|t| t["name"] == "plugins.list")
+        .expect("plugins.list in the catalogue");
+    assert_eq!(list["title"], "List plugins");
+    assert_eq!(list["annotations"]["readOnlyHint"], true);
+    assert_eq!(list["annotations"]["destructiveHint"], false);
+    assert_eq!(list["annotations"]["openWorldHint"], false);
+    assert_eq!(list["inputSchema"]["additionalProperties"], false);
+    assert!(
+        list["inputSchema"]["required"].is_null()
+            || list["inputSchema"]["required"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+        "plugins.list takes no arguments; got {list}",
+    );
+
+    let show = tools
+        .iter()
+        .find(|t| t["name"] == "plugins.show")
+        .expect("plugins.show in the catalogue");
+    assert_eq!(show["title"], "Show plugin detail");
+    assert_eq!(show["annotations"]["readOnlyHint"], true);
+    assert_eq!(show["annotations"]["destructiveHint"], false);
+    assert_eq!(show["annotations"]["openWorldHint"], false);
+    let required = show["inputSchema"]["required"]
+        .as_array()
+        .expect("plugins.show has required fields");
+    assert!(
+        required.iter().any(|v| v == "plugin_id"),
+        "plugins.show must require plugin_id; got {required:?}",
+    );
+}
+
+/// 14.3d: a token without `plugins:list` cannot invoke either
+/// tool.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_tools_require_plugins_list_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for name in ["plugins.list", "plugins.show"] {
+        let arguments = if name == "plugins.show" {
+            json!({"plugin_id": "example.mcp-plugins-scope"})
+        } else {
+            json!({})
+        };
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": name, "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32001,
+            "{name}: devices:list must not satisfy plugins:list; got {response}",
+        );
+    }
+}
+
+/// 14.3d: `plugins.list` on a fresh engine returns
+/// `structuredContent = {"plugins": []}`.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_list_empty_engine_returns_empty_list() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.list", "arguments": {}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "fresh engine list must succeed; got {response}"
+    );
+    let plugins = result["structuredContent"]["plugins"]
+        .as_array()
+        .expect("structuredContent.plugins must be an array");
+    assert!(
+        plugins.is_empty(),
+        "fresh engine has no plugins; got {plugins:?}",
+    );
+}
+
+/// 14.3d: `plugins.show` on an unknown plugin returns an
+/// application-level `isError = true` (not a JSON-RPC
+/// protocol error) — mirrors the resource-side `NotFound`
+/// shape. Message is human-readable.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_show_unknown_returns_tool_level_error() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.show", "arguments": {"plugin_id": "example.does-not-exist"}}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "not-found is tool-level, not protocol; got {response}"
+    );
+    let result = &response["result"];
+    assert_eq!(
+        result["isError"], true,
+        "must surface as tool-level error; got {response}"
+    );
+    let content = result["content"].as_array().expect("content array");
+    let text = content[0]["text"].as_str().expect("text content");
+    assert!(
+        text.contains("example.does-not-exist"),
+        "error must name the missing plugin; got {text}",
+    );
+}
+
+/// 14.3d: `plugins.show` rejects missing / empty / unknown
+/// fields as `-32602 INVALID_PARAMS` — the standard tool
+/// argument-validation contract.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_show_rejects_malformed_arguments() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("missing plugin_id", json!({})),
+        ("empty plugin_id", json!({"plugin_id": ""})),
+        ("unknown field", json!({"plugin_id": "x", "extra": 1})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "plugins.show", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// 14.3d: `plugins.list` lands in the audit ledger under
+/// `mcp.tool.plugins.list` with `decision = "allow"` and
+/// `execution_outcome = NULL` (host-state read, no plugin
+/// reached).
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_list_lands_in_the_audit_log() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.list", "arguments": {}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.plugins.list")
+        .expect("plugins.list row");
+    assert_eq!(row.status, 200);
+    assert_eq!(row.decision, "allow");
+    assert!(
+        row.execution_outcome.is_none(),
+        "read tools leave outcome NULL"
+    );
+    assert!(row.finalized_ms.is_some(), "finalize must have landed");
+}
+
+/// 14.3d: `plugins.show` on a not-found target still audits
+/// as `status = 200` + `decision = "allow"` (the caller was
+/// authorised; the target just didn't exist). Same shape as
+/// the resource-side `NotFound` handling.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_show_not_found_still_audits_as_allow() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.show", "arguments": {"plugin_id": "example.audit-nf"}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.plugins.show")
+        .expect("plugins.show row");
+    assert_eq!(row.status, 200);
+    assert_eq!(row.decision, "allow");
+    assert!(row.finalized_ms.is_some(), "finalize must have landed");
+}
+
+/// 14.3d: `plugins.list` and `plugins.show` responses keep
+/// the text mirror alongside `structuredContent` for legacy
+/// clients — same rule as the other read tools.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_list_response_keeps_text_mirror_for_legacy_clients() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.list", "arguments": {}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(result["isError"], true);
+    let content = result["content"].as_array().expect("content array");
+    let text = content[0]["text"].as_str().expect("text content");
+    let parsed: Value = serde_json::from_str(text).expect("text mirror is JSON");
+    assert!(
+        parsed["plugins"].is_array(),
+        "text mirror must carry the same body; got {text}"
+    );
+    assert!(
+        result["structuredContent"]["plugins"].is_array(),
+        "structuredContent must still carry the parsed body; got {response}",
+    );
+}
