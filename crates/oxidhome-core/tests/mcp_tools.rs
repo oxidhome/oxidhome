@@ -2265,6 +2265,79 @@ async fn plugins_start_end_to_end_boots_an_installed_plugin() {
     handle.stop().await.expect("stop");
 }
 
+/// Round-1 P1 on PR #133: `config_overrides` is documented as
+/// `type: "object"`. Explicit JSON `null`, scalars, and arrays
+/// must land as `INVALID_PARAMS` at the tool boundary — not
+/// silently coerce to `None` (which would start with manifest
+/// defaults) and not slip past into the loader (where scalars
+/// and arrays only fail after a supervisor has been spawned).
+/// Omission remains valid (`None` → manifest defaults, as
+/// designed).
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_start_rejects_non_object_config_overrides() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, config_overrides) in [
+        ("null", json!(null)),
+        ("string scalar", json!("value")),
+        ("integer scalar", json!(42)),
+        ("boolean scalar", json!(true)),
+        ("array", json!(["a", "b"])),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "plugins.start", "arguments": {
+                "plugin_id": "example.config-guard",
+                "config_overrides": config_overrides,
+            }}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: non-object config_overrides must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// Round-1 P1 boundary on PR #133: omitting `config_overrides`
+/// still works (the field is optional; `None` → manifest
+/// defaults). Locks in that the fix only shuts down the
+/// non-object shapes, not the "no overrides" happy path.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_start_omitted_config_overrides_still_valid() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    // No plugin installed; the response should still be a
+    // tool-level `not_installed` error, not an INVALID_PARAMS
+    // — proving args deserialisation succeeded past the point
+    // where `config_overrides = null` would have failed pre-fix.
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.start", "arguments": {"plugin_id": "example.absent-omit"}}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "omitted config_overrides must not be INVALID_PARAMS; got {response}",
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["kind"],
+        "not_installed"
+    );
+}
+
 /// 14.3f + Round-1 P2 lessons: `plugins.start` lands in the
 /// audit ledger with `execution_outcome` + `domain_error` NULL
 /// — host lifecycle actions, no plugin `execute-command`

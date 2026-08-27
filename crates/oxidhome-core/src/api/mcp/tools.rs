@@ -2083,8 +2083,41 @@ struct PluginsStartArgs {
     // (which for start means "instance_id = plugin_id").
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     instance_id: Option<String>,
-    #[serde(default)]
+    // Round-1 P1 on PR #133: same null-guard as
+    // `instance_id`, plus a type-check that only accepts a
+    // JSON object. Pre-fix, `Option<toml::Value>` accepted
+    // explicit `null` (→ `None`, silently starting with
+    // manifest defaults) and non-table scalars/arrays (which
+    // only failed after the supervisor was already spawned).
+    // The schema advertises `type: "object"`; enforce it here.
+    #[serde(default, deserialize_with = "deserialize_optional_toml_table")]
     config_overrides: Option<toml::Value>,
+}
+
+/// Enforces the `config_overrides` field's schema at the tool
+/// boundary: absent → `None` (via `#[serde(default)]` on the
+/// field), object → `Some(toml::Value::Table)`, everything
+/// else (explicit `null`, scalars, arrays) → a
+/// `deserialize`-time error that lands as
+/// `INVALID_PARAMS`. Converting through
+/// `serde_json::Value` first makes the type-check explicit
+/// and keeps the error message deterministic across serde
+/// versions.
+fn deserialize_optional_toml_table<'de, D>(deserializer: D) -> Result<Option<toml::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match &value {
+        serde_json::Value::Object(_) => {
+            let toml_value =
+                serde_json::from_value::<toml::Value>(value).map_err(serde::de::Error::custom)?;
+            Ok(Some(toml_value))
+        }
+        _ => Err(serde::de::Error::custom(
+            "config_overrides must be a JSON object; null, scalars, and arrays are rejected",
+        )),
+    }
 }
 
 #[derive(Serialize)]
