@@ -15,6 +15,9 @@
 //!   protection).
 //! - `logs.query` (14.3b — read-only, gated on `logs:read`;
 //!   tool-shape of the `oxidhome://logs` resource).
+//! - `events.history` (14.3c — read-only, gated on
+//!   `events:read`; tool-shape of the `oxidhome://events`
+//!   resource).
 //!
 //! # Layout
 //!
@@ -46,7 +49,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::Engine;
 use crate::api::auth::wit_error_kind;
-use crate::api::scopes::{DEVICES_COMMAND, LOGS_READ, require_scope};
+use crate::api::scopes::{DEVICES_COMMAND, EVENTS_READ, LOGS_READ, require_scope};
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
@@ -96,6 +99,27 @@ pub(super) fn list_tools() -> Vec<Tool> {
         // state; all three defaults would misclassify it
         // (`read_only_hint = false`, `destructive_hint = true`,
         // `open_world_hint = true`).
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .open_world(false),
+        ),
+        Tool::new(
+            "events.history",
+            "Historical event query against the durable `EventLog`. Returns a JSON list \
+             of `HistoricalEvent` rows matching the filters (state changes, button \
+             presses, inference results, custom plugin events). Read-only; gated on \
+             `events:read`. Same wire shape as `oxidhome://events` — a client that \
+             reads the resource and one that calls this tool see identical row bodies. \
+             Durations (`since`, `until`) use `Ns|Nm|Nh|Nd` suffixes (`60s`, `5m`, \
+             `2h`, `1d`) and resolve relative to `now`. `topic` matches exactly; \
+             `topic_prefix` prefix-matches (mutually exclusive with `topic` — supply \
+             at most one). Response size is bounded server-side; `limit` is clamped \
+             to 100 rows.",
+            Arc::new(events_history_schema()),
+        )
+        .with_title("Query event history")
         .annotate(
             ToolAnnotations::new()
                 .read_only(true)
@@ -362,6 +386,7 @@ pub(super) async fn call(
     let (family, required) = match name {
         "device.send_command" => ("device.send_command", DEVICES_COMMAND),
         "logs.query" => ("logs.query", LOGS_READ),
+        "events.history" => ("events.history", EVENTS_READ),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -419,6 +444,7 @@ pub(super) async fn call(
     let outcome = match name {
         "device.send_command" => device_send_command_call(engine.clone(), request.arguments).await,
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
+        "events.history" => events_history_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -1195,6 +1221,236 @@ async fn logs_query_call(
         // (`-32602` / 400). Arguments were fine; the
         // response is too large. Matches the resource-side
         // outcome shape.
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+// ── events.history ──────────────────────────────────────────────
+
+/// Inclusive ceiling for `after_id` / `before_id`. See the
+/// call site in [`events_history_call`] for the rationale
+/// (store clamps `> i64::MAX` to `i64::MAX`, silently
+/// widening the query).
+#[allow(clippy::cast_sign_loss)]
+const CURSOR_MAX: u64 = i64::MAX as u64;
+
+fn events_history_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "since": {
+                "type": "string",
+                "description": "Relative duration: `Ns|Nm|Nh|Nd`. Resolves to `now - since`. e.g. `10m`, `2h`.",
+            },
+            "until": {
+                "type": "string",
+                "description": "Relative duration (same grammar as `since`). Resolves to `now - until`.",
+            },
+            "device":   { "type": "string", "description": "Filter by device id." },
+            "instance": { "type": "string", "description": "Filter by owning instance id." },
+            "plugin":   { "type": "string", "description": "Filter by owning plugin id." },
+            "topic": {
+                "type": "string",
+                "description": "Exact-match topic (e.g. `switch`, `button`, `inference`). Mutually exclusive with `topic_prefix` — supply at most one.",
+            },
+            "topic_prefix": {
+                "type": "string",
+                "description": "Prefix-match on topic (e.g. `automation.` matches `automation.morning`, `automation.evening`, …). Mutually exclusive with `topic`.",
+            },
+            "after_id": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": i64::MAX,
+                "description": "Cursor: return only rows with `id > after_id`. Pairs with tail-client resume so a reconnect after N ms doesn't gap or duplicate rows.",
+            },
+            "before_id": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": i64::MAX,
+                "description": "Cursor: return only rows with `id < before_id`. Descending pagination — pass the lowest id from the previous batch to walk backwards.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": i64::from(crate::api::mcp::resources::EVENTS_QUERY_MAX_LIMIT),
+                "description": "Max rows to return (default 100, cap 100).",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventsHistoryArgs {
+    since: Option<String>,
+    until: Option<String>,
+    device: Option<String>,
+    instance: Option<String>,
+    plugin: Option<String>,
+    topic: Option<String>,
+    topic_prefix: Option<String>,
+    after_id: Option<u64>,
+    before_id: Option<u64>,
+    limit: Option<u32>,
+}
+
+// Linear top-to-bottom decision flow (parse → duration
+// resolve → topic → limit → gate → spawn_blocking →
+// encode). Splitting it into helpers would hide the sequence
+// without shrinking any individual step; matches the shape of
+// `logs_query_call`.
+#[allow(clippy::too_many_lines)]
+async fn events_history_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    // `arguments = None` → empty filter, latest 100 rows.
+    let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
+    let args: EventsHistoryArgs = match serde_json::from_value(args_value) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "events.history arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+
+    let now = crate::state::event_log::now_unix_ms();
+    let since_ms = match args
+        .since
+        .as_deref()
+        .map(super::resources::parse_duration_ms)
+        .transpose()
+    {
+        Ok(v) => v.map(|d| now.saturating_sub(d)),
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!("invalid `since` value: {err}"));
+        }
+    };
+    let until_ms = match args
+        .until
+        .as_deref()
+        .map(super::resources::parse_duration_ms)
+        .transpose()
+    {
+        Ok(v) => v.map(|d| now.saturating_sub(d)),
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!("invalid `until` value: {err}"));
+        }
+    };
+
+    // `topic` (exact) and `topic_prefix` are mutually
+    // exclusive — same policy as the resource-side handler:
+    // prefer prefix when both are set and warn so an operator
+    // can spot the ambiguous client.
+    let topic = match (args.topic, args.topic_prefix) {
+        (topic_exact, Some(p)) => {
+            if let Some(exact) = &topic_exact {
+                tracing::warn!(
+                    target: "mcp.tool.events.history",
+                    topic_exact = %exact,
+                    topic_prefix = %p,
+                    "MCP events.history: both `topic` and `topic_prefix` supplied — using `topic_prefix`",
+                );
+            }
+            Some((p, crate::state::TopicMatch::Prefix))
+        }
+        (Some(t), None) => Some((t, crate::state::TopicMatch::Exact)),
+        (None, None) => None,
+    };
+
+    let limit = args
+        .limit
+        .unwrap_or(super::resources::EVENTS_QUERY_DEFAULT_LIMIT)
+        .clamp(1, super::resources::EVENTS_QUERY_MAX_LIMIT);
+
+    // Cursor IDs are wire-typed as `u64` but the store binds
+    // them as SQLite `INTEGER` (signed 64-bit). Anything above
+    // `i64::MAX` is silently clamped to `i64::MAX` by the store,
+    // which would turn e.g. `before_id: u64::MAX` (a client
+    // intending "start from the newest row") into `id <
+    // i64::MAX` — a query broadening rather than restricting.
+    // The advertised JSON Schema already caps both at
+    // `i64::MAX`; enforce the same bound at the tool boundary
+    // so an over-cap cursor lands as `INVALID_PARAMS` instead
+    // of silently succeeding with the wrong page.
+    if let Some(v) = args.after_id
+        && v > CURSOR_MAX
+    {
+        return ToolOutcome::InvalidParams(format!(
+            "invalid `after_id` value `{v}`; must be <= {CURSOR_MAX}",
+        ));
+    }
+    if let Some(v) = args.before_id
+        && v > CURSOR_MAX
+    {
+        return ToolOutcome::InvalidParams(format!(
+            "invalid `before_id` value `{v}`; must be <= {CURSOR_MAX}",
+        ));
+    }
+
+    let event_query = crate::state::EventQuery {
+        since_ms,
+        until_ms,
+        device_id: args.device,
+        instance_id: args.instance,
+        plugin_id: args.plugin,
+        topic,
+        after_id: args.after_id,
+        before_id: args.before_id,
+    };
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    // Shared `STORE_QUERY_SEMAPHORE` — permit MOVES into the
+    // closure so a cancelled outer future doesn't leave
+    // detached blocking tasks piled up on the mutex.
+    // Saturation surfaces as `Busy` (`-32004` / 503) — same
+    // shape as the resource-side outcome.
+    let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+        tracing::warn!(
+            cap = STORE_QUERY_MAX,
+            "MCP events.history store-query saturated — refusing call",
+        );
+        return ToolOutcome::Busy(format!(
+            "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
+        ));
+    };
+    let event_log = engine.event_log();
+    let join = tokio::task::spawn_blocking(move || {
+        let _guard = query_permit;
+        event_log.query(&event_query, limit_usize)
+    })
+    .await;
+    let rows = match join {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            tracing::error!(target: "mcp.tool.events.history", %err, "event query failed");
+            return ToolOutcome::Internal("event query failed".into());
+        }
+        Err(join_err) => {
+            tracing::error!(target: "mcp.tool.events.history", %join_err, "event query task panicked");
+            return ToolOutcome::Internal("event query task panicked".into());
+        }
+    };
+
+    let events: Vec<_> = rows
+        .into_iter()
+        .map(super::super::server::WireHistoricalEvent::from_row)
+        .collect();
+    let body = super::resources::EventsBody { events };
+    match super::resources::encode_body_capped(&body, "events.history", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            // Pure host-state read — plugin was never reached,
+            // so `execution_outcome` stays `None` per the
+            // audit ledger contract.
+            plugin_reached: false,
+        },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
         EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
     }

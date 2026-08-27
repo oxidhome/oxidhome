@@ -795,7 +795,7 @@ fn plugins_detail(engine: &Engine, id: &str) -> ReadOutcome {
 /// Default `limit` when the caller omits one. Matches the
 /// REST `/api/v1/events` endpoint so a client that pins the
 /// same page size cross-transport sees identical pagination.
-const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
+pub(super) const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
 /// Ceiling on a single events query. Deliberately tighter
 /// than the REST endpoint's `1_000` — an event payload is
 /// capped at [`crate::runtime::state::MAX_EVENT_PAYLOAD_BYTES`]
@@ -807,7 +807,7 @@ const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
 /// that still delivers plenty of pagination granularity for
 /// LLM agents (which usually iterate in pages of tens rather
 /// than thousands).
-const EVENTS_QUERY_MAX_LIMIT: u32 = 100;
+pub(super) const EVENTS_QUERY_MAX_LIMIT: u32 = 100;
 
 /// Default / ceiling for `logs`. Same reasoning as
 /// [`EVENTS_QUERY_MAX_LIMIT`]: a log row's `message` +
@@ -819,9 +819,14 @@ const EVENTS_QUERY_MAX_LIMIT: u32 = 100;
 pub(super) const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
 pub(super) const LOGS_QUERY_MAX_LIMIT: u32 = 100;
 
+/// Wire body shared between the `oxidhome://events`
+/// resource read and the `events.history` tool (14.3c). Both
+/// surfaces serialise the same shape so a client sees the
+/// same JSON regardless of whether it went through
+/// `resources/read` or `tools/call`.
 #[derive(Serialize)]
-struct EventsBody {
-    events: Vec<super::super::server::WireHistoricalEvent>,
+pub(super) struct EventsBody {
+    pub(super) events: Vec<super::super::server::WireHistoricalEvent>,
 }
 
 /// Keys the `oxidhome://events` filter recognizes. Anything

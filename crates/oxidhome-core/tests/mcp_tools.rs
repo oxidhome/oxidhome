@@ -1034,3 +1034,274 @@ async fn logs_query_advertises_read_only_annotations() {
     assert_eq!(annotations["destructiveHint"], false);
     assert_eq!(annotations["openWorldHint"], false);
 }
+
+/// 14.3c: `events.history` is catalogued with a JSON Schema
+/// that has no required fields, an `additionalProperties:
+/// false` guard, and read-only annotations. Parallels
+/// [`list_tools_advertises_logs_query`].
+#[tokio::test(flavor = "current_thread")]
+async fn list_tools_advertises_events_history() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "events.history")
+        .expect("events.history in the catalogue");
+    assert_eq!(tool["title"], "Query event history");
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    assert!(
+        schema["required"].is_null() || schema["required"].as_array().is_none_or(Vec::is_empty),
+        "events.history must not require any fields; got {schema}",
+    );
+    // Cursor fields are exposed with a sane lower bound.
+    assert_eq!(schema["properties"]["after_id"]["minimum"], 0);
+    assert_eq!(schema["properties"]["before_id"]["minimum"], 0);
+}
+
+/// 14.3c: `events.history` advertises the read-only
+/// annotation triplet. Parallels
+/// [`logs_query_advertises_read_only_annotations`].
+#[tokio::test(flavor = "current_thread")]
+async fn events_history_advertises_read_only_annotations() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tool = response["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "events.history")
+        .expect("events.history catalogued");
+    let annotations = &tool["annotations"];
+    assert_eq!(annotations["readOnlyHint"], true);
+    assert_eq!(annotations["destructiveHint"], false);
+    assert_eq!(annotations["openWorldHint"], false);
+}
+
+/// 14.3c: a token without `events:read` cannot invoke
+/// `events.history`. Parallels
+/// [`logs_query_requires_logs_read_scope`].
+#[tokio::test(flavor = "current_thread")]
+async fn events_history_requires_events_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.history", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:list must not satisfy events:read; got {response}",
+    );
+}
+
+/// 14.3c: empty-arg `events.history` on a fresh engine
+/// returns `structuredContent = {"events": []}`. Proves
+/// dispatch works and the wire body has the resource-side
+/// shape.
+#[tokio::test(flavor = "current_thread")]
+async fn events_history_empty_engine_returns_empty_list() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.history", "arguments": {}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "empty engine + empty filter must succeed; got {response}",
+    );
+    let structured = &result["structuredContent"];
+    let events = structured["events"]
+        .as_array()
+        .expect("structuredContent.events must be an array");
+    assert!(
+        events.is_empty(),
+        "fresh engine has no rows; got {events:?}",
+    );
+}
+
+/// 14.3c: malformed typed filters land as `-32602
+/// INVALID_PARAMS` — bogus `since`, non-integer `after_id`,
+/// and unknown top-level fields are all rejected without
+/// touching the store.
+#[tokio::test(flavor = "current_thread")]
+async fn events_history_rejects_malformed_filters() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("bad since", json!({"since": "nope"})),
+        ("non-integer after_id", json!({"after_id": "abc"})),
+        ("unknown field", json!({"topic": "switch", "topik": "typo"})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "events.history", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// 14.3c: `events.history` lands in the audit ledger as
+/// `mcp.tool.events.history` with `decision = "allow"` and
+/// `execution_outcome = NULL` (read tools never reach a
+/// plugin). Parallels [`logs_query_lands_in_the_audit_log`].
+#[tokio::test(flavor = "multi_thread")]
+async fn events_history_lands_in_the_audit_log() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.history", "arguments": {"topic_prefix": "automation."}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.events.history")
+        .expect("events.history row");
+    assert_eq!(row.status, 200);
+    assert_eq!(row.decision, "allow");
+    assert!(
+        row.execution_outcome.is_none(),
+        "read tools must leave execution_outcome NULL; got {:?}",
+        row.execution_outcome,
+    );
+    assert!(row.domain_error.is_none());
+    assert!(row.finalized_ms.is_some(), "finalize must have landed");
+    assert!(row.intent_ms <= row.finalized_ms.unwrap());
+}
+
+/// Round-1 P2 on PR #130: cursor IDs deserialize as `u64` but
+/// the store binds them as `SQLite` `INTEGER` (signed 64-bit);
+/// anything above `i64::MAX` is clamped to `i64::MAX` by the
+/// store, so e.g. `before_id: u64::MAX` would silently become
+/// `id < i64::MAX` — a broadening. Enforce the schema's
+/// `maximum: i64::MAX` at the tool boundary so over-cap
+/// cursors land as `INVALID_PARAMS` instead.
+#[tokio::test(flavor = "current_thread")]
+async fn events_history_rejects_out_of_range_cursors() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let over_cap: u64 = (i64::MAX as u64) + 1;
+    for (label, arguments) in [
+        ("after_id over cap", json!({"after_id": over_cap})),
+        ("before_id over cap", json!({"before_id": over_cap})),
+        ("u64::MAX before_id", json!({"before_id": u64::MAX})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "events.history", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: cursor above i64::MAX must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+
+    // Boundary — exactly `i64::MAX` is accepted (the schema
+    // says `maximum: i64::MAX`, inclusive).
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.history", "arguments": {"before_id": i64::MAX as u64}}),
+    )
+    .await;
+    assert_ne!(
+        response["result"]["isError"], true,
+        "i64::MAX cursor is the inclusive ceiling; must succeed. got {response}",
+    );
+}
+
+/// 14.3c: `events.history` responses keep the text mirror
+/// alongside `structuredContent` — same rule as `logs.query`:
+/// legacy MCP clients that predate `structuredContent` still
+/// consume `content[0].text`.
+#[tokio::test(flavor = "current_thread")]
+async fn events_history_response_keeps_text_mirror_for_legacy_clients() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.history", "arguments": {}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(result["isError"], true);
+    let content = result["content"].as_array().expect("content array");
+    assert!(
+        !content.is_empty(),
+        "legacy clients must receive `content[0].text` too; got {content:?}",
+    );
+    let text = content[0]["text"].as_str().expect("text content");
+    let parsed: Value = serde_json::from_str(text).expect("text mirror is JSON");
+    assert!(
+        parsed["events"].is_array(),
+        "text mirror must carry the same body as structuredContent; got {text}",
+    );
+    assert!(
+        result["structuredContent"]["events"].is_array(),
+        "structuredContent must still carry the parsed body; got {response}",
+    );
+}
