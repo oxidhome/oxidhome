@@ -1218,6 +1218,56 @@ async fn events_history_lands_in_the_audit_log() {
     assert!(row.intent_ms <= row.finalized_ms.unwrap());
 }
 
+/// Round-1 P2 on PR #130: cursor IDs deserialize as `u64` but
+/// the store binds them as `SQLite` `INTEGER` (signed 64-bit);
+/// anything above `i64::MAX` is clamped to `i64::MAX` by the
+/// store, so e.g. `before_id: u64::MAX` would silently become
+/// `id < i64::MAX` — a broadening. Enforce the schema's
+/// `maximum: i64::MAX` at the tool boundary so over-cap
+/// cursors land as `INVALID_PARAMS` instead.
+#[tokio::test(flavor = "current_thread")]
+async fn events_history_rejects_out_of_range_cursors() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let over_cap: u64 = (i64::MAX as u64) + 1;
+    for (label, arguments) in [
+        ("after_id over cap", json!({"after_id": over_cap})),
+        ("before_id over cap", json!({"before_id": over_cap})),
+        ("u64::MAX before_id", json!({"before_id": u64::MAX})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "events.history", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: cursor above i64::MAX must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+
+    // Boundary — exactly `i64::MAX` is accepted (the schema
+    // says `maximum: i64::MAX`, inclusive).
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.history", "arguments": {"before_id": i64::MAX as u64}}),
+    )
+    .await;
+    assert_ne!(
+        response["result"]["isError"], true,
+        "i64::MAX cursor is the inclusive ceiling; must succeed. got {response}",
+    );
+}
+
 /// 14.3c: `events.history` responses keep the text mirror
 /// alongside `structuredContent` — same rule as `logs.query`:
 /// legacy MCP clients that predate `structuredContent` still

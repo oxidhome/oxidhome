@@ -1228,6 +1228,13 @@ async fn logs_query_call(
 
 // ── events.history ──────────────────────────────────────────────
 
+/// Inclusive ceiling for `after_id` / `before_id`. See the
+/// call site in [`events_history_call`] for the rationale
+/// (store clamps `> i64::MAX` to `i64::MAX`, silently
+/// widening the query).
+#[allow(clippy::cast_sign_loss)]
+const CURSOR_MAX: u64 = i64::MAX as u64;
+
 fn events_history_schema() -> serde_json::Map<String, JsonValue> {
     let schema = json!({
         "type": "object",
@@ -1362,6 +1369,31 @@ async fn events_history_call(
         .limit
         .unwrap_or(super::resources::EVENTS_QUERY_DEFAULT_LIMIT)
         .clamp(1, super::resources::EVENTS_QUERY_MAX_LIMIT);
+
+    // Cursor IDs are wire-typed as `u64` but the store binds
+    // them as SQLite `INTEGER` (signed 64-bit). Anything above
+    // `i64::MAX` is silently clamped to `i64::MAX` by the store,
+    // which would turn e.g. `before_id: u64::MAX` (a client
+    // intending "start from the newest row") into `id <
+    // i64::MAX` — a query broadening rather than restricting.
+    // The advertised JSON Schema already caps both at
+    // `i64::MAX`; enforce the same bound at the tool boundary
+    // so an over-cap cursor lands as `INVALID_PARAMS` instead
+    // of silently succeeding with the wrong page.
+    if let Some(v) = args.after_id
+        && v > CURSOR_MAX
+    {
+        return ToolOutcome::InvalidParams(format!(
+            "invalid `after_id` value `{v}`; must be <= {CURSOR_MAX}",
+        ));
+    }
+    if let Some(v) = args.before_id
+        && v > CURSOR_MAX
+    {
+        return ToolOutcome::InvalidParams(format!(
+            "invalid `before_id` value `{v}`; must be <= {CURSOR_MAX}",
+        ));
+    }
 
     let event_query = crate::state::EventQuery {
         since_ms,
