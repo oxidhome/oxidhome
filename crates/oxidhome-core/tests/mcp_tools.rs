@@ -1554,6 +1554,52 @@ async fn plugins_show_not_found_still_audits_as_allow() {
     assert!(row.finalized_ms.is_some(), "finalize must have landed");
 }
 
+/// Round-1 P2 on PR #131: `plugins.list` advertises
+/// `additionalProperties: false` in its schema but the pre-fix
+/// dispatch discarded `request.arguments`, letting unknown
+/// fields silently succeed. Enforce the empty-args contract at
+/// the tool boundary so a client sending anything besides `{}`
+/// (or nothing) gets `-32602 INVALID_PARAMS`.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_list_rejects_unknown_arguments() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("unknown top-level field", json!({"junk": 1})),
+        ("multiple unknown fields", json!({"a": "b", "c": 2})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "plugins.list", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: unknown fields must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+
+    // Boundary — `{}` and omitting `arguments` altogether are
+    // both accepted (the schema has no required fields).
+    for arguments_value in [Some(json!({})), None] {
+        let mut params = json!({"name": "plugins.list"});
+        if let Some(args) = arguments_value {
+            params["arguments"] = args;
+        }
+        let response = call(&router, &bearer, &session, "tools/call", params).await;
+        assert_ne!(
+            response["result"]["isError"], true,
+            "empty / absent arguments must succeed; got {response}",
+        );
+    }
+}
+
 /// 14.3d: `plugins.list` and `plugins.show` responses keep
 /// the text mirror alongside `structuredContent` for legacy
 /// clients — same rule as the other read tools.

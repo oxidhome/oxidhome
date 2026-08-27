@@ -491,7 +491,7 @@ pub(super) async fn call(
         "device.send_command" => device_send_command_call(engine.clone(), request.arguments).await,
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => events_history_call(engine.clone(), request.arguments).await,
-        "plugins.list" => plugins_list_call(&engine),
+        "plugins.list" => plugins_list_call(&engine, request.arguments),
         "plugins.show" => plugins_show_call(&engine, request.arguments),
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
@@ -1522,7 +1522,29 @@ fn plugins_list_schema() -> serde_json::Map<String, JsonValue> {
     }
 }
 
-fn plugins_list_call(engine: &Engine) -> ToolOutcome {
+/// Empty-args deserialiser for `plugins.list`. `deny_unknown_fields`
+/// on a zero-field struct enforces the schema's
+/// `additionalProperties: false` at the tool boundary — a client
+/// sending `{"junk": 1}` (or any unknown field) lands as
+/// `INVALID_PARAMS` instead of silently succeeding.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsListArgs {}
+
+fn plugins_list_call(
+    engine: &Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    // Absent arguments and `{}` are both valid — the schema
+    // has no required fields. Round-1 P2 on PR #131: any
+    // other content violates `additionalProperties: false`.
+    let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
+    if let Err(err) = serde_json::from_value::<PluginsListArgs>(args_value) {
+        return ToolOutcome::InvalidParams(format!(
+            "plugins.list arguments do not match the input schema: {err}",
+        ));
+    }
+
     let body = super::resources::plugins_list_body(engine);
     match super::resources::encode_body_capped(&body, "plugins.list", MAX_TOOL_BODY_BYTES) {
         EncodedBody::Value(v) => ToolOutcome::Ok {
