@@ -1632,3 +1632,362 @@ async fn plugins_list_response_keeps_text_mirror_for_legacy_clients() {
         "structuredContent must still carry the parsed body; got {response}",
     );
 }
+
+// ── 14.3e — plugins.stop + plugins.uninstall ────────────────────
+
+fn stage_switch_source(prefix: &str, plugin_id: &str) -> _support::TempDir {
+    let wasm_src = _support::build_example("simulated-switch", "simulated_switch.wasm");
+    let source = _support::tempdir(prefix);
+    std::fs::copy(&wasm_src, source.path().join("simulated_switch.wasm")).expect("copy wasm");
+    std::fs::write(
+        source.path().join("manifest.toml"),
+        format!(
+            r#"manifest_version = 1
+[plugin]
+id = "{plugin_id}"
+name = "MCP plugins.stop/uninstall test"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "simulated_switch.wasm"
+[capabilities]
+declares_devices = ["switch"]
+"#,
+        ),
+    )
+    .expect("write manifest");
+    source
+}
+
+/// 14.3e: both admin tools are catalogued with `destructive`
+/// annotations and require a `plugin_id`.
+#[tokio::test(flavor = "current_thread")]
+async fn list_tools_advertises_plugins_stop_and_uninstall_with_destructive_annotations() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+
+    for name in ["plugins.stop", "plugins.uninstall"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} in the catalogue"));
+        assert_eq!(tool["annotations"]["readOnlyHint"], false, "{name}");
+        assert_eq!(tool["annotations"]["destructiveHint"], true, "{name}");
+        assert_eq!(tool["annotations"]["openWorldHint"], false, "{name}");
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} has required fields"));
+        assert!(
+            required.iter().any(|v| v == "plugin_id"),
+            "{name} must require plugin_id; got {required:?}",
+        );
+    }
+}
+
+/// 14.3e: `plugins.stop` requires `plugins:stop`; devices:list
+/// alone (or even plugins:list) does not satisfy it.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_stop_requires_plugins_stop_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "list-only", &["plugins:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.stop", "arguments": {"plugin_id": "example.does-not-exist"}}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "plugins:list must not satisfy plugins:stop; got {response}",
+    );
+}
+
+/// 14.3e: `plugins.uninstall` requires `plugins:uninstall`.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_uninstall_requires_plugins_uninstall_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "stop-only", &["plugins:stop"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.uninstall", "arguments": {"plugin_id": "example.does-not-exist"}}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "plugins:stop must not satisfy plugins:uninstall; got {response}",
+    );
+}
+
+/// 14.3e: `plugins.stop` rejects missing / empty / unknown
+/// arguments. Same shape as the other admin tools.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_stop_rejects_malformed_arguments() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("missing plugin_id", json!({})),
+        ("empty plugin_id", json!({"plugin_id": ""})),
+        (
+            "empty instance_id",
+            json!({"plugin_id": "x", "instance_id": ""}),
+        ),
+        ("unknown field", json!({"plugin_id": "x", "extra": 1})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "plugins.stop", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// 14.3e: `plugins.stop` on a plugin with no running instances
+/// succeeds idempotently with an empty `stopped` list.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_stop_no_running_instances_returns_empty_list() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.stop", "arguments": {"plugin_id": "example.absent"}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "no-op stop must succeed; got {response}"
+    );
+    let stopped = result["structuredContent"]["stopped"]
+        .as_array()
+        .expect("structuredContent.stopped array");
+    assert!(
+        stopped.is_empty(),
+        "no-op stop returns empty list; got {stopped:?}"
+    );
+}
+
+/// 14.3e: `plugins.stop` end-to-end — boots a real supervised
+/// instance, stops it via the tool, verifies the response
+/// carries the stopped id AND the registry is cleared.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_stop_end_to_end_halts_a_running_instance() {
+    let _wasm = _support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = _support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+
+    let handle = engine
+        .start_instance(switch_dir, "switch-stop-e2e", None)
+        .await
+        .expect("start_instance");
+    handle.wait_for_running().await.expect("running");
+    let plugin_id = handle.plugin_id().to_string();
+
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.stop", "arguments": {"plugin_id": plugin_id}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(result["isError"], true, "stop must succeed; got {response}");
+    let stopped: Vec<&str> = result["structuredContent"]["stopped"]
+        .as_array()
+        .expect("stopped array")
+        .iter()
+        .map(|v| v.as_str().expect("id string"))
+        .collect();
+    assert!(
+        stopped.contains(&"switch-stop-e2e"),
+        "stopped list must name the halted instance; got {stopped:?}",
+    );
+    assert!(
+        engine.instances().get("switch-stop-e2e").is_none(),
+        "registry entry must clear post-stop",
+    );
+}
+
+/// 14.3e: `plugins.uninstall` on a not-installed plugin
+/// surfaces as an application-level `isError: true` with
+/// `domain_kind = "not_installed"` — mirrors the REST 404
+/// shape without leaking JSON-RPC protocol errors for a
+/// state-driven condition.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_uninstall_unknown_plugin_returns_tool_level_error() {
+    // `Engine::new()` has no plugins root and would return
+    // `no_plugins_root` first; give the engine a state dir so
+    // uninstall reaches the `not_installed` check.
+    let state_dir = _support::tempdir("mcp-uninstall-nf-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.uninstall", "arguments": {"plugin_id": "example.absent-uninstall"}}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "not-found is tool-level; got {response}"
+    );
+    let result = &response["result"];
+    assert_eq!(
+        result["isError"], true,
+        "must be tool-level error; got {response}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["kind"], "not_installed");
+    assert_eq!(structured["plugin_id"], "example.absent-uninstall");
+}
+
+/// 14.3e: `plugins.uninstall` refuses when the plugin has
+/// supervised instances still running — carries structured
+/// `kind = "instances_running"` + the offending `running`
+/// list so the caller can call `plugins.stop` and retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_uninstall_refuses_with_running_instances() {
+    let plugin_id = "example.mcp-stop-uninstall";
+    let source = stage_switch_source("mcp-uninstall-running", plugin_id);
+    let state_dir = _support::tempdir("mcp-uninstall-state");
+
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+
+    let installed = engine
+        .installed_plugins()
+        .install(source.path())
+        .expect("install plugin");
+    let installation_uuid = std::sync::Arc::clone(&installed.installation_uuid);
+    let handle = engine
+        .start_installed_instance(
+            installed.path.clone(),
+            "switch-live-1",
+            None,
+            installation_uuid,
+        )
+        .await
+        .expect("start installed instance");
+    handle.wait_for_running().await.expect("running");
+
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.uninstall", "arguments": {"plugin_id": plugin_id}}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "instances-running is tool-level; got {response}"
+    );
+    let result = &response["result"];
+    assert_eq!(
+        result["isError"], true,
+        "must be tool-level error; got {response}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["kind"], "instances_running");
+    let running: Vec<&str> = structured["running"]
+        .as_array()
+        .expect("running array")
+        .iter()
+        .map(|v| v.as_str().expect("string"))
+        .collect();
+    assert!(
+        running.contains(&"switch-live-1"),
+        "running list must name the blocking instance; got {running:?}",
+    );
+
+    // Clean up: stop and let the handle drop.
+    handle.stop().await.expect("stop");
+}
+
+/// 14.3e: mutating admin tools land in the audit ledger under
+/// `mcp.tool.plugins.<action>` with `decision = "allow"` and
+/// `execution_outcome = "success"` (plugin-reaching action —
+/// distinct from the read tools' NULL outcome).
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_stop_lands_in_the_audit_log_with_success_outcome() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    // No-op stop is enough: the tool records
+    // `execution_outcome = "success"` because it drove the
+    // (empty) supervisor loop, not because it observed a
+    // plugin Ok/OkWithState.
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.stop", "arguments": {"plugin_id": "example.noop"}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.plugins.stop")
+        .expect("plugins.stop row");
+    assert_eq!(row.status, 200);
+    assert_eq!(row.decision, "allow");
+    assert_eq!(row.execution_outcome.as_deref(), Some("success"));
+    assert!(row.domain_error.is_none());
+    assert!(row.finalized_ms.is_some());
+}
