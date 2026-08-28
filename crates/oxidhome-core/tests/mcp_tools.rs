@@ -2507,6 +2507,70 @@ async fn plugins_install_rejects_relative_source_dir() {
     }
 }
 
+/// Round-2 P2 on PR #134: `BadManifest.reason` bakes
+/// absolute paths into its own string via
+/// `parsing {path.display()}: …`, so surfacing it in either
+/// `message` or `structuredContent.reason` defeats the path
+/// redaction the outer arm attempts. Return a path-free
+/// generic tag and log the full detail server-side. This test
+/// stages a truly malformed manifest and asserts NEITHER the
+/// source parent NOR the state root appears anywhere in the
+/// wire response.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_bad_manifest_response_carries_no_paths() {
+    let source = _support::tempdir("mcp-install-bad-manifest-src");
+    // Malformed TOML that will fail `toml::from_str`.
+    std::fs::write(
+        source.path().join("manifest.toml"),
+        "this is not = valid TOML: [[[[",
+    )
+    .expect("write bad manifest");
+    let state_dir = _support::tempdir("mcp-install-bad-manifest-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let source_display = source.path().display().to_string();
+    let source_parent_display = source
+        .path()
+        .parent()
+        .expect("source has a parent")
+        .display()
+        .to_string();
+    let state_display = state_dir.path().display().to_string();
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.install", "arguments": {"source_dir": source_display}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_eq!(
+        result["isError"], true,
+        "malformed manifest must be tool-level error"
+    );
+    assert_eq!(result["structuredContent"]["kind"], "bad_manifest");
+
+    let wire = serde_json::to_string(&response).expect("response serialises");
+    for needle in [source_parent_display.as_str(), state_display.as_str()] {
+        assert!(
+            !wire.contains(needle),
+            "wire response must not leak host path fragment `{needle}`; got:\n{wire}",
+        );
+    }
+    // And the structured reason is deliberately absent — a
+    // machine consumer sees only `kind`, no free-form reason
+    // that might be regenerated with paths in a future refactor.
+    assert!(
+        result["structuredContent"]["reason"].is_null(),
+        "structured payload must not carry a reason string; got {result}",
+    );
+}
+
 /// 14.3g: `plugins.install` against a source dir that doesn't
 /// exist lands as a tool-level `isError: true` with structured
 /// `kind = "source_missing"`.

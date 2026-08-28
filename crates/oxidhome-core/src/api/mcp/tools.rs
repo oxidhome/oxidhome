@@ -2396,20 +2396,27 @@ async fn plugins_install_call(
             };
         }
         Ok(Err(crate::state::InstallError::BadManifest { path, reason })) => {
-            // BadManifest.reason is authored by our own parser
-            // over the operator's `manifest.toml`; it's safe to
-            // surface. `path` may be absolute — hand back the
-            // file-name only so we don't echo the operator's
-            // full staging layout to a curious tool caller.
-            let file = path.file_name().map_or_else(
-                || "manifest.toml".into(),
-                |f| f.to_string_lossy().into_owned(),
+            // Round-2 P2 on PR #134: `BadManifest.reason` is
+            // authored by the internal parser and freely
+            // interpolates `path.display()` (`parsing
+            // /operator/staging/manifest.toml: …`, `manifest
+            // /abs/path is invalid: …`), so surfacing it
+            // defeated the redaction on the outer `path`.
+            // Log the full detail server-side; return a
+            // path-free tag to the caller. `path` isn't
+            // structured back either, so neither the source
+            // parent nor the state root can leak via this
+            // arm.
+            tracing::warn!(
+                target: "mcp.tool.plugins.install",
+                path = %path.display(),
+                %reason,
+                "install failed: bad manifest",
             );
             return ToolOutcome::ExecErr {
-                message: format!("bad manifest in `{file}`: {reason}"),
+                message: "bad manifest; see server logs for details".into(),
                 structured: Some(json!({
                     "kind": "bad_manifest",
-                    "reason": reason,
                 })),
                 domain_kind: None,
             };
