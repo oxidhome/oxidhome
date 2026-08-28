@@ -25,13 +25,24 @@ for ::buffa::view::OwnedView<
     ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
         ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
     }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
 }
 /// Full service name for this service.
 pub const HEALTH_SERVICE_SERVICE_NAME: &str = "oxidhome.v1.HealthService";
-/// Static [`Spec`](::connectrpc::Spec) for the server-side `Check` RPC.
-///
-/// The dispatcher surfaces this on
-/// [`RequestContext::spec`](::connectrpc::RequestContext::spec).
+/// Static [`Spec`](::connectrpc::Spec) for the `Check` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const HEALTH_SERVICE_CHECK_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/oxidhome.v1.HealthService/Check",
         ::connectrpc::StreamType::Unary,
@@ -67,7 +78,7 @@ pub const HEALTH_SERVICE_CHECK_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::se
 ///
 /// Request types resolved through `extern_path` (e.g. well-known types
 /// from another crate) use the same wrappers; the crate that owns the
-/// type must be generated with buffa ≥ 0.8.0 and views enabled so the
+/// type must be generated with buffa ≥ 0.9.0 and views enabled so the
 /// backing `HasMessageView` impl exists.
 ///
 /// The `impl Encodable<Out>` return bound accepts the owned `Out`, the
@@ -260,6 +271,7 @@ impl<T: HealthService> ::connectrpc::Dispatcher for HealthServiceServer<T> {
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
+                        ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
                         crate::proto::oxidhome::v1::CheckRequest,
@@ -428,8 +440,7 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                HEALTH_SERVICE_SERVICE_NAME,
-                "Check",
+                HEALTH_SERVICE_CHECK_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )
