@@ -2339,13 +2339,26 @@ async fn plugins_install_call(
     if args.source_dir.is_empty() {
         return ToolOutcome::InvalidParams("`source_dir` must not be empty".into());
     }
+    // Round-1 P2 on PR #134: the schema advertises `source_dir`
+    // as an absolute path. Without an explicit check, `.` and
+    // `../staged` would reach the installer and resolve against
+    // the daemon's process working directory — so identical
+    // MCP calls behave differently depending on how the daemon
+    // was launched. Enforce absolute at the tool boundary so
+    // the wire contract matches the code path.
+    let source = std::path::PathBuf::from(&args.source_dir);
+    if !source.is_absolute() {
+        return ToolOutcome::InvalidParams(format!(
+            "`source_dir` must be an absolute path; got `{}`",
+            args.source_dir,
+        ));
+    }
 
     // REST wraps the sync install in `spawn_blocking` so a slow
     // disk doesn't stall the axum runtime — same reasoning
     // holds for MCP's rmcp task. The registry itself does the
     // FS + SQL work.
     let installed_registry = engine.installed_plugins();
-    let source = std::path::PathBuf::from(args.source_dir);
     let join = tokio::task::spawn_blocking(move || installed_registry.install(&source)).await;
 
     let installed = match join {

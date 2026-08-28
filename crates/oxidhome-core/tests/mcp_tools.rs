@@ -2472,6 +2472,41 @@ async fn plugins_install_rejects_malformed_arguments() {
     }
 }
 
+/// Round-1 P2 on PR #134: the schema advertises `source_dir`
+/// as an absolute path. Relative paths (`.`, `../staged`) must
+/// land as `-32602 INVALID_PARAMS` at the tool boundary —
+/// letting them through would resolve against the daemon's
+/// process working directory, making identical calls behave
+/// differently depending on how the daemon was launched.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_rejects_relative_source_dir() {
+    let state_dir = _support::tempdir("mcp-install-relpath-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, source_dir) in [
+        ("bare dot", "."),
+        ("parent traversal", "../staged-plugin"),
+        ("bare name", "staged-plugin"),
+        ("dot slash", "./staged-plugin"),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "plugins.install", "arguments": {"source_dir": source_dir}}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: relative source_dir `{source_dir}` must be INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
 /// 14.3g: `plugins.install` against a source dir that doesn't
 /// exist lands as a tool-level `isError: true` with structured
 /// `kind = "source_missing"`.
