@@ -31,6 +31,11 @@
 //! - `plugins.start` (14.3f — mutating admin, gated on
 //!   `plugins:start`; tool-shape of `POST
 //!   /api/v1/plugins/{id}/start`).
+//! - `plugins.install` (14.3g — mutating admin, destructive,
+//!   gated on `plugins:install`; tool-shape of `POST
+//!   /api/v1/plugins`). Loopback-only (14.1 Origin+Host
+//!   guard), so the `source_dir` path is the same trust
+//!   surface REST uses.
 //!
 //! # Layout
 //!
@@ -63,8 +68,8 @@ use serde_json::{Value as JsonValue, json};
 use crate::Engine;
 use crate::api::auth::wit_error_kind;
 use crate::api::scopes::{
-    DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP,
-    PLUGINS_UNINSTALL, require_scope,
+    DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START,
+    PLUGINS_STOP, PLUGINS_UNINSTALL, require_scope,
 };
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
@@ -212,6 +217,32 @@ pub(super) fn list_tools() -> Vec<Tool> {
                 // driving physical actuation) is real — flag
                 // as destructive so a planner treats it as
                 // write surface.
+                .destructive(true)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.install",
+            "Install a plugin from a daemon-local staged directory. Reads \
+             `<source_dir>/manifest.toml` for the canonical `plugin_id`, then \
+             recursively copies `source_dir` into `<state_dir>/plugins/<plugin_id>/`. \
+             Does NOT start the plugin — the operator follows up with \
+             `plugins.start`. SENSITIVE + DESTRUCTIVE: gated on `plugins:install` — a \
+             token holding this scope can effectively load arbitrary `.wasm` onto the \
+             host. `source_dir` MUST already exist on the daemon-local filesystem; \
+             the MCP endpoint is loopback-only, so this mirrors REST's trust model \
+             for the same operation.",
+            Arc::new(plugins_install_schema()),
+        )
+        .with_title("Install plugin")
+        .annotate(
+            ToolAnnotations::new()
+                // Mutates persistent host state (FS + SQL
+                // registry rows).
+                .read_only(false)
+                // Reversible via `plugins.uninstall`, but the
+                // observable side effect (new code on disk +
+                // a `plugin_installation` registry row) is
+                // real.
                 .destructive(true)
                 .open_world(false),
         ),
@@ -519,6 +550,7 @@ pub(super) async fn call(
         "plugins.stop" => ("plugins.stop", PLUGINS_STOP),
         "plugins.uninstall" => ("plugins.uninstall", PLUGINS_UNINSTALL),
         "plugins.start" => ("plugins.start", PLUGINS_START),
+        "plugins.install" => ("plugins.install", PLUGINS_INSTALL),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -582,6 +614,7 @@ pub(super) async fn call(
         "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments).await,
         "plugins.uninstall" => plugins_uninstall_call(engine.clone(), request.arguments).await,
         "plugins.start" => plugins_start_call(engine.clone(), request.arguments).await,
+        "plugins.install" => plugins_install_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -2245,6 +2278,163 @@ async fn plugins_start_call(
             // `plugins.uninstall`: host lifecycle action, not
             // a plugin `execute-command` invocation. Keep
             // `execution_outcome` NULL.
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+// ── plugins.install ─────────────────────────────────────────────
+
+fn plugins_install_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_dir"],
+        "properties": {
+            "source_dir": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Absolute path (daemon-local) to the staged plugin directory. Must contain a `manifest.toml` naming the canonical `plugin_id`; the tool recursively copies the whole directory into `<state_dir>/plugins/<plugin_id>/`.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsInstallArgs {
+    source_dir: String,
+}
+
+#[derive(Serialize)]
+struct PluginsInstallBody {
+    plugin_id: String,
+    version: String,
+    installed_path: String,
+}
+
+async fn plugins_install_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    let Some(arguments) = arguments else {
+        return ToolOutcome::InvalidParams(
+            "plugins.install requires a `source_dir` argument".into(),
+        );
+    };
+    let args: PluginsInstallArgs = match serde_json::from_value(JsonValue::Object(arguments)) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "plugins.install arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+    if args.source_dir.is_empty() {
+        return ToolOutcome::InvalidParams("`source_dir` must not be empty".into());
+    }
+
+    // REST wraps the sync install in `spawn_blocking` so a slow
+    // disk doesn't stall the axum runtime — same reasoning
+    // holds for MCP's rmcp task. The registry itself does the
+    // FS + SQL work.
+    let installed_registry = engine.installed_plugins();
+    let source = std::path::PathBuf::from(args.source_dir);
+    let join = tokio::task::spawn_blocking(move || installed_registry.install(&source)).await;
+
+    let installed = match join {
+        Ok(Ok(installed)) => installed,
+        Ok(Err(crate::state::InstallError::SourceMissing(path))) => {
+            return ToolOutcome::ExecErr {
+                message: format!(
+                    "source dir is missing or has no manifest.toml: {}",
+                    path.display(),
+                ),
+                structured: Some(json!({
+                    "kind": "source_missing",
+                    "source_dir": path.display().to_string(),
+                })),
+                // Round-1 P2 lesson from PR #132: host-state
+                // precondition, not a plugin WIT error — keep
+                // the audit slot NULL.
+                domain_kind: None,
+            };
+        }
+        Ok(Err(crate::state::InstallError::AlreadyInstalled { plugin_id })) => {
+            return ToolOutcome::ExecErr {
+                message: format!("plugin `{plugin_id}` is already installed"),
+                structured: Some(json!({
+                    "kind": "already_installed",
+                    "plugin_id": plugin_id,
+                })),
+                domain_kind: None,
+            };
+        }
+        Ok(Err(crate::state::InstallError::BadManifest { path, reason })) => {
+            // BadManifest.reason is authored by our own parser
+            // over the operator's `manifest.toml`; it's safe to
+            // surface. `path` may be absolute — hand back the
+            // file-name only so we don't echo the operator's
+            // full staging layout to a curious tool caller.
+            let file = path.file_name().map_or_else(
+                || "manifest.toml".into(),
+                |f| f.to_string_lossy().into_owned(),
+            );
+            return ToolOutcome::ExecErr {
+                message: format!("bad manifest in `{file}`: {reason}"),
+                structured: Some(json!({
+                    "kind": "bad_manifest",
+                    "reason": reason,
+                })),
+                domain_kind: None,
+            };
+        }
+        Ok(Err(crate::state::InstallError::NoPluginsRoot)) => {
+            return ToolOutcome::ExecErr {
+                message: "install requires a state-dir-backed engine".into(),
+                structured: Some(json!({
+                    "kind": "no_plugins_root",
+                })),
+                domain_kind: None,
+            };
+        }
+        Ok(Err(err)) => {
+            // Round-1 P2 lesson from PR #132: `InstallError::Io`
+            // can carry absolute filesystem paths;
+            // `InstallError::Persistence` can carry SQLite
+            // diagnostics. Log server-side; hand the client a
+            // generic message. Matches REST + Connect-RPC's
+            // opaque 500 for the same conditions.
+            tracing::error!(
+                target: "mcp.tool.plugins.install",
+                %err,
+                "install failed",
+            );
+            return ToolOutcome::Internal("install failed; see server logs for details".into());
+        }
+        Err(join_err) => {
+            tracing::error!(target: "mcp.tool.plugins.install", %join_err, "install task panicked");
+            return ToolOutcome::Internal("install task panicked".into());
+        }
+    };
+
+    let body = PluginsInstallBody {
+        plugin_id: installed.plugin_id.to_string(),
+        version: installed.version,
+        installed_path: installed.path.display().to_string(),
+    };
+    match super::resources::encode_body_capped(&body, "plugins.install", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            // Same taxonomy rule as the other lifecycle tools:
+            // host FS + SQL work, no plugin `execute-command`
+            // invocation. Keep `execution_outcome` NULL.
             plugin_reached: false,
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
