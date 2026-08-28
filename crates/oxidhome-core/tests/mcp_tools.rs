@@ -2371,3 +2371,364 @@ async fn plugins_start_not_installed_leaves_audit_taxonomy_clean() {
     assert!(row.execution_outcome.is_none());
     assert!(row.domain_error.is_none());
 }
+
+// ── 14.3g — plugins.install ─────────────────────────────────────
+
+/// Stage a source dir for `plugins.install` to consume — same
+/// shape as [`stage_switch_source`] but returns the *source*
+/// (not-yet-installed) directory rather than one already
+/// staged for `installed_plugins().install()`.
+fn stage_install_source(prefix: &str, plugin_id: &str) -> _support::TempDir {
+    stage_switch_source(prefix, plugin_id)
+}
+
+/// 14.3g: `plugins.install` is catalogued with `destructive`
+/// annotations and requires `source_dir`.
+#[tokio::test(flavor = "current_thread")]
+async fn list_tools_advertises_plugins_install_with_destructive_annotations() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "plugins.install")
+        .expect("plugins.install in the catalogue");
+    assert_eq!(tool["title"], "Install plugin");
+    assert_eq!(tool["annotations"]["readOnlyHint"], false);
+    assert_eq!(tool["annotations"]["destructiveHint"], true);
+    assert_eq!(tool["annotations"]["openWorldHint"], false);
+    let required = tool["inputSchema"]["required"]
+        .as_array()
+        .expect("required array");
+    assert!(
+        required.iter().any(|v| v == "source_dir"),
+        "plugins.install must require source_dir; got {required:?}",
+    );
+}
+
+/// 14.3g: `plugins.install` requires `plugins:install` — even
+/// a token with every other admin scope short of install is
+/// denied.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_requires_plugins_install_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(
+        &engine,
+        "no-install",
+        &[
+            "plugins:list",
+            "plugins:start",
+            "plugins:stop",
+            "plugins:uninstall",
+        ],
+    );
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.install", "arguments": {"source_dir": "/nowhere"}}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "other admin scopes must not satisfy plugins:install; got {response}",
+    );
+}
+
+/// 14.3g: `plugins.install` rejects malformed argument shapes.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_rejects_malformed_arguments() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("missing source_dir", json!({})),
+        ("empty source_dir", json!({"source_dir": ""})),
+        ("null source_dir", json!({"source_dir": null})),
+        ("unknown field", json!({"source_dir": "/x", "extra": 1})),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "plugins.install", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: must surface as INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// Round-1 P2 on PR #134: the schema advertises `source_dir`
+/// as an absolute path. Relative paths (`.`, `../staged`) must
+/// land as `-32602 INVALID_PARAMS` at the tool boundary —
+/// letting them through would resolve against the daemon's
+/// process working directory, making identical calls behave
+/// differently depending on how the daemon was launched.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_rejects_relative_source_dir() {
+    let state_dir = _support::tempdir("mcp-install-relpath-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, source_dir) in [
+        ("bare dot", "."),
+        ("parent traversal", "../staged-plugin"),
+        ("bare name", "staged-plugin"),
+        ("dot slash", "./staged-plugin"),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "plugins.install", "arguments": {"source_dir": source_dir}}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: relative source_dir `{source_dir}` must be INVALID_PARAMS; got {response}",
+        );
+    }
+}
+
+/// Round-2 P2 on PR #134: `BadManifest.reason` bakes
+/// absolute paths into its own string via
+/// `parsing {path.display()}: …`, so surfacing it in either
+/// `message` or `structuredContent.reason` defeats the path
+/// redaction the outer arm attempts. Return a path-free
+/// generic tag and log the full detail server-side. This test
+/// stages a truly malformed manifest and asserts NEITHER the
+/// source parent NOR the state root appears anywhere in the
+/// wire response.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_bad_manifest_response_carries_no_paths() {
+    let source = _support::tempdir("mcp-install-bad-manifest-src");
+    // Malformed TOML that will fail `toml::from_str`.
+    std::fs::write(
+        source.path().join("manifest.toml"),
+        "this is not = valid TOML: [[[[",
+    )
+    .expect("write bad manifest");
+    let state_dir = _support::tempdir("mcp-install-bad-manifest-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let source_display = source.path().display().to_string();
+    let source_parent_display = source
+        .path()
+        .parent()
+        .expect("source has a parent")
+        .display()
+        .to_string();
+    let state_display = state_dir.path().display().to_string();
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.install", "arguments": {"source_dir": source_display}}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_eq!(
+        result["isError"], true,
+        "malformed manifest must be tool-level error"
+    );
+    assert_eq!(result["structuredContent"]["kind"], "bad_manifest");
+
+    let wire = serde_json::to_string(&response).expect("response serialises");
+    for needle in [source_parent_display.as_str(), state_display.as_str()] {
+        assert!(
+            !wire.contains(needle),
+            "wire response must not leak host path fragment `{needle}`; got:\n{wire}",
+        );
+    }
+    // And the structured reason is deliberately absent — a
+    // machine consumer sees only `kind`, no free-form reason
+    // that might be regenerated with paths in a future refactor.
+    assert!(
+        result["structuredContent"]["reason"].is_null(),
+        "structured payload must not carry a reason string; got {result}",
+    );
+}
+
+/// 14.3g: `plugins.install` against a source dir that doesn't
+/// exist lands as a tool-level `isError: true` with structured
+/// `kind = "source_missing"`.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_source_missing_returns_tool_level_error() {
+    let state_dir = _support::tempdir("mcp-install-nf-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.install", "arguments": {
+            "source_dir": "/definitely/does/not/exist",
+        }}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "source-missing is tool-level; got {response}"
+    );
+    let result = &response["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["kind"], "source_missing");
+}
+
+/// 14.3g: an in-memory engine (no `<state_dir>/plugins/` root)
+/// surfaces install as `kind = "no_plugins_root"`.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_no_plugins_root_returns_tool_level_error() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    // Stage a real source dir so we get past the
+    // source-missing check and hit the no-plugins-root arm.
+    let source = stage_install_source("mcp-install-no-root", "example.no-root");
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.install", "arguments": {
+            "source_dir": source.path().display().to_string(),
+        }}),
+    )
+    .await;
+    let result = &response["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["kind"], "no_plugins_root");
+}
+
+/// 14.3g end-to-end: stage a real plugin, install it via the
+/// tool, verify the response body carries `plugin_id`,
+/// `version`, and an `installed_path` that lives under the
+/// engine's state dir. A follow-up `plugins.install` for the
+/// same id returns `kind = "already_installed"` (idempotence
+/// check).
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_install_end_to_end_and_rejects_duplicate() {
+    let plugin_id = "example.mcp-install-e2e";
+    let source = stage_install_source("mcp-install-e2e-src", plugin_id);
+    let state_dir = _support::tempdir("mcp-install-e2e-state");
+
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let install_args = json!({"name": "plugins.install", "arguments": {
+        "source_dir": source.path().display().to_string(),
+    }});
+
+    // First install: success.
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        install_args.clone(),
+    )
+    .await;
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "install must succeed; got {response}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["plugin_id"], plugin_id);
+    let installed_path = structured["installed_path"]
+        .as_str()
+        .expect("installed_path string");
+    assert!(
+        installed_path.starts_with(&state_dir.path().display().to_string()),
+        "installed_path must live under the engine's state dir; got {installed_path}",
+    );
+
+    // The registry sees it too.
+    assert!(
+        engine.installed_plugins().get(plugin_id).is_some(),
+        "installed_plugins() must reflect the fresh install",
+    );
+
+    // Second install of the same id: `already_installed` tool-
+    // level error (locks in that install is not idempotent —
+    // the operator must uninstall first).
+    let response = call(&router, &bearer, &session, "tools/call", install_args).await;
+    let result = &response["result"];
+    assert_eq!(
+        result["isError"], true,
+        "duplicate install must be tool-level error"
+    );
+    assert_eq!(result["structuredContent"]["kind"], "already_installed");
+    assert_eq!(result["structuredContent"]["plugin_id"], plugin_id);
+}
+
+/// 14.3g + Round-1 P2 lessons: `plugins.install` lands in the
+/// audit ledger with `execution_outcome` + `domain_error` NULL
+/// (host lifecycle, not a plugin `execute-command`).
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_install_audit_taxonomy_stays_clean() {
+    let state_dir = _support::tempdir("mcp-install-audit-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    // Deliberately point at a bogus path so we exercise the
+    // source-missing ExecErr path — the taxonomy rule applies
+    // uniformly, error or success.
+    let _ = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.install", "arguments": {"source_dir": "/absent-audit-install"}}),
+    )
+    .await;
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.plugins.install")
+        .expect("plugins.install row");
+    assert_eq!(row.decision, "allow");
+    assert!(
+        row.execution_outcome.is_none(),
+        "install is host-lifecycle; execution_outcome must be NULL; got {:?}",
+        row.execution_outcome,
+    );
+    assert!(row.domain_error.is_none());
+}
