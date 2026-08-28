@@ -15,13 +15,16 @@
 //!   summary. Gated on `events:read` + `logs:read`.
 //! - `draft_automation` — walks the client through drafting an
 //!   automation rule given a trigger + action. Gated on
-//!   `plugins:list` so the caller can enumerate what plugins /
-//!   capabilities are actually available before referring to
-//!   them in the draft.
+//!   `plugins:list` (so the caller can see which plugin will
+//!   deliver the action) + `devices:list` + `devices:read` (so
+//!   the trigger + action reference real device ids rather than
+//!   placeholders).
 //! - `explain_recent_errors` — walks the client through
-//!   fetching recent error-level logs and event failures and
-//!   explaining what went wrong. Gated on `logs:read` +
-//!   `events:read`.
+//!   fetching recent error-level logs and explaining what went
+//!   wrong. Gated on `logs:read` — event rows carry state
+//!   transitions, not command failures (those live in the audit
+//!   ledger, which the MCP surface does not yet expose), so
+//!   this prompt sticks to log evidence.
 //!
 //! # Scope gating
 //!
@@ -42,7 +45,9 @@ use rmcp::model::{
     PromptMessage, Role,
 };
 
-use crate::api::scopes::{EVENTS_READ, LOGS_READ, PLUGINS_LIST, Scope, require_scope};
+use crate::api::scopes::{
+    DEVICES_LIST, DEVICES_READ, EVENTS_READ, LOGS_READ, PLUGINS_LIST, Scope, require_scope,
+};
 use crate::auth::Actor;
 
 use super::resources::SCOPE_DENIED_CODE;
@@ -67,9 +72,10 @@ pub(super) fn list_prompts() -> Vec<Prompt> {
             "draft_automation",
             Some(
                 "Draft a household automation rule given a plain-language `trigger` and \
-                 `action`. Uses `plugins.list` + `plugins.show` to see what plugins and \
-                 capabilities are actually available so the draft references real device / \
-                 capability names rather than placeholders.",
+                 `action`. Uses `oxidhome://devices` + `oxidhome://devices/{id}` to see what \
+                 devices + capabilities actually exist, and `plugins.list` to see which \
+                 plugin owns each device — so the draft references real device ids and \
+                 real capability actions rather than placeholders.",
             ),
             Some(vec![
                 PromptArgument::new("trigger")
@@ -92,9 +98,11 @@ pub(super) fn list_prompts() -> Vec<Prompt> {
         Prompt::new(
             "explain_recent_errors",
             Some(
-                "Fetch recent error-level logs + failed events and produce a plain-language \
-                 explanation of what went wrong and which components / plugins are involved. \
-                 Composes `oxidhome://logs?level=Error` + `oxidhome://events`.",
+                "Fetch recent error-level logs and produce a plain-language explanation of \
+                 what went wrong and which components / plugins are involved. Composes \
+                 `oxidhome://logs?level=Error`. Event rows carry state transitions, not \
+                 command failures, so this prompt sticks to log evidence — command outcomes \
+                 live in the audit ledger, which the MCP surface does not yet expose.",
             ),
             None,
         )
@@ -121,14 +129,29 @@ pub(super) fn get(
         "draft_automation" => {
             let (trigger, action) = draft_automation_args(request.arguments.as_ref())?;
             (
-                &[PLUGINS_LIST][..],
+                // Round-1 P1 on PR #135: `draft_automation`
+                // needs to reference real device ids and
+                // capabilities, not just plugin metadata. Add
+                // `devices:list` (enumerate the fleet) +
+                // `devices:read` (drill into an individual
+                // device's capabilities) alongside
+                // `plugins:list` (see which plugin owns each
+                // device — needed to explain what will
+                // actually happen).
+                &[PLUGINS_LIST, DEVICES_LIST, DEVICES_READ][..],
                 "Draft an automation rule from a trigger and action.",
                 draft_automation_message(&trigger, &action),
             )
         }
         "explain_recent_errors" => (
-            &[LOGS_READ, EVENTS_READ][..],
-            "Explain recent errors from logs + events.",
+            // Round-1 P1 on PR #135: dropped `events:read` —
+            // event rows are state transitions and don't carry
+            // command failures. This prompt sticks to log
+            // evidence; command-outcome failures would need the
+            // audit ledger, which the MCP surface doesn't yet
+            // expose.
+            &[LOGS_READ][..],
+            "Explain recent errors from logs.",
             explain_recent_errors_message(),
         ),
         _ => {
@@ -218,33 +241,39 @@ fn draft_automation_message(trigger: &str, action: &str) -> String {
          \n\
          > {action}\n\
          \n\
-         First, use `tools/call` on `plugins.list` to see what plugins are currently installed \
-         + running, and `plugins.show` on any plugin whose capabilities you'd need to reference \
-         (device drivers, HTTP handlers). Ground the draft in real plugin / device / capability \
-         ids that actually exist — never invent one. Then produce a draft automation with:\n\
+         First, read `oxidhome://devices` to enumerate the household's devices, then read \
+         `oxidhome://devices/{{device_id}}` on any device you plan to reference to see the \
+         concrete capabilities it exposes (switch/toggle, dimmer/set, lock/lock, etc.). Use \
+         `tools/call` on `plugins.list` to see which plugin owns each device — the plugin \
+         identity is what will actually execute the command. Ground the draft in real device \
+         ids + real capability action names — never invent one. Then produce a draft automation \
+         with:\n\
          \n\
          1. A short human-readable summary of what it does.\n\
-         2. The trigger condition, phrased against a specific plugin / device.\n\
-         3. The action(s), phrased against a specific `device.send_command` invocation.\n\
+         2. The trigger condition, phrased against a specific device id + capability.\n\
+         3. The action(s), phrased against a specific `device.send_command` invocation with real \
+            `device_id`, `capability`, and `action` values.\n\
          4. Any preconditions or safety notes the operator should know before enabling it (e.g. \
-            `plugins:command` scope, locks / alarms flagged destructive).\n\
+            `devices:command` scope, locks / alarms flagged destructive).\n\
          \n\
-         If a needed plugin isn't installed, say so and stop — do not draft against a missing \
-         plugin."
+         If a needed device or capability doesn't exist, say so and stop — do not draft against \
+         one that isn't there."
     )
 }
 
 fn explain_recent_errors_message() -> String {
     "You are helping the household operator understand what recently went wrong. Fetch \
-     `oxidhome://logs?since=24h&level=Error` to see the last 24 hours of error-level logs, and \
-     `oxidhome://events?since=24h` to see the same window of historical events (an event row \
-     with a domain error is a plugin `execute-command` that returned `Err`). Group the findings \
-     by component (host, specific plugin id, specific device) and, for each group, produce:\n\
+     `oxidhome://logs?since=24h&level=Error` to see the last 24 hours of error-level logs. \
+     Note: only logs are consulted here — event rows carry state transitions, not command \
+     outcomes, so a plugin's `execute-command` that returned `Err` is NOT recoverable from the \
+     event history; it lives in the audit ledger, which this MCP server does not yet expose. \
+     Group the findings by component (host, specific plugin id, specific device) and, for each \
+     group, produce:\n\
      \n\
      1. A short plain-language description of what went wrong.\n\
-     2. The best evidence you have (a log target + message, or an event topic + payload).\n\
-     3. A suggested next step — a follow-up log / event query, a config check, a plugin restart, \
-        or `no action needed if transient`.\n\
+     2. The best evidence you have (log target + message).\n\
+     3. A suggested next step — a follow-up log query, a config check, a plugin restart, or \
+        `no action needed if transient`.\n\
      \n\
      Be honest about uncertainty. If a log line names an internal component the operator can't \
      act on, say so. If there are no errors in the window, say so."

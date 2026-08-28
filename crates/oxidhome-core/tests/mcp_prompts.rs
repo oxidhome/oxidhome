@@ -466,3 +466,172 @@ async fn get_prompts_reference_the_composed_resources() {
         );
     }
 }
+
+/// Round-1 P1 on PR #135: `draft_automation` must be able to
+/// discover real device ids + capabilities, so it needs
+/// `devices:list` + `devices:read` alongside `plugins:list` —
+/// plugin metadata alone doesn't identify a switch or a lock.
+/// A token holding `plugins:list` but not the devices scopes
+/// lands as `-32001 SCOPE_DENIED` and the message names the
+/// missing scope.
+#[tokio::test(flavor = "current_thread")]
+async fn get_prompt_draft_automation_requires_devices_scopes() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "plugins-only", &["plugins:list"]);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "prompts/get",
+        json!({"name": "draft_automation", "arguments": {
+            "trigger": "front door unlocks",
+            "action": "turn on hallway lights",
+        }}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32001);
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("devices:list"),
+        "denied message must name the missing devices scope; got `{message}`",
+    );
+
+    // Adding `devices:list` isn't enough — the prompt also
+    // needs `devices:read` to drill into individual devices.
+    let bearer = mint_bearer_with_scopes(
+        &engine,
+        "plugins-and-devices-list",
+        &["plugins:list", "devices:list"],
+    );
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "prompts/get",
+        json!({"name": "draft_automation", "arguments": {
+            "trigger": "front door unlocks",
+            "action": "turn on hallway lights",
+        }}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32001);
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("devices:read"),
+        "denied message must name devices:read as the still-missing scope; got `{message}`",
+    );
+}
+
+/// Round-1 P1 + P2 on PR #135: the `draft_automation` template
+/// body must (a) direct the client to real devices via
+/// `oxidhome://devices` (P1: plugin metadata doesn't identify
+/// devices) and (b) name the correct scope `devices:command`
+/// for the executed action (P2: there is no `plugins:command`
+/// scope).
+#[tokio::test(flavor = "current_thread")]
+async fn get_prompt_draft_automation_body_references_devices_and_correct_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "prompts/get",
+        json!({"name": "draft_automation", "arguments": {
+            "trigger": "front door unlocks",
+            "action": "turn on hallway lights",
+        }}),
+    )
+    .await;
+    let text = response["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("text");
+    assert!(
+        text.contains("oxidhome://devices"),
+        "draft_automation must direct client to the devices resource; got:\n{text}",
+    );
+    assert!(
+        text.contains("devices:command"),
+        "draft_automation must name `devices:command` (not `plugins:command`); got:\n{text}",
+    );
+    assert!(
+        !text.contains("plugins:command"),
+        "`plugins:command` is not a real scope; got:\n{text}",
+    );
+}
+
+/// Round-1 P1 on PR #135: event rows carry state transitions,
+/// not command failures — `WireHistoricalEvent` has no domain-
+/// error field. Command outcomes live in the audit ledger,
+/// which the MCP surface does not yet expose. So the prompt
+/// must NOT direct the client at `oxidhome://events` under a
+/// false promise it can find failures there; keep it to
+/// `oxidhome://logs` and be explicit about the scope.
+#[tokio::test(flavor = "current_thread")]
+async fn get_prompt_explain_recent_errors_does_not_reference_events_for_failures() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "prompts/get",
+        json!({"name": "explain_recent_errors"}),
+    )
+    .await;
+    let text = response["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("text");
+    // Must fetch logs.
+    assert!(
+        text.contains("oxidhome://logs"),
+        "must fetch logs; got:\n{text}"
+    );
+    // Must NOT direct the client at events for failures — the
+    // pre-fix body did, and events don't carry that data.
+    assert!(
+        !text.contains("oxidhome://events"),
+        "explain_recent_errors must not point at oxidhome://events for failure data; got:\n{text}",
+    );
+}
+
+/// Round-1 P1 on PR #135: `explain_recent_errors` no longer
+/// needs `events:read` since it doesn't read events; scope
+/// requirement is `logs:read` alone.
+#[tokio::test(flavor = "current_thread")]
+async fn get_prompt_explain_recent_errors_requires_only_logs_read() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "logs-only-explain", &["logs:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "prompts/get",
+        json!({"name": "explain_recent_errors"}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "logs:read alone must satisfy explain_recent_errors post-fix; got {response}",
+    );
+    assert!(
+        !response["result"]["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
