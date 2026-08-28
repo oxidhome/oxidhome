@@ -110,10 +110,13 @@ pub(super) fn list_prompts() -> Vec<Prompt> {
 }
 
 /// `prompts/get` — validate the requested name, check scopes,
-/// build the templated `PromptMessage` sequence. Unknown names
-/// map to `method_not_found` mirroring the tool-side shape;
-/// missing / empty required arguments to `-32602`; scope
-/// failures to `-32001`.
+/// build the templated `PromptMessage` sequence. Unknown
+/// prompt names + missing / empty required arguments both
+/// map to `-32602` (`INVALID_PARAMS`) — `prompts/get` itself
+/// is a supported method, so `method_not_found` would be the
+/// wrong shape; the *arguments* (specifically `name`) were
+/// what didn't validate. Scope failures map to `-32001`
+/// mirroring the tool + resource surfaces.
 pub(super) fn get(
     request: &GetPromptRequestParams,
     actor: &Actor,
