@@ -1,0 +1,252 @@
+//! MCP `prompts/*` implementation for `OxidHome`.
+//!
+//! Phase 14.6. Prompts are hand-authored templates that guide
+//! an LLM client through common household tasks by composing
+//! the resource + tool surface `super::resources` and
+//! `super::tools` expose. They are NOT text-completion endpoints
+//! — the server does not run inference. Each `prompts/get`
+//! returns a `PromptMessage` sequence the client fills into its
+//! own model turn.
+//!
+//! # Catalogue
+//!
+//! - `summarize_today` — walks the client through fetching
+//!   today's events + logs and producing a plain-language
+//!   summary. Gated on `events:read` + `logs:read`.
+//! - `draft_automation` — walks the client through drafting an
+//!   automation rule given a trigger + action. Gated on
+//!   `plugins:list` so the caller can enumerate what plugins /
+//!   capabilities are actually available before referring to
+//!   them in the draft.
+//! - `explain_recent_errors` — walks the client through
+//!   fetching recent error-level logs and event failures and
+//!   explaining what went wrong. Gated on `logs:read` +
+//!   `events:read`.
+//!
+//! # Scope gating
+//!
+//! `prompts/list` is public — every session sees the full
+//! catalogue regardless of scope. `prompts/get` enforces the
+//! per-prompt required scopes and lands scope failures as
+//! `ScopeDenied` (`-32001`), matching the resource + tool
+//! surface's shape. The rationale: a prompt template is not
+//! itself sensitive (it's a documented pattern for using the
+//! server), but embedding it inside a session where the caller
+//! *cannot* execute the referenced resources/tools would give
+//! them a template they can only inspect. Refusing at
+//! `get` time keeps the surface consistent with tools/resources
+//! and avoids handing an agent a plan it can't execute.
+
+use rmcp::model::{
+    ErrorData as McpError, GetPromptRequestParams, GetPromptResult, Prompt, PromptArgument,
+    PromptMessage, Role,
+};
+
+use crate::api::scopes::{EVENTS_READ, LOGS_READ, PLUGINS_LIST, Scope, require_scope};
+use crate::auth::Actor;
+
+use super::resources::SCOPE_DENIED_CODE;
+
+/// Publicly-visible catalogue of prompts this handler exposes.
+/// Every MCP session sees the full list regardless of scope —
+/// see the module-level comment on why `get` is where scope is
+/// enforced.
+pub(super) fn list_prompts() -> Vec<Prompt> {
+    vec![
+        Prompt::new(
+            "summarize_today",
+            Some(
+                "Produce a plain-language summary of today's household activity — device state \
+                 transitions, notable events, and any logged warnings or errors. Composes \
+                 `oxidhome://events` + `oxidhome://logs`.",
+            ),
+            None,
+        )
+        .with_title("Summarize today's household activity"),
+        Prompt::new(
+            "draft_automation",
+            Some(
+                "Draft a household automation rule given a plain-language `trigger` and \
+                 `action`. Uses `plugins.list` + `plugins.show` to see what plugins and \
+                 capabilities are actually available so the draft references real device / \
+                 capability names rather than placeholders.",
+            ),
+            Some(vec![
+                PromptArgument::new("trigger")
+                    .with_title("Trigger")
+                    .with_description(
+                        "Plain-language description of what should trigger the automation \
+                         (e.g. `when the front door unlocks after sunset`).",
+                    )
+                    .with_required(true),
+                PromptArgument::new("action")
+                    .with_title("Action")
+                    .with_description(
+                        "Plain-language description of what should happen (e.g. `turn on the \
+                         hallway lights and start the porch camera`).",
+                    )
+                    .with_required(true),
+            ]),
+        )
+        .with_title("Draft a household automation"),
+        Prompt::new(
+            "explain_recent_errors",
+            Some(
+                "Fetch recent error-level logs + failed events and produce a plain-language \
+                 explanation of what went wrong and which components / plugins are involved. \
+                 Composes `oxidhome://logs?level=Error` + `oxidhome://events`.",
+            ),
+            None,
+        )
+        .with_title("Explain recent errors"),
+    ]
+}
+
+/// `prompts/get` — validate the requested name, check scopes,
+/// build the templated `PromptMessage` sequence. Unknown names
+/// map to `method_not_found` mirroring the tool-side shape;
+/// missing / empty required arguments to `-32602`; scope
+/// failures to `-32001`.
+pub(super) fn get(
+    request: &GetPromptRequestParams,
+    actor: &Actor,
+) -> Result<GetPromptResult, McpError> {
+    let name = request.name.as_str();
+    let (required_scopes, description, message_text) = match name {
+        "summarize_today" => (
+            &[EVENTS_READ, LOGS_READ][..],
+            "Summarize today's household activity.",
+            summarize_today_message(),
+        ),
+        "draft_automation" => {
+            let (trigger, action) = draft_automation_args(request.arguments.as_ref())?;
+            (
+                &[PLUGINS_LIST][..],
+                "Draft an automation rule from a trigger and action.",
+                draft_automation_message(&trigger, &action),
+            )
+        }
+        "explain_recent_errors" => (
+            &[LOGS_READ, EVENTS_READ][..],
+            "Explain recent errors from logs + events.",
+            explain_recent_errors_message(),
+        ),
+        _ => {
+            return Err(McpError::invalid_params(
+                format!("unknown prompt `{name}`"),
+                None,
+            ));
+        }
+    };
+
+    if let Some(scope) = first_missing_scope(actor, required_scopes) {
+        return Err(McpError::new(
+            SCOPE_DENIED_CODE,
+            format!("scope `{}` required for prompt `{name}`", scope.name()),
+            None,
+        ));
+    }
+
+    let mut result = GetPromptResult::new(vec![PromptMessage::new_text(Role::User, message_text)]);
+    result.description = Some(description.into());
+    Ok(result)
+}
+
+fn first_missing_scope(actor: &Actor, required: &[Scope]) -> Option<Scope> {
+    for scope in required {
+        if require_scope(actor, *scope).is_err() {
+            return Some(*scope);
+        }
+    }
+    None
+}
+
+fn draft_automation_args(
+    arguments: Option<&rmcp::model::JsonObject>,
+) -> Result<(String, String), McpError> {
+    let Some(args) = arguments else {
+        return Err(McpError::invalid_params(
+            "draft_automation requires `trigger` and `action` arguments".to_string(),
+            None,
+        ));
+    };
+    let trigger = required_string_arg(args, "trigger")?;
+    let action = required_string_arg(args, "action")?;
+    Ok((trigger, action))
+}
+
+fn required_string_arg(args: &rmcp::model::JsonObject, key: &str) -> Result<String, McpError> {
+    match args.get(key) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+        Some(serde_json::Value::String(_)) => Err(McpError::invalid_params(
+            format!("prompt argument `{key}` must not be empty"),
+            None,
+        )),
+        Some(_) => Err(McpError::invalid_params(
+            format!("prompt argument `{key}` must be a non-empty string"),
+            None,
+        )),
+        None => Err(McpError::invalid_params(
+            format!("prompt argument `{key}` is required"),
+            None,
+        )),
+    }
+}
+
+fn summarize_today_message() -> String {
+    "You are helping the household operator understand what happened today. Use the OxidHome \
+     MCP server's `oxidhome://events?since=24h` resource to fetch the last 24 hours of \
+     historical events, and `oxidhome://logs?since=24h&level=Info` to fetch the same window of \
+     logs. Then produce a plain-language summary organised as:\n\
+     \n\
+     1. Notable device state changes (lights, switches, locks, sensors).\n\
+     2. Automation activity (scheduled jobs, custom rules that fired).\n\
+     3. Anything unusual worth an operator's attention — warnings, errors, or a plugin that \
+        went quiet.\n\
+     \n\
+     Keep it short (under 300 words). If nothing notable happened, say so."
+        .into()
+}
+
+fn draft_automation_message(trigger: &str, action: &str) -> String {
+    format!(
+        "You are helping the household operator draft an automation rule. Their trigger is:\n\
+         \n\
+         > {trigger}\n\
+         \n\
+         Their action is:\n\
+         \n\
+         > {action}\n\
+         \n\
+         First, use `tools/call` on `plugins.list` to see what plugins are currently installed \
+         + running, and `plugins.show` on any plugin whose capabilities you'd need to reference \
+         (device drivers, HTTP handlers). Ground the draft in real plugin / device / capability \
+         ids that actually exist — never invent one. Then produce a draft automation with:\n\
+         \n\
+         1. A short human-readable summary of what it does.\n\
+         2. The trigger condition, phrased against a specific plugin / device.\n\
+         3. The action(s), phrased against a specific `device.send_command` invocation.\n\
+         4. Any preconditions or safety notes the operator should know before enabling it (e.g. \
+            `plugins:command` scope, locks / alarms flagged destructive).\n\
+         \n\
+         If a needed plugin isn't installed, say so and stop — do not draft against a missing \
+         plugin."
+    )
+}
+
+fn explain_recent_errors_message() -> String {
+    "You are helping the household operator understand what recently went wrong. Fetch \
+     `oxidhome://logs?since=24h&level=Error` to see the last 24 hours of error-level logs, and \
+     `oxidhome://events?since=24h` to see the same window of historical events (an event row \
+     with a domain error is a plugin `execute-command` that returned `Err`). Group the findings \
+     by component (host, specific plugin id, specific device) and, for each group, produce:\n\
+     \n\
+     1. A short plain-language description of what went wrong.\n\
+     2. The best evidence you have (a log target + message, or an event topic + payload).\n\
+     3. A suggested next step — a follow-up log / event query, a config check, a plugin restart, \
+        or `no action needed if transient`.\n\
+     \n\
+     Be honest about uncertainty. If a log line names an internal component the operator can't \
+     act on, say so. If there are no errors in the window, say so."
+        .into()
+}

@@ -25,6 +25,7 @@
 //! [`BoundedSessionManager`]: session_store::BoundedSessionManager
 
 mod handler;
+mod prompts;
 mod resources;
 mod server;
 mod session_store;

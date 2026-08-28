@@ -1,8 +1,9 @@
 //! MCP [`ServerHandler`] for `OxidHome`.
 //!
 //! Answers `initialize`, serves the resource catalogue built
-//! in [`super::resources`], and the tool catalogue built in
-//! [`super::tools`] (14.3). Prompts land at 14.6.
+//! in [`super::resources`], the tool catalogue built in
+//! [`super::tools`] (14.3), and the prompt catalogue built in
+//! [`super::prompts`] (14.6).
 //!
 //! The [`Engine`] handle is stashed on the struct so every
 //! resource / tool handler can reach the device registry, log
@@ -17,9 +18,10 @@ use std::future::Future;
 use rmcp::{
     RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, Implementation, ListResourceTemplatesResult, ListResourcesResult,
-        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
-        ReadResourceResponse, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, GetPromptRequestParams, GetPromptResponse, Implementation,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+        ServerCapabilities, ServerInfo,
     },
     service::{MaybeSendFuture, RequestContext},
 };
@@ -27,7 +29,7 @@ use rmcp::{
 use crate::Engine;
 use crate::auth::Actor;
 
-use super::{resources, tools};
+use super::{prompts, resources, tools};
 
 /// `OxidHome`'s MCP server handler.
 #[derive(Clone)]
@@ -133,6 +135,28 @@ impl ServerHandler for OxidHomeMcpHandler {
             let result = tools::call(engine, request, &actor).await?;
             Ok(result.into())
         }
+    }
+
+    fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListPromptsResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        std::future::ready(Ok(ListPromptsResult {
+            prompts: prompts::list_prompts(),
+            ..Default::default()
+        }))
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        let actor = resolve_actor(&context);
+        std::future::ready(prompts::get(&request, &actor).map(GetPromptResponse::from))
     }
 }
 
