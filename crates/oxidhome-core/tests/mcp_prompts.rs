@@ -350,14 +350,17 @@ async fn get_prompt_draft_automation_rejects_missing_args_and_scope() {
     assert_eq!(response["error"]["code"], -32602);
 }
 
-/// 14.6: `draft_automation` under a token WITHOUT `plugins:list`
-/// scope but WITH valid arguments still lands as `-32001` —
-/// argument shape is validated BEFORE scope check, but scope
-/// is still enforced.
+/// 14.6: `draft_automation` under a token WITHOUT
+/// `devices:list` (but with valid arguments) lands as
+/// `-32001` — argument shape is validated first, but the
+/// scope check is still enforced. Round-2 P1 on PR #135
+/// simplified requirements to `devices:list` alone (see
+/// [`get_prompt_draft_automation_uses_only_devices_list_scope`]);
+/// this test locks in the deny path.
 #[tokio::test(flavor = "current_thread")]
-async fn get_prompt_draft_automation_requires_plugins_list_scope() {
+async fn get_prompt_draft_automation_requires_devices_list_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "no-plugins", &["logs:read"]);
+    let bearer = mint_bearer_with_scopes(&engine, "no-devices", &["logs:read"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -377,7 +380,7 @@ async fn get_prompt_draft_automation_requires_plugins_list_scope() {
         response["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("plugins:list"),
+            .contains("devices:list"),
     );
 }
 
@@ -467,20 +470,22 @@ async fn get_prompts_reference_the_composed_resources() {
     }
 }
 
-/// Round-1 P1 on PR #135: `draft_automation` must be able to
-/// discover real device ids + capabilities, so it needs
-/// `devices:list` + `devices:read` alongside `plugins:list` —
-/// plugin metadata alone doesn't identify a switch or a lock.
-/// A token holding `plugins:list` but not the devices scopes
-/// lands as `-32001 SCOPE_DENIED` and the message names the
-/// missing scope.
+/// Round-2 P1 on PR #135: `draft_automation` needs ONLY
+/// `devices:list` (both `oxidhome://devices` and
+/// `oxidhome://devices/{id}` are gated on it — round-2 F1 on
+/// PR #120 deliberately unified them). The round-1 fix
+/// over-required `plugins:list` + `devices:read` on top,
+/// which rejected correctly-scoped least-privilege tokens.
+/// This test locks in that a `devices:list`-only token
+/// succeeds AND that neither of the over-required scopes is
+/// mentioned in a denial message.
 #[tokio::test(flavor = "current_thread")]
-async fn get_prompt_draft_automation_requires_devices_scopes() {
+async fn get_prompt_draft_automation_uses_only_devices_list_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "plugins-only", &["plugins:list"]);
+    // Positive: devices:list alone succeeds.
+    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
     let router = build_router(engine.clone());
     let (router, session) = handshake(router, &bearer).await;
-
     let response = call(
         &router,
         &bearer,
@@ -492,20 +497,14 @@ async fn get_prompt_draft_automation_requires_devices_scopes() {
         }}),
     )
     .await;
-    assert_eq!(response["error"]["code"], -32001);
-    let message = response["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("devices:list"),
-        "denied message must name the missing devices scope; got `{message}`",
+        response["error"].is_null(),
+        "devices:list alone must satisfy draft_automation; got {response}",
     );
 
-    // Adding `devices:list` isn't enough — the prompt also
-    // needs `devices:read` to drill into individual devices.
-    let bearer = mint_bearer_with_scopes(
-        &engine,
-        "plugins-and-devices-list",
-        &["plugins:list", "devices:list"],
-    );
+    // Negative: a token missing `devices:list` gets denied on
+    // `devices:list` (not on some other over-required scope).
+    let bearer = mint_bearer_with_scopes(&engine, "logs-only-draft", &["logs:read"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
     let response = call(
@@ -522,9 +521,17 @@ async fn get_prompt_draft_automation_requires_devices_scopes() {
     assert_eq!(response["error"]["code"], -32001);
     let message = response["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("devices:read"),
-        "denied message must name devices:read as the still-missing scope; got `{message}`",
+        message.contains("devices:list"),
+        "denial must name devices:list; got `{message}`",
     );
+    // The round-1 over-required scopes must NOT be enforced —
+    // a future refactor that reintroduces them fails here.
+    for over_scope in ["devices:read", "plugins:list"] {
+        assert!(
+            !message.contains(over_scope),
+            "denial must not name {over_scope} (over-requirement regressed); got `{message}`",
+        );
+    }
 }
 
 /// Round-1 P1 + P2 on PR #135: the `draft_automation` template
@@ -565,6 +572,49 @@ async fn get_prompt_draft_automation_body_references_devices_and_correct_scope()
     assert!(
         !text.contains("plugins:command"),
         "`plugins:command` is not a real scope; got:\n{text}",
+    );
+}
+
+/// Round-2 P1 on PR #135: action verbs (`toggle`, `set`,
+/// `lock`, …) are plugin-defined free-form strings; the host
+/// does NOT publish a catalogue of valid actions per
+/// capability. The prompt body must acknowledge this rather
+/// than promise that device detail carries concrete actions
+/// (which it doesn't — `DeviceDetail.capabilities` is only
+/// `Vec<String>` of capability *names*). A future edit that
+/// re-adds the false promise fails here.
+#[tokio::test(flavor = "current_thread")]
+async fn get_prompt_draft_automation_body_is_honest_about_action_verbs() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "prompts/get",
+        json!({"name": "draft_automation", "arguments": {
+            "trigger": "front door unlocks",
+            "action": "turn on hallway lights",
+        }}),
+    )
+    .await;
+    let text = response["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("text");
+    // Must not falsely promise device detail carries actions.
+    let lower = text.to_lowercase();
+    assert!(
+        lower.contains("not enumerable") || lower.contains("plugin-defined"),
+        "body must flag action verbs as plugin-defined / not enumerable; got:\n{text}",
+    );
+    // Must still guide the client toward a real convention +
+    // operator confirmation.
+    assert!(
+        lower.contains("convention") && lower.contains("operator"),
+        "body must guide toward a convention + operator confirmation; got:\n{text}",
     );
 }
 

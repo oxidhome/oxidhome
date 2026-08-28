@@ -15,10 +15,10 @@
 //!   summary. Gated on `events:read` + `logs:read`.
 //! - `draft_automation` — walks the client through drafting an
 //!   automation rule given a trigger + action. Gated on
-//!   `plugins:list` (so the caller can see which plugin will
-//!   deliver the action) + `devices:list` + `devices:read` (so
-//!   the trigger + action reference real device ids rather than
-//!   placeholders).
+//!   `devices:list` (both the collection `oxidhome://devices`
+//!   and the per-id `oxidhome://devices/{id}` share this
+//!   scope) so the draft can reference real device ids +
+//!   capability names.
 //! - `explain_recent_errors` — walks the client through
 //!   fetching recent error-level logs and explaining what went
 //!   wrong. Gated on `logs:read` — event rows carry state
@@ -45,9 +45,7 @@ use rmcp::model::{
     PromptMessage, Role,
 };
 
-use crate::api::scopes::{
-    DEVICES_LIST, DEVICES_READ, EVENTS_READ, LOGS_READ, PLUGINS_LIST, Scope, require_scope,
-};
+use crate::api::scopes::{DEVICES_LIST, EVENTS_READ, LOGS_READ, Scope, require_scope};
 use crate::auth::Actor;
 
 use super::resources::SCOPE_DENIED_CODE;
@@ -73,9 +71,10 @@ pub(super) fn list_prompts() -> Vec<Prompt> {
             Some(
                 "Draft a household automation rule given a plain-language `trigger` and \
                  `action`. Uses `oxidhome://devices` + `oxidhome://devices/{id}` to see what \
-                 devices + capabilities actually exist, and `plugins.list` to see which \
-                 plugin owns each device — so the draft references real device ids and \
-                 real capability actions rather than placeholders.",
+                 devices + capabilities actually exist, so the draft references real device \
+                 ids and real capability names. Action verbs (e.g. `toggle`, `on`, `set`) are \
+                 plugin-defined and NOT enumerable from the host — the draft must either use \
+                 a well-known capability convention or defer the exact verb to the operator.",
             ),
             Some(vec![
                 PromptArgument::new("trigger")
@@ -129,16 +128,19 @@ pub(super) fn get(
         "draft_automation" => {
             let (trigger, action) = draft_automation_args(request.arguments.as_ref())?;
             (
-                // Round-1 P1 on PR #135: `draft_automation`
-                // needs to reference real device ids and
-                // capabilities, not just plugin metadata. Add
-                // `devices:list` (enumerate the fleet) +
-                // `devices:read` (drill into an individual
-                // device's capabilities) alongside
-                // `plugins:list` (see which plugin owns each
-                // device — needed to explain what will
-                // actually happen).
-                &[PLUGINS_LIST, DEVICES_LIST, DEVICES_READ][..],
+                // Round-2 P1 on PR #135: only `devices:list`
+                // is needed. Both `oxidhome://devices` (the
+                // collection) and `oxidhome://devices/{id}`
+                // (per-device detail — same registration
+                // metadata + capability names, filtered to
+                // one id) share this single scope by design
+                // (see resources.rs — round-2 F1 on PR #120
+                // deliberately unified them). The previous
+                // round-1 fix over-required `plugins:list` +
+                // `devices:read` on top of this, which
+                // rejected correctly-scoped least-privilege
+                // tokens.
+                &[DEVICES_LIST][..],
                 "Draft an automation rule from a trigger and action.",
                 draft_automation_message(&trigger, &action),
             )
@@ -242,22 +244,32 @@ fn draft_automation_message(trigger: &str, action: &str) -> String {
          > {action}\n\
          \n\
          First, read `oxidhome://devices` to enumerate the household's devices, then read \
-         `oxidhome://devices/{{device_id}}` on any device you plan to reference to see the \
-         concrete capabilities it exposes (switch/toggle, dimmer/set, lock/lock, etc.). Use \
-         `tools/call` on `plugins.list` to see which plugin owns each device — the plugin \
-         identity is what will actually execute the command. Ground the draft in real device \
-         ids + real capability action names — never invent one. Then produce a draft automation \
-         with:\n\
+         `oxidhome://devices/{{device_id}}` on any device you plan to reference. The response \
+         gives you the real `device_id` and the `capabilities: []` list — an array of \
+         capability *names* the device exposes (e.g. `switch`, `dimmer`, `lock`, \
+         `motion-sensor`). Ground the draft in these real values — never invent a `device_id` \
+         or invent a capability name that isn't in the list.\n\
+         \n\
+         IMPORTANT — action verbs are NOT enumerable from the host: `device.send_command` \
+         takes a plugin-defined `action` string alongside `device_id` and `capability`, and \
+         the host does not publish a catalogue of valid actions per capability. Use a \
+         well-known convention where one clearly applies (e.g. `switch` → `toggle` / `on` / \
+         `off`; `dimmer` → `set` with a `level` arg; `lock` → `lock` / `unlock`) and mark it \
+         as a convention that the operator should confirm; when no obvious convention fits, \
+         defer the exact verb to the operator rather than guess.\n\
+         \n\
+         Then produce a draft automation with:\n\
          \n\
          1. A short human-readable summary of what it does.\n\
          2. The trigger condition, phrased against a specific device id + capability.\n\
-         3. The action(s), phrased against a specific `device.send_command` invocation with real \
-            `device_id`, `capability`, and `action` values.\n\
+         3. The action(s), phrased as a `device.send_command` invocation with the real \
+            `device_id` and `capability`, plus an action verb (call out whether the verb is \
+            from a well-known convention or needs operator confirmation).\n\
          4. Any preconditions or safety notes the operator should know before enabling it (e.g. \
             `devices:command` scope, locks / alarms flagged destructive).\n\
          \n\
-         If a needed device or capability doesn't exist, say so and stop — do not draft against \
-         one that isn't there."
+         If a needed device or capability isn't in the fleet, say so and stop — do not draft \
+         against one that isn't there."
     )
 }
 
