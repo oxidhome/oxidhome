@@ -303,9 +303,11 @@ async fn get_prompt_summarize_today_requires_both_scopes() {
     );
 }
 
-/// 14.6: `draft_automation` requires `plugins:list` AND both
+/// 14.6: `draft_automation` requires `devices:list` AND both
 /// `trigger` + `action` arguments. Missing arguments land as
-/// `-32602`; missing scope as `-32001`.
+/// `-32602`; missing scope as `-32001`. (Round-2 P1 on PR #135
+/// simplified the scope requirement to `devices:list` alone —
+/// see [`get_prompt_draft_automation_uses_only_devices_list_scope`].)
 #[tokio::test(flavor = "current_thread")]
 async fn get_prompt_draft_automation_rejects_missing_args_and_scope() {
     let engine = Engine::new().expect("engine");
@@ -573,6 +575,54 @@ async fn get_prompt_draft_automation_body_references_devices_and_correct_scope()
         !text.contains("plugins:command"),
         "`plugins:command` is not a real scope; got:\n{text}",
     );
+}
+
+/// Round-3 P1 on PR #135: the round-2 body used `lock` and
+/// `motion-sensor` as example capability names, but the
+/// resource never serialises those — built-ins are `switch`,
+/// `dimmer`, `color-light`, `sensor`, `button`,
+/// `video-stream`, `audio-stream`, and anything else appears
+/// as `extension(<name>)` (see `capability_name` in
+/// `runtime/state.rs`). Locking in that the body only mentions
+/// real built-in names AND explicitly calls out the
+/// `extension(<name>)` wire form for anything else, so a
+/// planner can't emit `capability: "lock"` when the actual
+/// wire value would be `extension(lock)`.
+#[tokio::test(flavor = "current_thread")]
+async fn get_prompt_draft_automation_body_uses_real_capability_wire_names() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "prompts/get",
+        json!({"name": "draft_automation", "arguments": {
+            "trigger": "front door unlocks",
+            "action": "turn on hallway lights",
+        }}),
+    )
+    .await;
+    let text = response["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("text");
+
+    // Body MUST explain the `extension(<name>)` wire form so a
+    // planner doesn't emit a bare custom name.
+    assert!(
+        text.contains("extension("),
+        "body must document the extension(<name>) wire form; got:\n{text}",
+    );
+    // Body MUST reference real built-in names.
+    for real_name in ["switch", "dimmer", "color-light", "sensor"] {
+        assert!(
+            text.contains(real_name),
+            "body must reference the real built-in capability `{real_name}`; got:\n{text}",
+        );
+    }
 }
 
 /// Round-2 P1 on PR #135: action verbs (`toggle`, `set`,
