@@ -28,6 +28,9 @@
 //! - `plugins.uninstall` (14.3e — mutating admin,
 //!   destructive, gated on `plugins:uninstall`; tool-shape
 //!   of `DELETE /api/v1/plugins/{id}`).
+//! - `plugins.start` (14.3f — mutating admin, gated on
+//!   `plugins:start`; tool-shape of `POST
+//!   /api/v1/plugins/{id}/start`).
 //!
 //! # Layout
 //!
@@ -60,8 +63,8 @@ use serde_json::{Value as JsonValue, json};
 use crate::Engine;
 use crate::api::auth::wit_error_kind;
 use crate::api::scopes::{
-    DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_LIST, PLUGINS_STOP, PLUGINS_UNINSTALL,
-    require_scope,
+    DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP,
+    PLUGINS_UNINSTALL, require_scope,
 };
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
@@ -183,6 +186,32 @@ pub(super) fn list_tools() -> Vec<Tool> {
                 // Reversible via `plugins.start`, but the observable
                 // side effect (halted supervision) is real and can
                 // interrupt in-flight commands — flag as destructive.
+                .destructive(true)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.start",
+            "Start a supervised instance of an installed plugin. Returns once the \
+             instance reaches `Running` (or fails to). Optional `instance_id` (defaults \
+             to `plugin_id`) lets multiple instances of the same plugin coexist. \
+             Optional `config_overrides` is a TOML-shaped JSON blob that layers over \
+             the manifest's `[config]` table. SENSITIVE: gated on `plugins:start` — \
+             starting a plugin activates its declared capabilities (device drivers, \
+             services, HTTP listeners), so the same admin surface admin operators \
+             consider before enabling a plugin at the CLI.",
+            Arc::new(plugins_start_schema()),
+        )
+        .with_title("Start plugin instance")
+        .annotate(
+            ToolAnnotations::new()
+                // Mutates host runtime state (spawns a
+                // supervisor task).
+                .read_only(false)
+                // Reversible via `plugins.stop`, but the
+                // observable side effect (a running supervisor
+                // driving physical actuation) is real — flag
+                // as destructive so a planner treats it as
+                // write surface.
                 .destructive(true)
                 .open_world(false),
         ),
@@ -489,6 +518,7 @@ pub(super) async fn call(
         "plugins.show" => ("plugins.show", PLUGINS_LIST),
         "plugins.stop" => ("plugins.stop", PLUGINS_STOP),
         "plugins.uninstall" => ("plugins.uninstall", PLUGINS_UNINSTALL),
+        "plugins.start" => ("plugins.start", PLUGINS_START),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -551,6 +581,7 @@ pub(super) async fn call(
         "plugins.show" => plugins_show_call(&engine, request.arguments),
         "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments).await,
         "plugins.uninstall" => plugins_uninstall_call(engine.clone(), request.arguments).await,
+        "plugins.start" => plugins_start_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -2005,6 +2036,215 @@ async fn plugins_uninstall_call(
             // manipulates host state (FS + SQL registry rows)
             // — no plugin `execute-command` runs. Leave the
             // slot NULL, same as the read tools.
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+// ── plugins.start ───────────────────────────────────────────────
+
+fn plugins_start_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id"],
+        "properties": {
+            "plugin_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Installed `plugin_id` to start.",
+            },
+            "instance_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional: instance id to run under. Defaults to `plugin_id`. Must be a safe filesystem segment (no `/`, `..`, absolute paths, or leading dots).",
+            },
+            "config_overrides": {
+                "type": "object",
+                "description": "Optional: TOML-shaped JSON blob that layers over the manifest's `[config]` table. Follows the same shape the REST endpoint's `config_overrides` accepts.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsStartArgs {
+    plugin_id: String,
+    // Round-1 P1 on PR #132: string-only helper rejects
+    // explicit JSON `null` on the optional field so a malformed
+    // client payload can't silently coerce to the default
+    // (which for start means "instance_id = plugin_id").
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    instance_id: Option<String>,
+    // Round-1 P1 on PR #133: same null-guard as
+    // `instance_id`, plus a type-check that only accepts a
+    // JSON object. Pre-fix, `Option<toml::Value>` accepted
+    // explicit `null` (→ `None`, silently starting with
+    // manifest defaults) and non-table scalars/arrays (which
+    // only failed after the supervisor was already spawned).
+    // The schema advertises `type: "object"`; enforce it here.
+    #[serde(default, deserialize_with = "deserialize_optional_toml_table")]
+    config_overrides: Option<toml::Value>,
+}
+
+/// Enforces the `config_overrides` field's schema at the tool
+/// boundary: absent → `None` (via `#[serde(default)]` on the
+/// field), object → `Some(toml::Value::Table)`, everything
+/// else (explicit `null`, scalars, arrays) → a
+/// `deserialize`-time error that lands as
+/// `INVALID_PARAMS`. Converting through
+/// `serde_json::Value` first makes the type-check explicit
+/// and keeps the error message deterministic across serde
+/// versions.
+fn deserialize_optional_toml_table<'de, D>(deserializer: D) -> Result<Option<toml::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match &value {
+        serde_json::Value::Object(_) => {
+            let toml_value =
+                serde_json::from_value::<toml::Value>(value).map_err(serde::de::Error::custom)?;
+            Ok(Some(toml_value))
+        }
+        _ => Err(serde::de::Error::custom(
+            "config_overrides must be a JSON object; null, scalars, and arrays are rejected",
+        )),
+    }
+}
+
+#[derive(Serialize)]
+struct PluginsStartBody {
+    plugin_id: String,
+    instance_id: String,
+    state: String,
+}
+
+async fn plugins_start_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    let Some(arguments) = arguments else {
+        return ToolOutcome::InvalidParams("plugins.start requires a `plugin_id` argument".into());
+    };
+    let args: PluginsStartArgs = match serde_json::from_value(JsonValue::Object(arguments)) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "plugins.start arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+    if args.plugin_id.is_empty() {
+        return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
+    }
+    if args.instance_id.as_ref().is_some_and(String::is_empty) {
+        return ToolOutcome::InvalidParams(
+            "`instance_id`, when supplied, must not be empty".into(),
+        );
+    }
+
+    let instance_id = args.instance_id.unwrap_or_else(|| args.plugin_id.clone());
+    // Follow-up review H1 (mirroring REST): reject caller-
+    // supplied `instance_id`s that aren't safe as FS segments
+    // before they reach the KV / blob store (which use the id
+    // directly in `<blobs_root>/<instance_id>/...`). Absolute
+    // paths would replace the root under `Path::join`, `..`
+    // escapes it, `\0` truncates on POSIX. Also rejected:
+    // empty and leading-`.` (collides with blob-store `.tmp`
+    // staging).
+    if !crate::state::is_safe_instance_id(&instance_id) {
+        return ToolOutcome::InvalidParams(format!(
+            "`instance_id` `{instance_id}` is not a safe filesystem segment"
+        ));
+    }
+
+    // H2 round-2 F1: serialize against a concurrent uninstall
+    // for the same plugin_id. Without this lock, uninstall's
+    // running-instances check could pass while start is mid-
+    // supervisor-registration, and uninstall could then yank
+    // the registry row + FS from under the fresh instance.
+    let lifecycle_lock = engine.plugin_lifecycle_lock(&args.plugin_id);
+    let _guard = lifecycle_lock.lock().await;
+    let Some(installed) = engine.installed_plugins().get(&args.plugin_id) else {
+        return ToolOutcome::ExecErr {
+            message: format!("plugin `{}` is not installed", args.plugin_id),
+            structured: Some(json!({
+                "kind": "not_installed",
+                "plugin_id": args.plugin_id,
+            })),
+            // Round-1 P2 on PR #132: host-state precondition,
+            // not a plugin WIT error — keep the audit slot
+            // NULL.
+            domain_kind: None,
+        };
+    };
+
+    // H11 round-2 F1: `start_installed_instance` pins the
+    // load-time identity to the `installation_uuid` observed
+    // under the lifecycle lock. Loader fails closed if the
+    // registry row named by that uuid disappears between now
+    // and the supervisor's re-read (concurrent uninstall
+    // race) — never falls back to synthetic identity +
+    // manifest-requested capabilities.
+    let handle = match engine
+        .start_installed_instance(
+            installed.path.clone(),
+            instance_id.clone(),
+            args.config_overrides,
+            std::sync::Arc::clone(&installed.installation_uuid),
+        )
+        .await
+    {
+        Ok(h) => h,
+        Err(err) => {
+            // Round-1 P2 on PR #132: raw errors from
+            // `start_installed_instance` (loader failures,
+            // wasmtime errors) can carry host filesystem paths
+            // and internal type names. Log server-side; hand
+            // the client a generic message.
+            tracing::error!(
+                target: "mcp.tool.plugins.start",
+                plugin_id = %args.plugin_id,
+                %instance_id,
+                %err,
+                "start failed",
+            );
+            return ToolOutcome::Internal("start failed; see server logs for details".into());
+        }
+    };
+    if let Err(err) = handle.wait_for_running().await {
+        tracing::error!(
+            target: "mcp.tool.plugins.start",
+            plugin_id = %args.plugin_id,
+            %instance_id,
+            %err,
+            "instance failed to reach Running",
+        );
+        return ToolOutcome::Internal(
+            "instance failed to reach Running; see server logs for details".into(),
+        );
+    }
+
+    let body = PluginsStartBody {
+        plugin_id: args.plugin_id,
+        instance_id,
+        state: format!("{:?}", handle.state()),
+    };
+    match super::resources::encode_body_capped(&body, "plugins.start", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            // Same taxonomy rule as `plugins.stop` /
+            // `plugins.uninstall`: host lifecycle action, not
+            // a plugin `execute-command` invocation. Keep
+            // `execution_outcome` NULL.
             plugin_reached: false,
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
