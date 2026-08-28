@@ -2319,6 +2319,12 @@ struct PluginsInstallBody {
     installed_path: String,
 }
 
+// Linear top-to-bottom decision flow (parse → absolute
+// check → spawn_blocking → per-variant error mapping →
+// encode). Splitting per-variant into helpers would hide the
+// InstallError → ToolOutcome mapping without shrinking any
+// individual step; matches the shape of `plugins_uninstall_call`.
+#[allow(clippy::too_many_lines)]
 async fn plugins_install_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
