@@ -214,6 +214,23 @@ dependencies = [
  "rustversion",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "buffa"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf9e6224bc4ee1f189ad257120c156fb05f95b826f5369d620b24984476c200a"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
+ "once_cell",
+ "rustversion",
+ "serde",
+ "serde_json",
  "smoothutf8",
  "thiserror",
 ]
@@ -334,14 +351,14 @@ dependencies = [
 
 [[package]]
 name = "connectrpc"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4d1bbfc95ed1f4f31a027f5b97ff981be2617bc8a5c800fd6fcc701867bb97f"
+checksum = "85de144722d22eb03b7985136d8cd29b89d277a2df4ae0f53ef46488c467cbaf"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "buffa",
+ "buffa 0.9.1",
  "bytes",
  "futures",
  "http",
@@ -354,6 +371,7 @@ dependencies = [
  "pin-project",
  "serde",
  "serde_json",
+ "sync_wrapper",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1627,7 +1645,7 @@ dependencies = [
 name = "oxidhome-proto"
 version = "0.1.0"
 dependencies = [
- "buffa",
+ "buffa 0.8.1",
  "connectrpc",
  "serde",
 ]
@@ -2260,9 +2278,9 @@ dependencies = [
 
 [[package]]
 name = "smoothutf8"
-version = "0.1.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36358427d32ecdb1624616deed99eccfef0a167fe5bf40ddb51efe6980bc1ec8"
+checksum = "6b4ec95892483d6d94284caccfddb9b77111a4dcac33ed25d624248def0fa5f1"
 dependencies = [
  "simdutf8",
 ]
