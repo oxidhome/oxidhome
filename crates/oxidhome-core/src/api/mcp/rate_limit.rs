@@ -86,6 +86,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -93,6 +94,7 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use tokio::sync::Semaphore;
 
 use crate::api::auth::extract_bearer;
 use crate::state::TokenStore;
@@ -136,16 +138,43 @@ const MAX_TRACKED_KEYS: usize = 1024;
 /// bearers means a rotating garbage-bearer attacker can't
 /// grow the map with unique entries — round-3 P1 on PR #140.
 const UNAUTHENTICATED_KEY: &str = "unauthenticated";
+/// Hard cap on in-flight blocking verifications. Prevents
+/// unbounded growth of the shared blocking-pool queue when
+/// `SQLite` stalls and arrivals exceed completions — round-5
+/// P1 on PR #140. Sized to comfortably exceed steady-state
+/// under load; if we're saturating this AND `SQLite` is stalling
+/// the whole daemon is unhealthy and returning 429 is correct.
+const DEFAULT_VERIFY_INFLIGHT: usize = 32;
+/// Rejected-request logging is aggregated: the middleware
+/// emits at most one `warn!` per this window with the
+/// accumulated count for each rejection reason. Prevents
+/// log-storming a stdout consumer or the persistent tracing
+/// layer under a rejection flood — round-5 P2 on PR #140.
+const REJECT_LOG_WINDOW: Duration = Duration::from_secs(1);
 
-/// Stashes ONLY the successful verify result so `require_token`
-/// can skip its own SELECT on the happy path. Verify failures
-/// are not carried — they're rare, and `require_token`'s own
-/// SELECT will fail identically (both call `verify_read_only`
-/// under the hood), so there's no correctness win from reusing
-/// them. Keeping only the Ok case also sidesteps `TokenError`'s
-/// missing `Clone` impl (required by `Extensions::insert`).
+/// Full result of the pre-auth verify. `require_token` reads
+/// this off request extensions and skips its own SELECT
+/// entirely — for BOTH success and failure paths. Round-5 P1
+/// on PR #140: pre-fix, only `Ok` was cached, so unknown
+/// tokens still forced a second synchronous SELECT downstream
+/// (parking tokio workers on the shared `SQLite` mutex under
+/// a garbage-bearer flood).
+///
+/// - `Verified(rec)` — bearer resolved to a live token; downstream
+///   should stamp the actor + audit path but skip its own SELECT.
+///   The `last_used_ms` bump still needs to happen; downstream
+///   offloads it via `spawn_blocking` (round-5 P1 too).
+/// - `Denied` — bearer was missing, malformed, unknown, or
+///   revoked. Downstream records the anonymous probe and returns
+///   401 without re-verifying.
+/// - `Internal` — `SQLite` failure during verify (contrasted with
+///   `Denied`). Downstream returns 500 without re-verifying.
 #[derive(Clone)]
-pub(crate) struct PreVerifiedBearer(pub(crate) TokenRecord);
+pub(crate) enum PreVerifiedBearer {
+    Verified(TokenRecord),
+    Denied,
+    Internal,
+}
 
 /// Per-token leaky bucket. `tokens` is fractional so refill
 /// under low load isn't rounded to zero. `last_observed`
@@ -175,6 +204,86 @@ struct RateLimiterInner {
     refill_per_second: f64,
     max_keys: usize,
     tokens: Arc<TokenStore>,
+    /// Bounds the number of concurrent
+    /// `spawn_blocking(verify_read_only)` tasks. Round-5 P1
+    /// on PR #140: without this, a spike in arrivals past
+    /// steady-state `SQLite` throughput piles up on the shared
+    /// blocking-pool queue (disconnected requests don't cancel
+    /// `spawn_blocking`). Permit MOVES into the closure so
+    /// it's released only when the actual SELECT finishes,
+    /// not when the outer future is dropped.
+    verify_inflight: Arc<Semaphore>,
+    /// Aggregated per-window rejection counters. Emitting one
+    /// `warn!` per rejection is itself a `DoS` vector under a
+    /// flood — round-5 P2 on PR #140. See [`RejectLogger`].
+    ingress_reject_log: RejectLogger,
+    per_token_reject_log: RejectLogger,
+    verify_saturated_reject_log: RejectLogger,
+}
+
+/// Per-reason rejection aggregator. Emits at most one
+/// `warn!` per [`REJECT_LOG_WINDOW`] with the accumulated
+/// count. Concurrent probes race harmlessly via a single
+/// atomic CAS on `window_start_ms`.
+#[derive(Debug)]
+struct RejectLogger {
+    /// Millisecond timestamp of the current window's start
+    /// (UNIX epoch). Zero means no window has opened yet;
+    /// the first probe seeds it.
+    window_start_ms: AtomicU64,
+    /// Rejections observed in the current window (reset on
+    /// window rollover).
+    count: AtomicU64,
+    /// Short label included in the emitted `warn!` so the
+    /// operator can tell ingress from per-token from
+    /// verify-saturated.
+    reason: &'static str,
+}
+
+impl RejectLogger {
+    const fn new(reason: &'static str) -> Self {
+        Self {
+            window_start_ms: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            reason,
+        }
+    }
+
+    /// Record one rejection. Emits at most one `warn!` per
+    /// window with the accumulated count; every rejection
+    /// past that is a cheap atomic increment.
+    fn record(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let now_ms = now_unix_ms();
+        let start = self.window_start_ms.load(Ordering::Relaxed);
+        let window_ms = REJECT_LOG_WINDOW.as_millis().try_into().unwrap_or(u64::MAX);
+        if start == 0 || now_ms.saturating_sub(start) >= window_ms {
+            // Try to claim the window rollover. Only the CAS
+            // winner emits the warn — losers drop through and
+            // just wait for the next window.
+            if self
+                .window_start_ms
+                .compare_exchange(start, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                let count = self.count.swap(0, Ordering::Relaxed);
+                if count > 0 {
+                    tracing::warn!(
+                        reason = self.reason,
+                        count,
+                        window_secs = REJECT_LOG_WINDOW.as_secs(),
+                        "MCP rate limit rejections in the last window",
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 impl RateLimiterState {
@@ -236,6 +345,10 @@ impl RateLimiterState {
                 refill_per_second,
                 max_keys,
                 tokens,
+                verify_inflight: Arc::new(Semaphore::new(DEFAULT_VERIFY_INFLIGHT)),
+                ingress_reject_log: RejectLogger::new("ingress_bucket"),
+                per_token_reject_log: RejectLogger::new("per_token_bucket"),
+                verify_saturated_reject_log: RejectLogger::new("verify_saturated"),
             }),
         }
     }
@@ -344,36 +457,29 @@ fn evict_one_lru(buckets: &mut HashMap<String, TokenBucket>) {
     }
 }
 
-/// Middleware. Two-stage rate limit:
+/// Middleware. Three-stage rate limit + verify:
 ///
 /// 1. Coarse global ingress bucket — rejects a verify flood
-///    before any DB work (round-4 P1 on PR #140). Without
-///    this, a syntactically-valid-but-unknown token stream
-///    (or a single valid token being hammered) could push
-///    unlimited serialized SELECTs through the shared
-///    `SQLite` mutex.
-/// 2. Per-resolved-token bucket — fairness across callers.
-///    The verify itself runs on the blocking pool because
-///    `Db::read` uses a `std::sync::Mutex` and requires that.
+///    before any DB work (round-4 P1 on PR #140).
+/// 2. Bounded in-flight verify semaphore — caps concurrent
+///    `spawn_blocking(verify_read_only)` tasks so the shared
+///    blocking-pool queue can't grow unboundedly when `SQLite`
+///    stalls (round-5 P1 on PR #140). Saturated → immediate
+///    429 without submitting the blocking task.
+/// 3. Per-resolved-token bucket — fairness across callers.
 ///
-/// Successful verifies stash the record on request extensions
-/// as [`PreVerifiedBearer`] so `require_token` skips its own
-/// SELECT — net cost per admitted request stays at one SELECT
-/// + one UPDATE + two audit writes.
+/// All verify outcomes (success / denied / `SQLite` error) are
+/// cached on request extensions as [`PreVerifiedBearer`], so
+/// `require_token` runs zero synchronous `SQLite` work
+/// downstream — round-5 P1 on PR #140.
 pub(super) async fn rate_limit(
     State(state): State<RateLimiterState>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Stage 1: coarse ingress bucket. Runs before ANY DB work
-    // so a verify-flood attacker can't park tokio workers on
-    // the `SQLite` mutex before the per-token bucket has a
-    // chance to reject them (round-4 P1 on PR #140).
+    // Stage 1: coarse ingress bucket. Cheap in-memory check.
     if let Err(retry_after) = state.try_consume_ingress() {
-        tracing::warn!(
-            retry_after,
-            "MCP ingress bucket exhausted — replying 429 before token resolution",
-        );
+        state.inner.ingress_reject_log.record();
         return too_many_requests(retry_after);
     }
 
@@ -381,17 +487,39 @@ pub(super) async fn rate_limit(
     // consistent with `require_token` (round-3 P1 on PR #140).
     let bearer = extract_bearer(&request).map(str::to_owned);
 
-    // Stage 2 setup: read-only verify off the async worker.
-    // `Db::read` uses the shared `SQLite` mutex + its docs
-    // require `spawn_blocking` from async callers — round-4 P1
-    // on PR #140.
-    let (key, pre_verified): (String, Option<PreVerifiedBearer>) = match bearer {
+    // Stage 2: bounded blocking verify. Skip entirely when
+    // there's no bearer — nothing to verify.
+    let pre_verified: PreVerifiedBearer = match bearer {
         Some(b) => {
+            // Try to acquire an in-flight permit. Saturated
+            // → immediate 429 with no blocking-task submission
+            // (round-5 P1 on PR #140).
+            let Ok(permit) = Arc::clone(&state.inner.verify_inflight).try_acquire_owned() else {
+                state.inner.verify_saturated_reject_log.record();
+                return too_many_requests(1);
+            };
             let tokens = Arc::clone(&state.inner.tokens);
-            let verify = tokio::task::spawn_blocking(move || tokens.verify_read_only(&b)).await;
+            // Permit MOVES into the closure so it's held for
+            // the actual SELECT duration, not just the outer
+            // future's lifetime. A disconnected outer future
+            // doesn't cancel the blocking task; if we dropped
+            // the permit at the await point we'd overcount
+            // completions and let the queue overrun.
+            let verify = tokio::task::spawn_blocking(move || {
+                let _guard = permit;
+                tokens.verify_read_only(&b)
+            })
+            .await;
             match verify {
-                Ok(Ok(rec)) => (rec.id.clone(), Some(PreVerifiedBearer(rec))),
-                Ok(Err(_)) => (UNAUTHENTICATED_KEY.to_string(), None),
+                Ok(Ok(rec)) => PreVerifiedBearer::Verified(rec),
+                Ok(Err(crate::state::auth_token::TokenError::Sqlite(err))) => {
+                    tracing::error!(
+                        %err,
+                        "MCP rate-limit verify hit SQLite error; deferring to require_token",
+                    );
+                    PreVerifiedBearer::Internal
+                }
+                Ok(Err(_)) => PreVerifiedBearer::Denied,
                 Err(join_err) => {
                     tracing::error!(
                         %join_err,
@@ -405,22 +533,23 @@ pub(super) async fn rate_limit(
                 }
             }
         }
-        None => (UNAUTHENTICATED_KEY.to_string(), None),
+        None => PreVerifiedBearer::Denied,
     };
 
+    // Stage 3: per-token bucket. Successful verifies get their
+    // own token-id bucket; every failure collapses to the
+    // shared unauthenticated bucket (round-3 P1 on PR #140).
+    let key = match &pre_verified {
+        PreVerifiedBearer::Verified(rec) => rec.id.clone(),
+        PreVerifiedBearer::Denied | PreVerifiedBearer::Internal => UNAUTHENTICATED_KEY.to_string(),
+    };
     match state.try_consume(&key) {
         Ok(()) => {
-            if let Some(pre) = pre_verified {
-                request.extensions_mut().insert(pre);
-            }
+            request.extensions_mut().insert(pre_verified);
             next.run(request).await
         }
         Err(retry_after) => {
-            tracing::warn!(
-                bucket_key = %key,
-                retry_after,
-                "MCP per-token bucket exhausted — replying 429 Too Many Requests",
-            );
+            state.inner.per_token_reject_log.record();
             too_many_requests(retry_after)
         }
     }

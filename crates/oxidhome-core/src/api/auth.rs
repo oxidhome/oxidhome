@@ -181,19 +181,31 @@ pub(crate) async fn require_token(
         return unauthorized();
     };
 
-    // Round-3 P1 on PR #140: the MCP rate-limit layer runs
-    // read-only verification upstream and stashes the
-    // resolved record as `PreVerifiedBearer` when it
-    // succeeded. Reusing it saves a redundant SELECT on the
-    // happy path — we only need the write-half
-    // (`last_used_ms` bump) here.
+    // Round-3/5 P1 on PR #140: the MCP rate-limit layer runs
+    // read-only verification upstream and stashes the FULL
+    // outcome as `PreVerifiedBearer` (success + denied +
+    // internal). Reusing it means the auth path adds ZERO
+    // synchronous `SQLite` work on the MCP mount — the
+    // read-only SELECT already ran on the blocking pool, and
+    // any `last_used_ms` bump on the happy path is offloaded
+    // via `spawn_blocking` below to keep the runtime worker
+    // unparked.
     let verify_result = match req
         .extensions_mut()
         .remove::<super::mcp::PreVerifiedBearer>()
     {
-        Some(pre) => {
-            let _ = state.tokens.touch_last_used(&pre.0.id);
-            Ok(pre.0)
+        Some(super::mcp::PreVerifiedBearer::Verified(rec)) => {
+            let tokens = state.tokens.clone();
+            let id_for_bump = rec.id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = tokens.touch_last_used(&id_for_bump);
+            })
+            .await;
+            Ok(rec)
+        }
+        Some(super::mcp::PreVerifiedBearer::Denied) => Err(TokenError::Unknown),
+        Some(super::mcp::PreVerifiedBearer::Internal) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
         None => state.tokens.verify(&bearer),
     };
