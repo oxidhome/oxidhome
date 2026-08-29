@@ -677,3 +677,89 @@ async fn sdk_errors_on_non_requests_are_preserved() {
     );
     assert_ne!(unknown_session.status(), StatusCode::ACCEPTED);
 }
+
+/// 14.7b: per-token rate limit. Two initialize calls against
+/// a capacity-1 mount: the first succeeds, the second lands as
+/// `429 Too Many Requests` with a `Retry-After` header. Refill
+/// is disabled (rate=0) so the second call can't win a race.
+#[tokio::test(flavor = "current_thread")]
+async fn rate_limit_exceeded_returns_429() {
+    use oxidhome_core::api::mcp::mount_routes_with_rate_limiter;
+
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = mount_routes_with_rate_limiter(&engine, 1, 0.0);
+
+    let post_init = || {
+        router.clone().oneshot(
+            base_request("POST", &bearer)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+    };
+
+    // First request drains the single token.
+    let first = post_init().await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK, "first request must succeed");
+
+    // Second request has no tokens left.
+    let second = post_init().await.unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "over-limit request must reply 429",
+    );
+    let retry_after = second
+        .headers()
+        .get(header::RETRY_AFTER)
+        .expect("Retry-After header on 429")
+        .to_str()
+        .unwrap();
+    assert!(
+        retry_after.parse::<u64>().is_ok(),
+        "Retry-After must be a positive integer seconds value; got `{retry_after}`",
+    );
+}
+
+/// 14.7b: rate limit is per-token, not global. A second token
+/// past the first one's exhaustion still gets served — the
+/// limiter's bucket map is keyed on actor id.
+#[tokio::test(flavor = "current_thread")]
+async fn rate_limit_is_per_token_not_global() {
+    use oxidhome_core::api::mcp::mount_routes_with_rate_limiter;
+
+    let engine = Engine::new().expect("engine");
+    let bearer_a = engine
+        .auth_tokens()
+        .create("token-a", b"[\"*\"]")
+        .expect("mint bearer a")
+        .plaintext;
+    let bearer_b = engine
+        .auth_tokens()
+        .create("token-b", b"[\"*\"]")
+        .expect("mint bearer b")
+        .plaintext;
+    let router = mount_routes_with_rate_limiter(&engine, 1, 0.0);
+
+    let init_with = |bearer: String| {
+        router.clone().oneshot(
+            base_request("POST", &bearer)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+    };
+
+    // token-a drains its bucket then hits 429.
+    assert_eq!(init_with(bearer_a.clone()).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        init_with(bearer_a).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS,
+    );
+
+    // token-b's bucket is untouched — still gets served.
+    assert_eq!(
+        init_with(bearer_b).await.unwrap().status(),
+        StatusCode::OK,
+        "second token must not inherit the first's rate-limit state",
+    );
+}

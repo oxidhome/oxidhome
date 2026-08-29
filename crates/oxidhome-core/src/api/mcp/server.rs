@@ -158,15 +158,56 @@ pub fn mount_routes_with_limits(
     mount_routes_with_all_limits(engine, cap, request_body_deadline, PENDING_BODY_GATE)
 }
 
+/// Mount variant that overrides the per-token rate limiter.
+/// Public so 14.7b's integration test can drive the 429 shape
+/// with a capacity of 1 rather than the production 60. All
+/// other limits stay at production defaults.
+pub fn mount_routes_with_rate_limiter(
+    engine: &Engine,
+    rate_limit_capacity: u32,
+    rate_limit_refill_per_second: f64,
+) -> Router {
+    mount_inner(
+        engine,
+        MAX_SESSIONS,
+        REQUEST_BODY_DEADLINE,
+        PENDING_BODY_GATE,
+        super::rate_limit::RateLimiterState::with_capacity_and_refill(
+            rate_limit_capacity,
+            rate_limit_refill_per_second,
+        ),
+    )
+}
+
 /// Fully-parametrized mount — session cap, body deadline, AND
 /// concurrent-body-buffer permits. Public so the R6 F1
 /// regression test can exhaust the pending-body gate without
-/// firing 256 requests.
+/// firing 256 requests. Uses the production per-token rate
+/// limiter; see [`mount_routes_with_rate_limiter`] to override
+/// that too.
 pub fn mount_routes_with_all_limits(
     engine: &Engine,
     cap: usize,
     request_body_deadline: Duration,
     pending_body_gate: usize,
+) -> Router {
+    mount_inner(
+        engine,
+        cap,
+        request_body_deadline,
+        pending_body_gate,
+        super::rate_limit::RateLimiterState::new(),
+    )
+}
+
+/// Internal mount that takes every knob. Every `mount_*` public
+/// variant delegates here.
+fn mount_inner(
+    engine: &Engine,
+    cap: usize,
+    request_body_deadline: Duration,
+    pending_body_gate: usize,
+    rate_limiter: super::rate_limit::RateLimiterState,
 ) -> Router {
     let session_manager = Arc::new(BoundedSessionManager::new(
         LocalSessionManager::default(),
@@ -230,9 +271,19 @@ pub fn mount_routes_with_all_limits(
     // The token-store lookup cost per request is the price
     // of that safety; on a home hub with one operator it's
     // trivial.
+    // 14.7b: per-token rate limit. Sits after `require_token`
+    // (so `Actor::id()` is available on request extensions) and
+    // before the admission gate (so a rate-limited request
+    // doesn't consume a pending-body permit). Tests that need
+    // to drive the 429 shape override the limiter via
+    // `mount_routes_with_rate_limiter`.
     Router::new()
         .route_service(MCP_ENDPOINT, service)
         .layer(from_fn_with_state(state, admission_gate))
+        .layer(from_fn_with_state(
+            rate_limiter,
+            super::rate_limit::rate_limit,
+        ))
         .layer(from_fn_with_state(
             auth_state,
             super::super::auth::require_token,
