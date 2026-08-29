@@ -272,14 +272,23 @@ fn mount_inner(
     // The token-store lookup cost per request is the price
     // of that safety; on a home hub with one operator it's
     // trivial.
-    // 14.7b: per-bearer rate limit. Round-2 P1 on PR #140 moved
+    // 14.7b: per-token rate limit. Round-2 P1 on PR #140 moved
     // this OUTSIDE `require_token` so a rejected request does
     // zero SQLite writes — no `last_used_ms` update, no audit
-    // intent, no audit finalize. The limiter keys on a
-    // SHA-256 fingerprint of the raw bearer (or a shared
-    // "anonymous" sentinel), which is available before the
-    // auth layer runs. Tests that need to drive the 429 shape
-    // override the limiter via `mount_routes_with_rate_limiter`.
+    // intent, no audit finalize. Round-3 P1 rekeyed on the
+    // *resolved* token id (via a read-only
+    // `TokenStore::verify_read_only`) rather than the raw
+    // bearer, so rotating garbage bearers all fall into a
+    // single shared `unauthenticated` bucket instead of each
+    // getting a fresh capacity-60 slot. Round-4 P1 added a
+    // coarse global ingress bucket in front of the verify so
+    // a flood of syntactically-valid-but-unknown tokens can't
+    // push serialized SELECTs through the shared SQLite mutex
+    // before either bucket returns 429; the verify itself now
+    // runs on the blocking pool via spawn_blocking (Db::read
+    // uses a std::sync::Mutex). Tests that need to drive the
+    // 429 shape override the limiter via
+    // `mount_routes_with_rate_limiter`.
     //
     // Layer order (bottom-up in code = outer-to-inner at
     // runtime):

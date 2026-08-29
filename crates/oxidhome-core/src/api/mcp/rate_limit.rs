@@ -46,18 +46,34 @@
 //!
 //! # Algorithm
 //!
-//! Leaky bucket per key:
+//! Two leaky buckets in series:
 //!
-//! - **Capacity** = [`DEFAULT_BUCKET_CAPACITY`] tokens. Bursts
-//!   up to this many requests are served without throttling.
-//! - **Refill rate** = [`DEFAULT_TOKENS_PER_SECOND`]. Sustained
-//!   throughput past that latches into 429s.
-//! - **Hard-capped map** = [`MAX_TRACKED_KEYS`] entries. When
-//!   a NEW key would push the map over the cap, the least-
-//!   recently-observed entry is evicted (round-2 P2 on PR
-//!   #140). Anonymous / unrecognized requests share ONE map
-//!   entry ([`UNAUTHENTICATED_KEY`]), so garbage-bearer
-//!   rotation can't grow the map at all.
+//! 1. **Ingress bucket** — one shared bucket for the entire
+//!    endpoint. Rate-caps at [`DEFAULT_INGRESS_TOKENS_PER_SECOND`]
+//!    with burst [`DEFAULT_INGRESS_CAPACITY`]. Runs BEFORE the
+//!    read-only bearer verification, so a flood of syntactically
+//!    valid but unknown tokens (or a flood of the same valid
+//!    token) can't force unlimited serialized `SQLite` SELECTs
+//!    that would park tokio workers on the shared DB mutex
+//!    (round-4 P1 on PR #140). This is a coarse ingress cap,
+//!    not a per-caller policy — the per-token bucket below is
+//!    the fairness layer.
+//! 2. **Per-token bucket** — one bucket per resolved token id
+//!    (or [`UNAUTHENTICATED_KEY`]).
+//!    - **Capacity** = [`DEFAULT_BUCKET_CAPACITY`] tokens.
+//!    - **Refill rate** = [`DEFAULT_TOKENS_PER_SECOND`].
+//!    - **Hard-capped map** = [`MAX_TRACKED_KEYS`] entries.
+//!      When a NEW key would push the map over the cap, the
+//!      least-recently-observed entry is evicted (round-2 P2
+//!      on PR #140). Anonymous / unrecognized requests share
+//!      ONE map entry, so garbage-bearer rotation can't grow
+//!      the map at all.
+//!
+//! Between the two buckets the `TokenStore::verify_read_only`
+//! call runs off the async worker via
+//! `tokio::task::spawn_blocking` — `Db::read` uses the shared
+//! `SQLite` mutex and its own docs require blocking-pool
+//! isolation for async callers (round-4 P1 on PR #140).
 //!
 //! # Wire shape
 //!
@@ -91,6 +107,18 @@ pub(super) const DEFAULT_BUCKET_CAPACITY: u32 = 60;
 /// what any agentic-loop client should need against a
 /// household hub, well below what a runaway loop can push.
 pub(super) const DEFAULT_TOKENS_PER_SECOND: f64 = 30.0;
+/// Default burst capacity for the shared ingress bucket. Sized
+/// well above [`DEFAULT_BUCKET_CAPACITY`] so a legitimate
+/// operator with several agents on separate tokens all
+/// bursting concurrently doesn't hit the coarse ingress cap
+/// before the per-token cap.
+pub(super) const DEFAULT_INGRESS_CAPACITY: u32 = 400;
+/// Default ingress refill: 200 requests/second across the
+/// entire endpoint. Roughly seven times the per-token rate so
+/// a household with a handful of active tokens has headroom;
+/// still bounded well below what an unbounded verify flood
+/// could push through the shared `SQLite` mutex.
+pub(super) const DEFAULT_INGRESS_TOKENS_PER_SECOND: f64 = 200.0;
 /// Idle threshold used by the opportunistic cheap-sweep path.
 /// An entry idle longer than this is a preferred eviction
 /// victim when the map fills up. Not the sole enforcement
@@ -137,6 +165,12 @@ pub(super) struct RateLimiterState {
 
 struct RateLimiterInner {
     buckets: Mutex<HashMap<String, TokenBucket>>,
+    /// Coarse global bucket applied BEFORE the per-token
+    /// verification / bucket check. See the module-doc's
+    /// "Algorithm" section for the rationale.
+    ingress: Mutex<TokenBucket>,
+    ingress_capacity: f64,
+    ingress_refill_per_second: f64,
     capacity: f64,
     refill_per_second: f64,
     max_keys: usize,
@@ -145,41 +179,91 @@ struct RateLimiterInner {
 
 impl RateLimiterState {
     /// Build a limiter with the default capacity + refill + map
-    /// cap, wired against `engine.auth_tokens()`.
+    /// cap + ingress bucket, wired against `engine.auth_tokens()`.
     pub(super) fn new(tokens: Arc<TokenStore>) -> Self {
-        Self::with_capacity_and_refill(tokens, DEFAULT_BUCKET_CAPACITY, DEFAULT_TOKENS_PER_SECOND)
+        Self::with_all(
+            tokens,
+            DEFAULT_BUCKET_CAPACITY,
+            DEFAULT_TOKENS_PER_SECOND,
+            MAX_TRACKED_KEYS,
+            DEFAULT_INGRESS_CAPACITY,
+            DEFAULT_INGRESS_TOKENS_PER_SECOND,
+        )
     }
 
-    /// Build a limiter with custom bucket parameters — public
-    /// for tests that need to drive the 429 shape without
-    /// waiting for 30 requests/second to accumulate.
+    /// Build a limiter with custom per-token bucket parameters
+    /// but production ingress + map cap. Public for tests that
+    /// need to drive the per-token 429 shape without waiting
+    /// for 30 requests/second to accumulate.
     pub(super) fn with_capacity_and_refill(
         tokens: Arc<TokenStore>,
         capacity: u32,
         refill_per_second: f64,
     ) -> Self {
-        Self::with_all(tokens, capacity, refill_per_second, MAX_TRACKED_KEYS)
+        Self::with_all(
+            tokens,
+            capacity,
+            refill_per_second,
+            MAX_TRACKED_KEYS,
+            DEFAULT_INGRESS_CAPACITY,
+            DEFAULT_INGRESS_TOKENS_PER_SECOND,
+        )
     }
 
     /// Fully-parametrized constructor — tests that exercise
-    /// the LRU-eviction path need to override
-    /// [`MAX_TRACKED_KEYS`] without spraying `1_025` real
-    /// tokens at the mutex.
+    /// the LRU-eviction path OR the ingress bucket need to
+    /// override the corresponding cap without spraying real
+    /// requests at the mutex.
     pub(super) fn with_all(
         tokens: Arc<TokenStore>,
         capacity: u32,
         refill_per_second: f64,
         max_keys: usize,
+        ingress_capacity: u32,
+        ingress_refill_per_second: f64,
     ) -> Self {
         assert!(max_keys > 0, "rate limiter map cap must be > 0");
         Self {
             inner: Arc::new(RateLimiterInner {
                 buckets: Mutex::new(HashMap::new()),
+                ingress: Mutex::new(TokenBucket {
+                    tokens: f64::from(ingress_capacity),
+                    last_observed: Instant::now(),
+                }),
+                ingress_capacity: f64::from(ingress_capacity),
+                ingress_refill_per_second,
                 capacity: f64::from(capacity),
                 refill_per_second,
                 max_keys,
                 tokens,
             }),
+        }
+    }
+
+    /// Attempt to consume one token from the coarse global
+    /// ingress bucket. Returns `Err(seconds_until_refill)` when
+    /// the bucket is empty — the middleware short-circuits with
+    /// a 429 BEFORE any DB work, so a verify-flood attacker
+    /// can't push through the shared `SQLite` mutex.
+    fn try_consume_ingress(&self) -> Result<(), u64> {
+        let now = Instant::now();
+        let mut bucket = self
+            .inner
+            .ingress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let elapsed_secs = now.duration_since(bucket.last_observed).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed_secs * self.inner.ingress_refill_per_second)
+            .min(self.inner.ingress_capacity);
+        bucket.last_observed = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            Ok(())
+        } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let wait_secs =
+                ((1.0 - bucket.tokens) / self.inner.ingress_refill_per_second).ceil() as u64;
+            Err(wait_secs.max(1))
         }
     }
 
@@ -260,36 +344,67 @@ fn evict_one_lru(buckets: &mut HashMap<String, TokenBucket>) {
     }
 }
 
-/// Middleware. Consumes one token per request per resolved
-/// token id (or per shared unauthenticated bucket). Runs
-/// OUTSIDE `require_token` so a rejected request does zero
-/// durable writes; a downstream `require_token` reuses the
-/// verify result via [`PreVerifiedBearer`] so we don't pay
-/// two SELECTs for a happy-path admission.
+/// Middleware. Two-stage rate limit:
+///
+/// 1. Coarse global ingress bucket — rejects a verify flood
+///    before any DB work (round-4 P1 on PR #140). Without
+///    this, a syntactically-valid-but-unknown token stream
+///    (or a single valid token being hammered) could push
+///    unlimited serialized SELECTs through the shared
+///    `SQLite` mutex.
+/// 2. Per-resolved-token bucket — fairness across callers.
+///    The verify itself runs on the blocking pool because
+///    `Db::read` uses a `std::sync::Mutex` and requires that.
+///
+/// Successful verifies stash the record on request extensions
+/// as [`PreVerifiedBearer`] so `require_token` skips its own
+/// SELECT — net cost per admitted request stays at one SELECT
+/// + one UPDATE + two audit writes.
 pub(super) async fn rate_limit(
     State(state): State<RateLimiterState>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    // Stage 1: coarse ingress bucket. Runs before ANY DB work
+    // so a verify-flood attacker can't park tokio workers on
+    // the `SQLite` mutex before the per-token bucket has a
+    // chance to reject them (round-4 P1 on PR #140).
+    if let Err(retry_after) = state.try_consume_ingress() {
+        tracing::warn!(
+            retry_after,
+            "MCP ingress bucket exhausted — replying 429 before token resolution",
+        );
+        return too_many_requests(retry_after);
+    }
+
     // Reuse the canonical bearer extractor so parsing is
-    // consistent with `require_token`. Case-insensitive
-    // `Bearer`, multiple-space tolerance, all handled there
-    // (round-3 P1 on PR #140).
+    // consistent with `require_token` (round-3 P1 on PR #140).
     let bearer = extract_bearer(&request).map(str::to_owned);
 
-    // Read-only verify. Failures (missing / malformed / unknown /
-    // revoked) all collapse to the shared unauthenticated bucket
-    // (round-3 P1 on PR #140: prevents rotating-garbage bypass).
-    // Only successful records are stashed for `require_token` to
-    // reuse — see the docstring on `PreVerifiedBearer`.
-    let (key, pre_verified): (String, Option<PreVerifiedBearer>) = match bearer.as_deref() {
-        Some(b) => match state.inner.tokens.verify_read_only(b) {
-            Ok(rec) => {
-                let key = rec.id.clone();
-                (key, Some(PreVerifiedBearer(rec)))
+    // Stage 2 setup: read-only verify off the async worker.
+    // `Db::read` uses the shared `SQLite` mutex + its docs
+    // require `spawn_blocking` from async callers — round-4 P1
+    // on PR #140.
+    let (key, pre_verified): (String, Option<PreVerifiedBearer>) = match bearer {
+        Some(b) => {
+            let tokens = Arc::clone(&state.inner.tokens);
+            let verify = tokio::task::spawn_blocking(move || tokens.verify_read_only(&b)).await;
+            match verify {
+                Ok(Ok(rec)) => (rec.id.clone(), Some(PreVerifiedBearer(rec))),
+                Ok(Err(_)) => (UNAUTHENTICATED_KEY.to_string(), None),
+                Err(join_err) => {
+                    tracing::error!(
+                        %join_err,
+                        "MCP rate-limit verify task panicked; refusing request",
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Body::from(r#"{"error":"rate-limit verify task failed"}"#),
+                    )
+                        .into_response();
+                }
             }
-            Err(_) => (UNAUTHENTICATED_KEY.to_string(), None),
-        },
+        }
         None => (UNAUTHENTICATED_KEY.to_string(), None),
     };
 
@@ -304,16 +419,20 @@ pub(super) async fn rate_limit(
             tracing::warn!(
                 bucket_key = %key,
                 retry_after,
-                "MCP rate limit exceeded — replying 429 Too Many Requests",
+                "MCP per-token bucket exhausted — replying 429 Too Many Requests",
             );
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, retry_after.to_string())],
-                Body::from(r#"{"error":"MCP per-token rate limit exceeded; retry shortly"}"#),
-            )
-                .into_response()
+            too_many_requests(retry_after)
         }
     }
+}
+
+fn too_many_requests(retry_after: u64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, retry_after.to_string())],
+        Body::from(r#"{"error":"MCP rate limit exceeded; retry shortly"}"#),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -377,7 +496,7 @@ mod tests {
     #[test]
     fn map_size_stays_bounded_under_key_pressure() {
         let (store, _, _) = store_with_one_token();
-        let limiter = RateLimiterState::with_all(store, 1, 0.0, 3);
+        let limiter = RateLimiterState::with_all(store, 1, 0.0, 3, 1000, 0.0);
         for i in 0..5 {
             let _ = limiter.try_consume(&format!("k-{i}"));
         }
@@ -394,7 +513,7 @@ mod tests {
     #[test]
     fn lru_eviction_preserves_recent_entries() {
         let (store, _, _) = store_with_one_token();
-        let limiter = RateLimiterState::with_all(store, 1, 0.0, 3);
+        let limiter = RateLimiterState::with_all(store, 1, 0.0, 3, 1000, 0.0);
         for i in 0..3 {
             let _ = limiter.try_consume(&format!("k-{i}"));
             std::thread::sleep(Duration::from_millis(2));
@@ -422,7 +541,7 @@ mod tests {
         // Force feed unrecognized bearers directly via
         // try_consume against the sentinel key — mirrors what
         // the middleware would do after verify fails.
-        let limiter = RateLimiterState::with_all(store, 3, 0.0, 3);
+        let limiter = RateLimiterState::with_all(store, 3, 0.0, 3, 1000, 0.0);
         for _ in 0..100 {
             let _ = limiter.try_consume(UNAUTHENTICATED_KEY);
         }
@@ -444,7 +563,7 @@ mod tests {
     #[test]
     fn unauthenticated_bucket_survives_lru_eviction() {
         let (store, _, _) = store_with_one_token();
-        let limiter = RateLimiterState::with_all(store, 1, 0.0, 2);
+        let limiter = RateLimiterState::with_all(store, 1, 0.0, 2, 1000, 0.0);
         // Seed the unauth bucket first — oldest.
         let _ = limiter.try_consume(UNAUTHENTICATED_KEY);
         std::thread::sleep(Duration::from_millis(2));
@@ -459,5 +578,23 @@ mod tests {
             "unauthenticated bucket must survive LRU; got {:?}",
             buckets.keys().collect::<Vec<_>>(),
         );
+    }
+
+    /// Round-4 P1 on PR #140: the ingress bucket is a coarse
+    /// global cap that rejects a verify flood BEFORE any DB
+    /// work. Two consumes on a capacity-2 ingress bucket
+    /// admitted; the third is denied.
+    #[test]
+    fn ingress_bucket_rate_caps_before_verify() {
+        let (store, _, _) = store_with_one_token();
+        // Per-token bucket is generous; ingress bucket is
+        // capacity 2 with no refill.
+        let limiter = RateLimiterState::with_all(store, 1000, 0.0, 1024, 2, 0.0);
+        limiter.try_consume_ingress().expect("first ingress admit");
+        limiter.try_consume_ingress().expect("second ingress admit");
+        let err = limiter
+            .try_consume_ingress()
+            .expect_err("third ingress must be denied");
+        assert!(err >= 1);
     }
 }
