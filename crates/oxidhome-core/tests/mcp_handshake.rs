@@ -750,7 +750,10 @@ async fn rate_limit_is_per_token_not_global() {
     };
 
     // token-a drains its bucket then hits 429.
-    assert_eq!(init_with(bearer_a.clone()).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        init_with(bearer_a.clone()).await.unwrap().status(),
+        StatusCode::OK
+    );
     assert_eq!(
         init_with(bearer_a).await.unwrap().status(),
         StatusCode::TOO_MANY_REQUESTS,

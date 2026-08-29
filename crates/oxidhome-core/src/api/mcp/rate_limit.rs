@@ -97,10 +97,7 @@ struct RateLimiterInner {
 impl RateLimiterState {
     /// Build a limiter with the default capacity + refill.
     pub(super) fn new() -> Self {
-        Self::with_capacity_and_refill(
-            DEFAULT_BUCKET_CAPACITY,
-            DEFAULT_TOKENS_PER_SECOND,
-        )
+        Self::with_capacity_and_refill(DEFAULT_BUCKET_CAPACITY, DEFAULT_TOKENS_PER_SECOND)
     }
 
     /// Build a limiter with custom parameters — public for tests
@@ -142,8 +139,8 @@ impl RateLimiterState {
 
         // Refill by elapsed_seconds * rate, capped at capacity.
         let elapsed_secs = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed_secs * self.inner.refill_per_second)
-            .min(self.inner.capacity);
+        bucket.tokens =
+            (bucket.tokens + elapsed_secs * self.inner.refill_per_second).min(self.inner.capacity);
         bucket.last_refill = now;
 
         if bucket.tokens >= 1.0 {
@@ -195,9 +192,7 @@ pub(super) async fn rate_limit(
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, retry_after.to_string())],
-                Body::from(
-                    r#"{"error":"MCP per-token rate limit exceeded; retry shortly"}"#,
-                ),
+                Body::from(r#"{"error":"MCP per-token rate limit exceeded; retry shortly"}"#),
             )
                 .into_response()
         }
@@ -231,7 +226,9 @@ mod tests {
     fn refill_replenishes_the_bucket_over_time() {
         let limiter = RateLimiterState::with_capacity_and_refill(1, 100.0);
         limiter.try_consume("token-a").expect("first drains");
-        limiter.try_consume("token-a").expect_err("immediate second denied");
+        limiter
+            .try_consume("token-a")
+            .expect_err("immediate second denied");
         // Sleep well past 10 ms; refill at 100/sec = 1 token / 10 ms.
         std::thread::sleep(Duration::from_millis(50));
         limiter.try_consume("token-a").expect("refill served");
