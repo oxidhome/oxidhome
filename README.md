@@ -52,7 +52,7 @@ share one axum listener, so a household hub only exposes one endpoint.
 | Tool | `logs.query` | `logs:read` | Tool-shape of `oxidhome://logs`. |
 | Tool | `events.history` | `events:read` | Tool-shape of `oxidhome://events`. |
 | Tool | `plugins.list` / `plugins.show` | `plugins:list` | Read-only. |
-| Tool | `plugins.install` | `plugins:install` | Loopback-only; takes a daemon-local `source_dir`. |
+| Tool | `plugins.install` | `plugins:install` | Takes a `source_dir` that must exist on the daemon-local filesystem — the tool copies from there into `<state_dir>/plugins/`. |
 | Tool | `plugins.start` / `plugins.stop` | `plugins:start` / `plugins:stop` | Runtime lifecycle. |
 | Tool | `plugins.uninstall` | `plugins:uninstall` | Refuses if instances still running. |
 | Prompt | `summarize_today` | `events:read` + `logs:read` | 24 h household summary. |
@@ -89,6 +89,8 @@ mcp() {
 }
 
 # 1. `initialize` — capture response headers to extract the session id.
+#    Per MCP 2025-11-25 §Transports, the `MCP-Protocol-Version` header is
+#    only required on requests *after* the handshake, so this leg omits it.
 mcp -D /tmp/mcp-hdr.txt \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
        "params":{"protocolVersion":"2025-11-25","capabilities":{},
@@ -98,16 +100,20 @@ mcp -D /tmp/mcp-hdr.txt \
 SESSION_ID=$(awk 'tolower($1)=="mcp-session-id:"{print $2}' /tmp/mcp-hdr.txt \
              | tr -d '\r')
 
+# Every post-init request must carry the negotiated protocol version.
+POST_INIT_HEADERS=(-H "mcp-session-id: $SESSION_ID"
+                   -H 'MCP-Protocol-Version: 2025-11-25')
+
 # 2. `notifications/initialized` — no id, no response body; server returns 202.
-mcp -H "mcp-session-id: $SESSION_ID" \
+mcp "${POST_INIT_HEADERS[@]}" \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
 # 3. Any real RPC. Call `resources/list` to see the catalogue,
 #    or `tools/call` to invoke a tool.
-mcp -H "mcp-session-id: $SESSION_ID" \
+mcp "${POST_INIT_HEADERS[@]}" \
   -d '{"jsonrpc":"2.0","id":2,"method":"resources/list"}'
 
-mcp -H "mcp-session-id: $SESSION_ID" \
+mcp "${POST_INIT_HEADERS[@]}" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call",
        "params":{"name":"logs.query","arguments":{"since":"1h"}}}'
 ```
