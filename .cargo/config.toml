@@ -20,4 +20,4 @@
 # plugin release lands on crates.io. Each pin must move together with
 # its runtime pin in the root `Cargo.toml` (`buffa` / `connectrpc`)
 # and a regenerated tree in the same commit.
-install-tools = "install --locked cargo-deny cargo-llvm-cov cargo-machete cargo-nextest cargo-action-fmt wit-deps-cli wasm-tools protoc-gen-buffa@0.8.1 protoc-gen-buffa-packaging@0.8.1 connectrpc-codegen@0.8.0"
+install-tools = "install --locked cargo-deny cargo-llvm-cov cargo-machete cargo-nextest cargo-action-fmt wit-deps-cli wasm-tools protoc-gen-buffa@0.9.1 protoc-gen-buffa-packaging@0.9.1 connectrpc-codegen@0.9.0"
