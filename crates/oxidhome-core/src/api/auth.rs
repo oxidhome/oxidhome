@@ -165,6 +165,15 @@ pub(crate) struct AuthState {
 /// - `"error"` — handler returned 5xx
 /// - `"pending"` — intent recorded; handler still running, or the
 ///   request was abandoned before finalize
+// Sequential state machine: pull inflight semaphore →
+// extract bearer → resolve verify result (from cache or fresh)
+// → branch on Ok/Denied/SqliteErr → audit intent → run
+// handler → audit finalize. Splitting this into helpers would
+// hide the ordering that the audit-ledger contract depends on
+// (intent must commit before the handler runs, finalize must
+// see the intent's id). Same allow-with-comment shape used
+// elsewhere in the crate.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn require_token(
     State(state): State<AuthState>,
     mut req: Request,
@@ -173,11 +182,34 @@ pub(crate) async fn require_token(
     let http_path = req.uri().path().to_string();
     let method = req.method().to_string();
 
+    // Round-6 P1 on PR #140: on the MCP mount, the rate
+    // limiter injects a shared semaphore capping ALL pre-
+    // admission SQLite writes. `try_best_effort` will attempt
+    // to acquire a permit before each `spawn_blocking`, and
+    // skip the write when saturated (touch_last_used +
+    // anonymous probes are best-effort — the operator prefers
+    // a missed row over an unbounded blocking-pool queue).
+    // REST/Connect mounts don't inject this and get the
+    // unbounded path (their per-mount throughput is bounded
+    // by the daemon's overall admission cap).
+    let inflight = req
+        .extensions()
+        .get::<super::mcp::PreAdmissionInflight>()
+        .cloned();
+
     let Some(bearer) = extract_bearer(&req).map(str::to_owned) else {
         // No `Authorization` header at all — no fingerprint to
         // record (the client presented nothing). Still audit as
         // anonymous so the probe volume is visible.
-        record_anonymous_probe(&state.audit_log, &method, &http_path, 401, None).await;
+        try_best_effort_probe(
+            inflight.as_ref(),
+            &state.audit_log,
+            &method,
+            &http_path,
+            401,
+            None,
+        )
+        .await;
         return unauthorized();
     };
 
@@ -188,19 +220,14 @@ pub(crate) async fn require_token(
     // synchronous `SQLite` work on the MCP mount — the
     // read-only SELECT already ran on the blocking pool, and
     // any `last_used_ms` bump on the happy path is offloaded
-    // via `spawn_blocking` below to keep the runtime worker
-    // unparked.
+    // via `spawn_blocking` below (bounded by
+    // `PreAdmissionInflight` when injected — round-6 P1).
     let verify_result = match req
         .extensions_mut()
         .remove::<super::mcp::PreVerifiedBearer>()
     {
         Some(super::mcp::PreVerifiedBearer::Verified(rec)) => {
-            let tokens = state.tokens.clone();
-            let id_for_bump = rec.id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = tokens.touch_last_used(&id_for_bump);
-            })
-            .await;
+            try_best_effort_touch(inflight.as_ref(), &state.tokens, &rec.id).await;
             Ok(rec)
         }
         Some(super::mcp::PreVerifiedBearer::Denied) => Err(TokenError::Unknown),
@@ -223,7 +250,15 @@ pub(crate) async fn require_token(
             // a fingerprint so a forensic sweep can correlate
             // repeats. Never store the raw secret.
             let fp = credential_fingerprint(&bearer);
-            record_anonymous_probe(&state.audit_log, &method, &http_path, 401, Some(fp)).await;
+            try_best_effort_probe(
+                inflight.as_ref(),
+                &state.audit_log,
+                &method,
+                &http_path,
+                401,
+                Some(fp),
+            )
+            .await;
             return unauthorized();
         }
         Err(TokenError::Sqlite(err)) => {
@@ -311,6 +346,93 @@ pub(crate) async fn require_token(
 /// authentication. Best-effort — the auth check has already decided
 /// the outcome and no handler will run, so a ledger failure here
 /// only loses this one row (no unaudited mutation).
+/// Best-effort `record_anonymous_probe` gated by the shared
+/// pre-admission semaphore when the MCP mount injected one
+/// (round-6 P1 on PR #140). Saturated → skip the write and
+/// log at debug; the operator prefers a dropped probe row over
+/// an unbounded blocking-pool queue during a flood. Non-MCP
+/// mounts pass `None` and get the original unbounded path.
+async fn try_best_effort_probe(
+    inflight: Option<&super::mcp::PreAdmissionInflight>,
+    audit_log: &Arc<AuditLog>,
+    method: &str,
+    path: &str,
+    status: u16,
+    credential_fp: Option<String>,
+) {
+    if let Some(gate) = inflight {
+        let Ok(permit) = Arc::clone(&gate.0).try_acquire_owned() else {
+            tracing::debug!(
+                target: "api.audit",
+                method,
+                path,
+                "pre-admission inflight cap reached — skipping anonymous probe",
+            );
+            return;
+        };
+        let entry = AuditEntry {
+            id: 0,
+            intent_ms: 0,
+            finalized_ms: None,
+            token_id: ANONYMOUS_TOKEN_ID.into(),
+            actor_kind: ANONYMOUS_TOKEN_ID.into(),
+            method: method.to_owned(),
+            path: path.to_owned(),
+            status,
+            decision: "deny".into(),
+            required_scope: None,
+            execution_outcome: None,
+            domain_error: None,
+            credential_fp,
+        };
+        let al = Arc::clone(audit_log);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _guard = permit;
+            let _ = al.record_completed(&entry);
+        })
+        .await;
+        return;
+    }
+    // Non-MCP mount: preserve the original unbounded path.
+    record_anonymous_probe(audit_log, method, path, status, credential_fp).await;
+}
+
+/// Best-effort `touch_last_used` gated by the shared pre-
+/// admission semaphore when the MCP mount injected one
+/// (round-6 P1 on PR #140). Saturated → skip the timestamp
+/// bump. Non-MCP mounts pass `None` and just `spawn_blocking`
+/// the write directly.
+async fn try_best_effort_touch(
+    inflight: Option<&super::mcp::PreAdmissionInflight>,
+    tokens: &Arc<crate::state::TokenStore>,
+    token_id: &str,
+) {
+    if let Some(gate) = inflight {
+        let Ok(permit) = Arc::clone(&gate.0).try_acquire_owned() else {
+            tracing::debug!(
+                target: "auth.token",
+                token_id,
+                "pre-admission inflight cap reached — skipping last_used_ms bump",
+            );
+            return;
+        };
+        let tokens = Arc::clone(tokens);
+        let id = token_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _guard = permit;
+            let _ = tokens.touch_last_used(&id);
+        })
+        .await;
+        return;
+    }
+    let tokens = Arc::clone(tokens);
+    let id = token_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = tokens.touch_last_used(&id);
+    })
+    .await;
+}
+
 pub(super) async fn record_anonymous_probe(
     audit_log: &Arc<AuditLog>,
     method: &str,

@@ -176,6 +176,19 @@ pub(crate) enum PreVerifiedBearer {
     Internal,
 }
 
+/// Shared cap on best-effort pre-admission `SQLite` tasks
+/// (`touch_last_used` on the admitted path,
+/// `record_anonymous_probe` on the failed-auth path). The MCP
+/// rate limiter attaches this to request extensions; the auth
+/// middleware pulls it out and `try_acquire`s a permit before
+/// each best-effort `spawn_blocking` — permit MOVES into the
+/// closure so it survives outer-future cancellation. Saturated
+/// = skip the best-effort write (the operator prefers a missed
+/// timestamp bump / anonymous probe over an unbounded
+/// blocking-pool queue) — round-6 P1 on PR #140.
+#[derive(Clone)]
+pub(crate) struct PreAdmissionInflight(pub(crate) Arc<Semaphore>);
+
 /// Per-token leaky bucket. `tokens` is fractional so refill
 /// under low load isn't rounded to zero. `last_observed`
 /// doubles as the LRU stamp for eviction.
@@ -536,12 +549,37 @@ pub(super) async fn rate_limit(
         None => PreVerifiedBearer::Denied,
     };
 
+    // Round-6 P1 on PR #140: hand the auth middleware the
+    // same verify_inflight semaphore so its best-effort
+    // SQLite writes (`touch_last_used` /
+    // `record_anonymous_probe`) can bound themselves too. A
+    // no-bearer flood that skipped the verify semaphore was
+    // otherwise pushing 30 anonymous-probe writes / second
+    // into an unbounded blocking-pool queue.
+    request
+        .extensions_mut()
+        .insert(PreAdmissionInflight(Arc::clone(
+            &state.inner.verify_inflight,
+        )));
+
+    // Round-6 P2 on PR #140: a genuine `SQLite` failure must
+    // NOT be recoded as 429 just because the shared
+    // unauthenticated bucket happens to be exhausted. Short-
+    // circuit the Internal case here so the documented 500
+    // path always wins.
+    if matches!(pre_verified, PreVerifiedBearer::Internal) {
+        request.extensions_mut().insert(pre_verified);
+        return next.run(request).await;
+    }
+
     // Stage 3: per-token bucket. Successful verifies get their
     // own token-id bucket; every failure collapses to the
     // shared unauthenticated bucket (round-3 P1 on PR #140).
     let key = match &pre_verified {
         PreVerifiedBearer::Verified(rec) => rec.id.clone(),
-        PreVerifiedBearer::Denied | PreVerifiedBearer::Internal => UNAUTHENTICATED_KEY.to_string(),
+        PreVerifiedBearer::Denied => UNAUTHENTICATED_KEY.to_string(),
+        // Handled above.
+        PreVerifiedBearer::Internal => unreachable!(),
     };
     match state.try_consume(&key) {
         Ok(()) => {

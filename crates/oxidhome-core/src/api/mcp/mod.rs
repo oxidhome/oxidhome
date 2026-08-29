@@ -35,7 +35,7 @@ mod tools;
 /// Re-export so `crate::api::auth::require_token` can pull the
 /// pre-verify result off the request extensions without a
 /// circular module dep (round-3 P1 on PR #140).
-pub(crate) use rate_limit::PreVerifiedBearer;
+pub(crate) use rate_limit::{PreAdmissionInflight, PreVerifiedBearer};
 pub use server::{
     MAX_REQUEST_BODY_BYTES, MCP_ENDPOINT, mount_routes, mount_routes_with_all_limits,
     mount_routes_with_cap, mount_routes_with_limits, mount_routes_with_rate_limiter,
