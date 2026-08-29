@@ -29,9 +29,10 @@ share one axum listener, so a household hub only exposes one endpoint.
   admin token (scope `*`) to `<state_dir>/admin-token` (mode `0600`).
   Scope-limited tokens are minted programmatically today via
   `engine.auth_tokens().create(id, &scope_json)` (see
-  `crates/oxidhome-core/src/state/auth_token.rs`); a CLI / REST admin
-  surface for minting is planned but not yet shipped. Missing or malformed
-  bearer → `401`.
+  `crates/oxidhome-core/src/state/auth_token.rs`); a CLI surface for
+  minting / rotation / revocation is planned but not yet shipped, and by
+  design token administration will not be exposed over REST (the API
+  layer only ever *verifies* tokens). Missing or malformed bearer → `401`.
 - **Scope model**: per-surface. `devices:list` reads the fleet;
   `devices:command` sends actuation commands; `events:read` / `logs:read`
   read history; `plugins:list` reads plugin metadata; `plugins:install` /
@@ -73,7 +74,7 @@ issues an `mcp-session-id` header), a fire-and-forget
 clients (Claude Desktop, MCP Inspector, agent SDKs) handle the session
 plumbing themselves; a hand-rolled `curl` walkthrough looks like:
 
-```sh
+```bash
 export OXIDHOME_MCP_URL=http://127.0.0.1:7780/api/v1/mcp
 # Default state_dir is `<cwd>/.oxidhome-state`; override with
 # `$OXIDHOME_STATE_DIR`. Point this at the daemon's actual state_dir.
