@@ -181,7 +181,24 @@ pub(crate) async fn require_token(
         return unauthorized();
     };
 
-    let (token_id, actor_kind) = match state.tokens.verify(&bearer) {
+    // Round-3 P1 on PR #140: the MCP rate-limit layer runs
+    // read-only verification upstream and stashes the
+    // resolved record as `PreVerifiedBearer` when it
+    // succeeded. Reusing it saves a redundant SELECT on the
+    // happy path — we only need the write-half
+    // (`last_used_ms` bump) here.
+    let verify_result = match req
+        .extensions_mut()
+        .remove::<super::mcp::PreVerifiedBearer>()
+    {
+        Some(pre) => {
+            let _ = state.tokens.touch_last_used(&pre.0.id);
+            Ok(pre.0)
+        }
+        None => state.tokens.verify(&bearer),
+    };
+
+    let (token_id, actor_kind) = match verify_result {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
             let token_id = actor.id().to_string();
@@ -488,7 +505,7 @@ pub(crate) fn parse_scopes(blob: &[u8]) -> Option<Vec<String>> {
 /// `pub(super)` so the Connect-side auth middleware uses exactly
 /// the same extractor — case-handling drift between the two
 /// surfaces would be a footgun.
-pub(super) fn extract_bearer(req: &Request) -> Option<&str> {
+pub(crate) fn extract_bearer(req: &Request) -> Option<&str> {
     let h = req.headers().get(header::AUTHORIZATION)?;
     let s = h.to_str().ok()?;
     let (scheme, rest) = s.split_once(' ')?;

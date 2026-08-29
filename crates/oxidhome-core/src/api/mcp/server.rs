@@ -173,6 +173,7 @@ pub fn mount_routes_with_rate_limiter(
         REQUEST_BODY_DEADLINE,
         PENDING_BODY_GATE,
         super::rate_limit::RateLimiterState::with_capacity_and_refill(
+            engine.auth_tokens(),
             rate_limit_capacity,
             rate_limit_refill_per_second,
         ),
@@ -196,7 +197,7 @@ pub fn mount_routes_with_all_limits(
         cap,
         request_body_deadline,
         pending_body_gate,
-        super::rate_limit::RateLimiterState::new(),
+        super::rate_limit::RateLimiterState::new(engine.auth_tokens()),
     )
 }
 

@@ -184,13 +184,30 @@ impl TokenStore {
     /// two bumps a now-revoked token's "last used" by a few
     /// milliseconds — neither leaks privilege.
     pub fn verify(&self, presented: &str) -> Result<TokenRecord, TokenError> {
+        let rec = self.verify_read_only(presented)?;
+        // Best-effort `last_used_ms` bump. Lock-contention failures
+        // are deliberately swallowed inside `touch_last_used`: the
+        // token is already verified, and missing a timestamp update
+        // is strictly less bad than rejecting the request.
+        let now = touch_last_used(&self.db, &rec.id);
+        Ok(TokenRecord {
+            last_used_ms: Some(now),
+            ..rec
+        })
+    }
+
+    /// Read-only half of [`Self::verify`]: parses + hashes the
+    /// presented bearer, looks the row up, checks the `revoked_ms`
+    /// gate. Does NOT bump `last_used_ms` — that's the writable
+    /// half. Split out so the MCP rate limiter can key on a
+    /// resolved `token_id` (or a shared "unauthenticated" sentinel)
+    /// without doing a durable write on every rejected request
+    /// (round-3 P1 on PR #140).
+    pub fn verify_read_only(&self, presented: &str) -> Result<TokenRecord, TokenError> {
         let secret = parse_token(presented).ok_or(TokenError::Malformed)?;
         let hash = sha256(&secret);
-        let now = now_ms();
-
         let hash_for_db = hash.to_vec();
-        let rec = self
-            .db
+        self.db
             .read(move |conn| -> Result<TokenRecord, TokenError> {
                 let mut stmt = conn.prepare(
                     "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
@@ -206,32 +223,19 @@ impl TokenStore {
                     return Err(TokenError::Revoked);
                 }
                 Ok(row)
-            })?;
+            })
+    }
 
-        // Best-effort `last_used_ms` bump. Lock-contention failures
-        // here are deliberately swallowed: the token is already
-        // verified, and missing a timestamp update is strictly less
-        // bad than rejecting the request.
-        let id_for_db = rec.id.clone();
-        if let Err(err) = self.db.write(move |conn| -> Result<(), TokenError> {
-            conn.execute(
-                "UPDATE auth_token SET last_used_ms = ?1 WHERE id = ?2",
-                params![now, id_for_db],
-            )?;
-            Ok(())
-        }) {
-            tracing::warn!(
-                target: "auth.token",
-                token_id = %rec.id,
-                error = %err,
-                "failed to bump last_used_ms; verify itself succeeded",
-            );
-        }
-        let rec = TokenRecord {
-            last_used_ms: Some(now),
-            ..rec
-        };
-        Ok(rec)
+    /// Best-effort `last_used_ms` bump for a token whose id is
+    /// already known (typically because [`Self::verify_read_only`]
+    /// resolved it upstream). The MCP rate limiter calls
+    /// [`Self::verify_read_only`] before the audit path, then
+    /// `require_token` calls this to complete the write half
+    /// without redoing the SELECT (round-3 P1 on PR #140).
+    /// Returns the timestamp written.
+    #[must_use]
+    pub fn touch_last_used(&self, token_id: &str) -> i64 {
+        touch_last_used(&self.db, token_id)
     }
 
     /// Mark a token revoked. Idempotent — calling on an already-
@@ -363,6 +367,32 @@ fn parse_token(presented: &str) -> Option<[u8; TOKEN_BYTES]> {
 /// uniqueness across a hub's token table (operators mint a handful).
 fn derive_id(hash: &[u8; 32]) -> String {
     base64url_no_pad(&hash[..12])
+}
+
+/// Best-effort `last_used_ms` bump. Extracted from
+/// [`TokenStore::verify`] so the MCP rate-limit path can call
+/// it separately after a successful read-only verify. Failures
+/// are logged and swallowed; the caller has already
+/// authenticated. Returns the timestamp that was written.
+fn touch_last_used(db: &Db, token_id: &str) -> i64 {
+    let now = now_ms();
+    let id_for_db = token_id.to_string();
+    let logged_id = token_id.to_string();
+    if let Err(err) = db.write(move |conn| -> Result<(), TokenError> {
+        conn.execute(
+            "UPDATE auth_token SET last_used_ms = ?1 WHERE id = ?2",
+            params![now, id_for_db],
+        )?;
+        Ok(())
+    }) {
+        tracing::warn!(
+            target: "auth.token",
+            token_id = %logged_id,
+            error = %err,
+            "failed to bump last_used_ms; verify itself succeeded",
+        );
+    }
+    now
 }
 
 fn now_ms() -> i64 {

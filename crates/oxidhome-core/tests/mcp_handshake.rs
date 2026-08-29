@@ -833,3 +833,99 @@ async fn rate_limited_requests_bypass_the_audit_ledger() {
          (rate-limited requests are leaking into the audit ledger)",
     );
 }
+
+/// Round-3 P1 on PR #140: rotating garbage bearers must NOT
+/// bypass the rate limiter. Pre-fix, keying on the raw bearer
+/// fingerprint gave every `Bearer garbage-N` its own fresh
+/// capacity-60 bucket, so 429s never triggered and every
+/// request cost one anonymous audit row. Post-fix, every
+/// unrecognized bearer collapses to the shared
+/// `UNAUTHENTICATED_KEY` bucket, so a rotating attacker
+/// exhausts that ONE bucket quickly.
+#[tokio::test(flavor = "current_thread")]
+async fn rotating_garbage_bearers_share_one_bucket_end_to_end() {
+    use oxidhome_core::api::mcp::mount_routes_with_rate_limiter;
+
+    let engine = Engine::new().expect("engine");
+    let router = mount_routes_with_rate_limiter(&engine, 2, 0.0);
+
+    let post_with = |bearer: String| {
+        router.clone().oneshot(
+            base_request("POST", &bearer)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+    };
+
+    // First two garbage bearers pass rate-limit (they hit 401
+    // downstream, but the limiter admits them). The third
+    // must hit 429 — the shared bucket is exhausted.
+    assert_ne!(
+        post_with("oxh_garbage-1".into()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "first garbage bearer must reach auth (and 401 there)",
+    );
+    assert_ne!(
+        post_with("oxh_garbage-2".into()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS,
+    );
+    assert_eq!(
+        post_with("oxh_garbage-3".into()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "third distinct garbage bearer must hit the shared unauthenticated bucket's 429 \
+         — pre-fix, each fresh bearer got its own capacity-2 bucket",
+    );
+}
+
+/// Round-3 P1 on PR #140: the rate limiter must parse
+/// Authorization identically to the auth layer. `Bearer tok`,
+/// `Bearer  tok` (double space), and `bearer tok` (lowercase
+/// scheme) all resolve to the same token per RFC 6750 § 2.1
+/// and `crate::api::auth::extract_bearer`. They must therefore
+/// hit the SAME rate-limit bucket, not distinct ones a caller
+/// could rotate through to reset their limit.
+#[tokio::test(flavor = "current_thread")]
+async fn equivalent_authorization_headers_share_one_bucket() {
+    use oxidhome_core::api::mcp::mount_routes_with_rate_limiter;
+
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = mount_routes_with_rate_limiter(&engine, 1, 0.0);
+
+    let post_with_header = |auth_value: String| {
+        router.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .header(header::AUTHORIZATION, auth_value)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+    };
+
+    // Canonical shape — first request drains the bucket.
+    assert_eq!(
+        post_with_header(format!("Bearer {bearer}"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+    );
+    // Double space, lowercase scheme — all authenticate as
+    // the same token, so all should hit 429.
+    for variant in [
+        format!("Bearer  {bearer}"),
+        format!("bearer {bearer}"),
+        format!("BEARER {bearer}"),
+    ] {
+        assert_eq!(
+            post_with_header(variant.clone()).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "variant `{variant}` must hit the SAME bucket as `Bearer <token>`; \
+             pre-fix, distinct headers got distinct buckets",
+        );
+    }
+}

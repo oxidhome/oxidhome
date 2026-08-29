@@ -1,9 +1,10 @@
-//! Phase 14.7b — per-bearer rate limits on the MCP mount.
+//! Phase 14.7b — per-token rate limits on the MCP mount.
 //!
 //! Sits **before** the bearer-auth layer so a rejected request
-//! does zero durable work — no `SQLite` `last_used_ms` update, no
-//! audit intent, no audit finalize. A runaway token that hits
-//! 429s stops costing the daemon anything past a `HashMap` probe:
+//! does zero durable work — no `SQLite` `last_used_ms` update,
+//! no audit intent, no audit finalize. A runaway token that
+//! hits 429s stops costing the daemon anything past one
+//! read-only `SQLite` SELECT + a `HashMap` probe:
 //!
 //! ```text
 //! request → rate_limit → require_token → admission_gate → mcp_service
@@ -11,51 +12,60 @@
 //!
 //! # Bucket key
 //!
-//! The key is a SHA-256 fingerprint of the presented bearer, NOT
-//! the resolved actor id. Two reasons:
+//! The key is the **resolved token id**, obtained via a
+//! read-only [`TokenStore::verify_read_only`] before the audit
+//! path is entered. Deriving the key server-side (rather than
+//! from client-controlled bytes) means:
 //!
-//! 1. **Zero-cost reject.** Running after `require_token` would
-//!    force the auth path to complete (one `SQLite` lookup + one
-//!    `last_used_ms` UPDATE + one audit-intent INSERT + one audit
-//!    finalize UPDATE per rate-limited request — round-2 P1 on
-//!    PR #140). Keying on the bearer fingerprint lets the middleware
-//!    reject before any DB write.
-//! 2. **Anonymous callers get bounded too.** A caller with no
-//!    bearer (or a garbage bearer) still lands in a bucket. Without
-//!    that, an unauthenticated attacker could push through
-//!    unlimited 401s and grow the audit ledger. The eviction cap
-//!    below bounds map size regardless of key entropy.
+//! 1. **Rotating garbage-bearer attackers land in ONE bucket.**
+//!    Round-3 P1 on PR #140 flagged that a fingerprint-of-
+//!    bearer key gave every `Bearer garbage-N` a fresh
+//!    capacity-60 bucket, so 429s never triggered. Every
+//!    unrecognized bearer now hits the shared
+//!    [`UNAUTHENTICATED_KEY`] bucket, which is bounded by one
+//!    single map entry regardless of key entropy.
+//! 2. **Equivalent Authorization headers land in the SAME
+//!    bucket.** Round-3 P1 on PR #140: the pre-fix parser was
+//!    case-sensitive and space-strict, so `Bearer tok`,
+//!    `Bearer  tok`, and `bearer tok` — all identical under
+//!    RFC 6750 § 2.1 — got distinct buckets, letting a caller
+//!    reset their rate limit by varying whitespace. Reusing
+//!    the canonical extractor from `crate::api::auth::extract_bearer`
+//!    keeps parsing consistent between the rate limiter and
+//!    the auth layer.
 //!
-//! The fingerprint is the first 16 bytes of `SHA-256(bearer)` as
-//! hex — 128 bits of collision resistance is more than enough for
-//! a rate-limit key that need only survive a few seconds of
-//! reuse per bearer. Absent-bearer requests all share the sentinel
-//! `"anonymous"` key so they don't inflate the map with unique
-//! entries.
+//! # Verify reuse
+//!
+//! To avoid a second SELECT downstream, the resolved token
+//! record is stashed in the request extensions as
+//! [`PreVerifiedBearer`]. `crate::api::auth::require_token`
+//! reads it out and skips its own SELECT, doing only the
+//! `last_used_ms` bump + audit intent + audit finalize on the
+//! way through. Net cost per request: ONE `SQLite` SELECT
+//! regardless of outcome (rate-limited or admitted).
 //!
 //! # Algorithm
 //!
 //! Leaky bucket per key:
 //!
-//! - **Capacity** = [`DEFAULT_BUCKET_CAPACITY`] tokens. Bursts up
-//!   to this many requests are served without throttling.
+//! - **Capacity** = [`DEFAULT_BUCKET_CAPACITY`] tokens. Bursts
+//!   up to this many requests are served without throttling.
 //! - **Refill rate** = [`DEFAULT_TOKENS_PER_SECOND`]. Sustained
 //!   throughput past that latches into 429s.
-//! - **Hard-capped map** = [`MAX_TRACKED_KEYS`] entries. When a
-//!   NEW key would push the map over the cap, the least-recently-
-//!   observed entry is evicted (round-2 P2 on PR #140). The
-//!   previous idle-only sweep didn't remove anything when `1_025`
-//!   recent bearers were rotating faster than
-//!   [`IDLE_EVICTION_WINDOW`], and every subsequent request would
-//!   walk the whole map under the global mutex without freeing a
-//!   slot.
+//! - **Hard-capped map** = [`MAX_TRACKED_KEYS`] entries. When
+//!   a NEW key would push the map over the cap, the least-
+//!   recently-observed entry is evicted (round-2 P2 on PR
+//!   #140). Anonymous / unrecognized requests share ONE map
+//!   entry ([`UNAUTHENTICATED_KEY`]), so garbage-bearer
+//!   rotation can't grow the map at all.
 //!
 //! # Wire shape
 //!
 //! Exceeded → plain HTTP `429 Too Many Requests` with a
-//! `Retry-After: <seconds>` header. Mirrors the admission gate's
-//! plain-HTTP 503 shape: the JSON-RPC session hasn't started yet,
-//! so a full JSON-RPC error envelope would be misleading.
+//! `Retry-After: <seconds>` header. Mirrors the admission
+//! gate's plain-HTTP 503 shape: the JSON-RPC session hasn't
+//! started yet, so a full JSON-RPC error envelope would be
+//! misleading.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,43 +77,54 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use sha2::{Digest, Sha256};
 
-/// Default burst capacity per bearer. Two seconds worth of
+use crate::api::auth::extract_bearer;
+use crate::state::TokenStore;
+use crate::state::auth_token::TokenRecord;
+
+/// Default burst capacity per token. Two seconds worth of
 /// sustained throughput at [`DEFAULT_TOKENS_PER_SECOND`], so
-/// well-behaved clients that fan out a handful of parallel reads
-/// see zero throttling.
+/// well-behaved clients that fan out a handful of parallel
+/// reads see zero throttling.
 pub(super) const DEFAULT_BUCKET_CAPACITY: u32 = 60;
-/// Default refill: 30 requests/second/bearer sustained. Above
-/// what any agentic-loop client should need against a household
-/// hub, well below what a runaway loop can push.
+/// Default refill: 30 requests/second/token sustained. Above
+/// what any agentic-loop client should need against a
+/// household hub, well below what a runaway loop can push.
 pub(super) const DEFAULT_TOKENS_PER_SECOND: f64 = 30.0;
-/// Idle threshold used by the opportunistic cheap-sweep path. An
-/// entry idle for longer is a preferred eviction victim when the
-/// map fills up. Not the sole enforcement mechanism — see
-/// [`MAX_TRACKED_KEYS`] for the hard cap.
+/// Idle threshold used by the opportunistic cheap-sweep path.
+/// An entry idle longer than this is a preferred eviction
+/// victim when the map fills up. Not the sole enforcement
+/// mechanism — see [`MAX_TRACKED_KEYS`] for the hard cap.
 const IDLE_EVICTION_WINDOW: Duration = Duration::from_mins(5);
-/// Hard cap on distinct bearer fingerprints tracked. Sized well
-/// above any realistic per-hub bearer count. Enforced by
-/// LRU-style eviction on insert — the round-2 P2 fix on PR #140
-/// (a pure idle-sweep could leave the map at `1_025` forever if
-/// rotation is faster than [`IDLE_EVICTION_WINDOW`]).
+/// Hard cap on distinct token ids tracked. Sized well above
+/// any realistic per-hub token count. Enforced by LRU-style
+/// eviction on insert (round-2 P2 on PR #140). Anonymous
+/// requests share ONE key, so this cap only bounds the
+/// distinct-VALID-token axis.
 const MAX_TRACKED_KEYS: usize = 1024;
-/// Sentinel key for requests without a bearer. Batching every
-/// anonymous request into one bucket avoids inflating the map
-/// with unique entries when attackers hit the endpoint without
-/// credentials.
-const ANONYMOUS_KEY: &str = "anonymous";
+/// Sentinel key for requests whose bearer failed
+/// [`TokenStore::verify_read_only`] (missing header, malformed,
+/// unknown, revoked). Sharing one bucket for all unrecognized
+/// bearers means a rotating garbage-bearer attacker can't
+/// grow the map with unique entries — round-3 P1 on PR #140.
+const UNAUTHENTICATED_KEY: &str = "unauthenticated";
 
-/// Per-bearer leaky bucket. `tokens` is fractional so refill
-/// under low load isn't rounded to zero. `last_observed` doubles
-/// as the LRU stamp for eviction.
+/// Stashes ONLY the successful verify result so `require_token`
+/// can skip its own SELECT on the happy path. Verify failures
+/// are not carried — they're rare, and `require_token`'s own
+/// SELECT will fail identically (both call `verify_read_only`
+/// under the hood), so there's no correctness win from reusing
+/// them. Keeping only the Ok case also sidesteps `TokenError`'s
+/// missing `Clone` impl (required by `Extensions::insert`).
+#[derive(Clone)]
+pub(crate) struct PreVerifiedBearer(pub(crate) TokenRecord);
+
+/// Per-token leaky bucket. `tokens` is fractional so refill
+/// under low load isn't rounded to zero. `last_observed`
+/// doubles as the LRU stamp for eviction.
 #[derive(Debug)]
 struct TokenBucket {
     tokens: f64,
-    /// Wall-clock instant of the most recent probe against this
-    /// bucket (accepted OR rejected). Both refill and LRU
-    /// eviction use it.
     last_observed: Instant,
 }
 
@@ -119,25 +140,37 @@ struct RateLimiterInner {
     capacity: f64,
     refill_per_second: f64,
     max_keys: usize,
+    tokens: Arc<TokenStore>,
 }
 
 impl RateLimiterState {
-    /// Build a limiter with the default capacity + refill + map cap.
-    pub(super) fn new() -> Self {
-        Self::with_capacity_and_refill(DEFAULT_BUCKET_CAPACITY, DEFAULT_TOKENS_PER_SECOND)
+    /// Build a limiter with the default capacity + refill + map
+    /// cap, wired against `engine.auth_tokens()`.
+    pub(super) fn new(tokens: Arc<TokenStore>) -> Self {
+        Self::with_capacity_and_refill(tokens, DEFAULT_BUCKET_CAPACITY, DEFAULT_TOKENS_PER_SECOND)
     }
 
-    /// Build a limiter with custom bucket parameters — public for
-    /// tests that need to drive the 429 shape without waiting for
-    /// 30 requests/second to accumulate.
-    pub(super) fn with_capacity_and_refill(capacity: u32, refill_per_second: f64) -> Self {
-        Self::with_all(capacity, refill_per_second, MAX_TRACKED_KEYS)
+    /// Build a limiter with custom bucket parameters — public
+    /// for tests that need to drive the 429 shape without
+    /// waiting for 30 requests/second to accumulate.
+    pub(super) fn with_capacity_and_refill(
+        tokens: Arc<TokenStore>,
+        capacity: u32,
+        refill_per_second: f64,
+    ) -> Self {
+        Self::with_all(tokens, capacity, refill_per_second, MAX_TRACKED_KEYS)
     }
 
-    /// Fully-parametrized constructor — tests that exercise the
-    /// LRU-eviction path need to override [`MAX_TRACKED_KEYS`]
-    /// without spraying `1_025` real bearers at the mutex.
-    pub(super) fn with_all(capacity: u32, refill_per_second: f64, max_keys: usize) -> Self {
+    /// Fully-parametrized constructor — tests that exercise
+    /// the LRU-eviction path need to override
+    /// [`MAX_TRACKED_KEYS`] without spraying `1_025` real
+    /// tokens at the mutex.
+    pub(super) fn with_all(
+        tokens: Arc<TokenStore>,
+        capacity: u32,
+        refill_per_second: f64,
+        max_keys: usize,
+    ) -> Self {
         assert!(max_keys > 0, "rate limiter map cap must be > 0");
         Self {
             inner: Arc::new(RateLimiterInner {
@@ -145,14 +178,15 @@ impl RateLimiterState {
                 capacity: f64::from(capacity),
                 refill_per_second,
                 max_keys,
+                tokens,
             }),
         }
     }
 
     /// Refill the caller's bucket based on wall-clock elapsed
-    /// since last observation, then attempt to consume one token.
-    /// Returns `Err(seconds_until_refill)` when denied — the
-    /// middleware uses that value for `Retry-After`.
+    /// since last observation, then attempt to consume one
+    /// token. Returns `Err(seconds_until_refill)` when denied —
+    /// the middleware uses that value for `Retry-After`.
     fn try_consume(&self, key: &str) -> Result<(), u64> {
         let now = Instant::now();
         let mut buckets = self
@@ -161,11 +195,11 @@ impl RateLimiterState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Ensure room for a NEW entry before we probe: if we'd
-        // be inserting and the map is at the hard cap, evict
-        // the least-recently-observed entry. Existing keys skip
-        // the eviction path entirely — no O(N) sweep on the hot
-        // path.
+        // Ensure room for a NEW entry before we probe: if
+        // we'd be inserting and the map is at the hard cap,
+        // evict the least-recently-observed entry. Existing
+        // keys skip the eviction path entirely — no O(N) sweep
+        // on the hot path.
         if !buckets.contains_key(key) && buckets.len() >= self.inner.max_keys {
             evict_one_lru(&mut buckets);
         }
@@ -175,7 +209,6 @@ impl RateLimiterState {
             last_observed: now,
         });
 
-        // Refill by elapsed_seconds * rate, capped at capacity.
         let elapsed_secs = now.duration_since(bucket.last_observed).as_secs_f64();
         bucket.tokens =
             (bucket.tokens + elapsed_secs * self.inner.refill_per_second).min(self.inner.capacity);
@@ -186,9 +219,8 @@ impl RateLimiterState {
             Ok(())
         } else {
             // Suggest a retry after enough time to refill one
-            // token. Rounded up to the nearest second to keep
-            // the header sane; a client polling faster than that
-            // just re-hits 429.
+            // token. Rounded up to the nearest second; a
+            // client polling faster than that just re-hits 429.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let wait_secs = ((1.0 - bucket.tokens) / self.inner.refill_per_second).ceil() as u64;
             Err(wait_secs.max(1))
@@ -197,16 +229,22 @@ impl RateLimiterState {
 }
 
 /// Evict the least-recently-observed bucket. Called only when
-/// the map is at [`MAX_TRACKED_KEYS`] AND we're about to insert a
-/// NEW key — so the O(N) scan cost is bounded to "at most one
-/// scan per new key past the cap." Existing-key probes skip it.
+/// the map is at [`MAX_TRACKED_KEYS`] AND we're about to
+/// insert a NEW key — so the O(N) scan cost is bounded to "at
+/// most one scan per new key past the cap." Existing-key
+/// probes skip it.
 fn evict_one_lru(buckets: &mut HashMap<String, TokenBucket>) {
     let now = Instant::now();
-    // Prefer an idle-window victim (cheap to justify) if one
-    // exists. Otherwise fall back to the globally oldest entry.
     let idle_victim = buckets
         .iter()
-        .find(|(_, b)| now.duration_since(b.last_observed) >= IDLE_EVICTION_WINDOW)
+        .find(|(k, b)| {
+            // Never evict the shared unauthenticated bucket —
+            // it's the whole reason garbage-bearer rotation
+            // can't grow the map. Falling back to LRU on it
+            // would let an attacker flush a legitimate bucket
+            // by racing past the cap.
+            *k != UNAUTHENTICATED_KEY && now.duration_since(b.last_observed) >= IDLE_EVICTION_WINDOW
+        })
         .map(|(k, _)| k.clone());
     if let Some(k) = idle_victim {
         buckets.remove(&k);
@@ -214,6 +252,7 @@ fn evict_one_lru(buckets: &mut HashMap<String, TokenBucket>) {
     }
     if let Some((oldest_key, _)) = buckets
         .iter()
+        .filter(|(k, _)| *k != UNAUTHENTICATED_KEY)
         .min_by_key(|(_, b)| b.last_observed)
         .map(|(k, b)| (k.clone(), b.last_observed))
     {
@@ -221,51 +260,46 @@ fn evict_one_lru(buckets: &mut HashMap<String, TokenBucket>) {
     }
 }
 
-/// Fingerprint the presented bearer (or the sentinel for
-/// absent-bearer requests). Truncated SHA-256 — 128 bits of
-/// collision resistance is more than a rate-limit key needs, and
-/// the shorter string keeps `HashMap` memory low.
-fn bucket_key_from_request(request: &Request) -> String {
-    let Some(bearer) = extract_bearer(request) else {
-        return ANONYMOUS_KEY.to_string();
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(bearer.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(32);
-    for byte in &digest[..16] {
-        use std::fmt::Write as _;
-        // `write!` on `String` is infallible.
-        let _ = write!(hex, "{byte:02x}");
-    }
-    format!("bearer:{hex}")
-}
-
-/// Pull `Authorization: Bearer <secret>` off a request. Returns
-/// `None` on missing header, non-UTF-8 value, or a value that
-/// doesn't start with `Bearer `. Local to this module so the
-/// rate limiter doesn't add a public dep on the auth crate's
-/// extractor.
-fn extract_bearer(request: &Request) -> Option<&str> {
-    request
-        .headers()
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-}
-
-/// Middleware. Consumes one token per request per bearer
-/// fingerprint. Runs OUTSIDE `require_token` so a rejected
-/// request does zero `SQLite` writes.
+/// Middleware. Consumes one token per request per resolved
+/// token id (or per shared unauthenticated bucket). Runs
+/// OUTSIDE `require_token` so a rejected request does zero
+/// durable writes; a downstream `require_token` reuses the
+/// verify result via [`PreVerifiedBearer`] so we don't pay
+/// two SELECTs for a happy-path admission.
 pub(super) async fn rate_limit(
     State(state): State<RateLimiterState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let key = bucket_key_from_request(&request);
+    // Reuse the canonical bearer extractor so parsing is
+    // consistent with `require_token`. Case-insensitive
+    // `Bearer`, multiple-space tolerance, all handled there
+    // (round-3 P1 on PR #140).
+    let bearer = extract_bearer(&request).map(str::to_owned);
+
+    // Read-only verify. Failures (missing / malformed / unknown /
+    // revoked) all collapse to the shared unauthenticated bucket
+    // (round-3 P1 on PR #140: prevents rotating-garbage bypass).
+    // Only successful records are stashed for `require_token` to
+    // reuse — see the docstring on `PreVerifiedBearer`.
+    let (key, pre_verified): (String, Option<PreVerifiedBearer>) = match bearer.as_deref() {
+        Some(b) => match state.inner.tokens.verify_read_only(b) {
+            Ok(rec) => {
+                let key = rec.id.clone();
+                (key, Some(PreVerifiedBearer(rec)))
+            }
+            Err(_) => (UNAUTHENTICATED_KEY.to_string(), None),
+        },
+        None => (UNAUTHENTICATED_KEY.to_string(), None),
+    };
+
     match state.try_consume(&key) {
-        Ok(()) => next.run(request).await,
+        Ok(()) => {
+            if let Some(pre) = pre_verified {
+                request.extensions_mut().insert(pre);
+            }
+            next.run(request).await
+        }
         Err(retry_after) => {
             tracing::warn!(
                 bucket_key = %key,
@@ -275,7 +309,7 @@ pub(super) async fn rate_limit(
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, retry_after.to_string())],
-                Body::from(r#"{"error":"MCP per-bearer rate limit exceeded; retry shortly"}"#),
+                Body::from(r#"{"error":"MCP per-token rate limit exceeded; retry shortly"}"#),
             )
                 .into_response()
         }
@@ -285,10 +319,19 @@ pub(super) async fn rate_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::db::Db;
+
+    fn store_with_one_token() -> (Arc<TokenStore>, String, String) {
+        let db = Arc::new(Db::open_in_memory().expect("in-memory db"));
+        let store = Arc::new(TokenStore::new(db));
+        let issued = store.create("test", b"[\"*\"]").expect("mint");
+        (store, issued.id, issued.plaintext)
+    }
 
     #[test]
     fn allows_up_to_capacity_then_denies() {
-        let limiter = RateLimiterState::with_capacity_and_refill(3, 0.0);
+        let (store, _, _) = store_with_one_token();
+        let limiter = RateLimiterState::with_capacity_and_refill(store, 3, 0.0);
         for _ in 0..3 {
             limiter.try_consume("k").expect("within capacity");
         }
@@ -298,7 +341,8 @@ mod tests {
 
     #[test]
     fn separate_keys_have_independent_buckets() {
-        let limiter = RateLimiterState::with_capacity_and_refill(1, 0.0);
+        let (store, _, _) = store_with_one_token();
+        let limiter = RateLimiterState::with_capacity_and_refill(store, 1, 0.0);
         limiter.try_consume("a").expect("first-a");
         limiter.try_consume("a").expect_err("second-a denied");
         limiter.try_consume("b").expect("first-b");
@@ -306,7 +350,8 @@ mod tests {
 
     #[test]
     fn refill_replenishes_the_bucket_over_time() {
-        let limiter = RateLimiterState::with_capacity_and_refill(1, 100.0);
+        let (store, _, _) = store_with_one_token();
+        let limiter = RateLimiterState::with_capacity_and_refill(store, 1, 100.0);
         limiter.try_consume("k").expect("first drains");
         limiter
             .try_consume("k")
@@ -317,7 +362,8 @@ mod tests {
 
     #[test]
     fn refill_caps_at_capacity() {
-        let limiter = RateLimiterState::with_capacity_and_refill(2, 1000.0);
+        let (store, _, _) = store_with_one_token();
+        let limiter = RateLimiterState::with_capacity_and_refill(store, 2, 1000.0);
         limiter.try_consume("k").expect("first");
         std::thread::sleep(Duration::from_millis(50));
         limiter.try_consume("k").expect("post-refill 1");
@@ -327,13 +373,11 @@ mod tests {
             .expect_err("cap prevents unbounded refill");
     }
 
-    /// Round-2 P2 on PR #140: with a hard map cap of 3, five
-    /// distinct keys must not grow the map past three entries.
-    /// Prior implementation would leave 5 entries in the map and
-    /// walk them all on every subsequent request.
+    /// Round-2 P2 on PR #140: hard map cap.
     #[test]
     fn map_size_stays_bounded_under_key_pressure() {
-        let limiter = RateLimiterState::with_all(1, 0.0, 3);
+        let (store, _, _) = store_with_one_token();
+        let limiter = RateLimiterState::with_all(store, 1, 0.0, 3);
         for i in 0..5 {
             let _ = limiter.try_consume(&format!("k-{i}"));
         }
@@ -345,54 +389,75 @@ mod tests {
         );
     }
 
-    /// Under key pressure the LRU should evict the oldest entry,
-    /// preserving the most recent ones. `k-0` (touched first) is
-    /// evicted when `k-3` arrives at cap.
+    /// LRU eviction preserves recent entries (never touches
+    /// [`UNAUTHENTICATED_KEY`] even if it's technically oldest).
     #[test]
     fn lru_eviction_preserves_recent_entries() {
-        let limiter = RateLimiterState::with_all(1, 0.0, 3);
+        let (store, _, _) = store_with_one_token();
+        let limiter = RateLimiterState::with_all(store, 1, 0.0, 3);
         for i in 0..3 {
             let _ = limiter.try_consume(&format!("k-{i}"));
-            // Force distinct `last_observed` timestamps so LRU
-            // picks a deterministic victim.
             std::thread::sleep(Duration::from_millis(2));
         }
-        // Push one more — k-0 (oldest) should be evicted.
         let _ = limiter.try_consume("k-3");
         let buckets = limiter.inner.buckets.lock().unwrap();
         assert!(
             !buckets.contains_key("k-0"),
-            "oldest key must be evicted at cap; got keys {:?}",
+            "oldest key must be evicted at cap; got {:?}",
             buckets.keys().collect::<Vec<_>>(),
         );
-        assert!(buckets.contains_key("k-3"), "newest key must be admitted");
+        assert!(buckets.contains_key("k-3"));
         assert!(buckets.contains_key("k-2"));
     }
 
+    /// Round-3 P1 on PR #140: garbage-bearer rotation must
+    /// NOT grow the bucket map. Every unrecognized bearer
+    /// collapses to the shared unauthenticated bucket, so
+    /// even 100 unique garbage bearers leave the map with
+    /// at most a couple of entries (unauthenticated + any
+    /// admitted probes).
     #[test]
-    fn fingerprint_is_stable_across_calls() {
-        let make_req = |bearer: &str| {
-            axum::http::Request::builder()
-                .uri("/")
-                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap()
-        };
-        let a = bucket_key_from_request(&make_req("secret-a"));
-        let b = bucket_key_from_request(&make_req("secret-a"));
-        assert_eq!(a, b, "same bearer must fingerprint identically");
-        assert_ne!(a, bucket_key_from_request(&make_req("secret-b")));
+    fn rotating_garbage_bearers_share_one_bucket() {
+        let (store, _, _) = store_with_one_token();
+        // Force feed unrecognized bearers directly via
+        // try_consume against the sentinel key — mirrors what
+        // the middleware would do after verify fails.
+        let limiter = RateLimiterState::with_all(store, 3, 0.0, 3);
+        for _ in 0..100 {
+            let _ = limiter.try_consume(UNAUTHENTICATED_KEY);
+        }
+        let buckets = limiter.inner.buckets.lock().unwrap();
+        assert_eq!(
+            buckets.len(),
+            1,
+            "unauthenticated requests must share ONE bucket; got {} keys: {:?}",
+            buckets.len(),
+            buckets.keys().collect::<Vec<_>>(),
+        );
     }
 
+    /// Round-3 P1 on PR #140: the LRU evictor must NOT
+    /// remove the shared unauthenticated bucket, even under
+    /// key pressure. Otherwise an attacker could flush a
+    /// legitimate bucket by racing past the cap with fresh
+    /// unauthenticated probes.
     #[test]
-    fn absent_bearer_hits_the_shared_anonymous_bucket() {
-        let make_req = || {
-            axum::http::Request::builder()
-                .uri("/")
-                .body(Body::empty())
-                .unwrap()
-        };
-        assert_eq!(bucket_key_from_request(&make_req()), ANONYMOUS_KEY);
-        assert_eq!(bucket_key_from_request(&make_req()), ANONYMOUS_KEY);
+    fn unauthenticated_bucket_survives_lru_eviction() {
+        let (store, _, _) = store_with_one_token();
+        let limiter = RateLimiterState::with_all(store, 1, 0.0, 2);
+        // Seed the unauth bucket first — oldest.
+        let _ = limiter.try_consume(UNAUTHENTICATED_KEY);
+        std::thread::sleep(Duration::from_millis(2));
+        let _ = limiter.try_consume("real-token");
+        std::thread::sleep(Duration::from_millis(2));
+        // Push past cap — this should evict `real-token`
+        // (the oldest EVICTABLE), not the unauth bucket.
+        let _ = limiter.try_consume("another-real");
+        let buckets = limiter.inner.buckets.lock().unwrap();
+        assert!(
+            buckets.contains_key(UNAUTHENTICATED_KEY),
+            "unauthenticated bucket must survive LRU; got {:?}",
+            buckets.keys().collect::<Vec<_>>(),
+        );
     }
 }
