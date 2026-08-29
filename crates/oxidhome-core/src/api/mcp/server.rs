@@ -271,22 +271,28 @@ fn mount_inner(
     // The token-store lookup cost per request is the price
     // of that safety; on a home hub with one operator it's
     // trivial.
-    // 14.7b: per-token rate limit. Sits after `require_token`
-    // (so `Actor::id()` is available on request extensions) and
-    // before the admission gate (so a rate-limited request
-    // doesn't consume a pending-body permit). Tests that need
-    // to drive the 429 shape override the limiter via
-    // `mount_routes_with_rate_limiter`.
+    // 14.7b: per-bearer rate limit. Round-2 P1 on PR #140 moved
+    // this OUTSIDE `require_token` so a rejected request does
+    // zero SQLite writes — no `last_used_ms` update, no audit
+    // intent, no audit finalize. The limiter keys on a
+    // SHA-256 fingerprint of the raw bearer (or a shared
+    // "anonymous" sentinel), which is available before the
+    // auth layer runs. Tests that need to drive the 429 shape
+    // override the limiter via `mount_routes_with_rate_limiter`.
+    //
+    // Layer order (bottom-up in code = outer-to-inner at
+    // runtime):
+    //   request → rate_limit → require_token → admission_gate → service
     Router::new()
         .route_service(MCP_ENDPOINT, service)
         .layer(from_fn_with_state(state, admission_gate))
         .layer(from_fn_with_state(
-            rate_limiter,
-            super::rate_limit::rate_limit,
-        ))
-        .layer(from_fn_with_state(
             auth_state,
             super::super::auth::require_token,
+        ))
+        .layer(from_fn_with_state(
+            rate_limiter,
+            super::rate_limit::rate_limit,
         ))
 }
 

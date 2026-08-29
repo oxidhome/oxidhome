@@ -721,9 +721,12 @@ async fn rate_limit_exceeded_returns_429() {
     );
 }
 
-/// 14.7b: rate limit is per-token, not global. A second token
-/// past the first one's exhaustion still gets served — the
-/// limiter's bucket map is keyed on actor id.
+/// 14.7b: rate limit is per-bearer, not global. A second
+/// bearer past the first one's exhaustion still gets served —
+/// round-2 P1 on PR #140 rekeys the limiter on a SHA-256
+/// fingerprint of the presented bearer (so it can run OUTSIDE
+/// `require_token` and skip the audit path on reject); this
+/// test proves independence across bearers is preserved.
 #[tokio::test(flavor = "current_thread")]
 async fn rate_limit_is_per_token_not_global() {
     use oxidhome_core::api::mcp::mount_routes_with_rate_limiter;
@@ -764,5 +767,69 @@ async fn rate_limit_is_per_token_not_global() {
         init_with(bearer_b).await.unwrap().status(),
         StatusCode::OK,
         "second token must not inherit the first's rate-limit state",
+    );
+}
+
+/// Round-2 P1 on PR #140: a rate-limited request must NOT
+/// reach the audit path. Pre-fix, the rate limiter sat AFTER
+/// `require_token`, so every 429 still cost three `SQLite`
+/// writes (`last_used_ms` + audit intent + audit finalize). The
+/// fix moved the limiter OUTSIDE the auth layer so a rejected
+/// request costs nothing durable. This test proves it: drain
+/// the bucket with one accepted request, fire N more 429s,
+/// and assert the audit ledger only sees the accepted call
+/// (path `mcp.session.init` or similar — one row, not N+1).
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limited_requests_bypass_the_audit_ledger() {
+    use oxidhome_core::api::mcp::mount_routes_with_rate_limiter;
+    use oxidhome_core::state::AuditQuery;
+
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = mount_routes_with_rate_limiter(&engine, 1, 0.0);
+
+    let post_init = || {
+        router.clone().oneshot(
+            base_request("POST", &bearer)
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+    };
+
+    let baseline = {
+        let audit = engine.audit_log();
+        tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 256))
+            .await
+            .expect("audit query join")
+            .expect("audit query")
+            .len()
+    };
+
+    // First request succeeds and audits.
+    assert_eq!(post_init().await.unwrap().status(), StatusCode::OK);
+    // Fire five 429s.
+    for _ in 0..5 {
+        assert_eq!(
+            post_init().await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+    }
+
+    let after = {
+        let audit = engine.audit_log();
+        tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 256))
+            .await
+            .expect("audit query join")
+            .expect("audit query")
+    };
+    let delta = after.len() - baseline;
+    // Exactly one new audit row for the ONE accepted request.
+    // A pre-fix limiter would have added 6 (or 12 with intent
+    // + finalize). Any delta > 1 means at least one rate-
+    // limited request slipped through to the audit path.
+    assert!(
+        delta <= 1,
+        "expected at most 1 new audit row for the one accepted request; got {delta} \
+         (rate-limited requests are leaking into the audit ledger)",
     );
 }
