@@ -285,7 +285,7 @@ pub(crate) async fn require_token(
         domain_error: None,
         credential_fp: None,
     };
-    let audit_id = match record_intent_blocking(&state.audit_log, intent).await {
+    let audit_id = match record_intent_blocking(&state.audit_log, intent, inflight.as_ref()).await {
         Ok(id) => id,
         Err(msg) => {
             // Backstop: `eprintln!` because the tracing side rides
@@ -360,41 +360,66 @@ async fn try_best_effort_probe(
     status: u16,
     credential_fp: Option<String>,
 ) {
-    if let Some(gate) = inflight {
-        let Ok(permit) = Arc::clone(&gate.0).try_acquire_owned() else {
-            tracing::debug!(
-                target: "api.audit",
-                method,
-                path,
-                "pre-admission inflight cap reached — skipping anonymous probe",
-            );
-            return;
-        };
-        let entry = AuditEntry {
-            id: 0,
-            intent_ms: 0,
-            finalized_ms: None,
-            token_id: ANONYMOUS_TOKEN_ID.into(),
-            actor_kind: ANONYMOUS_TOKEN_ID.into(),
-            method: method.to_owned(),
-            path: path.to_owned(),
-            status,
-            decision: "deny".into(),
-            required_scope: None,
-            execution_outcome: None,
-            domain_error: None,
-            credential_fp,
-        };
-        let al = Arc::clone(audit_log);
-        let _ = tokio::task::spawn_blocking(move || {
-            let _guard = permit;
-            let _ = al.record_completed(&entry);
-        })
-        .await;
+    let Some(gate) = inflight else {
+        // Non-MCP mount: preserve the original unbounded path
+        // — its own error/join logging remains authoritative.
+        record_anonymous_probe(audit_log, method, path, status, credential_fp).await;
         return;
+    };
+    let Ok(permit) = Arc::clone(&gate.0).try_acquire_owned() else {
+        tracing::debug!(
+            target: "api.audit",
+            method,
+            path,
+            "pre-admission inflight cap reached — skipping anonymous probe",
+        );
+        return;
+    };
+    let entry = AuditEntry {
+        id: 0,
+        intent_ms: 0,
+        finalized_ms: None,
+        token_id: ANONYMOUS_TOKEN_ID.into(),
+        actor_kind: ANONYMOUS_TOKEN_ID.into(),
+        method: method.to_owned(),
+        path: path.to_owned(),
+        status,
+        decision: "deny".into(),
+        required_scope: None,
+        execution_outcome: None,
+        domain_error: None,
+        credential_fp,
+    };
+    let al = Arc::clone(audit_log);
+    // Round-7 P2 on PR #140: preserve the original
+    // implementation's error / join-failure reporting. Dropping
+    // it silently loses forensic rows without any operator
+    // signal.
+    let owned_method = method.to_owned();
+    let owned_path = path.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let _guard = permit;
+        al.record_completed(&entry)
+    })
+    .await
+    {
+        Ok(Ok(_id)) => {}
+        Ok(Err(err)) => {
+            eprintln!("oxidhome audit_log: record_completed (anonymous probe) failed: {err}");
+            tracing::error!(
+                target: "api.audit",
+                error = %err,
+                method = %owned_method,
+                path = %owned_path,
+                "audit-ledger anonymous-probe write failed",
+            );
+        }
+        Err(join_err) => {
+            eprintln!(
+                "oxidhome audit_log: record_completed (anonymous probe) join failed: {join_err}",
+            );
+        }
     }
-    // Non-MCP mount: preserve the original unbounded path.
-    record_anonymous_probe(audit_log, method, path, status, credential_fp).await;
 }
 
 /// Best-effort `touch_last_used` gated by the shared pre-
@@ -485,11 +510,35 @@ pub(super) async fn record_anonymous_probe(
 /// the shared `Db` mutex. Returns a `String` error on either the
 /// SQL failure or a `spawn_blocking` join failure — the middleware
 /// only needs "something went wrong" to fail-closed with a 500.
+///
+/// Round-7 P1 on PR #140: when the MCP mount's
+/// `PreAdmissionInflight` semaphore is present, the intent
+/// task must acquire a permit before submission. Saturated →
+/// return an error so the middleware fails closed with a 500
+/// instead of enqueueing another blocking task on top of a
+/// stalled shared pool. Permit moves into the closure so it
+/// survives outer-future cancellation.
 async fn record_intent_blocking(
     audit_log: &Arc<AuditLog>,
     entry: AuditEntry,
+    inflight: Option<&super::mcp::PreAdmissionInflight>,
 ) -> Result<u64, String> {
     let al = Arc::clone(audit_log);
+    if let Some(gate) = inflight {
+        let Ok(permit) = Arc::clone(&gate.0).try_acquire_owned() else {
+            return Err("pre-admission inflight cap reached; refusing audit intent".into());
+        };
+        return match tokio::task::spawn_blocking(move || {
+            let _guard = permit;
+            al.record_intent(&entry)
+        })
+        .await
+        {
+            Ok(Ok(id)) => Ok(id),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(join_err) => Err(format!("spawn_blocking join: {join_err}")),
+        };
+    }
     match tokio::task::spawn_blocking(move || al.record_intent(&entry)).await {
         Ok(Ok(id)) => Ok(id),
         Ok(Err(err)) => Err(err.to_string()),
