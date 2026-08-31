@@ -158,15 +158,57 @@ pub fn mount_routes_with_limits(
     mount_routes_with_all_limits(engine, cap, request_body_deadline, PENDING_BODY_GATE)
 }
 
+/// Mount variant that overrides the per-token rate limiter.
+/// Public so 14.7b's integration test can drive the 429 shape
+/// with a capacity of 1 rather than the production 60. All
+/// other limits stay at production defaults.
+pub fn mount_routes_with_rate_limiter(
+    engine: &Engine,
+    rate_limit_capacity: u32,
+    rate_limit_refill_per_second: f64,
+) -> Router {
+    mount_inner(
+        engine,
+        MAX_SESSIONS,
+        REQUEST_BODY_DEADLINE,
+        PENDING_BODY_GATE,
+        super::rate_limit::RateLimiterState::with_capacity_and_refill(
+            engine.auth_tokens(),
+            rate_limit_capacity,
+            rate_limit_refill_per_second,
+        ),
+    )
+}
+
 /// Fully-parametrized mount — session cap, body deadline, AND
 /// concurrent-body-buffer permits. Public so the R6 F1
 /// regression test can exhaust the pending-body gate without
-/// firing 256 requests.
+/// firing 256 requests. Uses the production per-token rate
+/// limiter; see [`mount_routes_with_rate_limiter`] to override
+/// that too.
 pub fn mount_routes_with_all_limits(
     engine: &Engine,
     cap: usize,
     request_body_deadline: Duration,
     pending_body_gate: usize,
+) -> Router {
+    mount_inner(
+        engine,
+        cap,
+        request_body_deadline,
+        pending_body_gate,
+        super::rate_limit::RateLimiterState::new(engine.auth_tokens()),
+    )
+}
+
+/// Internal mount that takes every knob. Every `mount_*` public
+/// variant delegates here.
+fn mount_inner(
+    engine: &Engine,
+    cap: usize,
+    request_body_deadline: Duration,
+    pending_body_gate: usize,
+    rate_limiter: super::rate_limit::RateLimiterState,
 ) -> Router {
     let session_manager = Arc::new(BoundedSessionManager::new(
         LocalSessionManager::default(),
@@ -230,12 +272,37 @@ pub fn mount_routes_with_all_limits(
     // The token-store lookup cost per request is the price
     // of that safety; on a home hub with one operator it's
     // trivial.
+    // 14.7b: per-token rate limit. Round-2 P1 on PR #140 moved
+    // this OUTSIDE `require_token` so a rejected request does
+    // zero SQLite writes — no `last_used_ms` update, no audit
+    // intent, no audit finalize. Round-3 P1 rekeyed on the
+    // *resolved* token id (via a read-only
+    // `TokenStore::verify_read_only`) rather than the raw
+    // bearer, so rotating garbage bearers all fall into a
+    // single shared `unauthenticated` bucket instead of each
+    // getting a fresh capacity-60 slot. Round-4 P1 added a
+    // coarse global ingress bucket in front of the verify so
+    // a flood of syntactically-valid-but-unknown tokens can't
+    // push serialized SELECTs through the shared SQLite mutex
+    // before either bucket returns 429; the verify itself now
+    // runs on the blocking pool via spawn_blocking (Db::read
+    // uses a std::sync::Mutex). Tests that need to drive the
+    // 429 shape override the limiter via
+    // `mount_routes_with_rate_limiter`.
+    //
+    // Layer order (bottom-up in code = outer-to-inner at
+    // runtime):
+    //   request → rate_limit → require_token → admission_gate → service
     Router::new()
         .route_service(MCP_ENDPOINT, service)
         .layer(from_fn_with_state(state, admission_gate))
         .layer(from_fn_with_state(
             auth_state,
             super::super::auth::require_token,
+        ))
+        .layer(from_fn_with_state(
+            rate_limiter,
+            super::rate_limit::rate_limit,
         ))
 }
 
