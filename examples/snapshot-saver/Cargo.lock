@@ -300,9 +300,9 @@ dependencies = [
 
 [[package]]
 name = "wit-bindgen"
-version = "0.61.0"
+version = "0.61.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbfef9403167686bfe35ffa8787df4c0f50742e5b0f471c7fb156a6614193c5d"
+checksum = "e473fd0095479f9689ac7d2a52c427cc96bb2b973ace50238dfcc1ab1cd52d93"
 dependencies = [
  "bitflags",
  "wit-bindgen-rust-macro",
