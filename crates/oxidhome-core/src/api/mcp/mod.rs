@@ -21,6 +21,10 @@
 //! - [`tools`] — 14.3 tools registry. Starts with
 //!   `device.send_command`; more tools land per the design
 //!   doc's ordering.
+//! - [`stdio`] — 14.5 subprocess transport (`oxidhome mcp-stdio`
+//!   binary mode). Serves the same handler over
+//!   `(stdin, stdout)` via `rmcp::transport::stdio()` under
+//!   an ambient wildcard actor (parent-process trust model).
 //!
 //! [`BoundedSessionManager`]: session_store::BoundedSessionManager
 
@@ -30,6 +34,7 @@ mod rate_limit;
 mod resources;
 mod server;
 mod session_store;
+mod stdio;
 mod tools;
 
 /// Re-export so `crate::api::auth::require_token` can pull the
@@ -40,3 +45,4 @@ pub use server::{
     MAX_REQUEST_BODY_BYTES, MCP_ENDPOINT, mount_routes, mount_routes_with_all_limits,
     mount_routes_with_cap, mount_routes_with_limits, mount_routes_with_rate_limiter,
 };
+pub use stdio::{ServeStdioError, serve_stdio, serve_stdio_over};

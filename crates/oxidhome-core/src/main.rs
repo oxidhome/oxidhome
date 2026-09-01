@@ -1,10 +1,19 @@
 //! `oxidhome` host daemon entrypoint.
 //!
-//! Opens the state directory, mints the first-run admin token if
-//! the store is empty, optionally starts one plugin handed on argv
-//! (a dev-time affordance — the supervised lifecycle endpoints
-//! land in 12-API-f), and then serves the Phase-12 HTTP/WS API
-//! until a shutdown signal arrives.
+//! Two modes:
+//!
+//! - **Default (HTTP daemon)** — opens the state directory,
+//!   mints the first-run admin token if the store is empty,
+//!   optionally starts one plugin handed on argv (a dev-time
+//!   affordance), and serves the Phase-12 HTTP/WS API until a
+//!   shutdown signal arrives.
+//! - **`mcp-stdio` subcommand (14.5)** — argv[1] = `mcp-stdio`
+//!   switches into a subprocess mode that serves MCP framed
+//!   JSON-RPC over stdin/stdout, backed by the same `Engine`
+//!   layout the HTTP daemon would use. Intended for MCP clients
+//!   (Claude Desktop, MCP Inspector, agent SDKs) that spawn
+//!   subprocesses. Runs until stdin EOF or client shutdown;
+//!   does not bind the HTTP listener.
 //!
 //! ## Environment
 //!
@@ -34,6 +43,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use oxidhome_core::Engine;
+use oxidhome_core::api::mcp::serve_stdio;
 use oxidhome_core::api::{ApiConfig, bind, ensure_admin_token, serve};
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -85,6 +95,16 @@ const DEFAULT_BIND: &str = "127.0.0.1:7780";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 14.5: `oxidhome mcp-stdio` runs the MCP server over the
+    // process's stdin/stdout instead of the HTTP listener.
+    // Intended for MCP clients that spawn subprocesses (Claude
+    // Desktop, MCP Inspector, agent SDKs). Detected here so
+    // stdout isn't polluted with the daemon's tracing lines
+    // before the JSON-RPC session opens.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "mcp-stdio") {
+        return run_stdio().await;
+    }
+
     let state_dir = resolve_state_dir()?;
     // Engine first — its `log_store` provides the SQLite tracing
     // layer that the global subscriber composes below.
@@ -304,6 +324,54 @@ async fn shutdown_signal() -> &'static str {
         s = ctrl_c => s,
         s = terminate => s,
     }
+}
+
+/// 14.5: MCP subprocess mode. The parent process launched us
+/// with filesystem access to `$OXIDHOME_STATE_DIR` (default:
+/// `<cwd>/.oxidhome-state`); we open our own `Engine` against
+/// that dir and serve MCP framed JSON-RPC over stdin/stdout
+/// until the client hangs up (stdin EOF) or issues a JSON-RPC
+/// shutdown.
+///
+/// `SQLite` is opened in WAL mode by [`Engine::with_state_dir`],
+/// so running this subprocess alongside a live HTTP daemon
+/// against the same state dir is safe — both processes see
+/// consistent snapshots + serialized writes.
+///
+/// Stdout is reserved for the MCP transport, so tracing goes
+/// to stderr only. We do NOT initialize the log-store tracing
+/// layer here — the daemon binary (if any) already carries
+/// that responsibility, and having two writers on the same
+/// `SQLite` `log_events` table from one process is redundant.
+async fn run_stdio() -> anyhow::Result<()> {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    // Tracing → stderr (not stdout, which is the MCP wire).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr.with_max_level(tracing::Level::TRACE))
+                .with_filter(filter),
+        )
+        .try_init();
+
+    let state_dir = resolve_state_dir()?;
+    let engine = Engine::with_state_dir(&state_dir).with_context(|| {
+        format!(
+            "opening engine state at {} — set $OXIDHOME_STATE_DIR to override",
+            state_dir.display(),
+        )
+    })?;
+    tracing::info!(
+        state_dir = %state_dir.display(),
+        "oxidhome mcp-stdio ready — awaiting client on stdin",
+    );
+    serve_stdio(engine)
+        .await
+        .context("MCP stdio session failed")?;
+    tracing::info!("oxidhome mcp-stdio session closed");
+    Ok(())
 }
 
 fn init_tracing(engine: &Engine) {
