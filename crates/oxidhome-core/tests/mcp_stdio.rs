@@ -118,9 +118,15 @@ async fn stdio_handshake_and_resources_list() {
     // Close the client side — server should quiesce.
     drop(client_writer);
     drop(client_reader);
-    let _ = tokio::time::timeout(Duration::from_secs(5), server_task)
+    // Round-3 nit on PR #143: assert the server actually
+    // returned Ok — a swallowed error would let a broken
+    // handshake or a mid-session serve error look like
+    // success.
+    let joined = tokio::time::timeout(Duration::from_secs(5), server_task)
         .await
-        .expect("server task deadline");
+        .expect("server task deadline")
+        .expect("server task join");
+    joined.expect("serve_stdio_over returned Err");
 }
 
 /// 14.5: the stdio ambient actor holds `*` scope, so a
@@ -170,7 +176,13 @@ async fn stdio_ambient_actor_has_wildcard_scope() {
 
     drop(client_writer);
     drop(client_reader);
-    let _ = tokio::time::timeout(Duration::from_secs(5), server_task)
+    // Round-3 nit on PR #143: assert the server actually
+    // returned Ok — a swallowed error would let a broken
+    // handshake or a mid-session serve error look like
+    // success.
+    let joined = tokio::time::timeout(Duration::from_secs(5), server_task)
         .await
-        .expect("server task deadline");
+        .expect("server task deadline")
+        .expect("server task join");
+    joined.expect("serve_stdio_over returned Err");
 }

@@ -78,9 +78,25 @@ fn try_lock_exclusive(file: &File, state_dir: &Path) -> anyhow::Result<()> {
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == -1 {
         let err = std::io::Error::last_os_error();
+        // Only EWOULDBLOCK (aliased with EAGAIN on Linux)
+        // means the lock is held by another holder. Other
+        // errno values (EBADF, EINVAL, ENOLCK, permission
+        // errors on quirky filesystems) surface with the raw
+        // error so an operator can distinguish "someone else
+        // is running" from "this filesystem doesn't support
+        // flock" — round-2 P2 on PR #143 flagged the prior
+        // misleading catch-all diagnostic.
+        let raw = err.raw_os_error();
+        if raw == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!(
+                "another `oxidhome` process is already using state dir {} \
+                 (set $OXIDHOME_STATE_DIR to a distinct dir, or stop the other process)",
+                state_dir.display(),
+            );
+        }
         anyhow::bail!(
-            "another `oxidhome` process is already using state dir {}: {} \
-             (set $OXIDHOME_STATE_DIR to a distinct dir, or stop the other process)",
+            "acquiring exclusive lock on state dir {} failed: {} \
+             (this filesystem may not support flock — check the state-dir setup)",
             state_dir.display(),
             err,
         );
@@ -118,6 +134,14 @@ mod tests {
         assert!(
             msg.contains(&dir.path().display().to_string()),
             "diagnostic must name the state dir; got: {msg}",
+        );
+        // Round-2 P2 on PR #143: diagnostic must specifically
+        // name "another process" for the EWOULDBLOCK path
+        // (contrasted with generic "flock failed" for other
+        // errno).
+        assert!(
+            msg.contains("already using"),
+            "diagnostic must identify the contention case; got: {msg}",
         );
         drop(first);
         // Once the first lock is dropped a fresh acquire

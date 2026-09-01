@@ -345,19 +345,46 @@ async fn shutdown_signal() -> &'static str {
 /// until the client hangs up (stdin EOF) or issues a JSON-RPC
 /// shutdown.
 ///
-/// `SQLite` is opened in WAL mode by [`Engine::with_state_dir`],
-/// so running this subprocess alongside a live HTTP daemon
-/// against the same state dir is safe — both processes see
-/// consistent snapshots + serialized writes.
+/// `SQLite` is opened in WAL mode by [`Engine::with_state_dir`].
+/// Round-1 P1 on PR #143: state-dir ownership is EXCLUSIVE
+/// across processes (see [`acquire_state_dir_lock`]); running
+/// this subprocess against a state dir already owned by the
+/// HTTP daemon fails fast.
 ///
-/// Stdout is reserved for the MCP transport, so tracing goes
-/// to stderr only. We do NOT initialize the log-store tracing
-/// layer here — the daemon binary (if any) already carries
-/// that responsibility, and having two writers on the same
-/// `SQLite` `log_events` table from one process is redundant.
+/// Stdout is reserved for the MCP transport, so the stderr
+/// pretty-printer takes it. Round-2 P2 on PR #143 additionally
+/// attaches the engine's `SQLite` [`LogStore`] tracing layer so
+/// this session's own events land in `oxidhome://logs` —
+/// otherwise the exclusive-ownership fix left `LogStore` with
+/// no writer at all when the daemon isn't running (which is
+/// the common case for stdio).
+///
+/// Shutdown runs the same bounded stop + reaper drain the HTTP
+/// daemon uses (round-2 P1 on PR #143) — plugins the client
+/// started via `plugins.start` reach a terminal state before
+/// the process exits, instead of relying on runtime teardown
+/// to abort mid-supervisor.
 async fn run_stdio() -> anyhow::Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
-    // Tracing → stderr (not stdout, which is the MCP wire).
+
+    let state_dir = resolve_state_dir()?;
+    // Round-1 P1 on PR #143: exclusive lock, held for the
+    // process lifetime.
+    let _state_dir_lock = acquire_state_dir_lock(&state_dir)?;
+    let engine = Engine::with_state_dir(&state_dir).with_context(|| {
+        format!(
+            "opening engine state at {} — set $OXIDHOME_STATE_DIR to override",
+            state_dir.display(),
+        )
+    })?;
+    let log_store = engine.log_store();
+
+    // Tracing → stderr (not stdout, which is the MCP wire) +
+    // the engine's `SQLite` `LogStore` layer so events reach
+    // `oxidhome://logs`. Round-2 P2 on PR #143: prior to this
+    // change the stderr-only subscriber left `LogStore`
+    // unwritten under the new exclusive-lock regime (no
+    // concurrent daemon means no other writer either).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
@@ -366,34 +393,45 @@ async fn run_stdio() -> anyhow::Result<()> {
                 .with_writer(std::io::stderr.with_max_level(tracing::Level::TRACE))
                 .with_filter(filter),
         )
+        .with(engine.log_store().layer())
         .try_init();
 
-    let state_dir = resolve_state_dir()?;
-    // Round-1 P1 on PR #143: same exclusive lock the daemon
-    // acquires. `Engine`'s in-memory registries (device,
-    // instance, event, service, per-plugin lifecycle locks) are
-    // per-process, so running stdio against a state dir already
-    // owned by the HTTP daemon would serve stale device /
-    // instance reads AND let mutating tools (plugins.uninstall
-    // in particular) act on an empty subprocess-local instance
-    // registry while the daemon's supervisor keeps running —
-    // deleting a live plugin's on-disk footprint out from under
-    // it. Fail fast when another process holds the lock.
-    let _state_dir_lock = acquire_state_dir_lock(&state_dir)?;
-    let engine = Engine::with_state_dir(&state_dir).with_context(|| {
-        format!(
-            "opening engine state at {} — set $OXIDHOME_STATE_DIR to override",
-            state_dir.display(),
-        )
-    })?;
     tracing::info!(
         state_dir = %state_dir.display(),
         "oxidhome mcp-stdio ready — awaiting client on stdin",
     );
-    serve_stdio(engine)
-        .await
-        .context("MCP stdio session failed")?;
+    let serve_result = serve_stdio(engine.clone()).await;
+
+    // Round-2 P1 on PR #143: same bounded shutdown the HTTP
+    // daemon runs. Stdio exposes wildcard `plugins.start`, so
+    // live supervisors may exist when the client hangs up;
+    // without this the tokio runtime teardown would abort them
+    // mid-cleanup and leave partially-evicted device / service
+    // state behind. Best-effort by design — deadlines mirror
+    // the daemon's so a wedged supervisor doesn't wedge exit.
+    let _ = engine
+        .stop_all_supervised_instances(SHUTDOWN_STOP_PER_INSTANCE_DEADLINE)
+        .await;
+    let _ = engine
+        .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
+        .await;
+
+    // Flush the log writer before returning so the tail of the
+    // session lands in `<state_dir>/oxidhome.db`. Matches the
+    // daemon's happy-path drain (round-2 P2 on PR #143).
+    if !log_store.flush(SHUTDOWN_FLUSH_BUDGET) {
+        tracing::warn!(
+            sent = log_store.sent(),
+            written = log_store.written(),
+            dropped = log_store.dropped(),
+            "log_store: flush budget exceeded — some tail rows may be lost",
+        );
+    }
+
     tracing::info!("oxidhome mcp-stdio session closed");
+    // Propagate the serve error AFTER cleanup so cleanup still
+    // runs on a mid-session transport failure.
+    serve_result.context("MCP stdio session failed")?;
     Ok(())
 }
 
