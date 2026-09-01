@@ -26,10 +26,22 @@
 //! # Engine ownership
 //!
 //! The subprocess opens its own [`Engine`] against the state
-//! dir. `SQLite` WAL supports multi-process access, so running
-//! stdio alongside the HTTP daemon is safe (both see the same
-//! device / event / audit tables). Read consistency + write
-//! ordering come from WAL's snapshot-isolation guarantees.
+//! dir. **State-dir ownership is exclusive across processes**
+//! (round-1 P1 on PR #143): the daemon and the stdio subprocess
+//! each hold per-process in-memory registries (device,
+//! instance, event, service, per-plugin lifecycle locks) that
+//! `SQLite` WAL does NOT synchronise across processes. Running
+//! stdio against a state dir already owned by the HTTP daemon
+//! would serve stale reads AND let mutating tools
+//! (`plugins.uninstall` in particular) act on an empty
+//! subprocess-local instance registry while the daemon's
+//! supervisor kept running — deleting a live plugin's on-disk
+//! footprint out from under it. The daemon binary and the
+//! `mcp-stdio` subprocess both acquire an exclusive
+//! `flock` on `<state_dir>/.oxidhome.lock` at startup and fail
+//! fast if it's held. Operators who want both surfaces
+//! concurrently point them at distinct state dirs (or use the
+//! HTTP mount from the stdio client instead).
 //!
 //! # Shutdown
 //!

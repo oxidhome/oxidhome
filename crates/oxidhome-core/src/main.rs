@@ -45,6 +45,7 @@ use anyhow::Context;
 use oxidhome_core::Engine;
 use oxidhome_core::api::mcp::serve_stdio;
 use oxidhome_core::api::{ApiConfig, bind, ensure_admin_token, serve};
+use oxidhome_core::exclusive_lock::acquire_state_dir_lock;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -106,6 +107,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state_dir = resolve_state_dir()?;
+    // Round-1 P1 on PR #143: enforce single-process ownership of
+    // the state dir. `Engine`'s in-memory registries (device,
+    // instance, event, service, per-plugin lifecycle locks) are
+    // per-process — two `Engine`s against the same state dir
+    // would race on plugin start/uninstall + serve stale reads
+    // (SQLite WAL only protects the tables themselves, not the
+    // supervisor bookkeeping). The lock is held for the process
+    // lifetime; leaked here on purpose (a `let _` binding would
+    // drop at end of scope, releasing the lock while the daemon
+    // is still running).
+    let _state_dir_lock = acquire_state_dir_lock(&state_dir)?;
     // Engine first — its `log_store` provides the SQLite tracing
     // layer that the global subscriber composes below.
     //
@@ -357,6 +369,17 @@ async fn run_stdio() -> anyhow::Result<()> {
         .try_init();
 
     let state_dir = resolve_state_dir()?;
+    // Round-1 P1 on PR #143: same exclusive lock the daemon
+    // acquires. `Engine`'s in-memory registries (device,
+    // instance, event, service, per-plugin lifecycle locks) are
+    // per-process, so running stdio against a state dir already
+    // owned by the HTTP daemon would serve stale device /
+    // instance reads AND let mutating tools (plugins.uninstall
+    // in particular) act on an empty subprocess-local instance
+    // registry while the daemon's supervisor keeps running —
+    // deleting a live plugin's on-disk footprint out from under
+    // it. Fail fast when another process holds the lock.
+    let _state_dir_lock = acquire_state_dir_lock(&state_dir)?;
     let engine = Engine::with_state_dir(&state_dir).with_context(|| {
         format!(
             "opening engine state at {} — set $OXIDHOME_STATE_DIR to override",
