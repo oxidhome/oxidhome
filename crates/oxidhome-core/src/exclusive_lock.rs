@@ -74,8 +74,26 @@ fn try_lock_exclusive(file: &File, state_dir: &Path) -> anyhow::Result<()> {
     // diagnostic rather than blocking (a blocking acquire
     // would silently hang a fresh `oxidhome mcp-stdio`
     // launched while the daemon is running).
-    #[allow(unsafe_code)]
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    // Retry on EINTR: `flock(2)` is a system call and can be
+    // interrupted by an incoming signal. Treating that as a
+    // hard failure would surface as a spurious "flock failed"
+    // diagnostic on a daemon that just happened to catch a
+    // SIGCHLD (or any handler-installed signal) mid-startup
+    // — round-4 Copilot on PR #143. The loop is bounded by
+    // the kernel's actual acquisition outcome; a genuinely
+    // contended lock still returns EWOULDBLOCK/EAGAIN
+    // immediately (LOCK_NB), and a genuinely broken syscall
+    // returns EBADF/EINVAL/etc. without cycling.
+    let rc = loop {
+        // SAFETY: `file.as_raw_fd()` is a valid, open file
+        // descriptor for the lifetime of `file` (borrowed).
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break rc;
+    };
     if rc == -1 {
         let err = std::io::Error::last_os_error();
         // `EWOULDBLOCK` / `EAGAIN` both mean "another holder
