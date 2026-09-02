@@ -87,6 +87,12 @@ jsonschema = { version = "0.52.0", default-features = false }
 rmcp = { version = "3.1.4", default-features = false, features = [
     "server",
     "transport-streamable-http-server",
+    # 14.5: `oxidhome mcp-stdio` subprocess mode. `transport-io`
+    # pulls in `rmcp::transport::stdio()` + `IntoTransport` for
+    # `(tokio::io::Stdin, tokio::io::Stdout)` — the standard MCP
+    # subprocess shape most clients (Claude Desktop, MCP Inspector,
+    # agent SDKs) launch.
+    "transport-io",
     "macros",
 ] }
 thiserror = "2.0.18"
