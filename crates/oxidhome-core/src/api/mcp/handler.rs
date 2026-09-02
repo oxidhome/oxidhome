@@ -14,14 +14,16 @@
 //! clone is cheap.
 
 use std::future::Future;
+use std::time::Instant;
 
 use rmcp::{
-    RoleServer, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, GetPromptRequestParams, GetPromptResponse, Implementation,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-        ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResponse,
+        GetPromptResult, Implementation, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
+        ServerInfo,
     },
     service::{MaybeSendFuture, RequestContext},
 };
@@ -132,8 +134,17 @@ impl ServerHandler for OxidHomeMcpHandler {
         let engine = self.engine.clone();
         let actor = self.resolve_actor(&context);
         async move {
-            let result = resources::read(engine, &request.uri, &actor).await?;
-            Ok(result.into())
+            // 14.7c: standardised completion event. `read` is
+            // instrumented at the dispatch boundary (one event
+            // per request, success or failure) so operators
+            // can build `mcp.resource` dashboards without a
+            // metrics dep.
+            let start = Instant::now();
+            let uri = request.uri.clone();
+            let result = resources::read(engine, &request.uri, &actor).await;
+            emit_completion("mcp.resource", &uri, &actor, &classify_read(&result), start);
+            let response = result?;
+            Ok(response.into())
         }
     }
 
@@ -158,8 +169,20 @@ impl ServerHandler for OxidHomeMcpHandler {
         let engine = self.engine.clone();
         let actor = self.resolve_actor(&context);
         async move {
-            let result = tools::call(engine, request, &actor).await?;
-            Ok(result.into())
+            // 14.7c: standardised completion event. See
+            // `read_resource` above for the rationale.
+            let start = Instant::now();
+            let tool_name = request.name.clone();
+            let result = tools::call(engine, request, &actor).await;
+            emit_completion(
+                "mcp.tool",
+                &tool_name,
+                &actor,
+                &classify_call(&result),
+                start,
+            );
+            let response = result?;
+            Ok(response.into())
         }
     }
 
@@ -182,7 +205,19 @@ impl ServerHandler for OxidHomeMcpHandler {
     ) -> impl Future<Output = Result<GetPromptResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
     {
         let actor = self.resolve_actor(&context);
-        std::future::ready(prompts::get(&request, &actor).map(GetPromptResponse::from))
+        // 14.7c: standardised completion event. See
+        // `read_resource` above for the rationale.
+        let start = Instant::now();
+        let name = request.name.clone();
+        let result = prompts::get(&request, &actor);
+        emit_completion(
+            "mcp.prompt",
+            &name,
+            &actor,
+            &classify_prompt(&result),
+            start,
+        );
+        std::future::ready(result.map(GetPromptResponse::from))
     }
 }
 
@@ -215,5 +250,117 @@ impl OxidHomeMcpHandler {
         let parts = context.extensions.get::<axum::http::request::Parts>();
         let actor = parts.and_then(|p| p.extensions.get::<Actor>()).cloned();
         actor.unwrap_or_else(|| Actor::api(resources::UNAUTHENTICATED_TOKEN_ID, Vec::new()))
+    }
+}
+
+// ── 14.7c: structured MCP completion tracing ────────────────────
+//
+// One `tracing::info!` per dispatched MCP request under a
+// stable target (`mcp.resource` / `mcp.tool` / `mcp.prompt`)
+// with a stable field shape. Lets operators build metric
+// dashboards via their tracing pipeline (Vector, Grafana Alloy,
+// otel-collector) without an in-process metrics crate + scrape
+// endpoint. Distinct from the per-error `tracing::warn!` /
+// `tracing::error!` events already emitted inside the handlers
+// (those stay for context on the failing branch); this is the
+// once-per-request completion signal with an `outcome` tag a
+// dashboard can `count_by`.
+
+/// Emit the standardised completion event.
+fn emit_completion(target: &'static str, name: &str, actor: &Actor, outcome: &str, start: Instant) {
+    #[allow(clippy::cast_possible_truncation)]
+    let duration_ms = start.elapsed().as_millis() as u64;
+    // Trampoline through match so `target:` gets a literal
+    // string — `tracing::info!` requires that.
+    match target {
+        "mcp.resource" => tracing::info!(
+            target: "mcp.resource",
+            mcp_name = %name,
+            mcp_actor_id = %actor.id(),
+            mcp_outcome = %outcome,
+            mcp_duration_ms = duration_ms,
+            "MCP resource read completed",
+        ),
+        "mcp.tool" => tracing::info!(
+            target: "mcp.tool",
+            mcp_name = %name,
+            mcp_actor_id = %actor.id(),
+            mcp_outcome = %outcome,
+            mcp_duration_ms = duration_ms,
+            "MCP tool call completed",
+        ),
+        "mcp.prompt" => tracing::info!(
+            target: "mcp.prompt",
+            mcp_name = %name,
+            mcp_actor_id = %actor.id(),
+            mcp_outcome = %outcome,
+            mcp_duration_ms = duration_ms,
+            "MCP prompt get completed",
+        ),
+        _ => tracing::info!(
+            target: "mcp",
+            mcp_name = %name,
+            mcp_actor_id = %actor.id(),
+            mcp_outcome = %outcome,
+            mcp_duration_ms = duration_ms,
+            "MCP request completed",
+        ),
+    }
+}
+
+/// Map the tool-call result to a stable outcome tag.
+///
+/// - `Ok(res)` where `is_error` is set → `"exec_err"` (a
+///   plugin returned Err, a not-found precondition failed —
+///   application-level failure the client sees as
+///   `CallToolResult { isError: true }`).
+/// - `Ok(_)` otherwise → `"ok"`.
+/// - `Err(mcp_error)` → tag derived from the JSON-RPC code
+///   ([`classify_mcp_error`]), so scope denials, oversized
+///   responses, and the audit-queue busy path each get a
+///   dashboard-friendly slice.
+fn classify_call(result: &Result<CallToolResult, McpError>) -> &'static str {
+    match result {
+        Ok(r) if r.is_error == Some(true) => "exec_err",
+        Ok(_) => "ok",
+        Err(err) => classify_mcp_error(err),
+    }
+}
+
+/// Read-side classifier — resource reads don't carry an
+/// application-level `is_error` shape, so `Ok(_)` collapses to
+/// `"ok"` and error paths go through the JSON-RPC-code
+/// classifier.
+fn classify_read(result: &Result<ReadResourceResult, McpError>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(err) => classify_mcp_error(err),
+    }
+}
+
+/// Prompt-side classifier — same shape as
+/// [`classify_read`]; prompt failures carry the same JSON-RPC
+/// codes tools/resources use.
+fn classify_prompt(result: &Result<GetPromptResult, McpError>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(err) => classify_mcp_error(err),
+    }
+}
+
+/// Map a JSON-RPC error code to a stable dashboard-friendly
+/// tag. Kept in sync with the codes MCP handlers emit.
+fn classify_mcp_error(err: &McpError) -> &'static str {
+    // Codes come from `resources::{SCOPE_DENIED_CODE, ...}`
+    // and rmcp's standard JSON-RPC codes. Keep this match
+    // aligned with the emit sites.
+    match err.code.0 {
+        -32001 => "denied",
+        -32003 => "too_large",
+        -32004 => "busy",
+        -32601 => "unknown_method",
+        -32602 => "invalid_params",
+        -32603 => "internal",
+        _ => "error",
     }
 }
