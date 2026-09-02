@@ -400,7 +400,20 @@ async fn run_stdio() -> anyhow::Result<()> {
         state_dir = %state_dir.display(),
         "oxidhome mcp-stdio ready — awaiting client on stdin",
     );
-    let serve_result = serve_stdio(engine.clone()).await;
+    // Round-3 P1 on PR #143: race the transport future against
+    // `shutdown_signal` so SIGINT/SIGTERM enter the same bounded
+    // stop / drain / flush sequence below instead of falling
+    // through to the OS default (immediate termination — plugins
+    // aborted mid-supervisor, log tail lost). The prior version
+    // awaited `serve_stdio` directly, so ctrl-c bypassed the
+    // whole cleanup path.
+    let serve_result = tokio::select! {
+        result = serve_stdio(engine.clone()) => result,
+        signal = shutdown_signal() => {
+            tracing::info!(signal = signal, "shutdown signal received; draining stdio session");
+            Ok(())
+        }
+    };
 
     // Round-2 P1 on PR #143: same bounded shutdown the HTTP
     // daemon runs. Stdio exposes wildcard `plugins.start`, so

@@ -47,10 +47,15 @@
 //! # Shutdown
 //!
 //! `serve_server` returns when either side closes the transport
-//! (stdin EOF, JSON-RPC `shutdown`, or a fatal frame error). We
-//! don't install a signal handler — a `SIGINT` from the parent
-//! ripples through as stdin EOF; a `SIGTERM` is the parent's
-//! decision to reap the child.
+//! (stdin EOF, JSON-RPC `shutdown`, or a fatal frame error).
+//! Signal handling is the **binary's** responsibility: the
+//! `run_stdio` entrypoint (`src/main.rs`) races this call
+//! against `shutdown_signal()` in a `tokio::select!` so
+//! `SIGINT` / `SIGTERM` enter the same bounded stop + drain
+//! sequence the HTTP daemon uses (round-3 P1 on PR #143 — the
+//! pre-fix doc's "SIGINT ripples through as stdin EOF" was
+//! wrong; on Unix the default `SIGINT` disposition is
+//! immediate termination unless a handler is installed).
 
 use tokio::io::{AsyncRead, AsyncWrite};
 

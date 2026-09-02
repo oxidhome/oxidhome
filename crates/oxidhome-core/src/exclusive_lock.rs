@@ -78,16 +78,19 @@ fn try_lock_exclusive(file: &File, state_dir: &Path) -> anyhow::Result<()> {
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == -1 {
         let err = std::io::Error::last_os_error();
-        // Only EWOULDBLOCK (aliased with EAGAIN on Linux)
-        // means the lock is held by another holder. Other
-        // errno values (EBADF, EINVAL, ENOLCK, permission
-        // errors on quirky filesystems) surface with the raw
-        // error so an operator can distinguish "someone else
-        // is running" from "this filesystem doesn't support
-        // flock" — round-2 P2 on PR #143 flagged the prior
-        // misleading catch-all diagnostic.
+        // `EWOULDBLOCK` / `EAGAIN` both mean "another holder
+        // has the lock." POSIX permits `EAGAIN`; Linux aliases
+        // it to `EWOULDBLOCK` but not every Unix does, so
+        // matching both keeps the contention diagnostic
+        // correct across platforms (round-3 Copilot on PR
+        // #143). Other errno values (`EBADF`, `EINVAL`,
+        // `ENOLCK`, permission errors on quirky filesystems)
+        // surface with the raw error so an operator can
+        // distinguish "someone else is running" from "this
+        // filesystem doesn't support flock" — round-2 P2 on
+        // PR #143 flagged the prior misleading catch-all.
         let raw = err.raw_os_error();
-        if raw == Some(libc::EWOULDBLOCK) {
+        if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
             anyhow::bail!(
                 "another `oxidhome` process is already using state dir {} \
                  (set $OXIDHOME_STATE_DIR to a distinct dir, or stop the other process)",
@@ -188,13 +191,27 @@ mod tests {
         }
     }
     fn tempdir() -> TempDir {
-        let mut base = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
+        // Uniqueness within this process comes from a static
+        // atomic counter. `create_dir` (not `create_dir_all`)
+        // fails if the dir already exists, so we retry with a
+        // fresh suffix — that closes the round-3 Copilot
+        // finding on PR #143 (pid+nanos alone could collide
+        // across a very tight loop).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base_dir = std::env::temp_dir();
         let pid = std::process::id();
-        base.push(format!("oxidhome-lock-test-{pid}-{nanos}"));
-        std::fs::create_dir_all(&base).expect("mk tempdir");
-        TempDir { path: base }
+        loop {
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let candidate = base_dir.join(format!("oxidhome-lock-test-{pid}-{nanos}-{n}"));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => return TempDir { path: candidate },
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => panic!("mk tempdir: {err}"),
+            }
+        }
     }
 }
