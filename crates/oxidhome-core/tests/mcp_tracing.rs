@@ -391,6 +391,15 @@ fn error_paths_carry_stable_outcome_tags() {
         "unknown prompt must classify as invalid_params; got {:?}",
         bad_prompt.fields,
     );
+    // Round-2 P1 on PR #144: even for an unknown prompt name,
+    // `mcp_name` must be the bounded sentinel `"unknown"` — not
+    // the caller-supplied string.
+    assert_eq!(
+        bad_prompt.fields.get("mcp_name").map(String::as_str),
+        Some("unknown"),
+        "P1 regression: unknown prompt name must map to \"unknown\", not the raw string; got {:?}",
+        bad_prompt.fields,
+    );
 }
 
 /// 14.7c round-1 P1: `mcp_name` on `mcp.resource.complete`
@@ -455,6 +464,94 @@ fn resource_completion_uses_bounded_family_slug() {
             ev.fields.get("mcp_name").map(String::as_str),
             Some("devices.detail"),
             "P1 regression: mcp_name must be the family slug, not the URI; got {:?}",
+            ev.fields,
+        );
+    }
+}
+
+/// 14.7c round-2 P1: unknown tool/prompt names come from the
+/// caller and are unbounded. `mcp_name` must collapse them to
+/// the sentinel `"unknown"` so a hostile or bugged client
+/// can't blow up a dashboard label index.
+#[test]
+fn unknown_tool_and_prompt_names_collapse_to_unknown() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let (subscriber, events) = setup_capture();
+
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let engine = Engine::new().expect("engine");
+            let bearer = mint_bearer(&engine);
+            let router = build_router(engine);
+            let (router, session) = handshake(router, &bearer).await;
+
+            // Two nonsense tool names — different unbounded
+            // strings that must both land as `mcp_name =
+            // "unknown"`.
+            for tool in [
+                "not-a-real-tool",
+                "hostile-💥-\u{1f4a5}-emoji-name-that-would-explode-label-cardinality",
+            ] {
+                let _ = call(
+                    &router,
+                    &bearer,
+                    &session,
+                    "tools/call",
+                    json!({"name": tool, "arguments": {}}),
+                )
+                .await;
+            }
+
+            // Two nonsense prompt names — same idea.
+            for prompt in ["no-such-prompt", "another/garbage?name"] {
+                let _ = call(
+                    &router,
+                    &bearer,
+                    &session,
+                    "prompts/get",
+                    json!({"name": prompt}),
+                )
+                .await;
+            }
+        });
+    });
+
+    let captured = events.lock().unwrap().clone();
+    let tool_evs: Vec<_> = captured
+        .iter()
+        .filter(|e| e.target == "mcp.tool.complete")
+        .collect();
+    assert_eq!(
+        tool_evs.len(),
+        2,
+        "two unknown-tool calls must produce two completion events; got {captured:#?}",
+    );
+    for ev in &tool_evs {
+        assert_eq!(
+            ev.fields.get("mcp_name").map(String::as_str),
+            Some("unknown"),
+            "P1 regression: unknown tool name must map to \"unknown\", not the raw string; got {:?}",
+            ev.fields,
+        );
+    }
+
+    let prompt_evs: Vec<_> = captured
+        .iter()
+        .filter(|e| e.target == "mcp.prompt.complete")
+        .collect();
+    assert_eq!(
+        prompt_evs.len(),
+        2,
+        "two unknown-prompt calls must produce two completion events; got {captured:#?}",
+    );
+    for ev in &prompt_evs {
+        assert_eq!(
+            ev.fields.get("mcp_name").map(String::as_str),
+            Some("unknown"),
+            "P1 regression: unknown prompt name must map to \"unknown\", not the raw string; got {:?}",
             ev.fields,
         );
     }

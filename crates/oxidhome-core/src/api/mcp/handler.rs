@@ -188,20 +188,24 @@ impl ServerHandler for OxidHomeMcpHandler {
         let actor = self.resolve_actor(&context);
         async move {
             // 14.7c: standardised completion event. See
-            // `read_resource` above for the rationale. Tool
-            // names are a small closed set (routing table in
-            // `tools::list_tools`) so `mcp_name` = tool name is
-            // already bounded-cardinality — no normalisation
-            // needed. The dedicated `mcp.tool.complete` target
-            // keeps this stream isolated from the
-            // `target: "mcp.tool"` error logs the audit-finalize
-            // paths in `tools.rs` emit (different field shape).
+            // `read_resource` above for the rationale.
+            //
+            // Round-2 P1 on PR #144: the caller-supplied
+            // `request.name` is unbounded — a client can
+            // submit any string on `tools/call`. Map it
+            // through [`tools::canonical_tool_name`] so
+            // `mcp_name` is either a routed static string
+            // or the sentinel `"unknown"`. The dedicated
+            // `mcp.tool.complete` target keeps this stream
+            // isolated from the `target: "mcp.tool"` error
+            // logs the audit-finalize paths in `tools.rs`
+            // emit (different field shape).
             let start = Instant::now();
-            let tool_name = request.name.clone();
+            let canonical = tools::canonical_tool_name(&request.name);
             let result = tools::call(engine, request, &actor).await;
             emit_completion(
                 "mcp.tool.complete",
-                &tool_name,
+                canonical,
                 &actor,
                 classify_call(&result),
                 start,
@@ -231,18 +235,18 @@ impl ServerHandler for OxidHomeMcpHandler {
     {
         let actor = self.resolve_actor(&context);
         // 14.7c: standardised completion event. See
-        // `read_resource` above for the rationale. Prompt
-        // names come from `prompts::list_prompts`; the closed
-        // catalogue bounds `mcp_name` cardinality without
-        // normalisation. Dedicated `mcp.prompt.complete`
-        // target so the audit-error stream (if it ever adds
-        // one under `mcp.prompt`) doesn't blend.
+        // `read_resource` above for the rationale.
+        //
+        // Round-2 P1 on PR #144: `request.name` is
+        // caller-supplied and unbounded. Map through
+        // [`prompts::canonical_prompt_name`] so `mcp_name` is
+        // a routed static string or the sentinel `"unknown"`.
         let start = Instant::now();
-        let name = request.name.clone();
+        let canonical = prompts::canonical_prompt_name(&request.name);
         let result = prompts::get(&request, &actor);
         emit_completion(
             "mcp.prompt.complete",
-            &name,
+            canonical,
             &actor,
             classify_prompt(&result),
             start,
