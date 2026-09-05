@@ -211,11 +211,22 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
 /// scope up front (mirrors the REST endpoints' `require_scope`
 /// gates), so a token holding e.g. `logs:read` can't enumerate
 /// devices just by hitting the MCP mount.
-pub(super) async fn read(
-    engine: Engine,
-    uri: &str,
-    actor: &Actor,
-) -> Result<ReadResourceResult, McpError> {
+/// Result of dispatching a resource read.
+///
+/// Carries the routed `family` slug alongside the JSON-RPC
+/// result so the dispatch site can emit a bounded-cardinality
+/// tracing tag ([Phase 14.7c]) without re-parsing the URI.
+/// Family is a small closed set (`devices`, `devices.detail`,
+/// `plugins`, `plugins.detail`, `events`, `logs`, `status`,
+/// `blobs`, `unknown`); the URI itself is caller-controlled
+/// and unbounded (blob names, device ids, query strings) and
+/// must never appear in a dashboard label.
+pub(super) struct ReadDispatch {
+    pub family: &'static str,
+    pub result: Result<ReadResourceResult, McpError>,
+}
+
+pub(super) async fn read(engine: Engine, uri: &str, actor: &Actor) -> ReadDispatch {
     // Round-6 F3 on PR #122: bound the concurrent audit-write
     // tasks. `try_acquire_owned` refuses immediately when the
     // queue is at [`AUDIT_QUEUE_MAX`], so a disconnect-flooded
@@ -238,11 +249,19 @@ pub(super) async fn read(
             uri,
             "MCP audit-write queue saturated — refusing read without audit",
         );
-        return Err(McpError::new(
-            RESOURCE_BUSY_CODE,
-            "MCP audit-write queue saturated; retry shortly",
-            None,
-        ));
+        return ReadDispatch {
+            // Refusal happens before routing runs — the URI
+            // never got matched to a family, so tag it as
+            // `busy` so operators can slice audit-queue
+            // saturations without them landing under whatever
+            // family the caller happened to hit.
+            family: "busy",
+            result: Err(McpError::new(
+                RESOURCE_BUSY_CODE,
+                "MCP audit-write queue saturated; retry shortly",
+                None,
+            )),
+        };
     };
 
     let token_id = actor.id().to_string();
@@ -263,7 +282,7 @@ pub(super) async fn read(
         audit_log.record_completed(&audit_entry)
     })
     .await;
-    match audit_result {
+    let result = match audit_result {
         Ok(Ok(_row_id)) => outcome.into_result(uri),
         Ok(Err(err)) => {
             tracing::error!(%err, uri, "MCP resource audit write failed — refusing read");
@@ -279,7 +298,8 @@ pub(super) async fn read(
                 None,
             ))
         }
-    }
+    };
+    ReadDispatch { family, result }
 }
 
 /// Maximum concurrent MCP audit-write tasks. Bounds the size

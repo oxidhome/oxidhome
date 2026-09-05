@@ -3,7 +3,8 @@
 //! Drives one `tools/call`, one `resources/read`, and one
 //! `prompts/get` through the MCP mount with a custom tracing
 //! layer attached. Asserts the standardised
-//! `mcp.tool` / `mcp.resource` / `mcp.prompt` completion
+//! `mcp.resource.complete` / `mcp.tool.complete` /
+//! `mcp.prompt.complete` completion
 //! events land with the expected field shape
 //! (`mcp_name`, `mcp_actor_id`, `mcp_outcome`,
 //! `mcp_duration_ms`).
@@ -198,7 +199,7 @@ where
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let target = event.metadata().target();
-        if !target.starts_with("mcp.") && target != "mcp" {
+        if !target.ends_with(".complete") || !target.starts_with("mcp.") {
             return;
         }
         let mut collector = FieldCollector::default();
@@ -303,18 +304,21 @@ fn dispatched_requests_emit_completion_events() {
     let captured = events.lock().unwrap().clone();
     let resource_ev = captured
         .iter()
-        .find(|e| e.target == "mcp.resource")
-        .expect("mcp.resource event missing");
+        .find(|e| e.target == "mcp.resource.complete")
+        .expect("mcp.resource.complete event missing");
     let tool_ev = captured
         .iter()
-        .find(|e| e.target == "mcp.tool")
-        .expect("mcp.tool event missing");
+        .find(|e| e.target == "mcp.tool.complete")
+        .expect("mcp.tool.complete event missing");
     let prompt_ev = captured
         .iter()
-        .find(|e| e.target == "mcp.prompt")
-        .expect("mcp.prompt event missing");
+        .find(|e| e.target == "mcp.prompt.complete")
+        .expect("mcp.prompt.complete event missing");
 
-    assert_shape(resource_ev, "oxidhome://devices", "ok");
+    // P1 (round-1 review of PR #144): `mcp_name` for resources
+    // is the routed family slug, not the caller-controlled
+    // URI. `oxidhome://devices` routes to family `devices`.
+    assert_shape(resource_ev, "devices", "ok");
     assert_shape(tool_ev, "logs.query", "ok");
     assert_shape(prompt_ev, "summarize_today", "ok");
 }
@@ -368,8 +372,8 @@ fn error_paths_carry_stable_outcome_tags() {
     let captured = events.lock().unwrap().clone();
     let denied = captured
         .iter()
-        .find(|e| e.target == "mcp.tool")
-        .expect("mcp.tool event");
+        .find(|e| e.target == "mcp.tool.complete")
+        .expect("mcp.tool.complete event");
     assert_eq!(
         denied.fields.get("mcp_outcome").map(String::as_str),
         Some("denied"),
@@ -379,12 +383,79 @@ fn error_paths_carry_stable_outcome_tags() {
 
     let bad_prompt = captured
         .iter()
-        .find(|e| e.target == "mcp.prompt")
-        .expect("mcp.prompt event");
+        .find(|e| e.target == "mcp.prompt.complete")
+        .expect("mcp.prompt.complete event");
     assert_eq!(
         bad_prompt.fields.get("mcp_outcome").map(String::as_str),
         Some("invalid_params"),
         "unknown prompt must classify as invalid_params; got {:?}",
         bad_prompt.fields,
     );
+}
+
+/// 14.7c round-1 P1: `mcp_name` on `mcp.resource.complete`
+/// must be the routed family slug — a bounded closed set —
+/// not the caller-controlled URI. Fires three URIs whose
+/// only difference is the id/query segment and asserts every
+/// captured event lands on the same family label. If someone
+/// later plumbs the raw URI back through, this test blows up
+/// with three distinct `mcp_name` values and forces the
+/// discussion.
+#[test]
+fn resource_completion_uses_bounded_family_slug() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let (subscriber, events) = setup_capture();
+
+    with_default(subscriber, || {
+        rt.block_on(async {
+            let engine = Engine::new().expect("engine");
+            let bearer = mint_bearer(&engine);
+            let router = build_router(engine);
+            let (router, session) = handshake(router, &bearer).await;
+
+            // Same family, three different unbounded suffixes:
+            // - a made-up device id
+            // - a plausible-looking uuid
+            // - a query string
+            // On the raw-URI path all three would be distinct
+            // `mcp_name` values; on the family path they all
+            // collapse to `devices.detail`.
+            for uri in [
+                "oxidhome://devices/dev-a",
+                "oxidhome://devices/00000000-0000-0000-0000-000000000000",
+                "oxidhome://devices/dev-b?refresh=true",
+            ] {
+                let _ = call(
+                    &router,
+                    &bearer,
+                    &session,
+                    "resources/read",
+                    json!({"uri": uri}),
+                )
+                .await;
+            }
+        });
+    });
+
+    let captured = events.lock().unwrap().clone();
+    let resource_events: Vec<_> = captured
+        .iter()
+        .filter(|e| e.target == "mcp.resource.complete")
+        .collect();
+    assert_eq!(
+        resource_events.len(),
+        3,
+        "three resources/read calls must produce three completion events; got {captured:#?}",
+    );
+    for ev in &resource_events {
+        assert_eq!(
+            ev.fields.get("mcp_name").map(String::as_str),
+            Some("devices.detail"),
+            "P1 regression: mcp_name must be the family slug, not the URI; got {:?}",
+            ev.fields,
+        );
+    }
 }

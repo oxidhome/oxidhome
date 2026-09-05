@@ -137,13 +137,31 @@ impl ServerHandler for OxidHomeMcpHandler {
             // 14.7c: standardised completion event. `read` is
             // instrumented at the dispatch boundary (one event
             // per request, success or failure) so operators
-            // can build `mcp.resource` dashboards without a
-            // metrics dep.
+            // can build `mcp.resource.complete` dashboards
+            // without a metrics dep.
+            //
+            // `mcp_name` is the routed **family slug** (from
+            // [`resources::ReadDispatch::family`]), not the
+            // caller-controlled URI — URIs carry blob names,
+            // device ids, and query params and would blow up
+            // any Prometheus/Loki label cardinality budget.
+            //
+            // Completion events live under a dedicated
+            // `mcp.resource.complete` target so a filter like
+            // `count_by(mcp_outcome)` on that target sees a
+            // uniform field shape — audit-error diagnostics
+            // in this module stay on plain `mcp.*` targets and
+            // don't leak into completion counts.
             let start = Instant::now();
-            let uri = request.uri.clone();
-            let result = resources::read(engine, &request.uri, &actor).await;
-            emit_completion("mcp.resource", &uri, &actor, &classify_read(&result), start);
-            let response = result?;
+            let dispatch = resources::read(engine, &request.uri, &actor).await;
+            emit_completion(
+                "mcp.resource.complete",
+                dispatch.family,
+                &actor,
+                classify_read(&dispatch.result),
+                start,
+            );
+            let response = dispatch.result?;
             Ok(response.into())
         }
     }
@@ -170,15 +188,22 @@ impl ServerHandler for OxidHomeMcpHandler {
         let actor = self.resolve_actor(&context);
         async move {
             // 14.7c: standardised completion event. See
-            // `read_resource` above for the rationale.
+            // `read_resource` above for the rationale. Tool
+            // names are a small closed set (routing table in
+            // `tools::list_tools`) so `mcp_name` = tool name is
+            // already bounded-cardinality — no normalisation
+            // needed. The dedicated `mcp.tool.complete` target
+            // keeps this stream isolated from the
+            // `target: "mcp.tool"` error logs the audit-finalize
+            // paths in `tools.rs` emit (different field shape).
             let start = Instant::now();
             let tool_name = request.name.clone();
             let result = tools::call(engine, request, &actor).await;
             emit_completion(
-                "mcp.tool",
+                "mcp.tool.complete",
                 &tool_name,
                 &actor,
-                &classify_call(&result),
+                classify_call(&result),
                 start,
             );
             let response = result?;
@@ -206,15 +231,20 @@ impl ServerHandler for OxidHomeMcpHandler {
     {
         let actor = self.resolve_actor(&context);
         // 14.7c: standardised completion event. See
-        // `read_resource` above for the rationale.
+        // `read_resource` above for the rationale. Prompt
+        // names come from `prompts::list_prompts`; the closed
+        // catalogue bounds `mcp_name` cardinality without
+        // normalisation. Dedicated `mcp.prompt.complete`
+        // target so the audit-error stream (if it ever adds
+        // one under `mcp.prompt`) doesn't blend.
         let start = Instant::now();
         let name = request.name.clone();
         let result = prompts::get(&request, &actor);
         emit_completion(
-            "mcp.prompt",
+            "mcp.prompt.complete",
             &name,
             &actor,
-            &classify_prompt(&result),
+            classify_prompt(&result),
             start,
         );
         std::future::ready(result.map(GetPromptResponse::from))
@@ -256,15 +286,26 @@ impl OxidHomeMcpHandler {
 // ── 14.7c: structured MCP completion tracing ────────────────────
 //
 // One `tracing::info!` per dispatched MCP request under a
-// stable target (`mcp.resource` / `mcp.tool` / `mcp.prompt`)
-// with a stable field shape. Lets operators build metric
-// dashboards via their tracing pipeline (Vector, Grafana Alloy,
+// **dedicated completion target** — `mcp.resource.complete`,
+// `mcp.tool.complete`, `mcp.prompt.complete` — with a stable
+// field shape (`mcp_name`, `mcp_actor_id`, `mcp_outcome`,
+// `mcp_duration_ms`). Lets operators build metric dashboards
+// via their tracing pipeline (Vector, Grafana Alloy,
 // otel-collector) without an in-process metrics crate + scrape
-// endpoint. Distinct from the per-error `tracing::warn!` /
-// `tracing::error!` events already emitted inside the handlers
-// (those stay for context on the failing branch); this is the
-// once-per-request completion signal with an `outcome` tag a
-// dashboard can `count_by`.
+// endpoint.
+//
+// The `.complete` suffix keeps this stream isolated from the
+// per-error `tracing::warn!`/`tracing::error!` diagnostics
+// emitted from the handler bodies under plain `mcp.tool`,
+// `mcp.resource`, `mcp.prompt` (different field shape, no
+// completion counter contract). A dashboard filtering
+// `target=mcp.tool.complete` therefore sees a uniform shape
+// and can `count_by(mcp_outcome)` safely.
+//
+// Round-1 P1 on PR #144: `mcp_name` must be
+// bounded-cardinality — for resources it's the routed family
+// slug (see [`resources::ReadDispatch`]), not the URI; tool
+// and prompt names are already a closed catalogue.
 
 /// Emit the standardised completion event.
 fn emit_completion(target: &'static str, name: &str, actor: &Actor, outcome: &str, start: Instant) {
@@ -273,37 +314,42 @@ fn emit_completion(target: &'static str, name: &str, actor: &Actor, outcome: &st
     // Trampoline through match so `target:` gets a literal
     // string — `tracing::info!` requires that.
     match target {
-        "mcp.resource" => tracing::info!(
-            target: "mcp.resource",
+        "mcp.resource.complete" => tracing::info!(
+            target: "mcp.resource.complete",
             mcp_name = %name,
             mcp_actor_id = %actor.id(),
             mcp_outcome = %outcome,
             mcp_duration_ms = duration_ms,
             "MCP resource read completed",
         ),
-        "mcp.tool" => tracing::info!(
-            target: "mcp.tool",
+        "mcp.tool.complete" => tracing::info!(
+            target: "mcp.tool.complete",
             mcp_name = %name,
             mcp_actor_id = %actor.id(),
             mcp_outcome = %outcome,
             mcp_duration_ms = duration_ms,
             "MCP tool call completed",
         ),
-        "mcp.prompt" => tracing::info!(
-            target: "mcp.prompt",
+        "mcp.prompt.complete" => tracing::info!(
+            target: "mcp.prompt.complete",
             mcp_name = %name,
             mcp_actor_id = %actor.id(),
             mcp_outcome = %outcome,
             mcp_duration_ms = duration_ms,
             "MCP prompt get completed",
         ),
+        // Unknown target routes to a fallback bucket rather
+        // than a plain `mcp` — plain `mcp` would collide with
+        // any future generic MCP diagnostic. This arm is a
+        // programming-error backstop: every emit site above
+        // uses one of the three dedicated targets.
         _ => tracing::info!(
-            target: "mcp",
+            target: "mcp.unknown.complete",
             mcp_name = %name,
             mcp_actor_id = %actor.id(),
             mcp_outcome = %outcome,
             mcp_duration_ms = duration_ms,
-            "MCP request completed",
+            "MCP request completed (unrecognised target — please file a bug)",
         ),
     }
 }
