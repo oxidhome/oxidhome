@@ -211,11 +211,22 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
 /// scope up front (mirrors the REST endpoints' `require_scope`
 /// gates), so a token holding e.g. `logs:read` can't enumerate
 /// devices just by hitting the MCP mount.
-pub(super) async fn read(
-    engine: Engine,
-    uri: &str,
-    actor: &Actor,
-) -> Result<ReadResourceResult, McpError> {
+/// Result of dispatching a resource read.
+///
+/// Carries the routed `family` slug alongside the JSON-RPC
+/// result so the dispatch site can emit a bounded-cardinality
+/// tracing tag ([Phase 14.7c]) without re-parsing the URI.
+/// Family is a small closed set (`devices`, `devices.detail`,
+/// `plugins`, `plugins.detail`, `events`, `logs`, `status`,
+/// `blobs`, `unknown`); the URI itself is caller-controlled
+/// and unbounded (blob names, device ids, query strings) and
+/// must never appear in a dashboard label.
+pub(super) struct ReadDispatch {
+    pub family: &'static str,
+    pub result: Result<ReadResourceResult, McpError>,
+}
+
+pub(super) async fn read(engine: Engine, uri: &str, actor: &Actor) -> ReadDispatch {
     // Round-6 F3 on PR #122: bound the concurrent audit-write
     // tasks. `try_acquire_owned` refuses immediately when the
     // queue is at [`AUDIT_QUEUE_MAX`], so a disconnect-flooded
@@ -232,17 +243,31 @@ pub(super) async fn read(
     // the per-request audit row. The `RESOURCE_BUSY_CODE`
     // client response makes the transient-overload semantics
     // explicit; a well-behaved client retries.
+    // Round-2 P2 on PR #144: classify the family BEFORE
+    // trying to acquire the audit permit. Routing is pure
+    // (no I/O), so this is cheap; running it first lets the
+    // saturation branch tag `mcp_name` with the actual
+    // family instead of the fixed `"busy"` sentinel — the
+    // saturation signal already lives in `mcp_outcome`
+    // (`busy` = JSON-RPC -32004), so overloading `mcp_name`
+    // as a second saturation flag loses the caller-supplied
+    // resource identity.
+    let family = route_family(uri);
+
     let Ok(audit_permit) = std::sync::Arc::clone(&AUDIT_QUEUE_SEMAPHORE).try_acquire_owned() else {
         tracing::warn!(
             cap = AUDIT_QUEUE_MAX,
             uri,
             "MCP audit-write queue saturated — refusing read without audit",
         );
-        return Err(McpError::new(
-            RESOURCE_BUSY_CODE,
-            "MCP audit-write queue saturated; retry shortly",
-            None,
-        ));
+        return ReadDispatch {
+            family,
+            result: Err(McpError::new(
+                RESOURCE_BUSY_CODE,
+                "MCP audit-write queue saturated; retry shortly",
+                None,
+            )),
+        };
     };
 
     let token_id = actor.id().to_string();
@@ -263,7 +288,7 @@ pub(super) async fn read(
         audit_log.record_completed(&audit_entry)
     })
     .await;
-    match audit_result {
+    let result = match audit_result {
         Ok(Ok(_row_id)) => outcome.into_result(uri),
         Ok(Err(err)) => {
             tracing::error!(%err, uri, "MCP resource audit write failed — refusing read");
@@ -279,7 +304,8 @@ pub(super) async fn read(
                 None,
             ))
         }
-    }
+    };
+    ReadDispatch { family, result }
 }
 
 /// Maximum concurrent MCP audit-write tasks. Bounds the size
@@ -488,24 +514,50 @@ enum Kind<'a> {
     Blob(&'a str, &'a str),
 }
 
-/// Route a URI to its family, check the family's required
-/// scope against the actor, and build the body if allowed.
-/// Async because the events / logs families hit the shared
-/// `SQLite` mutex and must run under `spawn_blocking` to keep
-/// the tokio worker free (round-1 F1 on PR #121).
-async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, ReadOutcome) {
+/// Output of routing a URI without any I/O — carries the
+/// family label + scope requirement + dispatch kind, or a
+/// terminal outcome the caller must return without dispatch
+/// (scheme mismatch, malformed blob URI, unknown authority).
+///
+/// Round-2 P2 on PR #144: routing is now pure so we can run it
+/// *before* trying to acquire the audit permit. That way an
+/// audit-queue saturation still gets tagged with the correct
+/// resource family (or `"unknown"` etc.), not the fixed
+/// `"busy"` sentinel — `mcp_outcome` already carries the
+/// saturation signal.
+enum Route<'a> {
+    Dispatch {
+        family: &'static str,
+        required: Scope,
+        kind: Kind<'a>,
+    },
+    Terminal {
+        family: &'static str,
+        outcome: ReadOutcome,
+    },
+}
+
+/// Pure routing pass. Splits the URI into family + kind
+/// without touching the engine or scope-checking. Called
+/// twice-over-nothing: once from [`read`] to size the
+/// audit-queue busy signal, and once (via [`read_inner`]) to
+/// drive dispatch. Both passes share this function so the
+/// routing table lives in exactly one place.
+fn resolve_route<'a>(uri: &'a str) -> Route<'a> {
     let Some(rest) = uri.strip_prefix(SCHEME) else {
-        return (
-            "unknown",
-            ReadOutcome::NotFound(format!("URI {uri} does not use the oxidhome:// scheme")),
-        );
+        return Route::Terminal {
+            family: "unknown",
+            outcome: ReadOutcome::NotFound(format!(
+                "URI {uri} does not use the oxidhome:// scheme"
+            )),
+        };
     };
     // Peel the optional query string first so path-splitting
     // (`/` separator) only walks the authority + id — a caller
     // hitting `oxidhome://events?since=1h` would otherwise
     // land in the "unknown" arm because `events?since=1h`
     // isn't a registered family.
-    let (path, query_str) = rest.split_once('?').map_or((rest, ""), |(p, q)| (p, q));
+    let (path, _query_str) = rest.split_once('?').map_or((rest, ""), |(p, q)| (p, q));
     // Path split: `authority[/tail]`. Authority is the family
     // (`devices`, `plugins`, `events`, `logs`); tail (if any)
     // is the id.
@@ -514,16 +566,14 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         None => (path, None),
     };
 
-    // Route → (family slug, required scope). Scope check
-    // happens uniformly below so every routed URI wears the
-    // same enforcement — no way to accidentally add a family
-    // that skips it. `Kind` names the dispatch after scope
-    // succeeds; keeps the routing decision separate from the
-    // async body-build.
-    let (family, required, kind): (&'static str, Scope, Kind) = match (family_seg, id_seg) {
-        ("devices", None) => ("devices", DEVICES_LIST, Kind::DevicesList),
-        ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => (
-            "devices.detail",
+    match (family_seg, id_seg) {
+        ("devices", None) => Route::Dispatch {
+            family: "devices",
+            required: DEVICES_LIST,
+            kind: Kind::DevicesList,
+        },
+        ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => Route::Dispatch {
+            family: "devices.detail",
             // Device-detail carries registration
             // metadata (owner, name, manufacturer,
             // model, capabilities) — the same shape
@@ -539,16 +589,34 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
             // withholding it from `devices:list` tokens
             // was the opposite of the intended
             // boundary — round-3 F1 fix).
-            DEVICES_LIST,
-            Kind::DevicesDetail(id),
-        ),
-        ("plugins", None) => ("plugins", PLUGINS_LIST, Kind::PluginsList),
-        ("plugins", Some(id)) if !id.is_empty() && !id.contains('/') => {
-            ("plugins.detail", PLUGINS_LIST, Kind::PluginsDetail(id))
-        }
-        ("events", None) => ("events", EVENTS_READ, Kind::Events),
-        ("logs", None) => ("logs", LOGS_READ, Kind::Logs),
-        ("status", None) => ("status", STATUS_READ, Kind::Status),
+            required: DEVICES_LIST,
+            kind: Kind::DevicesDetail(id),
+        },
+        ("plugins", None) => Route::Dispatch {
+            family: "plugins",
+            required: PLUGINS_LIST,
+            kind: Kind::PluginsList,
+        },
+        ("plugins", Some(id)) if !id.is_empty() && !id.contains('/') => Route::Dispatch {
+            family: "plugins.detail",
+            required: PLUGINS_LIST,
+            kind: Kind::PluginsDetail(id),
+        },
+        ("events", None) => Route::Dispatch {
+            family: "events",
+            required: EVENTS_READ,
+            kind: Kind::Events,
+        },
+        ("logs", None) => Route::Dispatch {
+            family: "logs",
+            required: LOGS_READ,
+            kind: Kind::Logs,
+        },
+        ("status", None) => Route::Dispatch {
+            family: "status",
+            required: STATUS_READ,
+            kind: Kind::Status,
+        },
         // Blobs URI: `oxidhome://blobs/<instance_id>/<name>`.
         // Split the tail on the *first* `/` — instance ids are
         // slash-free (validated by the blob store's
@@ -556,24 +624,56 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         // belongs to `name`. Empty either side is a
         // path-shape error, not a not-found.
         ("blobs", Some(tail)) => match tail.split_once('/') {
-            Some((instance, name)) if !instance.is_empty() && !name.is_empty() => {
-                ("blobs", BLOBS_READ, Kind::Blob(instance, name))
-            }
-            _ => {
-                return (
-                    "blobs",
-                    ReadOutcome::NotFound(format!(
-                        "blobs URI must be oxidhome://blobs/<instance_id>/<name>; got {uri}",
-                    )),
-                );
-            }
+            Some((instance, name)) if !instance.is_empty() && !name.is_empty() => Route::Dispatch {
+                family: "blobs",
+                required: BLOBS_READ,
+                kind: Kind::Blob(instance, name),
+            },
+            _ => Route::Terminal {
+                family: "blobs",
+                outcome: ReadOutcome::NotFound(format!(
+                    "blobs URI must be oxidhome://blobs/<instance_id>/<name>; got {uri}",
+                )),
+            },
         },
-        _ => {
-            return (
-                "unknown",
-                ReadOutcome::NotFound(format!("no MCP resource is registered for {uri}")),
-            );
-        }
+        _ => Route::Terminal {
+            family: "unknown",
+            outcome: ReadOutcome::NotFound(format!("no MCP resource is registered for {uri}")),
+        },
+    }
+}
+
+/// Cheap family tag — the routed family this URI would land
+/// on, without any of the borrowed [`Kind`] payload. Used from
+/// [`read`] before the audit permit so a saturation is still
+/// tagged with the actual resource family.
+fn route_family(uri: &str) -> &'static str {
+    match resolve_route(uri) {
+        Route::Dispatch { family, .. } | Route::Terminal { family, .. } => family,
+    }
+}
+
+/// Route a URI to its family, check the family's required
+/// scope against the actor, and build the body if allowed.
+/// Async because the events / logs families hit the shared
+/// `SQLite` mutex and must run under `spawn_blocking` to keep
+/// the tokio worker free (round-1 F1 on PR #121).
+async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, ReadOutcome) {
+    // Re-peel the query string here — the borrowed `Kind`
+    // arms don't need it, but the events / logs family
+    // builders do.
+    let query_str = uri
+        .strip_prefix(SCHEME)
+        .and_then(|rest| rest.split_once('?'))
+        .map_or("", |(_, q)| q);
+
+    let (family, required, kind) = match resolve_route(uri) {
+        Route::Dispatch {
+            family,
+            required,
+            kind,
+        } => (family, required, kind),
+        Route::Terminal { family, outcome } => return (family, outcome),
     };
 
     if require_scope(actor, required).is_err() {

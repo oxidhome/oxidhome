@@ -112,6 +112,10 @@ path = "tests/mcp_prompts.rs"
 name = "mcp_stdio"
 path = "tests/mcp_stdio.rs"
 
+[[test]]
+name = "mcp_tracing"
+path = "tests/mcp_tracing.rs"
+
 [dependencies]
 # Pinned exactly. Wasmtime's component-model API surface evolves; we want
 # silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors

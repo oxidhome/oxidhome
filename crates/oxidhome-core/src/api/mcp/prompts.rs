@@ -117,6 +117,26 @@ pub(super) fn list_prompts() -> Vec<Prompt> {
 /// wrong shape; the *arguments* (specifically `name`) were
 /// what didn't validate. Scope failures map to `-32001`
 /// mirroring the tool + resource surfaces.
+/// Map a caller-supplied prompt name to the routing table's
+/// canonical static string, or `"unknown"` when the name isn't
+/// registered. Bounds the `mcp_name` tracing label cardinality
+/// on `prompts/get`: clients can send arbitrary strings and
+/// echoing them would blow up a dashboard label index.
+///
+/// Kept in sync with the routing `match` in [`get`] below;
+/// adding a prompt means adding an arm here.
+///
+/// Round-2 P1 on PR #144.
+#[must_use]
+pub(super) fn canonical_prompt_name(name: &str) -> &'static str {
+    match name {
+        "summarize_today" => "summarize_today",
+        "draft_automation" => "draft_automation",
+        "explain_recent_errors" => "explain_recent_errors",
+        _ => "unknown",
+    }
+}
+
 pub(super) fn get(
     request: &GetPromptRequestParams,
     actor: &Actor,
