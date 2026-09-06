@@ -74,8 +74,8 @@ pub fn build_router(engine: Engine) -> Router {
         // REST does not consume per-tool constraints in
         // 14.4a: empty enforced set → refuse any
         // constraint-bearing token. See
-        // [`AuthState::enforced_constraint_keys`] docs.
-        enforced_constraint_keys: &[],
+        // [`AuthState::enforced_constraints`] docs.
+        enforced_constraints: &[],
     };
     let connect_service = super::connect_rpc::axum_service(engine.clone());
     // The authenticated cluster — every JSON handler except the

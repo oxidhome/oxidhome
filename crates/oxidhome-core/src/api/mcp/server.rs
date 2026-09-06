@@ -265,7 +265,7 @@ fn mount_inner(
         // would be admitted but unenforced), and would admit
         // forward-compat keys the current build doesn't know
         // how to enforce.
-        enforced_constraint_keys: &[],
+        enforced_constraints: &[],
     };
 
     // `route_service` — the exact `/api/v1/mcp` path only, no

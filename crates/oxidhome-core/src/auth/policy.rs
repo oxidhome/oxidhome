@@ -54,22 +54,27 @@
 //! no dispatch site would consult the constraint.
 //!
 //! The bearer middleware ([`crate::api::auth::require_token`],
-//! [`crate::api::connect_rpc`]) therefore carries a per-key
-//! allowlist (`AuthState::enforced_constraint_keys`). A
-//! bearer whose policy contains **any** constraint key
-//! outside the current transport's set is refused with 403
-//! at verify time.
+//! [`crate::api::connect_rpc`]) therefore carries a
+//! per-(key, field) allowlist (`AuthState::enforced_constraints`,
+//! a `&'static [EnforcedConstraint]`). A bearer whose policy
+//! names any constraint key outside the transport's set — or
+//! sets a field on an enforced key that the entry doesn't
+//! consume — is refused with 403 at verify time, and the
+//! specific offending key (and field, on a field-level
+//! refusal) is written to the audit row as
+//! `<constraint-unenforced:{key}[#{field}]>`.
 //!
-//! In 14.4a **every transport** passes an empty set, so any
-//! constraint-bearing token is refused. Each per-tool
-//! enforcement slice adds its key to the transport that
-//! consumes it, atomically with wiring the dispatch-site
-//! check — 14.4b adds `"device.send_command"` on MCP; 14.4c
-//! adds the five `plugins.*` keys on MCP; …
+//! In 14.4a **every transport** passes an empty slice, so
+//! any constraint-bearing token is refused. Each per-tool
+//! enforcement slice adds its own [`EnforcedConstraint`] to
+//! the transport that consumes it, atomically with wiring
+//! the dispatch-site check — 14.4b adds
+//! `("device.send_command", devices)` on MCP; 14.4c adds the
+//! five `plugins.*` entries with `plugins` on MCP; …
 //!
-//! See round-3 / round-4 / round-5 P1 on PR #147 for the
-//! iteration history (bool → set) and why the finer grain
-//! matters.
+//! See round-3 / round-4 / round-5 / round-6 P1 on PR #147
+//! for the iteration history (bool → key set → (key, field)
+//! set) and why each refinement matters.
 //!
 //! # Device IDs
 //!
@@ -145,10 +150,14 @@ pub struct TokenPolicy {
 /// all). Bare `Vec::is_empty()` conflates the two.
 ///
 /// Patterns support a single trailing `*` wildcard
-/// (`dev-a1b2c3d4*`); this is the minimum expressive shape
-/// for the common "one room's devices" and "one plugin
-/// family's ids" cases. Richer glob / regex support can
-/// land in a follow-up without breaking the wire shape.
+/// (`dev-a1b2c3d4*`) so an operator can whitelist one or a
+/// handful of specific *known* devices by their leading hex.
+/// Because SHA-derived device IDs are uniformly distributed,
+/// the glob does **not** group semantically by room, plugin,
+/// or capability — see the module-level "Device IDs" doc.
+/// Semantic grouping needs a future tuple- or tag-based
+/// selector; the current wire shape can accept it without
+/// breaking back-compat.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolConstraint {
@@ -236,6 +245,54 @@ struct ExtendedPolicy {
     scopes: Vec<String>,
     #[serde(default)]
     constraints: HashMap<String, ToolConstraint>,
+}
+
+// ── Enforcement declaration ────────────────────────────────────────
+
+/// One entry in a transport's enforced-constraint set — a
+/// tool name plus the [`ToolConstraint`] fields the transport
+/// actually consults at dispatch. Naming a key without
+/// declaring a field would fail open on that field: the flat
+/// scope check passes and no dispatch site reads it, so an
+/// operator's `{"device.send_command": {"plugins": [...]}}`
+/// would silently grant unrestricted device access.
+///
+/// Round-6 P1 on PR #147.
+#[derive(Debug, Clone, Copy)]
+pub struct EnforcedConstraint {
+    /// Tool name — must match the `constraints` map key
+    /// exactly (`device.send_command`, `plugins.install`, …).
+    pub key: &'static str,
+    /// `true` when the transport's dispatch site consults
+    /// [`ToolConstraint::allows_device`] on this key. A
+    /// bearer whose constraint carries `devices` but this
+    /// flag is `false` is refused — the field would be inert.
+    pub enforce_devices: bool,
+    /// Same idea for [`ToolConstraint::allows_plugin`].
+    pub enforce_plugins: bool,
+}
+
+impl EnforcedConstraint {
+    /// Diagnose one of the actor's constraints against this
+    /// enforcement declaration. Returns `Some(field_name)`
+    /// when the constraint sets a field this key doesn't
+    /// enforce — the offending field is what the bearer
+    /// middleware surfaces in its log line + audit row.
+    /// `None` means every field the operator set is consumed
+    /// at dispatch.
+    ///
+    /// Called only when [`Self::key`] already matches the
+    /// actor's constraint key; the key match is caller-side.
+    #[must_use]
+    pub fn first_unenforced_field(&self, constraint: &ToolConstraint) -> Option<&'static str> {
+        if constraint.devices.is_some() && !self.enforce_devices {
+            return Some("devices");
+        }
+        if constraint.plugins.is_some() && !self.enforce_plugins {
+            return Some("plugins");
+        }
+        None
+    }
 }
 
 /// Decode the `scope_json` blob into a [`TokenPolicy`].

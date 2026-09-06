@@ -5831,7 +5831,12 @@ async fn rest_refuses_constraint_bearing_token() {
     assert_eq!(denial.decision, "deny");
     assert_eq!(
         denial.required_scope.as_deref(),
-        Some("<constraint-bearing-token-refused>"),
+        // Round-6 P2 on PR #147: the sentinel names the
+        // offending key so a ledger sweep can attribute the
+        // refusal without cross-referencing the log line.
+        // 14.4a enforces no keys, so this is
+        // `KeyNotEnforced`.
+        Some("<constraint-unenforced:device.send_command>"),
     );
 }
 

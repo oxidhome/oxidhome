@@ -1176,8 +1176,8 @@ pub fn axum_service(engine: Engine) -> axum::Router {
         audit_log: engine.audit_log(),
         // Connect-RPC doesn't consume per-tool constraints
         // in 14.4a. Empty set → refuse constraint-bearing
-        // tokens. See [`AuthState::enforced_constraint_keys`].
-        enforced_constraint_keys: &[],
+        // tokens. See [`AuthState::enforced_constraints`].
+        enforced_constraints: &[],
     };
     let inner = router(engine).into_axum_service();
     axum::Router::new()
@@ -1238,21 +1238,20 @@ async fn connect_auth_middleware(
             // Connect-RPC, so refusing it here prevents the
             // MCP-only restriction from being bypassed via an
             // equivalent Connect RPC.
-            if let Some(unenforced) =
-                super::auth::first_unenforced_constraint(&actor, state.enforced_constraint_keys)
+            if let Some(refusal) =
+                super::auth::first_constraint_refusal(&actor, state.enforced_constraints)
             {
+                let sentinel = refusal.audit_sentinel();
                 tracing::warn!(
                     target: "api.auth",
                     token_id = %actor.id(),
-                    unenforced_key = %unenforced,
-                    "token carries a constraint key Connect-RPC does not enforce; refusing (14.4a)",
+                    refusal = %refusal.as_display(),
+                    "token carries a constraint Connect-RPC does not enforce; refusing (14.4a)",
                 );
-                // Round-4 P2 on PR #147: authenticated
-                // denial — attribute to the known token_id +
-                // actor_kind, not the anonymous bucket. See
-                // [`crate::api::auth::record_authenticated_denial`]
-                // for the shared helper used across both
-                // transports.
+                // Round-4 P2 / round-6 P2 on PR #147:
+                // authenticated denial with the specific
+                // offending key (and field, on a field-level
+                // refusal) in `required_scope`.
                 let entry = crate::state::AuditEntry {
                     id: 0,
                     intent_ms: 0,
@@ -1263,7 +1262,7 @@ async fn connect_auth_middleware(
                     path: path.clone(),
                     status: axum::http::StatusCode::FORBIDDEN.as_u16(),
                     decision: "deny".into(),
-                    required_scope: Some("<constraint-bearing-token-refused>".into()),
+                    required_scope: Some(sentinel),
                     execution_outcome: None,
                     domain_error: None,
                     credential_fp: None,
@@ -1271,7 +1270,7 @@ async fn connect_auth_middleware(
                 super::auth::record_authenticated_denial(&state.audit_log, None, entry).await;
                 return connect_error_response(
                     ConnectError::permission_denied(
-                        "token carries a constraint key this transport does not enforce",
+                        "token carries a constraint this transport does not enforce",
                     ),
                     req.headers(),
                 );

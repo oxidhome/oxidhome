@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 pub mod policy;
 
-pub use policy::{TokenPolicy, ToolConstraint, parse_policy};
+pub use policy::{EnforcedConstraint, TokenPolicy, ToolConstraint, parse_policy};
 
 /// What kind of caller this `Actor` represents. Drives where the
 /// audit log attributes the action and which scope policy the

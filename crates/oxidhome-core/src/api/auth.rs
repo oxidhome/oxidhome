@@ -141,30 +141,33 @@ pub(crate) struct AuthState {
     /// module-level doc for the two-phase write contract and the
     /// blocking / cancellation-safety discipline.
     pub audit_log: Arc<AuditLog>,
-    /// Phase 14.4a: constraint keys this transport enforces.
-    /// The middleware refuses a bearer whose policy contains
-    /// **any** constraint key outside this set — landing such
-    /// a token would fail open on the unenforced keys (the
-    /// flat scope check passes and no dispatch site consults
-    /// the constraint).
+    /// Phase 14.4a: which constraints this transport
+    /// enforces, keyed by tool name plus which
+    /// [`ToolConstraint`] fields the dispatch site actually
+    /// consults. The middleware refuses a bearer if its
+    /// policy names any constraint key outside this set, or
+    /// if a listed constraint sets a field the entry does not
+    /// enforce — landing either would fail open (the flat
+    /// scope check passes and no dispatch site reads the
+    /// constraint / field).
     ///
     /// In 14.4a every transport passes `&[]`: no dispatch
     /// site consumes constraints yet, so *every*
     /// constraint-bearing token is refused. Each per-tool
-    /// enforcement slice adds its own key to the transport
+    /// enforcement slice adds its own entry to the transport
     /// that consumes it, atomically with wiring the
-    /// dispatch-site check — 14.4b adds `"device.send_command"`
-    /// on MCP; 14.4c adds `"plugins.install"`,
-    /// `"plugins.stop"`, `"plugins.uninstall"`,
-    /// `"plugins.start"`, `"plugins.show"` on MCP; …
+    /// dispatch-site check — 14.4b adds `("device.send_command",
+    /// devices)` on MCP; 14.4c adds the five `plugins.*`
+    /// entries with `plugins` on MCP; …
     ///
-    /// Round-5 P1 on PR #147 replaced the transport-wide
-    /// `allow_constraints: bool` with this per-key set —
-    /// a bool would recreate the fail-open window between
-    /// 14.4b (flips MCP to `true`) and 14.4c (wires the
-    /// `plugins.*` checks), plus admit unknown forward-compat
-    /// constraint keys that no host build enforces.
-    pub enforced_constraint_keys: &'static [&'static str],
+    /// Round-6 P1 on PR #147 replaced the per-key-only set
+    /// with per-(key, field) entries — a plain key set would
+    /// admit e.g. `{"device.send_command": {"plugins":
+    /// ["acme.*"]}}` once 14.4b enforced the key, but the
+    /// device-only dispatch check never reads `plugins`, so
+    /// the constraint would be inert and the actor would have
+    /// unrestricted device access.
+    pub enforced_constraints: &'static [crate::auth::EnforcedConstraint],
 }
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
@@ -275,25 +278,22 @@ pub(crate) async fn require_token(
             // mis-scoped issue surfaces immediately instead of
             // silently granting broader access than the
             // operator intended.
-            if let Some(unenforced) =
-                first_unenforced_constraint(&actor, state.enforced_constraint_keys)
-            {
+            if let Some(refusal) = first_constraint_refusal(&actor, state.enforced_constraints) {
+                let sentinel = refusal.audit_sentinel();
                 tracing::warn!(
                     target: "api.auth",
                     token_id = %actor.id(),
-                    unenforced_key = %unenforced,
-                    "token carries a constraint key this transport does not enforce; refusing (14.4a)",
+                    refusal = %refusal.as_display(),
+                    "token carries a constraint this transport does not enforce; refusing (14.4a)",
                 );
-                // Round-4 P2 on PR #147: the caller
-                // authenticated successfully — audit the 403
-                // as an *authenticated* denial so forensic
-                // sweeps can attribute the refusal to the
-                // known token_id + actor_kind, not lose it in
-                // the anonymous-probe bucket. `decision =
-                // "deny"`, `required_scope` carries a stable
-                // sentinel so operators can slice this
-                // specific gate without pattern-matching on
-                // the audit's free-text.
+                // Round-4 P2 on PR #147: authenticated denial,
+                // not an anonymous probe — surface token_id +
+                // actor_kind to a forensic sweep.
+                // Round-6 P2: `required_scope` carries the
+                // specific offending key (and field, on a
+                // field-level refusal) so operators can slice
+                // per-cause without pattern-matching a
+                // free-text log line.
                 let entry = AuditEntry {
                     id: 0,
                     intent_ms: 0,
@@ -304,7 +304,7 @@ pub(crate) async fn require_token(
                     path: http_path.clone(),
                     status: StatusCode::FORBIDDEN.as_u16(),
                     decision: "deny".into(),
-                    required_scope: Some("<constraint-bearing-token-refused>".into()),
+                    required_scope: Some(sentinel),
                     execution_outcome: None,
                     domain_error: None,
                     credential_fp: None,
@@ -494,22 +494,81 @@ async fn try_best_effort_probe(
     }
 }
 
-/// Round-5 P1 on PR #147: does the actor's constraint set
-/// name any key this transport doesn't enforce? Returns the
-/// first offending key so the log line + audit row surface
-/// *which* key blew the check (helps operators debug a
-/// mis-scoped token). `None` = every key the token carries
-/// is in the enforced set, so the token is safe to admit.
+/// Reason the bearer middleware refused a constraint. Turned
+/// into a stable `required_scope` sentinel on the audit row
+/// so operators can slice per-cause without pattern-matching a
+/// free-text log line.
 ///
-/// The check compares by exact string; forward-compat
-/// constraint blobs `parse_policy` preserves (`{"scopes":[],
-/// "constraints":{"future.tool":{}}}`) fail here because no
-/// current build has `"future.tool"` in any enforced set.
-pub(super) fn first_unenforced_constraint<'a>(
+/// Round-6 P2 on PR #147: an earlier cut used one opaque
+/// `<constraint-bearing-token-refused>` sentinel; the
+/// offending key never reached the ledger, so a forensic sweep
+/// couldn't tell an unknown-key case from a supported-key /
+/// unsupported-field case. The variants preserve that
+/// distinction.
+pub(super) enum ConstraintRefusal<'a> {
+    /// Tool name is outside the transport's enforced set —
+    /// either an unknown key or one this transport doesn't
+    /// consume.
+    KeyNotEnforced { key: &'a str },
+    /// Tool name is enforced but the constraint sets a field
+    /// the dispatch site does not read — the field would sit
+    /// inert and the actor would have unrestricted access to
+    /// that field.
+    FieldNotEnforced { key: &'a str, field: &'static str },
+}
+
+impl ConstraintRefusal<'_> {
+    /// Stable `required_scope` sentinel written to the audit
+    /// ledger. Includes the offending key (and field, for
+    /// `FieldNotEnforced`) so an operator's ledger scan can
+    /// attribute the refusal without cross-referencing the
+    /// tracing log.
+    pub(super) fn audit_sentinel(&self) -> String {
+        match self {
+            Self::KeyNotEnforced { key } => {
+                format!("<constraint-unenforced:{key}>")
+            }
+            Self::FieldNotEnforced { key, field } => {
+                format!("<constraint-unenforced:{key}#{field}>")
+            }
+        }
+    }
+
+    /// Compact human-readable identifier for tracing. Log
+    /// consumers can grep or filter on the sentinel string.
+    pub(super) fn as_display(&self) -> String {
+        self.audit_sentinel()
+    }
+}
+
+/// Round-6 P1 on PR #147: does the actor's policy carry any
+/// constraint entry this transport can't safely admit? Both
+/// unknown/unenforced keys AND known keys whose blob sets an
+/// unenforced field return `Some(refusal)` — the caller
+/// surfaces the refusal in its warn log and its audit-row
+/// sentinel so operators know exactly what blew the check.
+///
+/// Iterates `actor.constraint_keys()` — one hashmap walk per
+/// bearer request; the enforced slice is a handful of entries
+/// (bounded by the number of MCP tools), so an inner linear
+/// scan is fine and keeps the enforced-declaration site a
+/// plain `&'static [EnforcedConstraint]`.
+pub(super) fn first_constraint_refusal<'a>(
     actor: &'a Actor,
-    enforced: &[&'static str],
-) -> Option<&'a str> {
-    actor.constraint_keys().find(|key| !enforced.contains(key))
+    enforced: &[crate::auth::EnforcedConstraint],
+) -> Option<ConstraintRefusal<'a>> {
+    for key in actor.constraint_keys() {
+        let Some(entry) = enforced.iter().find(|e| e.key == key) else {
+            return Some(ConstraintRefusal::KeyNotEnforced { key });
+        };
+        let constraint = actor
+            .constraint(key)
+            .expect("key came from constraint_keys");
+        if let Some(field) = entry.first_unenforced_field(constraint) {
+            return Some(ConstraintRefusal::FieldNotEnforced { key, field });
+        }
+    }
+    None
 }
 
 /// Round-4 P2 on PR #147: write an authenticated denial row.
@@ -938,11 +997,15 @@ mod tests {
     }
 
     #[test]
-    fn first_unenforced_constraint_finds_key_outside_enforced_set() {
-        // Round-5 P1 on PR #147: prove the fine-grained gate
-        // catches a mixed-constraint token even when *some* of
-        // its keys are enforced — the whole point of the set
-        // vs bool refactor.
+    fn first_constraint_refusal_catches_unknown_and_field_mismatch() {
+        use crate::auth::EnforcedConstraint;
+
+        // Round-6 P1 on PR #147: the gate must refuse both
+        // (a) a constraint key outside the enforced set and
+        // (b) a supported key that carries a field the entry
+        // does not enforce (fail-open otherwise — the flat
+        // scope passes and the field sits inert).
+
         let mut constraints = std::collections::HashMap::new();
         constraints.insert(
             "device.send_command".to_string(),
@@ -958,21 +1021,86 @@ mod tests {
                 plugins: Some(vec!["acme.*".into()]),
             },
         );
-        let actor = Actor::api_with_policy("tok-mixed", vec!["*".into()], constraints);
+        let mixed_actor = Actor::api_with_policy("tok-mixed", vec!["*".into()], constraints);
 
-        // Empty set → any constraint key blows the check.
-        assert!(first_unenforced_constraint(&actor, &[]).is_some());
-        // Only `device.send_command` enforced → `plugins.stop`
-        // is the offender. This is the exact fail-open window
-        // a boolean gate would open between 14.4b and 14.4c.
-        assert_eq!(
-            first_unenforced_constraint(&actor, &["device.send_command"]),
-            Some("plugins.stop"),
+        // Empty enforced set → the first key visited blows
+        // the check.
+        assert!(matches!(
+            first_constraint_refusal(&mixed_actor, &[]),
+            Some(ConstraintRefusal::KeyNotEnforced { .. }),
+        ));
+
+        // Only `device.send_command` enforced with `devices` →
+        // `plugins.stop` fails as an unknown key.
+        let enforced_device = &[EnforcedConstraint {
+            key: "device.send_command",
+            enforce_devices: true,
+            enforce_plugins: false,
+        }][..];
+        let refusal = first_constraint_refusal(&mixed_actor, enforced_device)
+            .expect("plugins.stop must fail as an unenforced key");
+        assert!(matches!(
+            refusal,
+            ConstraintRefusal::KeyNotEnforced {
+                key: "plugins.stop"
+            },
+        ));
+
+        // Both enforced with their respective supported
+        // fields → nothing to refuse.
+        let enforced_full = &[
+            EnforcedConstraint {
+                key: "device.send_command",
+                enforce_devices: true,
+                enforce_plugins: false,
+            },
+            EnforcedConstraint {
+                key: "plugins.stop",
+                enforce_devices: false,
+                enforce_plugins: true,
+            },
+        ][..];
+        assert!(first_constraint_refusal(&mixed_actor, enforced_full).is_none());
+
+        // Field-mismatch case: a token carrying `plugins` on
+        // `device.send_command` must be refused even when the
+        // key is enforced — the device-only dispatch check
+        // never reads `plugins`, so the field would be inert.
+        let mut wrong_field = std::collections::HashMap::new();
+        wrong_field.insert(
+            "device.send_command".to_string(),
+            crate::auth::ToolConstraint {
+                devices: None,
+                plugins: Some(vec!["acme.*".into()]),
+            },
         );
-        // Both enforced → nothing left to refuse.
-        assert!(
-            first_unenforced_constraint(&actor, &["device.send_command", "plugins.stop"],)
-                .is_none()
+        let wrong_actor = Actor::api_with_policy("tok-wrong-field", vec!["*".into()], wrong_field);
+        let refusal = first_constraint_refusal(&wrong_actor, enforced_device)
+            .expect("device.send_command with plugins field must refuse");
+        assert!(matches!(
+            refusal,
+            ConstraintRefusal::FieldNotEnforced {
+                key: "device.send_command",
+                field: "plugins",
+            },
+        ));
+
+        // Audit sentinels surface the offending key + field
+        // so operators can slice per-cause on the ledger.
+        assert_eq!(
+            ConstraintRefusal::KeyNotEnforced {
+                key: "plugins.stop"
+            }
+            .audit_sentinel(),
+            "<constraint-unenforced:plugins.stop>",
+        );
+        assert_eq!(
+            ConstraintRefusal::FieldNotEnforced {
+                key: "device.send_command",
+                field: "plugins",
+            }
+            .audit_sentinel(),
+            "<constraint-unenforced:device.send_command#plugins>",
         );
     }
 
