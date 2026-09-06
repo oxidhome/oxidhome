@@ -1174,12 +1174,10 @@ pub fn axum_service(engine: Engine) -> axum::Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // 14.4a: Connect-RPC doesn't consume per-tool
-        // constraints. Refuse constraint-bearing tokens
-        // here so a caller can't bypass the intended
-        // MCP-only restriction via an equivalent Connect
-        // RPC. See [`AuthState::allow_constraints`] docs.
-        allow_constraints: false,
+        // Connect-RPC doesn't consume per-tool constraints
+        // in 14.4a. Empty set → refuse constraint-bearing
+        // tokens. See [`AuthState::enforced_constraint_keys`].
+        enforced_constraint_keys: &[],
     };
     let inner = router(engine).into_axum_service();
     axum::Router::new()
@@ -1240,11 +1238,14 @@ async fn connect_auth_middleware(
             // Connect-RPC, so refusing it here prevents the
             // MCP-only restriction from being bypassed via an
             // equivalent Connect RPC.
-            if !state.allow_constraints && actor.is_constrained() {
+            if let Some(unenforced) =
+                super::auth::first_unenforced_constraint(&actor, state.enforced_constraint_keys)
+            {
                 tracing::warn!(
                     target: "api.auth",
                     token_id = %actor.id(),
-                    "constraint-bearing token presented on Connect-RPC; refusing (14.4a)",
+                    unenforced_key = %unenforced,
+                    "token carries a constraint key Connect-RPC does not enforce; refusing (14.4a)",
                 );
                 // Round-4 P2 on PR #147: authenticated
                 // denial — attribute to the known token_id +
@@ -1270,7 +1271,7 @@ async fn connect_auth_middleware(
                 super::auth::record_authenticated_denial(&state.audit_log, None, entry).await;
                 return connect_error_response(
                     ConnectError::permission_denied(
-                        "constraint-bearing tokens are only accepted by the MCP surface",
+                        "token carries a constraint key this transport does not enforce",
                     ),
                     req.headers(),
                 );

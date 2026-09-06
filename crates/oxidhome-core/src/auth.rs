@@ -188,16 +188,25 @@ impl Actor {
     }
 
     /// `true` when this actor's token carried any per-tool
-    /// constraint entry. Used at bearer time by non-MCP
-    /// transports (REST, Connect-RPC) to refuse
-    /// constraint-bearing tokens — the constraint keys are
-    /// MCP tool names and no non-MCP dispatch site consumes
-    /// them, so accepting such a token there would let the
-    /// caller bypass the constraint by using an equivalent
-    /// REST endpoint (round-3 P1 on PR #147).
+    /// constraint entry.
     #[must_use]
     pub fn is_constrained(&self) -> bool {
         !self.inner.constraints.is_empty()
+    }
+
+    /// Iterate the constraint keys the token carried
+    /// (`device.send_command`, `plugins.install`, unknown
+    /// forward-compat keys). Order is unspecified.
+    ///
+    /// The bearer middleware uses this to reject tokens whose
+    /// constraint set contains any key the current transport
+    /// does not enforce — see `AuthState.enforced_constraint_keys`
+    /// in [`crate::api::auth`]. Landing a token whose keys are
+    /// only *partially* enforced would fail open on the
+    /// unenforced keys (the flat scope check would pass and
+    /// no dispatch site consults the constraint).
+    pub fn constraint_keys(&self) -> impl Iterator<Item = &str> + '_ {
+        self.inner.constraints.keys().map(String::as_str)
     }
 }
 

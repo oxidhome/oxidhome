@@ -141,18 +141,30 @@ pub(crate) struct AuthState {
     /// module-level doc for the two-phase write contract and the
     /// blocking / cancellation-safety discipline.
     pub audit_log: Arc<AuditLog>,
-    /// Phase 14.4a: whether this middleware instance accepts
-    /// tokens carrying per-tool constraints. In 14.4a **every
-    /// transport** passes `false` — no dispatch site consumes
-    /// constraints yet, so accepting a constraint-bearing
-    /// token anywhere would give it unrestricted authority on
-    /// that transport (the flat scope check passes and no
-    /// enforcement site reads the constraint). Each 14.4b/c
-    /// slice flips the flag for its transport atomically with
-    /// wiring the corresponding dispatch-site check.
-    /// Round-3 P1 on PR #147 introduced the field; round-4
-    /// unified `false` across transports.
-    pub allow_constraints: bool,
+    /// Phase 14.4a: constraint keys this transport enforces.
+    /// The middleware refuses a bearer whose policy contains
+    /// **any** constraint key outside this set — landing such
+    /// a token would fail open on the unenforced keys (the
+    /// flat scope check passes and no dispatch site consults
+    /// the constraint).
+    ///
+    /// In 14.4a every transport passes `&[]`: no dispatch
+    /// site consumes constraints yet, so *every*
+    /// constraint-bearing token is refused. Each per-tool
+    /// enforcement slice adds its own key to the transport
+    /// that consumes it, atomically with wiring the
+    /// dispatch-site check — 14.4b adds `"device.send_command"`
+    /// on MCP; 14.4c adds `"plugins.install"`,
+    /// `"plugins.stop"`, `"plugins.uninstall"`,
+    /// `"plugins.start"`, `"plugins.show"` on MCP; …
+    ///
+    /// Round-5 P1 on PR #147 replaced the transport-wide
+    /// `allow_constraints: bool` with this per-key set —
+    /// a bool would recreate the fail-open window between
+    /// 14.4b (flips MCP to `true`) and 14.4c (wires the
+    /// `plugins.*` checks), plus admit unknown forward-compat
+    /// constraint keys that no host build enforces.
+    pub enforced_constraint_keys: &'static [&'static str],
 }
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
@@ -263,11 +275,14 @@ pub(crate) async fn require_token(
             // mis-scoped issue surfaces immediately instead of
             // silently granting broader access than the
             // operator intended.
-            if !state.allow_constraints && actor.is_constrained() {
+            if let Some(unenforced) =
+                first_unenforced_constraint(&actor, state.enforced_constraint_keys)
+            {
                 tracing::warn!(
                     target: "api.auth",
                     token_id = %actor.id(),
-                    "constraint-bearing token presented on a transport that does not yet enforce constraints; refusing (14.4a)",
+                    unenforced_key = %unenforced,
+                    "token carries a constraint key this transport does not enforce; refusing (14.4a)",
                 );
                 // Round-4 P2 on PR #147: the caller
                 // authenticated successfully — audit the 403
@@ -477,6 +492,24 @@ async fn try_best_effort_probe(
             );
         }
     }
+}
+
+/// Round-5 P1 on PR #147: does the actor's constraint set
+/// name any key this transport doesn't enforce? Returns the
+/// first offending key so the log line + audit row surface
+/// *which* key blew the check (helps operators debug a
+/// mis-scoped token). `None` = every key the token carries
+/// is in the enforced set, so the token is safe to admit.
+///
+/// The check compares by exact string; forward-compat
+/// constraint blobs `parse_policy` preserves (`{"scopes":[],
+/// "constraints":{"future.tool":{}}}`) fail here because no
+/// current build has `"future.tool"` in any enforced set.
+pub(super) fn first_unenforced_constraint<'a>(
+    actor: &'a Actor,
+    enforced: &[&'static str],
+) -> Option<&'a str> {
+    actor.constraint_keys().find(|key| !enforced.contains(key))
 }
 
 /// Round-4 P2 on PR #147: write an authenticated denial row.
@@ -902,6 +935,45 @@ mod tests {
             &["devices:command".to_string(), "plugins:list".to_string()]
         );
         assert!(actor.constraint("device.send_command").is_none());
+    }
+
+    #[test]
+    fn first_unenforced_constraint_finds_key_outside_enforced_set() {
+        // Round-5 P1 on PR #147: prove the fine-grained gate
+        // catches a mixed-constraint token even when *some* of
+        // its keys are enforced — the whole point of the set
+        // vs bool refactor.
+        let mut constraints = std::collections::HashMap::new();
+        constraints.insert(
+            "device.send_command".to_string(),
+            crate::auth::ToolConstraint {
+                devices: Some(vec!["dev-a1b2c3d4*".into()]),
+                plugins: None,
+            },
+        );
+        constraints.insert(
+            "plugins.stop".to_string(),
+            crate::auth::ToolConstraint {
+                devices: None,
+                plugins: Some(vec!["acme.*".into()]),
+            },
+        );
+        let actor = Actor::api_with_policy("tok-mixed", vec!["*".into()], constraints);
+
+        // Empty set → any constraint key blows the check.
+        assert!(first_unenforced_constraint(&actor, &[]).is_some());
+        // Only `device.send_command` enforced → `plugins.stop`
+        // is the offender. This is the exact fail-open window
+        // a boolean gate would open between 14.4b and 14.4c.
+        assert_eq!(
+            first_unenforced_constraint(&actor, &["device.send_command"]),
+            Some("plugins.stop"),
+        );
+        // Both enforced → nothing left to refuse.
+        assert!(
+            first_unenforced_constraint(&actor, &["device.send_command", "plugins.stop"],)
+                .is_none()
+        );
     }
 
     #[test]

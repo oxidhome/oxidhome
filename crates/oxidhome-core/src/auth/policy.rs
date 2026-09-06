@@ -31,7 +31,7 @@
 //!     "scopes": ["devices:command"],
 //!     "constraints": {
 //!       "device.send_command": {
-//!         "devices": ["dev-a1b2c3d4*", "dev-11223344556677"]
+//!         "devices": ["dev-a1b2c3d4*", "dev-1122334455667788"]
 //!       }
 //!     }
 //!   }
@@ -44,38 +44,56 @@
 //!   loaded (though nothing will consult those keys until the
 //!   host learns them).
 //!
-//! # Constraints are MCP-only
+//! # Enforcement is staged per key, per transport
 //!
 //! Constraint keys are MCP tool names, and only the MCP
-//! dispatch layer consumes them. A constraint-bearing token
-//! that reached REST or Connect-RPC would silently bypass its
-//! own restriction — the token could still hit the equivalent
-//! REST endpoint (`POST /api/v1/devices/{id}/commands`) where
-//! only the flat scope is checked.
+//! dispatch layer will consume them once enforcement lands
+//! per tool. Landing a constraint-bearing token before its
+//! keys are enforced would grant it unrestricted authority
+//! on that transport — the flat scope check would pass and
+//! no dispatch site would consult the constraint.
 //!
 //! The bearer middleware ([`crate::api::auth::require_token`],
-//! [`crate::api::connect_rpc`]) refuses constraint-bearing
-//! tokens on non-MCP transports at verify time (returns 403).
-//! The MCP mount's middleware permits them via the
-//! `AuthState::allow_constraints` flag. See round-3 P1 on
-//! PR #147.
+//! [`crate::api::connect_rpc`]) therefore carries a per-key
+//! allowlist (`AuthState::enforced_constraint_keys`). A
+//! bearer whose policy contains **any** constraint key
+//! outside the current transport's set is refused with 403
+//! at verify time.
+//!
+//! In 14.4a **every transport** passes an empty set, so any
+//! constraint-bearing token is refused. Each per-tool
+//! enforcement slice adds its key to the transport that
+//! consumes it, atomically with wiring the dispatch-site
+//! check — 14.4b adds `"device.send_command"` on MCP; 14.4c
+//! adds the five `plugins.*` keys on MCP; …
+//!
+//! See round-3 / round-4 / round-5 P1 on PR #147 for the
+//! iteration history (bool → set) and why the finer grain
+//! matters.
 //!
 //! # Device IDs
 //!
-//! Device IDs in OxidHome are **opaque `dev-<16 hex>` strings**
-//! — a stable hash of `(installation_uuid, instance_id,
-//! local_id)` computed by
-//! [`crate::state::devices::stable_device_id`]. They are not
-//! human-meaningful; there is no `dev-kitchen-lamp` in a
-//! real deployment. When authoring a `devices` allowlist,
-//! operators name specific devices by their opaque IDs (as
-//! shown by `oxidhome devices list`) or, if they want to
-//! group by room / plugin / instance, they combine multiple
-//! entries or use a shared prefix over an id space they
-//! control. A future slice may add tag-based selectors so
-//! operators can express "all kitchen devices" without
-//! enumerating each opaque id — that's out of scope for
-//! 14.4a's wire shape.
+//! Device IDs in OxidHome are **opaque `dev-<16 hex>`
+//! strings** — a truncated SHA-256 over `(installation_uuid,
+//! instance_id, local_id)` computed by
+//! [`crate::state::devices::stable_device_id`]. There is no
+//! `dev-kitchen-lamp` in a real deployment; every id is 20
+//! characters (the `dev-` prefix plus 16 hex).
+//!
+//! Because the id is a SHA truncation, its bits are
+//! uniformly distributed — a prefix like `dev-a*` groups
+//! roughly 1/16th of the id space at random, **not** by
+//! room or plugin. The `prefix*` glob is therefore useful
+//! only for whitelisting one or a handful of *specific*
+//! known devices (typed short by knowing their leading
+//! hex), not for semantic grouping.
+//!
+//! Semantic grouping (by room / plugin / capability / user
+//! tag) needs a selector shape that speaks the underlying
+//! `(installation_uuid, instance_id, local_id)` tuple or an
+//! operator-assigned tag layer. Both are future work; 14.4a
+//! ships only the opaque-id allowlist so simple "just this
+//! one device" cases have a solution today.
 //!
 //! # Scope of 14.4a
 //!
@@ -258,7 +276,7 @@ mod tests {
             "scopes": ["devices:command"],
             "constraints": {
                 "device.send_command": {
-                    "devices": ["dev-a1b2c3d4*", "dev-11223344556677"]
+                    "devices": ["dev-a1b2c3d4*", "dev-1122334455667788"]
                 }
             }
         }"#;
@@ -273,7 +291,7 @@ mod tests {
             Some(
                 &[
                     "dev-a1b2c3d4*".to_string(),
-                    "dev-11223344556677".to_string()
+                    "dev-1122334455667788".to_string()
                 ][..]
             ),
         );
@@ -333,7 +351,7 @@ mod tests {
         let cx = ToolConstraint {
             devices: Some(vec![
                 "dev-a1b2c3d4*".to_string(),
-                "dev-11223344556677".to_string(),
+                "dev-1122334455667788".to_string(),
             ]),
             plugins: None,
         };
@@ -343,10 +361,10 @@ mod tests {
         // Prefix boundary — `*` matches the empty tail too.
         assert!(cx.allows_device("dev-a1b2c3d4"));
         // Literal.
-        assert!(cx.allows_device("dev-11223344556677"));
+        assert!(cx.allows_device("dev-1122334455667788"));
         // Not covered.
         assert!(!cx.allows_device("dev-a1b2c3d3ffffffff"));
-        assert!(!cx.allows_device("dev-112233445566772"));
+        assert!(!cx.allows_device("dev-11223344556677882"));
     }
 
     #[test]

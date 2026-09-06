@@ -252,20 +252,20 @@ fn mount_inner(
     let auth_state = super::super::auth::AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // 14.4a: constraint-bearing tokens are refused on
-        // every transport until enforcement lands (14.4b for
-        // `device.send_command`; 14.4c for `plugins.*`).
+        // 14.4a: MCP consumes no constraint keys yet. Empty
+        // set → refuse every constraint-bearing token.
         //
-        // Round-4 P1 on PR #147: accepting them here first
-        // would give a token like `{scopes: ["*"],
-        // constraints: {"device.send_command": {"devices":
-        // []}}}` unrestricted MCP authority — the flat scope
-        // check would pass and no dispatch site would consult
-        // the deny-all constraint. Each 14.4b/c slice will
-        // flip this to `true` as part of wiring the
-        // corresponding enforcement, atomically with the
-        // dispatch-site check.
-        allow_constraints: false,
+        // Round-5 P1 on PR #147: this is a *set*, not a
+        // boolean, because per-tool enforcement lands in
+        // staged slices. 14.4b will add "device.send_command"
+        // here atomically with wiring the check inside
+        // `tools::call`; 14.4c will add the five `plugins.*`
+        // keys. A boolean would open a fail-open window
+        // between 14.4b and 14.4c (`plugins.*` constraints
+        // would be admitted but unenforced), and would admit
+        // forward-compat keys the current build doesn't know
+        // how to enforce.
+        enforced_constraint_keys: &[],
     };
 
     // `route_service` — the exact `/api/v1/mcp` path only, no
