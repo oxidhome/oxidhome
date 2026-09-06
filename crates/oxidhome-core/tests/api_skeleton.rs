@@ -5775,8 +5775,9 @@ async fn dashboards_write_requires_dashboards_write_scope() {
 /// constraints: {"device.send_command": {"devices": []}}}`
 /// token unrestricted MCP authority (flat scope passes; no
 /// dispatch site consults the deny-all constraint). Each
-/// 14.4b/c slice flips `AuthState::allow_constraints` for
-/// its transport atomically with wiring the corresponding
+/// 14.4b/c slice adds its own `EnforcedConstraint` entry to
+/// `AuthState::enforced_constraints` for the transport that
+/// consumes it, atomically with wiring the corresponding
 /// dispatch-site check.
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_refuses_constraint_bearing_token() {
@@ -5836,7 +5837,7 @@ async fn rest_refuses_constraint_bearing_token() {
         // refusal without cross-referencing the log line.
         // 14.4a enforces no keys, so this is
         // `KeyNotEnforced`.
-        Some("<constraint-unenforced:device.send_command>"),
+        Some("<constraint-key-unenforced:device.send_command>"),
     );
 }
 

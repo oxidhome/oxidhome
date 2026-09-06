@@ -519,17 +519,30 @@ pub(super) enum ConstraintRefusal<'a> {
 
 impl ConstraintRefusal<'_> {
     /// Stable `required_scope` sentinel written to the audit
-    /// ledger. Includes the offending key (and field, for
-    /// `FieldNotEnforced`) so an operator's ledger scan can
-    /// attribute the refusal without cross-referencing the
-    /// tracing log.
+    /// ledger. Distinct prefixes per variant so an operator's
+    /// ledger scan can slice each refusal cause without any
+    /// ambiguity:
+    ///
+    /// - `<constraint-key-unenforced:{key}>` — the tool name
+    ///   itself is outside the transport's enforced set.
+    /// - `<constraint-field-unenforced:{key}:{field}>` — the
+    ///   key is enforced but the constraint set a field the
+    ///   dispatch site does not consume.
+    ///
+    /// Round-7 P2 on PR #147: the round-6 shape reused one
+    /// prefix and separated key+field with `#`, which
+    /// collided with an unknown key whose name literally
+    /// contained `#` (either variant produced the same
+    /// sentinel). Distinct prefixes + a `:` separator (never
+    /// legal inside a tool name — tool names are
+    /// `dotted.snake_case`) closes that ambiguity.
     pub(super) fn audit_sentinel(&self) -> String {
         match self {
             Self::KeyNotEnforced { key } => {
-                format!("<constraint-unenforced:{key}>")
+                format!("<constraint-key-unenforced:{key}>")
             }
             Self::FieldNotEnforced { key, field } => {
-                format!("<constraint-unenforced:{key}#{field}>")
+                format!("<constraint-field-unenforced:{key}:{field}>")
             }
         }
     }
@@ -1092,7 +1105,7 @@ mod tests {
                 key: "plugins.stop"
             }
             .audit_sentinel(),
-            "<constraint-unenforced:plugins.stop>",
+            "<constraint-key-unenforced:plugins.stop>",
         );
         assert_eq!(
             ConstraintRefusal::FieldNotEnforced {
@@ -1100,7 +1113,7 @@ mod tests {
                 field: "plugins",
             }
             .audit_sentinel(),
-            "<constraint-unenforced:device.send_command#plugins>",
+            "<constraint-field-unenforced:device.send_command:plugins>",
         );
     }
 

@@ -62,7 +62,9 @@
 //! consume — is refused with 403 at verify time, and the
 //! specific offending key (and field, on a field-level
 //! refusal) is written to the audit row as
-//! `<constraint-unenforced:{key}[#{field}]>`.
+//! `<constraint-key-unenforced:{key}>` (unknown / unenforced
+//! key) or `<constraint-field-unenforced:{key}:{field}>`
+//! (enforced key with an unenforced field).
 //!
 //! In 14.4a **every transport** passes an empty slice, so
 //! any constraint-bearing token is refused. Each per-tool
@@ -78,7 +80,7 @@
 //!
 //! # Device IDs
 //!
-//! Device IDs in OxidHome are **opaque `dev-<16 hex>`
+//! Device IDs in `OxidHome` are **opaque `dev-<16 hex>`
 //! strings** — a truncated SHA-256 over `(installation_uuid,
 //! instance_id, local_id)` computed by
 //! [`crate::state::devices::stable_device_id`]. There is no
@@ -173,9 +175,19 @@ pub struct ToolConstraint {
     pub devices: Option<Vec<String>>,
     /// Plugin-id allowlist for tools that take a `plugin_id`
     /// argument (`plugins.show`, `plugins.stop`,
-    /// `plugins.uninstall`, `plugins.start`,
-    /// `plugins.install`). Same shape + semantics as
-    /// [`Self::devices`].
+    /// `plugins.uninstall`, `plugins.start`). Same shape +
+    /// semantics as [`Self::devices`].
+    ///
+    /// **`plugins.install` is a special case**: the tool
+    /// takes a `source_dir`, not a `plugin_id` — the id is
+    /// only known after the manifest is read. When 14.4c
+    /// wires enforcement, the `plugins.install` dispatch site
+    /// must parse the manifest and validate the resulting
+    /// plugin id **before** any installation side effects
+    /// (the on-disk `plugins/<id>/` layout, the `plugin_installation`
+    /// row, the running-instance guards). Refusing a manifest
+    /// mid-install is fine; refusing it after the on-disk
+    /// layout was committed would leave orphan state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugins: Option<Vec<String>>,
 }
@@ -243,8 +255,53 @@ enum PolicyWire {
 #[serde(deny_unknown_fields)]
 struct ExtendedPolicy {
     scopes: Vec<String>,
-    #[serde(default)]
+    // Round-7 P1 on PR #147: reject duplicate JSON keys. The
+    // default `HashMap` deserializer accepts them and keeps
+    // the last value; once enforcement lands, a bearer with
+    // `{"device.send_command":{"devices":[]},
+    //   "device.send_command":{}}` would parse as
+    // unrestricted, defeating a deny-all restriction the
+    // operator authored. Custom visitor rejects duplicates at
+    // parse time so the fail-closed contract holds.
+    #[serde(default, deserialize_with = "deserialize_unique_map")]
     constraints: HashMap<String, ToolConstraint>,
+}
+
+fn deserialize_unique_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, ToolConstraint>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+
+    struct UniqueMapVisitor;
+
+    impl<'de> Visitor<'de> for UniqueMapVisitor {
+        type Value = HashMap<String, ToolConstraint>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map of tool-name -> ToolConstraint with unique keys")
+        }
+
+        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut map = HashMap::with_capacity(access.size_hint().unwrap_or(0));
+            while let Some((key, value)) = access.next_entry::<String, ToolConstraint>()? {
+                if let Some(prev) = map.insert(key.clone(), value) {
+                    let _ = prev;
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate constraint key `{key}`",
+                    )));
+                }
+            }
+            Ok(map)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMapVisitor)
 }
 
 // ── Enforcement declaration ────────────────────────────────────────
@@ -379,6 +436,28 @@ mod tests {
         assert!(parse_policy(br#"{"scopes":[],"constraints":{"t":{"unknown":true}}}"#).is_none());
         // Non-array `devices` inside a constraint.
         assert!(parse_policy(br#"{"scopes":[],"constraints":{"t":{"devices":"x"}}}"#).is_none());
+    }
+
+    #[test]
+    fn duplicate_constraint_keys_reject() {
+        // Round-7 P1 on PR #147: default HashMap deserialization
+        // silently keeps the last value for duplicate keys.
+        // Once enforcement lands, a bearer with
+        // {"device.send_command":{"devices":[]},
+        //  "device.send_command":{}} would parse as
+        // unrestricted and defeat the operator's deny-all —
+        // the custom map visitor refuses at parse time.
+        let blob = br#"{
+            "scopes": ["*"],
+            "constraints": {
+                "device.send_command": {"devices": []},
+                "device.send_command": {}
+            }
+        }"#;
+        assert!(
+            parse_policy(blob).is_none(),
+            "duplicate constraint key must fail parse",
+        );
     }
 
     #[test]
