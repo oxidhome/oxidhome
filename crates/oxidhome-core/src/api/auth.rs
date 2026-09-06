@@ -654,28 +654,36 @@ pub(super) async fn finalize_audit(
 /// `pub(super)` so the Connect-side auth middleware reuses the
 /// same record → actor projection.
 pub(super) fn actor_from_record(rec: &TokenRecord) -> Actor {
-    let scopes = parse_scopes(&rec.scope_json).unwrap_or_else(|| {
+    // Phase 14.4a: `scope_json` now decodes into a
+    // [`TokenPolicy`] — either the legacy `["scope"]` array or
+    // the extended `{scopes, constraints}` object. Parse
+    // failure ⇒ deny-all actor (empty scopes + empty
+    // constraints), same rationale as pre-14.4: an operator
+    // who saved a malformed blob gets useful "every request
+    // is denied" audit signal rather than the API going down.
+    let policy = crate::auth::parse_policy(&rec.scope_json).unwrap_or_else(|| {
         tracing::warn!(
             target: "api.auth",
             token_id = %rec.id,
-            "scope_json failed to parse; defaulting to deny-all",
+            "scope_json failed to parse as TokenPolicy; defaulting to deny-all",
         );
-        Vec::new()
+        crate::auth::TokenPolicy::default()
     });
-    Actor::api(rec.id.clone(), scopes)
+    Actor::api_with_policy(rec.id.clone(), policy.scopes, policy.constraints)
 }
 
-/// Parse `scope_json` as a JSON array of strings. Returns `None` on
-/// any parse failure. The wildcard contract: an element equal to
-/// `"*"` means "any scope" — 12-API-b's scope-policy enforcer
-/// recognizes it. `pub(crate)` so the bootstrap test can pin the
-/// admin-blob round trip (see [`crate::api`]).
+/// Legacy scope-array parser retained as a thin shim over
+/// [`crate::auth::parse_policy`] for the tests that pin it
+/// directly. Prefer `parse_policy` — the shim discards
+/// [`TokenPolicy::constraints`].
+///
+/// The wildcard contract: an element equal to `"*"` means
+/// "any scope" — 12-API-b's scope-policy enforcer recognises
+/// it. `pub(crate)` so the bootstrap test can pin the
+/// admin-blob round trip.
+#[cfg(test)]
 pub(crate) fn parse_scopes(blob: &[u8]) -> Option<Vec<String>> {
-    let value: serde_json::Value = serde_json::from_slice(blob).ok()?;
-    let arr = value.as_array()?;
-    arr.iter()
-        .map(|v| v.as_str().map(String::from))
-        .collect::<Option<Vec<_>>>()
+    crate::auth::parse_policy(blob).map(|p| p.scopes)
 }
 
 /// Pull the bearer secret out of an `Authorization: <scheme> …`
@@ -727,6 +735,78 @@ mod tests {
         assert!(parse_scopes(b"{}").is_none());
         assert!(parse_scopes(br#"["ok", 7]"#).is_none());
         assert!(parse_scopes(b"not json").is_none());
+    }
+
+    #[test]
+    fn actor_from_record_carries_constraints_on_extended_policy() {
+        // Phase 14.4a: a stored record whose scope_json uses
+        // the extended shape must surface both scopes AND
+        // constraints on the built Actor. The dispatch layer
+        // (later slice) reads `Actor::constraint(tool_name)`
+        // to enforce.
+        let rec = TokenRecord {
+            id: "tok-14-4a".into(),
+            label: "tester".into(),
+            scope_json: br#"{
+                "scopes": ["devices:command"],
+                "constraints": {
+                    "device.send_command": {
+                        "devices": ["dev-kitchen-*"]
+                    }
+                }
+            }"#
+            .to_vec(),
+            created_ms: 0,
+            last_used_ms: None,
+            revoked_ms: None,
+        };
+        let actor = actor_from_record(&rec);
+        assert_eq!(actor.scopes(), &["devices:command".to_string()]);
+        let cx = actor
+            .constraint("device.send_command")
+            .expect("device.send_command constraint present");
+        assert!(cx.allows_device("dev-kitchen-light"));
+        assert!(!cx.allows_device("dev-bedroom-light"));
+        assert!(actor.constraint("plugins.install").is_none());
+    }
+
+    #[test]
+    fn actor_from_record_legacy_shape_has_no_constraints() {
+        let rec = TokenRecord {
+            id: "tok-legacy".into(),
+            label: "legacy".into(),
+            scope_json: br#"["devices:command","plugins:list"]"#.to_vec(),
+            created_ms: 0,
+            last_used_ms: None,
+            revoked_ms: None,
+        };
+        let actor = actor_from_record(&rec);
+        assert_eq!(
+            actor.scopes(),
+            &["devices:command".to_string(), "plugins:list".to_string()]
+        );
+        assert!(actor.constraint("device.send_command").is_none());
+    }
+
+    #[test]
+    fn actor_from_record_malformed_scope_json_denies_all() {
+        // Fail-closed: garbage in scope_json becomes an actor
+        // with empty scopes + empty constraints. The
+        // dispatch layer's scope check then denies every
+        // request. The bearer still authenticates (the token
+        // secret verified against the store) — the middleware
+        // just refuses to trust its authorisations.
+        let rec = TokenRecord {
+            id: "tok-broken".into(),
+            label: "broken".into(),
+            scope_json: b"not json at all".to_vec(),
+            created_ms: 0,
+            last_used_ms: None,
+            revoked_ms: None,
+        };
+        let actor = actor_from_record(&rec);
+        assert!(actor.scopes().is_empty());
+        assert!(actor.constraint("device.send_command").is_none());
     }
 
     #[test]

@@ -24,7 +24,12 @@
 //! cross-cutting design and `00_OVERVIEW.md` for the per-phase
 //! breakdown.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+
+pub mod policy;
+
+pub use policy::{TokenPolicy, ToolConstraint, parse_policy};
 
 /// What kind of caller this `Actor` represents. Drives where the
 /// audit log attributes the action and which scope policy the
@@ -73,6 +78,12 @@ struct ActorInner {
     kind: ActorKind,
     id: String,
     scopes: Vec<String>,
+    // Phase 14.4a: per-tool constraint map from the token
+    // policy. `HashMap::new()` for plugin actors and for API
+    // tokens that don't carry constraints (legacy scope-array
+    // shape). Empty allocation is one small
+    // heap word, not per-actor overhead.
+    constraints: HashMap<String, policy::ToolConstraint>,
 }
 
 impl Actor {
@@ -91,6 +102,7 @@ impl Actor {
                 // empty here keeps the actor purely about identity;
                 // gating consults the manifest directly.
                 scopes: Vec::new(),
+                constraints: HashMap::new(),
             }),
         }
     }
@@ -103,11 +115,31 @@ impl Actor {
     /// dispatch layer checks individual entries before executing.
     #[must_use]
     pub fn api(token_id: impl Into<String>, scopes: Vec<String>) -> Self {
+        Self::api_with_policy(token_id, scopes, HashMap::new())
+    }
+
+    /// Construct an `Actor` for a Phase-12 external caller that
+    /// carries a Phase-14.4 [`TokenPolicy`] with per-tool
+    /// constraints. Same shape as [`Self::api`] otherwise; the
+    /// `constraints` map is what
+    /// [`Self::constraint`] surfaces to dispatch sites.
+    ///
+    /// [`Self::api`] delegates here with `HashMap::new()`, so
+    /// existing call sites that don't know about the policy
+    /// blob keep working — they just get a no-constraint
+    /// actor.
+    #[must_use]
+    pub fn api_with_policy(
+        token_id: impl Into<String>,
+        scopes: Vec<String>,
+        constraints: HashMap<String, policy::ToolConstraint>,
+    ) -> Self {
         Self {
             inner: Arc::new(ActorInner {
                 kind: ActorKind::Api,
                 id: token_id.into(),
                 scopes,
+                constraints,
             }),
         }
     }
@@ -133,6 +165,27 @@ impl Actor {
     pub fn scopes(&self) -> &[String] {
         &self.inner.scopes
     }
+
+    /// Look up the per-tool constraint for `tool_name`, if the
+    /// token carried one. `None` means the tool is
+    /// **unrestricted** for this actor (subject to the flat
+    /// scope check upstream).
+    ///
+    /// Callers combine this with the flat scope check — a
+    /// dispatch site first calls
+    /// [`crate::api::scopes::require_scope`] to confirm the
+    /// actor holds `<tool>:...`, then, if a constraint
+    /// exists, checks the tool's argument shape against
+    /// [`ToolConstraint::allows_device`] /
+    /// [`ToolConstraint::allows_plugin`].
+    ///
+    /// Introduced in Phase 14.4a; enforcement lands per-tool
+    /// in follow-up slices — no dispatch site consults this
+    /// yet.
+    #[must_use]
+    pub fn constraint(&self, tool_name: &str) -> Option<&policy::ToolConstraint> {
+        self.inner.constraints.get(tool_name)
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +205,37 @@ mod tests {
         let a = Actor::plugin("x");
         let b = a.clone();
         assert!(Arc::ptr_eq(&a.inner, &b.inner));
+    }
+
+    #[test]
+    fn actor_constraint_returns_none_when_no_policy() {
+        // Legacy `Actor::api` — no constraints, so every
+        // tool lookup returns None (unrestricted).
+        let a = Actor::api("tok-abc", vec!["devices:command".into()]);
+        assert!(a.constraint("device.send_command").is_none());
+        assert!(a.constraint("plugins.install").is_none());
+    }
+
+    #[test]
+    fn actor_constraint_surfaces_policy_map() {
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "device.send_command".to_string(),
+            policy::ToolConstraint {
+                devices: Some(vec!["dev-kitchen-*".into()]),
+                plugins: None,
+            },
+        );
+        let a = Actor::api_with_policy("tok-xyz", vec!["devices:command".into()], constraints);
+
+        let cx = a
+            .constraint("device.send_command")
+            .expect("device.send_command constraint present");
+        assert!(cx.allows_device("dev-kitchen-light"));
+        assert!(!cx.allows_device("dev-bedroom-light"));
+
+        // Unqueried tool name is still unrestricted.
+        assert!(a.constraint("plugins.install").is_none());
     }
 
     #[test]
