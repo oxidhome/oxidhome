@@ -512,7 +512,6 @@ impl From<McpValue> for Value {
 // the audit invariant across the module without shortening
 // any decision. Same reasoning as `blob_read` on the
 // resources side (PR #122).
-#[allow(clippy::too_many_lines)]
 /// Map a caller-supplied tool name to the routing table's
 /// canonical static string, or `"unknown"` when the name isn't
 /// registered. Used at the dispatch boundary to keep the
@@ -541,6 +540,10 @@ pub(super) fn canonical_tool_name(name: &str) -> &'static str {
     }
 }
 
+// `call` is a flat routing table + audit choreography;
+// splitting per-tool arms into helpers would hide the flat
+// list from a grep. Same rationale as `list_tools` above.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn call(
     engine: Engine,
     request: CallToolRequestParams,

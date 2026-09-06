@@ -543,7 +543,7 @@ enum Route<'a> {
 /// audit-queue busy signal, and once (via [`read_inner`]) to
 /// drive dispatch. Both passes share this function so the
 /// routing table lives in exactly one place.
-fn resolve_route<'a>(uri: &'a str) -> Route<'a> {
+fn resolve_route(uri: &str) -> Route<'_> {
     let Some(rest) = uri.strip_prefix(SCHEME) else {
         return Route::Terminal {
             family: "unknown",
