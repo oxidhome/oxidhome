@@ -1246,14 +1246,28 @@ async fn connect_auth_middleware(
                     token_id = %actor.id(),
                     "constraint-bearing token presented on Connect-RPC; refusing (14.4a)",
                 );
-                record_anonymous_probe(
-                    &state.audit_log,
-                    &method,
-                    &path,
-                    403,
-                    Some(crate::state::credential_fingerprint(&bearer)),
-                )
-                .await;
+                // Round-4 P2 on PR #147: authenticated
+                // denial — attribute to the known token_id +
+                // actor_kind, not the anonymous bucket. See
+                // [`crate::api::auth::record_authenticated_denial`]
+                // for the shared helper used across both
+                // transports.
+                let entry = crate::state::AuditEntry {
+                    id: 0,
+                    intent_ms: 0,
+                    finalized_ms: None,
+                    token_id: actor.id().to_string(),
+                    actor_kind: actor.kind().as_str().to_string(),
+                    method: method.clone(),
+                    path: path.clone(),
+                    status: axum::http::StatusCode::FORBIDDEN.as_u16(),
+                    decision: "deny".into(),
+                    required_scope: Some("<constraint-bearing-token-refused>".into()),
+                    execution_outcome: None,
+                    domain_error: None,
+                    credential_fp: None,
+                };
+                super::auth::record_authenticated_denial(&state.audit_log, None, entry).await;
                 return connect_error_response(
                     ConnectError::permission_denied(
                         "constraint-bearing tokens are only accepted by the MCP surface",

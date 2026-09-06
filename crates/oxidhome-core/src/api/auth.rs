@@ -142,16 +142,16 @@ pub(crate) struct AuthState {
     /// blocking / cancellation-safety discipline.
     pub audit_log: Arc<AuditLog>,
     /// Phase 14.4a: whether this middleware instance accepts
-    /// tokens carrying per-tool constraints. Constraint keys
-    /// are MCP tool names, and no non-MCP dispatch site
-    /// consumes them, so a constraint-bearing token that
-    /// reaches REST or Connect would bypass its own
-    /// restriction by using an equivalent non-MCP endpoint
-    /// (e.g. `POST /api/v1/devices/{id}/commands` vs
-    /// `tools/call device.send_command`). REST + Connect
-    /// builders pass `false` and refuse such tokens with 403
-    /// at bearer time; the MCP mount builder passes `true`.
-    /// Round-3 P1 on PR #147.
+    /// tokens carrying per-tool constraints. In 14.4a **every
+    /// transport** passes `false` — no dispatch site consumes
+    /// constraints yet, so accepting a constraint-bearing
+    /// token anywhere would give it unrestricted authority on
+    /// that transport (the flat scope check passes and no
+    /// enforcement site reads the constraint). Each 14.4b/c
+    /// slice flips the flag for its transport atomically with
+    /// wiring the corresponding dispatch-site check.
+    /// Round-3 P1 on PR #147 introduced the field; round-4
+    /// unified `false` across transports.
     pub allow_constraints: bool,
 }
 
@@ -267,17 +267,34 @@ pub(crate) async fn require_token(
                 tracing::warn!(
                     target: "api.auth",
                     token_id = %actor.id(),
-                    "constraint-bearing token presented on a non-MCP transport; refusing (14.4a)",
+                    "constraint-bearing token presented on a transport that does not yet enforce constraints; refusing (14.4a)",
                 );
-                try_best_effort_probe(
-                    inflight.as_ref(),
-                    &state.audit_log,
-                    &method,
-                    &http_path,
-                    403,
-                    Some(credential_fingerprint(&bearer)),
-                )
-                .await;
+                // Round-4 P2 on PR #147: the caller
+                // authenticated successfully — audit the 403
+                // as an *authenticated* denial so forensic
+                // sweeps can attribute the refusal to the
+                // known token_id + actor_kind, not lose it in
+                // the anonymous-probe bucket. `decision =
+                // "deny"`, `required_scope` carries a stable
+                // sentinel so operators can slice this
+                // specific gate without pattern-matching on
+                // the audit's free-text.
+                let entry = AuditEntry {
+                    id: 0,
+                    intent_ms: 0,
+                    finalized_ms: None,
+                    token_id: actor.id().to_string(),
+                    actor_kind: actor.kind().as_str().to_string(),
+                    method: method.clone(),
+                    path: http_path.clone(),
+                    status: StatusCode::FORBIDDEN.as_u16(),
+                    decision: "deny".into(),
+                    required_scope: Some("<constraint-bearing-token-refused>".into()),
+                    execution_outcome: None,
+                    domain_error: None,
+                    credential_fp: None,
+                };
+                record_authenticated_denial(&state.audit_log, inflight.as_ref(), entry).await;
                 return (StatusCode::FORBIDDEN, "").into_response();
             }
             let token_id = actor.id().to_string();
@@ -457,6 +474,65 @@ async fn try_best_effort_probe(
         Err(join_err) => {
             eprintln!(
                 "oxidhome audit_log: record_completed (anonymous probe) join failed: {join_err}",
+            );
+        }
+    }
+}
+
+/// Round-4 P2 on PR #147: write an authenticated denial row.
+/// Sibling of [`try_best_effort_probe`] but for the case
+/// where the caller *did* authenticate — the audit row must
+/// carry the known `token_id` + `actor_kind` so a forensic
+/// sweep can attribute the refusal, not lose it in the
+/// anonymous bucket.
+///
+/// Same inflight-semaphore discipline as the probe helper on
+/// the MCP mount: bounded queue, skip-when-saturated with a
+/// debug log. Non-MCP mount just does the unbounded
+/// `spawn_blocking` write.
+pub(super) async fn record_authenticated_denial(
+    audit_log: &Arc<AuditLog>,
+    inflight: Option<&super::mcp::PreAdmissionInflight>,
+    entry: AuditEntry,
+) {
+    let al = Arc::clone(audit_log);
+    let owned_method = entry.method.clone();
+    let owned_path = entry.path.clone();
+
+    let join = if let Some(gate) = inflight {
+        let Ok(permit) = Arc::clone(&gate.0).try_acquire_owned() else {
+            tracing::debug!(
+                target: "api.audit",
+                method = %owned_method,
+                path = %owned_path,
+                "pre-admission inflight cap reached — skipping authenticated denial",
+            );
+            return;
+        };
+        tokio::task::spawn_blocking(move || {
+            let _guard = permit;
+            al.record_completed(&entry)
+        })
+        .await
+    } else {
+        tokio::task::spawn_blocking(move || al.record_completed(&entry)).await
+    };
+
+    match join {
+        Ok(Ok(_id)) => {}
+        Ok(Err(err)) => {
+            eprintln!("oxidhome audit_log: record_completed (authenticated denial) failed: {err}");
+            tracing::error!(
+                target: "api.audit",
+                error = %err,
+                method = %owned_method,
+                path = %owned_path,
+                "audit-ledger authenticated-denial write failed",
+            );
+        }
+        Err(join_err) => {
+            eprintln!(
+                "oxidhome audit_log: record_completed (authenticated denial) join failed: {join_err}",
             );
         }
     }

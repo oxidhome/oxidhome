@@ -5763,14 +5763,25 @@ async fn dashboards_write_requires_dashboards_write_scope() {
 
 /// Round-3 P1 on PR #147: a constraint-bearing token
 /// (extended `TokenPolicy` envelope with `constraints`) must
-/// be refused at bearer time by non-MCP surfaces. Without
-/// this, a caller could bypass the intended MCP-only
-/// restriction by using an equivalent REST endpoint — REST
-/// has no code today that consumes per-tool constraints, so
-/// its scope check would silently succeed while the
-/// constraint sits inert on the actor.
+/// be refused at bearer time on transports that don't
+/// consume constraints. Without this, a caller could bypass
+/// the intended constraint by using a transport whose scope
+/// check silently succeeds while the constraint sits inert
+/// on the actor.
+///
+/// Round-4 P1 update: the refusal covers **every** transport
+/// in 14.4a — MCP included. Landing acceptance before the
+/// per-tool dispatch checks would grant a `{scopes: ["*"],
+/// constraints: {"device.send_command": {"devices": []}}}`
+/// token unrestricted MCP authority (flat scope passes; no
+/// dispatch site consults the deny-all constraint). Each
+/// 14.4b/c slice flips `AuthState::allow_constraints` for
+/// its transport atomically with wiring the corresponding
+/// dispatch-site check.
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_refuses_constraint_bearing_token() {
+    use oxidhome_core::state::AuditQuery;
+
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
@@ -5784,7 +5795,8 @@ async fn rest_refuses_constraint_bearing_token() {
             }"#,
         )
         .expect("create constrained token");
-    let router = build_router(engine);
+    let audit_log = engine.audit_log();
+    let router = build_router(engine.clone());
     let resp = router
         .oneshot(
             Request::builder()
@@ -5802,6 +5814,24 @@ async fn rest_refuses_constraint_bearing_token() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "REST must refuse a constraint-bearing token with 403",
+    );
+
+    // Round-4 P2 on PR #147: the 403 must land in the ledger
+    // as an authenticated denial — attributed to the known
+    // token_id + actor_kind, NOT the anonymous bucket.
+    let rows = audit_log
+        .query(&AuditQuery::default(), 16)
+        .expect("query audit");
+    let denial = rows
+        .iter()
+        .find(|r| r.status == 403 && r.path == "/api/v1/instances")
+        .expect("constraint-refused row present");
+    assert_eq!(denial.token_id, issued.id, "token_id must be attributed");
+    assert_eq!(denial.actor_kind, "api", "actor_kind must be attributed");
+    assert_eq!(denial.decision, "deny");
+    assert_eq!(
+        denial.required_scope.as_deref(),
+        Some("<constraint-bearing-token-refused>"),
     );
 }
 

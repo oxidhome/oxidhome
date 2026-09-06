@@ -252,16 +252,20 @@ fn mount_inner(
     let auth_state = super::super::auth::AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // 14.4a: MCP is the only surface where per-tool
-        // constraints have meaning today (constraint keys are
-        // MCP tool names, and no non-MCP dispatch site
-        // consumes them). Accept constraint-bearing tokens
-        // here; REST + Connect refuse them at bearer time so
-        // they can't be bypassed via an equivalent REST
-        // endpoint. Actual constraint enforcement lands per
-        // tool in 14.4b (`device.send_command`) + 14.4c
-        // (`plugins.*`).
-        allow_constraints: true,
+        // 14.4a: constraint-bearing tokens are refused on
+        // every transport until enforcement lands (14.4b for
+        // `device.send_command`; 14.4c for `plugins.*`).
+        //
+        // Round-4 P1 on PR #147: accepting them here first
+        // would give a token like `{scopes: ["*"],
+        // constraints: {"device.send_command": {"devices":
+        // []}}}` unrestricted MCP authority — the flat scope
+        // check would pass and no dispatch site would consult
+        // the deny-all constraint. Each 14.4b/c slice will
+        // flip this to `true` as part of wiring the
+        // corresponding enforcement, atomically with the
+        // dispatch-site check.
+        allow_constraints: false,
     };
 
     // `route_service` — the exact `/api/v1/mcp` path only, no
