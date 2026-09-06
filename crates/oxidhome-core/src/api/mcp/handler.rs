@@ -313,8 +313,14 @@ impl OxidHomeMcpHandler {
 
 /// Emit the standardised completion event.
 fn emit_completion(target: &'static str, name: &str, actor: &Actor, outcome: &str, start: Instant) {
-    #[allow(clippy::cast_possible_truncation)]
-    let duration_ms = start.elapsed().as_millis() as u64;
+    // Round-4 (Copilot) on PR #144: use a fallible conversion
+    // and clamp on overflow rather than an `as` truncation +
+    // lint suppression. `Instant::elapsed` returns a `Duration`
+    // whose ms count fits in `u64` for any request under
+    // ~584 million years — the saturation is defensive, not
+    // load-bearing — but expressing intent this way keeps the
+    // code readable and drops the `allow`.
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     // Trampoline through match so `target:` gets a literal
     // string — `tracing::info!` requires that.
     match target {
@@ -400,17 +406,28 @@ fn classify_prompt(result: &Result<GetPromptResult, McpError>) -> &'static str {
 
 /// Map a JSON-RPC error code to a stable dashboard-friendly
 /// tag. Kept in sync with the codes MCP handlers emit.
+///
+/// Round-4 (Copilot) on PR #144: match against the named
+/// constants (`resources::SCOPE_DENIED_CODE` etc. + rmcp's
+/// standard `ErrorCode::INVALID_PARAMS` / `METHOD_NOT_FOUND` /
+/// `INTERNAL_ERROR`) instead of the raw numeric literals, so a
+/// future adjustment to one of those constants doesn't drift
+/// the classifier silently.
 fn classify_mcp_error(err: &McpError) -> &'static str {
-    // Codes come from `resources::{SCOPE_DENIED_CODE, ...}`
-    // and rmcp's standard JSON-RPC codes. Keep this match
-    // aligned with the emit sites.
-    match err.code.0 {
-        -32001 => "denied",
-        -32003 => "too_large",
-        -32004 => "busy",
-        -32601 => "unknown_method",
-        -32602 => "invalid_params",
-        -32603 => "internal",
-        _ => "error",
+    use rmcp::model::ErrorCode;
+    if err.code == resources::SCOPE_DENIED_CODE {
+        "denied"
+    } else if err.code == resources::RESOURCE_TOO_LARGE_CODE {
+        "too_large"
+    } else if err.code == resources::RESOURCE_BUSY_CODE {
+        "busy"
+    } else if err.code == ErrorCode::METHOD_NOT_FOUND {
+        "unknown_method"
+    } else if err.code == ErrorCode::INVALID_PARAMS {
+        "invalid_params"
+    } else if err.code == ErrorCode::INTERNAL_ERROR {
+        "internal"
+    } else {
+        "error"
     }
 }
