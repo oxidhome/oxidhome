@@ -71,6 +71,12 @@ pub fn build_router(engine: Engine) -> Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
+        // REST + Connect do not consume per-tool constraints
+        // (14.4a). Refuse constraint-bearing tokens here so a
+        // caller can't bypass the intended MCP-only restriction
+        // via an equivalent REST/Connect endpoint. See
+        // [`AuthState::allow_constraints`] docs.
+        allow_constraints: false,
     };
     let connect_service = super::connect_rpc::axum_service(engine.clone());
     // The authenticated cluster — every JSON handler except the

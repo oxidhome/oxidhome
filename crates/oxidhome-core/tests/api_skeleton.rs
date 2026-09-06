@@ -5760,3 +5760,76 @@ async fn dashboards_write_requires_dashboards_write_scope() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+/// Round-3 P1 on PR #147: a constraint-bearing token
+/// (extended `TokenPolicy` envelope with `constraints`) must
+/// be refused at bearer time by non-MCP surfaces. Without
+/// this, a caller could bypass the intended MCP-only
+/// restriction by using an equivalent REST endpoint — REST
+/// has no code today that consumes per-tool constraints, so
+/// its scope check would silently succeed while the
+/// constraint sits inert on the actor.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_refuses_constraint_bearing_token() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create(
+            "constrained",
+            br#"{
+                "scopes": ["*"],
+                "constraints": {
+                    "device.send_command": {"devices": ["dev-a1b2c3d4*"]}
+                }
+            }"#,
+        )
+        .expect("create constrained token");
+    let router = build_router(engine);
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/instances")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "REST must refuse a constraint-bearing token with 403",
+    );
+}
+
+/// Round-3 P1 on PR #147: legacy (bare scope-array) tokens
+/// must still work on REST — the refuse-on-constraints check
+/// only fires when the extended envelope carried a non-empty
+/// `constraints` map. Any regression here would break every
+/// pre-14.4 deployment on upgrade.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_accepts_legacy_scope_array_token() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("legacy-admin", b"[\"*\"]")
+        .expect("create legacy token");
+    let router = build_router(engine);
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/instances")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

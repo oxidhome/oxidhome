@@ -252,6 +252,16 @@ fn mount_inner(
     let auth_state = super::super::auth::AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
+        // 14.4a: MCP is the only surface where per-tool
+        // constraints have meaning today (constraint keys are
+        // MCP tool names, and no non-MCP dispatch site
+        // consumes them). Accept constraint-bearing tokens
+        // here; REST + Connect refuse them at bearer time so
+        // they can't be bypassed via an equivalent REST
+        // endpoint. Actual constraint enforcement lands per
+        // tool in 14.4b (`device.send_command`) + 14.4c
+        // (`plugins.*`).
+        allow_constraints: true,
     };
 
     // `route_service` — the exact `/api/v1/mcp` path only, no

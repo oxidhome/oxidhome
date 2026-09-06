@@ -141,6 +141,18 @@ pub(crate) struct AuthState {
     /// module-level doc for the two-phase write contract and the
     /// blocking / cancellation-safety discipline.
     pub audit_log: Arc<AuditLog>,
+    /// Phase 14.4a: whether this middleware instance accepts
+    /// tokens carrying per-tool constraints. Constraint keys
+    /// are MCP tool names, and no non-MCP dispatch site
+    /// consumes them, so a constraint-bearing token that
+    /// reaches REST or Connect would bypass its own
+    /// restriction by using an equivalent non-MCP endpoint
+    /// (e.g. `POST /api/v1/devices/{id}/commands` vs
+    /// `tools/call device.send_command`). REST + Connect
+    /// builders pass `false` and refuse such tokens with 403
+    /// at bearer time; the MCP mount builder passes `true`.
+    /// Round-3 P1 on PR #147.
+    pub allow_constraints: bool,
 }
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
@@ -240,6 +252,34 @@ pub(crate) async fn require_token(
     let (token_id, actor_kind) = match verify_result {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
+            // Round-3 P1 on PR #147: a token whose policy blob
+            // carries per-tool constraints (14.4a extended
+            // envelope) must not reach REST/Connect surfaces —
+            // the constraint keys are MCP tool names and no
+            // non-MCP dispatch site consumes them. Accepting
+            // such a token here would let the caller bypass
+            // its own restriction by using an equivalent
+            // non-MCP endpoint. Fail-closed with 403 so a
+            // mis-scoped issue surfaces immediately instead of
+            // silently granting broader access than the
+            // operator intended.
+            if !state.allow_constraints && actor.is_constrained() {
+                tracing::warn!(
+                    target: "api.auth",
+                    token_id = %actor.id(),
+                    "constraint-bearing token presented on a non-MCP transport; refusing (14.4a)",
+                );
+                try_best_effort_probe(
+                    inflight.as_ref(),
+                    &state.audit_log,
+                    &method,
+                    &http_path,
+                    403,
+                    Some(credential_fingerprint(&bearer)),
+                )
+                .await;
+                return (StatusCode::FORBIDDEN, "").into_response();
+            }
             let token_id = actor.id().to_string();
             let actor_kind = actor.kind().as_str().to_string();
             req.extensions_mut().insert(actor);
@@ -751,7 +791,7 @@ mod tests {
                 "scopes": ["devices:command"],
                 "constraints": {
                     "device.send_command": {
-                        "devices": ["dev-kitchen-*"]
+                        "devices": ["dev-a1b2c3d4*"]
                     }
                 }
             }"#
@@ -765,8 +805,8 @@ mod tests {
         let cx = actor
             .constraint("device.send_command")
             .expect("device.send_command constraint present");
-        assert!(cx.allows_device("dev-kitchen-light"));
-        assert!(!cx.allows_device("dev-bedroom-light"));
+        assert!(cx.allows_device("dev-a1b2c3d4e5f60718"));
+        assert!(!cx.allows_device("dev-a1b2c3d3ffffffff"));
         assert!(actor.constraint("plugins.install").is_none());
     }
 

@@ -1174,6 +1174,12 @@ pub fn axum_service(engine: Engine) -> axum::Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
+        // 14.4a: Connect-RPC doesn't consume per-tool
+        // constraints. Refuse constraint-bearing tokens
+        // here so a caller can't bypass the intended
+        // MCP-only restriction via an equivalent Connect
+        // RPC. See [`AuthState::allow_constraints`] docs.
+        allow_constraints: false,
     };
     let inner = router(engine).into_axum_service();
     axum::Router::new()
@@ -1228,6 +1234,33 @@ async fn connect_auth_middleware(
     let (token_id, actor_kind) = match state.tokens.verify(&bearer) {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
+            // Round-3 P1 on PR #147: same reasoning as
+            // [`crate::api::auth::require_token`] — a
+            // constraint-bearing token has no meaning on
+            // Connect-RPC, so refusing it here prevents the
+            // MCP-only restriction from being bypassed via an
+            // equivalent Connect RPC.
+            if !state.allow_constraints && actor.is_constrained() {
+                tracing::warn!(
+                    target: "api.auth",
+                    token_id = %actor.id(),
+                    "constraint-bearing token presented on Connect-RPC; refusing (14.4a)",
+                );
+                record_anonymous_probe(
+                    &state.audit_log,
+                    &method,
+                    &path,
+                    403,
+                    Some(crate::state::credential_fingerprint(&bearer)),
+                )
+                .await;
+                return connect_error_response(
+                    ConnectError::permission_denied(
+                        "constraint-bearing tokens are only accepted by the MCP surface",
+                    ),
+                    req.headers(),
+                );
+            }
             let token_id = actor.id().to_string();
             let actor_kind = actor.kind().as_str().to_string();
             req.extensions_mut().insert(actor);

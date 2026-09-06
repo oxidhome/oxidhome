@@ -9,7 +9,7 @@
 //! Phase 14.4 extends that shape with **per-tool constraints**
 //! — an operator issuing an MCP token should be able to say
 //! *"this token can send commands to any device matching
-//! `dev-kitchen-*`, but nothing else"*, not just *"this token
+//! `dev-a1b2c3d4*`, but nothing else"*, not just *"this token
 //! holds `devices:command`"*.
 //!
 //! # Wire shape
@@ -31,7 +31,7 @@
 //!     "scopes": ["devices:command"],
 //!     "constraints": {
 //!       "device.send_command": {
-//!         "devices": ["dev-kitchen-*", "dev-hallway-lamp"]
+//!         "devices": ["dev-a1b2c3d4*", "dev-11223344556677"]
 //!       }
 //!     }
 //!   }
@@ -43,6 +43,39 @@
 //!   shape doesn't force a host rebuild before it can be
 //!   loaded (though nothing will consult those keys until the
 //!   host learns them).
+//!
+//! # Constraints are MCP-only
+//!
+//! Constraint keys are MCP tool names, and only the MCP
+//! dispatch layer consumes them. A constraint-bearing token
+//! that reached REST or Connect-RPC would silently bypass its
+//! own restriction — the token could still hit the equivalent
+//! REST endpoint (`POST /api/v1/devices/{id}/commands`) where
+//! only the flat scope is checked.
+//!
+//! The bearer middleware ([`crate::api::auth::require_token`],
+//! [`crate::api::connect_rpc`]) refuses constraint-bearing
+//! tokens on non-MCP transports at verify time (returns 403).
+//! The MCP mount's middleware permits them via the
+//! `AuthState::allow_constraints` flag. See round-3 P1 on
+//! PR #147.
+//!
+//! # Device IDs
+//!
+//! Device IDs in OxidHome are **opaque `dev-<16 hex>` strings**
+//! — a stable hash of `(installation_uuid, instance_id,
+//! local_id)` computed by
+//! [`crate::state::devices::stable_device_id`]. They are not
+//! human-meaningful; there is no `dev-kitchen-lamp` in a
+//! real deployment. When authoring a `devices` allowlist,
+//! operators name specific devices by their opaque IDs (as
+//! shown by `oxidhome devices list`) or, if they want to
+//! group by room / plugin / instance, they combine multiple
+//! entries or use a shared prefix over an id space they
+//! control. A future slice may add tag-based selectors so
+//! operators can express "all kitchen devices" without
+//! enumerating each opaque id — that's out of scope for
+//! 14.4a's wire shape.
 //!
 //! # Scope of 14.4a
 //!
@@ -94,7 +127,7 @@ pub struct TokenPolicy {
 /// all). Bare `Vec::is_empty()` conflates the two.
 ///
 /// Patterns support a single trailing `*` wildcard
-/// (`dev-kitchen-*`); this is the minimum expressive shape
+/// (`dev-a1b2c3d4*`); this is the minimum expressive shape
 /// for the common "one room's devices" and "one plugin
 /// family's ids" cases. Richer glob / regex support can
 /// land in a follow-up without breaking the wire shape.
@@ -104,8 +137,11 @@ pub struct ToolConstraint {
     /// Device-id allowlist for tools that take a `device_id`
     /// argument (`device.send_command`, and future tools that
     /// address a specific device). Each entry is either a
-    /// literal id or a `prefix*` glob. `None` = no
-    /// constraint; `Some(vec![])` = deny all.
+    /// literal id or a `prefix*` glob against the opaque
+    /// `dev-<16 hex>` string produced by
+    /// [`crate::state::devices::stable_device_id`]. `None` =
+    /// no constraint; `Some(vec![])` = deny all. See the
+    /// module-level "Device IDs" doc for the rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devices: Option<Vec<String>>,
     /// Plugin-id allowlist for tools that take a `plugin_id`
@@ -222,7 +258,7 @@ mod tests {
             "scopes": ["devices:command"],
             "constraints": {
                 "device.send_command": {
-                    "devices": ["dev-kitchen-*", "dev-hallway-lamp"]
+                    "devices": ["dev-a1b2c3d4*", "dev-11223344556677"]
                 }
             }
         }"#;
@@ -234,7 +270,12 @@ mod tests {
             .expect("constraint");
         assert_eq!(
             cx.devices.as_deref(),
-            Some(&["dev-kitchen-*".to_string(), "dev-hallway-lamp".to_string()][..]),
+            Some(
+                &[
+                    "dev-a1b2c3d4*".to_string(),
+                    "dev-11223344556677".to_string()
+                ][..]
+            ),
         );
         assert!(cx.plugins.is_none());
     }
@@ -268,7 +309,7 @@ mod tests {
     #[test]
     fn constraint_allows_none_means_unrestricted() {
         let cx = ToolConstraint::default();
-        assert!(cx.allows_device("dev-kitchen-light"));
+        assert!(cx.allows_device("dev-a1b2c3d4e5f60718"));
         assert!(cx.allows_plugin("acme.thermostat"));
     }
 
@@ -285,23 +326,27 @@ mod tests {
 
     #[test]
     fn constraint_allows_literal_and_prefix_glob() {
+        // Device IDs in OxidHome are opaque `dev-<16 hex>`
+        // strings (see `crate::state::devices::stable_device_id`);
+        // this test uses realistic shapes rather than the
+        // human-friendly names the docs use as illustrations.
         let cx = ToolConstraint {
             devices: Some(vec![
-                "dev-kitchen-*".to_string(),
-                "dev-hallway-lamp".to_string(),
+                "dev-a1b2c3d4*".to_string(),
+                "dev-11223344556677".to_string(),
             ]),
             plugins: None,
         };
         // Prefix glob.
-        assert!(cx.allows_device("dev-kitchen-light"));
-        assert!(cx.allows_device("dev-kitchen-fan"));
+        assert!(cx.allows_device("dev-a1b2c3d4e5f60718"));
+        assert!(cx.allows_device("dev-a1b2c3d4000000ff"));
         // Prefix boundary — `*` matches the empty tail too.
-        assert!(cx.allows_device("dev-kitchen-"));
+        assert!(cx.allows_device("dev-a1b2c3d4"));
         // Literal.
-        assert!(cx.allows_device("dev-hallway-lamp"));
+        assert!(cx.allows_device("dev-11223344556677"));
         // Not covered.
-        assert!(!cx.allows_device("dev-bedroom-light"));
-        assert!(!cx.allows_device("dev-hallway-lamp2"));
+        assert!(!cx.allows_device("dev-a1b2c3d3ffffffff"));
+        assert!(!cx.allows_device("dev-112233445566772"));
     }
 
     #[test]
@@ -312,10 +357,10 @@ mod tests {
         // pattern they thought was a glob doesn't get an
         // unintended broader match.
         let cx = ToolConstraint {
-            devices: Some(vec!["dev-*-light".to_string()]),
+            devices: Some(vec!["dev-a*b".to_string()]),
             plugins: None,
         };
-        assert!(cx.allows_device("dev-*-light"));
-        assert!(!cx.allows_device("dev-kitchen-light"));
+        assert!(cx.allows_device("dev-a*b"));
+        assert!(!cx.allows_device("dev-a12345b"));
     }
 }

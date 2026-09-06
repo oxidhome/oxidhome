@@ -186,6 +186,19 @@ impl Actor {
     pub fn constraint(&self, tool_name: &str) -> Option<&policy::ToolConstraint> {
         self.inner.constraints.get(tool_name)
     }
+
+    /// `true` when this actor's token carried any per-tool
+    /// constraint entry. Used at bearer time by non-MCP
+    /// transports (REST, Connect-RPC) to refuse
+    /// constraint-bearing tokens — the constraint keys are
+    /// MCP tool names and no non-MCP dispatch site consumes
+    /// them, so accepting such a token there would let the
+    /// caller bypass the constraint by using an equivalent
+    /// REST endpoint (round-3 P1 on PR #147).
+    #[must_use]
+    pub fn is_constrained(&self) -> bool {
+        !self.inner.constraints.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -222,7 +235,7 @@ mod tests {
         constraints.insert(
             "device.send_command".to_string(),
             policy::ToolConstraint {
-                devices: Some(vec!["dev-kitchen-*".into()]),
+                devices: Some(vec!["dev-a1b2c3d4*".into()]),
                 plugins: None,
             },
         );
@@ -231,8 +244,8 @@ mod tests {
         let cx = a
             .constraint("device.send_command")
             .expect("device.send_command constraint present");
-        assert!(cx.allows_device("dev-kitchen-light"));
-        assert!(!cx.allows_device("dev-bedroom-light"));
+        assert!(cx.allows_device("dev-a1b2c3d4e5f60718"));
+        assert!(!cx.allows_device("dev-a1b2c3d3ffffffff"));
 
         // Unqueried tool name is still unrestricted.
         assert!(a.constraint("plugins.install").is_none());
