@@ -141,6 +141,33 @@ pub(crate) struct AuthState {
     /// module-level doc for the two-phase write contract and the
     /// blocking / cancellation-safety discipline.
     pub audit_log: Arc<AuditLog>,
+    /// Phase 14.4a: which constraints this transport
+    /// enforces, keyed by tool name plus which
+    /// [`ToolConstraint`] fields the dispatch site actually
+    /// consults. The middleware refuses a bearer if its
+    /// policy names any constraint key outside this set, or
+    /// if a listed constraint sets a field the entry does not
+    /// enforce — landing either would fail open (the flat
+    /// scope check passes and no dispatch site reads the
+    /// constraint / field).
+    ///
+    /// In 14.4a every transport passes `&[]`: no dispatch
+    /// site consumes constraints yet, so *every*
+    /// constraint-bearing token is refused. Each per-tool
+    /// enforcement slice adds its own entry to the transport
+    /// that consumes it, atomically with wiring the
+    /// dispatch-site check — 14.4b adds `("device.send_command",
+    /// devices)` on MCP; 14.4c adds the five `plugins.*`
+    /// entries with `plugins` on MCP; …
+    ///
+    /// Round-6 P1 on PR #147 replaced the per-key-only set
+    /// with per-(key, field) entries — a plain key set would
+    /// admit e.g. `{"device.send_command": {"plugins":
+    /// ["acme.*"]}}` once 14.4b enforced the key, but the
+    /// device-only dispatch check never reads `plugins`, so
+    /// the constraint would be inert and the actor would have
+    /// unrestricted device access.
+    pub enforced_constraints: &'static [crate::auth::EnforcedConstraint],
 }
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
@@ -240,6 +267,51 @@ pub(crate) async fn require_token(
     let (token_id, actor_kind) = match verify_result {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
+            // Round-3 P1 on PR #147: a token whose policy blob
+            // carries per-tool constraints (14.4a extended
+            // envelope) must not reach REST/Connect surfaces —
+            // the constraint keys are MCP tool names and no
+            // non-MCP dispatch site consumes them. Accepting
+            // such a token here would let the caller bypass
+            // its own restriction by using an equivalent
+            // non-MCP endpoint. Fail-closed with 403 so a
+            // mis-scoped issue surfaces immediately instead of
+            // silently granting broader access than the
+            // operator intended.
+            if let Some(refusal) = first_constraint_refusal(&actor, state.enforced_constraints) {
+                let sentinel = refusal.audit_sentinel();
+                tracing::warn!(
+                    target: "api.auth",
+                    token_id = %actor.id(),
+                    refusal = %refusal.as_display(),
+                    "token carries a constraint this transport does not enforce; refusing (14.4a)",
+                );
+                // Round-4 P2 on PR #147: authenticated denial,
+                // not an anonymous probe — surface token_id +
+                // actor_kind to a forensic sweep.
+                // Round-6 P2: `required_scope` carries the
+                // specific offending key (and field, on a
+                // field-level refusal) so operators can slice
+                // per-cause without pattern-matching a
+                // free-text log line.
+                let entry = AuditEntry {
+                    id: 0,
+                    intent_ms: 0,
+                    finalized_ms: None,
+                    token_id: actor.id().to_string(),
+                    actor_kind: actor.kind().as_str().to_string(),
+                    method: method.clone(),
+                    path: http_path.clone(),
+                    status: StatusCode::FORBIDDEN.as_u16(),
+                    decision: "deny".into(),
+                    required_scope: Some(sentinel),
+                    execution_outcome: None,
+                    domain_error: None,
+                    credential_fp: None,
+                };
+                record_authenticated_denial(&state.audit_log, inflight.as_ref(), entry).await;
+                return (StatusCode::FORBIDDEN, "").into_response();
+            }
             let token_id = actor.id().to_string();
             let actor_kind = actor.kind().as_str().to_string();
             req.extensions_mut().insert(actor);
@@ -417,6 +489,157 @@ async fn try_best_effort_probe(
         Err(join_err) => {
             eprintln!(
                 "oxidhome audit_log: record_completed (anonymous probe) join failed: {join_err}",
+            );
+        }
+    }
+}
+
+/// Reason the bearer middleware refused a constraint. Turned
+/// into a stable `required_scope` sentinel on the audit row
+/// so operators can slice per-cause without pattern-matching a
+/// free-text log line.
+///
+/// Round-6 P2 on PR #147: an earlier cut used one opaque
+/// `<constraint-bearing-token-refused>` sentinel; the
+/// offending key never reached the ledger, so a forensic sweep
+/// couldn't tell an unknown-key case from a supported-key /
+/// unsupported-field case. The variants preserve that
+/// distinction.
+pub(super) enum ConstraintRefusal<'a> {
+    /// Tool name is outside the transport's enforced set —
+    /// either an unknown key or one this transport doesn't
+    /// consume.
+    KeyNotEnforced { key: &'a str },
+    /// Tool name is enforced but the constraint sets a field
+    /// the dispatch site does not read — the field would sit
+    /// inert and the actor would have unrestricted access to
+    /// that field.
+    FieldNotEnforced { key: &'a str, field: &'static str },
+}
+
+impl ConstraintRefusal<'_> {
+    /// Stable `required_scope` sentinel written to the audit
+    /// ledger. Distinct prefixes per variant so an operator's
+    /// ledger scan can slice each refusal cause without any
+    /// ambiguity:
+    ///
+    /// - `<constraint-key-unenforced:{key}>` — the tool name
+    ///   itself is outside the transport's enforced set.
+    /// - `<constraint-field-unenforced:{key}:{field}>` — the
+    ///   key is enforced but the constraint set a field the
+    ///   dispatch site does not consume.
+    ///
+    /// Round-7 P2 on PR #147: the round-6 shape reused one
+    /// prefix and separated key+field with `#`, which
+    /// collided with an unknown key whose name literally
+    /// contained `#` (either variant produced the same
+    /// sentinel). The distinct per-variant prefixes are what
+    /// close the ambiguity; unknown keys are otherwise
+    /// preserved verbatim (`parse_policy` accepts arbitrary
+    /// forward-compat keys), so no character in the key
+    /// itself is reserved.
+    pub(super) fn audit_sentinel(&self) -> String {
+        match self {
+            Self::KeyNotEnforced { key } => {
+                format!("<constraint-key-unenforced:{key}>")
+            }
+            Self::FieldNotEnforced { key, field } => {
+                format!("<constraint-field-unenforced:{key}:{field}>")
+            }
+        }
+    }
+
+    /// Compact human-readable identifier for tracing. Log
+    /// consumers can grep or filter on the sentinel string.
+    pub(super) fn as_display(&self) -> String {
+        self.audit_sentinel()
+    }
+}
+
+/// Round-6 P1 on PR #147: does the actor's policy carry any
+/// constraint entry this transport can't safely admit? Both
+/// unknown/unenforced keys AND known keys whose blob sets an
+/// unenforced field return `Some(refusal)` — the caller
+/// surfaces the refusal in its warn log and its audit-row
+/// sentinel so operators know exactly what blew the check.
+///
+/// Iterates `actor.constraint_keys()` — one hashmap walk per
+/// bearer request; the enforced slice is a handful of entries
+/// (bounded by the number of MCP tools), so an inner linear
+/// scan is fine and keeps the enforced-declaration site a
+/// plain `&'static [EnforcedConstraint]`.
+pub(super) fn first_constraint_refusal<'a>(
+    actor: &'a Actor,
+    enforced: &[crate::auth::EnforcedConstraint],
+) -> Option<ConstraintRefusal<'a>> {
+    for key in actor.constraint_keys() {
+        let Some(entry) = enforced.iter().find(|e| e.key == key) else {
+            return Some(ConstraintRefusal::KeyNotEnforced { key });
+        };
+        let constraint = actor
+            .constraint(key)
+            .expect("key came from constraint_keys");
+        if let Some(field) = entry.first_unenforced_field(constraint) {
+            return Some(ConstraintRefusal::FieldNotEnforced { key, field });
+        }
+    }
+    None
+}
+
+/// Round-4 P2 on PR #147: write an authenticated denial row.
+/// Sibling of [`try_best_effort_probe`] but for the case
+/// where the caller *did* authenticate — the audit row must
+/// carry the known `token_id` + `actor_kind` so a forensic
+/// sweep can attribute the refusal, not lose it in the
+/// anonymous bucket.
+///
+/// Same inflight-semaphore discipline as the probe helper on
+/// the MCP mount: bounded queue, skip-when-saturated with a
+/// debug log. Non-MCP mount just does the unbounded
+/// `spawn_blocking` write.
+pub(super) async fn record_authenticated_denial(
+    audit_log: &Arc<AuditLog>,
+    inflight: Option<&super::mcp::PreAdmissionInflight>,
+    entry: AuditEntry,
+) {
+    let al = Arc::clone(audit_log);
+    let owned_method = entry.method.clone();
+    let owned_path = entry.path.clone();
+
+    let join = if let Some(gate) = inflight {
+        let Ok(permit) = Arc::clone(&gate.0).try_acquire_owned() else {
+            tracing::debug!(
+                target: "api.audit",
+                method = %owned_method,
+                path = %owned_path,
+                "pre-admission inflight cap reached — skipping authenticated denial",
+            );
+            return;
+        };
+        tokio::task::spawn_blocking(move || {
+            let _guard = permit;
+            al.record_completed(&entry)
+        })
+        .await
+    } else {
+        tokio::task::spawn_blocking(move || al.record_completed(&entry)).await
+    };
+
+    match join {
+        Ok(Ok(_id)) => {}
+        Ok(Err(err)) => {
+            eprintln!("oxidhome audit_log: record_completed (authenticated denial) failed: {err}");
+            tracing::error!(
+                target: "api.audit",
+                error = %err,
+                method = %owned_method,
+                path = %owned_path,
+                "audit-ledger authenticated-denial write failed",
+            );
+        }
+        Err(join_err) => {
+            eprintln!(
+                "oxidhome audit_log: record_completed (authenticated denial) join failed: {join_err}",
             );
         }
     }
@@ -654,28 +877,36 @@ pub(super) async fn finalize_audit(
 /// `pub(super)` so the Connect-side auth middleware reuses the
 /// same record → actor projection.
 pub(super) fn actor_from_record(rec: &TokenRecord) -> Actor {
-    let scopes = parse_scopes(&rec.scope_json).unwrap_or_else(|| {
+    // Phase 14.4a: `scope_json` now decodes into a
+    // [`TokenPolicy`] — either the legacy `["scope"]` array or
+    // the extended `{scopes, constraints}` object. Parse
+    // failure ⇒ deny-all actor (empty scopes + empty
+    // constraints), same rationale as pre-14.4: an operator
+    // who saved a malformed blob gets useful "every request
+    // is denied" audit signal rather than the API going down.
+    let policy = crate::auth::parse_policy(&rec.scope_json).unwrap_or_else(|| {
         tracing::warn!(
             target: "api.auth",
             token_id = %rec.id,
-            "scope_json failed to parse; defaulting to deny-all",
+            "scope_json failed to parse as TokenPolicy; defaulting to deny-all",
         );
-        Vec::new()
+        crate::auth::TokenPolicy::default()
     });
-    Actor::api(rec.id.clone(), scopes)
+    Actor::api_with_policy(rec.id.clone(), policy.scopes, policy.constraints)
 }
 
-/// Parse `scope_json` as a JSON array of strings. Returns `None` on
-/// any parse failure. The wildcard contract: an element equal to
-/// `"*"` means "any scope" — 12-API-b's scope-policy enforcer
-/// recognizes it. `pub(crate)` so the bootstrap test can pin the
-/// admin-blob round trip (see [`crate::api`]).
+/// Legacy scope-array parser retained as a thin shim over
+/// [`crate::auth::parse_policy`] for the tests that pin it
+/// directly. Prefer `parse_policy` — the shim discards
+/// [`TokenPolicy::constraints`].
+///
+/// The wildcard contract: an element equal to `"*"` means
+/// "any scope" — 12-API-b's scope-policy enforcer recognises
+/// it. `pub(crate)` so the bootstrap test can pin the
+/// admin-blob round trip.
+#[cfg(test)]
 pub(crate) fn parse_scopes(blob: &[u8]) -> Option<Vec<String>> {
-    let value: serde_json::Value = serde_json::from_slice(blob).ok()?;
-    let arr = value.as_array()?;
-    arr.iter()
-        .map(|v| v.as_str().map(String::from))
-        .collect::<Option<Vec<_>>>()
+    crate::auth::parse_policy(blob).map(|p| p.scopes)
 }
 
 /// Pull the bearer secret out of an `Authorization: <scheme> …`
@@ -727,6 +958,186 @@ mod tests {
         assert!(parse_scopes(b"{}").is_none());
         assert!(parse_scopes(br#"["ok", 7]"#).is_none());
         assert!(parse_scopes(b"not json").is_none());
+    }
+
+    #[test]
+    fn actor_from_record_carries_constraints_on_extended_policy() {
+        // Phase 14.4a: a stored record whose scope_json uses
+        // the extended shape must surface both scopes AND
+        // constraints on the built Actor. The dispatch layer
+        // (later slice) reads `Actor::constraint(tool_name)`
+        // to enforce.
+        let rec = TokenRecord {
+            id: "tok-14-4a".into(),
+            label: "tester".into(),
+            scope_json: br#"{
+                "scopes": ["devices:command"],
+                "constraints": {
+                    "device.send_command": {
+                        "devices": ["dev-a1b2c3d4*"]
+                    }
+                }
+            }"#
+            .to_vec(),
+            created_ms: 0,
+            last_used_ms: None,
+            revoked_ms: None,
+        };
+        let actor = actor_from_record(&rec);
+        assert_eq!(actor.scopes(), &["devices:command".to_string()]);
+        let cx = actor
+            .constraint("device.send_command")
+            .expect("device.send_command constraint present");
+        assert!(cx.allows_device("dev-a1b2c3d4e5f60718"));
+        assert!(!cx.allows_device("dev-a1b2c3d3ffffffff"));
+        assert!(actor.constraint("plugins.install").is_none());
+    }
+
+    #[test]
+    fn actor_from_record_legacy_shape_has_no_constraints() {
+        let rec = TokenRecord {
+            id: "tok-legacy".into(),
+            label: "legacy".into(),
+            scope_json: br#"["devices:command","plugins:list"]"#.to_vec(),
+            created_ms: 0,
+            last_used_ms: None,
+            revoked_ms: None,
+        };
+        let actor = actor_from_record(&rec);
+        assert_eq!(
+            actor.scopes(),
+            &["devices:command".to_string(), "plugins:list".to_string()]
+        );
+        assert!(actor.constraint("device.send_command").is_none());
+    }
+
+    #[test]
+    fn first_constraint_refusal_catches_unknown_and_field_mismatch() {
+        use crate::auth::EnforcedConstraint;
+
+        // Round-6 P1 on PR #147: the gate must refuse both
+        // (a) a constraint key outside the enforced set and
+        // (b) a supported key that carries a field the entry
+        // does not enforce (fail-open otherwise — the flat
+        // scope passes and the field sits inert).
+
+        let mut constraints = std::collections::HashMap::new();
+        constraints.insert(
+            "device.send_command".to_string(),
+            crate::auth::ToolConstraint {
+                devices: Some(vec!["dev-a1b2c3d4*".into()]),
+                plugins: None,
+            },
+        );
+        constraints.insert(
+            "plugins.stop".to_string(),
+            crate::auth::ToolConstraint {
+                devices: None,
+                plugins: Some(vec!["acme.*".into()]),
+            },
+        );
+        let mixed_actor = Actor::api_with_policy("tok-mixed", vec!["*".into()], constraints);
+
+        // Empty enforced set → the first key visited blows
+        // the check.
+        assert!(matches!(
+            first_constraint_refusal(&mixed_actor, &[]),
+            Some(ConstraintRefusal::KeyNotEnforced { .. }),
+        ));
+
+        // Only `device.send_command` enforced with `devices` →
+        // `plugins.stop` fails as an unknown key.
+        let enforced_device = &[EnforcedConstraint {
+            key: "device.send_command",
+            enforce_devices: true,
+            enforce_plugins: false,
+        }][..];
+        let refusal = first_constraint_refusal(&mixed_actor, enforced_device)
+            .expect("plugins.stop must fail as an unenforced key");
+        assert!(matches!(
+            refusal,
+            ConstraintRefusal::KeyNotEnforced {
+                key: "plugins.stop"
+            },
+        ));
+
+        // Both enforced with their respective supported
+        // fields → nothing to refuse.
+        let enforced_full = &[
+            EnforcedConstraint {
+                key: "device.send_command",
+                enforce_devices: true,
+                enforce_plugins: false,
+            },
+            EnforcedConstraint {
+                key: "plugins.stop",
+                enforce_devices: false,
+                enforce_plugins: true,
+            },
+        ][..];
+        assert!(first_constraint_refusal(&mixed_actor, enforced_full).is_none());
+
+        // Field-mismatch case: a token carrying `plugins` on
+        // `device.send_command` must be refused even when the
+        // key is enforced — the device-only dispatch check
+        // never reads `plugins`, so the field would be inert.
+        let mut wrong_field = std::collections::HashMap::new();
+        wrong_field.insert(
+            "device.send_command".to_string(),
+            crate::auth::ToolConstraint {
+                devices: None,
+                plugins: Some(vec!["acme.*".into()]),
+            },
+        );
+        let wrong_actor = Actor::api_with_policy("tok-wrong-field", vec!["*".into()], wrong_field);
+        let refusal = first_constraint_refusal(&wrong_actor, enforced_device)
+            .expect("device.send_command with plugins field must refuse");
+        assert!(matches!(
+            refusal,
+            ConstraintRefusal::FieldNotEnforced {
+                key: "device.send_command",
+                field: "plugins",
+            },
+        ));
+
+        // Audit sentinels surface the offending key + field
+        // so operators can slice per-cause on the ledger.
+        assert_eq!(
+            ConstraintRefusal::KeyNotEnforced {
+                key: "plugins.stop"
+            }
+            .audit_sentinel(),
+            "<constraint-key-unenforced:plugins.stop>",
+        );
+        assert_eq!(
+            ConstraintRefusal::FieldNotEnforced {
+                key: "device.send_command",
+                field: "plugins",
+            }
+            .audit_sentinel(),
+            "<constraint-field-unenforced:device.send_command:plugins>",
+        );
+    }
+
+    #[test]
+    fn actor_from_record_malformed_scope_json_denies_all() {
+        // Fail-closed: garbage in scope_json becomes an actor
+        // with empty scopes + empty constraints. The
+        // dispatch layer's scope check then denies every
+        // request. The bearer still authenticates (the token
+        // secret verified against the store) — the middleware
+        // just refuses to trust its authorisations.
+        let rec = TokenRecord {
+            id: "tok-broken".into(),
+            label: "broken".into(),
+            scope_json: b"not json at all".to_vec(),
+            created_ms: 0,
+            last_used_ms: None,
+            revoked_ms: None,
+        };
+        let actor = actor_from_record(&rec);
+        assert!(actor.scopes().is_empty());
+        assert!(actor.constraint("device.send_command").is_none());
     }
 
     #[test]

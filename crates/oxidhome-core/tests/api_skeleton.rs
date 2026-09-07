@@ -5760,3 +5760,112 @@ async fn dashboards_write_requires_dashboards_write_scope() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+/// Round-3 P1 on PR #147: a constraint-bearing token
+/// (extended `TokenPolicy` envelope with `constraints`) must
+/// be refused at bearer time on transports that don't
+/// consume constraints. Without this, a caller could bypass
+/// the intended constraint by using a transport whose scope
+/// check silently succeeds while the constraint sits inert
+/// on the actor.
+///
+/// Round-4 P1 update: the refusal covers **every** transport
+/// in 14.4a — MCP included. Landing acceptance before the
+/// per-tool dispatch checks would grant a `{scopes: ["*"],
+/// constraints: {"device.send_command": {"devices": []}}}`
+/// token unrestricted MCP authority (flat scope passes; no
+/// dispatch site consults the deny-all constraint). Each
+/// 14.4b/c slice adds its own `EnforcedConstraint` entry to
+/// `AuthState::enforced_constraints` for the transport that
+/// consumes it, atomically with wiring the corresponding
+/// dispatch-site check.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_refuses_constraint_bearing_token() {
+    use oxidhome_core::state::AuditQuery;
+
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create(
+            "constrained",
+            br#"{
+                "scopes": ["*"],
+                "constraints": {
+                    "device.send_command": {"devices": ["dev-a1b2c3d4*"]}
+                }
+            }"#,
+        )
+        .expect("create constrained token");
+    let audit_log = engine.audit_log();
+    let router = build_router(engine.clone());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/instances")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "REST must refuse a constraint-bearing token with 403",
+    );
+
+    // Round-4 P2 on PR #147: the 403 must land in the ledger
+    // as an authenticated denial — attributed to the known
+    // token_id + actor_kind, NOT the anonymous bucket.
+    let rows = audit_log
+        .query(&AuditQuery::default(), 16)
+        .expect("query audit");
+    let denial = rows
+        .iter()
+        .find(|r| r.status == 403 && r.path == "/api/v1/instances")
+        .expect("constraint-refused row present");
+    assert_eq!(denial.token_id, issued.id, "token_id must be attributed");
+    assert_eq!(denial.actor_kind, "api", "actor_kind must be attributed");
+    assert_eq!(denial.decision, "deny");
+    assert_eq!(
+        denial.required_scope.as_deref(),
+        // Round-6 P2 on PR #147: the sentinel names the
+        // offending key so a ledger sweep can attribute the
+        // refusal without cross-referencing the log line.
+        // 14.4a enforces no keys, so this is
+        // `KeyNotEnforced`.
+        Some("<constraint-key-unenforced:device.send_command>"),
+    );
+}
+
+/// Round-3 P1 on PR #147: legacy (bare scope-array) tokens
+/// must still work on REST — the refuse-on-constraints check
+/// only fires when the extended envelope carried a non-empty
+/// `constraints` map. Any regression here would break every
+/// pre-14.4 deployment on upgrade.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_accepts_legacy_scope_array_token() {
+    let engine = Engine::new().expect("engine");
+    let issued = engine
+        .auth_tokens()
+        .create("legacy-admin", b"[\"*\"]")
+        .expect("create legacy token");
+    let router = build_router(engine);
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/instances")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued.plaintext),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

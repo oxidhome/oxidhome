@@ -252,6 +252,32 @@ fn mount_inner(
     let auth_state = super::super::auth::AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
+        // 14.4a: MCP consumes no constraint keys yet. Empty
+        // slice → refuse every constraint-bearing token.
+        //
+        // Round-6 P1 on PR #147: this is a
+        // `&[EnforcedConstraint]`, not a bool or a bare
+        // key set. Each entry names a key + which
+        // `ToolConstraint` fields (`enforce_devices` /
+        // `enforce_plugins`) the dispatch site actually
+        // consults; both dimensions are gated at bearer
+        // verify time.
+        //
+        // 14.4b will land the tools::call `device.send_command`
+        // dispatch check and add
+        //   EnforcedConstraint {
+        //       key: "device.send_command",
+        //       enforce_devices: true,
+        //       enforce_plugins: false,
+        //   }
+        // here atomically with that check. 14.4c adds five
+        // `plugins.*` entries (each `enforce_plugins: true,
+        // enforce_devices: false`). Per-field flags close the
+        // fail-open window where a token with `plugins` set
+        // on `device.send_command` would sail past a key-only
+        // gate but the device-only dispatch check would never
+        // read the inert `plugins` field.
+        enforced_constraints: &[],
     };
 
     // `route_service` — the exact `/api/v1/mcp` path only, no
