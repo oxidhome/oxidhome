@@ -253,18 +253,30 @@ fn mount_inner(
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
         // 14.4a: MCP consumes no constraint keys yet. Empty
-        // set → refuse every constraint-bearing token.
+        // slice → refuse every constraint-bearing token.
         //
-        // Round-5 P1 on PR #147: this is a *set*, not a
-        // boolean, because per-tool enforcement lands in
-        // staged slices. 14.4b will add "device.send_command"
-        // here atomically with wiring the check inside
-        // `tools::call`; 14.4c will add the five `plugins.*`
-        // keys. A boolean would open a fail-open window
-        // between 14.4b and 14.4c (`plugins.*` constraints
-        // would be admitted but unenforced), and would admit
-        // forward-compat keys the current build doesn't know
-        // how to enforce.
+        // Round-6 P1 on PR #147: this is a
+        // `&[EnforcedConstraint]`, not a bool or a bare
+        // key set. Each entry names a key + which
+        // `ToolConstraint` fields (`enforce_devices` /
+        // `enforce_plugins`) the dispatch site actually
+        // consults; both dimensions are gated at bearer
+        // verify time.
+        //
+        // 14.4b will land the tools::call `device.send_command`
+        // dispatch check and add
+        //   EnforcedConstraint {
+        //       key: "device.send_command",
+        //       enforce_devices: true,
+        //       enforce_plugins: false,
+        //   }
+        // here atomically with that check. 14.4c adds five
+        // `plugins.*` entries (each `enforce_plugins: true,
+        // enforce_devices: false`). Per-field flags close the
+        // fail-open window where a token with `plugins` set
+        // on `device.send_command` would sail past a key-only
+        // gate but the device-only dispatch check would never
+        // read the inert `plugins` field.
         enforced_constraints: &[],
     };
 

@@ -533,9 +533,11 @@ impl ConstraintRefusal<'_> {
     /// prefix and separated key+field with `#`, which
     /// collided with an unknown key whose name literally
     /// contained `#` (either variant produced the same
-    /// sentinel). Distinct prefixes + a `:` separator (never
-    /// legal inside a tool name — tool names are
-    /// `dotted.snake_case`) closes that ambiguity.
+    /// sentinel). The distinct per-variant prefixes are what
+    /// close the ambiguity; unknown keys are otherwise
+    /// preserved verbatim (`parse_policy` accepts arbitrary
+    /// forward-compat keys), so no character in the key
+    /// itself is reserved.
     pub(super) fn audit_sentinel(&self) -> String {
         match self {
             Self::KeyNotEnforced { key } => {

@@ -198,13 +198,17 @@ impl Actor {
     /// (`device.send_command`, `plugins.install`, unknown
     /// forward-compat keys). Order is unspecified.
     ///
-    /// The bearer middleware uses this to reject tokens whose
-    /// constraint set contains any key the current transport
-    /// does not enforce — see `AuthState.enforced_constraint_keys`
-    /// in [`crate::api::auth`]. Landing a token whose keys are
-    /// only *partially* enforced would fail open on the
-    /// unenforced keys (the flat scope check would pass and
-    /// no dispatch site consults the constraint).
+    /// The bearer middleware iterates this to reject tokens
+    /// carrying any constraint the current transport does not
+    /// enforce — see `AuthState::enforced_constraints`
+    /// (`&[EnforcedConstraint]`) in [`crate::api::auth`]. Each
+    /// enforced entry names a key **and** which
+    /// [`ToolConstraint`] fields the dispatch site actually
+    /// consults; a bearer whose policy names an unenforced
+    /// key OR sets a field the entry doesn't consume would
+    /// fail open on that dimension (flat scope check passes,
+    /// no dispatch site reads the field), so both cases are
+    /// refused.
     pub fn constraint_keys(&self) -> impl Iterator<Item = &str> + '_ {
         self.inner.constraints.keys().map(String::as_str)
     }
