@@ -637,7 +637,9 @@ pub(super) async fn call(
 
     // Actually dispatch.
     let outcome = match name {
-        "device.send_command" => device_send_command_call(engine.clone(), request.arguments).await,
+        "device.send_command" => {
+            device_send_command_call(engine.clone(), request.arguments, actor).await
+        }
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => events_history_call(engine.clone(), request.arguments).await,
         "plugins.list" => plugins_list_call(&engine, request.arguments),
@@ -1040,6 +1042,20 @@ impl ToolOutcome {
 
 // ── device.send_command ─────────────────────────────────────────
 
+/// Phase 14.4b: `required_scope` sentinel written to the audit
+/// ledger when `device.send_command` refuses a call because
+/// the token's `devices` allowlist doesn't cover the requested
+/// `device_id`. Distinct from the flat-scope sentinel
+/// (`devices:command`) so an operator's ledger scan can slice
+/// constraint refusals from scope refusals.
+///
+/// Kept in sync with the MCP mount's `EnforcedConstraint`
+/// entry in `api::mcp::server::mount_routes` — adding the
+/// entry there without matching this constant (or vice versa)
+/// would drift the audit shape from the enforcement shape.
+pub(super) const CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES: &str =
+    "constraint:device.send_command:devices";
+
 /// Cap on the plugin-supplied error message before we let it
 /// enter any JSON serialisation. The WIT contract lets a
 /// plugin's `command-result::err` payload carry an
@@ -1055,6 +1071,7 @@ const MAX_PLUGIN_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
 async fn device_send_command_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    actor: &Actor,
 ) -> ToolOutcome {
     let args: DeviceSendCommandArgs = match arguments {
         Some(map) => match serde_json::from_value(JsonValue::Object(map)) {
@@ -1071,6 +1088,28 @@ async fn device_send_command_call(
             );
         }
     };
+
+    // Phase 14.4b: enforce the token policy's per-device
+    // allowlist on `device.send_command`. `None` = no
+    // constraint on this tool (unrestricted, subject to the
+    // flat scope check above); `Some(cx)` with
+    // `allows_device` false refuses the call as a scope-shape
+    // denial so the audit ledger records
+    // `required_scope = "constraint:device.send_command:devices"`
+    // — distinct from a flat `devices:command` refusal so
+    // operators can slice constraint enforcement separately.
+    //
+    // Check happens BEFORE the device lookup so a token whose
+    // allowlist doesn't cover the id can't learn whether the
+    // id exists — the constraint is a pure string match on
+    // caller input and independent of registry state.
+    if let Some(cx) = actor.constraint("device.send_command")
+        && !cx.allows_device(&args.device_id)
+    {
+        return ToolOutcome::Denied {
+            required: CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES,
+        };
+    }
 
     // Resolve device → owning instance the same way the REST
     // handler does. `NotFound` is deliberately indistinct
