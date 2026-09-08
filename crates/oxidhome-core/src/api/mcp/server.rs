@@ -252,32 +252,28 @@ fn mount_inner(
     let auth_state = super::super::auth::AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // 14.4a: MCP consumes no constraint keys yet. Empty
-        // slice → refuse every constraint-bearing token.
+        // Phase 14.4b: `device.send_command` now enforces
+        // its `devices` allowlist inside `tools::call` (see
+        // `tools::CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES`).
+        // Added here atomically with that dispatch-site
+        // check so bearer time and dispatch time can't drift.
         //
-        // Round-6 P1 on PR #147: this is a
-        // `&[EnforcedConstraint]`, not a bool or a bare
-        // key set. Each entry names a key + which
-        // `ToolConstraint` fields (`enforce_devices` /
-        // `enforce_plugins`) the dispatch site actually
-        // consults; both dimensions are gated at bearer
-        // verify time.
+        // Each entry names its key + which `ToolConstraint`
+        // fields (`enforce_devices` / `enforce_plugins`) the
+        // dispatch site actually consults. A bearer whose
+        // policy carries `plugins` on `device.send_command`
+        // is still refused at verify time — the field would
+        // sit inert (the device-only dispatch check never
+        // reads it).
         //
-        // 14.4b will land the tools::call `device.send_command`
-        // dispatch check and add
-        //   EnforcedConstraint {
-        //       key: "device.send_command",
-        //       enforce_devices: true,
-        //       enforce_plugins: false,
-        //   }
-        // here atomically with that check. 14.4c adds five
-        // `plugins.*` entries (each `enforce_plugins: true,
-        // enforce_devices: false`). Per-field flags close the
-        // fail-open window where a token with `plugins` set
-        // on `device.send_command` would sail past a key-only
-        // gate but the device-only dispatch check would never
-        // read the inert `plugins` field.
-        enforced_constraints: &[],
+        // 14.4c adds five `plugins.*` entries
+        // (each `enforce_plugins: true, enforce_devices:
+        // false`) atomically with each tool's dispatch check.
+        enforced_constraints: &[crate::auth::EnforcedConstraint {
+            key: "device.send_command",
+            enforce_devices: true,
+            enforce_plugins: false,
+        }],
     };
 
     // `route_service` — the exact `/api/v1/mcp` path only, no

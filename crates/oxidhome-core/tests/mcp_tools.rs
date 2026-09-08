@@ -2732,3 +2732,186 @@ async fn plugins_install_audit_taxonomy_stays_clean() {
     );
     assert!(row.domain_error.is_none());
 }
+
+// ── 14.4b: device.send_command constraint enforcement ────────────
+
+/// Mint a bearer carrying an extended `TokenPolicy` envelope
+/// with the constraint blob under test. `scope_json` in the
+/// store accepts either shape (legacy scope array or the
+/// `{scopes, constraints}` object) — this helper always
+/// writes the extended shape so 14.4a's parse path runs.
+fn mint_bearer_with_constraint(engine: &Engine, id: &str, constraints_json: &str) -> String {
+    let scope_json = format!(r#"{{"scopes":["*"],"constraints":{constraints_json}}}"#);
+    engine
+        .auth_tokens()
+        .create(id, scope_json.as_bytes())
+        .expect("mint bearer with constraint")
+        .plaintext
+}
+
+/// Round-1 14.4b: a token whose
+/// `constraints.device.send_command.devices` allowlist
+/// doesn't cover the requested id must be refused with
+/// -32001 `SCOPE_DENIED` before the device lookup runs — the
+/// deny is the operator's policy, not registry state.
+///
+/// The mount now enforces the `device.send_command` /
+/// `devices` constraint entry, so this token verifies at
+/// bearer time; the refusal happens inside `tools::call`.
+#[tokio::test(flavor = "current_thread")]
+async fn device_send_command_constraint_refuses_disallowed_device_id() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "restricted",
+        r#"{"device.send_command":{"devices":["dev-a1b2c3d4*"]}}"#,
+    );
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": "dev-ffffffffffffffff",
+                "capability": "switch",
+                "action": "toggle",
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "constraint refusal must land as SCOPE_DENIED; got {response}",
+    );
+}
+
+/// Round-1 14.4b: a token whose allowlist covers the id
+/// clears the constraint check — it then falls through to
+/// the same "unknown device" path any other authorized
+/// caller sees for a nonexistent id. Verifies constraint
+/// enforcement is a **pure filter** on the caller-supplied
+/// string, not a rewrite / lookup / side effect.
+#[tokio::test(flavor = "current_thread")]
+async fn device_send_command_constraint_admits_allowed_id() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "restricted-allow",
+        r#"{"device.send_command":{"devices":["dev-a1b2c3d4*"]}}"#,
+    );
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": "dev-a1b2c3d400000001",
+                "capability": "switch",
+                "action": "toggle",
+            }
+        }),
+    )
+    .await;
+    // Constraint cleared → unknown-device tool-level
+    // ExecErr, NOT a protocol-level SCOPE_DENIED.
+    assert!(
+        response["error"].is_null(),
+        "allowed id must clear constraint gate; got {response}",
+    );
+    assert_eq!(
+        response["result"]["isError"], true,
+        "unknown device is a tool-level error; got {response}",
+    );
+}
+
+/// Round-1 14.4b: an empty `devices` allowlist means
+/// *deny-all* (14.4a's `Option<Vec<String>>` contract:
+/// `Some(vec![])` != `None`). Any id must refuse.
+#[tokio::test(flavor = "current_thread")]
+async fn device_send_command_empty_allowlist_refuses_every_id() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "deny-all",
+        r#"{"device.send_command":{"devices":[]}}"#,
+    );
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "device.send_command",
+            "arguments": {
+                "device_id": "dev-a1b2c3d4e5f60718",
+                "capability": "switch",
+                "action": "toggle",
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "empty allowlist must deny every id; got {response}",
+    );
+}
+
+/// Round-1 14.4b: bearer-time gate still refuses a
+/// constraint carrying `plugins` on `device.send_command`
+/// (round-6 P1 protection from 14.4a). The device dispatch
+/// site doesn't read `plugins`, so the field would sit inert
+/// and the actor would have unrestricted device access. The
+/// mount's `enforce_plugins: false` on this entry catches it
+/// at bearer time — before the router even hands the request
+/// to the handler.
+#[tokio::test(flavor = "current_thread")]
+async fn device_send_command_field_mismatch_refused_at_bearer() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt;
+
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "wrong-field",
+        r#"{"device.send_command":{"plugins":["acme.*"]}}"#,
+    );
+    let router = build_router(engine);
+
+    // Bearer-refuse happens on the first request against the
+    // mount, not via the MCP JSON-RPC error channel — the
+    // middleware returns 403 before rmcp sees anything. Send
+    // a plain POST to the mount and assert 403.
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(oxidhome_core::api::MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "constraint carrying `plugins` on device.send_command must refuse at bearer time",
+    );
+}
