@@ -2988,7 +2988,7 @@ async fn plugins_start_constraint_refuses_disallowed_plugin_id() {
 
 /// An allowed `plugin_id` clears the constraint gate — the
 /// tool then reports whatever it would for a nonexistent
-/// plugin (tool-level ExecErr, not a protocol scope denial).
+/// plugin (tool-level `ExecErr`, not a protocol scope denial).
 /// One test covers all four; the branches share the check.
 #[tokio::test(flavor = "current_thread")]
 async fn plugins_show_constraint_admits_matching_plugin_id() {

@@ -180,10 +180,15 @@ pub struct ToolConstraint {
     ///
     /// **`plugins.install` is a special case**: the tool
     /// takes a `source_dir`, not a `plugin_id` — the id is
-    /// only known after the manifest is read. When 14.4c
-    /// wires enforcement, the `plugins.install` dispatch site
-    /// must parse the manifest and validate the resulting
-    /// plugin id **before** any installation side effects
+    /// only known after the manifest is read. 14.4c wires
+    /// enforcement for the other four `plugins.*` tools and
+    /// leaves `plugins.install` deferred to 14.4d; until then
+    /// a token carrying a `plugins.install` constraint
+    /// refuses at bearer time (the key isn't in the mount's
+    /// enforced set). When 14.4d lands, the
+    /// `plugins.install` dispatch site must parse the
+    /// manifest and validate the resulting plugin id
+    /// **before** any installation side effects
     /// (the on-disk `plugins/<id>/` layout, the `plugin_installation`
     /// row, the running-instance guards). Refusing a manifest
     /// mid-install is fine; refusing it after the on-disk

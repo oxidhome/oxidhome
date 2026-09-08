@@ -2043,6 +2043,13 @@ struct PluginsUninstallBody {
     plugin_id: String,
 }
 
+// Uninstall is a linear FS/SQL choreography — lifecycle-lock
+// acquire, running-instance guard, spawn_blocking(compose
+// uninstall), audit-taxonomy shaping. Splitting the arms into
+// helpers would fragment the flow across three fns without
+// making any single one clearer; same rationale as the
+// `#[allow]` on `call` at the top of this module.
+#[allow(clippy::too_many_lines)]
 async fn plugins_uninstall_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
