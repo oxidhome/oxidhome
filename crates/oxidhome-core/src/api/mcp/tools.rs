@@ -1050,7 +1050,7 @@ impl ToolOutcome {
 /// constraint refusals from scope refusals.
 ///
 /// Kept in sync with the MCP mount's `EnforcedConstraint`
-/// entry in `api::mcp::server::mount_routes` — adding the
+/// entry in `api::mcp::server::mount_inner` — adding the
 /// entry there without matching this constant (or vice versa)
 /// would drift the audit shape from the enforcement shape.
 pub(super) const CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES: &str =

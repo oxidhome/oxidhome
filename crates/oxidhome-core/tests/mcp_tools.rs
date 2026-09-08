@@ -2752,7 +2752,7 @@ fn mint_bearer_with_constraint(engine: &Engine, id: &str, constraints_json: &str
 /// Round-1 14.4b: a token whose
 /// `constraints.device.send_command.devices` allowlist
 /// doesn't cover the requested id must be refused with
-/// -32001 SCOPE_DENIED before the device lookup runs — the
+/// -32001 `SCOPE_DENIED` before the device lookup runs — the
 /// deny is the operator's policy, not registry state.
 ///
 /// The mount now enforces the `device.send_command` /
@@ -2815,7 +2815,7 @@ async fn device_send_command_constraint_admits_allowed_id() {
         json!({
             "name": "device.send_command",
             "arguments": {
-                "device_id": "dev-a1b2c3d4000001",
+                "device_id": "dev-a1b2c3d400000001",
                 "capability": "switch",
                 "action": "toggle",
             }
