@@ -643,10 +643,12 @@ pub(super) async fn call(
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => events_history_call(engine.clone(), request.arguments).await,
         "plugins.list" => plugins_list_call(&engine, request.arguments),
-        "plugins.show" => plugins_show_call(&engine, request.arguments),
-        "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments).await,
-        "plugins.uninstall" => plugins_uninstall_call(engine.clone(), request.arguments).await,
-        "plugins.start" => plugins_start_call(engine.clone(), request.arguments).await,
+        "plugins.show" => plugins_show_call(&engine, request.arguments, actor),
+        "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments, actor).await,
+        "plugins.uninstall" => {
+            plugins_uninstall_call(engine.clone(), request.arguments, actor).await
+        }
+        "plugins.start" => plugins_start_call(engine.clone(), request.arguments, actor).await,
         "plugins.install" => plugins_install_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
@@ -1042,19 +1044,24 @@ impl ToolOutcome {
 
 // ── device.send_command ─────────────────────────────────────────
 
-/// Phase 14.4b: `required_scope` sentinel written to the audit
-/// ledger when `device.send_command` refuses a call because
-/// the token's `devices` allowlist doesn't cover the requested
-/// `device_id`. Distinct from the flat-scope sentinel
-/// (`devices:command`) so an operator's ledger scan can slice
+/// Phase 14.4b/c: `required_scope` sentinels written to the
+/// audit ledger when a per-tool `ToolConstraint` refuses a
+/// call. Format: `constraint:<tool>:<field>` — distinct from
+/// the flat-scope sentinels so operators can slice
 /// constraint refusals from scope refusals.
 ///
-/// Kept in sync with the MCP mount's `EnforcedConstraint`
-/// entry in `api::mcp::server::mount_inner` — adding the
-/// entry there without matching this constant (or vice versa)
-/// would drift the audit shape from the enforcement shape.
+/// Each constant is kept in sync with the matching
+/// `EnforcedConstraint` entry in
+/// `api::mcp::server::mount_inner` — adding an entry there
+/// without a matching sentinel (or vice versa) would drift
+/// the audit shape from the enforcement shape.
 pub(super) const CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES: &str =
     "constraint:device.send_command:devices";
+pub(super) const CONSTRAINT_PLUGINS_SHOW_PLUGINS: &str = "constraint:plugins.show:plugins";
+pub(super) const CONSTRAINT_PLUGINS_STOP_PLUGINS: &str = "constraint:plugins.stop:plugins";
+pub(super) const CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS: &str =
+    "constraint:plugins.uninstall:plugins";
+pub(super) const CONSTRAINT_PLUGINS_START_PLUGINS: &str = "constraint:plugins.start:plugins";
 
 /// Cap on the plugin-supplied error message before we let it
 /// enter any JSON serialisation. The WIT contract lets a
@@ -1781,6 +1788,7 @@ struct PluginsShowArgs {
 fn plugins_show_call(
     engine: &Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    actor: &Actor,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams("plugins.show requires a `plugin_id` argument".into());
@@ -1795,6 +1803,18 @@ fn plugins_show_call(
     };
     if args.plugin_id.is_empty() {
         return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
+    }
+
+    // Phase 14.4c: enforce `plugins` allowlist BEFORE the
+    // detail lookup so the not-installed / not-installed
+    // paths can't be used to probe an id the operator's
+    // policy hides.
+    if let Some(cx) = actor.constraint("plugins.show")
+        && !cx.allows_plugin(&args.plugin_id)
+    {
+        return ToolOutcome::Denied {
+            required: CONSTRAINT_PLUGINS_SHOW_PLUGINS,
+        };
     }
 
     let Some(body) = super::resources::plugins_detail_body(engine, &args.plugin_id) else {
@@ -1884,6 +1904,7 @@ struct PluginsStopBody {
 async fn plugins_stop_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    actor: &Actor,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams("plugins.stop requires a `plugin_id` argument".into());
@@ -1903,6 +1924,17 @@ async fn plugins_stop_call(
         return ToolOutcome::InvalidParams(
             "`instance_id`, when supplied, must not be empty".into(),
         );
+    }
+
+    // Phase 14.4c: enforce `plugins` allowlist BEFORE
+    // touching the instance registry so a disallowed id
+    // can't infer running-state through timing / semantics.
+    if let Some(cx) = actor.constraint("plugins.stop")
+        && !cx.allows_plugin(&args.plugin_id)
+    {
+        return ToolOutcome::Denied {
+            required: CONSTRAINT_PLUGINS_STOP_PLUGINS,
+        };
     }
 
     // Mirror the REST handler: iterate the registry, filter to
@@ -2014,6 +2046,7 @@ struct PluginsUninstallBody {
 async fn plugins_uninstall_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    actor: &Actor,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams(
@@ -2030,6 +2063,17 @@ async fn plugins_uninstall_call(
     };
     if args.plugin_id.is_empty() {
         return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
+    }
+
+    // Phase 14.4c: enforce `plugins` allowlist BEFORE
+    // acquiring the lifecycle lock so a disallowed id can't
+    // starve a concurrent lookup for the same key.
+    if let Some(cx) = actor.constraint("plugins.uninstall")
+        && !cx.allows_plugin(&args.plugin_id)
+    {
+        return ToolOutcome::Denied {
+            required: CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS,
+        };
     }
 
     // Mirror REST's uninstall: hold the per-plugin_id
@@ -2233,6 +2277,7 @@ struct PluginsStartBody {
 async fn plugins_start_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    actor: &Actor,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams("plugins.start requires a `plugin_id` argument".into());
@@ -2252,6 +2297,18 @@ async fn plugins_start_call(
         return ToolOutcome::InvalidParams(
             "`instance_id`, when supplied, must not be empty".into(),
         );
+    }
+
+    // Phase 14.4c: enforce `plugins` allowlist BEFORE the
+    // manifest scan / supervisor spawn — a disallowed id
+    // shouldn't observably touch the FS or the process
+    // table.
+    if let Some(cx) = actor.constraint("plugins.start")
+        && !cx.allows_plugin(&args.plugin_id)
+    {
+        return ToolOutcome::Denied {
+            required: CONSTRAINT_PLUGINS_START_PLUGINS,
+        };
     }
 
     let instance_id = args.instance_id.unwrap_or_else(|| args.plugin_id.clone());

@@ -252,28 +252,56 @@ fn mount_inner(
     let auth_state = super::super::auth::AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // Phase 14.4b: `device.send_command` now enforces
-        // its `devices` allowlist inside `tools::call` (see
-        // `tools::CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES`).
-        // Added here atomically with that dispatch-site
+        // Phase 14.4b/c: each entry names a tool key + which
+        // `ToolConstraint` fields the dispatch site consults.
+        // Added atomically with the corresponding dispatch
         // check so bearer time and dispatch time can't drift.
         //
-        // Each entry names its key + which `ToolConstraint`
-        // fields (`enforce_devices` / `enforce_plugins`) the
-        // dispatch site actually consults. A bearer whose
-        // policy carries `plugins` on `device.send_command`
-        // is still refused at verify time — the field would
-        // sit inert (the device-only dispatch check never
-        // reads it).
+        // 14.4b: `device.send_command` / `devices` (see
+        //   `tools::CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES`).
+        // 14.4c: four `plugins.*` entries / `plugins`
+        //   (`plugins.show`, `plugins.stop`,
+        //   `plugins.uninstall`, `plugins.start`). Each
+        //   consults `actor.constraint(<tool>).allows_plugin`
+        //   before touching any state so a disallowed id
+        //   can't probe existence / running-state / FS
+        //   through timing.
         //
-        // 14.4c adds five `plugins.*` entries
-        // (each `enforce_plugins: true, enforce_devices:
-        // false`) atomically with each tool's dispatch check.
-        enforced_constraints: &[crate::auth::EnforcedConstraint {
-            key: "device.send_command",
-            enforce_devices: true,
-            enforce_plugins: false,
-        }],
+        // `plugins.install` is deferred to 14.4d — the tool
+        // takes a `source_dir`, not a `plugin_id`; the id is
+        // manifest-derived and enforcement must run BEFORE
+        // any on-disk / SQL side effects so a mid-install
+        // refusal doesn't leave orphan state. Until that
+        // slice lands, a token with a `plugins.install`
+        // constraint refuses at bearer time (this entry is
+        // absent from the enforced set).
+        enforced_constraints: &[
+            crate::auth::EnforcedConstraint {
+                key: "device.send_command",
+                enforce_devices: true,
+                enforce_plugins: false,
+            },
+            crate::auth::EnforcedConstraint {
+                key: "plugins.show",
+                enforce_devices: false,
+                enforce_plugins: true,
+            },
+            crate::auth::EnforcedConstraint {
+                key: "plugins.stop",
+                enforce_devices: false,
+                enforce_plugins: true,
+            },
+            crate::auth::EnforcedConstraint {
+                key: "plugins.uninstall",
+                enforce_devices: false,
+                enforce_plugins: true,
+            },
+            crate::auth::EnforcedConstraint {
+                key: "plugins.start",
+                enforce_devices: false,
+                enforce_plugins: true,
+            },
+        ],
     };
 
     // `route_service` — the exact `/api/v1/mcp` path only, no
