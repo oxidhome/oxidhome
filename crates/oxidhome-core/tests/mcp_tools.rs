@@ -3019,45 +3019,100 @@ async fn plugins_show_constraint_admits_matching_plugin_id() {
     );
 }
 
-/// `plugins.install` is deferred to 14.4d (constraint key
-/// intentionally NOT in the enforced set — the tool takes a
-/// `source_dir`, not a `plugin_id`, and enforcement must run
-/// against the manifest-derived id BEFORE any on-disk / SQL
-/// side effects). Until then, a token that carries a
-/// `plugins.install` constraint must refuse at bearer time
-/// (403) — proof that the enforced-set gate covers the
-/// "key present, no enforcement" fail-open case.
-#[tokio::test(flavor = "current_thread")]
-async fn plugins_install_constraint_refused_at_bearer() {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode, header};
-    use tower::ServiceExt;
+// ── 14.4d: plugins.install constraint against manifest-derived id ─
 
-    let engine = Engine::new().expect("engine");
+/// A token whose `plugins.install` allowlist doesn't cover
+/// the manifest-derived `plugin_id` must be refused as
+/// `SCOPE_DENIED`. The refusal fires inside
+/// `installed_plugins::install_gated` AFTER the manifest is
+/// parsed but BEFORE any FS or SQL side effect — so no
+/// orphan `<state_dir>/plugins/<id>/` dir, no orphan
+/// `plugin_installation` row, no in-memory registration.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_install_constraint_refuses_disallowed_manifest_id() {
+    let plugin_id = "example.install-constraint-deny";
+    let source = stage_install_source("mcp-install-constraint-deny-src", plugin_id);
+    let state_dir = _support::tempdir("mcp-install-constraint-deny-state");
+
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
     let bearer = mint_bearer_with_constraint(
         &engine,
-        "install-constrained",
+        "install-restricted-deny",
         r#"{"plugins.install":{"plugins":["acme.*"]}}"#,
     );
-    let router = build_router(engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
 
-    let resp = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(oxidhome_core::api::MCP_ENDPOINT)
-                .header(header::HOST, MCP_HOST)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
-                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-                .body(Body::from(initialize_body()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.install", "arguments": {
+            "source_dir": source.path().display().to_string(),
+        }}),
+    )
+    .await;
     assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "plugins.install constraint must refuse at bearer time until 14.4d wires enforcement",
+        response["error"]["code"], -32001,
+        "constraint refusal must land as `SCOPE_DENIED`; got {response}",
+    );
+
+    // Registry must not carry an entry — no orphan state.
+    assert!(
+        engine.installed_plugins().get(plugin_id).is_none(),
+        "refused install must not register the plugin",
+    );
+    // Dest dir must not exist.
+    let dest = state_dir.path().join("plugins").join(plugin_id);
+    assert!(
+        !dest.exists(),
+        "refused install must not create the on-disk layout; found {}",
+        dest.display(),
+    );
+}
+
+/// A token whose `plugins.install` allowlist covers the
+/// manifest-derived `plugin_id` completes the install
+/// normally — proof that the gate is a pure filter on the
+/// manifest id, not a state-mutating rewrite.
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_install_constraint_admits_matching_manifest_id() {
+    let plugin_id = "acme.install-constraint-allow";
+    let source = stage_install_source("mcp-install-constraint-allow-src", plugin_id);
+    let state_dir = _support::tempdir("mcp-install-constraint-allow-state");
+
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "install-restricted-allow",
+        r#"{"plugins.install":{"plugins":["acme.*"]}}"#,
+    );
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.install", "arguments": {
+            "source_dir": source.path().display().to_string(),
+        }}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "allowed manifest id must clear the gate; got {response}",
+    );
+    let result = &response["result"];
+    assert_ne!(
+        result["isError"], true,
+        "install must succeed; got {response}"
+    );
+    assert_eq!(result["structuredContent"]["plugin_id"], plugin_id);
+    assert!(
+        engine.installed_plugins().get(plugin_id).is_some(),
+        "allowed install must register the plugin",
     );
 }

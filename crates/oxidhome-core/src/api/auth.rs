@@ -159,11 +159,10 @@ pub(crate) struct AuthState {
     /// dispatch-site check — 14.4b adds `("device.send_command",
     /// devices)` on MCP; 14.4c adds four `plugins.*` entries
     /// (`show`, `stop`, `uninstall`, `start`) with `plugins`
-    /// on MCP; 14.4d adds `plugins.install` once the
-    /// manifest-derived-id check lands (the tool takes
-    /// `source_dir`, not `plugin_id`, so enforcement must
-    /// run against the parsed manifest before any on-disk /
-    /// SQL side effects to avoid orphan state).
+    /// on MCP; 14.4d adds `plugins.install` with `plugins`
+    /// (enforced inside `installed_plugins::install_gated`
+    /// against the manifest-derived id before any FS or SQL
+    /// side effect).
     ///
     /// Round-6 P1 on PR #147 replaced the per-key-only set
     /// with per-(key, field) entries — a plain key set would

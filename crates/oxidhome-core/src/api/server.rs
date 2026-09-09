@@ -1763,6 +1763,15 @@ impl From<InstallError> for PluginLifecycleError {
             // the FS side effect was rolled back by
             // `InstalledPluginRegistry::install`.
             InstallError::Persistence(err) => Self::Internal(err.into()),
+            // Phase 14.4d: `ConstraintDenied` is produced only by
+            // `install_gated`, which REST doesn't call — REST goes
+            // through the no-op `install` wrapper. Surface as
+            // `Internal` defensively so a future rewire to
+            // `install_gated` doesn't silently drop the refusal;
+            // the audit log captures the specific case.
+            InstallError::ConstraintDenied { required, .. } => Self::Internal(anyhow::anyhow!(
+                "unexpected constraint denial on REST install path: {required}",
+            )),
         }
     }
 }

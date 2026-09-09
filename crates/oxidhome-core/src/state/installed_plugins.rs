@@ -672,6 +672,17 @@ pub enum InstallError {
     /// internal error rather than an operator-fixable I/O issue.
     #[error("persisting installation identity: {0}")]
     Persistence(#[from] rusqlite::Error),
+    /// Phase 14.4d: an install-time gate (currently the MCP
+    /// token-policy check on `plugins.install`) refused the
+    /// manifest-derived `plugin_id`. Raised BEFORE any FS or
+    /// SQL side effect fires so a refused install leaves no
+    /// orphan state — the `required` sentinel names the
+    /// scope-shaped audit slot the caller was missing.
+    #[error("install refused for plugin {plugin_id}: {required}")]
+    ConstraintDenied {
+        plugin_id: String,
+        required: &'static str,
+    },
 }
 
 /// Why an uninstall failed.
@@ -1605,8 +1616,37 @@ impl InstalledPluginRegistry {
     // in-memory registration. Splitting the SQL rollback closure
     // away from the FS steps would obscure the ordering guarantee
     // the C1b review F3 fixup depends on.
-    #[allow(clippy::too_many_lines)]
     pub fn install(&self, source_dir: &Path) -> Result<InstalledPlugin, InstallError> {
+        // No-op gate: the plain `install` entrypoint keeps its
+        // pre-14.4d shape so every existing caller (REST +
+        // Connect + tests) stays untouched. `install_gated` is
+        // the constraint-checking variant the MCP tool uses.
+        self.install_gated(source_dir, |_| Ok(()))
+    }
+
+    /// Install with a caller-provided gate that runs against
+    /// the manifest-derived `plugin_id` AFTER the manifest is
+    /// parsed and the id-safety check passes, but BEFORE any
+    /// FS or SQL side effect (staging copy, SQL INSERT, dest
+    /// activation). A gate `Err(required)` refuses the install
+    /// with [`InstallError::ConstraintDenied`] and leaves no
+    /// orphan state — no dir, no row, no in-memory
+    /// registration.
+    ///
+    /// Same manifest read the install proceeds with feeds the
+    /// gate, so a mid-check source-dir swap can't smuggle a
+    /// different id past the gate.
+    ///
+    /// Round 14.4d.
+    #[allow(clippy::too_many_lines)]
+    pub fn install_gated<F>(
+        &self,
+        source_dir: &Path,
+        id_gate: F,
+    ) -> Result<InstalledPlugin, InstallError>
+    where
+        F: FnOnce(&str) -> Result<(), &'static str>,
+    {
         let plugins_root = self
             .plugins_root
             .as_ref()
@@ -1636,6 +1676,17 @@ impl InstalledPluginRegistry {
             return Err(InstallError::BadManifest {
                 path: manifest_path,
                 reason: format!("plugin id {plugin_id:?} contains an unsafe character"),
+            });
+        }
+        // Phase 14.4d: run the caller-supplied gate against
+        // the manifest-derived id BEFORE any staging /
+        // INSERT / activate step below. A refuse here is
+        // safe to surface as a scope-shaped denial — no
+        // FS / SQL / in-memory state has been touched yet.
+        if let Err(required) = id_gate(&plugin_id) {
+            return Err(InstallError::ConstraintDenied {
+                plugin_id,
+                required,
             });
         }
         let dest = plugins_root.join(&plugin_id);

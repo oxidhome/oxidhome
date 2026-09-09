@@ -649,7 +649,7 @@ pub(super) async fn call(
             plugins_uninstall_call(engine.clone(), request.arguments, actor).await
         }
         "plugins.start" => plugins_start_call(engine.clone(), request.arguments, actor).await,
-        "plugins.install" => plugins_install_call(engine.clone(), request.arguments).await,
+        "plugins.install" => plugins_install_call(engine.clone(), request.arguments, actor).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -1062,6 +1062,7 @@ pub(super) const CONSTRAINT_PLUGINS_STOP_PLUGINS: &str = "constraint:plugins.sto
 pub(super) const CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS: &str =
     "constraint:plugins.uninstall:plugins";
 pub(super) const CONSTRAINT_PLUGINS_START_PLUGINS: &str = "constraint:plugins.start:plugins";
+pub(super) const CONSTRAINT_PLUGINS_INSTALL_PLUGINS: &str = "constraint:plugins.install:plugins";
 
 /// Cap on the plugin-supplied error message before we let it
 /// enter any JSON serialisation. The WIT contract lets a
@@ -2462,6 +2463,7 @@ struct PluginsInstallBody {
 async fn plugins_install_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    actor: &Actor,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams(
@@ -2494,15 +2496,44 @@ async fn plugins_install_call(
         ));
     }
 
+    // Phase 14.4d: build the gate against the actor's
+    // `plugins.install` constraint. It runs inside
+    // `install_gated` against the manifest-derived id BEFORE
+    // any FS/SQL side effect, so a refuse leaves no orphan
+    // state. `None` = no constraint (unrestricted subject to
+    // flat scope).
+    //
+    // Cloned into the spawn_blocking below because the gate
+    // captures the constraint reference; the whole closure
+    // must be 'static + Send. Constraint blobs are small
+    // (a couple of Vec<String>).
+    let constraint = actor.constraint("plugins.install").cloned();
+
     // REST wraps the sync install in `spawn_blocking` so a slow
     // disk doesn't stall the axum runtime — same reasoning
     // holds for MCP's rmcp task. The registry itself does the
     // FS + SQL work.
     let installed_registry = engine.installed_plugins();
-    let join = tokio::task::spawn_blocking(move || installed_registry.install(&source)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        installed_registry.install_gated(&source, |plugin_id| {
+            if let Some(cx) = &constraint
+                && !cx.allows_plugin(plugin_id)
+            {
+                return Err(CONSTRAINT_PLUGINS_INSTALL_PLUGINS);
+            }
+            Ok(())
+        })
+    })
+    .await;
 
     let installed = match join {
         Ok(Ok(installed)) => installed,
+        Ok(Err(crate::state::InstallError::ConstraintDenied {
+            plugin_id: _,
+            required,
+        })) => {
+            return ToolOutcome::Denied { required };
+        }
         Ok(Err(crate::state::InstallError::SourceMissing(path))) => {
             return ToolOutcome::ExecErr {
                 message: format!(

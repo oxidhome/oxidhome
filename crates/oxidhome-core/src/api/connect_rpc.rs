@@ -735,6 +735,19 @@ fn install_error_to_connect(err: InstallError) -> ConnectError {
             tracing::error!(target: "api.plugins", error = %err, "install persistence error");
             ConnectError::internal("install persistence error")
         }
+        // Phase 14.4d: `ConstraintDenied` is produced only by
+        // `install_gated`, which Connect doesn't call — Connect
+        // uses the no-op `install` wrapper. Surface as
+        // `internal` defensively so a future rewire to
+        // `install_gated` doesn't silently drop the refusal.
+        InstallError::ConstraintDenied { required, .. } => {
+            tracing::error!(
+                target: "api.plugins",
+                required,
+                "unexpected constraint denial on Connect install path",
+            );
+            ConnectError::internal("install constraint error")
+        }
     }
 }
 
