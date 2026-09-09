@@ -51,6 +51,9 @@ pub use installed_plugins::{
     content_digest, effective_capabilities, read_installed_bytes, recompute_digest_and_manifest,
     recompute_installed_digest,
 };
+// Crate-private wrapper for the gated-install flow; see the
+// type doc for why this stays out of the public re-export.
+pub(crate) use installed_plugins::GatedInstallError;
 pub(crate) use kv::stored_value_size;
 pub use kv::{KvError, KvStore};
 pub use log_store::{

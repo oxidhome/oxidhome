@@ -2526,15 +2526,30 @@ async fn plugins_install_call(
     })
     .await;
 
-    let installed = match join {
-        Ok(Ok(installed)) => installed,
-        Ok(Err(crate::state::InstallError::ConstraintDenied {
+    // Phase 14.4d: `install_gated` returns a crate-private
+    // `GatedInstallError` wrapper. Peel the constraint-refuse
+    // variant off first (that's what this tool added); the
+    // remaining `Install(InstallError)` variants are the
+    // pre-14.4d public shape and get the same treatment REST
+    // + Connect give them.
+    let install_result = match join {
+        Ok(Ok(installed)) => Ok(installed),
+        Ok(Err(crate::state::GatedInstallError::ConstraintDenied {
             plugin_id: _,
             required,
         })) => {
             return ToolOutcome::Denied { required };
         }
-        Ok(Err(crate::state::InstallError::SourceMissing(path))) => {
+        Ok(Err(crate::state::GatedInstallError::Install(err))) => Err(err),
+        Err(join_err) => {
+            tracing::error!(target: "mcp.tool.plugins.install", %join_err, "install task panicked");
+            return ToolOutcome::Internal("install task panicked".into());
+        }
+    };
+
+    let installed = match install_result {
+        Ok(installed) => installed,
+        Err(crate::state::InstallError::SourceMissing(path)) => {
             return ToolOutcome::ExecErr {
                 message: format!(
                     "source dir is missing or has no manifest.toml: {}",
@@ -2550,7 +2565,7 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
-        Ok(Err(crate::state::InstallError::AlreadyInstalled { plugin_id })) => {
+        Err(crate::state::InstallError::AlreadyInstalled { plugin_id }) => {
             return ToolOutcome::ExecErr {
                 message: format!("plugin `{plugin_id}` is already installed"),
                 structured: Some(json!({
@@ -2560,7 +2575,7 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
-        Ok(Err(crate::state::InstallError::BadManifest { path, reason })) => {
+        Err(crate::state::InstallError::BadManifest { path, reason }) => {
             // Round-2 P2 on PR #134: `BadManifest.reason` is
             // authored by the internal parser and freely
             // interpolates `path.display()` (`parsing
@@ -2586,7 +2601,7 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
-        Ok(Err(crate::state::InstallError::NoPluginsRoot)) => {
+        Err(crate::state::InstallError::NoPluginsRoot) => {
             return ToolOutcome::ExecErr {
                 message: "install requires a state-dir-backed engine".into(),
                 structured: Some(json!({
@@ -2595,7 +2610,7 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
-        Ok(Err(err)) => {
+        Err(err) => {
             // Round-1 P2 lesson from PR #132: `InstallError::Io`
             // can carry absolute filesystem paths;
             // `InstallError::Persistence` can carry SQLite
@@ -2608,10 +2623,6 @@ async fn plugins_install_call(
                 "install failed",
             );
             return ToolOutcome::Internal("install failed; see server logs for details".into());
-        }
-        Err(join_err) => {
-            tracing::error!(target: "mcp.tool.plugins.install", %join_err, "install task panicked");
-            return ToolOutcome::Internal("install task panicked".into());
         }
     };
 

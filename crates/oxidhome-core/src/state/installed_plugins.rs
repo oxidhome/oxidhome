@@ -672,12 +672,30 @@ pub enum InstallError {
     /// internal error rather than an operator-fixable I/O issue.
     #[error("persisting installation identity: {0}")]
     Persistence(#[from] rusqlite::Error),
-    /// Phase 14.4d: an install-time gate (currently the MCP
-    /// token-policy check on `plugins.install`) refused the
-    /// manifest-derived `plugin_id`. Raised BEFORE any FS or
-    /// SQL side effect fires so a refused install leaves no
-    /// orphan state — the `required` sentinel names the
-    /// scope-shaped audit slot the caller was missing.
+}
+
+/// Phase 14.4d: crate-private wrapper around [`InstallError`]
+/// used by [`InstalledPluginRegistry::install_gated`] so the
+/// MCP-specific constraint-refusal variant doesn't leak into
+/// the public `InstallError` shape (which is `pub use`d from
+/// `state` and matched exhaustively by REST + Connect).
+///
+/// The plain `install` entrypoint remains an
+/// `InstallError`-returning API; only `install_gated` (called
+/// from the MCP tool) sees this wrapper. `From<InstallError>`
+/// keeps the internal call sites propagating pipeline errors
+/// with `?`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GatedInstallError {
+    /// The install pipeline itself failed — same variants as
+    /// the pre-14.4d public shape.
+    #[error(transparent)]
+    Install(#[from] InstallError),
+    /// The caller-supplied gate refused the manifest-derived
+    /// `plugin_id`. Raised BEFORE any FS or SQL side effect
+    /// fires so a refused install leaves no orphan state; the
+    /// `required` sentinel names the scope-shaped audit slot
+    /// the caller was missing.
     #[error("install refused for plugin {plugin_id}: {required}")]
     ConstraintDenied {
         plugin_id: String,
@@ -1617,11 +1635,18 @@ impl InstalledPluginRegistry {
     // away from the FS steps would obscure the ordering guarantee
     // the C1b review F3 fixup depends on.
     pub fn install(&self, source_dir: &Path) -> Result<InstalledPlugin, InstallError> {
-        // No-op gate: the plain `install` entrypoint keeps its
-        // pre-14.4d shape so every existing caller (REST +
-        // Connect + tests) stays untouched. `install_gated` is
-        // the constraint-checking variant the MCP tool uses.
-        self.install_gated(source_dir, |_| Ok(()))
+        // Pre-14.4d shape: no gate, `InstallError` return type
+        // — every existing caller (REST + Connect + tests)
+        // stays untouched. `install_gated` is the
+        // constraint-checking variant the MCP tool uses.
+        match self.install_gated(source_dir, |_| Ok(())) {
+            Ok(installed) => Ok(installed),
+            Err(GatedInstallError::Install(err)) => Err(err),
+            // Unreachable: the no-op gate returns `Ok(())`.
+            Err(GatedInstallError::ConstraintDenied { .. }) => {
+                unreachable!("no-op gate cannot refuse an install")
+            }
+        }
     }
 
     /// Install with a caller-provided gate that runs against
@@ -1629,21 +1654,25 @@ impl InstalledPluginRegistry {
     /// parsed and the id-safety check passes, but BEFORE any
     /// FS or SQL side effect (staging copy, SQL INSERT, dest
     /// activation). A gate `Err(required)` refuses the install
-    /// with [`InstallError::ConstraintDenied`] and leaves no
-    /// orphan state — no dir, no row, no in-memory
+    /// with [`GatedInstallError::ConstraintDenied`] and leaves
+    /// no orphan state — no dir, no row, no in-memory
     /// registration.
     ///
     /// Same manifest read the install proceeds with feeds the
     /// gate, so a mid-check source-dir swap can't smuggle a
     /// different id past the gate.
     ///
+    /// `pub(crate)` — the wrapper error keeps
+    /// MCP-specific constraint-refusal semantics out of the
+    /// public `InstallError` shape (which is `pub use`d from
+    /// `state` and matched exhaustively by REST + Connect).
     /// Round 14.4d.
     #[allow(clippy::too_many_lines)]
-    pub fn install_gated<F>(
+    pub(crate) fn install_gated<F>(
         &self,
         source_dir: &Path,
         id_gate: F,
-    ) -> Result<InstalledPlugin, InstallError>
+    ) -> Result<InstalledPlugin, GatedInstallError>
     where
         F: FnOnce(&str) -> Result<(), &'static str>,
     {
@@ -1653,11 +1682,11 @@ impl InstalledPluginRegistry {
             .ok_or(InstallError::NoPluginsRoot)?;
 
         if !source_dir.is_dir() {
-            return Err(InstallError::SourceMissing(source_dir.to_path_buf()));
+            return Err(InstallError::SourceMissing(source_dir.to_path_buf()).into());
         }
         let manifest_path = source_dir.join("manifest.toml");
         if !manifest_path.is_file() {
-            return Err(InstallError::SourceMissing(source_dir.to_path_buf()));
+            return Err(InstallError::SourceMissing(source_dir.to_path_buf()).into());
         }
         let manifest =
             read_manifest_sync(&manifest_path).map_err(|reason| InstallError::BadManifest {
@@ -1676,7 +1705,8 @@ impl InstalledPluginRegistry {
             return Err(InstallError::BadManifest {
                 path: manifest_path,
                 reason: format!("plugin id {plugin_id:?} contains an unsafe character"),
-            });
+            }
+            .into());
         }
         // Phase 14.4d: run the caller-supplied gate against
         // the manifest-derived id BEFORE any staging /
@@ -1684,14 +1714,14 @@ impl InstalledPluginRegistry {
         // safe to surface as a scope-shaped denial — no
         // FS / SQL / in-memory state has been touched yet.
         if let Err(required) = id_gate(&plugin_id) {
-            return Err(InstallError::ConstraintDenied {
+            return Err(GatedInstallError::ConstraintDenied {
                 plugin_id,
                 required,
             });
         }
         let dest = plugins_root.join(&plugin_id);
         if dest.exists() {
-            return Err(InstallError::AlreadyInstalled { plugin_id });
+            return Err(InstallError::AlreadyInstalled { plugin_id }.into());
         }
 
         // C1b review F3: SQL INSERT first, FS copy second.
@@ -1731,18 +1761,19 @@ impl InstalledPluginRegistry {
         // `.staging-<uuid>` dir that scan's staging-cleanup path
         // removes, so no ghost identity or FS residue survives.
         if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
+            std::fs::remove_dir_all(&staging).map_err(InstallError::from)?;
         }
         if let Err(err) = copy_dir_recursive(source_dir, &staging) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(if err.kind() == std::io::ErrorKind::InvalidInput {
+            let install_err = if err.kind() == std::io::ErrorKind::InvalidInput {
                 InstallError::BadManifest {
                     path: source_dir.to_path_buf(),
                     reason: err.to_string(),
                 }
             } else {
                 InstallError::Io(err)
-            });
+            };
+            return Err(install_err.into());
         }
         let staged_manifest_path = staging.join("manifest.toml");
         // Round-2 F2: capture the manifest bytes at the
@@ -1772,7 +1803,8 @@ impl InstalledPluginRegistry {
                     return Err(InstallError::BadManifest {
                         path: staged_manifest_path,
                         reason: err.to_string(),
-                    });
+                    }
+                    .into());
                 }
             };
         // Belt and suspenders: refuse if the staged manifest
@@ -1788,7 +1820,8 @@ impl InstalledPluginRegistry {
                     "staged manifest plugin.id {:?} disagrees with source plugin.id {:?}",
                     staged_manifest.plugin.id, plugin_id
                 ),
-            });
+            }
+            .into());
         }
 
         // Phase 13 round-2 F5 + round-3 F1/F2 + round-4 F2:
@@ -1810,7 +1843,8 @@ impl InstalledPluginRegistry {
                     return Err(InstallError::BadManifest {
                         path: staged_manifest_path,
                         reason,
-                    });
+                    }
+                    .into());
                 }
             },
             None => None,
@@ -1828,7 +1862,7 @@ impl InstalledPluginRegistry {
                 Ok(b) => b,
                 Err(err) => {
                     let _ = std::fs::remove_dir_all(&staging);
-                    return Err(InstallError::Io(err));
+                    return Err(InstallError::Io(err).into());
                 }
             };
         let ui_frames = staged_ui_assets
@@ -1855,13 +1889,14 @@ impl InstalledPluginRegistry {
             && let Err(err) = insert_installation_row(db, &row)
         {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(if is_unique_constraint(&err) {
+            let install_err = if is_unique_constraint(&err) {
                 InstallError::AlreadyInstalled {
                     plugin_id: (*id_arc).to_string(),
                 }
             } else {
                 InstallError::Persistence(err)
-            });
+            };
+            return Err(install_err.into());
         }
 
         // Any FS failure past the SQL INSERT must roll back the
@@ -1885,7 +1920,7 @@ impl InstalledPluginRegistry {
 
         if let Err(err) = std::fs::rename(&staging, &dest) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(rollback_sql(InstallError::Io(err)));
+            return Err(rollback_sql(InstallError::Io(err)).into());
         }
 
         self.write_entries().insert(id_arc, row.clone());
