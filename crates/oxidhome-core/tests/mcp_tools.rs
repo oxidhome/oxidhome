@@ -2915,3 +2915,149 @@ async fn device_send_command_field_mismatch_refused_at_bearer() {
         "constraint carrying `plugins` on device.send_command must refuse at bearer time",
     );
 }
+
+// ── 14.4c: plugins.* constraint enforcement ─────────────────────
+
+/// A token whose `plugins` allowlist on a given `plugins.*`
+/// tool doesn't cover the requested `plugin_id` must be
+/// refused as `SCOPE_DENIED` before any state check runs —
+/// same pattern as 14.4b's `device.send_command`. Parameterised
+/// over the four tools that take a `plugin_id` directly.
+async fn assert_plugins_tool_refuses_disallowed(
+    tool: &str,
+    args_for: impl Fn() -> serde_json::Value,
+) {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        &format!("restricted-{tool}"),
+        &format!(r#"{{"{tool}":{{"plugins":["acme.*"]}}}}"#),
+    );
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": tool, "arguments": args_for()}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "{tool} constraint refusal must land as `SCOPE_DENIED`; got {response}",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_show_constraint_refuses_disallowed_plugin_id() {
+    assert_plugins_tool_refuses_disallowed(
+        "plugins.show",
+        || json!({"plugin_id": "outside.thermostat"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_stop_constraint_refuses_disallowed_plugin_id() {
+    assert_plugins_tool_refuses_disallowed(
+        "plugins.stop",
+        || json!({"plugin_id": "outside.thermostat"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_uninstall_constraint_refuses_disallowed_plugin_id() {
+    assert_plugins_tool_refuses_disallowed(
+        "plugins.uninstall",
+        || json!({"plugin_id": "outside.thermostat"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_start_constraint_refuses_disallowed_plugin_id() {
+    assert_plugins_tool_refuses_disallowed(
+        "plugins.start",
+        || json!({"plugin_id": "outside.thermostat"}),
+    )
+    .await;
+}
+
+/// An allowed `plugin_id` clears the constraint gate — the
+/// tool then reports whatever it would for a nonexistent
+/// plugin (tool-level `ExecErr`, not a protocol scope denial).
+/// One test covers all four; the branches share the check.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_show_constraint_admits_matching_plugin_id() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "restricted-show-allow",
+        r#"{"plugins.show":{"plugins":["acme.*"]}}"#,
+    );
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.show", "arguments": {"plugin_id": "acme.thermostat"}}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "allowed plugin_id must clear the constraint gate; got {response}",
+    );
+    assert_eq!(
+        response["result"]["isError"], true,
+        "unknown plugin is a tool-level error; got {response}",
+    );
+}
+
+/// `plugins.install` is deferred to 14.4d (constraint key
+/// intentionally NOT in the enforced set — the tool takes a
+/// `source_dir`, not a `plugin_id`, and enforcement must run
+/// against the manifest-derived id BEFORE any on-disk / SQL
+/// side effects). Until then, a token that carries a
+/// `plugins.install` constraint must refuse at bearer time
+/// (403) — proof that the enforced-set gate covers the
+/// "key present, no enforcement" fail-open case.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_install_constraint_refused_at_bearer() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt;
+
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "install-constrained",
+        r#"{"plugins.install":{"plugins":["acme.*"]}}"#,
+    );
+    let router = build_router(engine);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(oxidhome_core::api::MCP_ENDPOINT)
+                .header(header::HOST, MCP_HOST)
+                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
+                .header(header::ACCEPT, MCP_ACCEPT)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::from(initialize_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "plugins.install constraint must refuse at bearer time until 14.4d wires enforcement",
+    );
+}
