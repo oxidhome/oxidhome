@@ -3270,18 +3270,115 @@ async fn events_subscribe_returns_catchup_rows_immediately() {
         .as_array()
         .expect("events array");
     assert_eq!(events.len(), 2, "must return both rows; got {events:?}");
-    // `EventQuery` returns newest-first; order-agnostic
-    // assertion keeps the test tolerant of any future policy
-    // change while still pinning membership.
-    let ids: std::collections::BTreeSet<u64> =
-        events.iter().map(|e| e["id"].as_u64().unwrap()).collect();
-    assert!(
-        ids.contains(&id_a),
-        "batch missing id_a={id_a}; got {events:?}"
+    // Round-2 P1 on PR #157: subscribe queries the log in
+    // ASC order so a forward-cursor caller advancing to
+    // max(returned) never skips past-cursor rows. Pin the
+    // exact order.
+    assert_eq!(events[0]["id"].as_u64(), Some(id_a));
+    assert_eq!(events[1]["id"].as_u64(), Some(id_b));
+}
+
+/// Round-2 P1 on PR #157: forward-cursor semantics — over a
+/// batch cap, advancing `after_id` to `max(returned)` must
+/// walk the whole log without skipping. With DESC order, the
+/// first batch is the newest `limit` rows and its `max` skips
+/// past every earlier row; ASC order plus advance-to-max
+/// paginates cleanly.
+#[tokio::test(flavor = "current_thread")]
+async fn events_subscribe_forward_cursor_walks_past_batch_cap() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    // 3 events; batch cap = 2 forces a second call.
+    let id_1 = inject_event(&engine, "sub.walk.a");
+    let id_2 = inject_event(&engine, "sub.walk.b");
+    let id_3 = inject_event(&engine, "sub.walk.c");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"after_id": 0, "limit": 2, "timeout_ms": 0}}),
+    )
+    .await;
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert_eq!(events.len(), 2, "first batch capped at 2; got {events:?}");
+    assert_eq!(events[0]["id"].as_u64(), Some(id_1));
+    assert_eq!(events[1]["id"].as_u64(), Some(id_2));
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"after_id": id_2, "limit": 2, "timeout_ms": 0}}),
+    )
+    .await;
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert_eq!(
+        events.len(),
+        1,
+        "second batch must return id_3; got {events:?}"
     );
+    assert_eq!(events[0]["id"].as_u64(), Some(id_3));
+}
+
+/// Round-2 P2 on PR #157: bus events that clear the coarse
+/// bus filter but fail the log filter (e.g. wrong plugin)
+/// must NOT short-circuit the deadline. The tool re-arms the
+/// select on empty requeries until either matching rows
+/// arrive or the deadline actually elapses.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_subscribe_wake_loop_survives_unrelated_bus_events() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    // Publisher: emit an event whose plugin/instance don't
+    // match the caller's filter (default helper uses
+    // `com.example.subscribe-test` / `sub-a`).
+    let publisher_engine = engine.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        inject_event(&publisher_engine, "sub.wake-loop.unrelated");
+    });
+
+    let start = std::time::Instant::now();
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "events.subscribe",
+            "arguments": {
+                "after_id": 0,
+                // Filter that no injected event matches — the
+                // requery on wake returns 0 rows.
+                "plugin": "com.example.nobody",
+                "timeout_ms": 500,
+            }
+        }),
+    )
+    .await;
+    let elapsed = start.elapsed();
     assert!(
-        ids.contains(&id_b),
-        "batch missing id_b={id_b}; got {events:?}"
+        elapsed >= Duration::from_millis(450),
+        "unrelated bus wake must NOT short-circuit the deadline; returned in only {elapsed:?}",
+    );
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert!(
+        events.is_empty(),
+        "filter miss, empty batch; got {events:?}"
     );
 }
 

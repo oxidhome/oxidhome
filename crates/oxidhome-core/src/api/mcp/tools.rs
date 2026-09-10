@@ -74,6 +74,7 @@ use crate::api::scopes::{
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::events::EventFilter as BusEventFilter;
 use crate::host_impl::plugin::oxidhome::plugin::types::KeyValue;
 use crate::host_impl::plugin::oxidhome::plugin::types::Value;
 use crate::state::audit_log::AuditEntry;
@@ -1676,6 +1677,10 @@ async fn events_history_call(
         topic,
         after_id: args.after_id,
         before_id: args.before_id,
+        // Preserve pre-14.3-subscribe newest-first shape —
+        // history's default paginates via `before_id` walking
+        // backwards.
+        order: crate::state::EventOrder::Desc,
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     // Shared `STORE_QUERY_SEMAPHORE` — permit MOVES into the
@@ -1738,6 +1743,25 @@ async fn events_history_call(
 /// slots at 16 — a 30s subscribe pins one for that long).
 const EVENTS_SUBSCRIBE_DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const EVENTS_SUBSCRIBE_MAX_TIMEOUT_MS: u64 = 30_000;
+
+/// Round-1 P1 on PR #157: cap the number of *simultaneously
+/// waiting* `events.subscribe` calls at a value strictly
+/// below the mount's shared `PENDING_BODY_GATE` (16). If a
+/// hostile client held all 16 admission slots on 30-second
+/// subscribes, every other MCP call would starve for the
+/// full timeout; capping subscribes at 12 reserves 4 slots
+/// for the rest of the tool catalogue.
+///
+/// Saturation surfaces as `Busy` (`-32004` / 503) — same
+/// shape as the store-query saturation branch below. Clients
+/// see it before the tool starts any work, so a busy signal
+/// doesn't wait on the deadline.
+const EVENTS_SUBSCRIBE_INFLIGHT_MAX: usize = 12;
+
+static EVENTS_SUBSCRIBE_INFLIGHT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(EVENTS_SUBSCRIBE_INFLIGHT_MAX))
+    });
 
 fn events_subscribe_schema() -> serde_json::Map<String, JsonValue> {
     let schema = json!({
@@ -1876,6 +1900,21 @@ async fn events_subscribe_call(
         .unwrap_or(EVENTS_SUBSCRIBE_DEFAULT_TIMEOUT_MS)
         .min(EVENTS_SUBSCRIBE_MAX_TIMEOUT_MS);
 
+    // Round-1 P1 on PR #157: bound the number of simultaneously
+    // waiting subscribes so a hostile client can't hold every
+    // MCP admission slot for the full 30s deadline. Acquired
+    // BEFORE any bus subscription / log query so a rejected
+    // call does no work.
+    let Ok(inflight_permit) = Arc::clone(&EVENTS_SUBSCRIBE_INFLIGHT).try_acquire_owned() else {
+        tracing::warn!(
+            cap = EVENTS_SUBSCRIBE_INFLIGHT_MAX,
+            "MCP events.subscribe inflight cap reached — refusing call",
+        );
+        return ToolOutcome::Busy(format!(
+            "MCP events.subscribe inflight cap reached ({EVENTS_SUBSCRIBE_INFLIGHT_MAX} in-flight); retry shortly"
+        ));
+    };
+
     // Bus pre-filter is coarser than the log filter — it only
     // knows `device` + `topic` (WIT `EventFilter` shape). The
     // final matching happens in the log requery below; this
@@ -1883,7 +1922,6 @@ async fn events_subscribe_call(
     // `topic` here uses exact match — the bus doesn't do
     // prefix — so a prefix-only client subscribes wide and
     // the requery narrows.
-    use crate::host_impl::plugin::oxidhome::plugin::events::EventFilter as BusEventFilter;
     let bus_filter = BusEventFilter {
         device: args.device.clone(),
         topic: match &topic {
@@ -1896,12 +1934,21 @@ async fn events_subscribe_call(
     // Subscribe FIRST — closes the race window with the log
     // query below. An event published between subscribe and
     // requery will wake the receiver.
-    let subscription = engine
+    let mut subscription = engine
         .events()
         .subscribe_labeled(bus_filter, "mcp.events.subscribe");
 
     // Build the log query used for both the initial catch-up
     // and the on-wake requery.
+    //
+    // Round-1 P1 on PR #157: ASC order. Newest-first (DESC)
+    // combined with "advance `after_id` to the max returned"
+    // permanently skips events past the batch cap — id 500 is
+    // returned as the batch max, cursor advances to 500, but
+    // ids 1..400 (also past the caller's original cursor)
+    // never surface. ASC keeps `advance to max(returned)`
+    // sound: batch is the oldest `limit` rows past the
+    // cursor, max = last, next call resumes there.
     let event_query = crate::state::EventQuery {
         since_ms,
         until_ms: None,
@@ -1911,6 +1958,7 @@ async fn events_subscribe_call(
         topic,
         after_id: args.after_id,
         before_id: None,
+        order: crate::state::EventOrder::Asc,
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
@@ -1931,6 +1979,7 @@ async fn events_subscribe_call(
             "MCP events.subscribe store-query saturated — refusing call",
         );
         drop(subscription);
+        drop(inflight_permit);
         return ToolOutcome::Busy(format!(
             "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
         ));
@@ -1939,11 +1988,13 @@ async fn events_subscribe_call(
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
             drop(subscription);
+            drop(inflight_permit);
             tracing::error!(target: "mcp.tool.events.subscribe", %err, "event query failed");
             return ToolOutcome::Internal("event query failed".into());
         }
         Err(join_err) => {
             drop(subscription);
+            drop(inflight_permit);
             tracing::error!(target: "mcp.tool.events.subscribe", %join_err, "event query task panicked");
             return ToolOutcome::Internal("event query task panicked".into());
         }
@@ -1954,41 +2005,68 @@ async fn events_subscribe_call(
         drop(subscription);
         rows
     } else {
-        // Wait on the bus. `receiver.recv()` returns `None`
-        // when the sender side drops — treat as spurious wake
-        // and fall through to the requery (returns empty).
-        let mut subscription = subscription;
-        let deadline = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
-        tokio::pin!(deadline);
-        let _ = tokio::select! {
-            biased;
-            msg = subscription.receiver.recv() => msg,
-            () = &mut deadline => None,
-        };
-        // Requery — durable wire shape + picks up anything
-        // else that queued behind the first event.
-        drop(subscription);
-        let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
-            tracing::warn!(
-                cap = STORE_QUERY_MAX,
-                "MCP events.subscribe requery saturated — refusing call",
-            );
-            return ToolOutcome::Busy(format!(
-                "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
-            ));
-        };
-        match query_once(query_permit, event_query).await {
-            Ok(Ok(rows)) => rows,
-            Ok(Err(err)) => {
-                tracing::error!(target: "mcp.tool.events.subscribe", %err, "event requery failed");
-                return ToolOutcome::Internal("event query failed".into());
+        // Round-1 P2 on PR #157: wake-loop. The bus filter
+        // only checks device + exact-topic; anything else in
+        // the caller's log filter (plugin, instance,
+        // topic_prefix, since) is applied only in the requery.
+        // A bus event that clears the bus filter but fails
+        // the log filter would wake us, we'd requery to
+        // zero rows, and return an empty batch well before
+        // the deadline — burning the caller's wait budget.
+        // Loop until either the requery returns rows or the
+        // deadline actually elapses.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let mut rows = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let sleep = tokio::time::sleep_until(deadline);
+            tokio::pin!(sleep);
+            let woken = tokio::select! {
+                biased;
+                msg = subscription.receiver.recv() => msg.is_some(),
+                () = &mut sleep => false,
+            };
+            if !woken {
+                break;
             }
-            Err(join_err) => {
-                tracing::error!(target: "mcp.tool.events.subscribe", %join_err, "event requery task panicked");
-                return ToolOutcome::Internal("event query task panicked".into());
+            let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+                tracing::warn!(
+                    cap = STORE_QUERY_MAX,
+                    "MCP events.subscribe requery saturated — refusing call",
+                );
+                drop(subscription);
+                drop(inflight_permit);
+                return ToolOutcome::Busy(format!(
+                    "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
+                ));
+            };
+            rows = match query_once(query_permit, event_query.clone()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(err)) => {
+                    drop(subscription);
+                    drop(inflight_permit);
+                    tracing::error!(target: "mcp.tool.events.subscribe", %err, "event requery failed");
+                    return ToolOutcome::Internal("event query failed".into());
+                }
+                Err(join_err) => {
+                    drop(subscription);
+                    drop(inflight_permit);
+                    tracing::error!(target: "mcp.tool.events.subscribe", %join_err, "event requery task panicked");
+                    return ToolOutcome::Internal("event query task panicked".into());
+                }
+            };
+            if !rows.is_empty() {
+                break;
             }
+            // Empty requery on a bus wake — the event didn't
+            // match the log filter. Drain any further queued
+            // wakes non-blocking so the next loop's `recv`
+            // waits for a *new* event, then continue waiting.
+            while subscription.receiver.try_recv().is_ok() {}
         }
+        drop(subscription);
+        rows
     };
+    drop(inflight_permit);
 
     let events: Vec<_> = rows
         .into_iter()
