@@ -44,7 +44,7 @@ pub use device_state::{
 pub use devices::{
     DeviceMeta, DeviceRegistry, MAX_CAPABILITIES_PER_DEVICE, MAX_DEVICES_PER_INSTANCE,
 };
-pub use event_log::{EventLog, EventLogError, EventQuery, HistoricalEvent, TopicMatch};
+pub use event_log::{EventLog, EventLogError, EventOrder, EventQuery, HistoricalEvent, TopicMatch};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
     InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, any_grant_matches,

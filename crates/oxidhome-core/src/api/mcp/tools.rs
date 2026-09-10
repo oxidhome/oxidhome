@@ -74,6 +74,7 @@ use crate::api::scopes::{
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::events::EventFilter as BusEventFilter;
 use crate::host_impl::plugin::oxidhome::plugin::types::KeyValue;
 use crate::host_impl::plugin::oxidhome::plugin::types::Value;
 use crate::state::audit_log::AuditEntry;
@@ -283,6 +284,27 @@ pub(super) fn list_tools() -> Vec<Tool> {
                 .read_only(true)
                 .destructive(false)
                 .open_world(false),
+        ),
+        Tool::new(
+            "events.subscribe",
+            "Bounded-timeout long-poll for new events after a cursor. Same filters + \
+             wire shape as `events.history`; the client passes `after_id` (the last \
+             `id` it saw) and a `timeout_ms` (default 5000, max 30000). Returns \
+             immediately with any matching events already past the cursor; otherwise \
+             blocks on the live event bus up to the deadline and returns whatever \
+             arrived. On timeout, returns an empty batch — the client polls again \
+             with the same `after_id`. Same `events:read` scope as `events.history`.",
+            Arc::new(events_subscribe_schema()),
+        )
+        .with_title("Long-poll for new events")
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                // Open-world: the subscription reads the live event
+                // stream, which reflects state advanced by other
+                // clients / plugins between calls.
+                .open_world(true),
         ),
     ]
 }
@@ -530,6 +552,7 @@ pub(super) fn canonical_tool_name(name: &str) -> &'static str {
         "device.send_command" => "device.send_command",
         "logs.query" => "logs.query",
         "events.history" => "events.history",
+        "events.subscribe" => "events.subscribe",
         "plugins.list" => "plugins.list",
         "plugins.show" => "plugins.show",
         "plugins.stop" => "plugins.stop",
@@ -576,6 +599,7 @@ pub(super) async fn call(
         "device.send_command" => ("device.send_command", DEVICES_COMMAND),
         "logs.query" => ("logs.query", LOGS_READ),
         "events.history" => ("events.history", EVENTS_READ),
+        "events.subscribe" => ("events.subscribe", EVENTS_READ),
         "plugins.list" => ("plugins.list", PLUGINS_LIST),
         "plugins.show" => ("plugins.show", PLUGINS_LIST),
         "plugins.stop" => ("plugins.stop", PLUGINS_STOP),
@@ -642,6 +666,7 @@ pub(super) async fn call(
         }
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => events_history_call(engine.clone(), request.arguments).await,
+        "events.subscribe" => events_subscribe_call(engine.clone(), request.arguments).await,
         "plugins.list" => plugins_list_call(&engine, request.arguments),
         "plugins.show" => plugins_show_call(&engine, request.arguments, actor),
         "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments, actor).await,
@@ -1652,6 +1677,10 @@ async fn events_history_call(
         topic,
         after_id: args.after_id,
         before_id: args.before_id,
+        // Preserve pre-14.3-subscribe newest-first shape —
+        // history's default paginates via `before_id` walking
+        // backwards.
+        order: crate::state::EventOrder::Desc,
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     // Shared `STORE_QUERY_SEMAPHORE` — permit MOVES into the
@@ -1697,6 +1726,356 @@ async fn events_history_call(
             // Pure host-state read — plugin was never reached,
             // so `execution_outcome` stays `None` per the
             // audit ledger contract.
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+// ── events.subscribe ────────────────────────────────────────────
+
+/// Default wait budget when `timeout_ms` is omitted. Bounded on
+/// the low end so a client using the default still gets a
+/// long-enough window to catch a real event, and on the high
+/// end so a hostile client can't hold an MCP admission slot
+/// indefinitely (the mount's `PENDING_BODY_GATE` caps concurrent
+/// slots at 16 — a 30s subscribe pins one for that long).
+const EVENTS_SUBSCRIBE_DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const EVENTS_SUBSCRIBE_MAX_TIMEOUT_MS: u64 = 30_000;
+
+/// Round-1 P1 on PR #157: cap the number of *simultaneously
+/// waiting* `events.subscribe` calls at a value strictly
+/// below the mount's shared `PENDING_BODY_GATE` (16). If a
+/// hostile client held all 16 admission slots on 30-second
+/// subscribes, every other MCP call would starve for the
+/// full timeout; capping subscribes at 12 reserves 4 slots
+/// for the rest of the tool catalogue.
+///
+/// Saturation surfaces as `Busy` (`-32004` / 503) — same
+/// shape as the store-query saturation branch below. Clients
+/// see it before the tool starts any work, so a busy signal
+/// doesn't wait on the deadline.
+const EVENTS_SUBSCRIBE_INFLIGHT_MAX: usize = 12;
+
+static EVENTS_SUBSCRIBE_INFLIGHT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(EVENTS_SUBSCRIBE_INFLIGHT_MAX))
+    });
+
+fn events_subscribe_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "since": {
+                "type": "string",
+                "description": "Relative duration for the initial log catch-up: `Ns|Nm|Nh|Nd`.",
+            },
+            "device":   { "type": "string", "description": "Filter by device id." },
+            "instance": { "type": "string", "description": "Filter by owning instance id." },
+            "plugin":   { "type": "string", "description": "Filter by owning plugin id." },
+            "topic": {
+                "type": "string",
+                "description": "Exact-match topic. Mutually exclusive with `topic_prefix`.",
+            },
+            "topic_prefix": {
+                "type": "string",
+                "description": "Prefix-match topic. Mutually exclusive with `topic`.",
+            },
+            "after_id": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": i64::MAX,
+                "description": "Cursor: return only rows with `id > after_id`. Client resumes with the last returned event's `id`.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": i64::from(crate::api::mcp::resources::EVENTS_QUERY_MAX_LIMIT),
+                "description": "Max rows to return in a single batch (default 100, cap 100).",
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": EVENTS_SUBSCRIBE_MAX_TIMEOUT_MS,
+                "description": "Milliseconds to wait for new events past the cursor (default 5000, cap 30000). `0` = poll once and return immediately.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventsSubscribeArgs {
+    since: Option<String>,
+    device: Option<String>,
+    instance: Option<String>,
+    plugin: Option<String>,
+    topic: Option<String>,
+    topic_prefix: Option<String>,
+    after_id: Option<u64>,
+    limit: Option<u32>,
+    timeout_ms: Option<u64>,
+}
+
+// Subscribe-then-query race-close: subscribe to the bus BEFORE
+// the initial log query. If we queried first and subscribed
+// second, an event that landed between the two would be lost
+// (log had id ≤ N at query time; bus subscription started after
+// id N+1 published). Subscribing first means either the initial
+// log query already returns id N+1, or the bus receiver wakes
+// on it. Requerying the log on wake gives us the durable wire
+// shape from `WireHistoricalEvent::from_row` for whatever
+// arrived — same body as `events.history`.
+#[allow(clippy::too_many_lines)]
+async fn events_subscribe_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
+    let args: EventsSubscribeArgs = match serde_json::from_value(args_value) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "events.subscribe arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+
+    let now = crate::state::event_log::now_unix_ms();
+    let since_ms = match args
+        .since
+        .as_deref()
+        .map(super::resources::parse_duration_ms)
+        .transpose()
+    {
+        Ok(v) => v.map(|d| now.saturating_sub(d)),
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!("invalid `since` value: {err}"));
+        }
+    };
+
+    // Same topic mutual-exclusion policy as events.history —
+    // prefer prefix + warn on both, so the two surfaces stay
+    // in lockstep on ambiguous input.
+    let topic = match (args.topic, args.topic_prefix) {
+        (topic_exact, Some(p)) => {
+            if let Some(exact) = &topic_exact {
+                tracing::warn!(
+                    target: "mcp.tool.events.subscribe",
+                    topic_exact = %exact,
+                    topic_prefix = %p,
+                    "MCP events.subscribe: both `topic` and `topic_prefix` supplied — using `topic_prefix`",
+                );
+            }
+            Some((p, crate::state::TopicMatch::Prefix))
+        }
+        (Some(t), None) => Some((t, crate::state::TopicMatch::Exact)),
+        (None, None) => None,
+    };
+
+    let limit = args
+        .limit
+        .unwrap_or(super::resources::EVENTS_QUERY_DEFAULT_LIMIT)
+        .clamp(1, super::resources::EVENTS_QUERY_MAX_LIMIT);
+
+    // Cursor bound — same rationale as events.history: SQLite
+    // signed-64 clamp would silently widen a `u64::MAX` cursor
+    // into `< i64::MAX`. Reject at the boundary.
+    if let Some(v) = args.after_id
+        && v > CURSOR_MAX
+    {
+        return ToolOutcome::InvalidParams(format!(
+            "invalid `after_id` value `{v}`; must be <= {CURSOR_MAX}",
+        ));
+    }
+
+    let timeout_ms = args
+        .timeout_ms
+        .unwrap_or(EVENTS_SUBSCRIBE_DEFAULT_TIMEOUT_MS)
+        .min(EVENTS_SUBSCRIBE_MAX_TIMEOUT_MS);
+
+    // Round-1 P1 on PR #157: bound the number of simultaneously
+    // waiting subscribes so a hostile client can't hold every
+    // MCP admission slot for the full 30s deadline. Acquired
+    // BEFORE any bus subscription / log query so a rejected
+    // call does no work.
+    let Ok(inflight_permit) = Arc::clone(&EVENTS_SUBSCRIBE_INFLIGHT).try_acquire_owned() else {
+        tracing::warn!(
+            cap = EVENTS_SUBSCRIBE_INFLIGHT_MAX,
+            "MCP events.subscribe inflight cap reached — refusing call",
+        );
+        return ToolOutcome::Busy(format!(
+            "MCP events.subscribe inflight cap reached ({EVENTS_SUBSCRIBE_INFLIGHT_MAX} in-flight); retry shortly"
+        ));
+    };
+
+    // Bus pre-filter is coarser than the log filter — it only
+    // knows `device` + `topic` (WIT `EventFilter` shape). The
+    // final matching happens in the log requery below; this
+    // filter's job is just to reduce wake noise. Passing
+    // `topic` here uses exact match — the bus doesn't do
+    // prefix — so a prefix-only client subscribes wide and
+    // the requery narrows.
+    let bus_filter = BusEventFilter {
+        device: args.device.clone(),
+        topic: match &topic {
+            Some((t, crate::state::TopicMatch::Exact)) => Some(t.clone()),
+            // Prefix or none → no bus-side topic filter.
+            _ => None,
+        },
+    };
+
+    // Subscribe FIRST — closes the race window with the log
+    // query below. An event published between subscribe and
+    // requery will wake the receiver.
+    let mut subscription = engine
+        .events()
+        .subscribe_labeled(bus_filter, "mcp.events.subscribe");
+
+    // Build the log query used for both the initial catch-up
+    // and the on-wake requery.
+    //
+    // Round-1 P1 on PR #157: ASC order. Newest-first (DESC)
+    // combined with "advance `after_id` to the max returned"
+    // permanently skips events past the batch cap — id 500 is
+    // returned as the batch max, cursor advances to 500, but
+    // ids 1..400 (also past the caller's original cursor)
+    // never surface. ASC keeps `advance to max(returned)`
+    // sound: batch is the oldest `limit` rows past the
+    // cursor, max = last, next call resumes there.
+    let event_query = crate::state::EventQuery {
+        since_ms,
+        until_ms: None,
+        device_id: args.device,
+        instance_id: args.instance,
+        plugin_id: args.plugin,
+        topic,
+        after_id: args.after_id,
+        before_id: None,
+        order: crate::state::EventOrder::Asc,
+    };
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+
+    let query_once = |query_permit: tokio::sync::OwnedSemaphorePermit,
+                      event_query: crate::state::EventQuery|
+     -> tokio::task::JoinHandle<_> {
+        let event_log = engine.event_log();
+        tokio::task::spawn_blocking(move || {
+            let _guard = query_permit;
+            event_log.query(&event_query, limit_usize)
+        })
+    };
+
+    // Initial catch-up query.
+    let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+        tracing::warn!(
+            cap = STORE_QUERY_MAX,
+            "MCP events.subscribe store-query saturated — refusing call",
+        );
+        drop(subscription);
+        drop(inflight_permit);
+        return ToolOutcome::Busy(format!(
+            "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
+        ));
+    };
+    let rows = match query_once(query_permit, event_query.clone()).await {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            drop(subscription);
+            drop(inflight_permit);
+            tracing::error!(target: "mcp.tool.events.subscribe", %err, "event query failed");
+            return ToolOutcome::Internal("event query failed".into());
+        }
+        Err(join_err) => {
+            drop(subscription);
+            drop(inflight_permit);
+            tracing::error!(target: "mcp.tool.events.subscribe", %join_err, "event query task panicked");
+            return ToolOutcome::Internal("event query task panicked".into());
+        }
+    };
+
+    let rows = if !rows.is_empty() || timeout_ms == 0 {
+        // Catch-up path OR poll-once — no wait.
+        drop(subscription);
+        rows
+    } else {
+        // Round-1 P2 on PR #157: wake-loop. The bus filter
+        // only checks device + exact-topic; anything else in
+        // the caller's log filter (plugin, instance,
+        // topic_prefix, since) is applied only in the requery.
+        // A bus event that clears the bus filter but fails
+        // the log filter would wake us, we'd requery to
+        // zero rows, and return an empty batch well before
+        // the deadline — burning the caller's wait budget.
+        // Loop until either the requery returns rows or the
+        // deadline actually elapses.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let mut rows = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let sleep = tokio::time::sleep_until(deadline);
+            tokio::pin!(sleep);
+            let woken = tokio::select! {
+                biased;
+                msg = subscription.receiver.recv() => msg.is_some(),
+                () = &mut sleep => false,
+            };
+            if !woken {
+                break;
+            }
+            let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
+                tracing::warn!(
+                    cap = STORE_QUERY_MAX,
+                    "MCP events.subscribe requery saturated — refusing call",
+                );
+                drop(subscription);
+                drop(inflight_permit);
+                return ToolOutcome::Busy(format!(
+                    "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
+                ));
+            };
+            rows = match query_once(query_permit, event_query.clone()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(err)) => {
+                    drop(subscription);
+                    drop(inflight_permit);
+                    tracing::error!(target: "mcp.tool.events.subscribe", %err, "event requery failed");
+                    return ToolOutcome::Internal("event query failed".into());
+                }
+                Err(join_err) => {
+                    drop(subscription);
+                    drop(inflight_permit);
+                    tracing::error!(target: "mcp.tool.events.subscribe", %join_err, "event requery task panicked");
+                    return ToolOutcome::Internal("event query task panicked".into());
+                }
+            };
+            if !rows.is_empty() {
+                break;
+            }
+            // Empty requery on a bus wake — the event didn't
+            // match the log filter. Drain any further queued
+            // wakes non-blocking so the next loop's `recv`
+            // waits for a *new* event, then continue waiting.
+            while subscription.receiver.try_recv().is_ok() {}
+        }
+        drop(subscription);
+        rows
+    };
+    drop(inflight_permit);
+
+    let events: Vec<_> = rows
+        .into_iter()
+        .map(super::super::server::WireHistoricalEvent::from_row)
+        .collect();
+    let body = super::resources::EventsBody { events };
+    match super::resources::encode_body_capped(&body, "events.subscribe", MAX_TOOL_BODY_BYTES) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
             plugin_reached: false,
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),

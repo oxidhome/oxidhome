@@ -2817,6 +2817,7 @@ async fn query_events(
         topic,
         after_id: params.after_id,
         before_id: params.before_id,
+        order: crate::state::EventOrder::Desc,
     };
     let rows =
         run_events_query(&state.engine.event_log(), &query, limit).map_err(EventsError::Storage)?;

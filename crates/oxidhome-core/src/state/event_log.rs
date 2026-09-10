@@ -111,6 +111,28 @@ pub struct EventQuery {
     /// batch, the caller passes the lowest returned id to
     /// walk backwards through history.
     pub before_id: Option<u64>,
+    /// Result ordering. Default DESC (newest first) matches
+    /// pre-14.3-events-subscribe behaviour; ASC lets a
+    /// forward-cursor caller (`after_id` + advance to `max
+    /// returned`) walk the log without skipping rows past
+    /// `limit`. Reviewer P1 on PR #157.
+    pub order: EventOrder,
+}
+
+/// Result-ordering policy for [`EventQuery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventOrder {
+    /// `ORDER BY received_ms DESC, id DESC` — newest first.
+    /// Default; matches the existing `oxidhome://events` +
+    /// `events.history` shape.
+    #[default]
+    Desc,
+    /// `ORDER BY received_ms ASC, id ASC` — oldest first.
+    /// The forward-cursor consumer (`events.subscribe`) uses
+    /// this so a batch capped at `limit` still lets the
+    /// caller advance the cursor and pick up any remaining
+    /// past-cursor rows on the next call.
+    Asc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,10 +336,15 @@ impl EventLog {
         binds.push(rusqlite::types::Value::Integer(
             i64::try_from(limit).unwrap_or(i64::MAX),
         ));
+        let order_sql = match filter.order {
+            EventOrder::Desc => "DESC",
+            EventOrder::Asc => "ASC",
+        };
         let _ = write!(
             sql,
-            " ORDER BY received_ms DESC, id DESC LIMIT ?{}",
-            binds.len()
+            " ORDER BY received_ms {order}, id {order} LIMIT ?{n}",
+            order = order_sql,
+            n = binds.len()
         );
 
         self.db.read(|conn| -> Result<_, EventLogError> {
