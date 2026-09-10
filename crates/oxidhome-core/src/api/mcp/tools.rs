@@ -649,7 +649,7 @@ pub(super) async fn call(
             plugins_uninstall_call(engine.clone(), request.arguments, actor).await
         }
         "plugins.start" => plugins_start_call(engine.clone(), request.arguments, actor).await,
-        "plugins.install" => plugins_install_call(engine.clone(), request.arguments).await,
+        "plugins.install" => plugins_install_call(engine.clone(), request.arguments, actor).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -1062,6 +1062,7 @@ pub(super) const CONSTRAINT_PLUGINS_STOP_PLUGINS: &str = "constraint:plugins.sto
 pub(super) const CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS: &str =
     "constraint:plugins.uninstall:plugins";
 pub(super) const CONSTRAINT_PLUGINS_START_PLUGINS: &str = "constraint:plugins.start:plugins";
+pub(super) const CONSTRAINT_PLUGINS_INSTALL_PLUGINS: &str = "constraint:plugins.install:plugins";
 
 /// Cap on the plugin-supplied error message before we let it
 /// enter any JSON serialisation. The WIT contract lets a
@@ -2462,6 +2463,7 @@ struct PluginsInstallBody {
 async fn plugins_install_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    actor: &Actor,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams(
@@ -2494,16 +2496,60 @@ async fn plugins_install_call(
         ));
     }
 
+    // Phase 14.4d: build the gate against the actor's
+    // `plugins.install` constraint. It runs inside
+    // `install_gated` against the manifest-derived id BEFORE
+    // any FS/SQL side effect, so a refuse leaves no orphan
+    // state. `None` = no constraint (unrestricted subject to
+    // flat scope).
+    //
+    // Cloned into the spawn_blocking below because the gate
+    // captures the constraint reference; the whole closure
+    // must be 'static + Send. Constraint blobs are small
+    // (a couple of Vec<String>).
+    let constraint = actor.constraint("plugins.install").cloned();
+
     // REST wraps the sync install in `spawn_blocking` so a slow
     // disk doesn't stall the axum runtime — same reasoning
     // holds for MCP's rmcp task. The registry itself does the
     // FS + SQL work.
     let installed_registry = engine.installed_plugins();
-    let join = tokio::task::spawn_blocking(move || installed_registry.install(&source)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        installed_registry.install_gated(&source, |plugin_id| {
+            if let Some(cx) = &constraint
+                && !cx.allows_plugin(plugin_id)
+            {
+                return Err(CONSTRAINT_PLUGINS_INSTALL_PLUGINS);
+            }
+            Ok(())
+        })
+    })
+    .await;
 
-    let installed = match join {
-        Ok(Ok(installed)) => installed,
-        Ok(Err(crate::state::InstallError::SourceMissing(path))) => {
+    // Phase 14.4d: `install_gated` returns a crate-private
+    // `GatedInstallError` wrapper. Peel the constraint-refuse
+    // variant off first (that's what this tool added); the
+    // remaining `Install(InstallError)` variants are the
+    // pre-14.4d public shape and get the same treatment REST
+    // + Connect give them.
+    let install_result = match join {
+        Ok(Ok(installed)) => Ok(installed),
+        Ok(Err(crate::state::GatedInstallError::ConstraintDenied {
+            plugin_id: _,
+            required,
+        })) => {
+            return ToolOutcome::Denied { required };
+        }
+        Ok(Err(crate::state::GatedInstallError::Install(err))) => Err(err),
+        Err(join_err) => {
+            tracing::error!(target: "mcp.tool.plugins.install", %join_err, "install task panicked");
+            return ToolOutcome::Internal("install task panicked".into());
+        }
+    };
+
+    let installed = match install_result {
+        Ok(installed) => installed,
+        Err(crate::state::InstallError::SourceMissing(path)) => {
             return ToolOutcome::ExecErr {
                 message: format!(
                     "source dir is missing or has no manifest.toml: {}",
@@ -2519,7 +2565,7 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
-        Ok(Err(crate::state::InstallError::AlreadyInstalled { plugin_id })) => {
+        Err(crate::state::InstallError::AlreadyInstalled { plugin_id }) => {
             return ToolOutcome::ExecErr {
                 message: format!("plugin `{plugin_id}` is already installed"),
                 structured: Some(json!({
@@ -2529,7 +2575,7 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
-        Ok(Err(crate::state::InstallError::BadManifest { path, reason })) => {
+        Err(crate::state::InstallError::BadManifest { path, reason }) => {
             // Round-2 P2 on PR #134: `BadManifest.reason` is
             // authored by the internal parser and freely
             // interpolates `path.display()` (`parsing
@@ -2555,7 +2601,7 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
-        Ok(Err(crate::state::InstallError::NoPluginsRoot)) => {
+        Err(crate::state::InstallError::NoPluginsRoot) => {
             return ToolOutcome::ExecErr {
                 message: "install requires a state-dir-backed engine".into(),
                 structured: Some(json!({
@@ -2564,7 +2610,7 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
-        Ok(Err(err)) => {
+        Err(err) => {
             // Round-1 P2 lesson from PR #132: `InstallError::Io`
             // can carry absolute filesystem paths;
             // `InstallError::Persistence` can carry SQLite
@@ -2577,10 +2623,6 @@ async fn plugins_install_call(
                 "install failed",
             );
             return ToolOutcome::Internal("install failed; see server logs for details".into());
-        }
-        Err(join_err) => {
-            tracing::error!(target: "mcp.tool.plugins.install", %join_err, "install task panicked");
-            return ToolOutcome::Internal("install task panicked".into());
         }
     };
 
