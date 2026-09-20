@@ -1745,18 +1745,25 @@ const EVENTS_SUBSCRIBE_DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const EVENTS_SUBSCRIBE_MAX_TIMEOUT_MS: u64 = 30_000;
 
 /// Round-1 P1 on PR #157: cap the number of *simultaneously
-/// waiting* `events.subscribe` calls at a value strictly
-/// below the mount's shared `PENDING_BODY_GATE` (16). If a
-/// hostile client held all 16 admission slots on 30-second
-/// subscribes, every other MCP call would starve for the
-/// full timeout; capping subscribes at 12 reserves 4 slots
-/// for the rest of the tool catalogue.
+/// waiting* `events.subscribe` calls so a hostile client
+/// can't hold every `PENDING_BODY_GATE` slot (16) on
+/// 30-second subscribes and starve every other MCP call.
+///
+/// Round-2 P2 on PR #157: also keep this at-or-below
+/// `STORE_QUERY_MAX` (8). Above that, `N > 8` concurrent
+/// subscribes would race for the store-query semaphore and
+/// the losers would return `Busy` even though the caller
+/// did nothing wrong — a spurious backpressure signal.
+/// Capping subscribes at 8 leaves ≥ 8 admission slots for
+/// the rest of the tool catalogue AND guarantees every
+/// admitted subscribe can acquire the store-query permit
+/// it needs.
 ///
 /// Saturation surfaces as `Busy` (`-32004` / 503) — same
 /// shape as the store-query saturation branch below. Clients
 /// see it before the tool starts any work, so a busy signal
 /// doesn't wait on the deadline.
-const EVENTS_SUBSCRIBE_INFLIGHT_MAX: usize = 12;
+const EVENTS_SUBSCRIBE_INFLIGHT_MAX: usize = 8;
 
 static EVENTS_SUBSCRIBE_INFLIGHT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| {
@@ -2028,16 +2035,36 @@ async fn events_subscribe_call(
             if !woken {
                 break;
             }
-            let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
-                tracing::warn!(
-                    cap = STORE_QUERY_MAX,
-                    "MCP events.subscribe requery saturated — refusing call",
-                );
-                drop(subscription);
-                drop(inflight_permit);
-                return ToolOutcome::Busy(format!(
-                    "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
-                ));
+            // Round-2 P2 on PR #157: requeries inside the
+            // wake loop wait for a store-query permit rather
+            // than returning `Busy`. The initial catch-up
+            // above uses `try_acquire_owned` (a fast-fail
+            // saturation signal on entry is meaningful); a
+            // requery running INSIDE the wait loop is already
+            // bounded by the tool's deadline, and returning
+            // `Busy` here would surface as backpressure the
+            // caller can't distinguish from "no matching
+            // events" — the whole point of the deadline.
+            let query_permit = match tokio::time::timeout_at(
+                deadline,
+                Arc::clone(&STORE_QUERY_SEMAPHORE).acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => {
+                    drop(subscription);
+                    drop(inflight_permit);
+                    tracing::error!(
+                        target: "mcp.tool.events.subscribe",
+                        "store-query semaphore closed",
+                    );
+                    return ToolOutcome::Internal("store-query semaphore closed".into());
+                }
+                // Deadline elapsed while waiting for the
+                // permit — legitimate timeout, return the
+                // empty batch the caller was polling for.
+                Err(_elapsed) => break,
             };
             rows = match query_once(query_permit, event_query.clone()).await {
                 Ok(Ok(r)) => r,
@@ -2057,11 +2084,16 @@ async fn events_subscribe_call(
             if !rows.is_empty() {
                 break;
             }
-            // Empty requery on a bus wake — the event didn't
-            // match the log filter. Drain any further queued
-            // wakes non-blocking so the next loop's `recv`
-            // waits for a *new* event, then continue waiting.
-            while subscription.receiver.try_recv().is_ok() {}
+            // Round-2 P2 on PR #157: NO drain. A drain here
+            // could discard a wake for a *matching* event
+            // that landed between the requery starting and
+            // this line running (the queue picked it up but
+            // the requery had already snapshot the log). The
+            // next select-arm iteration will pick up whatever
+            // queued during the requery — one extra requery
+            // for a non-matching wake is a tiny cost;
+            // dropping a matching wake would burn the whole
+            // deadline.
         }
         drop(subscription);
         rows

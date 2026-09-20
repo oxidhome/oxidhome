@@ -246,6 +246,11 @@ impl EventLog {
     /// - [`EventLogError::Encode`] if a stored row has a malformed
     ///   `payload_blob` (would mean the table was hand-edited or
     ///   migrated incorrectly).
+    // Filter → SQL builder + per-row projection is a linear
+    // top-to-bottom pipeline; splitting it hides the ordered
+    // bind list from a grep. Same rationale as the `#[allow]`s
+    // in `tools::call` and `installed_plugins::install_gated`.
+    #[allow(clippy::too_many_lines)]
     pub fn query(
         &self,
         filter: &EventQuery,
@@ -336,16 +341,26 @@ impl EventLog {
         binds.push(rusqlite::types::Value::Integer(
             i64::try_from(limit).unwrap_or(i64::MAX),
         ));
+        // `Asc` orders by `id` ONLY — no `received_ms` primary.
+        // Row id is a monotonic autoincrement (SQLite `INTEGER
+        // PRIMARY KEY`) so forward-cursor pagination is stable
+        // even if the wall clock is stepped back (NTP correction,
+        // manual `date --set`). Ordering by `received_ms ASC, id
+        // ASC` under a clock rollback would put freshly-inserted
+        // rows (higher id, older ts) before the old ones (lower
+        // id, newer ts), so a batch capped at `limit` could
+        // return the pre-rollback rows first and let a cursor
+        // "advance to max(returned)" skip past the higher-id
+        // rows entirely — the original P1 dressed in a clock bug.
+        // `Desc` keeps its historical `received_ms DESC, id DESC`
+        // shape for backward compatibility with `events.history`
+        // and `oxidhome://events`; those use `before_id` for
+        // backward pagination which is monotonic in id too.
         let order_sql = match filter.order {
-            EventOrder::Desc => "DESC",
-            EventOrder::Asc => "ASC",
+            EventOrder::Desc => "received_ms DESC, id DESC",
+            EventOrder::Asc => "id ASC",
         };
-        let _ = write!(
-            sql,
-            " ORDER BY received_ms {order}, id {order} LIMIT ?{n}",
-            order = order_sql,
-            n = binds.len()
-        );
+        let _ = write!(sql, " ORDER BY {order_sql} LIMIT ?{n}", n = binds.len());
 
         self.db.read(|conn| -> Result<_, EventLogError> {
             let mut stmt = conn.prepare(&sql)?;
