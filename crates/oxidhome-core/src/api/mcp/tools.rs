@@ -1748,26 +1748,49 @@ const EVENTS_SUBSCRIBE_MAX_TIMEOUT_MS: u64 = 30_000;
 /// waiting* `events.subscribe` calls so a hostile client
 /// can't hold every `PENDING_BODY_GATE` slot (16) on
 /// 30-second subscribes and starve every other MCP call.
+/// Cap 8 (½ the mount's admission gate) leaves ≥8 slots
+/// available for the rest of the tool catalogue.
 ///
-/// Round-3 P2 on PR #157: cap at ½ of `STORE_QUERY_MAX`
-/// (8 / 2 = 4). At-or-below the query gate isn't enough —
-/// N subscribes competing for N query permits leaves no
-/// headroom for concurrent `logs.query` / `events.history`
-/// / resource-side traffic, which would then queue behind
-/// the subscribes' requeries. Reserving ≥ ½ the store-query
-/// gate for other consumers keeps the read surfaces
-/// responsive under a subscribe burst.
+/// Round-3 P2 on PR #157: subscribe queries no longer
+/// contend with `logs.query` / `events.history` / resources
+/// — see [`EVENTS_SUBSCRIBE_QUERY_SEMAPHORE`]. The earlier
+/// "leave headroom on the shared store-query gate"
+/// constraint is moot; this cap only needs to protect the
+/// mount's admission gate.
 ///
 /// Saturation surfaces as `Busy` (`-32004` / 503) — same
 /// shape as the store-query saturation branch below. Clients
 /// see it before the tool starts any work, so a busy signal
 /// doesn't wait on the deadline.
-const EVENTS_SUBSCRIBE_INFLIGHT_MAX: usize = 4;
+const EVENTS_SUBSCRIBE_INFLIGHT_MAX: usize = 8;
 
 static EVENTS_SUBSCRIBE_INFLIGHT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| {
         Arc::new(tokio::sync::Semaphore::new(EVENTS_SUBSCRIBE_INFLIGHT_MAX))
     });
+
+/// Round-4 P1 on PR #157: bound in-flight subscribe log
+/// queries independently of admission. The permit MOVES into
+/// the `spawn_blocking` closure so a cancelled outer future
+/// (rmcp handler dropped mid-query on client disconnect)
+/// can't pile up detached blocking tasks — the permit
+/// releases when the actual SQLite read finishes, not when
+/// the caller-facing future drops. Same cancellation-safety
+/// pattern the shared `STORE_QUERY_SEMAPHORE` uses for the
+/// other read tools.
+///
+/// Sized to match [`EVENTS_SUBSCRIBE_INFLIGHT_MAX`]: since
+/// each subscribe does at most one query at a time, that
+/// bound is the natural ceiling. Extra headroom would let a
+/// cancel-burst stack more orphan blocking tasks; matching
+/// the admission cap keeps peak blocking-pool depth bounded
+/// at 4 even under adversarial cancellation. Saturation
+/// (e.g. 4 orphan queries still running) surfaces as `Busy`
+/// — same shape as the store-query saturation branch above.
+const EVENTS_SUBSCRIBE_QUERY_MAX: usize = EVENTS_SUBSCRIBE_INFLIGHT_MAX;
+
+static EVENTS_SUBSCRIBE_QUERY_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(EVENTS_SUBSCRIBE_QUERY_MAX)));
 
 fn events_subscribe_schema() -> serde_json::Map<String, JsonValue> {
     let schema = json!({
@@ -1968,26 +1991,55 @@ async fn events_subscribe_call(
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
-    // Round-3 P2 on PR #157: no `STORE_QUERY_SEMAPHORE` here.
-    // The inflight cap above already bounds concurrent
-    // subscribe queries (each subscribe holds exactly one
-    // inflight permit and does at most one query at a time
-    // internally); reusing the shared store-query gate would
-    // let a burst of subscribers pull permits away from
-    // concurrent `logs.query` / `events.history` /
-    // resources-side traffic, spurious-`Busy`-ing those
-    // callers. The inflight cap (currently 4, ≤ ½ of the
-    // shared gate's capacity of 8) is set so the total
-    // blocking-pool load added by subscribes stays small
-    // and predictable.
-    let query_once = |event_query: crate::state::EventQuery| -> tokio::task::JoinHandle<_> {
-        let event_log = engine.event_log();
-        tokio::task::spawn_blocking(move || event_log.query(&event_query, limit_usize))
-    };
+    // Round-3 P2 on PR #157: subscribes use a dedicated
+    // `EVENTS_SUBSCRIBE_QUERY_SEMAPHORE`, not the shared
+    // `STORE_QUERY_SEMAPHORE`, so a burst of subscribers
+    // can't pull permits from concurrent `logs.query` /
+    // `events.history` / resources-side traffic and
+    // spurious-`Busy` those callers.
+    //
+    // Round-4 P1 on PR #157: the permit MOVES INTO the
+    // `spawn_blocking` closure and drops when the SQLite
+    // read finishes, not when the outer future drops. A
+    // cancelled subscribe (client disconnects mid-query, rmcp
+    // handler task dropped) therefore leaves behind at most
+    // one orphan blocking task per permit — the semaphore
+    // bounds detached tasks at `EVENTS_SUBSCRIBE_QUERY_MAX`.
+    // Same cancellation-safety pattern used by the shared
+    // `STORE_QUERY_SEMAPHORE`.
+    let engine_for_queries = engine.clone();
+    let query_once =
+        |event_query: crate::state::EventQuery| -> Result<tokio::task::JoinHandle<_>, ()> {
+            let Ok(query_permit) =
+                Arc::clone(&EVENTS_SUBSCRIBE_QUERY_SEMAPHORE).try_acquire_owned()
+            else {
+                return Err(());
+            };
+            let event_log = engine_for_queries.event_log();
+            Ok(tokio::task::spawn_blocking(move || {
+                let _guard = query_permit;
+                event_log.query(&event_query, limit_usize)
+            }))
+        };
 
-    // Initial catch-up query — no store-query permit; the
-    // inflight cap above is the only admission gate.
-    let rows = match query_once(event_query.clone()).await {
+    // Initial catch-up query — permit is acquired
+    // synchronously; the blocking task holds it through the
+    // SQLite read.
+    let initial_join = match query_once(event_query.clone()) {
+        Ok(j) => j,
+        Err(()) => {
+            drop(subscription);
+            drop(inflight_permit);
+            tracing::warn!(
+                cap = EVENTS_SUBSCRIBE_QUERY_MAX,
+                "MCP events.subscribe query pool saturated — refusing call",
+            );
+            return ToolOutcome::Busy(format!(
+                "MCP events.subscribe query pool saturated ({EVENTS_SUBSCRIBE_QUERY_MAX} in-flight); retry shortly"
+            ));
+        }
+    };
+    let rows = match initial_join.await {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
             drop(subscription);
@@ -2031,9 +2083,26 @@ async fn events_subscribe_call(
             if !woken {
                 break;
             }
-            // Requery — no store-query permit (see the
-            // rationale on the initial catch-up above).
-            rows = match query_once(event_query.clone()).await {
+            // Requery — same permit-into-closure pattern as
+            // the initial catch-up above. Saturation here
+            // means orphan blocking tasks from earlier
+            // cancelled subscribes are still holding permits;
+            // treat as `Busy` so the caller retries.
+            let requery_join = match query_once(event_query.clone()) {
+                Ok(j) => j,
+                Err(()) => {
+                    drop(subscription);
+                    drop(inflight_permit);
+                    tracing::warn!(
+                        cap = EVENTS_SUBSCRIBE_QUERY_MAX,
+                        "MCP events.subscribe requery pool saturated — refusing call",
+                    );
+                    return ToolOutcome::Busy(format!(
+                        "MCP events.subscribe query pool saturated ({EVENTS_SUBSCRIBE_QUERY_MAX} in-flight); retry shortly"
+                    ));
+                }
+            };
+            rows = match requery_join.await {
                 Ok(Ok(r)) => r,
                 Ok(Err(err)) => {
                     drop(subscription);

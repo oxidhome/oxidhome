@@ -2773,10 +2773,13 @@ const EVENTS_QUERY_MAX_LIMIT: u32 = 1_000;
 
 /// `GET /api/v1/events?…` — historical event query against the
 /// `EventLog` `SQLite` table. Gated on `events:read`. Returns rows
-/// newest-first (the store's native `received_ms DESC, id DESC`
-/// order). Each row carries the same `id` a live tail message
-/// includes, so a client that saved the last-seen tail id can
-/// resume from `since_ms` or reconcile against `id`.
+/// in descending `id` order (highest first). Under normal
+/// operation this is "newest first" since id is a monotonic
+/// AUTOINCREMENT (migration 16); under wall-clock skew id
+/// still walks stably where `received_ms` would not. Each
+/// row carries the same `id` a live tail message includes,
+/// so a client that saved the last-seen tail id can resume
+/// from `since_ms` or reconcile against `id`.
 async fn query_events(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,

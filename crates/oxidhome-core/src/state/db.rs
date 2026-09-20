@@ -762,13 +762,16 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE event_log;
     ALTER TABLE event_log_new RENAME TO event_log;
 
-    -- `AUTOINCREMENT` creates `sqlite_sequence` on the fly if
-    -- it didn't already exist. Seed the counter for
-    -- `event_log` at the max id we copied, so the next INSERT
-    -- gets max+1 (matches the pre-migration behaviour for
-    -- fresh rows) rather than jumping back to 1.
-    INSERT OR REPLACE INTO sqlite_sequence(name, seq)
-    SELECT 'event_log', COALESCE(MAX(id), 0) FROM event_log;
+    -- No explicit `sqlite_sequence` seed. `AUTOINCREMENT`
+    -- tables track their high-water mark automatically: an
+    -- INSERT with an explicit id ≥ the current seq raises
+    -- the seq to that id (see SQLite `AUTOINCREMENT` docs).
+    -- The bulk copy above already advanced the sequence to
+    -- `MAX(id)`; a manual `INSERT OR REPLACE INTO
+    -- sqlite_sequence(name, seq)` would create a *duplicate*
+    -- row because the table has no unique constraint on
+    -- `name`, and AUTOINCREMENT might then read either row.
+    -- Round-4 P1 on PR #157.
 
     CREATE INDEX evt_received ON event_log(received_ms);
     CREATE INDEX evt_device   ON event_log(device_id, received_ms) WHERE device_id IS NOT NULL;
