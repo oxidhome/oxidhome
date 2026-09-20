@@ -717,6 +717,65 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX dashboard_by_owner ON dashboard(owner_user_id);
     ",
+    // 16 — Phase 14.3 follow-up (round-3 P1 on PR #157):
+    // switch `event_log.id` from plain `INTEGER PRIMARY KEY`
+    // to `INTEGER PRIMARY KEY AUTOINCREMENT`.
+    //
+    // Without `AUTOINCREMENT`, `INTEGER PRIMARY KEY` is a
+    // ROWID alias — SQLite reuses ids after a DELETE removes
+    // the current max. Retention (`DELETE FROM event_log
+    // WHERE received_ms < ?1`) normally deletes the oldest
+    // rows (lowest ids) so reuse can't fire, BUT under a
+    // wall-clock rollback a *fresh* insert lands with a
+    // lower `received_ms` and a higher id — retention then
+    // deletes that fresh row (matches the cutoff) and the
+    // next insert reuses its id. A durable MCP-subscribe
+    // cursor at `after_id = <reused id>` would then see the
+    // NEW row as an already-seen event and miss it.
+    //
+    // `AUTOINCREMENT` binds ids to a monotonic counter in
+    // `sqlite_sequence` so a reused id is never issued. The
+    // migration rebuilds `event_log` in place — SQLite has
+    // no `ALTER TABLE` for this — preserving every row's
+    // existing id (and every existing index) so any client
+    // that already saved an `after_id` cursor keeps working.
+    // The `INSERT INTO sqlite_sequence` line seeds the
+    // counter at the max existing id so post-migration
+    // inserts continue from there.
+    "
+    CREATE TABLE event_log_new (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        received_ms   INTEGER NOT NULL,
+        payload_ms    INTEGER NOT NULL,
+        device_id     TEXT,
+        instance_id   TEXT NOT NULL,
+        plugin_id     TEXT NOT NULL,
+        topic         TEXT NOT NULL,
+        payload_blob  BLOB NOT NULL
+    );
+
+    INSERT INTO event_log_new
+        (id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
+    SELECT id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob
+      FROM event_log;
+
+    DROP TABLE event_log;
+    ALTER TABLE event_log_new RENAME TO event_log;
+
+    -- `AUTOINCREMENT` creates `sqlite_sequence` on the fly if
+    -- it didn't already exist. Seed the counter for
+    -- `event_log` at the max id we copied, so the next INSERT
+    -- gets max+1 (matches the pre-migration behaviour for
+    -- fresh rows) rather than jumping back to 1.
+    INSERT OR REPLACE INTO sqlite_sequence(name, seq)
+    SELECT 'event_log', COALESCE(MAX(id), 0) FROM event_log;
+
+    CREATE INDEX evt_received ON event_log(received_ms);
+    CREATE INDEX evt_device   ON event_log(device_id, received_ms) WHERE device_id IS NOT NULL;
+    CREATE INDEX evt_topic    ON event_log(topic, received_ms);
+    CREATE INDEX evt_instance ON event_log(instance_id, received_ms);
+    CREATE INDEX evt_plugin   ON event_log(plugin_id, received_ms);
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

@@ -1749,21 +1749,20 @@ const EVENTS_SUBSCRIBE_MAX_TIMEOUT_MS: u64 = 30_000;
 /// can't hold every `PENDING_BODY_GATE` slot (16) on
 /// 30-second subscribes and starve every other MCP call.
 ///
-/// Round-2 P2 on PR #157: also keep this at-or-below
-/// `STORE_QUERY_MAX` (8). Above that, `N > 8` concurrent
-/// subscribes would race for the store-query semaphore and
-/// the losers would return `Busy` even though the caller
-/// did nothing wrong — a spurious backpressure signal.
-/// Capping subscribes at 8 leaves ≥ 8 admission slots for
-/// the rest of the tool catalogue AND guarantees every
-/// admitted subscribe can acquire the store-query permit
-/// it needs.
+/// Round-3 P2 on PR #157: cap at ½ of `STORE_QUERY_MAX`
+/// (8 / 2 = 4). At-or-below the query gate isn't enough —
+/// N subscribes competing for N query permits leaves no
+/// headroom for concurrent `logs.query` / `events.history`
+/// / resource-side traffic, which would then queue behind
+/// the subscribes' requeries. Reserving ≥ ½ the store-query
+/// gate for other consumers keeps the read surfaces
+/// responsive under a subscribe burst.
 ///
 /// Saturation surfaces as `Busy` (`-32004` / 503) — same
 /// shape as the store-query saturation branch below. Clients
 /// see it before the tool starts any work, so a busy signal
 /// doesn't wait on the deadline.
-const EVENTS_SUBSCRIBE_INFLIGHT_MAX: usize = 8;
+const EVENTS_SUBSCRIBE_INFLIGHT_MAX: usize = 4;
 
 static EVENTS_SUBSCRIBE_INFLIGHT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| {
@@ -1969,29 +1968,26 @@ async fn events_subscribe_call(
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
-    let query_once = |query_permit: tokio::sync::OwnedSemaphorePermit,
-                      event_query: crate::state::EventQuery|
-     -> tokio::task::JoinHandle<_> {
+    // Round-3 P2 on PR #157: no `STORE_QUERY_SEMAPHORE` here.
+    // The inflight cap above already bounds concurrent
+    // subscribe queries (each subscribe holds exactly one
+    // inflight permit and does at most one query at a time
+    // internally); reusing the shared store-query gate would
+    // let a burst of subscribers pull permits away from
+    // concurrent `logs.query` / `events.history` /
+    // resources-side traffic, spurious-`Busy`-ing those
+    // callers. The inflight cap (currently 4, ≤ ½ of the
+    // shared gate's capacity of 8) is set so the total
+    // blocking-pool load added by subscribes stays small
+    // and predictable.
+    let query_once = |event_query: crate::state::EventQuery| -> tokio::task::JoinHandle<_> {
         let event_log = engine.event_log();
-        tokio::task::spawn_blocking(move || {
-            let _guard = query_permit;
-            event_log.query(&event_query, limit_usize)
-        })
+        tokio::task::spawn_blocking(move || event_log.query(&event_query, limit_usize))
     };
 
-    // Initial catch-up query.
-    let Ok(query_permit) = Arc::clone(&STORE_QUERY_SEMAPHORE).try_acquire_owned() else {
-        tracing::warn!(
-            cap = STORE_QUERY_MAX,
-            "MCP events.subscribe store-query saturated — refusing call",
-        );
-        drop(subscription);
-        drop(inflight_permit);
-        return ToolOutcome::Busy(format!(
-            "MCP store-query queue saturated ({STORE_QUERY_MAX} in-flight); retry shortly"
-        ));
-    };
-    let rows = match query_once(query_permit, event_query.clone()).await {
+    // Initial catch-up query — no store-query permit; the
+    // inflight cap above is the only admission gate.
+    let rows = match query_once(event_query.clone()).await {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
             drop(subscription);
@@ -2035,38 +2031,9 @@ async fn events_subscribe_call(
             if !woken {
                 break;
             }
-            // Round-2 P2 on PR #157: requeries inside the
-            // wake loop wait for a store-query permit rather
-            // than returning `Busy`. The initial catch-up
-            // above uses `try_acquire_owned` (a fast-fail
-            // saturation signal on entry is meaningful); a
-            // requery running INSIDE the wait loop is already
-            // bounded by the tool's deadline, and returning
-            // `Busy` here would surface as backpressure the
-            // caller can't distinguish from "no matching
-            // events" — the whole point of the deadline.
-            let query_permit = match tokio::time::timeout_at(
-                deadline,
-                Arc::clone(&STORE_QUERY_SEMAPHORE).acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(p)) => p,
-                Ok(Err(_)) => {
-                    drop(subscription);
-                    drop(inflight_permit);
-                    tracing::error!(
-                        target: "mcp.tool.events.subscribe",
-                        "store-query semaphore closed",
-                    );
-                    return ToolOutcome::Internal("store-query semaphore closed".into());
-                }
-                // Deadline elapsed while waiting for the
-                // permit — legitimate timeout, return the
-                // empty batch the caller was polling for.
-                Err(_elapsed) => break,
-            };
-            rows = match query_once(query_permit, event_query.clone()).await {
+            // Requery — no store-query permit (see the
+            // rationale on the initial catch-up above).
+            rows = match query_once(event_query.clone()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(err)) => {
                     drop(subscription);

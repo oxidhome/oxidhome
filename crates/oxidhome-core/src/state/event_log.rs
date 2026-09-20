@@ -341,23 +341,20 @@ impl EventLog {
         binds.push(rusqlite::types::Value::Integer(
             i64::try_from(limit).unwrap_or(i64::MAX),
         ));
-        // `Asc` orders by `id` ONLY — no `received_ms` primary.
-        // Row id is a monotonic autoincrement (SQLite `INTEGER
-        // PRIMARY KEY`) so forward-cursor pagination is stable
-        // even if the wall clock is stepped back (NTP correction,
-        // manual `date --set`). Ordering by `received_ms ASC, id
-        // ASC` under a clock rollback would put freshly-inserted
-        // rows (higher id, older ts) before the old ones (lower
-        // id, newer ts), so a batch capped at `limit` could
-        // return the pre-rollback rows first and let a cursor
-        // "advance to max(returned)" skip past the higher-id
-        // rows entirely — the original P1 dressed in a clock bug.
-        // `Desc` keeps its historical `received_ms DESC, id DESC`
-        // shape for backward compatibility with `events.history`
-        // and `oxidhome://events`; those use `before_id` for
-        // backward pagination which is monotonic in id too.
+        // Both orderings sort by `id` alone (no `received_ms`
+        // primary): id is a monotonic autoincrement (schema
+        // migration 16), so pagination is stable under wall-
+        // clock jumps in either direction. Ordering by
+        // `received_ms DESC, id DESC` under a rollback would
+        // place a freshly-inserted row (lower ts, higher id)
+        // AFTER the older rows in the batch — a `before_id`
+        // walker taking `min(returned)` as the next cursor
+        // would skip the rollback row on the way down.
+        // `id DESC / id ASC` avoids the whole class of
+        // clock-vs-cursor gaps. Insertion order === id order
+        // === presentation order, both directions.
         let order_sql = match filter.order {
-            EventOrder::Desc => "received_ms DESC, id DESC",
+            EventOrder::Desc => "id DESC",
             EventOrder::Asc => "id ASC",
         };
         let _ = write!(sql, " ORDER BY {order_sql} LIMIT ?{n}", n = binds.len());
