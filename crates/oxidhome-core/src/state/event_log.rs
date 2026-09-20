@@ -968,7 +968,7 @@ mod tests {
     }
 
     /// Round-4 P1 on PR #157: migration 16 gave `event_log.id`
-    /// AUTOINCREMENT semantics — SQLite must NOT reuse an id
+    /// AUTOINCREMENT semantics — `SQLite` must NOT reuse an id
     /// after retention deletes a row (even when the deleted
     /// row is the current max, e.g. a clock-rollback row
     /// caught by `trim_older_than`).

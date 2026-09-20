@@ -1072,6 +1072,162 @@ mod tests {
     ///    `bytes_used` jumps to the byte total.
     ///
     /// The invariant under test — "`bytes_used = SUM(length_of_key_in_bytes + length_of_value)`" —
+    /// Round-5 P2 on PR #157: exercise the ACTUAL v15→v16
+    /// migration path, not just the post-migration
+    /// behaviour. Simulates a persisted v15 database
+    /// (`event_log` without `AUTOINCREMENT`) by:
+    ///
+    /// 1. Opening a Db (runs migrations 1..=15), then
+    ///    reverting to v15 shape: DROP the post-16
+    ///    `event_log`, recreate it under the pre-16
+    ///    `INTEGER PRIMARY KEY` schema, INSERT rows with
+    ///    known ids, PRAGMA user_version = 15.
+    /// 2. Reopening the same file — `apply_migrations`
+    ///    sees `user_version = 15 < 16` and runs migration
+    ///    16 exactly.
+    ///
+    /// Then asserts: `user_version = 16`, existing rows
+    /// preserved verbatim (id + payload), no duplicate
+    /// `sqlite_sequence` rows, AUTOINCREMENT high-water
+    /// tracked correctly (next insert gets `max_existing +
+    /// 1`, and reissuing after deleting that new max still
+    /// bumps rather than reuses).
+    #[test]
+    fn migration_16_from_v15_preserves_ids_and_enables_autoincrement() {
+        let dir = tempdir_for_test();
+
+        // Phase 1: open, drop the post-16 event_log, seed a
+        // pre-16 event_log with fixed ids, roll user_version
+        // back to 15.
+        {
+            let db = Db::open_file(dir.path()).expect("open");
+            db.write(|conn| -> rusqlite::Result<()> {
+                conn.execute_batch(
+                    "
+                    DROP TABLE IF EXISTS event_log;
+                    -- Pre-migration-16 schema: `INTEGER PRIMARY
+                    -- KEY` without `AUTOINCREMENT` (ROWID
+                    -- semantics).
+                    CREATE TABLE event_log (
+                        id            INTEGER PRIMARY KEY,
+                        received_ms   INTEGER NOT NULL,
+                        payload_ms    INTEGER NOT NULL,
+                        device_id     TEXT,
+                        instance_id   TEXT NOT NULL,
+                        plugin_id     TEXT NOT NULL,
+                        topic         TEXT NOT NULL,
+                        payload_blob  BLOB NOT NULL
+                    );
+                    -- Two rows with explicit ids so we can
+                    -- assert preservation across the rebuild.
+                    INSERT INTO event_log(id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
+                    VALUES (5, 100, 100, NULL, 'alpha', 'example.alpha', 't', X'00');
+                    INSERT INTO event_log(id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
+                    VALUES (9, 200, 200, NULL, 'alpha', 'example.alpha', 't', X'01');
+                    ",
+                )?;
+                // The AUTOINCREMENT table created by
+                // migration 16 also has a `sqlite_sequence`
+                // row from the post-migration state — but
+                // the DROP above only removes `event_log`
+                // itself, not its sqlite_sequence entry.
+                // Clear that entry so the migration starts
+                // from the clean pre-16 state (no
+                // `sqlite_sequence` row for `event_log`).
+                let _ = conn.execute(
+                    "DELETE FROM sqlite_sequence WHERE name = 'event_log'",
+                    (),
+                );
+                Ok(())
+            })
+            .expect("seed pre-migration state");
+            db.write(|conn| -> rusqlite::Result<()> {
+                conn.execute_batch("PRAGMA user_version = 15")?;
+                Ok(())
+            })
+            .expect("roll user_version back");
+        }
+
+        // Phase 2: reopen — `apply_migrations` sees v15 and
+        // applies exactly migration 16.
+        let db = Db::open_file(dir.path()).expect("reopen");
+
+        // user_version bumped to 16.
+        let version: i64 = db
+            .read(|c| c.pragma_query_value(None, "user_version", |row| row.get(0)))
+            .expect("user_version");
+        assert_eq!(version, 16, "migration 16 must have applied");
+
+        // Existing rows preserved verbatim.
+        let (id_5_ms, id_9_ms): (i64, i64) = db
+            .read(|c| -> rusqlite::Result<_> {
+                let a: i64 =
+                    c.query_row("SELECT received_ms FROM event_log WHERE id = 5", (), |r| {
+                        r.get(0)
+                    })?;
+                let b: i64 =
+                    c.query_row("SELECT received_ms FROM event_log WHERE id = 9", (), |r| {
+                        r.get(0)
+                    })?;
+                Ok((a, b))
+            })
+            .expect("read preserved rows");
+        assert_eq!((id_5_ms, id_9_ms), (100, 200));
+
+        // No duplicate `sqlite_sequence` rows for
+        // `event_log` (round-4 P1: the removed manual seed
+        // used to append a duplicate row here).
+        let seq_rows: i64 = db
+            .read(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'event_log'",
+                    (),
+                    |r| r.get(0),
+                )
+            })
+            .expect("count sqlite_sequence");
+        assert_eq!(seq_rows, 1, "exactly one sqlite_sequence row expected");
+
+        // High-water: seq = max existing id (9). Next
+        // insert with implicit id must be 10, not 1.
+        let next_id: i64 = db
+            .write(|conn| -> rusqlite::Result<i64> {
+                conn.execute(
+                    "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![300_i64, 300_i64, "alpha", "example.alpha", "t", &b"\x02"[..]],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .expect("insert after migration");
+        assert_eq!(
+            next_id, 10,
+            "post-migration insert must bump past MAX(id), not reuse",
+        );
+
+        // Round-4 P1: even after deleting that max, next
+        // insert must NOT reuse id=10.
+        db.write(|conn| -> rusqlite::Result<()> {
+            conn.execute("DELETE FROM event_log WHERE id = 10", ())?;
+            Ok(())
+        })
+        .expect("delete max");
+        let after_delete: i64 = db
+            .write(|conn| -> rusqlite::Result<i64> {
+                conn.execute(
+                    "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![400_i64, 400_i64, "alpha", "example.alpha", "t", &b"\x03"[..]],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .expect("insert after delete-max");
+        assert_eq!(
+            after_delete, 11,
+            "AUTOINCREMENT must not reuse the deleted max id",
+        );
+    }
+
     /// is the load-bearing bit of migration 2, and it still holds
     /// post-14. The column list changed but the math is the same.
     #[test]

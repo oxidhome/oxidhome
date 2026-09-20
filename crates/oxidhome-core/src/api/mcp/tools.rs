@@ -1774,19 +1774,19 @@ static EVENTS_SUBSCRIBE_INFLIGHT: std::sync::LazyLock<Arc<tokio::sync::Semaphore
 /// the `spawn_blocking` closure so a cancelled outer future
 /// (rmcp handler dropped mid-query on client disconnect)
 /// can't pile up detached blocking tasks — the permit
-/// releases when the actual SQLite read finishes, not when
+/// releases when the actual `SQLite` read finishes, not when
 /// the caller-facing future drops. Same cancellation-safety
 /// pattern the shared `STORE_QUERY_SEMAPHORE` uses for the
 /// other read tools.
 ///
-/// Sized to match [`EVENTS_SUBSCRIBE_INFLIGHT_MAX`]: since
-/// each subscribe does at most one query at a time, that
-/// bound is the natural ceiling. Extra headroom would let a
-/// cancel-burst stack more orphan blocking tasks; matching
-/// the admission cap keeps peak blocking-pool depth bounded
-/// at 4 even under adversarial cancellation. Saturation
-/// (e.g. 4 orphan queries still running) surfaces as `Busy`
-/// — same shape as the store-query saturation branch above.
+/// Sized to match [`EVENTS_SUBSCRIBE_INFLIGHT_MAX`] (8):
+/// each subscribe does at most one query at a time, so the
+/// admission cap is the natural ceiling for concurrent
+/// live queries. Extra headroom would let a cancel-burst
+/// stack more orphan blocking tasks; matching the admission
+/// cap keeps peak blocking-pool depth bounded at 8 even
+/// under adversarial cancellation. Saturation (e.g. 8 orphan
+/// queries still running) surfaces as `Busy`.
 const EVENTS_SUBSCRIBE_QUERY_MAX: usize = EVENTS_SUBSCRIBE_INFLIGHT_MAX;
 
 static EVENTS_SUBSCRIBE_QUERY_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
@@ -2024,20 +2024,17 @@ async fn events_subscribe_call(
 
     // Initial catch-up query — permit is acquired
     // synchronously; the blocking task holds it through the
-    // SQLite read.
-    let initial_join = match query_once(event_query.clone()) {
-        Ok(j) => j,
-        Err(()) => {
-            drop(subscription);
-            drop(inflight_permit);
-            tracing::warn!(
-                cap = EVENTS_SUBSCRIBE_QUERY_MAX,
-                "MCP events.subscribe query pool saturated — refusing call",
-            );
-            return ToolOutcome::Busy(format!(
-                "MCP events.subscribe query pool saturated ({EVENTS_SUBSCRIBE_QUERY_MAX} in-flight); retry shortly"
-            ));
-        }
+    // `SQLite` read.
+    let Ok(initial_join) = query_once(event_query.clone()) else {
+        drop(subscription);
+        drop(inflight_permit);
+        tracing::warn!(
+            cap = EVENTS_SUBSCRIBE_QUERY_MAX,
+            "MCP events.subscribe query pool saturated — refusing call",
+        );
+        return ToolOutcome::Busy(format!(
+            "MCP events.subscribe query pool saturated ({EVENTS_SUBSCRIBE_QUERY_MAX} in-flight); retry shortly"
+        ));
     };
     let rows = match initial_join.await {
         Ok(Ok(rows)) => rows,
@@ -2088,19 +2085,16 @@ async fn events_subscribe_call(
             // means orphan blocking tasks from earlier
             // cancelled subscribes are still holding permits;
             // treat as `Busy` so the caller retries.
-            let requery_join = match query_once(event_query.clone()) {
-                Ok(j) => j,
-                Err(()) => {
-                    drop(subscription);
-                    drop(inflight_permit);
-                    tracing::warn!(
-                        cap = EVENTS_SUBSCRIBE_QUERY_MAX,
-                        "MCP events.subscribe requery pool saturated — refusing call",
-                    );
-                    return ToolOutcome::Busy(format!(
-                        "MCP events.subscribe query pool saturated ({EVENTS_SUBSCRIBE_QUERY_MAX} in-flight); retry shortly"
-                    ));
-                }
+            let Ok(requery_join) = query_once(event_query.clone()) else {
+                drop(subscription);
+                drop(inflight_permit);
+                tracing::warn!(
+                    cap = EVENTS_SUBSCRIBE_QUERY_MAX,
+                    "MCP events.subscribe requery pool saturated — refusing call",
+                );
+                return ToolOutcome::Busy(format!(
+                    "MCP events.subscribe query pool saturated ({EVENTS_SUBSCRIBE_QUERY_MAX} in-flight); retry shortly"
+                ));
             };
             rows = match requery_join.await {
                 Ok(Ok(r)) => r,
