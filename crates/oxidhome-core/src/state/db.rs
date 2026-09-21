@@ -1081,7 +1081,7 @@ mod tests {
     ///    reverting to v15 shape: DROP the post-16
     ///    `event_log`, recreate it under the pre-16
     ///    `INTEGER PRIMARY KEY` schema, INSERT rows with
-    ///    known ids, PRAGMA user_version = 15.
+    ///    known ids, PRAGMA `user_version` = 15.
     /// 2. Reopening the same file — `apply_migrations`
     ///    sees `user_version = 15 < 16` and runs migration
     ///    16 exactly.
@@ -1092,7 +1092,12 @@ mod tests {
     /// tracked correctly (next insert gets `max_existing +
     /// 1`, and reissuing after deleting that new max still
     /// bumps rather than reuses).
+    // Two-phase reopen + full post-migration invariant sweep
+    // — splitting into per-assertion helpers would obscure
+    // the "same file, closed and reopened, migration ran"
+    // narrative the test depends on.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn migration_16_from_v15_preserves_ids_and_enables_autoincrement() {
         let dir = tempdir_for_test();
 

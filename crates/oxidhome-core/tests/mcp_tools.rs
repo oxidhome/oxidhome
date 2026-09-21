@@ -3128,14 +3128,14 @@ fn inject_event(engine: &oxidhome_core::Engine, topic: &str) -> u64 {
         CustomEvent, Event, EventPayload,
     };
 
-    #[allow(clippy::cast_possible_wrap)]
-    let now = std::time::SystemTime::now()
+    let now_u128 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock past epoch")
-        .as_millis() as i64;
+        .as_millis();
+    let now = i64::try_from(now_u128).unwrap_or(i64::MAX);
     let event = Event {
         device: None,
-        timestamp: now.max(0) as u64,
+        timestamp: u64::try_from(now_u128).unwrap_or(u64::MAX),
         origin_plugin_id: "com.example.subscribe-test".into(),
         origin_instance_id: "sub-a".into(),
         row_id: None,
