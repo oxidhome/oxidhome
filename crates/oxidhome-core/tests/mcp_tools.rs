@@ -3116,3 +3116,388 @@ async fn plugins_install_constraint_admits_matching_manifest_id() {
         "allowed install must register the plugin",
     );
 }
+
+// ── events.subscribe (14.3 last item) ─────────────────────────────
+
+/// Helper: record one event to the durable log AND publish it
+/// to the bus with the returned id — mirrors what the host's
+/// `publish_event` path does end-to-end so `events.subscribe`
+/// sees the same shape a real plugin publishes.
+fn inject_event(engine: &oxidhome_core::Engine, topic: &str) -> u64 {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload,
+    };
+
+    let now_u128 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock past epoch")
+        .as_millis();
+    let now = i64::try_from(now_u128).unwrap_or(i64::MAX);
+    let event = Event {
+        device: None,
+        timestamp: u64::try_from(now_u128).unwrap_or(u64::MAX),
+        origin_plugin_id: "com.example.subscribe-test".into(),
+        origin_instance_id: "sub-a".into(),
+        row_id: None,
+        payload: EventPayload::Custom(CustomEvent {
+            topic: topic.into(),
+            payload: String::new(),
+        }),
+    };
+    let id = engine
+        .event_log()
+        .record(now, &event, "sub-a", "com.example.subscribe-test")
+        .expect("record");
+    engine.events().publish_with_id(event, Some(id));
+    id
+}
+
+/// 14.3-last: `events.subscribe` is catalogued with a JSON
+/// Schema. Advertises `timeout_ms` as bounded ≤ 30000.
+#[tokio::test(flavor = "current_thread")]
+async fn list_tools_advertises_events_subscribe() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(&router, &bearer, &session, "tools/list", json!({})).await;
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "events.subscribe")
+        .expect("events.subscribe in catalogue");
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    let timeout_max = &schema["properties"]["timeout_ms"]["maximum"];
+    assert_eq!(
+        timeout_max.as_u64(),
+        Some(30_000),
+        "timeout_ms cap must be advertised as 30000; got {schema}",
+    );
+    let annotations = &tool["annotations"];
+    assert_eq!(annotations["readOnlyHint"], true);
+    assert_eq!(annotations["destructiveHint"], false);
+}
+
+/// 14.3-last: `events:read` gates the tool the same way
+/// `events.history` gates its counterpart.
+#[tokio::test(flavor = "current_thread")]
+async fn events_subscribe_requires_events_read_scope() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "no-events", &["devices:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"timeout_ms": 0}}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "devices:list must not satisfy events:read; got {response}",
+    );
+}
+
+/// 14.3-last: `timeout_ms: 0` never waits. On a fresh engine
+/// with no rows past the cursor, returns an empty batch
+/// immediately.
+#[tokio::test(flavor = "current_thread")]
+async fn events_subscribe_poll_zero_returns_empty_batch() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let start = std::time::Instant::now();
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"timeout_ms": 0}}),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "poll-once must return promptly; took {elapsed:?}",
+    );
+
+    let result = &response["result"];
+    assert_ne!(result["isError"], true, "must succeed; got {response}");
+    let events = result["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert!(events.is_empty(), "fresh engine, no rows; got {events:?}");
+}
+
+/// 14.3-last: catch-up path — events already recorded past
+/// the cursor return immediately without waiting on the bus.
+#[tokio::test(flavor = "current_thread")]
+async fn events_subscribe_returns_catchup_rows_immediately() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let id_a = inject_event(&engine, "sub.catchup.a");
+    let id_b = inject_event(&engine, "sub.catchup.b");
+    assert!(id_b > id_a);
+
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let start = std::time::Instant::now();
+    // Long deadline — catch-up must return well before it.
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"after_id": 0, "timeout_ms": 10_000}}),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "catch-up must not sleep the full timeout; took {elapsed:?}",
+    );
+
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert_eq!(events.len(), 2, "must return both rows; got {events:?}");
+    // Round-2 P1 on PR #157: subscribe queries the log in
+    // ASC order so a forward-cursor caller advancing to
+    // max(returned) never skips past-cursor rows. Pin the
+    // exact order.
+    assert_eq!(events[0]["id"].as_u64(), Some(id_a));
+    assert_eq!(events[1]["id"].as_u64(), Some(id_b));
+}
+
+/// Round-2 P1 on PR #157: forward-cursor semantics — over a
+/// batch cap, advancing `after_id` to `max(returned)` must
+/// walk the whole log without skipping. With DESC order, the
+/// first batch is the newest `limit` rows and its `max` skips
+/// past every earlier row; ASC order plus advance-to-max
+/// paginates cleanly.
+#[tokio::test(flavor = "current_thread")]
+async fn events_subscribe_forward_cursor_walks_past_batch_cap() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    // 3 events; batch cap = 2 forces a second call.
+    let id_1 = inject_event(&engine, "sub.walk.a");
+    let id_2 = inject_event(&engine, "sub.walk.b");
+    let id_3 = inject_event(&engine, "sub.walk.c");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"after_id": 0, "limit": 2, "timeout_ms": 0}}),
+    )
+    .await;
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert_eq!(events.len(), 2, "first batch capped at 2; got {events:?}");
+    assert_eq!(events[0]["id"].as_u64(), Some(id_1));
+    assert_eq!(events[1]["id"].as_u64(), Some(id_2));
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"after_id": id_2, "limit": 2, "timeout_ms": 0}}),
+    )
+    .await;
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert_eq!(
+        events.len(),
+        1,
+        "second batch must return id_3; got {events:?}"
+    );
+    assert_eq!(events[0]["id"].as_u64(), Some(id_3));
+}
+
+/// Round-2 P2 on PR #157: bus events that clear the coarse
+/// bus filter but fail the log filter (e.g. wrong plugin)
+/// must NOT short-circuit the deadline. The tool re-arms the
+/// select on empty requeries until either matching rows
+/// arrive or the deadline actually elapses.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_subscribe_wake_loop_survives_unrelated_bus_events() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    // Publisher: emit an event whose plugin/instance don't
+    // match the caller's filter (default helper uses
+    // `com.example.subscribe-test` / `sub-a`).
+    let publisher_engine = engine.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        inject_event(&publisher_engine, "sub.wake-loop.unrelated");
+    });
+
+    let start = std::time::Instant::now();
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "events.subscribe",
+            "arguments": {
+                "after_id": 0,
+                // Filter that no injected event matches — the
+                // requery on wake returns 0 rows.
+                "plugin": "com.example.nobody",
+                "timeout_ms": 500,
+            }
+        }),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(450),
+        "unrelated bus wake must NOT short-circuit the deadline; returned in only {elapsed:?}",
+    );
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert!(
+        events.is_empty(),
+        "filter miss, empty batch; got {events:?}"
+    );
+}
+
+/// 14.3-last: live-wake path — no rows past cursor at call
+/// time, an event is published DURING the wait, tool wakes on
+/// the bus and returns it.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_subscribe_wakes_on_live_event() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    // Publisher: wait ~100 ms so the tool is guaranteed to
+    // have subscribed + observed empty catch-up before the
+    // event lands on the bus.
+    let publisher_engine = engine.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        inject_event(&publisher_engine, "sub.live.wake");
+    });
+
+    let start = std::time::Instant::now();
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"after_id": 0, "timeout_ms": 5_000}}),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "wake must fire well before the timeout; took {elapsed:?}",
+    );
+
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert_eq!(
+        events.len(),
+        1,
+        "must return the published event; got {events:?}"
+    );
+    assert_eq!(events[0]["topic"], "sub.live.wake");
+}
+
+/// 14.3-last: after the wait budget expires with no matching
+/// event, the tool returns an empty batch. Client polls again
+/// with the same cursor.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_subscribe_returns_empty_on_timeout() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let start = std::time::Instant::now();
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "events.subscribe", "arguments": {"after_id": 0, "timeout_ms": 200}}),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(180),
+        "must wait ~timeout_ms; took only {elapsed:?}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "must not overshoot the timeout; took {elapsed:?}",
+    );
+
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert!(
+        events.is_empty(),
+        "no matching event, empty batch; got {events:?}"
+    );
+}
+
+/// 14.3-last: malformed typed args (bad `since`, unknown
+/// field, non-integer `after_id`) surface as `-32602`, matching
+/// events.history's shape.
+#[tokio::test(flavor = "current_thread")]
+async fn events_subscribe_rejects_malformed_filters() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (label, arguments) in [
+        ("bad since", json!({"since": "nope", "timeout_ms": 0})),
+        (
+            "non-integer after_id",
+            json!({"after_id": "abc", "timeout_ms": 0}),
+        ),
+        ("unknown field", json!({"topik": "typo", "timeout_ms": 0})),
+        (
+            "over-cap after_id",
+            json!({"after_id": u64::MAX, "timeout_ms": 0}),
+        ),
+    ] {
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "events.subscribe", "arguments": arguments}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{label}: must surface as `INVALID_PARAMS`; got {response}",
+        );
+    }
+}

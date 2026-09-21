@@ -111,6 +111,50 @@ pub struct EventQuery {
     /// batch, the caller passes the lowest returned id to
     /// walk backwards through history.
     pub before_id: Option<u64>,
+    /// Result ordering. Default `Desc` (highest id first) is
+    /// the natural "newest first" view under normal
+    /// operation, since the migration-16 AUTOINCREMENT id
+    /// is monotonic in insertion time. `Asc` lets a
+    /// forward-cursor caller (`after_id` + advance to `max
+    /// returned`) walk the log without skipping rows past
+    /// `limit`. Reviewer P1 on PR #157.
+    pub order: EventOrder,
+}
+
+/// Result-ordering policy for [`EventQuery`].
+///
+/// Both variants sort by `id` — the monotonic AUTOINCREMENT
+/// row id (migration 16) — with **no** `received_ms`
+/// component. Row id is insertion order; under normal
+/// operation that is identical to wall-clock order, so the
+/// visible shape matches the pre-14.3-events-subscribe
+/// "newest first / oldest first" behaviour every caller
+/// already relies on. Under a clock rollback (NTP step,
+/// manual `date --set`) the two diverge — a fresh row keeps
+/// its higher id but records a lower `received_ms` — and
+/// sorting by id preserves cursor integrity: a batch capped
+/// at `limit` advances the caller's cursor to the id
+/// boundary of the batch, and every unseen row lives on
+/// exactly one side of that boundary. Sorting by
+/// `received_ms` primary would put the rollback row inside
+/// a batch that then skipped past it on the next call.
+///
+/// Round-3 P1 on PR #157.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventOrder {
+    /// `ORDER BY id DESC` — highest id first. Under normal
+    /// operation this is "newest first" (id is monotonic in
+    /// insertion time). Default; matches the existing
+    /// `oxidhome://events` + `events.history` shape.
+    #[default]
+    Desc,
+    /// `ORDER BY id ASC` — lowest id first. Under normal
+    /// operation this is "oldest first". The forward-cursor
+    /// consumer (`events.subscribe`) uses this so a batch
+    /// capped at `limit` still lets the caller advance the
+    /// cursor and pick up any remaining past-cursor rows on
+    /// the next call.
+    Asc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,9 +258,11 @@ impl EventLog {
     }
 
     /// Query the history. Returns at most `limit` rows, ordered by
-    /// `received_ms DESC, id DESC` (newest first; the `id` tiebreak
-    /// matches the natural insertion order for events that share a
-    /// millisecond).
+    /// `id` (see [`EventOrder`] for the full rationale). Under
+    /// normal operation `Desc` is newest-first, `Asc` is
+    /// oldest-first; under a clock rollback both remain
+    /// stable across paginated calls because id is a
+    /// monotonic AUTOINCREMENT (migration 16).
     ///
     /// # Errors
     ///
@@ -224,6 +270,11 @@ impl EventLog {
     /// - [`EventLogError::Encode`] if a stored row has a malformed
     ///   `payload_blob` (would mean the table was hand-edited or
     ///   migrated incorrectly).
+    // Filter → SQL builder + per-row projection is a linear
+    // top-to-bottom pipeline; splitting it hides the ordered
+    // bind list from a grep. Same rationale as the `#[allow]`s
+    // in `tools::call` and `installed_plugins::install_gated`.
+    #[allow(clippy::too_many_lines)]
     pub fn query(
         &self,
         filter: &EventQuery,
@@ -314,11 +365,23 @@ impl EventLog {
         binds.push(rusqlite::types::Value::Integer(
             i64::try_from(limit).unwrap_or(i64::MAX),
         ));
-        let _ = write!(
-            sql,
-            " ORDER BY received_ms DESC, id DESC LIMIT ?{}",
-            binds.len()
-        );
+        // Both orderings sort by `id` alone (no `received_ms`
+        // primary): id is a monotonic autoincrement (schema
+        // migration 16), so pagination is stable under wall-
+        // clock jumps in either direction. Ordering by
+        // `received_ms DESC, id DESC` under a rollback would
+        // place a freshly-inserted row (lower ts, higher id)
+        // AFTER the older rows in the batch — a `before_id`
+        // walker taking `min(returned)` as the next cursor
+        // would skip the rollback row on the way down.
+        // `id DESC / id ASC` avoids the whole class of
+        // clock-vs-cursor gaps. Insertion order === id order
+        // === presentation order, both directions.
+        let order_sql = match filter.order {
+            EventOrder::Desc => "id DESC",
+            EventOrder::Asc => "id ASC",
+        };
+        let _ = write!(sql, " ORDER BY {order_sql} LIMIT ?{n}", n = binds.len());
 
         self.db.read(|conn| -> Result<_, EventLogError> {
             let mut stmt = conn.prepare(&sql)?;
@@ -861,6 +924,88 @@ mod tests {
         let rows = log.query(&EventQuery::default(), 16).expect("query");
         let times: Vec<_> = rows.iter().map(|r| r.received_ms).collect();
         assert_eq!(times, vec![30, 20, 10]);
+    }
+
+    /// Round-3 P1 on PR #157: ordering is by `id`, not by
+    /// `received_ms`. Insert three rows with inverted
+    /// timestamps (later `received_ms` on an earlier
+    /// insertion, later insertions with lower `received_ms`)
+    /// and prove both `Desc` and `Asc` return them in
+    /// insertion / id order — a `received_ms`-primary sort
+    /// would interleave and skip past cursor-pagination
+    /// boundaries.
+    #[test]
+    fn query_orders_by_id_regardless_of_wall_clock_skew() {
+        let log = log();
+        // Insertion order: row 1 → ts 1000, row 2 → ts 100
+        // (rollback), row 3 → ts 500.
+        for t in [1000_i64, 100, 500] {
+            log.record(t, &switch_event("d-1", true, 0), "alpha", "example.alpha")
+                .expect("record");
+        }
+        // Desc: ids 3, 2, 1 — NOT `received_ms DESC` (which
+        // would be 1000, 500, 100 → ids 1, 3, 2).
+        let desc = log.query(&EventQuery::default(), 16).expect("desc");
+        let desc_ts: Vec<_> = desc.iter().map(|r| r.received_ms).collect();
+        assert_eq!(
+            desc_ts,
+            vec![500, 100, 1000],
+            "Desc must walk by id, not ts"
+        );
+        // Asc: ids 1, 2, 3 — insertion order, again NOT ts
+        // order (which would be 100, 500, 1000 → ids 2, 3, 1).
+        let asc = log
+            .query(
+                &EventQuery {
+                    order: EventOrder::Asc,
+                    ..EventQuery::default()
+                },
+                16,
+            )
+            .expect("asc");
+        let asc_ts: Vec<_> = asc.iter().map(|r| r.received_ms).collect();
+        assert_eq!(asc_ts, vec![1000, 100, 500], "Asc must walk by id, not ts");
+    }
+
+    /// Round-4 P1 on PR #157: migration 16 gave `event_log.id`
+    /// AUTOINCREMENT semantics — `SQLite` must NOT reuse an id
+    /// after retention deletes a row (even when the deleted
+    /// row is the current max, e.g. a clock-rollback row
+    /// caught by `trim_older_than`).
+    #[test]
+    fn autoincrement_prevents_id_reuse_after_retention() {
+        let log = log();
+        // Insert rows normally, then a "rollback row" whose
+        // received_ms is far in the past — that row still
+        // gets the next id (higher than any predecessor).
+        let ids: Vec<u64> = [10_i64, 20, 30]
+            .iter()
+            .map(|t| {
+                log.record(*t, &switch_event("d-1", true, 0), "alpha", "example.alpha")
+                    .expect("record")
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        let rollback_id = log
+            .record(0, &switch_event("d-1", false, 0), "alpha", "example.alpha")
+            .expect("record rollback row");
+        assert_eq!(rollback_id, 4, "rollback row still gets next id");
+
+        // Retention drops rows with received_ms < 5 — that
+        // matches the rollback row (ts=0), which is currently
+        // the max id.
+        let dropped = log.trim_older_than(5).expect("trim");
+        assert_eq!(dropped, 1);
+
+        // Next insert MUST NOT reuse id=4 (that's the
+        // pre-migration bug). AUTOINCREMENT bumps to 5.
+        let next = log
+            .record(40, &switch_event("d-1", true, 0), "alpha", "example.alpha")
+            .expect("record after trim");
+        assert_eq!(
+            next, 5,
+            "AUTOINCREMENT must give a fresh id after deletion of the max row",
+        );
     }
 
     /// `limit` is honored — exceeding stops at `limit`, smaller is
