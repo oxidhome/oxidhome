@@ -124,7 +124,7 @@ path = "tests/mcp_tracing.rs"
 # `wasmtime-wasi-http` joins this list in Phase 8 when streaming plugins
 # need outgoing HTTP. Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli,
 # random, …) so libstd-pulled WASI imports resolve.
-wasmtime = { version = "=48.0.1", default-features = false, features = [
+wasmtime = { version = "=48.0.7", default-features = false, features = [
   "runtime",
   "component-model",
   "async",
