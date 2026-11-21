@@ -41,7 +41,7 @@ ipnet = { version = "2.12.0", default-features = false, features = ["serde", "st
 # (consistent build/cross-compile story for the Pi / ARM-NAS targets the
 # OS supports). The Phase-5a KV store + the Phase-5b/c/d additions all
 # go through this one dep. WAL mode is enabled in `state::db`.
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
 semver = { version = "1.0.28", default-features = false, features = ["serde", "std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # `serde_json` is the bridge between the WIT `value` variant and arbitrary
@@ -84,7 +84,7 @@ jsonschema = { version = "0.55.0", default-features = false }
 # streams (round-3 F3). Auth + stdio remain follow-ups (14.4,
 # 14.5) but land on top of the same service without further
 # feature-flag churn.
-rmcp = { version = "3.1.4", default-features = false, features = [
+rmcp = { version = "3.9.0", default-features = false, features = [
     "server",
     "transport-streamable-http-server",
     # 14.5: `oxidhome mcp-stdio` subprocess mode. `transport-io`
@@ -130,7 +130,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 # proto-only build answers `Content-Type: application/json` with HTTP
 # 415. The Connect wire format we expose is the curl-debuggable JSON
 # one, so the gate has to stay on.
-connectrpc = { version = "=0.9.0", default-features = false, features = ["axum", "server", "json"] }
+connectrpc = { version = "=0.9.1", default-features = false, features = ["axum", "server", "json"] }
 # `buffa` is the message-codegen runtime the generated code links
 # against. The Connect runtime (`connectrpc`) carries its own
 # transitive pin; this one keeps the generated message types in
