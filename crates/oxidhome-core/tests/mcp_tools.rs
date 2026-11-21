@@ -3382,6 +3382,57 @@ async fn events_subscribe_wake_loop_survives_unrelated_bus_events() {
     );
 }
 
+/// Round-7: the wake loop coalesces queued bus messages
+/// before each requery. A burst of non-matching events
+/// followed by a matching one must still return the
+/// matching row well before the deadline — the drain must
+/// never swallow the matching wake.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_subscribe_coalesced_wakes_still_deliver_match() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let publisher_engine = engine.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        for _ in 0..50 {
+            inject_event(&publisher_engine, "sub.burst.noise");
+        }
+        inject_event(&publisher_engine, "sub.burst.match");
+    });
+
+    let start = std::time::Instant::now();
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({
+            "name": "events.subscribe",
+            "arguments": {
+                "after_id": 0,
+                // Prefix → no bus-side topic filter, so every
+                // noise event wakes the loop.
+                "topic_prefix": "sub.burst.match",
+                "timeout_ms": 5000,
+            }
+        }),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "matching event must end the wait early; took {elapsed:?}",
+    );
+    let events = response["result"]["structuredContent"]["events"]
+        .as_array()
+        .expect("events array");
+    assert_eq!(events.len(), 1, "exactly the matching row; got {events:?}");
+    assert_eq!(events[0]["topic"], "sub.burst.match");
+}
+
 /// 14.3-last: live-wake path — no rows past cursor at call
 /// time, an event is published DURING the wait, tool wakes on
 /// the bus and returns it.

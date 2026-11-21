@@ -293,7 +293,10 @@ pub(super) fn list_tools() -> Vec<Tool> {
              immediately with any matching events already past the cursor; otherwise \
              blocks on the live event bus up to the deadline and returns whatever \
              arrived. On timeout, returns an empty batch — the client polls again \
-             with the same `after_id`. Same `events:read` scope as `events.history`.",
+             with the same `after_id`. Omitting `after_id` starts at the oldest \
+             retained matching row; to tail only new events, seed the cursor with \
+             the newest `id` from `events.history` (`limit: 1`). Same `events:read` \
+             scope as `events.history`.",
             Arc::new(events_subscribe_schema()),
         )
         .with_title("Long-poll for new events")
@@ -1816,7 +1819,7 @@ fn events_subscribe_schema() -> serde_json::Map<String, JsonValue> {
                 "type": "integer",
                 "minimum": 0,
                 "maximum": i64::MAX,
-                "description": "Cursor: return only rows with `id > after_id`. Client resumes with the last returned event's `id`.",
+                "description": "Cursor: return only rows with `id > after_id`, oldest first. Client resumes with the last returned event's `id`. Omitted = start at the oldest retained matching row.",
             },
             "limit": {
                 "type": "integer",
@@ -2080,6 +2083,17 @@ async fn events_subscribe_call(
             if !woken {
                 break;
             }
+            // Coalesce queued wakes BEFORE the requery snapshot
+            // so a burst of non-matching bus traffic costs one
+            // `SQLite` read, not one per message. Safe because the
+            // publisher persists the row before `publish_with_id`
+            // (both under `publish_sequence`): every message
+            // drained here belongs to a row already committed
+            // and therefore visible to the query below, and any
+            // message enqueued after this drain keeps its own
+            // wake. (Draining *after* the query is what round-2
+            // P2 rejected.)
+            while subscription.receiver.try_recv().is_ok() {}
             // Requery — same permit-into-closure pattern as
             // the initial catch-up above. Saturation here
             // means orphan blocking tasks from earlier
@@ -2119,11 +2133,9 @@ async fn events_subscribe_call(
             // that landed between the requery starting and
             // this line running (the queue picked it up but
             // the requery had already snapshot the log). The
-            // next select-arm iteration will pick up whatever
-            // queued during the requery — one extra requery
-            // for a non-matching wake is a tiny cost;
-            // dropping a matching wake would burn the whole
-            // deadline.
+            // next select-arm iteration picks up whatever
+            // queued during the requery; the pre-query drain
+            // above then coalesces it.
         }
         drop(subscription);
         rows
