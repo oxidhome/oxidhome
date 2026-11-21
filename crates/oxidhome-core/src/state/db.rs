@@ -739,9 +739,9 @@ const MIGRATIONS: &[&str] = &[
     // no `ALTER TABLE` for this — preserving every row's
     // existing id (and every existing index) so any client
     // that already saved an `after_id` cursor keeps working.
-    // The `INSERT INTO sqlite_sequence` line seeds the
-    // counter at the max existing id so post-migration
-    // inserts continue from there.
+    // Copying the rows with their explicit ids makes SQLite
+    // seed the `sqlite_sequence` counter at the max existing
+    // id, so post-migration inserts continue from there.
     "
     CREATE TABLE event_log_new (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1056,28 +1056,12 @@ mod tests {
         let _db2 = Db::open_file(dir.path()).expect("open 2");
     }
 
-    /// Migration 2 has to fix up `kv_usage.bytes_used` for any
-    /// instances that already accumulated character-counted totals
-    /// under migration 1. Simulate that (on top of the current
-    /// migration-14 schema — H2 rekeyed the `kv` / `kv_usage`
-    /// tables to `(installation_uuid, instance_id)`) by:
-    ///
-    /// 1. Open a fresh file DB (runs every migration on empty
-    ///    tables — nothing to re-baseline).
-    /// 2. Hand-craft a drifted row: insert a non-ASCII key and
-    ///    manually overwrite `bytes_used` with the character count
-    ///    migration 1's triggers would have produced.
-    /// 3. Run the migration-2 rebaseline body, rewritten against
-    ///    the migration-14 shape (composite PK), and confirm
-    ///    `bytes_used` jumps to the byte total.
-    ///
-    /// The invariant under test — "`bytes_used = SUM(length_of_key_in_bytes + length_of_value)`" —
     /// Round-5 P2 on PR #157: exercise the ACTUAL v15→v16
     /// migration path, not just the post-migration
     /// behaviour. Simulates a persisted v15 database
     /// (`event_log` without `AUTOINCREMENT`) by:
     ///
-    /// 1. Opening a Db (runs migrations 1..=15), then
+    /// 1. Opening a Db (runs every migration, through 16), then
     ///    reverting to v15 shape: DROP the post-16
     ///    `event_log`, recreate it under the pre-16
     ///    `INTEGER PRIMARY KEY` schema, INSERT rows with
@@ -1131,18 +1115,10 @@ mod tests {
                     VALUES (9, 200, 200, NULL, 'alpha', 'example.alpha', 't', X'01');
                     ",
                 )?;
-                // The AUTOINCREMENT table created by
-                // migration 16 also has a `sqlite_sequence`
-                // row from the post-migration state — but
-                // the DROP above only removes `event_log`
-                // itself, not its sqlite_sequence entry.
-                // Clear that entry so the migration starts
-                // from the clean pre-16 state (no
-                // `sqlite_sequence` row for `event_log`).
-                let _ = conn.execute(
-                    "DELETE FROM sqlite_sequence WHERE name = 'event_log'",
-                    (),
-                );
+                // No `sqlite_sequence` cleanup needed: SQLite
+                // deletes an AUTOINCREMENT table's sequence row
+                // when the table is dropped, so the DROP above
+                // already leaves the clean pre-16 state.
                 Ok(())
             })
             .expect("seed pre-migration state");
@@ -1233,6 +1209,22 @@ mod tests {
         );
     }
 
+    /// Migration 2 has to fix up `kv_usage.bytes_used` for any
+    /// instances that already accumulated character-counted totals
+    /// under migration 1. Simulate that (on top of the current
+    /// migration-14 schema — H2 rekeyed the `kv` / `kv_usage`
+    /// tables to `(installation_uuid, instance_id)`) by:
+    ///
+    /// 1. Open a fresh file DB (runs every migration on empty
+    ///    tables — nothing to re-baseline).
+    /// 2. Hand-craft a drifted row: insert a non-ASCII key and
+    ///    manually overwrite `bytes_used` with the character count
+    ///    migration 1's triggers would have produced.
+    /// 3. Run the migration-2 rebaseline body, rewritten against
+    ///    the migration-14 shape (composite PK), and confirm
+    ///    `bytes_used` jumps to the byte total.
+    ///
+    /// The invariant under test — "`bytes_used = SUM(length_of_key_in_bytes + length_of_value)`" —
     /// is the load-bearing bit of migration 2, and it still holds
     /// post-14. The column list changed but the math is the same.
     #[test]
