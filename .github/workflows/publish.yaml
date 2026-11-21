@@ -7,7 +7,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   Checks:
@@ -22,42 +23,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-      - name: Parse tag
-        id: parse
-        run: |
-          tag="${GITHUB_REF#refs/tags/}"
-          package="${tag%/v*}"
-          version="${tag##*/v}"
-          echo "package=$package" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag $tag -> package=$package version=$version"
-      - name: Verify Cargo.toml version matches tag
-        env:
-          PKG: ${{ steps.parse.outputs.package }}
-          VER: ${{ steps.parse.outputs.version }}
-        run: |
-          local_version=$(cargo pkgid --package "$PKG" 2>/dev/null | sed -E 's/.*[#@]//') || {
-            echo "::error::Package $PKG not found in workspace"
-            exit 1
-          }
-          if [ "$local_version" != "$VER" ]; then
-            echo "::error::Tag $PKG/v$VER but Cargo.toml has $PKG@$local_version"
-            exit 1
-          fi
+      # `Checks` has already parsed the tag and checked the crate and its
+      # Cargo.toml version against it; this only refuses a version that
+      # is already on crates.io.
       - name: Verify crate is in publishable set
+        if: ${{ !contains(fromJSON(needs.Checks.outputs.publish), needs.Checks.outputs.tag-package) }}
         env:
-          PKG: ${{ steps.parse.outputs.package }}
-          PUBLISH_LIST: ${{ needs.Checks.outputs.publish }}
+          PKG: ${{ needs.Checks.outputs.tag-package }}
+          VER: ${{ needs.Checks.outputs.tag-version }}
         run: |
-          if ! jq -e --arg pkg "$PKG" 'index($pkg)' <<<"$PUBLISH_LIST" >/dev/null; then
-            echo "::error::$PKG is not in the publishable set: $PUBLISH_LIST"
-            echo "::error::Either publish=false in Cargo.toml or this version is already on crates.io."
-            exit 1
-          fi
+          echo "::error::$PKG $VER is not in the publishable set: it is already on crates.io, or the registry lookup failed."
+          exit 1
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
       - name: Publish
         env:
-          PKG: ${{ steps.parse.outputs.package }}
+          PKG: ${{ needs.Checks.outputs.tag-package }}
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --all-features --package "$PKG" --verbose

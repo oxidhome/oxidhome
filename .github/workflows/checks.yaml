@@ -12,13 +12,21 @@ on:
     outputs:
       publish:
         value: ${{ jobs.RustMeta.outputs.publish }}
+      tag-package:
+        value: ${{ jobs.RustMeta.outputs.tag-package }}
+      tag-version:
+        value: ${{ jobs.RustMeta.outputs.tag-version }}
   schedule:
     - cron: "0 4 * * 1"   # Mondays 04:00 UTC, aligned with wit-deps.yaml
 
 env:
   CARGO_TERM_COLOR: always
 
-permissions: read-all
+# Every job here only clones the repo and runs cargo. Keeping this
+# narrow also caps what `publish.yaml` has to grant when it calls this
+# workflow.
+permissions:
+  contents: read
 
 jobs:
   RustMeta:
@@ -27,10 +35,42 @@ jobs:
     outputs:
       matrix: ${{ steps.rustmeta.outputs.matrix }}
       publish: ${{ steps.rustmeta.outputs.publish }}
+      tag-package: ${{ steps.rustmeta.outputs.tag-package }}
+      tag-version: ${{ steps.rustmeta.outputs.tag-version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: sv-tools/rust-metadata-action@56f5f4f6a41e50d5f5f440bd81c0ed041f9b8dfb # v1.2.3
+      # On a `<crate>/v<x.y.z>` tag push (`publish.yaml` calls this
+      # workflow) the action also parses the tag and fails when the crate
+      # is unknown, `publish = false`, or its Cargo.toml version differs
+      # from the tag.
+      - uses: sv-tools/rust-metadata-action@4020eda3b8b92b4cc9835dfe8d792ec2ace4690e # v1.3.1
         id: rustmeta
+      # `publish.yaml` ships one crate per tag and resolves siblings from
+      # crates.io, so tags have to be pushed in dependency order, and a
+      # crate's first version has to be published by hand: trusted
+      # publishing cannot create a crate.
+      - name: Report the release order
+        if: ${{ steps.rustmeta.outputs.publish != '[]' }}
+        env:
+          RELEASE_ORDER: ${{ steps.rustmeta.outputs.release-order }}
+          NEW_CRATES: ${{ steps.rustmeta.outputs.new-crates }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Release order"
+            echo
+            echo "One crate per tag, resolved from crates.io; push in this order:"
+            echo
+            echo '```sh'
+            jq -r '.[] | "git push origin \(.)"' <<<"$RELEASE_ORDER"
+            echo '```'
+            if [[ "$NEW_CRATES" != "[]" ]]; then
+              echo
+              echo "Not on crates.io yet; run \`cargo publish\` by hand before pushing their tags:"
+              echo
+              jq -r '.[] | "- `\(.)`"' <<<"$NEW_CRATES"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
   BuildJob:
     name: Build per crate
     needs: RustMeta
