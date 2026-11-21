@@ -23,7 +23,7 @@ use rmcp::{
         GetPromptResult, Implementation, ListPromptsResult, ListResourceTemplatesResult,
         ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
         ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
-        ServerInfo,
+        ServerConfig,
     },
     service::{MaybeSendFuture, RequestContext},
 };
@@ -72,8 +72,8 @@ impl OxidHomeMcpHandler {
 }
 
 impl ServerHandler for OxidHomeMcpHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
