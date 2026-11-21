@@ -202,7 +202,13 @@ impl ServerHandler for OxidHomeMcpHandler {
             // emit (different field shape).
             let start = Instant::now();
             let canonical = tools::canonical_tool_name(&request.name);
-            let result = tools::call(engine, request, &actor).await;
+            // Round-8 P2 on PR #157: rmcp runs the handler as a
+            // detached task and only signals `context.ct` on
+            // `notifications/cancelled` / session close, so a
+            // long-poll tool must observe the token itself.
+            let ct = context.ct.clone();
+            let cancelled: tools::CancelSignal = Box::pin(async move { ct.cancelled().await });
+            let result = tools::call(engine, request, &actor, cancelled).await;
             emit_completion(
                 "mcp.tool.complete",
                 canonical,

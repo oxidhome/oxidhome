@@ -3433,6 +3433,97 @@ async fn events_subscribe_coalesced_wakes_still_deliver_match() {
     assert_eq!(events[0]["topic"], "sub.burst.match");
 }
 
+/// Round-8 P2 on PR #157: rmcp does not abort a cancelled
+/// handler — it only fires the request's cancellation token.
+/// `events.subscribe` must observe it and end the wait early
+/// so a cancelled 30 s poll doesn't pin its inflight permit.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_subscribe_returns_early_on_client_cancel() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let request_id = rand_id();
+    let canceller = {
+        let router = router.clone();
+        let bearer = bearer.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let resp = router
+                .oneshot(
+                    base_request("POST", &bearer)
+                        .header("mcp-session-id", &session)
+                        .body(Body::from(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/cancelled",
+                                "params": { "requestId": request_id },
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        })
+    };
+
+    let start = std::time::Instant::now();
+    let response = router
+        .clone()
+        .oneshot(
+            base_request("POST", &bearer)
+                .header("mcp-session-id", &session)
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "events.subscribe",
+                            "arguments": { "after_id": 0, "timeout_ms": 30_000 },
+                        },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    canceller.await.expect("canceller task");
+    // rmcp drops the response of a cancelled request, so the
+    // observable signal is the audit row: the handler's
+    // finalize only runs once `events_subscribe_call`
+    // returns. Without the cancel arm it stays `pending` for
+    // the full 30 s deadline.
+    let finalized = loop {
+        let audit = engine.audit_log();
+        let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+            .await
+            .expect("audit query join")
+            .expect("audit query");
+        if rows
+            .iter()
+            .any(|r| r.path == "mcp.tool.events.subscribe" && r.decision != "pending")
+        {
+            break true;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        finalized,
+        "cancelled subscribe must finish well before its 30 s deadline",
+    );
+    drop(response);
+}
+
 /// 14.3-last: live-wake path — no rows past cursor at call
 /// time, an event is published DURING the wait, tool wakes on
 /// the bus and returns it.

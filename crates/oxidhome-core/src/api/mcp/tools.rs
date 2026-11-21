@@ -566,6 +566,13 @@ pub(super) fn canonical_tool_name(name: &str) -> &'static str {
     }
 }
 
+/// Resolves when the MCP client cancels the request
+/// (`notifications/cancelled`) or its session closes. rmcp
+/// does not abort a cancelled handler, so tools that wait
+/// (`events.subscribe`) select on this to release their
+/// capacity early.
+pub(super) type CancelSignal = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 // `call` is a flat routing table + audit choreography;
 // splitting per-tool arms into helpers would hide the flat
 // list from a grep. Same rationale as `list_tools` above.
@@ -574,6 +581,7 @@ pub(super) async fn call(
     engine: Engine,
     request: CallToolRequestParams,
     actor: &Actor,
+    cancelled: CancelSignal,
 ) -> Result<CallToolResult, McpError> {
     let Ok(audit_permit) = Arc::clone(&AUDIT_QUEUE_SEMAPHORE).try_acquire_owned() else {
         tracing::warn!(
@@ -669,7 +677,9 @@ pub(super) async fn call(
         }
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => events_history_call(engine.clone(), request.arguments).await,
-        "events.subscribe" => events_subscribe_call(engine.clone(), request.arguments).await,
+        "events.subscribe" => {
+            events_subscribe_call(engine.clone(), request.arguments, cancelled).await
+        }
         "plugins.list" => plugins_list_call(&engine, request.arguments),
         "plugins.show" => plugins_show_call(&engine, request.arguments, actor),
         "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments, actor).await,
@@ -1868,6 +1878,7 @@ struct EventsSubscribeArgs {
 async fn events_subscribe_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    mut cancelled: CancelSignal,
 ) -> ToolOutcome {
     let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
     let args: EventsSubscribeArgs = match serde_json::from_value(args_value) {
@@ -2075,8 +2086,13 @@ async fn events_subscribe_call(
         while tokio::time::Instant::now() < deadline {
             let sleep = tokio::time::sleep_until(deadline);
             tokio::pin!(sleep);
+            // Round-8 P2 on PR #157: a cancelled request ends
+            // the wait like a timeout (empty batch), releasing
+            // the subscription and inflight permit instead of
+            // pinning them until the deadline.
             let woken = tokio::select! {
                 biased;
+                () = &mut cancelled => false,
                 msg = subscription.receiver.recv() => msg.is_some(),
                 () = &mut sleep => false,
             };

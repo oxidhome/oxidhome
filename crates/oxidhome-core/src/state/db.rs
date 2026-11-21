@@ -737,7 +737,8 @@ const MIGRATIONS: &[&str] = &[
     // `sqlite_sequence` so a reused id is never issued. The
     // migration rebuilds `event_log` in place — SQLite has
     // no `ALTER TABLE` for this — preserving every row's
-    // existing id (and every existing index) so any client
+    // existing id (and recreating every index, the filter
+    // ones rekeyed to `(col, id)` — see below) so any client
     // that already saved an `after_id` cursor keeps working.
     // Copying the rows with their explicit ids makes SQLite
     // seed the `sqlite_sequence` counter at the max existing
@@ -773,11 +774,18 @@ const MIGRATIONS: &[&str] = &[
     -- `name`, and AUTOINCREMENT might then read either row.
     -- Round-4 P1 on PR #157.
 
+    -- Filter indexes are keyed `(col, id)`, not `(col,
+    -- received_ms)`: `EventLog::query` now orders by `id`
+    -- and pages on `id` cursors, so `(col, id)` lets SQLite
+    -- seek `col = ? AND id > ?` and stream rows in ORDER BY
+    -- order. The old time-keyed shape forced a scan of every
+    -- matching row plus a temp B-tree sort per query (round-8
+    -- P2). `evt_received` stays for retention + `since`.
     CREATE INDEX evt_received ON event_log(received_ms);
-    CREATE INDEX evt_device   ON event_log(device_id, received_ms) WHERE device_id IS NOT NULL;
-    CREATE INDEX evt_topic    ON event_log(topic, received_ms);
-    CREATE INDEX evt_instance ON event_log(instance_id, received_ms);
-    CREATE INDEX evt_plugin   ON event_log(plugin_id, received_ms);
+    CREATE INDEX evt_device   ON event_log(device_id, id) WHERE device_id IS NOT NULL;
+    CREATE INDEX evt_topic    ON event_log(topic, id);
+    CREATE INDEX evt_instance ON event_log(instance_id, id);
+    CREATE INDEX evt_plugin   ON event_log(plugin_id, id);
     ",
 ];
 
@@ -1054,6 +1062,40 @@ mod tests {
         // CREATE TABLE without IF NOT EXISTS) — proves user_version
         // gating works.
         let _db2 = Db::open_file(dir.path()).expect("open 2");
+    }
+
+    /// Round-8 P2 on PR #157: the `event_log` filter indexes
+    /// are keyed `(col, id)` so an id-cursor query seeks
+    /// straight to the cursor and streams in `ORDER BY id`
+    /// order — no full scan of the filtered set, no temp
+    /// B-tree sort.
+    #[test]
+    fn event_log_filter_indexes_serve_id_cursor_queries() {
+        let db = Db::open_in_memory().expect("open");
+        for col in ["device_id", "instance_id", "plugin_id", "topic"] {
+            for order in ["ASC", "DESC"] {
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN SELECT id FROM event_log \
+                     WHERE {col} = 'x' AND id > 5 ORDER BY id {order} LIMIT 100"
+                );
+                let plan: Vec<String> = db
+                    .read(|c| -> rusqlite::Result<_> {
+                        let mut stmt = c.prepare(&sql)?;
+                        let rows = stmt.query_map((), |r| r.get::<_, String>(3))?;
+                        rows.collect()
+                    })
+                    .expect("explain");
+                let plan = plan.join(" | ");
+                assert!(
+                    plan.contains(&format!("{col}=? AND id>?")),
+                    "{col} {order}: expected (col, id) index seek, got `{plan}`",
+                );
+                assert!(
+                    !plan.contains("TEMP B-TREE"),
+                    "{col} {order}: unexpected sort, got `{plan}`",
+                );
+            }
+        }
     }
 
     /// Round-5 P2 on PR #157: exercise the ACTUAL v15→v16

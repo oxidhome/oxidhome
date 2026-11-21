@@ -283,8 +283,8 @@ impl EventLog {
         // Build a parameterized WHERE clause + ordered params list.
         // Avoids string-templating columns and uses `?N` binds for
         // every value. The query planner picks among `evt_received`
-        // and the various `(col, received_ms)` indexes based on
-        // selectivity.
+        // and the various `(col, id)` indexes (migration 16) based
+        // on selectivity.
         use std::fmt::Write as _;
 
         let mut sql = String::from(
