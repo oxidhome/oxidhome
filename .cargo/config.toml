@@ -13,10 +13,6 @@
 #   and local devs typically already have it from a package manager
 #   or `go install`.
 #
-# cargo-machete is pinned to 0.9.2 because 0.10.1 uses a library
-# feature that is unstable on the pinned 1.95 toolchain and fails to
-# build; lift the pin once the toolchain moves past it.
-#
 # The three codegen plugins are version-pinned; everything else
 # floats. `crates/oxidhome-proto/src/gen/` is committed and the
 # `Codegen` CI job fails when `buf generate` disagrees with it, so an
