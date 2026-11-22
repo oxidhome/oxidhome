@@ -853,7 +853,9 @@ pub struct InstallPluginRequestView<'a> {
     /// reads the manifest to extract the canonical plugin id, then
     /// recursively copies the tree into
     /// `<state_dir>/plugins/<plugin_id>/` via a `.staging-<id>`
-    /// rename for atomicity.
+    /// rename for atomicity. Must be absolute and must not contain
+    /// `..` components; otherwise the call fails with
+    /// `invalid_argument`.
     ///
     /// Field 1: `source_dir`
     pub source_dir: &'a str,
@@ -1075,7 +1077,9 @@ impl InstallPluginRequestOwnedView {
     /// reads the manifest to extract the canonical plugin id, then
     /// recursively copies the tree into
     /// `<state_dir>/plugins/<plugin_id>/` via a `.staging-<id>`
-    /// rename for atomicity.
+    /// rename for atomicity. Must be absolute and must not contain
+    /// `..` components; otherwise the call fails with
+    /// `invalid_argument`.
     ///
     /// Field 1: `source_dir`
     #[must_use]
