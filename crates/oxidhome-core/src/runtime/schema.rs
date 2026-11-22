@@ -15,7 +15,9 @@
 //!   the contract ([`unit_code`] is each case's stable code in the
 //!   state projection); `other(label)` is a display-only fallback the
 //!   host keeps apart (`unit = "other"`, `unit_label = <label>`) and
-//!   refuses when the label spells a named code.
+//!   refuses when the label spells a named code. Sensor
+//!   `state-changed` deltas and `ok-with-state` replies may only
+//!   restate the spec's unit ([`check_sensor_fields`]).
 //! - **Service commands** carry `params` / `returns` field schemas.
 //!   [`check_service_info`] validates them at `register-service` /
 //!   `update-service`; [`check_args`] gates every `call-service`
@@ -169,6 +171,72 @@ pub(crate) fn measurement_fields(value: f64, unit: &Unit) -> Vec<KeyValue> {
         });
     }
     fields
+}
+
+/// How a sensor field bag reaches the projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SensorWrite {
+    /// `state-changed` delta: merged into the slot, so the unit may be
+    /// left out (the seeded one stays).
+    Delta,
+    /// `ok-with-state` reply: replaces the slot, so it must carry the
+    /// unit (and the label, for `other`) or the reading would lose it.
+    Snapshot,
+}
+
+/// A sensor `state-changed` delta or `ok-with-state` reply may restate
+/// `unit` / `unit_label`, but only as the device's sensor spec
+/// declares them; anything else would put a free-form unit back into
+/// the projection. A [`SensorWrite::Snapshot`] must restate them. No-op
+/// for other capabilities.
+pub(crate) fn check_sensor_fields(
+    info: &DeviceInfo,
+    capability: &str,
+    fields: &[KeyValue],
+    write: SensorWrite,
+) -> Result<(), String> {
+    if capability != "sensor" {
+        return Ok(());
+    }
+    let Some(spec_unit) = info.capabilities.iter().find_map(|c| match c {
+        CapabilitySpec::Sensor(s) => Some(&s.unit),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let (code, label) = unit_identity(spec_unit);
+    for kv in fields {
+        match (kv.key.as_str(), &kv.value) {
+            ("unit", Value::StringVal(v)) if v == code => {}
+            ("unit_label", Value::StringVal(v)) if Some(v.as_str()) == label => {}
+            ("unit" | "unit_label", _) => {
+                return Err(format!(
+                    "sensor field `{}` must match the sensor spec's unit `{}`",
+                    kv.key,
+                    unit_display(spec_unit)
+                ));
+            }
+            _ => {}
+        }
+    }
+    if write == SensorWrite::Snapshot {
+        let has = |key: &str| fields.iter().any(|kv| kv.key == key);
+        let missing = if !has("unit") {
+            Some("unit")
+        } else if label.is_some() && !has("unit_label") {
+            Some("unit_label")
+        } else {
+            None
+        };
+        if let Some(key) = missing {
+            return Err(format!(
+                "a sensor reply replaces the reading, so it must include `{key}` \
+                 (the sensor spec's unit is `{}`)",
+                unit_display(spec_unit)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_unit(unit: &Unit) -> Result<(), String> {
@@ -505,15 +573,14 @@ fn check_fields(schema: &[FieldSpec], values: &[KeyValue]) -> Result<(), String>
 
 /// The spec of `command` on `info`, or `invalid-argument` when the
 /// service doesn't declare it.
-pub(crate) fn find_command(
-    info: &ServiceInfo,
+pub(crate) fn find_command<'a>(
+    info: &'a ServiceInfo,
     service: &str,
     command: &str,
-) -> Result<CommandSpec, WitError> {
+) -> Result<&'a CommandSpec, WitError> {
     info.commands
         .iter()
         .find(|c| c.name == command)
-        .cloned()
         .ok_or_else(|| {
             WitError::InvalidArgument(format!(
                 "service `{service}` declares no command `{command}`"
@@ -669,6 +736,84 @@ mod tests {
                 "{bad:?} should be refused"
             );
         }
+    }
+
+    #[test]
+    fn sensor_fields_must_restate_the_spec_unit() {
+        let info = device(vec![sensor(Unit::Celsius, None, None)], vec![]);
+        let unit = |v: &str| KeyValue {
+            key: "unit".into(),
+            value: Value::StringVal(v.into()),
+        };
+        let value = KeyValue {
+            key: "value".into(),
+            value: Value::FloatVal(1.0),
+        };
+        check_sensor_fields(
+            &info,
+            "sensor",
+            std::slice::from_ref(&value),
+            SensorWrite::Delta,
+        )
+        .unwrap();
+        assert!(
+            check_sensor_fields(
+                &info,
+                "sensor",
+                std::slice::from_ref(&value),
+                SensorWrite::Snapshot
+            )
+            .is_err(),
+            "a snapshot reply must carry the unit"
+        );
+        check_sensor_fields(
+            &info,
+            "sensor",
+            &[value, unit("celsius")],
+            SensorWrite::Snapshot,
+        )
+        .unwrap();
+        assert!(
+            check_sensor_fields(&info, "sensor", &[unit("fahrenheit")], SensorWrite::Delta)
+                .is_err()
+        );
+        assert!(
+            check_sensor_fields(
+                &info,
+                "sensor",
+                &[KeyValue {
+                    key: "unit_label".into(),
+                    value: Value::StringVal("x".into()),
+                }],
+                SensorWrite::Delta,
+            )
+            .is_err()
+        );
+        // Other capabilities are not the sensor's business.
+        check_sensor_fields(&info, "switch", &[unit("anything")], SensorWrite::Snapshot).unwrap();
+
+        let other = device(
+            vec![sensor(Unit::Other("steps".into()), None, None)],
+            vec![],
+        );
+        let label = |v: &str| KeyValue {
+            key: "unit_label".into(),
+            value: Value::StringVal(v.into()),
+        };
+        check_sensor_fields(
+            &other,
+            "sensor",
+            &[unit("other"), label("steps")],
+            SensorWrite::Snapshot,
+        )
+        .unwrap();
+        assert!(
+            check_sensor_fields(&other, "sensor", &[unit("other")], SensorWrite::Snapshot).is_err(),
+            "an `other` snapshot must carry its label"
+        );
+        assert!(
+            check_sensor_fields(&other, "sensor", &[label("paces")], SensorWrite::Delta).is_err()
+        );
     }
 
     #[test]

@@ -397,12 +397,11 @@ pub(crate) async fn call_service(
     //    refusals that aren't authorization decisions (same-instance,
     //    cycle, deadline, owner not running), a malformed call never
     //    reaches the callee and writes no hop row. Only grant
-    //    refusals produce H6 `deny` rows.
-    let command_spec = {
-        let meta = services.get_any(&target)?;
-        super::schema::find_command(&meta.info, &target, &command)?
-    };
-    super::schema::check_args(&target, &command_spec, &args)?;
+    //    refusals produce H6 `deny` rows. The reply is checked
+    //    against this same registration snapshot.
+    let target_meta = services.get_any(&target)?;
+    let command_spec = super::schema::find_command(&target_meta.info, &target, &command)?;
+    super::schema::check_args(&target, command_spec, &args)?;
 
     // 4. Resolve target instance handle; refuse if it isn't running.
     let target_handle = instances.get(&target_instance).ok_or_else(|| {
@@ -481,7 +480,7 @@ pub(crate) async fn call_service(
     // row still records that the callee ran (allow / failed /
     // `internal`), not a dispatch error.
     let (outcome, audited) = match outcome {
-        Ok(result) => match super::schema::check_result(&target, &command_spec, result) {
+        Ok(result) => match super::schema::check_result(&target, command_spec, result) {
             Ok(result) => (Ok(result), None),
             Err(err) => (Err(err.clone()), Some(Ok(CommandResult::Err(err)))),
         },

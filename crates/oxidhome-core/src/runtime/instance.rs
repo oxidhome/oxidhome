@@ -1099,6 +1099,20 @@ impl PluginInstance {
                      doesn't declare; skipping state projection",
                 );
             }
+            // M2: a sensor reply replaces the reading, so it must
+            // carry the spec's unit (and nothing else).
+            if let Err(e) = super::schema::check_sensor_fields(
+                &meta.info,
+                &capability,
+                &fields,
+                super::schema::SensorWrite::Snapshot,
+            ) {
+                return Ok(CommandResult::Err(
+                    crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(
+                        format!("OkWithState on `{device_for_projection}/{capability}`: {e}"),
+                    ),
+                ));
+            }
             capability_declared
         } else {
             tracing::warn!(

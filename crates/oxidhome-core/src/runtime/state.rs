@@ -1258,6 +1258,17 @@ fn require_publish_authorized(
                     "publish-event: device `{device_id}` does not declare capability `{required}`",
                 )));
             }
+            if let EventPayload::StateChanged(sc) = payload {
+                super::schema::check_sensor_fields(
+                    &meta.info,
+                    &sc.capability,
+                    &sc.fields,
+                    super::schema::SensorWrite::Delta,
+                )
+                .map_err(|e| {
+                    WitError::InvalidArgument(format!("publish-event: device `{device_id}`: {e}"))
+                })?;
+            }
             Ok(())
         }
     }
@@ -2374,6 +2385,49 @@ mod tests {
                 payload: String::new(),
             }),
         }
+    }
+
+    /// M2: a sensor `state-changed` may restate the spec's unit code,
+    /// but a different (free-form) unit is refused before the event
+    /// reaches the bus or the projection.
+    #[test]
+    fn publish_refuses_sensor_state_with_foreign_unit() {
+        use crate::host_impl::plugin::oxidhome::plugin::types::Value;
+        let devices = DeviceRegistry::new();
+        let mut info = switch_device("thermo");
+        info.capabilities = vec![capabilities::CapabilitySpec::Sensor(
+            capabilities::SensorSpec {
+                unit: capabilities::Unit::Celsius,
+                min: None,
+                max: None,
+            },
+        )];
+        let id = devices
+            .try_register("uuid", "alpha".into(), info)
+            .expect("register");
+        let event = |unit: &str| {
+            let mut ev = state_change_event_of(Some(id.clone()), "sensor");
+            if let EventPayload::StateChanged(sc) = &mut ev.payload {
+                sc.fields = vec![
+                    KeyValue {
+                        key: "value".into(),
+                        value: Value::FloatVal(21.0),
+                    },
+                    KeyValue {
+                        key: "unit".into(),
+                        value: Value::StringVal(unit.into()),
+                    },
+                ];
+            }
+            ev
+        };
+        let alpha: InstanceId = "alpha".into();
+        require_publish_authorized(&devices, &alpha, &event("celsius")).expect("spec unit");
+        let err = require_publish_authorized(&devices, &alpha, &event("F")).unwrap_err();
+        assert!(
+            matches!(err, WitError::InvalidArgument(ref msg) if msg.contains("celsius")),
+            "got {err:?}",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
