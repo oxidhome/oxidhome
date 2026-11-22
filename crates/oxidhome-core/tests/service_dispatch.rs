@@ -575,6 +575,11 @@ async fn call_service_args_are_checked_against_the_declared_schema() {
         Error as WitError, KeyValue, Value,
     };
     use oxidhome_core::runtime::dispatcher;
+    use oxidhome_core::{
+        Actor,
+        auth::{ActorKind, InvocationContext, Principal, Transport},
+        state::AuditQuery,
+    };
 
     let (engine, counter_dir, _caller_dir, _state) = setup();
     let counter = engine
@@ -629,6 +634,40 @@ async fn call_service_args_are_checked_against_the_declared_schema() {
             other => panic!("`{command}` should be invalid-argument, got {other:?}"),
         }
     }
+
+    // H6 × M2: under an external root, a schema refusal is not an
+    // authorization decision and the callee never runs, so it writes
+    // no hop row (only grant refusals become `deny` rows).
+    let actor = Actor::api("tok-m2", vec!["*".into()]);
+    let root =
+        InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
+    let call_id = root.call_id().to_owned();
+    let outcome = dispatcher::call_service_from_host_in(
+        &engine,
+        root,
+        "test-driver",
+        &grants,
+        &grants,
+        target.clone(),
+        "increment",
+        by(Value::IntVal(0)),
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(WitError::InvalidArgument(_))),
+        "got {outcome:?}"
+    );
+    let rows = engine
+        .audit_log()
+        .query(
+            &AuditQuery {
+                call_id: Some(call_id),
+                ..AuditQuery::default()
+            },
+            50,
+        )
+        .expect("query");
+    assert_eq!(rows.len(), 0, "schema refusal audited: {rows:?}");
 
     match call("increment", by(Value::IntVal(5))).await {
         Ok(CommandResult::OkWithState(fields)) => assert!(
