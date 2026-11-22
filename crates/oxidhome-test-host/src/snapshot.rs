@@ -78,12 +78,12 @@ impl Snapshot {
                     .iter()
                     .map(|c| {
                         let params: Vec<String> = c.params.iter().map(render_field).collect();
-                        format!("{}({})", esc(&c.name), params.join(", "))
+                        format!("{}({})", tok(&c.name), params.join(", "))
                     })
                     .collect();
                 format!(
                     "{} {:?} {}",
-                    esc(&s.info.local_id),
+                    tok(&s.info.local_id),
                     s.info.name,
                     commands.join(", ")
                 )
@@ -95,7 +95,7 @@ impl Snapshot {
             .map(|e| {
                 format!(
                     "{} {}",
-                    e.device_id.as_deref().map_or_else(|| "-".to_owned(), esc),
+                    e.device_id.as_deref().map_or_else(|| "-".to_owned(), tok),
                     render_payload(&e.payload)
                 )
             })
@@ -106,7 +106,7 @@ impl Snapshot {
             let value = view
                 .get(&key)?
                 .map_or_else(|| "<removed>".to_owned(), |v| render_value(&v));
-            storage.push(format!("{} = {value}", esc(&key)));
+            storage.push(format!("{} = {value}", tok(&key)));
         }
         let blobs = instance
             .blobs()?
@@ -114,9 +114,9 @@ impl Snapshot {
             .map(|b| {
                 format!(
                     "{} {}B {}",
-                    esc(&b.name),
+                    tok(&b.name),
                     b.size_bytes,
-                    b.mime.as_deref().map_or_else(|| "-".to_owned(), esc)
+                    b.mime.as_deref().map_or_else(|| "-".to_owned(), tok)
                 )
             })
             .collect();
@@ -212,7 +212,8 @@ fn update_requested() -> bool {
 }
 
 /// A WIT value as compact text: bare bools and numbers, quoted
-/// strings, hex bytes (abbreviated past 32), `json:` + raw JSON.
+/// strings, hex bytes (abbreviated past 32), `json:` + the JSON text
+/// quoted.
 #[must_use]
 pub fn render_value(value: &Value) -> String {
     match value {
@@ -231,13 +232,27 @@ pub fn render_value(value: &Value) -> String {
             }
             out
         }
-        Value::JsonVal(json) => format!("json:{}", esc(json)),
+        Value::JsonVal(json) => format!("json:{json:?}"),
     }
 }
 
-/// Free-form text with control characters, quotes, and backslashes
-/// escaped (Rust `escape_debug`), so each item stays on one line and
-/// distinct values render distinctly.
+/// A name in a delimited position (key, id, topic, …): bare when it
+/// is a plain word (letters, digits, `_-.:/@+`), otherwise quoted and
+/// escaped like a Rust string, so no name can imitate the separators
+/// around it and every item stays on one line.
+fn tok(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.:/@+".contains(c));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("{text:?}")
+    }
+}
+
+/// Trailing free text (an event's payload): escaped onto one line.
 fn esc(text: &str) -> String {
     text.escape_debug().to_string()
 }
@@ -245,7 +260,7 @@ fn esc(text: &str) -> String {
 fn render_fields(fields: &[KeyValue]) -> String {
     let parts: Vec<String> = fields
         .iter()
-        .map(|kv| format!("{}={}", esc(&kv.key), render_value(&kv.value)))
+        .map(|kv| format!("{}={}", tok(&kv.key), render_value(&kv.value)))
         .collect();
     format!("{{{}}}", parts.join(", "))
 }
@@ -255,13 +270,13 @@ fn render_payload(payload: &EventPayload) -> String {
         EventPayload::StateChanged(sc) => {
             format!(
                 "state-changed {} {}",
-                sc.capability,
+                tok(&sc.capability),
                 render_fields(&sc.fields)
             )
         }
         EventPayload::Button(b) => format!("button {}", render_button(b)),
-        EventPayload::Inference(r) => format!("inference {} {}", esc(&r.model), esc(&r.payload)),
-        EventPayload::Custom(c) => format!("custom {} {}", esc(&c.topic), esc(&c.payload)),
+        EventPayload::Inference(r) => format!("inference {} {}", tok(&r.model), esc(&r.payload)),
+        EventPayload::Custom(c) => format!("custom {} {}", tok(&c.topic), esc(&c.payload)),
     }
 }
 
@@ -288,8 +303,8 @@ fn render_spec(spec: &CapabilitySpec) -> String {
         CapabilitySpec::Extension(ext) => {
             format!(
                 "extension({}/{}@{})",
-                esc(&ext.namespace),
-                esc(&ext.name),
+                tok(&ext.namespace),
+                tok(&ext.name),
                 ext.version
             )
         }
@@ -306,7 +321,7 @@ fn render_field(field: &FieldSpec) -> String {
         ValueKind::JsonVal => "json",
     };
     let optional = if field.required { "" } else { "?" };
-    format!("{}{optional}: {kind}", esc(&field.name))
+    format!("{}{optional}: {kind}", tok(&field.name))
 }
 
 /// Lines of `text` with trailing whitespace, surrounding blank lines,
@@ -457,14 +472,33 @@ mod tests {
     }
 
     #[test]
-    fn free_text_is_escaped_onto_one_line() {
-        assert_eq!(esc("a = 1\n  b"), "a = 1\\n  b");
+    fn names_cannot_imitate_separators() {
+        assert_eq!(tok("count"), "count");
+        assert_eq!(tok("automation.morning"), "automation.morning");
+        assert_eq!(tok(""), "\"\"");
+        assert_eq!(tok("a = 1\n  b"), "\"a = 1\\n  b\"");
+        let kv = |k: &str, v: bool| KeyValue {
+            key: k.into(),
+            value: Value::BoolVal(v),
+        };
+        assert_ne!(
+            render_fields(&[kv("a", true), kv("b", false)]),
+            render_fields(&[kv("a=true, b", false)])
+        );
+        assert_eq!(
+            render_fields(&[kv("a=true, b", false)]),
+            "{\"a=true, b\"=false}"
+        );
+        assert_eq!(
+            render_value(&Value::JsonVal("{\"a\": 1}, b=2".into())),
+            "json:\"{\\\"a\\\": 1}, b=2\""
+        );
         assert_eq!(
             render_payload(&EventPayload::Custom(crate::wit::events::CustomEvent {
-                topic: "t\nx".into(),
-                payload: "{\"k\":1}".into(),
+                topic: "t x".into(),
+                payload: "{\"k\":\n1}".into(),
             })),
-            "custom t\\nx {\\\"k\\\":1}"
+            "custom \"t x\" {\\\"k\\\":\\n1}"
         );
     }
 
@@ -479,7 +513,7 @@ mod tests {
             render_value(&Value::BytesVal(vec![1; 33])),
             format!("0x{}…(33 bytes)", "01".repeat(32))
         );
-        assert_eq!(render_value(&Value::JsonVal("{}".into())), "json:{}");
+        assert_eq!(render_value(&Value::JsonVal("{}".into())), "json:\"{}\"");
     }
 
     #[test]

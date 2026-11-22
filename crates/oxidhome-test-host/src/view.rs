@@ -133,8 +133,8 @@ impl StorageView {
     /// # Errors
     ///
     /// [`TestHostError::Storage`] when the write fails, including
-    /// when the instance has no storage quota (it was never
-    /// registered with the store) or the write would exceed it.
+    /// when the instance has no storage quota or the write would
+    /// exceed it.
     pub fn set(&self, key: &str, value: Value) -> Result<(), TestHostError> {
         Ok(self
             .kv
