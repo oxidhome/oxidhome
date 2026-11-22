@@ -121,24 +121,9 @@ name = "mcp_tracing"
 path = "tests/mcp_tracing.rs"
 
 [dependencies]
-# Pinned exactly. Wasmtime's component-model API surface evolves; we want
-# silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
-# the `wit-bindgen` pin policy in oxidhome-wit.
-#
-# `wasmtime-wasi-http` joins this list in Phase 8 when streaming plugins
-# need outgoing HTTP. Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli,
-# random, …) so libstd-pulled WASI imports resolve.
-wasmtime = { version = "=48.0.10", default-features = false, features = [
-  "runtime",
-  "component-model",
-  "async",
-  "cranelift",
-  "std",
-  # `anyhow` here flips on `From<wasmtime::Error> for anyhow::Error` so
-  # the host-runtime `?` plumbing keeps working with `anyhow::Result`.
-  "anyhow",
-] }
-wasmtime-wasi = { version = "=48.0.10", default-features = false, features = ["p2"] }
+# Exact pins (see the root Cargo.toml).
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
 # Decodes each plugin component's embedded WIT types for the load-time
 # contract check (`runtime::contract`).
 wit-parser.workspace = true
@@ -184,7 +169,7 @@ tower.workspace = true
 # of manifest.toml + plugin.wasm. Unix-only; the Windows fallback
 # in that helper doesn't need libc.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 # Connect RPC. `oxidhome-proto` holds the generated service traits;
 # `connectrpc` provides the Router that mounts onto axum via

@@ -29,13 +29,38 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-oxidhome-core = { path = "crates/oxidhome-core", version = "0.1.0" }
-oxidhome-manifest = { path = "crates/oxidhome-manifest", version = "0.1.0" }
-oxidhome-proto = { path = "crates/oxidhome-proto", version = "0.1.0" }
-oxidhome-sdk = { path = "crates/oxidhome-sdk", version = "0.1.0" }
-oxidhome-wit = { path = "crates/oxidhome-wit", version = "0.1.0" }
+oxidhome-core = { path = "crates/oxidhome-core" }
+oxidhome-manifest = { path = "crates/oxidhome-manifest" }
+oxidhome-proto = { path = "crates/oxidhome-proto" }
+oxidhome-sdk = { path = "crates/oxidhome-sdk" }
+oxidhome-wit = { path = "crates/oxidhome-wit" }
 
 # Shared external deps.
+# Pinned exactly. Wasmtime's component-model API surface evolves; we want
+# silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
+# the `wit-bindgen` pin policy below.
+#
+# `wasmtime-wasi-http` joins this list in Phase 8 when streaming plugins
+# need outgoing HTTP. Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli,
+# random, …) so libstd-pulled WASI imports resolve.
+wasmtime = { version = "=48.0.10", default-features = false, features = [
+  "runtime",
+  "component-model",
+  "async",
+  "cranelift",
+  "std",
+  # `anyhow` here flips on `From<wasmtime::Error> for anyhow::Error` so
+  # the host-runtime `?` plumbing keeps working with `anyhow::Result`.
+  "anyhow",
+] }
+wasmtime-wasi = { version = "=48.0.10", default-features = false, features = ["p2"] }
+# Pinned to an exact version. Cross-crate ABI surfaces are sensitive — a
+# silent minor bump in bindgen output could break either side. Bumps land
+# as deliberate PRs that re-run both bindgens. See the exact-pinning
+# policy in ARCHITECTURE.md "Implementation decisions".
+wit-bindgen = "=0.62.0"
+# `oxidhome-core`, unix-only (`flock` state-dir lock, no-follow opens).
+libc = "0.2.189"
 # WIT tooling for the M1 contract proof: the host decodes every plugin
 # component's embedded types (`wit-parser`) and compares them against
 # the `oxidhome:plugin` package `build.rs` encodes (`wit-component`);
