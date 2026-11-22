@@ -355,11 +355,14 @@ jobs:
         # Pre-built binary from buf's releases — no Go toolchain
         # needed on the runner just to compile buf itself. No
         # `version:` pin: track the latest buf release so codegen
-        # behavior stays aligned with the latest plugins. Resolving
+        # behavior stays aligned with the latest plugins. `buf-action`
+        # replaces the archived `buf-setup-action`; `setup_only` installs
+        # buf without running lint/format/breaking/push. Resolving
         # "latest" calls the GitHub API, which rate-limits anonymous
         # requests per runner IP, so pass the job's read-only token.
-        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
         with:
+          setup_only: true
           github_token: ${{ github.token }}
       - name: Install codegen plugins (protoc-gen-buffa{,-packaging},
           protoc-gen-connect-rust)
