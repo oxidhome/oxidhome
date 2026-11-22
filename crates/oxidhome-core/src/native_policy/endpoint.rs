@@ -221,10 +221,12 @@ fn classify_v4(ip: Ipv4Addr) -> AddressClass {
         (169, 254, _) => AddressClass::LinkLocal,
         (10 | 192 | 172 | 100, _, _) if is_private_v4(a, b) => AddressClass::Private,
         // 0/8 "this network" (incl. unspecified), 192.0.0/24 IETF protocol
-        // assignments, documentation nets, 198.18/15 benchmarking,
-        // 224/4 multicast, 240/4 reserved (incl. broadcast).
+        // assignments, documentation nets, 192.88.99/24 deprecated 6to4
+        // relay anycast, 198.18/15 benchmarking, 224/4 multicast, 240/4
+        // reserved (incl. broadcast).
         (0 | 224..=255, _, _)
         | (192, 0, 0 | 2)
+        | (192, 88, 99)
         | (198, 51, 100)
         | (203, 0, 113)
         | (198, 18..=19, _) => AddressClass::Forbidden,
@@ -311,6 +313,7 @@ mod tests {
             "203.0.113.1",
             "198.18.0.1",
             "192.0.0.1",
+            "192.88.99.1",
         ] {
             assert_eq!(class(forbidden), AddressClass::Forbidden, "{forbidden}");
         }
@@ -359,6 +362,8 @@ mod tests {
         assert_eq!(class("2002:7f00:1::1"), AddressClass::Loopback);
         assert_eq!(class("2002:c0a8:101::1"), AddressClass::Private);
         assert_eq!(class("2002:808:808::1"), AddressClass::Public);
+        assert_eq!(class("::ffff:192.88.99.2"), AddressClass::Forbidden);
+        assert_eq!(class("2002:c058:6302::1"), AddressClass::Forbidden);
     }
 
     #[test]
