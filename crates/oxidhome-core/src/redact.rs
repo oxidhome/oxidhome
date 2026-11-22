@@ -129,13 +129,30 @@ pub fn redact_json(value: &mut JsonValue) -> bool {
             }
             changed
         }
-        JsonValue::String(s) => match scrub_text(s) {
-            Cow::Borrowed(_) => false,
-            Cow::Owned(scrubbed) => {
-                *s = scrubbed;
-                true
+        JsonValue::String(s) => {
+            // A string that is itself a JSON document (a `json-val`, a
+            // custom event payload) is redacted structurally and
+            // re-encoded, so it stays valid JSON.
+            let trimmed = s.trim_start();
+            if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && let Ok(mut inner) = serde_json::from_str::<JsonValue>(s)
+            {
+                if !redact_json(&mut inner) {
+                    return false;
+                }
+                if let Ok(encoded) = serde_json::to_string(&inner) {
+                    *s = encoded;
+                    return true;
+                }
             }
-        },
+            match scrub_text(s) {
+                Cow::Borrowed(_) => false,
+                Cow::Owned(scrubbed) => {
+                    *s = scrubbed;
+                    true
+                }
+            }
+        }
         JsonValue::Bool(_) | JsonValue::Null | JsonValue::Number(_) => false,
     }
 }
@@ -393,50 +410,68 @@ pub fn config_secrets(config: &InstanceConfig) -> Vec<&str> {
 /// skipped (see there).
 #[must_use]
 pub fn scrub_secret_values<'a>(text: &'a str, secrets: &[&str]) -> Cow<'a, str> {
-    // Collect every match against the original text first, then merge
-    // overlapping ranges: replacing one secret before searching for the
-    // next would break up an overlapping match and leave a fragment.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for secret in secrets {
-        if secret.len() < MIN_SCRUB_SECRET_LEN {
-            continue;
-        }
-        let mut from = 0;
-        while let Some(i) = text[from..].find(secret) {
-            let start = from + i;
-            ranges.push((start, start + secret.len()));
-            // Step one char, not the whole secret, so overlapping
-            // occurrences of the same secret are all found.
-            from = start + text[start..].chars().next().map_or(1, char::len_utf8);
-        }
-    }
-    if ranges.is_empty() {
+    let secrets: Vec<&str> = secrets
+        .iter()
+        .copied()
+        .filter(|s| s.len() >= MIN_SCRUB_SECRET_LEN && text.contains(s))
+        .collect();
+    if secrets.is_empty() {
         return Cow::Borrowed(text);
     }
-    ranges.sort_unstable();
+    // One pass over the original text, merging overlapping matches as
+    // they are found: replacing one secret before searching for the
+    // next would break up an overlapping match and leave a fragment,
+    // and collecting every occurrence first would let a repetitive
+    // message allocate per match. Bookkeeping here is O(1); the output
+    // is never longer than the input plus one marker per merged run.
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    let mut current: Option<(usize, usize)> = None;
-    for (start, end) in ranges {
-        match &mut current {
-            Some((_, cur_end)) if start <= *cur_end => *cur_end = (*cur_end).max(end),
+    let mut run: Option<(usize, usize)> = None;
+    for (i, _) in text.char_indices() {
+        let Some(end) = secrets
+            .iter()
+            .filter(|s| text[i..].starts_with(**s))
+            .map(|s| i + s.len())
+            .max()
+        else {
+            continue;
+        };
+        match &mut run {
+            Some((_, run_end)) if i <= *run_end => *run_end = (*run_end).max(end),
             _ => {
-                if let Some((s, e)) = current.take() {
-                    out.push_str(&text[copied..s]);
+                if let Some((start, run_end)) = run.take() {
+                    out.push_str(&text[copied..start]);
                     out.push_str(REDACTED);
-                    copied = e;
+                    copied = run_end;
                 }
-                current = Some((start, end));
+                run = Some((i, end));
             }
         }
     }
-    if let Some((s, e)) = current {
-        out.push_str(&text[copied..s]);
+    if let Some((start, run_end)) = run {
+        out.push_str(&text[copied..start]);
         out.push_str(REDACTED);
-        copied = e;
+        copied = run_end;
     }
     out.push_str(&text[copied..]);
     Cow::Owned(out)
+}
+
+/// [`scrub_secret_values`] over the message of a command result's
+/// error, for plugin-authored text that leaves the sandbox.
+pub fn scrub_command_error(result: &mut CommandResult, secrets: &[&str]) {
+    use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
+    if let CommandResult::Err(
+        WitError::NotFound(m)
+        | WitError::InvalidArgument(m)
+        | WitError::PermissionDenied(m)
+        | WitError::Unavailable(m)
+        | WitError::Internal(m),
+    ) = result
+        && let Cow::Owned(scrubbed) = scrub_secret_values(m, secrets)
+    {
+        *m = scrubbed;
+    }
 }
 
 /// The read-API projection of an instance's resolved config.
@@ -674,6 +709,21 @@ mod tests {
     }
 
     #[test]
+    fn redact_json_handles_embedded_json_strings() {
+        let mut v = json!({
+            "payload": r#"{"password":{"value":"hunter2"},"pin":1234,"ok":1}"#,
+            "plain": "[not json",
+        });
+        assert!(redact_json(&mut v));
+        let inner: JsonValue = serde_json::from_str(v["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            inner,
+            json!({"password": {"value": "***"}, "pin": "***", "ok": 1})
+        );
+        assert_eq!(v["plain"], "[not json");
+    }
+
+    #[test]
     fn redact_json_keeps_tagged_values_decodable() {
         let mut v = json!({"pin": {"t": "Int", "v": 1234}});
         assert!(redact_json(&mut v));
@@ -759,6 +809,9 @@ default = 1883
             "***"
         );
         assert_eq!(scrub_secret_values("aaaaa", &["aaaa"]), "***");
+        assert_eq!(scrub_secret_values("aaaa-aaaa", &["aaaa"]), "***-***");
+        let big = "a".repeat(1 << 20);
+        assert_eq!(scrub_secret_values(&big, &["aaaa"]), "***");
         assert!(matches!(
             scrub_secret_values("clean", &["hunter2"]),
             Cow::Borrowed(_)
