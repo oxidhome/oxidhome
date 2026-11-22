@@ -428,6 +428,9 @@ jobs:
   PublishJob:
     name: Test publishing per crate
     needs: RustMeta
+    # Every crate is `publish = false` through 0.x, and an empty matrix
+    # is a workflow error, so skip the job until one is publishable.
+    if: ${{ needs.RustMeta.outputs.publish != '[]' }}
     strategy:
       matrix:
         package: ${{ fromJSON(needs.RustMeta.outputs.publish) }}
