@@ -140,6 +140,86 @@ fn try_lock_exclusive(_file: &File, state_dir: &Path) -> anyhow::Result<()> {
     )
 }
 
+/// M3: file name of the backup / restore lock, relative to the
+/// state dir. Separate from [`LOCK_FILE_NAME`] so an online backup
+/// (shared) can run alongside the daemon (which holds the state-dir
+/// lock) while still excluding a restore (exclusive), which would
+/// otherwise rename the database out from under the backup's open
+/// connection.
+pub const BACKUP_LOCK_FILE_NAME: &str = ".oxidhome-backup.lock";
+
+/// M3: take the backup / restore lock on
+/// `<state_dir>/.oxidhome-backup.lock` — shared for a backup,
+/// exclusive for a restore. Non-blocking; the returned `File` holds
+/// the lock until dropped.
+///
+/// # Errors
+///
+/// - The lock file can't be opened (or `state_dir` doesn't exist).
+/// - A conflicting holder exists: a restore when `exclusive` is
+///   false, a backup (or restore) when it is true.
+pub fn acquire_backup_lock(state_dir: &Path, exclusive: bool) -> anyhow::Result<File> {
+    let lock_path = state_dir.join(BACKUP_LOCK_FILE_NAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening backup lock file {}", lock_path.display()))?;
+    try_lock_backup(&file, exclusive, state_dir)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn try_lock_backup(file: &File, exclusive: bool, state_dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let op = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    } | libc::LOCK_NB;
+    let rc = loop {
+        // SAFETY: `file.as_raw_fd()` is a valid, open file
+        // descriptor for the lifetime of `file` (borrowed).
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break rc;
+    };
+    if rc == -1 {
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error();
+        if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
+            if exclusive {
+                anyhow::bail!(
+                    "a backup or restore is running against state dir {} — wait for it to finish",
+                    state_dir.display(),
+                );
+            }
+            anyhow::bail!(
+                "a restore is running against state dir {} — back up after it finishes",
+                state_dir.display(),
+            );
+        }
+        anyhow::bail!(
+            "acquiring the backup lock on state dir {} failed: {err}",
+            state_dir.display(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn try_lock_backup(_file: &File, _exclusive: bool, state_dir: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "backup / restore locking is currently only implemented on Unix (state dir: {})",
+        state_dir.display(),
+    )
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

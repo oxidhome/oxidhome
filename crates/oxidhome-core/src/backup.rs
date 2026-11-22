@@ -18,7 +18,9 @@
 //! ## Backup (online)
 //!
 //! [`create_backup`] never takes the state-dir lock, so it runs
-//! while the daemon is up:
+//! while the daemon is up. It holds the backup lock
+//! ([`crate::exclusive_lock::acquire_backup_lock`]) *shared*, which
+//! only excludes a restore:
 //!
 //! 1. `VACUUM INTO` from a fresh connection: one read transaction,
 //!    so the copy is a point-in-time snapshot including every
@@ -30,9 +32,11 @@
 //!    only after the row is gone), so copying exactly the files the
 //!    snapshot references reproduces the snapshot's view. Orphan
 //!    files (crash leftovers no row points at) are skipped.
-//! 3. A referenced file that vanished mid-copy, or a live plugin set
-//!    that changed between the snapshot and the end of the copy,
-//!    means the daemon raced the backup: the attempt is discarded
+//! 3. Plugin packages are copied from `plugins/<plugin_id>/` and
+//!    must hash to their row's `content_digest`. A referenced file
+//!    that vanished mid-copy, a package that doesn't match its
+//!    digest, or a live plugin set that changed between the snapshot
+//!    and the end of the copy means the daemon raced the backup: the attempt is discarded
 //!    and retried (up to [`BACKUP_ATTEMPTS`] times).
 //! 4. A `manifest.json` lists every file with its size and SHA-256.
 //!    The archive is built in a hidden sibling directory, verified
@@ -46,14 +50,17 @@
 //! ## Restore (offline)
 //!
 //! [`restore_offline`] holds the exclusive state-dir lock (so it
-//! refuses while the daemon or an `mcp-stdio` session runs) and:
+//! refuses while the daemon or an `mcp-stdio` session runs) plus the
+//! backup lock *exclusively*, and:
 //!
 //! 1. verifies the whole archive (checksums, no extra / missing
 //!    files, `PRAGMA integrity_check`, schema version, every blob
-//!    row has its file and vice versa, every live plugin row has its
-//!    package) **before touching the state dir**;
+//!    row has its file and vice versa, every live plugin row has a
+//!    package matching its digest) **before touching the state
+//!    dir**;
 //! 2. copies it into `<state_dir>/.restore-staging/`, re-checking
-//!    every checksum on the way in;
+//!    every checksum on the way in, and re-runs the database /
+//!    index / package checks on the staged copy;
 //! 3. writes a durable `<state_dir>/.restore-journal`, then moves
 //!    the current `oxidhome.db` (with its `-wal` / `-shm`), `blobs/`
 //!    and `plugins/` into `<state_dir>/pre-restore-<unix_ms>/` and
@@ -88,7 +95,10 @@
 //! newer than the binary is refused outright (no silent downgrade).
 //! Rolling back to the old binary means swapping the pre-migration
 //! snapshot in by hand while the daemon is stopped, which discards
-//! every write since the upgrade — see `ARCHITECTURE.md`.
+//! every write since the upgrade — see `ARCHITECTURE.md`. Rolling
+//! back across migration 14 additionally loses the legacy blob
+//! files, which [`crate::Engine::with_state_dir`] sweeps on the
+//! boot that applies it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -234,6 +244,9 @@ pub fn create_backup(state_dir: &Path, out: &Path) -> anyhow::Result<BackupRepor
         "backup target {} already exists",
         out.display(),
     );
+    // Shared: concurrent backups are fine, a restore is not — it
+    // would rename the database under our open connection.
+    let _backup_lock = crate::exclusive_lock::acquire_backup_lock(state_dir, false)?;
     let name = out
         .file_name()
         .and_then(|n| n.to_str())
@@ -263,9 +276,14 @@ pub fn create_backup(state_dir: &Path, out: &Path) -> anyhow::Result<BackupRepor
                     let _ = fs::remove_dir_all(&partial);
                     bail!("backup target {} appeared during the backup", out.display());
                 }
-                fs::rename(&partial, out).with_context(|| {
-                    format!("renaming {} to {}", partial.display(), out.display())
-                })?;
+                if let Err(err) = fs::rename(&partial, out) {
+                    let _ = fs::remove_dir_all(&partial);
+                    return Err(anyhow::Error::new(err).context(format!(
+                        "renaming {} to {}",
+                        partial.display(),
+                        out.display()
+                    )));
+                }
                 sync_dir(&parent).with_context(|| format!("syncing {}", parent.display()))?;
                 return Ok(BackupReport {
                     path: out.to_path_buf(),
@@ -355,7 +373,7 @@ fn backup_attempt(
     create_private_dir(&dest.join(PLUGINS_DIR))?;
 
     copy_indexed_blobs(state_dir, dest, &index, &mut files)?;
-    copy_live_plugins(state_dir, dest, &index, &mut files)?;
+    copy_live_plugins(state_dir, dest, &index, &source, &mut files)?;
 
     // The snapshot only pins the blob list; plugin trees are copied
     // from the live dir. An install / uninstall that committed after
@@ -434,6 +452,7 @@ fn copy_live_plugins(
     state_dir: &Path,
     dest: &Path,
     index: &SnapshotIndex,
+    source: &Connection,
     files: &mut Vec<FileEntry>,
 ) -> Result<(), AttemptError> {
     for plugin in &index.plugins {
@@ -447,8 +466,20 @@ fn copy_live_plugins(
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Raced an uninstall only if the row is gone by now;
+                // a live row without its directory (e.g. a package
+                // hand-placed under another directory name) won't fix
+                // itself on retry.
+                if read_live_plugins(source)?.contains(plugin) {
+                    return Err(anyhow::anyhow!(
+                        "installed plugin {} has a live installation row but no {rel} \
+                         directory; backups only archive packages at plugins/<plugin_id>",
+                        plugin.plugin_id,
+                    )
+                    .into());
+                }
                 return Err(AttemptError::Raced(format!(
-                    "installed plugin directory {rel} is missing"
+                    "installed plugin directory {rel} disappeared"
                 )));
             }
             Err(e) => {
@@ -458,6 +489,15 @@ fn copy_live_plugins(
             }
         }
         copy_tree_hashed(&src, dest, &rel, files)?;
+        // A package mid-uninstall (or replaced) still has a live row
+        // for a moment; the digest catches the torn copy.
+        check_package(&dest.join(&rel), plugin).map_err(|reason| {
+            AttemptError::Raced(format!(
+                "package of plugin {} changed during the copy or does not match its \
+                 installation row ({reason}); if this persists, reinstall the plugin",
+                plugin.plugin_id
+            ))
+        })?;
     }
 
     Ok(())
@@ -574,9 +614,8 @@ pub fn verify_backup(archive: &Path) -> anyhow::Result<VerifiedBackup> {
         manifest.format_version,
     );
 
-    let listed = check_archive_files(archive, &manifest)?;
-    let index = read_archived_index(archive, manifest.schema_version)?;
-    check_index_matches(&listed, &index)?;
+    check_archive_files(archive, &manifest)?;
+    let index = check_tree(archive, &manifest)?;
 
     Ok(VerifiedBackup {
         blobs: index.blobs.len(),
@@ -642,6 +681,43 @@ fn check_archive_files<'m>(
 
 /// Open the archived database read-only and check it before reading
 /// its index.
+/// Database, index and package checks over a tree whose files
+/// already match `manifest` (the archive, or the restore staging
+/// dir). Returns the database's index.
+fn check_tree(root: &Path, manifest: &BackupManifest) -> anyhow::Result<SnapshotIndex> {
+    let listed: BTreeMap<&str, &FileEntry> = manifest
+        .files
+        .iter()
+        .map(|e| (e.path.as_str(), e))
+        .collect();
+    let index = read_archived_index(root, manifest.schema_version)?;
+    check_index_matches(&listed, &index)?;
+    for plugin in &index.plugins {
+        check_package(&root.join(PLUGINS_DIR).join(&plugin.plugin_id), plugin).map_err(
+            |reason| anyhow::anyhow!("package of plugin {}: {reason}", plugin.plugin_id),
+        )?;
+    }
+    Ok(index)
+}
+
+/// The package at `dir` is the one `plugin`'s row was granted for:
+/// its manifest declares the same id and, unless the row is
+/// quarantined (no digest), its content digest matches.
+fn check_package(dir: &Path, plugin: &LivePlugin) -> Result<(), String> {
+    let Some(expected) = &plugin.content_digest else {
+        return Ok(());
+    };
+    let (digest, manifest) =
+        crate::state::recompute_digest_and_manifest(dir).map_err(|e| format!("{e:#}"))?;
+    if manifest.plugin.id != plugin.plugin_id {
+        return Err(format!("manifest declares id {}", manifest.plugin.id));
+    }
+    if digest != *expected {
+        return Err("content digest does not match its installation row".into());
+    }
+    Ok(())
+}
+
 fn read_archived_index(archive: &Path, manifest_schema: i64) -> anyhow::Result<SnapshotIndex> {
     let db_path = archive.join(DB_FILE_NAME);
     check_rollback_journal_header(&db_path)?;
@@ -827,15 +903,22 @@ fn check_rollback_journal_header(path: &Path) -> anyhow::Result<()> {
 pub fn restore_offline(state_dir: &Path, archive: &Path) -> anyhow::Result<RestoreReport> {
     let _lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
         .context("restore needs exclusive access — stop the daemon first")?;
+    let _backup_lock = crate::exclusive_lock::acquire_backup_lock(state_dir, true)?;
     ensure_no_interrupted_restore(state_dir)?;
     let verified =
         verify_backup(archive).with_context(|| format!("verifying {}", archive.display()))?;
 
     let staging = state_dir.join(RESTORE_STAGING_DIR);
     remove_dir_if_exists(&staging)?;
-    stage_archive(archive, &verified.manifest, &staging).inspect_err(|_| {
-        let _ = fs::remove_dir_all(&staging);
-    })?;
+    // The database / index / package checks run again on the staged
+    // bytes: verification read the archive, and a mutable archive
+    // could have shown different bytes to each pass.
+    stage_archive(archive, &verified.manifest, &staging)
+        .and_then(|()| check_tree(&staging, &verified.manifest).map(|_| ()))
+        .with_context(|| format!("staging {}", archive.display()))
+        .inspect_err(|_| {
+            let _ = fs::remove_dir_all(&staging);
+        })?;
 
     let previous_name = format!("{PRE_RESTORE_PREFIX}{}", now_unix_ms());
     let previous = state_dir.join(&previous_name);
@@ -863,6 +946,7 @@ pub fn restore_offline(state_dir: &Path, archive: &Path) -> anyhow::Result<Resto
 pub fn resume_restore_offline(state_dir: &Path) -> anyhow::Result<Option<RestoreReport>> {
     let _lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
         .context("restore needs exclusive access — stop the daemon first")?;
+    let _backup_lock = crate::exclusive_lock::acquire_backup_lock(state_dir, true)?;
     let path = state_dir.join(RESTORE_JOURNAL_FILE);
     let bytes = match fs::read(&path) {
         Ok(b) => b,
@@ -1054,7 +1138,15 @@ pub fn snapshot_before_migration(
         "database fails quick_check ({check}); refusing to migrate — restore a backup",
     );
     let dir = state_dir.join(PRE_MIGRATION_DIR);
+    let dir_is_new = fs::symlink_metadata(&dir).is_err();
     create_private_dir_all(&dir)
+        .and_then(|()| {
+            if dir_is_new {
+                sync_dir(state_dir)
+            } else {
+                Ok(())
+            }
+        })
         .with_context(|| format!("writing the pre-migration snapshot under {}", dir.display()))?;
     let name = format!("{:013}-v{from}-to-v{to}.db", now_unix_ms());
     let partial = dir.join(format!("{name}.partial"));

@@ -116,7 +116,7 @@ fn state_fingerprint(state: &Path) -> Vec<(String, Vec<u8>)> {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            if rel == ".oxidhome.lock" {
+            if rel == ".oxidhome.lock" || rel == ".oxidhome-backup.lock" {
                 continue;
             }
             if e.file_type().unwrap().is_dir() {
@@ -271,6 +271,26 @@ fn backup_gives_up_when_an_indexed_blob_file_is_missing() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
+/// A live installation whose package directory is missing is an
+/// inconsistent state, not a race: fail at once with a clear error.
+#[test]
+fn backup_fails_fast_when_a_live_plugin_has_no_package_dir() {
+    let fx = fixture();
+    std::fs::rename(
+        fx.state.path().join("plugins").join(PLUGIN_ID),
+        fx.state.path().join("plugins").join("renamed"),
+    )
+    .unwrap();
+    let out_dir = support::tempdir("backup-out");
+    let err = backup::create_backup(fx.state.path(), &out_path(&out_dir)).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("live installation row") && !msg.contains("attempts"),
+        "{msg}"
+    );
+    assert!(std::fs::read_dir(out_dir.path()).unwrap().next().is_none());
+}
+
 /// Orphan blob files (crash leftovers no row references) are not
 /// archived.
 #[test]
@@ -415,6 +435,55 @@ fn restore_refuses_a_newer_schema() {
         },
         "newer than this binary",
     );
+}
+
+/// A package whose bytes no longer match its installation row's
+/// content digest (even with a consistent manifest) is refused.
+#[test]
+fn restore_refuses_a_package_that_does_not_match_its_digest() {
+    assert_restore_refuses(
+        |archive| {
+            let rel = format!("plugins/{PLUGIN_ID}/plugin.wasm");
+            let bytes = b"\0asm\x0d\0\x01\0swapped";
+            std::fs::write(archive.join(&rel), bytes).unwrap();
+            let mut manifest = read_manifest(archive);
+            let entry = manifest.files.iter_mut().find(|f| f.path == rel).unwrap();
+            entry.size = bytes.len() as u64;
+            entry.sha256 = sha256_hex(bytes);
+            write_manifest(archive, &manifest);
+        },
+        "content digest",
+    );
+}
+
+/// Backups (shared) and restores (exclusive) exclude each other
+/// even with the daemon stopped.
+#[cfg(unix)]
+#[test]
+fn backup_and_restore_exclude_each_other() {
+    use oxidhome_core::exclusive_lock::acquire_backup_lock;
+    let fx = fixture();
+    let out_dir = support::tempdir("backup-out");
+    let archive = out_path(&out_dir);
+    backup::create_backup(fx.state.path(), &archive).unwrap();
+
+    let shared = acquire_backup_lock(fx.state.path(), false).unwrap();
+    let before = state_fingerprint(fx.state.path());
+    let err = backup::restore_offline(fx.state.path(), &archive).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("backup or restore is running"),
+        "{err:#}"
+    );
+    assert_eq!(state_fingerprint(fx.state.path()), before);
+    drop(shared);
+
+    let _exclusive = acquire_backup_lock(fx.state.path(), true).unwrap();
+    let err = backup::create_backup(fx.state.path(), &out_dir.path().join("second")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("a restore is running"),
+        "{err:#}"
+    );
+    assert!(!out_dir.path().join("second").exists());
 }
 
 #[cfg(unix)]
