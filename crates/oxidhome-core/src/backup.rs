@@ -143,7 +143,9 @@ pub const PRE_MIGRATION_KEEP: usize = 3;
 /// Oldest schema version a backup may carry. Archives can only be
 /// produced by binaries at or past this version, and the
 /// verification queries depend on its `blob` / `plugin_installation`
-/// shape.
+/// shape. Older-but-supported archives (e.g. v16, before H6's
+/// migration 17) are migrated by the post-swap boot, behind the usual
+/// pre-migration snapshot.
 pub const MIN_RESTORABLE_SCHEMA_VERSION: i64 = 16;
 /// Audit `path` for a completed restore.
 pub const AUDIT_PATH_RESTORE: &str = "cli.state.restore";
@@ -1146,6 +1148,11 @@ fn record_restore(state_dir: &Path, archive_created_ms: u64) -> anyhow::Result<(
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+        // Like M4's `cli.auth.*` rows: a local CLI action has no H6
+        // invocation context (host-origin work is not audited
+        // per-invocation), so the call-id columns stay NULL.
+        call_id: None,
+        invocation: None,
     };
     // Durable (`synchronous = FULL`): the audit-pending marker is
     // removed right after, so the row must survive a power loss. The

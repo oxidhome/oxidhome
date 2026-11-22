@@ -1471,7 +1471,7 @@ mod tests {
         let dir = tempdir_for_test();
         drop(Db::open_file(dir.path()).expect("fresh"));
         drop(Db::open_file(dir.path()).expect("current"));
-        assert!(pre_migration_snapshots(dir.path()).is_empty());
+        assert_eq!(pre_migration_snapshots(dir.path()), Vec::<PathBuf>::new());
     }
 
     /// No snapshot, no migration: the database stays at its old

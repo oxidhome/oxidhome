@@ -11,7 +11,7 @@ use oxidhome_core::backup::{
     self, AUDIT_PATH_RESTORE, BackupManifest, MANIFEST_FILE, RESTORE_JOURNAL_FILE,
     RESTORE_STAGING_DIR,
 };
-use oxidhome_core::state::{AuditQuery, Db};
+use oxidhome_core::state::{AuditEntry, AuditQuery, Db};
 use sha2::{Digest, Sha256};
 
 const PLUGIN_ID: &str = "example.backup-fixture";
@@ -320,8 +320,11 @@ fn backup_gives_up_when_an_indexed_blob_file_is_missing() {
         msg.contains("disappeared") && msg.contains("stop the daemon"),
         "{msg}"
     );
-    let leftovers: Vec<_> = std::fs::read_dir(out_dir.path()).unwrap().collect();
-    assert!(leftovers.is_empty(), "{leftovers:?}");
+    let leftovers: Vec<std::ffi::OsString> = std::fs::read_dir(out_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(leftovers, Vec::<std::ffi::OsString>::new());
 }
 
 /// A live installation whose package directory is missing looks
@@ -461,31 +464,178 @@ fn restore_refuses_a_path_traversal_entry() {
     );
 }
 
+/// Run `edit` on the archived database, then reseal the manifest
+/// (schema version, size, digest) so only `edit` differs.
+fn rewrite_archived_db(archive: &Path, edit: impl FnOnce(&rusqlite::Connection)) {
+    let db = archive.join("oxidhome.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        edit(&conn);
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let schema: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    let bytes = std::fs::read(&db).unwrap();
+    let mut manifest = read_manifest(archive);
+    manifest.schema_version = schema;
+    let entry = manifest
+        .files
+        .iter_mut()
+        .find(|f| f.path == "oxidhome.db")
+        .unwrap();
+    entry.size = bytes.len() as u64;
+    entry.sha256 = sha256_hex(&bytes);
+    write_manifest(archive, &manifest);
+}
+
+fn set_user_version(conn: &rusqlite::Connection, version: i64) {
+    conn.execute_batch(&format!("PRAGMA user_version = {version}"))
+        .unwrap();
+}
+
 #[test]
 fn restore_refuses_a_newer_schema() {
     assert_restore_refuses(
         |archive| {
-            let db = archive.join("oxidhome.db");
-            {
-                let conn = rusqlite::Connection::open(&db).unwrap();
-                let next = oxidhome_core::state::db::schema_version() + 1;
-                conn.execute_batch(&format!("PRAGMA user_version = {next}"))
-                    .unwrap();
-            }
-            let bytes = std::fs::read(&db).unwrap();
-            let mut manifest = read_manifest(archive);
-            manifest.schema_version += 1;
-            let entry = manifest
-                .files
-                .iter_mut()
-                .find(|f| f.path == "oxidhome.db")
-                .unwrap();
-            entry.size = bytes.len() as u64;
-            entry.sha256 = sha256_hex(&bytes);
-            write_manifest(archive, &manifest);
+            rewrite_archived_db(archive, |conn| {
+                set_user_version(conn, oxidhome_core::state::db::schema_version() + 1);
+            });
         },
         "newer than this binary",
     );
+}
+
+#[test]
+fn restore_refuses_a_schema_older_than_the_floor() {
+    assert_restore_refuses(
+        |archive| {
+            rewrite_archived_db(archive, |conn| {
+                set_user_version(conn, backup::MIN_RESTORABLE_SCHEMA_VERSION - 1);
+            });
+        },
+        "older than the oldest restorable",
+    );
+}
+
+/// An archive taken at the restore floor (v16, before H6's
+/// migration 17) restores; the post-swap boot migrates it (with a
+/// pre-migration snapshot) and records the audit row in the new
+/// shape.
+#[test]
+fn restore_migrates_an_archive_at_the_schema_floor() {
+    let fx = fixture();
+    let out_dir = support::tempdir("backup-out");
+    let archive = out_path(&out_dir);
+    backup::create_backup(fx.state.path(), &archive).unwrap();
+    rewrite_archived_db(&archive, |conn| {
+        // Undo every migration after the floor (17: H6 audit columns).
+        conn.execute_batch(
+            "DROP INDEX audit_call;
+             ALTER TABLE audit_event DROP COLUMN invocation_json;
+             ALTER TABLE audit_event DROP COLUMN call_id;",
+        )
+        .unwrap();
+        set_user_version(conn, backup::MIN_RESTORABLE_SCHEMA_VERSION);
+    });
+    assert_eq!(
+        backup::verify_backup(&archive)
+            .unwrap()
+            .manifest
+            .schema_version,
+        backup::MIN_RESTORABLE_SCHEMA_VERSION
+    );
+
+    backup::restore_offline(fx.state.path(), &archive).expect("restore");
+    let current = oxidhome_core::state::db::schema_version();
+    let snapshots: Vec<String> = std::fs::read_dir(fx.state.path().join(backup::PRE_MIGRATION_DIR))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let suffix = format!(
+        "-v{}-to-v{current}.db",
+        backup::MIN_RESTORABLE_SCHEMA_VERSION
+    );
+    assert!(
+        snapshots.iter().any(|n| n.ends_with(&suffix)),
+        "{snapshots:?}"
+    );
+
+    let engine = Engine::with_state_dir(fx.state.path()).unwrap();
+    let rows = engine
+        .audit_log()
+        .query(
+            &AuditQuery {
+                path: Some(AUDIT_PATH_RESTORE.into()),
+                ..AuditQuery::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].call_id, None);
+    assert_eq!(rows[0].invocation, None);
+    assert_eq!(
+        &*engine
+            .installed_plugins()
+            .get(PLUGIN_ID)
+            .unwrap()
+            .installation_uuid,
+        fx.uuid
+    );
+}
+
+/// H6's `call_id` / `invocation_json` audit columns survive a
+/// backup + restore unchanged.
+#[test]
+fn backup_round_trips_invocation_audit_columns() {
+    const CALL_ID: &str = "call-0123456789abcdef0123456789abcdef";
+    const INVOCATION: &str = r#"{"root":{"subject":"tok-1","transport":"rest"}}"#;
+    let fx = fixture();
+    {
+        let engine = Engine::with_state_dir(fx.state.path()).unwrap();
+        engine
+            .audit_log()
+            .record_completed(&AuditEntry {
+                id: 0,
+                intent_ms: 0,
+                finalized_ms: None,
+                token_id: "tok-1".into(),
+                actor_kind: "api".into(),
+                method: "POST".into(),
+                path: "/api/v1/devices/d/command".into(),
+                status: 200,
+                decision: "allow".into(),
+                required_scope: Some("devices:command".into()),
+                execution_outcome: Some("success".into()),
+                domain_error: None,
+                credential_fp: None,
+                call_id: Some(CALL_ID.into()),
+                invocation: Some(INVOCATION.into()),
+            })
+            .unwrap();
+    }
+    let out_dir = support::tempdir("backup-out");
+    let archive = out_path(&out_dir);
+    backup::create_backup(fx.state.path(), &archive).unwrap();
+    backup::restore_offline(fx.state.path(), &archive).unwrap();
+
+    let engine = Engine::with_state_dir(fx.state.path()).unwrap();
+    let rows = engine
+        .audit_log()
+        .query(
+            &AuditQuery {
+                call_id: Some(CALL_ID.into()),
+                ..AuditQuery::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].token_id, "tok-1");
+    assert_eq!(rows[0].invocation.as_deref(), Some(INVOCATION));
 }
 
 /// A package whose bytes no longer match its installation row's
