@@ -236,6 +236,21 @@ fn online_backup_then_restore_round_trips_db_blobs_and_plugins() {
     );
 }
 
+/// An archive inside the state dir could be moved or deleted by the
+/// swap / staging cleanup; restore refuses it up front.
+#[test]
+fn restore_refuses_an_archive_inside_the_state_dir() {
+    let fx = fixture();
+    let archive = fx.state.path().join(RESTORE_STAGING_DIR);
+    backup::create_backup(fx.state.path(), &archive).unwrap();
+    let err = backup::restore_offline(fx.state.path(), &archive).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("inside the state dir"),
+        "{err:#}"
+    );
+    backup::verify_backup(&archive).expect("archive untouched");
+}
+
 /// Disaster recovery: restore onto a machine with no state yet.
 #[test]
 fn restore_into_an_empty_state_dir() {

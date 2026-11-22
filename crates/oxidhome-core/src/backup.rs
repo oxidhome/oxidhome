@@ -906,6 +906,23 @@ pub fn restore_offline(state_dir: &Path, archive: &Path) -> anyhow::Result<Resto
         fs::symlink_metadata(state_dir.join(RESTORE_AUDIT_PENDING_FILE)).is_err(),
         "the previous restore's audit row is still pending — run `oxidhome restore --resume` first",
     );
+    // The swap moves, and staging cleanup deletes, paths inside the
+    // state dir; an archive in there could be destroyed mid-restore.
+    let canonical_state = fs::canonicalize(state_dir)
+        .with_context(|| format!("resolving {}", state_dir.display()))?;
+    let canonical_archive =
+        fs::canonicalize(archive).with_context(|| format!("resolving {}", archive.display()))?;
+    ensure!(
+        !canonical_archive.starts_with(&canonical_state),
+        "the backup {} is inside the state dir {}; move it elsewhere before restoring",
+        archive.display(),
+        state_dir.display(),
+    );
+    // The state dir may have just been created by the lock; make its
+    // entry durable before the restored state lands in it.
+    if let Some(parent) = canonical_state.parent() {
+        sync_dir(parent)?;
+    }
     let verified =
         verify_backup(archive).with_context(|| format!("verifying {}", archive.display()))?;
 
