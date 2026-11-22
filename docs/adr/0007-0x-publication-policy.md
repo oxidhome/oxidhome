@@ -21,7 +21,8 @@ directory at the workspace root that the bindgen crates read from outside their 
   the current version. A contract change needs a version bump and a new baseline.
 - **Exception while unpublished:** until `oxidhome-sdk` is published, no released contract exists, so the current
   version's baseline may be changed in place (delete it and bless it again) instead of bumping the version. Once the
-  SDK is published, baselines are immutable and compatible bumps must pass the semver check.
+  SDK is published, baselines become immutable. A version bump that claims to be compatible must pass the semver
+  check against the previous baseline already today.
 
 ## Rejected options
 
@@ -31,5 +32,5 @@ directory at the workspace root that the bindgen crates read from outside their 
 ## Consequences
 
 - Breaking WIT changes before the first SDK release stay cheap, and plugins must be rebuilt after one.
-- The compatibility guarantees (immutable baselines, semver checks) start at the first SDK release.
+- Baseline immutability starts at the first SDK release; the semver check on compatible bumps already runs in CI.
 - A second-language SDK that needs a versioned WIT artifact would force this decision to be revisited sooner.
