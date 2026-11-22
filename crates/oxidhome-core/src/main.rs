@@ -23,6 +23,17 @@
 //!   the same transaction, and writes the secret to
 //!   `<state_dir>/admin-token`. Never reachable over the network:
 //!   it needs filesystem access to the state dir.
+//! - **`backup <out-dir>` (M3)** — writes a consistent snapshot
+//!   of the database, the blob files it indexes and the installed
+//!   plugin packages to a new directory with a checksummed
+//!   `manifest.json`. Online: safe while the daemon runs.
+//! - **`verify-backup <dir>` (M3)** — checks an archive without
+//!   touching the state dir.
+//! - **`restore <dir>` / `restore --resume` (M3)** — offline:
+//!   verifies the archive, then swaps it in under the exclusive
+//!   state-dir lock, keeping the replaced state in
+//!   `<state_dir>/pre-restore-<unix_ms>/`. `--resume` finishes a
+//!   swap that was interrupted by a crash.
 //!
 //! ## Environment
 //!
@@ -123,6 +134,16 @@ async fn main() -> anyhow::Result<()> {
         .is_some_and(|a| a == "recover-admin-token")
     {
         return run_recover_admin_token();
+    }
+    match std::env::args_os()
+        .nth(1)
+        .as_deref()
+        .and_then(|a| a.to_str())
+    {
+        Some("backup") => return run_backup(),
+        Some("verify-backup") => return run_verify_backup(),
+        Some("restore") => return run_restore(),
+        _ => {}
     }
 
     let state_dir = resolve_state_dir()?;
@@ -336,14 +357,7 @@ fn run_recover_admin_token() -> anyhow::Result<()> {
             _ => anyhow::bail!("unexpected argument `{}`\n{USAGE}", arg.to_string_lossy()),
         }
     }
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = tracing_subscriber::registry()
-        .with(
-            fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_filter(filter),
-        )
-        .try_init();
+    init_cli_tracing();
 
     let state_dir = resolve_state_dir()?;
     let report = recover_admin_token_offline(&state_dir, scope)?;
@@ -357,6 +371,132 @@ fn run_recover_admin_token() -> anyhow::Result<()> {
     } else {
         println!("revoked: {}", report.revoked.join(", "));
     }
+    Ok(())
+}
+
+/// Stderr-only tracing for the offline / one-shot subcommands.
+fn init_cli_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(filter),
+        )
+        .try_init();
+}
+
+/// Parses `<subcommand> <path>` (plus `-h` / `--help`). `Ok(None)`
+/// means help was printed.
+fn single_path_arg(usage: &str, help: &str) -> anyhow::Result<Option<PathBuf>> {
+    let mut path = None;
+    for arg in std::env::args_os().skip(2) {
+        match arg.to_str() {
+            Some("-h" | "--help") => {
+                println!("{usage}");
+                println!("{help}");
+                return Ok(None);
+            }
+            Some(s) if s.starts_with('-') => {
+                anyhow::bail!("unexpected argument `{s}`\n{usage}")
+            }
+            _ if path.is_none() => path = Some(PathBuf::from(arg)),
+            _ => anyhow::bail!("unexpected argument `{}`\n{usage}", arg.to_string_lossy()),
+        }
+    }
+    path.map(Some)
+        .ok_or_else(|| anyhow::anyhow!("missing path\n{usage}"))
+}
+
+/// M3: `oxidhome backup <out-dir>`. Online — see
+/// [`oxidhome_core::backup::create_backup`].
+fn run_backup() -> anyhow::Result<()> {
+    let Some(out) = single_path_arg(
+        "usage: oxidhome backup <out-dir>",
+        "Writes a consistent snapshot of $OXIDHOME_STATE_DIR (database, blob files, installed \
+         plugins) to the new directory <out-dir>. Safe while the daemon runs.",
+    )?
+    else {
+        return Ok(());
+    };
+    init_cli_tracing();
+    let state_dir = resolve_state_dir()?;
+    let report = oxidhome_core::backup::create_backup(&state_dir, &out)?;
+    println!(
+        "backup written to {} (schema v{}, {} blob(s), {} plugin(s), {} file(s))",
+        report.path.display(),
+        report.manifest.schema_version,
+        report.blobs,
+        report.plugins,
+        report.manifest.files.len(),
+    );
+    Ok(())
+}
+
+/// M3: `oxidhome verify-backup <dir>`. Read-only.
+fn run_verify_backup() -> anyhow::Result<()> {
+    let Some(dir) = single_path_arg(
+        "usage: oxidhome verify-backup <dir>",
+        "Checks a backup archive's checksums, database integrity and index/file consistency.",
+    )?
+    else {
+        return Ok(());
+    };
+    init_cli_tracing();
+    let verified = oxidhome_core::backup::verify_backup(&dir)?;
+    println!(
+        "backup {} is valid (created_ms {}, schema v{}, {} blob(s), {} plugin(s))",
+        dir.display(),
+        verified.manifest.created_ms,
+        verified.manifest.schema_version,
+        verified.blobs,
+        verified.plugins,
+    );
+    Ok(())
+}
+
+/// M3: `oxidhome restore <dir>` / `oxidhome restore --resume`.
+/// Offline — takes the exclusive state-dir lock.
+fn run_restore() -> anyhow::Result<()> {
+    const USAGE: &str = "usage: oxidhome restore <dir> | oxidhome restore --resume";
+    let mut resume = false;
+    let mut archive = None;
+    for arg in std::env::args_os().skip(2) {
+        match arg.to_str() {
+            Some("--resume") => resume = true,
+            Some("-h" | "--help") => {
+                println!("{USAGE}");
+                println!(
+                    "With the daemon stopped, verifies the backup at <dir> and swaps it into \
+                     $OXIDHOME_STATE_DIR; the replaced state is kept in \
+                     pre-restore-<unix_ms>/. --resume finishes an interrupted restore."
+                );
+                return Ok(());
+            }
+            Some(s) if s.starts_with('-') => anyhow::bail!("unexpected argument `{s}`\n{USAGE}"),
+            _ if archive.is_none() => archive = Some(PathBuf::from(arg)),
+            _ => anyhow::bail!("unexpected argument `{}`\n{USAGE}", arg.to_string_lossy()),
+        }
+    }
+    init_cli_tracing();
+    let state_dir = resolve_state_dir()?;
+    let report = match (resume, archive) {
+        (true, None) => {
+            let Some(report) = oxidhome_core::backup::resume_restore_offline(&state_dir)? else {
+                println!("no interrupted restore in {}", state_dir.display());
+                return Ok(());
+            };
+            report
+        }
+        (false, Some(archive)) => oxidhome_core::backup::restore_offline(&state_dir, &archive)?,
+        _ => anyhow::bail!("{USAGE}"),
+    };
+    println!(
+        "restored backup created_ms {} into {}; previous state kept in {}",
+        report.archive_created_ms,
+        state_dir.display(),
+        report.previous.display(),
+    );
     Ok(())
 }
 

@@ -423,9 +423,12 @@ fn read_no_follow_within_bounded(
         // path component is a symlink. On macOS, POSIX-compliant.
         // Reading via the returned fd (not re-resolving `path`)
         // is what closes the TOCTOU on the file bytes themselves.
+        // `O_NONBLOCK` (M3): opening a FIFO without a writer would
+        // otherwise block before the regular-file check below
+        // rejects it; regular-file reads ignore the flag.
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?
     };
     #[cfg(not(unix))]

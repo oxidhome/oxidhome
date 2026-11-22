@@ -120,6 +120,10 @@ path = "tests/mcp_stdio.rs"
 name = "mcp_tracing"
 path = "tests/mcp_tracing.rs"
 
+[[test]]
+name = "backup_restore"
+path = "tests/backup_restore.rs"
+
 [dependencies]
 # Exact pins (see the root Cargo.toml).
 wasmtime.workspace = true

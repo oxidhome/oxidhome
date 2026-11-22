@@ -14,6 +14,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod backup;
 pub mod exclusive_lock;
 pub mod host_impl;
 pub mod runtime;
