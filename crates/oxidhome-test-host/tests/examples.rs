@@ -130,7 +130,7 @@ async fn service_counter_serves_typed_commands() {
     );
 
     assert_eq!(counter.stop().await.unwrap(), InstanceState::Stopped);
-    assert!(host.engine().services().list().is_empty());
+    assert_eq!(host.engine().services().list().len(), 0);
     assert!(matches!(
         host.call_service(&svc, "get", Vec::new()).await,
         Err(WitError::NotFound(_))

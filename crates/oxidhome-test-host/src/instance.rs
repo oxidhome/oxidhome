@@ -282,13 +282,11 @@ impl TestPluginInstance {
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis)
         {
-            loop {
-                // Next boundary strictly after the current time.
-                let done = self.elapsed.as_nanos() / interval.as_nanos();
-                let next = interval.saturating_mul(u32::try_from(done + 1).unwrap_or(u32::MAX));
-                if next > target {
-                    break;
-                }
+            // Next boundary strictly after the current time; `None`
+            // once it would overflow `Duration`, i.e. never reached.
+            while let Some(next) = next_boundary(self.elapsed, interval)
+                && next <= target
+            {
                 self.elapsed = next;
                 self.tick().await?;
                 ticks += 1;
@@ -316,9 +314,41 @@ impl TestPluginInstance {
     }
 }
 
+/// The first multiple of `interval` strictly after `now`.
+fn next_boundary(now: Duration, interval: Duration) -> Option<Duration> {
+    let into = now.as_nanos() % interval.as_nanos();
+    let into = Duration::new(
+        u64::try_from(into / 1_000_000_000).ok()?,
+        u32::try_from(into % 1_000_000_000).ok()?,
+    );
+    now.checked_sub(into)?.checked_add(interval)
+}
+
 impl Drop for TestPluginInstance {
     fn drop(&mut self) {
         // The lease (a field) frees the id after this teardown.
         self.engine.release_instance_state(self.lease.id());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_boundary;
+    use std::time::Duration;
+
+    #[test]
+    fn boundaries_are_strictly_after_now() {
+        let second = Duration::from_secs(1);
+        assert_eq!(next_boundary(Duration::ZERO, second), Some(second));
+        assert_eq!(
+            next_boundary(Duration::from_millis(999), second),
+            Some(second)
+        );
+        assert_eq!(next_boundary(second, second), Some(2 * second));
+        assert_eq!(
+            next_boundary(Duration::from_millis(4500), second),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(next_boundary(Duration::MAX, second), None);
     }
 }

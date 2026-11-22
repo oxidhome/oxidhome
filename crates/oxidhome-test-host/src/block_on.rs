@@ -10,13 +10,11 @@ use std::sync::OnceLock;
 /// ```no_run
 /// use oxidhome_test_host::{TestHost, block_on};
 ///
-/// #[test]
-/// fn counts_ticks() {
-///     let host = TestHost::new().unwrap();
-///     let mut counter = block_on(host.load("path/to/kv-counter")).unwrap();
-///     block_on(counter.init()).unwrap();
-///     block_on(counter.tick()).unwrap();
-/// }
+/// // The body of a plain `#[test] fn`:
+/// let host = TestHost::new().unwrap();
+/// let mut counter = block_on(host.load("path/to/kv-counter")).unwrap();
+/// block_on(counter.init()).unwrap();
+/// block_on(counter.tick()).unwrap();
 /// ```
 ///
 /// Every call uses the same process-wide multi-threaded runtime

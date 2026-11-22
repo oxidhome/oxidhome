@@ -26,7 +26,8 @@ use std::time::Duration;
 use oxidhome_test_host::wit::devices::{Command, CommandResult};
 use oxidhome_test_host::{LoadOptions, TestHost, TestHostError};
 
-#[tokio::test(flavor = "multi_thread")]
+// Run it from `#[tokio::test(flavor = "multi_thread")]`, or see
+// "Synchronous tests" below.
 async fn toggle_flips_the_switch() -> Result<(), TestHostError> {
     // A fresh engine on a temp state dir, removed on drop.
     let host = TestHost::new()?;
@@ -47,22 +48,23 @@ async fn toggle_flips_the_switch() -> Result<(), TestHostError> {
         action: "toggle".into(),
         args: Vec::new(),
     };
-    let reply = plugin.send_command(device, toggle).await?;
+    let reply = plugin.send_command(device.clone(), toggle).await?;
     assert!(matches!(reply, CommandResult::OkWithState(_)));
 
     // Assert on everything at once. Timestamps and other clock- or
-    // counter-derived values are left out, so this is stable.
-    plugin.snapshot()?.assert_matches(
+    // counter-derived values are left out, so this is stable; the
+    // device id is a hash of the plugin, instance, and local id.
+    plugin.snapshot()?.assert_matches(&format!(
         r#"
         devices:
-          dev-6b1f4a0c9d2e8f31 "My Switch" [switch]
+          {device} "My Switch" [switch]
         services:
         events:
-          dev-6b1f4a0c9d2e8f31 state-changed switch {state=true}
+          {device} state-changed switch {{state=true}}
         storage:
         blobs:
-        "#,
-    );
+        "#
+    ));
 
     // `tick` runs on a virtual clock: with `tick_interval_ms = 1000`,
     // advancing 3.5 s runs exactly three ticks.

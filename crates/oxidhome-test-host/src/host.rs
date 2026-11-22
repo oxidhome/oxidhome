@@ -303,13 +303,12 @@ impl TestHost {
             )
             .await
             .map_err(|e| TestHostError::Load {
-                plugin_id: plugin_id.clone(),
+                plugin_id,
                 source: e.into(),
             })?;
         Ok(SupervisedInstance::new(
             self.engine.clone(),
             handle,
-            plugin_id,
             reservation.keep(),
             Arc::clone(&self.state_dir),
         ))

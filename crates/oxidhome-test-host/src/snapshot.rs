@@ -167,9 +167,7 @@ impl Snapshot {
     #[track_caller]
     pub fn assert_matches_file(&self, path: impl AsRef<Path>) {
         let path = path.as_ref();
-        let update =
-            std::env::var_os(UPDATE_SNAPSHOTS_ENV).is_some_and(|v| !v.is_empty() && v != "0");
-        if update {
+        if update_requested() {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).unwrap_or_else(|e| {
                     panic!("creating snapshot directory {}: {e}", parent.display())
@@ -205,6 +203,12 @@ impl fmt::Display for Snapshot {
         }
         Ok(())
     }
+}
+
+/// Whether [`UPDATE_SNAPSHOTS_ENV`] asks for snapshot files to be
+/// rewritten.
+fn update_requested() -> bool {
+    std::env::var_os(UPDATE_SNAPSHOTS_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// A WIT value as compact text: bare bools and numbers, quoted
@@ -318,9 +322,48 @@ fn normalize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// A minimal line diff (longest common subsequence): unchanged lines
-/// prefixed with two spaces, removed with `- `, added with `+ `.
+/// Largest LCS table (cells) [`diff`] builds; past it the differing
+/// middle is shown as a plain remove-all / add-all.
+const MAX_DIFF_CELLS: usize = 1 << 20;
+
+/// A minimal line diff: unchanged lines prefixed with two spaces,
+/// removed with `- `, added with `+ `. The common prefix and suffix
+/// are matched directly; the middle by longest common subsequence
+/// while that stays under [`MAX_DIFF_CELLS`].
 fn diff(want: &[String], got: &[String]) -> String {
+    let prefix = want.iter().zip(got).take_while(|(a, b)| a == b).count();
+    let suffix = want[prefix..]
+        .iter()
+        .rev()
+        .zip(got[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (want_mid, got_mid) = (
+        &want[prefix..want.len() - suffix],
+        &got[prefix..got.len() - suffix],
+    );
+    let mut out = String::new();
+    for line in &want[..prefix] {
+        let _ = writeln!(out, "  {line}");
+    }
+    let (n, m) = (want_mid.len(), got_mid.len());
+    if (n + 1).saturating_mul(m + 1) > MAX_DIFF_CELLS {
+        for line in want_mid {
+            let _ = writeln!(out, "- {line}");
+        }
+        for line in got_mid {
+            let _ = writeln!(out, "+ {line}");
+        }
+    } else {
+        lcs_diff(want_mid, got_mid, &mut out);
+    }
+    for line in &want[want.len() - suffix..] {
+        let _ = writeln!(out, "  {line}");
+    }
+    out
+}
+
+fn lcs_diff(want: &[String], got: &[String], out: &mut String) {
     let (n, m) = (want.len(), got.len());
     // lcs[i][j] = LCS length of want[i..] and got[j..].
     let mut lcs = vec![vec![0_usize; m + 1]; n + 1];
@@ -333,7 +376,6 @@ fn diff(want: &[String], got: &[String]) -> String {
             };
         }
     }
-    let mut out = String::new();
     let (mut i, mut j) = (0, 0);
     while i < n || j < m {
         if i < n && j < m && want[i] == got[j] {
@@ -348,7 +390,6 @@ fn diff(want: &[String], got: &[String]) -> String {
             i += 1;
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -468,6 +509,27 @@ mod tests {
     }
 
     #[test]
+    fn large_diffs_fall_back_to_remove_and_add() {
+        let lines = |tag: &str| -> Vec<String> { (0..2000).map(|i| format!("{tag}{i}")).collect() };
+        let mut want = vec!["head".to_owned()];
+        want.extend(lines("a"));
+        want.push("tail".to_owned());
+        let mut got = vec!["head".to_owned()];
+        got.extend(lines("b"));
+        got.push("tail".to_owned());
+        let out = diff(&want, &got);
+        assert!(out.starts_with("  head\n- a0\n"), "{}", &out[..40]);
+        assert!(out.ends_with("+ b1999\n  tail\n"));
+        assert_eq!(out.lines().count(), 4002);
+        // Small middles still get a real LCS diff.
+        let small = diff(
+            &["x".into(), "a".into(), "y".into()],
+            &["x".into(), "b".into(), "a".into(), "y".into()],
+        );
+        assert_eq!(small, "  x\n+ b\n  a\n  y\n");
+    }
+
+    #[test]
     fn update_env_writes_then_compares() {
         // Only the read path here: setting the variable would race
         // other tests in this binary.
@@ -475,8 +537,11 @@ mod tests {
         let path = dir.path().join("snap.txt");
         std::fs::write(&path, sample().to_string()).expect("write");
         sample().assert_matches_file(&path);
-        let missing =
-            std::panic::catch_unwind(|| sample().assert_matches_file(dir.path().join("none")));
-        assert!(missing.is_err());
+        // In update mode a missing file is created instead.
+        if !update_requested() {
+            let missing =
+                std::panic::catch_unwind(|| sample().assert_matches_file(dir.path().join("none")));
+            assert!(missing.is_err());
+        }
     }
 }

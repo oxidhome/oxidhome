@@ -45,14 +45,18 @@ impl SupervisedInstance {
     pub(crate) fn new(
         engine: Engine,
         handle: InstanceHandle,
-        plugin_id: String,
         lease: IdLease,
         state_dir: Arc<TempDir>,
     ) -> Self {
+        let plugin_id: Arc<str> = handle.plugin_id().into();
         let watcher = {
             let handle = handle.clone();
             let engine = engine.clone();
+            // The supervisor may still be shutting down after the host
+            // and this handle are gone; keep its state dir until then.
+            let state_dir = Arc::clone(&state_dir);
             tokio::spawn(async move {
+                let _state_dir = state_dir;
                 let state = handle.wait_terminal().await;
                 // The engine's reaper releases the instance's devices
                 // and services, then unregisters it; only after that
@@ -67,7 +71,7 @@ impl SupervisedInstance {
         Self {
             handle,
             engine,
-            plugin_id: plugin_id.into(),
+            plugin_id,
             watcher: Some(watcher),
             runtime: tokio::runtime::Handle::current(),
             state_dir,
@@ -80,7 +84,7 @@ impl SupervisedInstance {
         self.handle.instance_id()
     }
 
-    /// The manifest's `plugin.id`.
+    /// The `plugin.id` of the manifest the supervisor runs.
     #[must_use]
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
