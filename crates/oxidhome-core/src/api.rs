@@ -28,8 +28,8 @@ mod server;
 mod ui_ticket;
 
 pub use bootstrap::{
-    RecoveryReport, RevokeScope, ensure_admin_token, reconcile_admin_token_files,
-    recover_admin_token, recover_admin_token_offline,
+    ADMIN_TOKEN_LABEL, RecoveryReport, RevokeScope, ensure_admin_token,
+    reconcile_admin_token_files, recover_admin_token, recover_admin_token_offline,
 };
 pub use mcp::MCP_ENDPOINT;
 pub use server::{ApiConfig, bind, build_router, serve};
