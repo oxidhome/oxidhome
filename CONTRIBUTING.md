@@ -34,7 +34,8 @@ Open an issue with:
 
 Open a GitHub Discussion (preferred) or an issue. Please read [`ARCHITECTURE.md`](ARCHITECTURE.md) first — most "why
 doesn't OxidHome do X" questions are answered there, and proposals that conflict with the documented design need to
-address why the existing reasoning should change.
+address why the existing reasoning should change. Settled decisions and the options they rejected are recorded as
+[architecture decision records](docs/adr/README.md).
 
 For changes to the WIT interface specifically, expect a longer review cycle. The WIT is the contract plugin authors
 depend on; we're cautious about changes pre-1.0 and very cautious post-1.0.

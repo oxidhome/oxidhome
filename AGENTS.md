@@ -6,6 +6,18 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the repository layout, crate respon
 phase-level design context. Treat it as the canonical source before changing module boundaries or introducing new
 top-level directories.
 
+Read the design documents in this order:
+
+1. [`ARCHITECTURE.md`](ARCHITECTURE.md) — the current, accepted architecture.
+2. [`docs/adr/`](docs/adr/README.md) — the decision records behind it, including decisions not implemented yet.
+3. [`wit/oxidhome.wit`](wit/oxidhome.wit) — the plugin contract as it is today.
+4. Overviews and phase plans — background and history only; check any claim in them against the three above.
+
+A document that disagrees with the code is stale; fix it rather than follow it.
+
+A settled cross-cutting decision gets an ADR (copy [`docs/adr/template.md`](docs/adr/template.md)). A decision that
+changes an accepted ADR gets a new ADR that supersedes it; the old one is not rewritten.
+
 ## Build, Test, and Development Commands
 
 - `cargo install-tools`: installs the CI toolchain from `.cargo/config.toml` (`cargo-nextest`, `cargo-llvm-cov`,

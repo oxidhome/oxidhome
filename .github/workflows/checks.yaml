@@ -238,6 +238,49 @@ jobs:
       # Same target-specific pass as `WasmClippy`: the SDK's docs are
       # what plugin authors read, and they build for wasm32-wasip2.
       - run: cargo doc --package oxidhome-sdk --target wasm32-wasip2 --all-features --no-deps --verbose
+  DocLinks:
+    name: Check markdown links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # `--offline` checks only links inside the repo (files and, with
+      # `--include-fragments`, heading anchors), so a flaky external
+      # site can't fail CI. Quoted globs are expanded by lychee; the
+      # crate glob matches nothing today and only warns.
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --offline --no-progress --include-fragments
+            README.md ARCHITECTURE.md CONTRIBUTING.md AGENTS.md
+            'docs/**/*.md' 'crates/*/README.md' 'examples/*/README.md'
+  DocClaims:
+    name: Check docs for stale claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Fails on any phrase from `.github/stale-doc-phrases.txt` in the
+      # repo docs. ADRs are skipped: they quote what they supersede.
+      - name: Grep docs for stale phrases
+        run: |
+          set -euo pipefail
+          patterns="$RUNNER_TEMP/stale-doc-phrases"
+          grep -vE '^[[:space:]]*(#|$)' .github/stale-doc-phrases.txt > "$patterns"
+          mapfile -d '' files < <(git ls-files -z -- \
+            README.md ARCHITECTURE.md CONTRIBUTING.md AGENTS.md \
+            'docs/*.md' 'crates/*/README.md' 'examples/*/README.md' \
+            ':!:docs/adr/*')
+          status=0
+          matches=$(grep -HniF -f "$patterns" -- "${files[@]}") || status=$?
+          if [ "$status" -gt 1 ]; then
+            exit "$status"
+          fi
+          if [ "$status" -eq 0 ]; then
+            while IFS=: read -r file line text; do
+              # `%` starts an escape in workflow commands.
+              echo "::error file=$file,line=$line::Stale doc claim (see .github/stale-doc-phrases.txt): ${text//%/%25}"
+            done <<<"$matches"
+            exit 1
+          fi
   TestsJob:
     name: Tests per crate
     needs: RustMeta
@@ -468,6 +511,8 @@ jobs:
       - Clippy
       - WasmClippy
       - Docs
+      - DocLinks
+      - DocClaims
       - Tests
       - Deps
       - OsvScannerPR
