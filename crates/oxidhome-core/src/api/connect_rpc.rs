@@ -748,6 +748,9 @@ fn install_error_to_connect(err: InstallError) -> ConnectError {
             "source dir missing or has no manifest.toml: {}",
             path.display()
         )),
+        InstallError::InvalidSource { reason, .. } => {
+            ConnectError::invalid_argument(format!("source_dir {reason}"))
+        }
         InstallError::AlreadyInstalled { plugin_id } => {
             ConnectError::already_exists(format!("plugin {plugin_id} is already installed"))
         }

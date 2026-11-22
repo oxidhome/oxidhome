@@ -3043,6 +3043,11 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
+        Err(crate::state::InstallError::InvalidSource { reason, .. }) => {
+            // Relative paths are already refused above; this
+            // catches the `..`-component case the registry owns.
+            return ToolOutcome::InvalidParams(format!("`source_dir` {reason}"));
+        }
         Err(crate::state::InstallError::AlreadyInstalled { plugin_id }) => {
             return ToolOutcome::ExecErr {
                 message: format!("plugin `{plugin_id}` is already installed"),

@@ -634,6 +634,27 @@ fn now_ms() -> i64 {
 /// destructive `uninstall` path relies on "all registry ids are
 /// FS-safe," and without a check in both insertion sites that
 /// invariant rests on an undocumented assumption. Now enforced.
+/// Reject an install `source_dir` that is relative or contains a
+/// `..` component before it reaches the filesystem. Every transport
+/// (REST, Connect, MCP) funnels through here, so they share one
+/// contract: an absolute, lexically-normalised daemon-local path.
+fn validate_source_dir(source_dir: &Path) -> Result<(), InstallError> {
+    let reason = if !source_dir.is_absolute() {
+        "must be an absolute path"
+    } else if source_dir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        "must not contain `..` components"
+    } else {
+        return Ok(());
+    };
+    Err(InstallError::InvalidSource {
+        path: source_dir.to_path_buf(),
+        reason,
+    })
+}
+
 fn is_safe_plugin_id(plugin_id: &str) -> bool {
     !plugin_id.is_empty()
         && !plugin_id.contains('/')
@@ -655,6 +676,13 @@ pub enum InstallError {
     /// contain `manifest.toml`.
     #[error("source dir is missing or has no manifest.toml: {0}")]
     SourceMissing(PathBuf),
+    /// `source_dir` is relative or contains a `..` component. A
+    /// relative path would resolve against the daemon's working
+    /// directory, so the same request could install different
+    /// trees depending on how the daemon was launched. REST maps to
+    /// `422 Unprocessable Entity`, Connect to `invalid_argument`.
+    #[error("source dir {path} is invalid: {reason}")]
+    InvalidSource { path: PathBuf, reason: &'static str },
     /// Manifest at `<source>/manifest.toml` couldn't be read or
     /// parsed.
     #[error("reading manifest from {path}: {reason}")]
@@ -1681,6 +1709,7 @@ impl InstalledPluginRegistry {
             .as_ref()
             .ok_or(InstallError::NoPluginsRoot)?;
 
+        validate_source_dir(source_dir)?;
         if !source_dir.is_dir() {
             return Err(InstallError::SourceMissing(source_dir.to_path_buf()).into());
         }
@@ -2795,6 +2824,29 @@ wasm = "plugin.wasm"
         // Uninstall again -> NotInstalled.
         let err = reg.uninstall("example.demo").unwrap_err();
         assert!(matches!(err, UninstallError::NotInstalled(_)));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn install_rejects_relative_or_dotdot_source() {
+        let root = tempdir("badsource");
+        let plugins_root = root.join("plugins");
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), fresh_db()).unwrap();
+        let source = write_plugin_dir(&root, "example.badsource");
+
+        let err = reg.install(Path::new("relative/source")).unwrap_err();
+        assert!(matches!(err, InstallError::InvalidSource { .. }), "{err:?}");
+
+        // Resolves to a valid source, but `..` is refused lexically
+        // before any filesystem access.
+        let dotdot = root
+            .join("plugins")
+            .join("..")
+            .join(source.file_name().unwrap());
+        let err = reg.install(&dotdot).unwrap_err();
+        assert!(matches!(err, InstallError::InvalidSource { .. }), "{err:?}");
+        assert!(!plugins_root.join("example.badsource").exists());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
