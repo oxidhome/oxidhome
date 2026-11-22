@@ -356,25 +356,23 @@ impl TokenStore {
         let row = PendingRow::new(issued, label, scope_json)?;
         let revoke_ids = revoke_ids.to_vec();
         let now = row.created_ms;
-        self.db
-            .write(move |conn| -> Result<Vec<String>, TokenError> {
-                let tx =
-                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let mut revoked = Vec::with_capacity(revoke_ids.len());
-                for id in revoke_ids {
-                    let n = tx.execute(
-                        "UPDATE auth_token SET revoked_ms = ?1 \
+        self.durable_write(move |conn| -> Result<Vec<String>, TokenError> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut revoked = Vec::with_capacity(revoke_ids.len());
+            for id in revoke_ids {
+                let n = tx.execute(
+                    "UPDATE auth_token SET revoked_ms = ?1 \
                      WHERE id = ?2 AND revoked_ms IS NULL",
-                        params![now, id],
-                    )?;
-                    if n > 0 {
-                        revoked.push(id);
-                    }
+                    params![now, id],
+                )?;
+                if n > 0 {
+                    revoked.push(id);
                 }
-                row.insert(&tx)?;
-                tx.commit()?;
-                Ok(revoked)
-            })
+            }
+            row.insert(&tx)?;
+            tx.commit()?;
+            Ok(revoked)
+        })
     }
 
     /// Hard-delete a token row that was **never used** (null
@@ -802,31 +800,46 @@ mod tests {
         assert!(store.verify(&other.plaintext).is_ok());
     }
 
-    /// `durable_write` must hand the shared connection back at
-    /// `synchronous = NORMAL` (1) so other stores keep their
-    /// throughput profile, on both the success and the error path.
+    /// Every auth-lifecycle write goes through `durable_write`,
+    /// which hands the shared connection back at
+    /// `synchronous = NORMAL` (1) on both the success and error
+    /// paths. Each call starts from `OFF` (0) so a method that
+    /// bypasses `durable_write` leaves 0 behind and fails here.
     #[test]
-    fn durable_write_restores_synchronous_normal() {
+    fn auth_lifecycle_writes_go_through_durable_write() {
         let db = fresh();
         let store = TokenStore::new(Arc::clone(&db));
+        let reset = || {
+            db.write(|c| c.pragma_update(None, "synchronous", "OFF"))
+                .unwrap();
+        };
         let sync = || -> i64 {
             db.read(|c| c.pragma_query_value(None, "synchronous", |r| r.get(0)))
                 .unwrap()
         };
-        assert!(
-            store
-                .insert_if_empty(&TokenStore::generate(), "admin", b"[]")
-                .unwrap()
-        );
-        assert_eq!(sync(), 1);
-        let mut forged = TokenStore::generate();
-        forged.id = "bad".into();
-        assert!(
-            store
-                .insert_and_revoke(&forged, "admin", b"[]", &[])
-                .is_err()
-        );
-        assert_eq!(sync(), 1);
+
+        reset();
+        let first = TokenStore::generate();
+        assert!(store.insert_if_empty(&first, "admin", b"[]").unwrap());
+        assert_eq!(sync(), 1, "insert_if_empty");
+
+        reset();
+        store
+            .insert_and_revoke(
+                &TokenStore::generate(),
+                "admin",
+                b"[]",
+                std::slice::from_ref(&first.id),
+            )
+            .unwrap();
+        assert_eq!(sync(), 1, "insert_and_revoke");
+
+        reset();
+        let unused = store.create("x", b"[]").unwrap();
+        reset();
+        assert!(store.delete_undelivered(&unused.id).unwrap());
+        assert_eq!(sync(), 1, "delete_undelivered");
+
         db.write(|c| {
             c.execute_batch(
                 "CREATE TRIGGER boom BEFORE INSERT ON auth_token \
@@ -834,12 +847,13 @@ mod tests {
             )
         })
         .unwrap();
+        reset();
         assert!(
             store
                 .insert_and_revoke(&TokenStore::generate(), "admin", b"[]", &[])
                 .is_err()
         );
-        assert_eq!(sync(), 1);
+        assert_eq!(sync(), 1, "error path");
     }
 
     #[test]

@@ -224,17 +224,18 @@ pub fn reconcile_admin_token_files(
     //    newest live secret ends up in `admin-token`), drop the rest.
     let mut live = Vec::new();
     for pending in list_pending(state_dir)? {
-        match read_token_file(&pending)?.map(|s| tokens.verify_read_only(&s)) {
-            None => {}
-            Some(Ok(rec)) => live.push((rec.created_ms, rec.id, pending)),
-            Some(Err(TokenError::Sqlite(e))) => {
+        let Some(secret) = read_token_file(&pending)? else {
+            continue;
+        };
+        match tokens.verify_read_only(&secret) {
+            Ok(rec) => live.push((rec.created_ms, rec.id, pending)),
+            Err(TokenError::Sqlite(e)) => {
                 return Err(anyhow::Error::new(e).context("verifying pending admin token"));
             }
-            Some(Err(_)) => {
+            Err(_) => {
                 // Never committed (crash before the insert) or since
                 // revoked. Audited like every other secret-file
                 // removal (fail-closed on the intent).
-                let secret = read_token_file(&pending)?.unwrap_or_default();
                 audited(
                     audit,
                     AUDIT_ACTOR_HOST,
@@ -599,8 +600,10 @@ fn record_intent(
         domain_error: None,
         credential_fp: None,
     };
+    // Durable: every caller follows the intent with a durable
+    // filesystem or token change that must not outlive its evidence.
     audit
-        .record_intent(&entry)
+        .record_intent_durable(&entry)
         .map_err(|e| anyhow::Error::new(e).context(format!("audit intent for {path}")))
 }
 

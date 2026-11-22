@@ -241,11 +241,50 @@ impl AuditLog {
     /// surfaces those as 500 (fail-closed) — an audit ledger that
     /// can't accept intents must not accept mutations.
     pub fn record_intent(&self, entry: &AuditEntry) -> Result<u64, AuditLogError> {
+        self.insert_intent(entry, false)
+    }
+
+    /// [`Self::record_intent`] with the insert committed under
+    /// `PRAGMA synchronous = FULL`, so the intent row survives a
+    /// power failure. The shared connection otherwise runs WAL +
+    /// `synchronous = NORMAL`, where a committed row can be lost.
+    /// Used by the host-local admin-token lifecycle (M4), whose
+    /// follow-up action is a durable filesystem change (a secret
+    /// file removed or promoted) that would otherwise outlive its
+    /// own audit evidence. The pragma is restored to `NORMAL`.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any `rusqlite` error.
+    pub fn record_intent_durable(&self, entry: &AuditEntry) -> Result<u64, AuditLogError> {
+        self.insert_intent(entry, true)
+    }
+
+    fn insert_intent(&self, entry: &AuditEntry, durable: bool) -> Result<u64, AuditLogError> {
         let intent_ms = now_unix_ms();
-        let id = self
-            .db
-            .write(|conn| -> Result<i64, AuditLogError> {
-                conn.execute(
+        let id = self.db.write(|conn| -> Result<i64, AuditLogError> {
+            if durable {
+                conn.pragma_update(None, "synchronous", "FULL")?;
+            }
+            let result = Self::insert_intent_row(conn, intent_ms, entry);
+            if durable {
+                let restore = conn.pragma_update(None, "synchronous", "NORMAL");
+                let id = result?;
+                restore?;
+                return Ok(id);
+            }
+            result
+        })?;
+        #[allow(clippy::cast_sign_loss)]
+        Ok(id as u64)
+    }
+
+    fn insert_intent_row(
+        conn: &rusqlite::Connection,
+        intent_ms: i64,
+        entry: &AuditEntry,
+    ) -> Result<i64, AuditLogError> {
+        conn.execute(
                     "INSERT INTO audit_event \
                      (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error) \
                      VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6, NULL, NULL)",
@@ -258,10 +297,7 @@ impl AuditLog {
                         &entry.credential_fp,
                     ],
                 )?;
-                Ok(conn.last_insert_rowid())
-            })?;
-        #[allow(clippy::cast_sign_loss)]
-        Ok(id as u64)
+        Ok(conn.last_insert_rowid())
     }
 
     /// Phase 2 of the two-phase write. UPDATE the pending row with
@@ -716,5 +752,40 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(log.count().unwrap(), 5);
+    }
+
+    /// `record_intent_durable` writes the same pending row as
+    /// `record_intent` and restores `synchronous = NORMAL`.
+    #[test]
+    fn record_intent_durable_matches_record_intent() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let log = AuditLog::new(Arc::clone(&db));
+        db.write(|c| c.pragma_update(None, "synchronous", "OFF"))
+            .unwrap();
+        let entry = AuditEntry {
+            id: 0,
+            intent_ms: 0,
+            finalized_ms: None,
+            token_id: "tok".into(),
+            actor_kind: "host".into(),
+            method: "LOCAL".into(),
+            path: "host.auth.bootstrap".into(),
+            status: 0,
+            decision: "pending".into(),
+            required_scope: None,
+            execution_outcome: None,
+            domain_error: None,
+            credential_fp: None,
+        };
+        let id = log.record_intent_durable(&entry).unwrap();
+        let sync: i64 = db
+            .read(|c| c.pragma_query_value(None, "synchronous", |r| r.get(0)))
+            .unwrap();
+        assert_eq!(sync, 1);
+        let rows = log.query(&AuditQuery::default(), 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].decision, "pending");
+        assert_eq!(rows[0].path, "host.auth.bootstrap");
     }
 }
