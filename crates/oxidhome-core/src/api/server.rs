@@ -211,13 +211,55 @@ pub fn build_router(engine: Engine) -> Router {
 /// Unavailable` with `{"status": "not_ready"}`. An orchestrator
 /// pointed at this endpoint pulls the daemon out of load-balancer
 /// rotation on DB failure instead of routing traffic to a shell.
+///
+/// H3: `event_log` reports the durable event mirror as `"ok"` or
+/// `"degraded"`. A degraded mirror keeps the probe at 200 — live
+/// device control and event delivery still work, only history is
+/// missing rows — so an orchestrator doesn't restart a daemon whose
+/// disk is full. Details are on the authenticated MCP
+/// `oxidhome://status` resource.
 async fn readyz(State(state): State<ApiState>) -> Response {
-    match state.engine.db_ping() {
+    let event_log = if state.engine.event_log().health().degraded {
+        "degraded"
+    } else {
+        "ok"
+    };
+    // H3: the ping waits on the shared connection mutex, which a hung
+    // write (the case the event-log mirror's deadline exists for) can
+    // hold indefinitely. Ping off the async workers, bound the wait,
+    // and cap outstanding pings — a timed-out ping keeps its slot
+    // until its blocking thread returns — so anonymous probes against
+    // a hung database can't park tokio workers or fill the blocking
+    // pool. An unresponsive database reads as not ready.
+    let ping = match READYZ_PING_SLOTS.try_acquire() {
+        Ok(permit) => {
+            let engine = state.engine.clone();
+            let ping = tokio::time::timeout(
+                READYZ_PING_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    engine.db_ping()
+                }),
+            )
+            .await;
+            match ping {
+                Ok(Ok(result)) => result.map_err(|e| e.to_string()),
+                Ok(Err(join)) => Err(format!("ping task failed: {join}")),
+                Err(_) => Err(format!(
+                    "no answer within {}ms",
+                    READYZ_PING_TIMEOUT.as_millis()
+                )),
+            }
+        }
+        Err(_) => Err("earlier pings are still waiting on the database".to_owned()),
+    };
+    match ping {
         Ok(()) => (
             StatusCode::OK,
             Json(ReadyzBody {
                 status: "ok",
                 version: env!("CARGO_PKG_VERSION"),
+                event_log,
             }),
         )
             .into_response(),
@@ -228,6 +270,7 @@ async fn readyz(State(state): State<ApiState>) -> Response {
                 Json(ReadyzBody {
                     status: "not_ready",
                     version: env!("CARGO_PKG_VERSION"),
+                    event_log,
                 }),
             )
                 .into_response()
@@ -235,10 +278,17 @@ async fn readyz(State(state): State<ApiState>) -> Response {
     }
 }
 
+/// Upper bound on the `/readyz` database ping (H3).
+const READYZ_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Outstanding `/readyz` database pings (H3).
+static READYZ_PING_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 #[derive(Serialize)]
 struct ReadyzBody {
     status: &'static str,
     version: &'static str,
+    event_log: &'static str,
 }
 
 /// Bind a TCP listener at the configured address.
@@ -2466,11 +2516,13 @@ async fn tail_events_loop(mut socket: WebSocket, mut sub: crate::state::EventSub
 #[derive(Serialize)]
 pub(crate) struct WireEvent {
     /// H5: the durable `event_log` row id assigned when this event
-    /// was persisted. `None` for events published via a code path
-    /// that doesn't hit `event_log` (host-side simulators,
-    /// in-process test harnesses). Tail clients use this to
-    /// reconcile against a later `GET /api/v1/events` history
-    /// query across a reconnect.
+    /// was persisted. Tail clients use this to reconcile against a
+    /// later `GET /api/v1/events` history query across a reconnect.
+    /// Absent when the event is not in history: the event-log
+    /// mirror was degraded (H3; history gets a `host.event_log.gap`
+    /// marker on recovery) or the event came from a host-side
+    /// simulator / test harness. Clients don't advance their cursor
+    /// on an event without `id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
     device_id: Option<String>,

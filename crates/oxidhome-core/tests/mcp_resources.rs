@@ -1044,6 +1044,9 @@ async fn read_status_returns_json_snapshot_on_fresh_engine() {
     assert_eq!(body["installed_plugins"], 0);
     assert_eq!(body["running_instances"], 0);
     assert_eq!(body["devices"], 0);
+    // H3: event-mirror health is part of the status body.
+    assert_eq!(body["event_log"]["degraded"], false);
+    assert_eq!(body["event_log"]["unrecorded_total"], 0);
     // 14.2c round-4 F3: uptime is a required field on the
     // status body. On a fresh engine the value is small but
     // non-negative; we don't pin the exact number because

@@ -1320,7 +1320,7 @@ impl host_events::Host for PluginState {
 
         // C4 review P2 F2: serialize the payload ONCE, cap on the
         // exact bytes that will hit disk, then hand the same
-        // buffer to `record_prepared` so persistence doesn't
+        // buffer to the event-log mirror so persistence doesn't
         // re-encode. Measured after the origin stamp so the cap
         // reflects what the durable log actually stores (not the
         // caller-supplied strings that were about to be
@@ -1420,62 +1420,54 @@ impl host_events::Host for PluginState {
             )));
         }
 
-        // Durable mirror first (Phase 5d): if the write fails — disk
-        // full, sqlite corruption, etc. — we'd rather refuse the
-        // publish than silently lose history. Live broadcast comes
-        // second.
-        let event_log = Arc::clone(&self.event_log);
-        let instance_id = self.instance_id.clone();
-        let plugin_id = self.manifest.plugin.id.clone();
-        let to_record = ev.clone();
-        // H5 review round-2 P2 F1: hold the bus's
-        // `publish_sequence` gate across the record + publish
-        // pair so two concurrent publishers can't commit rows in
-        // one order (A: rowid 1, B: rowid 2) and fan out in the
-        // opposite order (B's publish runs first because A is
-        // still parked on the `spawn_blocking` join). Without
-        // this gate, the `event.row_id` values stamped by
-        // `publish_with_id` would arrive out of order and clients
-        // using "last seen id" as a cursor high-water mark would
-        // miss rows.
+        // H3: best-effort durable mirror, then live fan-out. The
+        // mirror write never refuses the publish: a failing or slow
+        // disk (write error, panic, or `MirrorPolicy::write_deadline`
+        // exceeded) puts the event log into degraded mode, the event
+        // is delivered with `row_id = None`, and history gets a gap
+        // marker once writes recover. See `state::event_log::mirror`.
+        // If this future is dropped mid-write (trap, watchdog kill),
+        // the gate is released while the write still runs; the
+        // mirror then skips the disk for later publishes until that
+        // write drains, so cancellations can't pile up blocking
+        // writes or reorder rows.
         //
-        // The critical section is one spawn_blocking join + one
-        // synchronous `publish_with_id`. Publishes are already
-        // per-instance rate-limited (C2d) upstream, so
-        // contention on this gate is bounded.
+        // H5 review round-2 P2 F1: hold the bus's `publish_sequence`
+        // gate across the mirror + publish pair so two concurrent
+        // publishers can't commit rows in one order (A: rowid 1,
+        // B: rowid 2) and fan out in the opposite order. Delivery
+        // order therefore equals gate-acquisition order, and row ids
+        // rise strictly along it. H3: the gate is held for at most
+        // one write deadline; while degraded the mirror skips the
+        // disk, so a dead disk costs publishers no per-event wait.
         let sequence_gate = self.events.publish_sequence();
         let _sequence_guard = sequence_gate.lock().await;
-        // rusqlite is sync — hop to a blocking thread for the write
-        // so we don't park the tokio worker on disk I/O. Panics in
-        // the spawn_blocking body surface as `Error::Internal`,
-        // matching the storage-side error mapping. C4 review P2 F2:
-        // reuse the payload we already serialized for the cap
-        // check so we don't encode the same event twice.
-        let recorded = tokio::task::spawn_blocking(move || {
-            event_log.record_prepared(
+        // C4 review P2 F2: reuse the payload already serialized for
+        // the cap check so we don't encode the same event twice.
+        let mirrored = self
+            .event_log
+            .mirror(
                 crate::state::event_log::now_unix_ms(),
-                &to_record,
-                &instance_id,
-                &plugin_id,
+                ev.clone(),
+                self.instance_id.clone(),
+                self.manifest.plugin.id.clone(),
                 payload_blob,
             )
-        })
-        .await;
-        let row_id = match recorded {
-            Ok(Ok(id)) => Some(id),
-            Ok(Err(e)) => {
-                return Err(WitError::Internal(format!("event_log: write failed: {e}")));
-            }
-            Err(join) => {
-                return Err(WitError::Internal(format!(
-                    "event_log: blocking task panicked: {join}",
-                )));
-            }
-        };
+            .await;
+
+        // H3: a recovery write committed a gap marker below this
+        // event's row id (this publish's probe, or one whose publish
+        // was cancelled). Fan it out first so a live consumer that
+        // saves this event's id as its cursor has already seen the
+        // marker it would otherwise step over.
+        for marker in mirrored.gap_markers {
+            let row_id = marker.row_id;
+            let _delivered = self.events.publish_with_id(marker, row_id);
+        }
 
         // H9: update the host-owned state projection before the
         // fanout. Runs under the same `publish_sequence` gate as
-        // `event_log.record` above, so a snapshot API call
+        // the event-log mirror above, so a snapshot API call
         // observes the same ordering the durable log records —
         // no post-fanout callers can see a state update before
         // the projection has it. Only `state-changed` events
@@ -1500,18 +1492,17 @@ impl host_events::Host for PluginState {
             );
         }
 
-        // Admission already consumed above (pre-persistence). The
-        // bus's `publish_with_id` sends the event onto every
-        // subscriber's mpsc queue and signals matching wakes — see
+        // Admission already consumed (pre-persistence). The bus's
+        // `publish_with_id` sends the event onto every subscriber's
+        // mpsc queue and signals matching wakes — see
         // `EventBus::publish_with_id` for the send-before-signal
         // ordering that keeps waking supervisors from racing an
-        // empty receiver. H5: the row id captured from
-        // `event_log.record` above rides with the fanout so tail
-        // clients can reconcile against `GET /api/v1/events`. The
-        // `_sequence_guard` from `publish_sequence` above is still
-        // held here — dropped when this function returns — so no
-        // other publisher runs between the record and this publish.
-        let _delivered = self.events.publish_with_id(ev, row_id);
+        // empty receiver. H5: the row id from the mirror above rides
+        // with the fanout so tail clients can reconcile against
+        // `GET /api/v1/events`; `None` means "not in history" (H3).
+        // `_sequence_guard` is still held here, so no other
+        // publisher runs between the mirror and this publish.
+        let _delivered = self.events.publish_with_id(ev, mirrored.row_id);
         Ok(())
     }
 
@@ -2518,6 +2509,77 @@ mod tests {
         // C2b: host stamped the origin from the publisher's identity.
         assert_eq!(ev.origin_instance_id, "alpha");
         assert_eq!(ev.origin_plugin_id, "test.fixture");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_survives_event_log_write_failure() {
+        // H3: a failing durable mirror (full disk, corrupt db) must
+        // not stop live delivery. The publish succeeds, subscribers
+        // get the event with `row_id = None`, the event log reports
+        // degraded, and once writes recover the next event carries a
+        // row id again with a gap marker ahead of it in history.
+        let registry = Arc::new(DeviceRegistry::new());
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe_all();
+        let mut state = shared_state("alpha", registry, bus);
+        let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
+        let log = Arc::new(crate::state::EventLog::with_mirror_policy(
+            Arc::clone(&db),
+            crate::state::MirrorPolicy {
+                write_deadline: std::time::Duration::from_secs(5),
+                probe_interval: std::time::Duration::ZERO,
+            },
+        ));
+        state.event_log = Arc::clone(&log);
+        let id = host_devices::Host::register_device(&mut state, switch_device("d-1"))
+            .await
+            .expect("register");
+
+        db.write(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER h3_fail BEFORE INSERT ON event_log \
+                 BEGIN SELECT RAISE(ABORT, 'injected: database or disk is full'); END;",
+            )
+        })
+        .expect("install failure trigger");
+        host_events::Host::publish_event(&mut state, state_change_event(&id))
+            .await
+            .expect("publish must succeed while the event log is failing");
+        let ev = sub
+            .receiver
+            .try_recv()
+            .expect("event delivered despite the write failure")
+            .expect_event();
+        assert_eq!(ev.device.as_deref(), Some(id.as_str()));
+        assert_eq!(ev.row_id, None, "unrecorded events carry no row id");
+        assert!(log.health().degraded);
+
+        db.write(|c| c.execute_batch("DROP TRIGGER h3_fail;"))
+            .expect("drop failure trigger");
+        host_events::Host::publish_event(&mut state, state_change_event(&id))
+            .await
+            .expect("publish");
+        // The gap marker is fanned out ahead of the recovered event.
+        let marker = sub
+            .receiver
+            .try_recv()
+            .expect("gap marker delivered live")
+            .expect_event();
+        assert!(crate::state::event_log::is_gap_marker(&marker));
+        let ev = sub
+            .receiver
+            .try_recv()
+            .expect("event delivered")
+            .expect_event();
+        let row_id = ev.row_id.expect("recovered publish carries a row id");
+        assert!(marker.row_id.expect("marker row id") < row_id);
+        assert!(!log.health().degraded);
+        let rows = log
+            .query(&crate::state::EventQuery::default(), 10)
+            .expect("query");
+        assert_eq!(rows.len(), 2, "gap marker + recovered event");
+        assert_eq!(rows[0].id, row_id);
+        assert_eq!(rows[1].topic, crate::state::GAP_MARKER_TOPIC);
     }
 
     #[tokio::test(flavor = "current_thread")]

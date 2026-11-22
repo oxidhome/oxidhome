@@ -159,7 +159,8 @@ pub(super) fn list_resources() -> Vec<Resource> {
                 "JSON snapshot of host readiness: crate `version`, `uptime_ms` since \
                  the Engine was constructed (monotonic), whether the shared `SQLite` \
                  handle answers a ping (`ok`), plus counts of installed plugins, \
-                 running instances, and registered devices. Callers wanting a plain \
+                 running instances, and registered devices, plus `event_log` health \
+                 (`degraded`, unrecorded-event counters, last error; H3). Callers wanting a plain \
                  HTTP probe should hit `GET /api/v1/readyz`; this resource is the \
                  MCP-agent-friendly equivalent with a broader body.",
             )
@@ -1197,6 +1198,9 @@ struct StatusBody {
     installed_plugins: usize,
     running_instances: usize,
     devices: usize,
+    /// H3: durable event-mirror health — whether live events are
+    /// currently delivered without history rows, and how many were.
+    event_log: crate::state::EventLogHealth,
 }
 
 async fn status_read(engine: Engine) -> ReadOutcome {
@@ -1225,6 +1229,7 @@ async fn status_read(engine: Engine) -> ReadOutcome {
         installed_plugins: engine.installed_plugins().list().len(),
         running_instances: engine.instances().list().len(),
         devices: engine.devices().list().len(),
+        event_log: engine.event_log().health(),
     };
     encode(&body, "status")
 }

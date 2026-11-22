@@ -37,6 +37,12 @@ use crate::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value as WitVa
 
 use super::db::Db;
 
+mod mirror;
+
+pub use mirror::{
+    EventLogHealth, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, MirrorPolicy, is_gap_marker,
+};
+
 /// Errors returned by [`EventLog`]. Maps onto the WIT `error` variant
 /// in `host_impl::events::publish_event` via the same `Internal`-or-
 /// pass-through shape `KvError` uses.
@@ -79,6 +85,10 @@ pub struct HistoricalEvent {
 /// AND-combined; `None` everywhere returns the most recent `limit`
 /// rows from the whole table. Time bounds are inclusive on both ends
 /// and use `received_ms` (host-side, never the plugin's claim).
+///
+/// H3 exception: host gap markers ([`GAP_MARKER_TOPIC`]) ignore the
+/// `device_id`, `instance_id`, `plugin_id` and `topic` selectors and
+/// are returned whenever they fall inside the time and cursor bounds.
 ///
 /// Topic semantics:
 ///
@@ -164,16 +174,30 @@ pub enum TopicMatch {
 }
 
 /// Per-engine durable event history. Cheap to clone — holds an
-/// `Arc<Db>`.
+/// `Arc<Db>` plus the shared H3 mirror-health state (see
+/// [`EventLogHealth`]), so every clone observes the same degraded / healthy
+/// status.
 #[derive(Clone)]
 pub struct EventLog {
     db: Arc<Db>,
+    mirror: Arc<mirror::MirrorShared>,
 }
 
 impl EventLog {
     #[must_use]
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        Self::with_mirror_policy(db, MirrorPolicy::default())
+    }
+
+    /// Same as [`Self::new`] with an explicit H3 mirror policy
+    /// (write deadline + recovery-probe interval). Tests shrink both
+    /// so a degraded → recovered cycle runs in milliseconds.
+    #[must_use]
+    pub fn with_mirror_policy(db: Arc<Db>, policy: MirrorPolicy) -> Self {
+        Self {
+            db,
+            mirror: Arc::new(mirror::MirrorShared::new(policy)),
+        }
     }
 
     /// Insert one event. `received_ms` is the host's wall-clock at
@@ -225,35 +249,15 @@ impl EventLog {
         plugin_id: &str,
         payload_blob: Vec<u8>,
     ) -> Result<u64, EventLogError> {
-        let topic = topic_of(event).to_owned();
-        let device_id = event.device.clone();
-        // WIT `unix-ms` is `u64`; `SQLite` INTEGER is `i64`. Clamp the
-        // upper end so a plugin that claims `u64::MAX` lands as
-        // `i64::MAX` on disk rather than wrapping negative.
-        let payload_ms = i64::try_from(event.timestamp).unwrap_or(i64::MAX);
-        let instance_id_owned = instance_id.to_owned();
-        let plugin_id_owned = plugin_id.to_owned();
-
         self.db.write(move |conn| -> Result<u64, EventLogError> {
-            conn.execute(
-                "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    received_ms,
-                    payload_ms,
-                    device_id,
-                    instance_id_owned,
-                    plugin_id_owned,
-                    topic,
-                    payload_blob,
-                ],
-            )?;
-            // `last_insert_rowid` returns the just-inserted PRIMARY
-            // KEY for the active connection. Safe to cast: `SQLite`'s
-            // ROWID is a signed i64 but always positive for normal
-            // INTEGER PRIMARY KEY values.
-            #[allow(clippy::cast_sign_loss)]
-            Ok(conn.last_insert_rowid() as u64)
+            insert_row(
+                conn,
+                received_ms,
+                event,
+                instance_id,
+                plugin_id,
+                &payload_blob,
+            )
         })
     }
 
@@ -270,159 +274,219 @@ impl EventLog {
     /// - [`EventLogError::Encode`] if a stored row has a malformed
     ///   `payload_blob` (would mean the table was hand-edited or
     ///   migrated incorrectly).
-    // Filter → SQL builder + per-row projection is a linear
-    // top-to-bottom pipeline; splitting it hides the ordered
-    // bind list from a grep. Same rationale as the `#[allow]`s
-    // in `tools::call` and `installed_plugins::install_gated`.
-    #[allow(clippy::too_many_lines)]
     pub fn query(
         &self,
         filter: &EventQuery,
         limit: usize,
     ) -> Result<Vec<HistoricalEvent>, EventLogError> {
-        // Build a parameterized WHERE clause + ordered params list.
-        // Avoids string-templating columns and uses `?N` binds for
-        // every value. The query planner picks among `evt_received`
-        // and the various `(col, id)` indexes (migration 16) based
-        // on selectivity.
-        use std::fmt::Write as _;
-
-        let mut sql = String::from(
-            "SELECT id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob \
-             FROM event_log WHERE 1=1",
-        );
-        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
-
-        let push = |binds: &mut Vec<rusqlite::types::Value>,
-                    sql: &mut String,
-                    clause: &str,
-                    v: rusqlite::types::Value| {
-            binds.push(v);
-            // `?N` requires N to match the bind count — splice the
-            // index in as we go so the SQL stays in sync with the
-            // binds vec.
-            let _ = write!(sql, " AND {clause} ?{}", binds.len());
-        };
-
-        if let Some(t) = filter.since_ms {
-            push(&mut binds, &mut sql, "received_ms >=", t.into());
-        }
-        if let Some(t) = filter.until_ms {
-            push(&mut binds, &mut sql, "received_ms <=", t.into());
-        }
-        if let Some(d) = &filter.device_id {
-            push(&mut binds, &mut sql, "device_id =", d.clone().into());
-        }
-        if let Some(i) = &filter.instance_id {
-            push(&mut binds, &mut sql, "instance_id =", i.clone().into());
-        }
-        if let Some(p) = &filter.plugin_id {
-            push(&mut binds, &mut sql, "plugin_id =", p.clone().into());
-        }
-        if let Some((t, m)) = &filter.topic {
-            match m {
-                TopicMatch::Exact => {
-                    push(&mut binds, &mut sql, "topic =", t.clone().into());
-                }
-                // Prefix-match via `substr(topic, 1, length(?)) = ?` —
-                // same shape used by `kv::list_keys`, both correct on
-                // TEXT (character-prefix equality) and free of `LIKE`'s
-                // wildcard-escaping hazards.
-                TopicMatch::Prefix => {
-                    binds.push(rusqlite::types::Value::Text(t.clone()));
-                    let n_left = binds.len();
-                    binds.push(rusqlite::types::Value::Text(t.clone()));
-                    let n_right = binds.len();
-                    let _ = write!(sql, " AND substr(topic, 1, length(?{n_left})) = ?{n_right}");
-                }
-            }
-        }
-        // H5 review round-2 P1 F2: cursor filters. `after_id` is
-        // the "give me rows I haven't seen yet" cursor a tail
-        // client uses after a reconnect; `before_id` walks
-        // backwards through history for pagination. Both compare
-        // against the `INTEGER PRIMARY KEY` (monotonic across
-        // successful inserts), so a client that saved the last
-        // seen id can resume without gaps or duplicates even when
-        // more than one event lands in the same millisecond.
-        if let Some(after) = filter.after_id {
-            push(
-                &mut binds,
-                &mut sql,
-                "id >",
-                i64::try_from(after).unwrap_or(i64::MAX).into(),
-            );
-        }
-        if let Some(before) = filter.before_id {
-            push(
-                &mut binds,
-                &mut sql,
-                "id <",
-                i64::try_from(before).unwrap_or(i64::MAX).into(),
-            );
-        }
-
-        binds.push(rusqlite::types::Value::Integer(
-            i64::try_from(limit).unwrap_or(i64::MAX),
-        ));
-        // Both orderings sort by `id` alone (no `received_ms`
-        // primary): id is a monotonic autoincrement (schema
-        // migration 16), so pagination is stable under wall-
-        // clock jumps in either direction. Ordering by
-        // `received_ms DESC, id DESC` under a rollback would
-        // place a freshly-inserted row (lower ts, higher id)
-        // AFTER the older rows in the batch — a `before_id`
-        // walker taking `min(returned)` as the next cursor
-        // would skip the rollback row on the way down.
-        // `id DESC / id ASC` avoids the whole class of
-        // clock-vs-cursor gaps. Insertion order === id order
-        // === presentation order, both directions.
-        let order_sql = match filter.order {
-            EventOrder::Desc => "id DESC",
-            EventOrder::Asc => "id ASC",
-        };
-        let _ = write!(sql, " ORDER BY {order_sql} LIMIT ?{n}", n = binds.len());
-
+        let selected = build_query(filter, limit, Rows::Selected);
+        let has_selectors = filter.device_id.is_some()
+            || filter.instance_id.is_some()
+            || filter.plugin_id.is_some()
+            || filter.topic.is_some();
+        // H3: host gap markers bypass the selector filters — a
+        // device-, plugin- or topic-filtered consumer still has to
+        // learn that history is missing rows — while the time and
+        // cursor bounds apply to every row. Two separately ordered,
+        // limited scans (each index-friendly; an `OR` across them
+        // forces a full sort before `LIMIT`) merged by id, both under
+        // one connection lock so no write lands between them.
+        let markers = has_selectors.then(|| build_query(filter, limit, Rows::GapMarkers));
         self.db.read(|conn| -> Result<_, EventLogError> {
-            let mut stmt = conn.prepare(&sql)?;
-            let binds: Vec<&dyn rusqlite::ToSql> =
-                binds.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-            let mut rows = stmt.query(binds.as_slice())?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? {
-                let id: i64 = row.get(0)?;
-                let received_ms: i64 = row.get(1)?;
-                let payload_ms: i64 = row.get(2)?;
-                let device_id: Option<String> = row.get(3)?;
-                let instance_id: String = row.get(4)?;
-                let plugin_id: String = row.get(5)?;
-                let topic: String = row.get(6)?;
-                let blob: Vec<u8> = row.get(7)?;
-                let stored: StoredEventPayload =
-                    serde_json::from_slice(&blob).map_err(|source| EventLogError::Encode {
-                        topic: topic.clone(),
-                        source,
-                    })?;
-                // `payload_ms` is stored as i64 (`SQLite` INTEGER) but
-                // the API hands it back as the u64 the WIT contract
-                // promises. Negative values would mean a corrupted row
-                // — clamp to 0 rather than wrap.
-                #[allow(clippy::cast_sign_loss)]
-                out.push(HistoricalEvent {
-                    id: id as u64,
-                    received_ms,
-                    payload_ms: u64::try_from(payload_ms).unwrap_or(0),
-                    device_id,
-                    instance_id,
-                    plugin_id,
-                    topic,
-                    payload: stored.into_wit(),
-                });
+            let mut out = run_query(conn, &selected)?;
+            if let Some(markers) = &markers {
+                out.extend(run_query(conn, markers)?);
+                match filter.order {
+                    EventOrder::Desc => out.sort_by_key(|r| std::cmp::Reverse(r.id)),
+                    EventOrder::Asc => out.sort_by_key(|r| r.id),
+                }
+                out.dedup_by_key(|r| r.id);
+                out.truncate(limit);
             }
             Ok(out)
         })
     }
+}
 
+/// Which rows a [`build_query`] statement selects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    /// Rows matching every [`EventQuery`] filter.
+    Selected,
+    /// Host gap markers within the query's time and cursor bounds.
+    GapMarkers,
+}
+
+/// Filter → SQL + ordered binds for [`EventLog::query`].
+// Filter → SQL builder is a linear top-to-bottom pipeline;
+// splitting it hides the ordered bind list from a grep.
+#[allow(clippy::too_many_lines)]
+fn build_query(
+    filter: &EventQuery,
+    limit: usize,
+    rows: Rows,
+) -> (String, Vec<rusqlite::types::Value>) {
+    // Build a parameterized WHERE clause + ordered params list.
+    // Avoids string-templating columns and uses `?N` binds for
+    // every value. The query planner picks among `evt_received`
+    // and the various `(col, id)` indexes (migration 16) based
+    // on selectivity.
+    use std::fmt::Write as _;
+
+    let mut sql = String::from(
+        "SELECT id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob \
+             FROM event_log WHERE 1=1",
+    );
+    let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+
+    let push = |binds: &mut Vec<rusqlite::types::Value>,
+                sql: &mut String,
+                clause: &str,
+                v: rusqlite::types::Value| {
+        binds.push(v);
+        // `?N` requires N to match the bind count — splice the
+        // index in as we go so the SQL stays in sync with the
+        // binds vec.
+        let _ = write!(sql, " AND {clause} ?{}", binds.len());
+    };
+
+    if let Some(t) = filter.since_ms {
+        push(&mut binds, &mut sql, "received_ms >=", t.into());
+    }
+    if let Some(t) = filter.until_ms {
+        push(&mut binds, &mut sql, "received_ms <=", t.into());
+    }
+    match rows {
+        Rows::GapMarkers => {
+            let _ = write!(
+                sql,
+                " AND plugin_id = '{GAP_MARKER_ORIGIN}' AND topic = '{GAP_MARKER_TOPIC}'",
+            );
+        }
+        Rows::Selected => {
+            if let Some(d) = &filter.device_id {
+                push(&mut binds, &mut sql, "device_id =", d.clone().into());
+            }
+            if let Some(i) = &filter.instance_id {
+                push(&mut binds, &mut sql, "instance_id =", i.clone().into());
+            }
+            if let Some(p) = &filter.plugin_id {
+                push(&mut binds, &mut sql, "plugin_id =", p.clone().into());
+            }
+            if let Some((t, m)) = &filter.topic {
+                match m {
+                    TopicMatch::Exact => {
+                        push(&mut binds, &mut sql, "topic =", t.clone().into());
+                    }
+                    // Prefix-match via `substr(topic, 1, length(?)) = ?` —
+                    // same shape used by `kv::list_keys`, both correct on
+                    // TEXT (character-prefix equality) and free of `LIKE`'s
+                    // wildcard-escaping hazards.
+                    TopicMatch::Prefix => {
+                        binds.push(rusqlite::types::Value::Text(t.clone()));
+                        let n_left = binds.len();
+                        binds.push(rusqlite::types::Value::Text(t.clone()));
+                        let n_right = binds.len();
+                        let _ =
+                            write!(sql, " AND substr(topic, 1, length(?{n_left})) = ?{n_right}");
+                    }
+                }
+            }
+        }
+    }
+    // H5 review round-2 P1 F2: cursor filters. `after_id` is
+    // the "give me rows I haven't seen yet" cursor a tail
+    // client uses after a reconnect; `before_id` walks
+    // backwards through history for pagination. Both compare
+    // against the `INTEGER PRIMARY KEY` (monotonic across
+    // successful inserts), so a client that saved the last
+    // seen id can resume without gaps or duplicates even when
+    // more than one event lands in the same millisecond.
+    if let Some(after) = filter.after_id {
+        push(
+            &mut binds,
+            &mut sql,
+            "id >",
+            i64::try_from(after).unwrap_or(i64::MAX).into(),
+        );
+    }
+    if let Some(before) = filter.before_id {
+        push(
+            &mut binds,
+            &mut sql,
+            "id <",
+            i64::try_from(before).unwrap_or(i64::MAX).into(),
+        );
+    }
+
+    binds.push(rusqlite::types::Value::Integer(
+        i64::try_from(limit).unwrap_or(i64::MAX),
+    ));
+    // Both orderings sort by `id` alone (no `received_ms`
+    // primary): id is a monotonic autoincrement (schema
+    // migration 16), so pagination is stable under wall-
+    // clock jumps in either direction. Ordering by
+    // `received_ms DESC, id DESC` under a rollback would
+    // place a freshly-inserted row (lower ts, higher id)
+    // AFTER the older rows in the batch — a `before_id`
+    // walker taking `min(returned)` as the next cursor
+    // would skip the rollback row on the way down.
+    // `id DESC / id ASC` avoids the whole class of
+    // clock-vs-cursor gaps. Insertion order === id order
+    // === presentation order, both directions.
+    let order_sql = match filter.order {
+        EventOrder::Desc => "id DESC",
+        EventOrder::Asc => "id ASC",
+    };
+    let _ = write!(sql, " ORDER BY {order_sql} LIMIT ?{n}", n = binds.len());
+
+    (sql, binds)
+}
+
+/// Run one [`build_query`] statement and decode its rows.
+fn run_query(
+    conn: &rusqlite::Connection,
+    (sql, binds): &(String, Vec<rusqlite::types::Value>),
+) -> Result<Vec<HistoricalEvent>, EventLogError> {
+    let mut stmt = conn.prepare(sql)?;
+    let binds: Vec<&dyn rusqlite::ToSql> =
+        binds.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+    let mut rows = stmt.query(binds.as_slice())?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let received_ms: i64 = row.get(1)?;
+        let payload_ms: i64 = row.get(2)?;
+        let device_id: Option<String> = row.get(3)?;
+        let instance_id: String = row.get(4)?;
+        let plugin_id: String = row.get(5)?;
+        let topic: String = row.get(6)?;
+        let blob: Vec<u8> = row.get(7)?;
+        let stored: StoredEventPayload =
+            serde_json::from_slice(&blob).map_err(|source| EventLogError::Encode {
+                topic: topic.clone(),
+                source,
+            })?;
+        // `payload_ms` is stored as i64 (`SQLite` INTEGER) but
+        // the API hands it back as the u64 the WIT contract
+        // promises. Negative values would mean a corrupted row
+        // — clamp to 0 rather than wrap.
+        #[allow(clippy::cast_sign_loss)]
+        out.push(HistoricalEvent {
+            id: id as u64,
+            received_ms,
+            payload_ms: u64::try_from(payload_ms).unwrap_or(0),
+            device_id,
+            instance_id,
+            plugin_id,
+            topic,
+            payload: stored.into_wit(),
+        });
+    }
+    Ok(out)
+}
+
+impl EventLog {
     /// Delete every event with `received_ms < cutoff_ms`. Returns the
     /// number of rows removed. The retention scheduler (Phase 12) will
     /// call this periodically; for now it's just a knob for tests.
@@ -625,6 +689,43 @@ impl StoredValue {
             Self::Json(s) => WitValue::JsonVal(s),
         }
     }
+}
+
+/// Insert one `event_log` row on an already-locked connection and
+/// return its `AUTOINCREMENT` id. Shared by [`EventLog::record_prepared`]
+/// and the H3 mirror's gap-marker + event transaction.
+fn insert_row(
+    conn: &rusqlite::Connection,
+    received_ms: i64,
+    event: &Event,
+    instance_id: &str,
+    plugin_id: &str,
+    payload_blob: &[u8],
+) -> Result<u64, EventLogError> {
+    let topic = topic_of(event);
+    // WIT `unix-ms` is `u64`; `SQLite` INTEGER is `i64`. Clamp the
+    // upper end so a plugin that claims `u64::MAX` lands as
+    // `i64::MAX` on disk rather than wrapping negative.
+    let payload_ms = i64::try_from(event.timestamp).unwrap_or(i64::MAX);
+    conn.execute(
+        "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            received_ms,
+            payload_ms,
+            event.device,
+            instance_id,
+            plugin_id,
+            topic,
+            payload_blob,
+        ],
+    )?;
+    // `last_insert_rowid` returns the just-inserted PRIMARY KEY for
+    // the active connection. Safe to cast: `SQLite`'s ROWID is a
+    // signed i64 but always positive for normal INTEGER PRIMARY KEY
+    // values.
+    #[allow(clippy::cast_sign_loss)]
+    Ok(conn.last_insert_rowid() as u64)
 }
 
 /// C4 review P2 F2: serialize a WIT [`EventPayload`] into the
