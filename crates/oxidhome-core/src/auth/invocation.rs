@@ -488,7 +488,7 @@ mod tests {
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
         let a = root.entering("alpha");
         let b = a.delegate(hop("alpha", "beta"));
-        assert!(a.chain().is_empty());
+        assert_eq!(a.chain(), &[] as &[DelegationHop]);
         assert_eq!(b.chain(), &[hop("alpha", "beta")]);
         assert_eq!(b.current_actor(), Some("beta"));
         assert_eq!(b.call_id(), root.call_id());

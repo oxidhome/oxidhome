@@ -998,8 +998,7 @@ impl PluginInstance {
             // H6: the invocation the supervisor scoped around this
             // call (empty for direct, unsupervised calls).
             call_id = crate::auth::invocation::current()
-                .map(|c| c.call_id().to_owned())
-                .unwrap_or_default(),
+                .map_or_default(|c| c.call_id().to_owned()),
             instance_id = %data.instance_id,
             plugin_id = %data.manifest.plugin.id,
             device_id = %device,
@@ -1184,8 +1183,7 @@ impl PluginInstance {
         let span = info_span!(
             "plugin.execute_service_command",
             call_id = crate::auth::invocation::current()
-                .map(|c| c.call_id().to_owned())
-                .unwrap_or_default(),
+                .map_or_default(|c| c.call_id().to_owned()),
             instance_id = %data.instance_id,
             plugin_id = %data.manifest.plugin.id,
             service_id = %service,
