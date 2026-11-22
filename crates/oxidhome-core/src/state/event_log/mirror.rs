@@ -31,8 +31,9 @@
 //! order, but the marker's `unrecorded` count is then an upper bound
 //! and a consumer that replays history after seeing that event live
 //! (without an id) sees it twice. A timed-out *probe* that commits
-//! late leaves its marker in history while the outage stays open, so
-//! the next marker's count overlaps it.
+//! late leaves its marker in history (and fans it out with the next
+//! publish) while the outage stays open, so the next marker's count
+//! overlaps it.
 //!
 //! Callers serialize [`EventLog::mirror`] calls (the host holds the
 //! bus's `publish_sequence` gate around it). A publish future dropped
@@ -318,6 +319,12 @@ impl EventLog {
                         .map(|(id, marker)| (*id, marker.clone()))
                         .map_err(Clone::clone),
                 );
+            } else if let Ok((_, Some(marker))) = &result {
+                // A recovery write that committed after its deadline:
+                // health already counted it as failed and the outage
+                // stays open, but the marker row exists and live
+                // consumers must still see it before later row ids.
+                this.park_late_marker(marker.clone());
             }
             result
         });
@@ -370,6 +377,17 @@ impl EventLog {
         }
     }
 
+    fn park_late_marker(&self, marker: Event) {
+        let mut st = self.mirror.lock();
+        st.gap_markers_total += 1;
+        tracing::warn!(
+            target: "event_log.mirror",
+            marker_row_id = marker.row_id,
+            "event log: a timed-out recovery write committed late; its gap marker is in history",
+        );
+        st.undelivered_markers.push(marker);
+    }
+
     fn take_undelivered_markers(&self) -> Vec<Event> {
         std::mem::take(&mut self.mirror.lock().undelivered_markers)
     }
@@ -413,6 +431,7 @@ impl EventLog {
             None if !busy => return Plan::Write(None),
             Some(outage) if !busy && Instant::now() >= outage.next_probe => {
                 outage.probe_covers = Some(outage.unrecorded);
+                outage.after_probe_ms = None;
                 return Plan::Write(Some(outage.marker()));
             }
             Some(outage) => outage.count(received_ms),
@@ -1049,6 +1068,68 @@ mod tests {
         assert_eq!(
             (gap.unrecorded, gap.first_received_ms, gap.last_received_ms),
             (2, 100, 200),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_committed_probe_marker_is_still_delivered() {
+        let log = log_with(MirrorPolicy {
+            write_deadline: Duration::from_millis(200),
+            probe_interval: Duration::from_millis(10),
+        });
+        break_writes(&log);
+        assert_eq!(publish(&log, 1).await, None);
+        fix_writes(&log);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // The probe's write parks past its deadline, then commits.
+        let (release, holder) = hold_connection(&log);
+        assert_eq!(publish(&log, 2).await, None, "probe timed out");
+        release.send(()).expect("release");
+        holder.join().expect("holder");
+        drain(&log).await;
+        let h = log.health();
+        assert!(h.degraded, "the timed-out probe counted as a failure");
+        assert_eq!(h.gap_markers_total, 1, "the late marker is in history");
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let recovered = publish_full(&log, 3).await;
+        let ids: Vec<Option<u64>> = recovered.gap_markers.iter().map(|m| m.row_id).collect();
+        assert_eq!(ids.len(), 2, "late marker rides ahead of the new one");
+        assert!(ids[0] < ids[1] && ids[1] < recovered.row_id);
+        assert!(!log.health().degraded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_remainder_bounds_ignore_earlier_failed_probes() {
+        let log = log_with(MirrorPolicy {
+            write_deadline: Duration::from_secs(30),
+            probe_interval: Duration::from_millis(10),
+        });
+        break_writes(&log);
+        assert_eq!(publish(&log, 10).await, None);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(publish(&log, 20).await, None, "failed probe");
+        fix_writes(&log);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (release, holder) = hold_connection(&log);
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(20), publish_full(&log, 30)).await;
+        assert!(cancelled.is_err());
+        assert_eq!(publish(&log, 40).await, None, "skipped during the probe");
+        release.send(()).expect("release");
+        holder.join().expect("holder");
+        drain(&log).await;
+
+        let mut recovered = publish_full(&log, 50).await;
+        let EventPayload::Custom(c) = recovered.gap_markers.pop().expect("marker").payload else {
+            panic!("marker payload must be custom");
+        };
+        let gap: GapMarker = serde_json::from_str(&c.payload).expect("gap json");
+        assert_eq!(
+            (gap.unrecorded, gap.first_received_ms, gap.last_received_ms),
+            (1, 40, 40),
         );
     }
 }
