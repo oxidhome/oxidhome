@@ -22,19 +22,27 @@
 //!   ([`GAP_MARKER_TOPIC`], origin [`GAP_MARKER_ORIGIN`], payload
 //!   [`GapMarker`]) in the same transaction as the probing event, so
 //!   the marker's row id sits between the last pre-outage row and the
-//!   first post-recovery row.
+//!   first post-recovery row. [`Mirrored::gap_marker`] hands it back
+//!   so the caller fans it out live just before the probing event.
+//!   Markers bypass subscription and history selector filters.
 //!
 //! A write that timed out may still commit later. Such a row has an
 //! id below every later row, so history order still matches delivery
 //! order, but the marker's `unrecorded` count is then an upper bound
 //! and a consumer that replays history after seeing that event live
-//! (without an id) sees it twice.
+//! (without an id) sees it twice. A timed-out *probe* that commits
+//! late leaves its marker in history while the outage stays open, so
+//! the next marker's count overlaps it.
+//!
+//! The blocking write settles the health state itself when it
+//! finishes, so a publish future dropped mid-await (plugin trap,
+//! watchdog kill) still records the outcome.
 //!
 //! Callers must serialize [`EventLog::mirror`] calls (the host holds
 //! the bus's `publish_sequence` gate around it); the plan → write →
 //! settle sequence assumes no other mirror call interleaves.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -53,6 +61,14 @@ pub const GAP_MARKER_TOPIC: &str = "host.event_log.gap";
 /// `plugin_id == "host"` and topic [`GAP_MARKER_TOPIC`] is always
 /// host-written.
 pub const GAP_MARKER_ORIGIN: &str = "host";
+
+/// Whether `event` is a host-written gap marker (origin
+/// [`GAP_MARKER_ORIGIN`], topic [`GAP_MARKER_TOPIC`]).
+#[must_use]
+pub fn is_gap_marker(event: &Event) -> bool {
+    event.origin_plugin_id == GAP_MARKER_ORIGIN
+        && matches!(&event.payload, EventPayload::Custom(c) if c.topic == GAP_MARKER_TOPIC)
+}
 
 /// Deadline and probe cadence for the degraded-mode state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +191,17 @@ impl Drop for InFlight {
     }
 }
 
+/// Result of [`EventLog::mirror`].
+#[derive(Debug, Default)]
+pub(crate) struct Mirrored {
+    /// Row id of the published event; `None` = delivered unrecorded.
+    pub(crate) row_id: Option<u64>,
+    /// The gap marker committed ahead of the event when this publish
+    /// ended an outage, with its `row_id` set. The caller fans it out
+    /// before the event so a live cursor can't step over it.
+    pub(crate) gap_marker: Option<Event>,
+}
+
 enum Plan {
     /// Degraded and no probe due: deliver unrecorded, no disk work.
     Skip,
@@ -185,9 +212,9 @@ enum Plan {
 
 impl EventLog {
     /// Best-effort durable write for one published event (H3).
-    /// Returns the row id on success, `None` when the event must be
-    /// delivered unrecorded. Never fails: write errors move the
-    /// mirror into degraded mode instead (module docs).
+    /// Never fails: write errors move the mirror into degraded mode
+    /// instead (module docs). See [`Mirrored`] for what the caller
+    /// fans out.
     pub(crate) async fn mirror(
         &self,
         received_ms: i64,
@@ -195,47 +222,92 @@ impl EventLog {
         instance_id: String,
         plugin_id: String,
         payload_blob: Vec<u8>,
-    ) -> Option<u64> {
+    ) -> Mirrored {
         let gap = match self.plan(received_ms) {
-            Plan::Skip => return None,
+            Plan::Skip => return Mirrored::default(),
             Plan::Write(gap) => gap,
         };
         let probing = gap.is_some();
+        // Exactly one side settles the mirror state for this write:
+        // the blocking task when the write finishes (so a publish
+        // future dropped mid-await still records the outcome), or
+        // this task when the deadline fires first.
+        let settled = Arc::new(AtomicBool::new(false));
         let this = self.clone();
+        let settled_by_writer = Arc::clone(&settled);
         self.mirror.in_flight.fetch_add(1, Ordering::AcqRel);
         let guard = InFlight(Arc::clone(&self.mirror.in_flight));
-        let write = tokio::task::spawn_blocking(move || {
+        let mut write = tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            this.write_with_gap(
-                received_ms,
-                &event,
-                &instance_id,
-                &plugin_id,
-                &payload_blob,
-                gap.as_ref(),
-            )
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                this.write_with_gap(
+                    received_ms,
+                    &event,
+                    &instance_id,
+                    &plugin_id,
+                    &payload_blob,
+                    gap.as_ref(),
+                )
+            }));
+            let result = match result {
+                Ok(Ok(written)) => Ok(written),
+                Ok(Err(e)) => Err(format!("write failed: {e}")),
+                Err(_) => Err("blocking write panicked".to_owned()),
+            };
+            if !settled_by_writer.swap(true, Ordering::AcqRel) {
+                this.settle(
+                    received_ms,
+                    probing,
+                    result
+                        .as_ref()
+                        .map(|w| w.row_id.unwrap_or_default())
+                        .map_err(Clone::clone),
+                );
+            }
+            result
         });
         let deadline = self.mirror.policy.write_deadline;
-        let outcome = match tokio::time::timeout(deadline, write).await {
-            Ok(Ok(Ok(id))) => Ok(id),
-            Ok(Ok(Err(e))) => Err(format!("write failed: {e}")),
-            Ok(Err(join)) => Err(format!("blocking write task panicked: {join}")),
-            Err(_) => Err(format!(
-                "write exceeded the {}ms deadline (it may still commit)",
-                deadline.as_millis(),
-            )),
+        let joined = if let Ok(joined) = tokio::time::timeout(deadline, &mut write).await {
+            joined
+        } else {
+            if !settled.swap(true, Ordering::AcqRel) {
+                self.settle(
+                    received_ms,
+                    probing,
+                    Err(format!(
+                        "write exceeded the {}ms deadline (it may still commit)",
+                        deadline.as_millis(),
+                    )),
+                );
+                return Mirrored::default();
+            }
+            // The writer settled between the deadline firing and the
+            // swap; its result is ready.
+            write.await
         };
-        match outcome {
-            Ok(id) => {
-                if probing {
-                    self.note_recovered(id);
+        match joined {
+            Ok(Ok(written)) => written,
+            Ok(Err(_)) => Mirrored::default(),
+            Err(join) => {
+                // Only reachable if the runtime cancelled the task
+                // before it ran (shutdown).
+                if !settled.swap(true, Ordering::AcqRel) {
+                    self.settle(
+                        received_ms,
+                        probing,
+                        Err(format!("blocking write task failed: {join}")),
+                    );
                 }
-                Some(id)
+                Mirrored::default()
             }
-            Err(reason) => {
-                self.note_unrecorded(received_ms, reason, probing);
-                None
-            }
+        }
+    }
+
+    fn settle(&self, received_ms: i64, probing: bool, result: Result<u64, String>) {
+        match result {
+            Ok(id) if probing => self.note_recovered(id),
+            Ok(_) => {}
+            Err(reason) => self.note_unrecorded(received_ms, reason, probing),
         }
     }
 
@@ -321,8 +393,7 @@ impl EventLog {
         );
     }
 
-    /// One transaction: optional gap marker, then the event. Returns
-    /// the event's row id.
+    /// One transaction: optional gap marker, then the event.
     fn write_with_gap(
         &self,
         received_ms: i64,
@@ -331,20 +402,25 @@ impl EventLog {
         plugin_id: &str,
         payload_blob: &[u8],
         gap: Option<&GapMarker>,
-    ) -> Result<u64, EventLogError> {
+    ) -> Result<Mirrored, EventLogError> {
         let marker = gap.map(|g| gap_marker_event(g, received_ms)).transpose()?;
-        self.db.write(|conn| -> Result<u64, EventLogError> {
+        self.db.write(|conn| -> Result<Mirrored, EventLogError> {
             let tx = conn.transaction()?;
-            if let Some((marker, blob)) = &marker {
-                insert_row(
-                    &tx,
-                    received_ms,
-                    marker,
-                    GAP_MARKER_ORIGIN,
-                    GAP_MARKER_ORIGIN,
-                    blob,
-                )?;
-            }
+            let gap_marker = match marker {
+                Some((mut marker, blob)) => {
+                    let id = insert_row(
+                        &tx,
+                        received_ms,
+                        &marker,
+                        GAP_MARKER_ORIGIN,
+                        GAP_MARKER_ORIGIN,
+                        &blob,
+                    )?;
+                    marker.row_id = Some(id);
+                    Some(marker)
+                }
+                None => None,
+            };
             let id = insert_row(
                 &tx,
                 received_ms,
@@ -354,7 +430,10 @@ impl EventLog {
                 payload_blob,
             )?;
             tx.commit()?;
-            Ok(id)
+            Ok(Mirrored {
+                row_id: Some(id),
+                gap_marker,
+            })
         })
     }
 }
@@ -381,7 +460,7 @@ fn gap_marker_event(gap: &GapMarker, received_ms: i64) -> Result<(Event, Vec<u8>
 
 #[cfg(test)]
 mod tests {
-    use super::super::{EventOrder, EventQuery};
+    use super::super::{EventOrder, EventQuery, topic_of};
     use super::*;
     use crate::host_impl::plugin::oxidhome::plugin::events::StateChange;
     use crate::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value as WitValue};
@@ -413,7 +492,7 @@ mod tests {
         }
     }
 
-    async fn publish(log: &EventLog, received_ms: i64) -> Option<u64> {
+    async fn publish_full(log: &EventLog, received_ms: i64) -> Mirrored {
         let ev = switch_event(true);
         let blob = serialize_payload(&ev.payload, "switch").expect("blob");
         log.mirror(
@@ -424,6 +503,12 @@ mod tests {
             blob,
         )
         .await
+    }
+
+    async fn publish(log: &EventLog, received_ms: i64) -> Option<u64> {
+        let out = publish_full(log, received_ms).await;
+        assert!(out.gap_marker.is_none(), "unexpected gap marker");
+        out.row_id
     }
 
     /// Injects a write failure the way a full disk surfaces it: every
@@ -492,7 +577,13 @@ mod tests {
 
         fix_writes(&log);
         tokio::time::sleep(FAST.probe_interval * 2).await;
-        let after = publish(&log, 50).await.expect("recovered write");
+        let recovered = publish_full(&log, 50).await;
+        let after = recovered.row_id.expect("recovered write");
+        let live_marker = recovered
+            .gap_marker
+            .expect("marker handed back for fan-out");
+        assert_eq!(topic_of(&live_marker), GAP_MARKER_TOPIC);
+        assert_eq!(live_marker.origin_plugin_id, GAP_MARKER_ORIGIN);
 
         let h = log.health();
         assert!(!h.degraded);
@@ -509,6 +600,7 @@ mod tests {
         assert_eq!(rows[2].id, after);
         let marker = &rows[1];
         assert!(before < marker.id && marker.id < after);
+        assert_eq!(live_marker.row_id, Some(marker.id));
         assert_eq!(marker.topic, GAP_MARKER_TOPIC);
         assert_eq!(marker.plugin_id, GAP_MARKER_ORIGIN);
         assert_eq!(marker.instance_id, GAP_MARKER_ORIGIN);
@@ -535,6 +627,52 @@ mod tests {
             )
             .expect("cursor query");
         assert_eq!(page[0].topic, GAP_MARKER_TOPIC);
+
+        // Selector filters don't hide the marker; bounds still apply.
+        let filtered = log
+            .query(
+                &EventQuery {
+                    device_id: Some("some-other-device".into()),
+                    plugin_id: Some("example.other".into()),
+                    topic: Some(("switch".into(), super::super::TopicMatch::Exact)),
+                    order: EventOrder::Asc,
+                    ..EventQuery::default()
+                },
+                10,
+            )
+            .expect("filtered query");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, marker.id);
+        let bounded = log
+            .query(
+                &EventQuery {
+                    device_id: Some("some-other-device".into()),
+                    after_id: Some(marker.id),
+                    ..EventQuery::default()
+                },
+                10,
+            )
+            .expect("bounded query");
+        assert_eq!(bounded.len(), 0);
+    }
+
+    #[test]
+    fn only_host_origin_custom_events_are_gap_markers() {
+        let (marker, _) = gap_marker_event(
+            &GapMarker {
+                unrecorded: 1,
+                first_received_ms: 1,
+                last_received_ms: 1,
+                last_error: String::new(),
+            },
+            1,
+        )
+        .expect("marker");
+        assert!(is_gap_marker(&marker));
+        let mut forged = marker.clone();
+        forged.origin_plugin_id = "example.alpha".into();
+        assert!(!is_gap_marker(&forged));
+        assert!(!is_gap_marker(&switch_event(true)));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -607,7 +745,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         tokio::time::sleep(policy.probe_interval * 2).await;
-        let id = publish(&log, 3).await.expect("probe succeeds");
+        let id = publish_full(&log, 3).await.row_id.expect("probe succeeds");
 
         // Late row (received 1) < marker < probing event: history
         // order still matches delivery order.
@@ -617,5 +755,50 @@ mod tests {
         assert_eq!(rows[0].received_ms, 1);
         assert_eq!(rows[2].id, id);
         assert!(!log.health().degraded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_publish_future_still_settles_the_outcome() {
+        // A plugin trap / watchdog kill drops the publish future
+        // mid-await. The blocking write still finishes, and its
+        // failure must still put the mirror into degraded mode.
+        let log = log_with(MirrorPolicy {
+            write_deadline: Duration::from_secs(30),
+            probe_interval: Duration::from_secs(30),
+        });
+        break_writes(&log);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let db = Arc::clone(&log.db);
+        let holder = std::thread::spawn(move || {
+            db.write(|_| {
+                held_tx.send(()).expect("signal");
+                release_rx.recv().expect("release");
+                Ok::<_, rusqlite::Error>(())
+            })
+            .expect("hold");
+        });
+        held_rx.recv().expect("holder took the lock");
+
+        let dropped = tokio::time::timeout(Duration::from_millis(20), publish(&log, 1)).await;
+        assert!(
+            dropped.is_err(),
+            "publish future must be cancelled while parked"
+        );
+        assert!(!log.health().degraded, "outcome not known yet");
+
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+        let wait = Instant::now();
+        while log.mirror.in_flight.load(Ordering::Acquire) != 0 {
+            assert!(
+                wait.elapsed() < Duration::from_secs(10),
+                "write never drained"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let h = log.health();
+        assert!(h.degraded, "{h:?}");
+        assert_eq!(h.unrecorded_total, 1);
     }
 }

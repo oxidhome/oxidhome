@@ -39,7 +39,9 @@ use super::db::Db;
 
 mod mirror;
 
-pub use mirror::{EventLogHealth, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, MirrorPolicy};
+pub use mirror::{
+    EventLogHealth, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, MirrorPolicy, is_gap_marker,
+};
 
 /// Errors returned by [`EventLog`]. Maps onto the WIT `error` variant
 /// in `host_impl::events::publish_event` via the same `Internal`-or-
@@ -308,19 +310,30 @@ impl EventLog {
         if let Some(t) = filter.until_ms {
             push(&mut binds, &mut sql, "received_ms <=", t.into());
         }
+        // Selector filters (device / instance / plugin / topic) go
+        // in their own group. H3: host gap markers bypass them — a
+        // device-, plugin- or topic-filtered consumer still has to
+        // learn that history is missing rows — while the time and
+        // cursor bounds apply to every row.
+        let mut selectors = String::new();
         if let Some(d) = &filter.device_id {
-            push(&mut binds, &mut sql, "device_id =", d.clone().into());
+            push(&mut binds, &mut selectors, "device_id =", d.clone().into());
         }
         if let Some(i) = &filter.instance_id {
-            push(&mut binds, &mut sql, "instance_id =", i.clone().into());
+            push(
+                &mut binds,
+                &mut selectors,
+                "instance_id =",
+                i.clone().into(),
+            );
         }
         if let Some(p) = &filter.plugin_id {
-            push(&mut binds, &mut sql, "plugin_id =", p.clone().into());
+            push(&mut binds, &mut selectors, "plugin_id =", p.clone().into());
         }
         if let Some((t, m)) = &filter.topic {
             match m {
                 TopicMatch::Exact => {
-                    push(&mut binds, &mut sql, "topic =", t.clone().into());
+                    push(&mut binds, &mut selectors, "topic =", t.clone().into());
                 }
                 // Prefix-match via `substr(topic, 1, length(?)) = ?` —
                 // same shape used by `kv::list_keys`, both correct on
@@ -331,9 +344,18 @@ impl EventLog {
                     let n_left = binds.len();
                     binds.push(rusqlite::types::Value::Text(t.clone()));
                     let n_right = binds.len();
-                    let _ = write!(sql, " AND substr(topic, 1, length(?{n_left})) = ?{n_right}");
+                    let _ = write!(
+                        selectors,
+                        " AND substr(topic, 1, length(?{n_left})) = ?{n_right}"
+                    );
                 }
             }
+        }
+        if !selectors.is_empty() {
+            let _ = write!(
+                sql,
+                " AND ((1=1{selectors}) OR (plugin_id = '{GAP_MARKER_ORIGIN}' AND topic = '{GAP_MARKER_TOPIC}'))",
+            );
         }
         // H5 review round-2 P1 F2: cursor filters. `after_id` is
         // the "give me rows I haven't seen yet" cursor a tail

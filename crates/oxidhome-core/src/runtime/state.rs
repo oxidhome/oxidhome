@@ -1284,6 +1284,93 @@ fn require_publish_authorized(
     }
 }
 
+/// The post-admission half of `publish-event`: durable mirror,
+/// projection update, live fan-out — all under the bus's
+/// `publish_sequence` gate. Owns `Arc`s so it can run on a spawned
+/// task independent of the host call's future (H3).
+struct PublishCommit {
+    events: Arc<EventBus>,
+    event_log: Arc<crate::state::EventLog>,
+    device_state: Arc<crate::state::DeviceStateStore>,
+    instance_id: String,
+    plugin_id: String,
+}
+
+impl PublishCommit {
+    async fn run(self, ev: Event, payload_blob: Vec<u8>) {
+        // H5 review round-2 P2 F1: hold the bus's `publish_sequence`
+        // gate across the mirror + publish pair so two concurrent
+        // publishers can't commit rows in one order (A: rowid 1,
+        // B: rowid 2) and fan out in the opposite order. Delivery
+        // order therefore equals gate-acquisition order, and row ids
+        // rise strictly along it. H3: the gate is held for at most
+        // one write deadline; while degraded the mirror skips the
+        // disk, so a dead disk costs publishers no per-event wait.
+        let sequence_gate = self.events.publish_sequence();
+        let _sequence_guard = sequence_gate.lock().await;
+        // C4 review P2 F2: reuse the payload already serialized for
+        // the cap check so we don't encode the same event twice.
+        let mirrored = self
+            .event_log
+            .mirror(
+                crate::state::event_log::now_unix_ms(),
+                ev.clone(),
+                self.instance_id.clone(),
+                self.plugin_id.clone(),
+                payload_blob,
+            )
+            .await;
+
+        // H3: a recovery probe committed a gap marker just below
+        // this event's row id. Fan it out first so a live consumer
+        // that saves this event's id as its cursor has already seen
+        // the marker it would otherwise step over.
+        if let Some(marker) = mirrored.gap_marker {
+            let row_id = marker.row_id;
+            let _delivered = self.events.publish_with_id(marker, row_id);
+        }
+
+        // H9: update the host-owned state projection before the
+        // fanout. Runs under the same `publish_sequence` gate as
+        // the event-log mirror above, so a snapshot API call
+        // observes the same ordering the durable log records —
+        // no post-fanout callers can see a state update before
+        // the projection has it. Only `state-changed` events
+        // land here; other variants (button, inference, custom)
+        // aren't state-carrying by the WIT contract. H9 round-3:
+        // uses `apply_delta` (merge by key) because WIT
+        // `state-change.fields` is documented as *changes only*
+        // — the register-device / OkWithState paths use
+        // `replace_snapshot` instead.
+        if let (
+            Some(device_id),
+            crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
+        ) = (ev.device.clone(), &ev.payload)
+        {
+            self.device_state.apply_delta(
+                device_id,
+                self.instance_id.clone(),
+                sc.capability.clone(),
+                sc.fields.clone(),
+                ev.timestamp,
+                crate::state::event_log::now_unix_ms(),
+            );
+        }
+
+        // Admission already consumed (pre-persistence). The bus's
+        // `publish_with_id` sends the event onto every subscriber's
+        // mpsc queue and signals matching wakes — see
+        // `EventBus::publish_with_id` for the send-before-signal
+        // ordering that keeps waking supervisors from racing an
+        // empty receiver. H5: the row id from the mirror above rides
+        // with the fanout so tail clients can reconcile against
+        // `GET /api/v1/events`; `None` means "not in history" (H3).
+        // `_sequence_guard` is still held here, so no other
+        // publisher runs between the mirror and this publish.
+        let _delivered = self.events.publish_with_id(ev, mirrored.row_id);
+    }
+}
+
 impl host_events::Host for PluginState {
     #[allow(clippy::too_many_lines)]
     async fn publish_event(&mut self, ev: Event) -> Result<(), WitError> {
@@ -1427,70 +1514,23 @@ impl host_events::Host for PluginState {
         // is delivered with `row_id = None`, and history gets a gap
         // marker once writes recover. See `state::event_log::mirror`.
         //
-        // H5 review round-2 P2 F1: hold the bus's `publish_sequence`
-        // gate across the mirror + publish pair so two concurrent
-        // publishers can't commit rows in one order (A: rowid 1,
-        // B: rowid 2) and fan out in the opposite order. Delivery
-        // order therefore equals gate-acquisition order, and row ids
-        // rise strictly along it. The gate is held for at most one
-        // write deadline; while degraded the mirror skips the disk,
-        // so a dead disk costs publishers no per-event wait. C2d
-        // rate limiting already ran above, before any disk work.
-        let sequence_gate = self.events.publish_sequence();
-        let _sequence_guard = sequence_gate.lock().await;
-        // C4 review P2 F2: reuse the payload we already serialized
-        // for the cap check so we don't encode the same event twice.
-        let row_id = self
-            .event_log
-            .mirror(
-                crate::state::event_log::now_unix_ms(),
-                ev.clone(),
-                self.instance_id.clone(),
-                self.manifest.plugin.id.clone(),
-                payload_blob,
-            )
-            .await;
-
-        // H9: update the host-owned state projection before the
-        // fanout. Runs under the same `publish_sequence` gate as
-        // the event-log mirror above, so a snapshot API call
-        // observes the same ordering the durable log records —
-        // no post-fanout callers can see a state update before
-        // the projection has it. Only `state-changed` events
-        // land here; other variants (button, inference, custom)
-        // aren't state-carrying by the WIT contract. H9 round-3:
-        // uses `apply_delta` (merge by key) because WIT
-        // `state-change.fields` is documented as *changes only*
-        // — the register-device / OkWithState paths use
-        // `replace_snapshot` instead.
-        if let (
-            Some(device_id),
-            crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
-        ) = (ev.device.clone(), &ev.payload)
-        {
-            self.device_state.apply_delta(
-                device_id,
-                self.instance_id.clone(),
-                sc.capability.clone(),
-                sc.fields.clone(),
-                ev.timestamp,
-                crate::state::event_log::now_unix_ms(),
-            );
-        }
-
-        // Admission already consumed above (pre-persistence). The
-        // bus's `publish_with_id` sends the event onto every
-        // subscriber's mpsc queue and signals matching wakes — see
-        // `EventBus::publish_with_id` for the send-before-signal
-        // ordering that keeps waking supervisors from racing an
-        // empty receiver. H5: the row id from the mirror above rides
-        // with the fanout so tail clients can reconcile against
-        // `GET /api/v1/events`; `None` means "not in history" (H3).
-        // The `_sequence_guard` from `publish_sequence` above is
-        // still held here — dropped when this function returns — so
-        // no other publisher runs between the mirror and this publish.
-        let _delivered = self.events.publish_with_id(ev, row_id);
-        Ok(())
+        // The commit (mirror + projection + fan-out) runs on its own
+        // task so it completes even if this host call's future is
+        // dropped mid-await (plugin trap, watchdog kill): once
+        // admitted, a publish is recorded *and* delivered or neither
+        // side starts, and the sequence gate stays held until the
+        // write settled or hit its deadline — a cancelled caller
+        // can't release the gate under a still-running write.
+        let commit = PublishCommit {
+            events: Arc::clone(&self.events),
+            event_log: Arc::clone(&self.event_log),
+            device_state: Arc::clone(&self.device_state),
+            instance_id: self.instance_id.clone(),
+            plugin_id: self.manifest.plugin.id.clone(),
+        };
+        tokio::spawn(commit.run(ev, payload_blob))
+            .await
+            .map_err(|e| WitError::Internal(format!("publish-event: commit task failed: {e}")))
     }
 
     async fn subscribe(&mut self, filter: EventFilter) -> Result<SubscriptionId, WitError> {
@@ -2546,12 +2586,20 @@ mod tests {
         host_events::Host::publish_event(&mut state, state_change_event(&id))
             .await
             .expect("publish");
+        // The gap marker is fanned out ahead of the recovered event.
+        let marker = sub
+            .receiver
+            .try_recv()
+            .expect("gap marker delivered live")
+            .expect_event();
+        assert!(crate::state::event_log::is_gap_marker(&marker));
         let ev = sub
             .receiver
             .try_recv()
             .expect("event delivered")
             .expect_event();
         let row_id = ev.row_id.expect("recovered publish carries a row id");
+        assert!(marker.row_id.expect("marker row id") < row_id);
         assert!(!log.health().degraded);
         let rows = log
             .query(&crate::state::EventQuery::default(), 10)
@@ -2559,6 +2607,66 @@ mod tests {
         assert_eq!(rows.len(), 2, "gap marker + recovered event");
         assert_eq!(rows[0].id, row_id);
         assert_eq!(rows[1].topic, crate::state::GAP_MARKER_TOPIC);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_events_publish_commits_even_if_the_call_is_dropped() {
+        // H3: once admitted, a publish is mirrored and delivered even
+        // if the host call's future is dropped mid-await (plugin trap,
+        // watchdog kill) — and the sequence gate isn't released under
+        // a still-running write.
+        let registry = Arc::new(DeviceRegistry::new());
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe_all();
+        let mut state = shared_state("alpha", registry, Arc::clone(&bus));
+        let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
+        let log = Arc::new(crate::state::EventLog::new(Arc::clone(&db)));
+        state.event_log = Arc::clone(&log);
+        let id = host_devices::Host::register_device(&mut state, switch_device("d-1"))
+            .await
+            .expect("register");
+
+        // Park the durable write behind the connection mutex.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder_db = Arc::clone(&db);
+        let holder = std::thread::spawn(move || {
+            holder_db
+                .write(|_| {
+                    held_tx.send(()).expect("signal");
+                    release_rx.recv().expect("release");
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .expect("hold");
+        });
+        held_rx.recv().expect("holder took the lock");
+
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            host_events::Host::publish_event(&mut state, state_change_event(&id)),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "publish must still be parked on the write"
+        );
+        assert!(
+            bus.publish_sequence().try_lock().is_err(),
+            "the commit task keeps the sequence gate while its write runs",
+        );
+
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), sub.receiver.recv())
+            .await
+            .expect("delivered after the caller went away")
+            .expect("channel open")
+            .expect_event();
+        assert!(
+            ev.row_id.is_some(),
+            "the write committed and stamped its id"
+        );
+        assert_eq!(log.count().expect("count"), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

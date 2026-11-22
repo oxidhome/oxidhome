@@ -812,8 +812,18 @@ impl EventSubscription {
 /// Shared filter check. Extracted from `EventSubscription::matches`
 /// so the bus can filter wake registrations without cloning
 /// the subscription slot.
+///
+/// H3: a host gap marker matches every filter. It tells the
+/// subscriber that history is missing rows below the next row id it
+/// will see, which matters to a device- or topic-filtered consumer as
+/// much as to an unfiltered one. Plugins can't forge it: the host
+/// stamps `origin-plugin-id`, and no manifest `plugin.id` can be
+/// `"host"`.
 #[must_use]
 pub(crate) fn filter_matches(filter: &EventFilter, event: &Event) -> bool {
+    if crate::state::event_log::is_gap_marker(event) {
+        return true;
+    }
     if let Some(device) = &filter.device
         && event.device.as_ref() != Some(device)
     {
@@ -1402,5 +1412,20 @@ mod tests {
         assert_eq!(n, 1);
         drop(sub_b);
         assert_eq!(bus.subscribers.read().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn host_gap_marker_bypasses_subscription_filters() {
+        // H3: a filtered subscriber must still learn that history
+        // lost rows; a plugin-published look-alike gets no bypass.
+        let filter = EventFilter {
+            device: Some("d-1".into()),
+            topic: Some("switch".into()),
+        };
+        let mut marker = custom(None, crate::state::GAP_MARKER_TOPIC);
+        marker.origin_plugin_id = crate::state::GAP_MARKER_ORIGIN.into();
+        assert!(filter_matches(&filter, &marker));
+        marker.origin_plugin_id = "example.forger".into();
+        assert!(!filter_matches(&filter, &marker));
     }
 }
