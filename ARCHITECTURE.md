@@ -206,7 +206,7 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 
 ### Host → Plugin
 
-- **Lifecycle** — `init()`, `shutdown()`
+- **Lifecycle** — `init()`, `on-shutdown()`. The shutdown export is named `on-shutdown` because a bare `shutdown` core symbol collides with wasi-libc's socket `shutdown(fd, how)`; the SDK still exposes it to plugin authors as `Plugin::shutdown`.
 - **Event delivery** — the host buffers matching events on the subscriber's per-instance queue. A host-side helper (`PluginInstance::drain_events()`) walks that queue and invokes the plugin's `on-event` export once per buffered event. There is no separate `drain-events` export on the plugin world. Phase 3 ships the helper; *when* to call it is the caller's choice today — integration tests invoke it explicitly after each host-driven step. The intended future driver is a per-instance tokio task that owns the `Store` and `select!`s between control commands and bus events, draining automatically after each entry point (`init`, `execute-command`, `tick`); that scheduler lands with Phase 6's per-instance lifecycle. The polling-drain shape preserves the single-threaded per-`Store` WASM contract — no host call ever re-enters the plugin from a separate task — and avoids needing a streaming export on the plugin world.
 - **Commands** — `execute-command(device, cmd)` for actions targeting plugin's devices; `execute-service-command(service, command, args)` for actions targeting the plugin's services (Phase 7), routed from the host dispatcher
 - **Periodic** — `tick()` for plugins that genuinely need a heartbeat (most should be event-driven)

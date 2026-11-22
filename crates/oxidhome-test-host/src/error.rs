@@ -69,7 +69,7 @@ pub enum TestHostError {
     #[error(transparent)]
     Init(#[from] oxidhome_core::InitError),
     /// A call into the plugin (`tick`, `execute-command`, `on-event`,
-    /// `shutdown`) trapped or timed out.
+    /// `on-shutdown`) trapped or timed out.
     #[error("calling plugin export `{export}`")]
     Call {
         /// WIT export that was called.

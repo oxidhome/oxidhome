@@ -1002,9 +1002,10 @@ world plugin {
   use devices.{command, command-result};
   use events.{event};
 
-  // Lifecycle
+  // Lifecycle. `on-shutdown`, not `shutdown`: a bare `shutdown` core
+  // export collides with wasi-libc's socket `shutdown` symbol.
   export init: func() -> result<_, string>;
-  export shutdown: func();
+  export on-shutdown: func();
 
   // Event delivery from the host's bus to the plugin
   export on-event: func(ev: event);

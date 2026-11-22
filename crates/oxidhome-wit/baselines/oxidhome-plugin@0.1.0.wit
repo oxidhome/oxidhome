@@ -526,7 +526,7 @@ world plugin {
   use events.{event};
 
   export init: func() -> result<_, string>;
-  export shutdown: func();
+  export on-shutdown: func();
   export on-event: func(ev: event);
   export execute-command: func(device: device-id, cmd: command) -> command-result;
   export execute-service-command: func(service: service-id, command: string, args: list<key-value>) -> command-result;
@@ -561,7 +561,7 @@ world streaming-plugin {
   use events.{event};
 
   export init: func() -> result<_, string>;
-  export shutdown: func();
+  export on-shutdown: func();
   export on-event: func(ev: event);
   export execute-command: func(device: device-id, cmd: command) -> command-result;
   export execute-service-command: func(service: service-id, command: string, args: list<key-value>) -> command-result;
@@ -587,7 +587,7 @@ world ai-plugin {
   use events.{event};
 
   export init: func() -> result<_, string>;
-  export shutdown: func();
+  export on-shutdown: func();
   export on-event: func(ev: event);
   export execute-command: func(device: device-id, cmd: command) -> command-result;
   export execute-service-command: func(service: service-id, command: string, args: list<key-value>) -> command-result;
@@ -623,7 +623,7 @@ world streaming-ai-plugin {
   use events.{event};
 
   export init: func() -> result<_, string>;
-  export shutdown: func();
+  export on-shutdown: func();
   export on-event: func(ev: event);
   export execute-command: func(device: device-id, cmd: command) -> command-result;
   export execute-service-command: func(service: service-id, command: string, args: list<key-value>) -> command-result;

@@ -29,6 +29,10 @@ pub trait Plugin: Default + 'static {
 
     /// Called once before the host drops the component instance. The
     /// instance is dropped immediately after this call returns.
+    ///
+    /// Bound to the WIT world's `on-shutdown` export. The WIT name
+    /// avoids a core-symbol clash with wasi-libc's socket `shutdown`;
+    /// the Rust method keeps the shorter name, paired with `init`.
     fn shutdown(&mut self);
 
     /// Delivered by the host for every event matching one of this

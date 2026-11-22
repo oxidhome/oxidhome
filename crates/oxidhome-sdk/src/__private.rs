@@ -134,7 +134,7 @@ macro_rules! __plugin_impl {
                     $crate::__private::run_init::<$ty>(&__OXIDHOME_PLUGIN)
                 }
 
-                fn shutdown() {
+                fn on_shutdown() {
                     $crate::__private::run_shutdown::<$ty>(&__OXIDHOME_PLUGIN);
                 }
 

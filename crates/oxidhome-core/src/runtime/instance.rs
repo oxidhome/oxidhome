@@ -960,7 +960,7 @@ impl PluginInstance {
         .await
     }
 
-    /// Call the plugin's exported `shutdown`. The plugin can't fail this
+    /// Call the plugin's exported `on-shutdown`. The plugin can't fail this
     /// call by contract; trapping bubbles up as an error.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         let data = self.store.data();
@@ -972,7 +972,7 @@ impl PluginInstance {
         async {
             self.arm_watchdog();
             self.bindings
-                .call_shutdown(&mut self.store)
+                .call_on_shutdown(&mut self.store)
                 .await
                 .map_err(anyhow::Error::from)
                 .context("invoking plugin shutdown")
