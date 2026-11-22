@@ -286,3 +286,23 @@ async fn instance_outlives_its_host() {
     drop(storage);
     assert!(!state_dir.exists());
 }
+
+/// Dropping a `load_with` future mid-load frees its instance id (and
+/// tears down anything filed under it) just like a failed load.
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_load_releases_its_id() {
+    let staged = stage_unchanged(SIMULATED_SWITCH);
+    let host = TestHost::new().unwrap();
+    let load = host.load_with(staged.path(), LoadOptions::new().instance_id("switch"));
+    // A zero timeout polls the load once and then drops it.
+    if let Ok(result) = tokio::time::timeout(std::time::Duration::ZERO, load).await {
+        // The load finished on its first poll; nothing was cancelled.
+        drop(result.unwrap());
+    }
+    let mut switch = host
+        .load_with(staged.path(), LoadOptions::new().instance_id("switch"))
+        .await
+        .expect("id is free after the cancelled load");
+    switch.init().await.unwrap();
+    assert_eq!(switch.devices().len(), 1);
+}

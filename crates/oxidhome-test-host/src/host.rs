@@ -169,9 +169,9 @@ impl TestHost {
                 if !oxidhome_core::state::is_safe_instance_id(&id) {
                     return Err(TestHostError::InvalidInstanceId(id));
                 }
-                Reservation::claim(&self.live, id)?
+                Reservation::claim(&self.engine, &self.live, id)?
             }
-            None => Reservation::claim_generated(&self.live, &self.next_id),
+            None => Reservation::claim_generated(&self.engine, &self.live, &self.next_id),
         };
         let instance_id = reservation.id().to_owned();
 
@@ -203,24 +203,16 @@ impl TestHost {
         let inner = PluginInstance::load_with_pinned_manifest(
             &self.engine,
             plugin_dir,
-            instance_id.clone(),
+            instance_id,
             config.as_ref(),
             mode,
             manifest_bytes,
             manifest,
         )
         .await
-        .map_err(|e| {
-            // Component initializers run during instantiation and may
-            // already have called host imports; tear down whatever
-            // they left behind, as the supervisor's reaper does after
-            // a failed load. The id is still reserved, so nothing
-            // else owns state under it.
-            self.engine.release_instance_state(&instance_id);
-            TestHostError::Load {
-                plugin_id,
-                source: e.into(),
-            }
+        .map_err(|e| TestHostError::Load {
+            plugin_id,
+            source: e.into(),
         })?;
         Ok(TestPluginInstance::new(
             self.engine.clone(),
@@ -232,15 +224,19 @@ impl TestHost {
 }
 
 /// Holds an instance id in the host's live set until the load either
-/// succeeds (ownership moves to the instance) or fails (dropped here,
-/// freeing the id).
+/// succeeds (ownership moves to the instance) or fails or is cancelled
+/// (dropped here). On drop it first tears down any host state filed
+/// under the id — component initializers run during instantiation and
+/// may already have called host imports, which the supervisor's reaper
+/// would clean up after a failed load — and only then frees the id.
 struct Reservation {
+    engine: Engine,
     live: LiveIds,
     id: Option<String>,
 }
 
 impl Reservation {
-    fn claim(live: &LiveIds, id: String) -> Result<Self, TestHostError> {
+    fn claim(engine: &Engine, live: &LiveIds, id: String) -> Result<Self, TestHostError> {
         let mut guard = live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -248,6 +244,7 @@ impl Reservation {
             return Err(TestHostError::DuplicateInstanceId(id));
         }
         Ok(Self {
+            engine: engine.clone(),
             live: Arc::clone(live),
             id: Some(id),
         })
@@ -255,10 +252,10 @@ impl Reservation {
 
     /// Claim the next free `test-<n>` id, skipping any a caller chose
     /// explicitly.
-    fn claim_generated(live: &LiveIds, next: &AtomicU64) -> Self {
+    fn claim_generated(engine: &Engine, live: &LiveIds, next: &AtomicU64) -> Self {
         loop {
             let id = format!("test-{}", next.fetch_add(1, Ordering::Relaxed));
-            if let Ok(reservation) = Self::claim(live, id) {
+            if let Ok(reservation) = Self::claim(engine, live, id) {
                 return reservation;
             }
         }
@@ -277,6 +274,7 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
+            self.engine.release_instance_state(&id);
             self.live
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
