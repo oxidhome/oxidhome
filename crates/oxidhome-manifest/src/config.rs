@@ -524,29 +524,6 @@ fn resolve_secret(
     None
 }
 
-/// Dotted paths (`broker.password`) of every `type = "secret"` field in
-/// `fields`, recursing into `nested` tables. Sorted.
-#[must_use]
-pub fn secret_paths(fields: &BTreeMap<String, ConfigField>) -> Vec<String> {
-    fn walk(prefix: &str, fields: &BTreeMap<String, ConfigField>, out: &mut Vec<String>) {
-        for (name, field) in fields {
-            let path = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}.{name}")
-            };
-            match &field.ty {
-                ConfigFieldType::Secret { .. } => out.push(path),
-                ConfigFieldType::Nested { fields } => walk(&path, fields, out),
-                _ => {}
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk("", fields, &mut out);
-    out
-}
-
 fn resolve_bool(
     path: &str,
     default: Option<bool>,
@@ -2158,31 +2135,5 @@ max = 65535
         let text = errors.iter().map(ToString::to_string).collect::<String>();
         assert!(text.contains("expected string, got int"), "{text}");
         assert!(!text.contains("987654"), "{text}");
-    }
-
-    #[test]
-    fn secret_paths_walks_nested_tables() {
-        let mut inner = BTreeMap::new();
-        inner.insert("password".to_owned(), secret_field(true));
-        inner.insert(
-            "host".to_owned(),
-            ConfigField {
-                ty: ConfigFieldType::String { default: None },
-                description: None,
-            },
-        );
-        let mut fields = BTreeMap::new();
-        fields.insert(
-            "broker".to_owned(),
-            ConfigField {
-                ty: ConfigFieldType::Nested { fields: inner },
-                description: None,
-            },
-        );
-        fields.insert("token".to_owned(), secret_field(false));
-        assert_eq!(
-            secret_paths(&fields),
-            vec!["broker.password".to_owned(), "token".to_owned()]
-        );
     }
 }

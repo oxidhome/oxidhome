@@ -16,8 +16,8 @@
 //!   [`InstanceConfig`].
 //! - `type = "secret"` config fields (M7) resolve to
 //!   [`ConfigValue::Secret`] / [`SecretString`], which mask themselves
-//!   as [`MASKED`] in `Debug` and `Serialize`; [`secret_paths`] lists
-//!   them. See the [`config`] module docs.
+//!   as [`MASKED`] in `Debug` and `Serialize`. See the [`config`]
+//!   module docs.
 //! - [`compatibility::check`] — the host's preflight that a plugin's
 //!   declared `sdk_version` is acceptable.
 //!
@@ -37,7 +37,6 @@ mod manifest;
 pub use compatibility::{CompatError, check as check_compatibility};
 pub use config::{
     ConfigField, ConfigFieldType, ConfigValue, InstanceConfig, MASKED, SecretString, merge,
-    secret_paths,
 };
 pub use extension::{ExtensionId, ExtensionIdError};
 pub use manifest::{

@@ -183,6 +183,12 @@ impl HandlerOutcomeSlot {
     }
 }
 
+/// M7: does the request's `Actor` hold `blobs:read` (see
+/// [`can_read_blobs`])? `false` when the extension is missing.
+fn ctx_can_read_blobs(ctx: &RequestContext) -> bool {
+    ctx.extensions().get::<Actor>().is_some_and(can_read_blobs)
+}
+
 /// Wrap a [`ConnectError`] on the error-return site so the audit
 /// row picks up the outcome. Idiomatic use — at every `return Err(...)`
 /// inside a Connect handler that isn't a scope denial:
@@ -216,12 +222,6 @@ fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
 /// contract with the middleware (which stamps it during auth);
 /// missing it is an internal bug rather than a client error →
 /// `ConnectError::internal`, not `Unauthenticated`.
-/// M7: does the request's `Actor` hold `blobs:read` (see
-/// [`can_read_blobs`])? `false` when the extension is missing.
-fn ctx_can_read_blobs(ctx: &RequestContext) -> bool {
-    ctx.extensions().get::<Actor>().is_some_and(can_read_blobs)
-}
-
 fn require_scope_connect(ctx: &RequestContext, required: Scope) -> Result<(), ConnectError> {
     // If the middleware failed to stamp `Actor` into extensions,
     // wrap the internal error through `rpc_err` too — otherwise a

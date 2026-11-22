@@ -150,14 +150,24 @@ fn mask_leaves(value: &mut JsonValue) -> bool {
             *value = JsonValue::String(REDACTED.to_owned());
             true
         }
+        // A tagged wire value (`{"t": "Int", "v": 1234}`): swap the
+        // whole value for a `String` one so a typed client can still
+        // decode it (`{"t": "Int", "v": "***"}` would not).
+        JsonValue::Object(map)
+            if map.len() == 2
+                && map.get("t").is_some_and(JsonValue::is_string)
+                && map.contains_key("v") =>
+        {
+            let masked = serde_json::json!({"t": "String", "v": REDACTED});
+            if *value == masked {
+                return false;
+            }
+            *value = masked;
+            true
+        }
         JsonValue::Object(map) => {
             let mut changed = false;
-            for (k, v) in map.iter_mut() {
-                // Keep the `{t, v}` tag readable: it names a type, not
-                // a value.
-                if k == "t" && v.is_string() {
-                    continue;
-                }
+            for v in map.values_mut() {
                 changed |= mask_leaves(v);
             }
             changed
@@ -289,6 +299,10 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
     }
     if key_end > floor && matches!(bytes[key_end - 1], b'"' | b'\'') {
         key_end -= 1;
+        // `\"password\":` — JSON nested inside a `Debug`-escaped string.
+        if key_end > floor && bytes[key_end - 1] == b'\\' {
+            key_end -= 1;
+        }
     }
     let mut key_start = key_end;
     while key_start > floor && is_ident_byte(bytes[key_start - 1]) {
@@ -311,14 +325,32 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
     if wrapper > start && wrapper < bytes.len() && bytes[wrapper] == b'(' {
         start = wrapper + 1;
     }
+    // An escaped opening quote (`\"`) means the value ends at the next
+    // escaped quote; a plain one ends at the next unescaped quote.
+    let escaped = start + 1 < bytes.len()
+        && bytes[start] == b'\\'
+        && matches!(bytes[start + 1], b'"' | b'\'');
+    if escaped {
+        start += 1;
+    }
     let end = if start < bytes.len() && matches!(bytes[start], b'"' | b'\'') {
         let quote = bytes[start];
         start += 1;
         let mut end = start;
-        while end < bytes.len() && bytes[end] != quote {
+        while end < bytes.len() {
+            if bytes[end] == b'\\' {
+                if escaped && end + 1 < bytes.len() && bytes[end + 1] == quote {
+                    break;
+                }
+                end += 2;
+                continue;
+            }
+            if bytes[end] == quote {
+                break;
+            }
             end += 1;
         }
-        end
+        end.min(bytes.len())
     } else {
         let word_end = scan_value(bytes, start);
         let word = &bytes[start..word_end];
@@ -361,13 +393,50 @@ pub fn config_secrets(config: &InstanceConfig) -> Vec<&str> {
 /// skipped (see there).
 #[must_use]
 pub fn scrub_secret_values<'a>(text: &'a str, secrets: &[&str]) -> Cow<'a, str> {
-    let mut out = Cow::Borrowed(text);
+    // Collect every match against the original text first, then merge
+    // overlapping ranges: replacing one secret before searching for the
+    // next would break up an overlapping match and leave a fragment.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     for secret in secrets {
-        if secret.len() >= MIN_SCRUB_SECRET_LEN && out.contains(secret) {
-            out = Cow::Owned(out.replace(secret, REDACTED));
+        if secret.len() < MIN_SCRUB_SECRET_LEN {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(i) = text[from..].find(secret) {
+            let start = from + i;
+            ranges.push((start, start + secret.len()));
+            // Step one char, not the whole secret, so overlapping
+            // occurrences of the same secret are all found.
+            from = start + text[start..].chars().next().map_or(1, char::len_utf8);
         }
     }
-    out
+    if ranges.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    ranges.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut current: Option<(usize, usize)> = None;
+    for (start, end) in ranges {
+        match &mut current {
+            Some((_, cur_end)) if start <= *cur_end => *cur_end = (*cur_end).max(end),
+            _ => {
+                if let Some((s, e)) = current.take() {
+                    out.push_str(&text[copied..s]);
+                    out.push_str(REDACTED);
+                    copied = e;
+                }
+                current = Some((start, end));
+            }
+        }
+    }
+    if let Some((s, e)) = current {
+        out.push_str(&text[copied..s]);
+        out.push_str(REDACTED);
+        copied = e;
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
 }
 
 /// The read-API projection of an instance's resolved config.
@@ -525,6 +594,14 @@ mod tests {
                 r#"{"api_key": String("***"), "n": Int(1)}"#,
             ),
             ("pin: Some(1234)", "pin: Some(***)"),
+            (
+                r#"payload="{\"password\":\"hunter2\",\"user\":\"bob\"}""#,
+                r#"payload="{\"password\":\"***\",\"user\":\"bob\"}""#,
+            ),
+            (
+                r#"{"password":"a\"b","n":1}"#,
+                r#"{"password":"***","n":1}"#,
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(scrub_text(input), want, "input {input}");
@@ -583,7 +660,7 @@ mod tests {
                 "password": "***",
                 "nested": {"api_key": "***", "ok": true},
                 "fields": [
-                    {"key": "token", "value": {"t": "string", "v": "***"}},
+                    {"key": "token", "value": {"t": "String", "v": "***"}},
                     {"key": "brightness", "value": {"t": "int", "v": 5}}
                 ],
                 "log_fields": [["secret", {"t": "String", "v": "***"}], ["n", {"t": "Int", "v": 1}]],
@@ -594,6 +671,14 @@ mod tests {
             })
         );
         assert!(!redact_json(&mut v), "second pass is a no-op");
+    }
+
+    #[test]
+    fn redact_json_keeps_tagged_values_decodable() {
+        let mut v = json!({"pin": {"t": "Int", "v": 1234}});
+        assert!(redact_json(&mut v));
+        assert_eq!(v, json!({"pin": {"t": "String", "v": "***"}}));
+        assert!(!redact_json(&mut v));
     }
 
     #[test]
@@ -664,6 +749,16 @@ default = 1883
     fn scrub_secret_values_skips_short_secrets() {
         let out = scrub_secret_values("pw hunter2 and ab", &["hunter2", "ab"]);
         assert_eq!(out, "pw *** and ab");
+        // Overlapping and nested secrets leave no fragment behind.
+        assert_eq!(
+            scrub_secret_values("xabcdefghx", &["abcd", "abcdefgh"]),
+            "x***x"
+        );
+        assert_eq!(
+            scrub_secret_values("abcdefghi", &["abcdef", "defghi"]),
+            "***"
+        );
+        assert_eq!(scrub_secret_values("aaaaa", &["aaaa"]), "***");
         assert!(matches!(
             scrub_secret_values("clean", &["hunter2"]),
             Cow::Borrowed(_)

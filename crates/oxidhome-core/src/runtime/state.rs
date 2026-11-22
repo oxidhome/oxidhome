@@ -2018,6 +2018,14 @@ impl logging::Host for PluginState {
                 return;
             }
         }
+        // M7: a plugin that logs its own declared secret doesn't get it
+        // persisted (the log layer then applies the generic rules).
+        // Scrub before truncating so a cut can't leave half a secret.
+        let message = crate::redact::scrub_secret_values(
+            &message,
+            &crate::redact::config_secrets(&self.config),
+        )
+        .into_owned();
         let message = if message.len() > MAX_LOG_MESSAGE_BYTES {
             use std::fmt::Write as _;
             // Find the largest char boundary at or below the
@@ -2036,12 +2044,6 @@ impl logging::Host for PluginState {
         } else {
             message
         };
-        // M7: a plugin that logs its own declared secret doesn't get
-        // it persisted (the log layer then applies the generic rules).
-        let message = crate::redact::scrub_secret_values(
-            &message,
-            &crate::redact::config_secrets(&self.config),
-        );
         let instance_id = self.instance_id.as_str();
         match level {
             WitLevel::Trace => tracing::trace!(instance_id, "{message}"),
