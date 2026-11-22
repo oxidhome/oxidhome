@@ -120,7 +120,7 @@ pub(super) const REQUEST_BODY_DEADLINE: Duration = Duration::from_secs(5);
 /// response, which flows the *other* way anyway); 1 MiB is
 /// still an order of magnitude above what any published tool
 /// or resource dispatch produces on the request side, and it
-/// caps the memory bill under [`PENDING_BODY_GATE`] to
+/// caps the memory bill under `PENDING_BODY_GATE` to
 /// `PENDING_BODY_GATE * MAX_REQUEST_BODY_BYTES` (round-7 F1
 /// — rmcp's own default is 4 MiB, more than we need).
 pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -148,7 +148,7 @@ pub fn mount_routes_with_cap(engine: &Engine, cap: usize) -> Router {
 /// exposed. Public because the R5 F2 regression test needs a
 /// short deadline to run in reasonable time; production
 /// callers use [`mount_routes`]. Uses the production
-/// [`PENDING_BODY_GATE`] cap; see
+/// `PENDING_BODY_GATE` cap; see
 /// [`mount_routes_with_all_limits`] to override that too.
 pub fn mount_routes_with_limits(
     engine: &Engine,

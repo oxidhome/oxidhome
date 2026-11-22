@@ -1,6 +1,6 @@
 //! Cross-plugin service dispatch — Phase 7c.
 //!
-//! [`call_service`] is the host-side entry point for the WIT
+//! `call_service` is the host-side entry point for the WIT
 //! `host-services::call-service` import. It resolves the target
 //! service to its owning instance, rejects cycles at *instance*
 //! granularity, races the owning instance's `execute-service-command`
@@ -8,7 +8,7 @@
 //!
 //! ## Recursion-stack design (cross-task)
 //!
-//! Each supervisor task has its own `tokio::task_local` [`CALL_STACK`]
+//! Each supervisor task has its own `tokio::task_local` `CALL_STACK`
 //! holding the chain of in-flight `call-service` invocations *that
 //! led to whatever wasm it is currently driving*. The dispatcher:
 //!
@@ -43,7 +43,7 @@
 //!    `instance.execute_service_command(...)`, so any nested
 //!    `host::call_service` from inside the callee's wasm reads the
 //!    full chain and the cycle check works across the task hop.
-//! 6. Races the reply against [`DISPATCH_TIMEOUT`] and returns the
+//! 6. Races the reply against `DISPATCH_TIMEOUT` and returns the
 //!    result. The guard is owned by the supervisor's match arm at
 //!    this point and drops there when the wasm call returns (or when
 //!    the message is dropped without being processed — e.g. on

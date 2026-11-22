@@ -3,7 +3,7 @@
 //! Architecture-review C3, revised on the PR-#78 review. The auth
 //! middleware used to emit audit rows exclusively via
 //! `tracing::info!(target = "api.audit", ...)`, which routed them
-//! through the same bounded [`LogStore`] channel as diagnostic logs.
+//! through the same bounded [`LogStore`](crate::state::LogStore) channel as diagnostic logs.
 //! A saturation-driven drop there was silent. The first cut fixed
 //! that by routing every audit to a dedicated `audit_event` `SQLite`
 //! table; the review then flagged that "landed" ≠ "unforgeable

@@ -62,7 +62,7 @@ pub struct SupervisorTuning {
     /// is capped.
     pub healthy_reset: Duration,
     /// Per-call liveness watchdog deadline applied to every host entry
-    /// point. Production uses [`watchdog::WATCHDOG_DEFAULT`]; tests
+    /// point. Production uses `watchdog::WATCHDOG_DEFAULT`; tests
     /// lower it so a hung-plugin case trips in milliseconds.
     pub watchdog: Duration,
 }

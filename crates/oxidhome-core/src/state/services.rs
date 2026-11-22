@@ -8,8 +8,11 @@
 //! Owner-scoping matches `host-devices`: `update` / `remove` / `get`
 //! reject a non-owner with `NotFound` (indistinguishable from "id never
 //! existed") so a plugin can't probe another plugin's service ids. The
-//! dispatcher uses the unscoped [`Self::get_owner`] (owner-only) on the
-//! hot routing path and [`Self::get_any`] when it needs the full meta.
+//! dispatcher routes through the unscoped
+//! [`ServiceRegistry::get_owner_plugin_and_local_id`] (owner instance,
+//! plugin id and local id in one lookup). [`ServiceRegistry::get_owner`]
+//! (owner only) and [`ServiceRegistry::get_any`] (full meta) are the
+//! other unscoped lookups.
 //!
 //! **Concurrency.** All methods are synchronous. The `inner` map lives
 //! behind a `std::sync::RwLock` and the active-call counter behind a

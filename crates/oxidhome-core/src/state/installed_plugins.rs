@@ -2,7 +2,7 @@
 //!
 //! Tracks plugin packages copied into `<state_dir>/plugins/<plugin_id>/`.
 //! The filesystem is the source of truth for package *contents* —
-//! at boot, [`Self::scan`] walks the directory and builds an
+//! at boot, [`InstalledPluginRegistry::scan`] walks the directory and builds an
 //! in-memory index; subsequent `install` / `uninstall` calls keep
 //! the index in step.
 //!
@@ -11,7 +11,7 @@
 //! Architecture-review C1b: every install mints a
 //! **`installation_uuid`** that is persisted to the `SQLite`
 //! `plugin_installation` table (migration 11). This UUID feeds
-//! [`crate::state::stable_device_id`] so that uninstalling a plugin
+//! [`crate::state::devices::stable_device_id`] so that uninstalling a plugin
 //! and installing a fresh copy with the same `plugin_id` mints
 //! different device ids — the new install can't inherit the old
 //! install's audit / API surface.
@@ -81,7 +81,7 @@ pub struct InstalledPlugin {
     pub plugin_id: Arc<str>,
     /// C1b: host-minted per-install UUID (`inst-<32 hex>`).
     /// Persisted in the `plugin_installation` SQL table; feeds
-    /// [`crate::state::stable_device_id`] so that reinstalling the
+    /// [`crate::state::devices::stable_device_id`] so that reinstalling the
     /// same `plugin_id` produces different device ids. For
     /// in-memory registries (`Engine::new()` / dev loads without
     /// install) the fallback is the `plugin_id` itself — see
@@ -153,7 +153,7 @@ pub struct InstalledPlugin {
 /// Format: SHA-256 with a domain-separation tag + `u32`
 /// length-prefix framing over `(manifest_bytes, wasm_bytes,
 /// [(field_label, bytes), …])`. `ui_assets` MUST arrive in the
-/// canonical order [`validate_ui_package`] returns them; that
+/// canonical order `validate_ui_package` returns them; that
 /// ordering is what pins the digest across the install / scan
 /// pair. A plugin with no `[ui]` section passes an empty slice
 /// and the digest reduces to the pre-Phase-13 tag-bumped form.
@@ -217,7 +217,7 @@ pub fn content_digest(
 /// relative path (already validated to live under `plugin_dir`
 /// by `resolve_wasm_path` at load time; scan re-does the join).
 /// `ui` is the manifest's `[ui]` section (or `None` for plugins
-/// that don't ship UI); [`read_declared_ui_asset_bytes`] reads
+/// that don't ship UI); `read_declared_ui_asset_bytes` reads
 /// them via the same `read_no_follow_within` used for
 /// manifest / wasm so a mid-scan asset swap can't smuggle
 /// unhashed bytes past the digest.
@@ -226,7 +226,7 @@ pub fn content_digest(
 ///
 /// Any `std::io::Error` from the file reads, or an
 /// `InvalidInput` error carrying a UI-asset diagnostic when
-/// [`read_declared_ui_asset_bytes`] rejects a declared entry.
+/// `read_declared_ui_asset_bytes` rejects a declared entry.
 pub fn read_installed_bytes(
     plugin_dir: &Path,
     runtime_wasm_rel: &Path,
@@ -267,7 +267,7 @@ pub fn read_installed_bytes(
 /// # Errors
 ///
 /// Returns the same `String` diagnostics
-/// [`read_declared_ui_asset_bytes`] produces when a declared
+/// `read_declared_ui_asset_bytes` produces when a declared
 /// UI asset is missing / unreadable / not a regular file.
 /// Wrapped by the caller into the loader's `anyhow::Error`
 /// with the standard "content digest mismatch" refusal
@@ -779,7 +779,7 @@ impl InstalledPluginRegistry {
     /// support. No `installation_uuid` persistence — the fallback
     /// UUID at device-registration time is `manifest.plugin.id`
     /// itself (see the loader path in
-    /// [`crate::PluginInstance::instantiate`]).
+    /// `crate::PluginInstance::instantiate`).
     #[must_use]
     pub fn empty() -> Self {
         Self {

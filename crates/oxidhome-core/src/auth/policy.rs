@@ -3,7 +3,7 @@
 //! Phase 14.2a landed bearer + per-scope-string enforcement:
 //! the token record stored a JSON array of scope names
 //! (`["logs:read", "devices:command"]`), and each dispatch site
-//! called [`crate::api::scopes::require_scope`] against the
+//! called `crate::api::scopes::require_scope` against the
 //! bearer's scope list.
 //!
 //! Phase 14.4 extends that shape with **per-tool constraints**
@@ -53,8 +53,8 @@
 //! on that transport — the flat scope check would pass and
 //! no dispatch site would consult the constraint.
 //!
-//! The bearer middleware ([`crate::api::auth::require_token`],
-//! [`crate::api::connect_rpc`]) therefore carries a
+//! The bearer middleware (`crate::api::auth::require_token`,
+//! `crate::api::connect_rpc`) therefore carries a
 //! per-(key, field) allowlist (`AuthState::enforced_constraints`,
 //! a `&'static [EnforcedConstraint]`). A bearer whose policy
 //! names any constraint key outside the transport's set — or
@@ -121,7 +121,7 @@ use serde::{Deserialize, Serialize};
 /// see the module-level doc for the accepted JSON shapes.
 ///
 /// `scopes` mirrors the pre-14.4 flat scope list — the
-/// existing [`crate::api::scopes::require_scope`] path uses
+/// existing `crate::api::scopes::require_scope` path uses
 /// it verbatim.
 ///
 /// `constraints` maps a tool name to that tool's
@@ -358,7 +358,7 @@ impl EnforcedConstraint {
 /// Returns `None` when the blob is malformed. The
 /// bearer-auth middleware treats `None` as **deny-all** — a
 /// malformed policy is fail-closed. See
-/// [`crate::api::auth::require_token`] for that call site.
+/// `crate::api::auth::require_token` for that call site.
 #[must_use]
 pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
     let wire: PolicyWire = serde_json::from_slice(blob).ok()?;

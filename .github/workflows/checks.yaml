@@ -193,6 +193,21 @@ jobs:
       - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --all-features --all-targets --verbose -- --deny warnings
       - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --all-features --all-targets --quiet --message-format=json | cargo-action-fmt
         if: failure()
+  Docs:
+    name: Check rustdoc
+    runs-on: ubuntu-latest
+    env:
+      # Broken intra-doc links, bare URLs and malformed HTML in doc
+      # comments are warnings by default; docs.rs renders them wrong
+      # rather than failing, so make them fatal here instead.
+      RUSTDOCFLAGS: --deny warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+      - run: cargo doc --workspace --all-features --no-deps --verbose
+      # Same target-specific pass as `WasmClippy`: the SDK's docs are
+      # what plugin authors read, and they build for wasm32-wasip2.
+      - run: cargo doc --package oxidhome-sdk --target wasm32-wasip2 --all-features --no-deps --verbose
   TestsJob:
     name: Tests per crate
     needs: RustMeta
@@ -412,6 +427,7 @@ jobs:
       - Buf
       - Clippy
       - WasmClippy
+      - Docs
       - Tests
       - Deps
       - OsvScannerPR

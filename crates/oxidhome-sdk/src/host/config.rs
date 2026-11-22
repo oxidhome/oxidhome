@@ -19,6 +19,16 @@
 //! All three forward into the wit-bindgen-generated import; calling
 //! them from a native test binary fails to link — see the unit-test
 //! exemption note in [`super`].
+//!
+//! [`get`]: crate::host::config::get
+//! [`get_typed`]: crate::host::config::get_typed
+//! [`list`]: crate::host::config::list
+//! [`Value`]: crate::bindings::oxidhome::plugin::types::Value
+//! [`super`]: crate::host
+//
+// rustdoc merges these docs with the `config` item docs in `host.rs`
+// and resolves links from the `host` module, so the targets above
+// are crate-absolute paths.
 
 use std::collections::HashMap;
 

@@ -9,24 +9,22 @@
 //!
 //! # Layout
 //!
-//! - [`server`] — [`rmcp::transport::streamable_http_server::StreamableHttpService`]
+//! - `server` — [`rmcp::transport::streamable_http_server::StreamableHttpService`]
 //!   construction + axum mount.
-//! - [`handler`] — the [`rmcp::ServerHandler`] impl that
+//! - `handler` — the [`rmcp::ServerHandler`] impl that
 //!   answers `initialize` and (via the trait defaults) returns
 //!   empty tools / resources / prompts lists.
-//! - [`session_store`] — [`BoundedSessionManager`], a
+//! - `session_store` — `BoundedSessionManager`, a
 //!   `LocalSessionManager` wrapper with an admission cap that
 //!   closes the concurrent-init overshoot the reviewer flagged
 //!   in R3 F2 (against the previous SDK).
-//! - [`tools`] — 14.3 tools registry. Starts with
+//! - `tools` — 14.3 tools registry. Starts with
 //!   `device.send_command`; more tools land per the design
 //!   doc's ordering.
-//! - [`stdio`] — 14.5 subprocess transport (`oxidhome mcp-stdio`
+//! - `stdio` — 14.5 subprocess transport (`oxidhome mcp-stdio`
 //!   binary mode). Serves the same handler over
 //!   `(stdin, stdout)` via `rmcp::transport::stdio()` under
 //!   an ambient wildcard actor (parent-process trust model).
-//!
-//! [`BoundedSessionManager`]: session_store::BoundedSessionManager
 
 mod handler;
 mod prompts;

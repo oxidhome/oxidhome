@@ -1,9 +1,9 @@
 //! Phase 12 — external HTTP/WS API.
 //!
-//! [`serve`] builds an [`axum`] router on top of an [`Engine`] and
+//! [`serve`] builds an [`axum`] router on top of an [`Engine`](crate::Engine) and
 //! drives it forever. Auth is bearer-token via the SQLite-backed
 //! [`TokenStore`](crate::state::TokenStore); every authenticated
-//! request gets an [`Actor::api(token_id, scopes)`] stashed on the
+//! request gets an [`Actor::api(token_id, scopes)`](crate::Actor::api) stashed on the
 //! request extension, ready for the dispatch layer that consumes
 //! scopes (lands in a follow-up PR).
 //!
@@ -17,7 +17,7 @@
 //! The CLI (Phase 12 follow-up) is the only path that mints
 //! / rotates / revokes tokens; this module never issues them — it
 //! only verifies inbound `Authorization: Bearer …` headers against
-//! [`TokenStore::verify`].
+//! [`TokenStore::verify`](crate::state::TokenStore::verify).
 
 mod auth;
 mod bootstrap;

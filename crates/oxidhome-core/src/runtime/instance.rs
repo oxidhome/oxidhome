@@ -1229,7 +1229,7 @@ impl PluginInstance {
     /// argv loads mint a synthetic one at load time). Held on
     /// [`PluginState`] as an `Arc<str>` so cloning is cheap;
     /// the supervisor grabs a clone after each successful load
-    /// so [`InstanceHandle::installation_uuid`] can hand it
+    /// so [`InstanceHandle::installation_uuid`](crate::InstanceHandle::installation_uuid) can hand it
     /// back to callers (e.g. MCP `oxidhome://blobs/...` reads)
     /// without going through the installed-plugin registry
     /// (which doesn't have a row for dev / argv instances).

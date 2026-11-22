@@ -19,7 +19,7 @@
 //!
 //! Encoding: WIT `event-payload` variants are mirrored in a small
 //! tagged JSON enum so each row carries the variant tag plus its
-//! payload. Same pattern as [`super::kv::StoredValue`]. Postcard
+//! payload. Same pattern as `super::kv::StoredValue`. Postcard
 //! (smaller wire format) is an optimization for later; the store
 //! reads opaque BLOBs so a future migration can re-encode in place
 //! without touching this code.
@@ -431,7 +431,7 @@ impl EventLog {
     ///
     /// Forwards any SQL error.
     /// H5-adjacent: cheap accessor for the fully-serialized shape a
-    /// caller can hand to [`Self::record_prepared`]. Kept off
+    /// caller can hand to `Self::record_prepared`. Kept off
     /// [`EventPayload`]'s public surface so the storage-encoding
     /// choice (JSON today, `postcard` tomorrow) doesn't leak past
     /// the `state` module.
