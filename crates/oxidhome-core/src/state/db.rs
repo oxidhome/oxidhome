@@ -1529,6 +1529,30 @@ mod tests {
         );
     }
 
+    /// A wall-clock rollback makes the new snapshot sort oldest; it
+    /// must still survive pruning.
+    #[test]
+    fn pruning_never_drops_the_snapshot_just_written() {
+        let dir = tempdir_for_test();
+        seed_db_at(dir.path(), MIGRATIONS.len());
+        let snap_dir = dir.path().join(crate::backup::PRE_MIGRATION_DIR);
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        for i in 0..crate::backup::PRE_MIGRATION_KEEP {
+            std::fs::write(
+                snap_dir.join(format!("9999999999999-v{i}-to-v{}.db", i + 1)),
+                b"",
+            )
+            .unwrap();
+        }
+        let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+        let fresh = crate::backup::snapshot_before_migration(&conn, dir.path(), 1, 2).unwrap();
+        assert!(fresh.is_file());
+        assert_eq!(
+            pre_migration_snapshots(dir.path()).len(),
+            crate::backup::PRE_MIGRATION_KEEP
+        );
+    }
+
     /// Tiny tempdir helper — same shape as the one in the
     /// manifest-loader integration tests, kept local so this lib
     /// test doesn't pick up an external dep.

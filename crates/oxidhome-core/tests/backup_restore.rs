@@ -632,6 +632,8 @@ fn resume_records_a_missing_restore_audit_row() {
     )
     .unwrap();
     drop(Db::open_file(fx.state.path()).expect("audit-pending does not block startup"));
+    let err = backup::restore_offline(fx.state.path(), &archive).unwrap_err();
+    assert!(format!("{err:#}").contains("restore --resume"), "{err:#}");
 
     let resumed = backup::resume_restore_offline(fx.state.path()).unwrap();
     assert_eq!(resumed.unwrap().previous, restored.previous);

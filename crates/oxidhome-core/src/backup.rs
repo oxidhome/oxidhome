@@ -902,6 +902,10 @@ pub fn restore_offline(state_dir: &Path, archive: &Path) -> anyhow::Result<Resto
         .context("restore needs exclusive access — stop the daemon first")?;
     let _backup_lock = crate::exclusive_lock::acquire_backup_lock(state_dir, true)?;
     ensure_no_interrupted_restore(state_dir)?;
+    ensure!(
+        fs::symlink_metadata(state_dir.join(RESTORE_AUDIT_PENDING_FILE)).is_err(),
+        "the previous restore's audit row is still pending — run `oxidhome restore --resume` first",
+    );
     let verified =
         verify_backup(archive).with_context(|| format!("verifying {}", archive.display()))?;
 
@@ -1106,20 +1110,29 @@ fn record_restore(state_dir: &Path, archive_created_ms: u64) -> anyhow::Result<(
         actor_kind: crate::ActorKind::Cli.as_str().into(),
         method: AUDIT_METHOD_LOCAL.into(),
         path: AUDIT_PATH_RESTORE.into(),
-        status: 200,
-        decision: "allow".into(),
+        // Ignored by `record_intent_durable`.
+        status: 0,
+        decision: "pending".into(),
         required_scope: None,
-        execution_outcome: Some("success".into()),
+        execution_outcome: None,
         domain_error: None,
         credential_fp: None,
     };
-    let result = engine
-        .audit_log()
-        .record_completed(&entry)
-        .map(|_| ())
+    // Durable (`synchronous = FULL`): the audit-pending marker is
+    // removed right after, so the row must survive a power loss. The
+    // finalize is best-effort; a lost one leaves a pending row, which
+    // still records the restore.
+    let audit = engine.audit_log();
+    let result = audit
+        .record_intent_durable(&entry)
         .context("recording the restore audit row");
+    if let Ok(id) = &result
+        && let Err(err) = audit.finalize(*id, 200, "allow", None, Some("success"), None)
+    {
+        tracing::warn!(audit_id = id, error = %err, "failed to finalize the restore audit row");
+    }
     let _ = engine.log_store().flush(Duration::from_secs(5));
-    result
+    result.map(|_| ())
 }
 
 /// Move `from` to `to` if `from` exists. Refuses to overwrite.
@@ -1205,13 +1218,16 @@ pub fn snapshot_before_migration(
             dir.display()
         )));
     }
-    prune_pre_migration(&dir);
+    prune_pre_migration(&dir, &name);
     Ok(target)
 }
 
-/// Keep the newest [`PRE_MIGRATION_KEEP`] snapshots (names sort
-/// chronologically) and drop stray `.partial` files. Best-effort.
-fn prune_pre_migration(dir: &Path) {
+/// Keep `just_written` plus the newest [`PRE_MIGRATION_KEEP`] - 1
+/// other snapshots (names sort chronologically) and drop stray
+/// `.partial` files. `just_written` is exempt so a wall-clock
+/// rollback can't prune the snapshot that protects the migration
+/// about to run. Best-effort.
+fn prune_pre_migration(dir: &Path, just_written: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -1222,15 +1238,16 @@ fn prune_pre_migration(dir: &Path) {
         };
         if name.ends_with(".partial") {
             let _ = fs::remove_file(entry.path());
-        } else if Path::new(&name)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+        } else if name != just_written
+            && Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
         {
             snapshots.push(name);
         }
     }
     snapshots.sort();
-    let excess = snapshots.len().saturating_sub(PRE_MIGRATION_KEEP);
+    let excess = snapshots.len().saturating_sub(PRE_MIGRATION_KEEP - 1);
     for name in &snapshots[..excess] {
         if let Err(e) = fs::remove_file(dir.join(name)) {
             tracing::warn!(snapshot = %name, error = %e, "failed to prune pre-migration snapshot");
