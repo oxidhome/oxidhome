@@ -321,7 +321,7 @@ impl TokenStore {
         scope_json: &[u8],
     ) -> Result<bool, TokenError> {
         let row = PendingRow::new(issued, label, scope_json)?;
-        self.db.write(move |conn| -> Result<bool, TokenError> {
+        self.durable_write(move |conn| -> Result<bool, TokenError> {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let existing: i64 =
                 tx.query_row("SELECT COUNT(*) FROM auth_token", [], |r| r.get(0))?;
@@ -393,7 +393,7 @@ impl TokenStore {
     /// [`TokenError::Sqlite`] on DB failure.
     pub(crate) fn delete_undelivered(&self, token_id: &str) -> Result<bool, TokenError> {
         let id_owned = token_id.to_string();
-        self.db.write(move |conn| -> Result<bool, TokenError> {
+        self.durable_write(move |conn| -> Result<bool, TokenError> {
             let n = conn.execute(
                 "DELETE FROM auth_token \
                  WHERE id = ?1 AND last_used_ms IS NULL AND revoked_ms IS NULL",
@@ -402,6 +402,37 @@ impl TokenStore {
             Ok(n > 0)
         })
     }
+}
+
+impl TokenStore {
+    /// Run `f` with `PRAGMA synchronous = FULL` so its commit is
+    /// fsynced before returning. The shared connection runs WAL +
+    /// `synchronous = NORMAL`, under which a committed transaction
+    /// can be lost on power failure. The bootstrap / recovery paths
+    /// order file operations (promote or unlink a secret) after a
+    /// token commit, so that commit must be durable first (M4).
+    /// The pragma is restored to `NORMAL` afterwards.
+    fn durable_write<R: Send>(
+        &self,
+        f: impl FnOnce(&mut rusqlite::Connection) -> Result<R, TokenError>,
+    ) -> Result<R, TokenError> {
+        self.db.write(move |conn| -> Result<R, TokenError> {
+            conn.pragma_update(None, "synchronous", "FULL")?;
+            let result = f(conn);
+            let restore = conn.pragma_update(None, "synchronous", "NORMAL");
+            let out = result?;
+            restore?;
+            Ok(out)
+        })
+    }
+}
+
+/// Id of the token `plaintext` encodes, without a DB lookup.
+/// `None` if it isn't a well-formed token. Lets the bootstrap
+/// audit a stale secret file against the token it named even
+/// when that token is revoked or unknown.
+pub(crate) fn token_id_of(plaintext: &str) -> Option<String> {
+    parse_token(plaintext).map(|s| derive_id(&sha256(&s)))
 }
 
 /// Row values for an INSERT of a [`TokenStore::generate`]d token.
@@ -769,6 +800,46 @@ mod tests {
         ));
         assert!(store.verify(&new.plaintext).is_ok());
         assert!(store.verify(&other.plaintext).is_ok());
+    }
+
+    /// `durable_write` must hand the shared connection back at
+    /// `synchronous = NORMAL` (1) so other stores keep their
+    /// throughput profile, on both the success and the error path.
+    #[test]
+    fn durable_write_restores_synchronous_normal() {
+        let db = fresh();
+        let store = TokenStore::new(Arc::clone(&db));
+        let sync = || -> i64 {
+            db.read(|c| c.pragma_query_value(None, "synchronous", |r| r.get(0)))
+                .unwrap()
+        };
+        assert!(
+            store
+                .insert_if_empty(&TokenStore::generate(), "admin", b"[]")
+                .unwrap()
+        );
+        assert_eq!(sync(), 1);
+        let mut forged = TokenStore::generate();
+        forged.id = "bad".into();
+        assert!(
+            store
+                .insert_and_revoke(&forged, "admin", b"[]", &[])
+                .is_err()
+        );
+        assert_eq!(sync(), 1);
+        db.write(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON auth_token \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+        })
+        .unwrap();
+        assert!(
+            store
+                .insert_and_revoke(&TokenStore::generate(), "admin", b"[]", &[])
+                .is_err()
+        );
+        assert_eq!(sync(), 1);
     }
 
     #[test]

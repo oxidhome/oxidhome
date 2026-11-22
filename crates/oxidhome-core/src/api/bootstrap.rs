@@ -54,7 +54,7 @@
 //!
 //! ## Audit
 //!
-//! Every mint, revoke, promotion and post-enrollment file removal
+//! Every mint, revoke, promotion and secret-file removal
 //! lands in the `audit_event` ledger with the same two-phase
 //! intent/finalize contract the API middleware uses. Rows use
 //! `method = "LOCAL"`, `path = host.auth.*` (daemon) or
@@ -105,7 +105,11 @@ pub const AUDIT_PATH_BOOTSTRAP: &str = "host.auth.bootstrap";
 /// Audit path: an interrupted bootstrap / recovery's pending secret
 /// file was promoted to `admin-token` at startup.
 pub const AUDIT_PATH_PENDING_PROMOTED: &str = "host.auth.pending_promoted";
-/// Audit path: `admin-token` removed after the token was enrolled.
+/// Audit path: a pending secret file whose token never committed
+/// (or was revoked) was discarded at startup.
+pub const AUDIT_PATH_PENDING_DISCARDED: &str = "host.auth.pending_discarded";
+/// Audit path: `admin-token` removed after the token was enrolled,
+/// or because its token is no longer live.
 pub const AUDIT_PATH_FILE_REMOVED: &str = "host.auth.admin_file_removed";
 /// Audit path: offline recovery minted a replacement admin token.
 pub const AUDIT_PATH_RECOVER: &str = "cli.auth.recover";
@@ -227,8 +231,18 @@ pub fn reconcile_admin_token_files(
                 return Err(anyhow::Error::new(e).context("verifying pending admin token"));
             }
             Some(Err(_)) => {
-                tracing::info!(path = %pending.display(), "removing stale pending admin-token file");
-                remove_file_if_exists(&pending)?;
+                // Never committed (crash before the insert) or since
+                // revoked. Audited like every other secret-file
+                // removal (fail-closed on the intent).
+                let secret = read_token_file(&pending)?.unwrap_or_default();
+                audited(
+                    audit,
+                    AUDIT_ACTOR_HOST,
+                    &stale_subject(&secret),
+                    AUDIT_PATH_PENDING_DISCARDED,
+                    || remove_file_if_exists(&pending),
+                )?;
+                tracing::info!(path = %pending.display(), "removed stale pending admin-token file");
             }
         }
     }
@@ -273,14 +287,27 @@ pub fn reconcile_admin_token_files(
             return Err(anyhow::Error::new(e).context("verifying admin token file"));
         }
         Err(_) => {
+            audited(
+                audit,
+                AUDIT_ACTOR_HOST,
+                &stale_subject(&secret),
+                AUDIT_PATH_FILE_REMOVED,
+                || remove_file_if_exists(&final_path),
+            )?;
             tracing::info!(
                 path = %final_path.display(),
-                "admin-token file no longer matches a live token; removing it",
+                "admin-token file no longer matched a live token; removed it",
             );
-            remove_file_if_exists(&final_path)?;
         }
     }
     Ok(())
+}
+
+/// Audit subject for a secret file whose token isn't live: the id
+/// the secret encodes (revoked / never-committed token), or a
+/// sentinel for content that isn't a token at all.
+fn stale_subject(secret: &str) -> String {
+    crate::state::auth_token::token_id_of(secret).unwrap_or_else(|| "malformed".to_string())
 }
 
 /// Which existing tokens [`recover_admin_token`] revokes.
@@ -880,6 +907,27 @@ mod tests {
         fx.tokens.revoke(&issued.id).unwrap();
         fx.reconcile().unwrap();
         assert!(!fx.admin_file().exists());
+        let rows = fx.audit_rows(AUDIT_PATH_FILE_REMOVED);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].token_id, issued.id);
+    }
+
+    /// Fail-closed: a secret file is never removed without its
+    /// audit intent landing first.
+    #[test]
+    fn reconcile_keeps_files_when_audit_is_down() {
+        let fx = fixture();
+        let issued = fx.bootstrap().unwrap().unwrap();
+        fx.tokens.revoke(&issued.id).unwrap();
+        let dead = TokenStore::generate();
+        write_new_secret(&pending_path(fx.dir.path(), &dead.id), &dead.plaintext).unwrap();
+        fx.sql(
+            "CREATE TRIGGER no_audit BEFORE INSERT ON audit_event \
+             BEGIN SELECT RAISE(ABORT, 'audit down'); END;",
+        );
+        assert!(fx.reconcile().is_err());
+        assert_eq!(fx.pending_files().len(), 1);
+        assert!(fx.admin_file().exists());
     }
 
     /// A host already in the M4 lockout state (row, no secret)
