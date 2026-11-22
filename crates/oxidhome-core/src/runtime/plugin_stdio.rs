@@ -109,6 +109,10 @@ impl LineState {
     fn finish_line(&mut self) {
         let raw = std::mem::take(&mut self.buf);
         let dropped = std::mem::take(&mut self.dropped);
+        // A blank line carries nothing; don't spend a row or a token.
+        if dropped == 0 && matches!(raw.as_slice(), [] | [b'\r']) {
+            return;
+        }
         let admitted = self
             .rate
             .lock()
@@ -121,11 +125,19 @@ impl LineState {
         if let [rest @ .., b'\r'] = raw {
             raw = rest;
         }
-        let text = String::from_utf8_lossy(raw);
+        // Cut the *raw* line at the cap first, so the kept span is
+        // anchored to the input rather than to the (possibly shorter)
+        // redacted text. A declared secret straddling the cap extends
+        // the cut to its end: it is then scrubbed whole, never emitted
+        // as a fragment.
+        let cut = safe_cut(raw, MAX_LOG_MESSAGE_BYTES, &self.secrets);
+        let mut dropped = dropped + (raw.len() - cut);
+        let text = String::from_utf8_lossy(&raw[..cut]);
         let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
         let text = crate::redact::scrub_secret_values(&text, &secrets);
         let mut line = crate::redact::redact_text(&text).into_owned();
-        let mut dropped = dropped;
+        // Generic-rule markers can grow the text slightly; re-cap it.
+        // Every declared secret in it is already replaced.
         if line.len() > MAX_LOG_MESSAGE_BYTES {
             let mut cut = MAX_LOG_MESSAGE_BYTES;
             while !line.is_char_boundary(cut) {
@@ -139,6 +151,62 @@ impl LineState {
         }
         (self.sink)(self.stream, &self.instance_id, &self.plugin_id, &line);
     }
+}
+
+/// Where to cut a raw line: at `cap`, or past it to the end of any
+/// declared secret occurrence that straddles `cap`. Only occurrences
+/// within one secret's length of `cap` can straddle it, so each search
+/// runs over a window of at most twice the secret's length.
+fn safe_cut(raw: &[u8], cap: usize, secrets: &[String]) -> usize {
+    if raw.len() <= cap {
+        return raw.len();
+    }
+    let mut cut = cap;
+    for secret in secrets {
+        let len = secret.len();
+        if len < 2 {
+            continue;
+        }
+        let lo = cap.saturating_sub(len - 1);
+        let hi = (cap + len - 1).min(raw.len());
+        let Ok(matcher) = aho_corasick::AhoCorasick::builder()
+            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+            .build([secret])
+        else {
+            continue;
+        };
+        if let Some(end) = matcher
+            .find_overlapping_iter(&raw[lo..hi])
+            .map(|m| lo + m.end())
+            .max()
+        {
+            cut = cut.max(end);
+        }
+    }
+    cut
+}
+
+/// The values to scrub from output lines. A secret containing line
+/// breaks (a PEM key, say) never appears whole in one line, so each of
+/// its lines is matched on its own; segments shorter than
+/// [`crate::redact::MIN_SCRUB_SECRET_LEN`] are skipped like short
+/// secrets are.
+fn line_secrets(secrets: &[&str]) -> Arc<[String]> {
+    let mut out = Vec::new();
+    for secret in secrets {
+        if secret.contains('\n') {
+            out.extend(
+                secret
+                    .split('\n')
+                    .map(|seg| seg.strip_suffix('\r').unwrap_or(seg))
+                    .filter(|seg| seg.len() >= crate::redact::MIN_SCRUB_SECRET_LEN)
+                    .map(str::to_owned),
+            );
+        } else {
+            out.push((*secret).to_owned());
+        }
+    }
+    out.into()
 }
 
 impl Drop for LineState {
@@ -183,7 +251,7 @@ impl PluginOutput {
     ) -> (Self, Self) {
         let instance_id: Arc<str> = instance_id.into();
         let plugin_id: Arc<str> = plugin_id.into();
-        let secrets: Arc<[String]> = secrets.iter().map(|s| (*s).to_owned()).collect();
+        let secrets = line_secrets(secrets);
         let longest = secrets.iter().map(String::len).max().unwrap_or(0);
         let make = |stream| Self {
             state: Arc::new(Mutex::new(LineState {
@@ -269,7 +337,7 @@ mod tests {
     #[test]
     fn secret_printed_to_stdout_is_redacted_and_attributed() {
         let (out, err, lines) = capture(&["hunter2-secret"]);
-        out.write(b"connecting with hunter2-secret now\n");
+        out.write(b"\n\r\nconnecting with hunter2-secret now\n");
         err.write(b"retry: password=other\r\n");
         let got = lines.lock().unwrap().clone();
         assert_eq!(
@@ -326,6 +394,38 @@ mod tests {
             &got[0][got[0].len() - 40..]
         );
         assert!(got[0].len() < MAX_LOG_MESSAGE_BYTES + 40);
+    }
+
+    #[test]
+    fn cut_is_anchored_to_the_raw_line() {
+        // Earlier replacements shrink the text; the final occurrence
+        // straddling the raw cap must still be scrubbed whole.
+        let secret = "S".repeat(32);
+        let (out, _err, lines) = capture(&[&secret]);
+        let mut line = format!("{secret}|{secret}|");
+        line.push_str(&"x".repeat(MAX_LOG_MESSAGE_BYTES - line.len() - 1));
+        line.push_str(&secret);
+        line.push('\n');
+        out.write(line.as_bytes());
+        let got = texts(&lines);
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].contains("SS"), "secret fragment leaked");
+        assert!(got[0].ends_with("x***"), "{}", &got[0][got[0].len() - 20..]);
+    }
+
+    #[test]
+    fn multiline_secret_lines_are_scrubbed() {
+        let (out, _err, lines) = capture(&["alpha-secret\r\nbeta-secret\nab"]);
+        out.write(b"key:\nalpha-secret\nbeta-secret\nab\n");
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "key:".to_owned(),
+                "***".to_owned(),
+                "***".to_owned(),
+                "ab".to_owned()
+            ]
+        );
     }
 
     #[test]
