@@ -22,7 +22,7 @@
 //!   ([`GAP_MARKER_TOPIC`], origin [`GAP_MARKER_ORIGIN`], payload
 //!   [`GapMarker`]) in the same transaction as the probing event, so
 //!   the marker's row id sits between the last pre-outage row and the
-//!   first post-recovery row. [`Mirrored::gap_marker`] hands it back
+//!   first post-recovery row. [`Mirrored::gap_markers`] hands it back
 //!   so the caller fans it out live just before the probing event.
 //!   Markers bypass subscription and history selector filters.
 //!
@@ -145,8 +145,9 @@ struct Outage {
     /// write runs (possible after a cancelled publish released the
     /// gate) are counted past it and survive the recovery.
     probe_covers: Option<u64>,
-    /// Receive time of the first event skipped past `probe_covers`.
-    first_after_probe_ms: i64,
+    /// Receive-time bounds of the events counted past
+    /// `probe_covers`.
+    after_probe_ms: Option<(i64, i64)>,
 }
 
 impl Outage {
@@ -159,16 +160,24 @@ impl Outage {
             last_error: reason,
             next_probe,
             probe_covers: None,
-            first_after_probe_ms: 0,
+            after_probe_ms: None,
         }
     }
 
+    /// Count one more unrecorded event. Bounds are min / max, not
+    /// first / last seen: an orphaned write can settle after events
+    /// received later.
     fn count(&mut self, received_ms: i64) {
-        if self.probe_covers == Some(self.unrecorded) {
-            self.first_after_probe_ms = received_ms;
+        if self.probe_covers.is_some() {
+            self.after_probe_ms = Some(widen(self.after_probe_ms, received_ms));
         }
         self.unrecorded += 1;
-        self.last_received_ms = received_ms;
+        let (first, last) = widen(
+            Some((self.first_received_ms, self.last_received_ms)),
+            received_ms,
+        );
+        self.first_received_ms = first;
+        self.last_received_ms = last;
     }
 }
 
@@ -183,9 +192,18 @@ impl Outage {
     }
 }
 
+fn widen(bounds: Option<(i64, i64)>, t: i64) -> (i64, i64) {
+    bounds.map_or((t, t), |(lo, hi)| (lo.min(t), hi.max(t)))
+}
+
 #[derive(Debug, Default)]
 struct MirrorState {
     outage: Option<Outage>,
+    /// Gap markers recovery writes committed that no publish has
+    /// fanned out yet — normally just the current one, but a cancelled
+    /// publish leaves its marker here for the next mirror call, so
+    /// live consumers still see it before any later row id.
+    undelivered_markers: Vec<Event>,
     unrecorded_total: u64,
     gap_markers_total: u64,
     last_recovered_ms: Option<i64>,
@@ -232,10 +250,11 @@ impl Drop for InFlight {
 pub(crate) struct Mirrored {
     /// Row id of the published event; `None` = delivered unrecorded.
     pub(crate) row_id: Option<u64>,
-    /// The gap marker committed ahead of the event when this publish
-    /// ended an outage, with its `row_id` set. The caller fans it out
-    /// before the event so a live cursor can't step over it.
-    pub(crate) gap_marker: Option<Event>,
+    /// Gap markers committed by this publish's recovery write — or
+    /// by an earlier one whose publish was cancelled — in row-id
+    /// order, each with its `row_id` set. The caller fans them out
+    /// before the event so a live cursor can't step over them.
+    pub(crate) gap_markers: Vec<Event>,
 }
 
 enum Plan {
@@ -260,7 +279,7 @@ impl EventLog {
         payload_blob: Vec<u8>,
     ) -> Mirrored {
         let gap = match self.plan(received_ms) {
-            Plan::Skip => return Mirrored::default(),
+            Plan::Skip => return self.unrecorded_outcome(),
             Plan::Write(gap) => gap,
         };
         let probing = gap.is_some();
@@ -296,7 +315,7 @@ impl EventLog {
                     probing,
                     result
                         .as_ref()
-                        .map(|w| w.row_id.unwrap_or_default())
+                        .map(|(id, marker)| (*id, marker.clone()))
                         .map_err(Clone::clone),
                 );
             }
@@ -315,15 +334,18 @@ impl EventLog {
                         deadline.as_millis(),
                     )),
                 );
-                return Mirrored::default();
+                return self.unrecorded_outcome();
             }
             // The writer settled between the deadline firing and the
             // swap; its result is ready.
             write.await
         };
         match joined {
-            Ok(Ok(written)) => written,
-            Ok(Err(_)) => Mirrored::default(),
+            Ok(Ok((id, _))) => Mirrored {
+                row_id: Some(id),
+                gap_markers: self.take_undelivered_markers(),
+            },
+            Ok(Err(_)) => self.unrecorded_outcome(),
             Err(join) => {
                 // Only reachable if the runtime cancelled the task
                 // before it ran (shutdown).
@@ -334,14 +356,32 @@ impl EventLog {
                         Err(format!("blocking write task failed: {join}")),
                     );
                 }
-                Mirrored::default()
+                self.unrecorded_outcome()
             }
         }
     }
 
-    fn settle(&self, received_ms: i64, probing: bool, result: Result<u64, String>) {
+    /// The event goes out without a row id, preceded by any marker a
+    /// cancelled publish left undelivered.
+    fn unrecorded_outcome(&self) -> Mirrored {
+        Mirrored {
+            row_id: None,
+            gap_markers: self.take_undelivered_markers(),
+        }
+    }
+
+    fn take_undelivered_markers(&self) -> Vec<Event> {
+        std::mem::take(&mut self.mirror.lock().undelivered_markers)
+    }
+
+    fn settle(
+        &self,
+        received_ms: i64,
+        probing: bool,
+        result: Result<(u64, Option<Event>), String>,
+    ) {
         match result {
-            Ok(id) if probing => self.note_recovered(id),
+            Ok((id, marker)) if probing => self.note_recovered(id, marker),
             Ok(_) => {}
             Err(reason) => self.note_unrecorded(received_ms, reason, probing),
         }
@@ -422,8 +462,11 @@ impl EventLog {
         }
     }
 
-    fn note_recovered(&self, first_row_id: u64) {
+    fn note_recovered(&self, first_row_id: u64, marker: Option<Event>) {
         let mut st = self.mirror.lock();
+        // Parked until a publish fans it out (normally the one whose
+        // write just committed it, right after this returns).
+        st.undelivered_markers.extend(marker);
         let Some(outage) = st.outage.take() else {
             return;
         };
@@ -443,18 +486,19 @@ impl EventLog {
             // marker, so keep them for the next one (due right away).
             st.outage = Some(Outage {
                 since_ms: now_unix_ms(),
-                first_received_ms: outage.first_after_probe_ms,
-                last_received_ms: outage.last_received_ms,
+                first_received_ms: outage.after_probe_ms.map_or(0, |b| b.0),
+                last_received_ms: outage.after_probe_ms.map_or(0, |b| b.1),
                 unrecorded: remainder,
                 last_error: "events skipped while the recovery write was running".to_owned(),
                 next_probe: Instant::now(),
                 probe_covers: None,
-                first_after_probe_ms: 0,
+                after_probe_ms: None,
             });
         }
     }
 
-    /// One transaction: optional gap marker, then the event.
+    /// One transaction: optional gap marker, then the event. Returns
+    /// the event's row id and the marker with its row id stamped.
     fn write_with_gap(
         &self,
         received_ms: i64,
@@ -463,39 +507,37 @@ impl EventLog {
         plugin_id: &str,
         payload_blob: &[u8],
         gap: Option<&GapMarker>,
-    ) -> Result<Mirrored, EventLogError> {
+    ) -> Result<(u64, Option<Event>), EventLogError> {
         let marker = gap.map(|g| gap_marker_event(g, received_ms)).transpose()?;
-        self.db.write(|conn| -> Result<Mirrored, EventLogError> {
-            let tx = conn.transaction()?;
-            let gap_marker = match marker {
-                Some((mut marker, blob)) => {
-                    let id = insert_row(
-                        &tx,
-                        received_ms,
-                        &marker,
-                        GAP_MARKER_ORIGIN,
-                        GAP_MARKER_ORIGIN,
-                        &blob,
-                    )?;
-                    marker.row_id = Some(id);
-                    Some(marker)
-                }
-                None => None,
-            };
-            let id = insert_row(
-                &tx,
-                received_ms,
-                event,
-                instance_id,
-                plugin_id,
-                payload_blob,
-            )?;
-            tx.commit()?;
-            Ok(Mirrored {
-                row_id: Some(id),
-                gap_marker,
+        self.db
+            .write(|conn| -> Result<(u64, Option<Event>), EventLogError> {
+                let tx = conn.transaction()?;
+                let gap_marker = match marker {
+                    Some((mut marker, blob)) => {
+                        let id = insert_row(
+                            &tx,
+                            received_ms,
+                            &marker,
+                            GAP_MARKER_ORIGIN,
+                            GAP_MARKER_ORIGIN,
+                            &blob,
+                        )?;
+                        marker.row_id = Some(id);
+                        Some(marker)
+                    }
+                    None => None,
+                };
+                let id = insert_row(
+                    &tx,
+                    received_ms,
+                    event,
+                    instance_id,
+                    plugin_id,
+                    payload_blob,
+                )?;
+                tx.commit()?;
+                Ok((id, gap_marker))
             })
-        })
     }
 }
 
@@ -568,7 +610,7 @@ mod tests {
 
     async fn publish(log: &EventLog, received_ms: i64) -> Option<u64> {
         let out = publish_full(log, received_ms).await;
-        assert!(out.gap_marker.is_none(), "unexpected gap marker");
+        assert_eq!(out.gap_markers.len(), 0, "unexpected gap marker");
         out.row_id
     }
 
@@ -638,10 +680,11 @@ mod tests {
 
         fix_writes(&log);
         tokio::time::sleep(FAST.probe_interval * 2).await;
-        let recovered = publish_full(&log, 50).await;
+        let mut recovered = publish_full(&log, 50).await;
         let after = recovered.row_id.expect("recovered write");
         let live_marker = recovered
-            .gap_marker
+            .gap_markers
+            .pop()
             .expect("marker handed back for fan-out");
         assert_eq!(topic_of(&live_marker), GAP_MARKER_TOPIC);
         assert_eq!(live_marker.origin_plugin_id, GAP_MARKER_ORIGIN);
@@ -924,7 +967,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         let recovered = publish_full(&log, 3).await;
         assert!(recovered.row_id.is_some());
-        assert!(recovered.gap_marker.is_some());
+        assert_eq!(recovered.gap_markers.len(), 1);
         let topics: Vec<String> = all_rows(&log).into_iter().map(|r| r.topic).collect();
         // The orphaned event committed late, below the marker.
         assert_eq!(topics, ["switch", GAP_MARKER_TOPIC, "switch"]);
@@ -961,13 +1004,51 @@ mod tests {
         );
         assert_eq!(h.unrecorded_pending, 1);
 
-        let recovered = publish_full(&log, 4).await;
-        let EventPayload::Custom(c) = recovered.gap_marker.expect("second marker").payload else {
+        let mut recovered = publish_full(&log, 4).await;
+        // The cancelled probe's marker was never fanned out; it rides
+        // ahead of the new one, in row-id order.
+        assert_eq!(recovered.gap_markers.len(), 2);
+        assert!(recovered.gap_markers[0].row_id < recovered.gap_markers[1].row_id);
+        assert!(recovered.gap_markers[1].row_id < recovered.row_id);
+        let EventPayload::Custom(c) = recovered.gap_markers.pop().expect("second marker").payload
+        else {
             panic!("marker payload must be custom");
         };
         let gap: GapMarker = serde_json::from_str(&c.payload).expect("gap json");
         assert_eq!(gap.unrecorded, 1);
         assert_eq!(gap.first_received_ms, 3);
         assert!(!log.health().degraded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_bounds_hold_when_an_orphaned_write_fails_late() {
+        // A (received 100) is cancelled while its write is parked; B
+        // (received 200) is skipped; then A's write fails. The marker
+        // must still span 100..=200.
+        let log = log_with(MirrorPolicy {
+            write_deadline: Duration::from_secs(30),
+            probe_interval: Duration::from_millis(10),
+        });
+        break_writes(&log);
+        let (release, holder) = hold_connection(&log);
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), publish(&log, 100)).await;
+        assert!(cancelled.is_err());
+        assert_eq!(publish(&log, 200).await, None);
+        release.send(()).expect("release");
+        holder.join().expect("holder");
+        drain(&log).await;
+        assert_eq!(log.health().unrecorded_pending, 2);
+
+        fix_writes(&log);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut recovered = publish_full(&log, 300).await;
+        let EventPayload::Custom(c) = recovered.gap_markers.pop().expect("marker").payload else {
+            panic!("marker payload must be custom");
+        };
+        let gap: GapMarker = serde_json::from_str(&c.payload).expect("gap json");
+        assert_eq!(
+            (gap.unrecorded, gap.first_received_ms, gap.last_received_ms),
+            (2, 100, 200),
+        );
     }
 }

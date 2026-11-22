@@ -1455,11 +1455,12 @@ impl host_events::Host for PluginState {
             )
             .await;
 
-        // H3: a recovery probe committed a gap marker just below
-        // this event's row id. Fan it out first so a live consumer
-        // that saves this event's id as its cursor has already seen
-        // the marker it would otherwise step over.
-        if let Some(marker) = mirrored.gap_marker {
+        // H3: a recovery write committed a gap marker below this
+        // event's row id (this publish's probe, or one whose publish
+        // was cancelled). Fan it out first so a live consumer that
+        // saves this event's id as its cursor has already seen the
+        // marker it would otherwise step over.
+        for marker in mirrored.gap_markers {
             let row_id = marker.row_id;
             let _delivered = self.events.publish_with_id(marker, row_id);
         }
