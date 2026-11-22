@@ -14,9 +14,11 @@
 //! ([`oxidhome_core::PluginInstance`]): the same manifest validation,
 //! SDK compatibility check, config merge, capability gates, quotas,
 //! and host-import implementations the daemon uses. What the harness
-//! leaves out is the daemon *around* the runtime — the supervisor
-//! task, the HTTP/Connect/MCP surfaces, and plugin installation — so
-//! a test calls the plugin's exports directly and deterministically.
+//! leaves out is the daemon *around* the runtime — the
+//! HTTP/Connect/MCP surfaces and plugin installation. The supervisor
+//! task is opt-in: a directly loaded plugin has none, so a test calls
+//! its exports itself, deterministically; a started one runs under the
+//! production supervisor (see "Driven or supervised" below).
 //!
 //! Capability injection goes through the production grant boundary
 //! too: an injected grant is validated and intersected with the
