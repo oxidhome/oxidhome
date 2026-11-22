@@ -1640,6 +1640,30 @@ async fn install_returns_404_when_source_dir_missing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn install_returns_422_when_source_dir_relative() {
+    let state_dir = support::tempdir("install-relative");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let router = build_router(engine);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"source_dir":"staged/plugin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_to_json(response.into_body()).await;
+    assert_eq!(body["error"], "bad_install");
+    assert_eq!(body["reason"], "source_dir must be an absolute path");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn install_returns_422_when_manifest_malformed() {
     let state_dir = support::tempdir("install-bad");
     let bad_source = support::tempdir("bad-source");

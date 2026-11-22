@@ -54,7 +54,7 @@ share one axum listener, so a household hub only exposes one endpoint.
 | Tool | `events.history` | `events:read` | Tool-shape of `oxidhome://events`. |
 | Tool | `events.subscribe` | `events:read` | Long-poll for events past an `after_id` cursor (`timeout_ms` default 5 s, cap 30 s). |
 | Tool | `plugins.list` / `plugins.show` | `plugins:list` | Read-only. |
-| Tool | `plugins.install` | `plugins:install` | Takes a `source_dir` that must exist on the daemon-local filesystem — the tool copies from there into `<state_dir>/plugins/`. |
+| Tool | `plugins.install` | `plugins:install` | Takes an absolute `source_dir` (no `..` components) that must exist on the daemon-local filesystem — the tool copies from there into `<state_dir>/plugins/`. |
 | Tool | `plugins.start` / `plugins.stop` | `plugins:start` / `plugins:stop` | Runtime lifecycle. |
 | Tool | `plugins.uninstall` | `plugins:uninstall` | Refuses if instances still running. |
 | Prompt | `summarize_today` | `events:read` + `logs:read` | 24 h household summary. |

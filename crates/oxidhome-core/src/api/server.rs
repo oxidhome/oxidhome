@@ -1446,10 +1446,11 @@ impl IntoResponse for PluginSchemaError {
 
 // ── Plugin lifecycle (install / start / stop / uninstall) ────────
 
-/// `POST /api/v1/plugins` body. `source_dir` is a path on the
-/// daemon-local filesystem the operator already staged; the daemon
-/// copies it into `<state_dir>/plugins/<plugin_id>/`. A remote-fetch
-/// / multipart-upload variant is a follow-up that layers on top.
+/// `POST /api/v1/plugins` body. `source_dir` is an absolute path
+/// (no `..` components) on the daemon-local filesystem the operator
+/// already staged; the daemon copies it into
+/// `<state_dir>/plugins/<plugin_id>/`. A remote-fetch /
+/// multipart-upload variant is a follow-up that layers on top.
 #[derive(Deserialize)]
 struct InstallBody {
     source_dir: std::path::PathBuf,
@@ -1769,6 +1770,9 @@ impl From<InstallError> for PluginLifecycleError {
             InstallError::NoPluginsRoot => Self::NoPluginsRoot,
             InstallError::SourceMissing(_) => Self::NotFound,
             InstallError::AlreadyInstalled { plugin_id } => Self::AlreadyInstalled(plugin_id),
+            InstallError::InvalidSource { reason, .. } => {
+                Self::BadInstall(format!("source_dir {reason}"))
+            }
             InstallError::BadManifest { reason, .. } => Self::BadInstall(reason),
             InstallError::Io(err) => Self::Internal(err.into()),
             // C1b: the `plugin_installation` INSERT failed. Surface

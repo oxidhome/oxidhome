@@ -2909,7 +2909,7 @@ fn plugins_install_schema() -> serde_json::Map<String, JsonValue> {
             "source_dir": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Absolute path (daemon-local) to the staged plugin directory. Must contain a `manifest.toml` naming the canonical `plugin_id`; the tool recursively copies the whole directory into `<state_dir>/plugins/<plugin_id>/`.",
+                "description": "Absolute path (daemon-local, no `..` components) to the staged plugin directory. Must contain a `manifest.toml` naming the canonical `plugin_id`; the tool recursively copies the whole directory into `<state_dir>/plugins/<plugin_id>/`.",
             }
         }
     });
@@ -3042,6 +3042,11 @@ async fn plugins_install_call(
                 // the audit slot NULL.
                 domain_kind: None,
             };
+        }
+        Err(crate::state::InstallError::InvalidSource { reason, .. }) => {
+            // Relative paths are already refused above; this
+            // catches the `..`-component case the registry owns.
+            return ToolOutcome::InvalidParams(format!("`source_dir` {reason}"));
         }
         Err(crate::state::InstallError::AlreadyInstalled { plugin_id }) => {
             return ToolOutcome::ExecErr {
