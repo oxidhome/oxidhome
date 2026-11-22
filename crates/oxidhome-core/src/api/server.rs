@@ -226,22 +226,32 @@ async fn readyz(State(state): State<ApiState>) -> Response {
     };
     // H3: the ping waits on the shared connection mutex, which a hung
     // write (the case the event-log mirror's deadline exists for) can
-    // hold indefinitely. Ping off the async workers and bound the
-    // wait so concurrent probes can't park every tokio worker; an
-    // unresponsive database reads as not ready.
-    let engine = state.engine.clone();
-    let ping = tokio::time::timeout(
-        READYZ_PING_TIMEOUT,
-        tokio::task::spawn_blocking(move || engine.db_ping()),
-    )
-    .await;
-    let ping = match ping {
-        Ok(Ok(result)) => result.map_err(|e| e.to_string()),
-        Ok(Err(join)) => Err(format!("ping task failed: {join}")),
-        Err(_) => Err(format!(
-            "no answer within {}ms",
-            READYZ_PING_TIMEOUT.as_millis()
-        )),
+    // hold indefinitely. Ping off the async workers, bound the wait,
+    // and cap outstanding pings — a timed-out ping keeps its slot
+    // until its blocking thread returns — so anonymous probes against
+    // a hung database can't park tokio workers or fill the blocking
+    // pool. An unresponsive database reads as not ready.
+    let ping = match READYZ_PING_SLOTS.try_acquire() {
+        Ok(permit) => {
+            let engine = state.engine.clone();
+            let ping = tokio::time::timeout(
+                READYZ_PING_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    engine.db_ping()
+                }),
+            )
+            .await;
+            match ping {
+                Ok(Ok(result)) => result.map_err(|e| e.to_string()),
+                Ok(Err(join)) => Err(format!("ping task failed: {join}")),
+                Err(_) => Err(format!(
+                    "no answer within {}ms",
+                    READYZ_PING_TIMEOUT.as_millis()
+                )),
+            }
+        }
+        Err(_) => Err("earlier pings are still waiting on the database".to_owned()),
     };
     match ping {
         Ok(()) => (
@@ -270,6 +280,9 @@ async fn readyz(State(state): State<ApiState>) -> Response {
 
 /// Upper bound on the `/readyz` database ping (H3).
 const READYZ_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Outstanding `/readyz` database pings (H3).
+static READYZ_PING_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 #[derive(Serialize)]
 struct ReadyzBody {

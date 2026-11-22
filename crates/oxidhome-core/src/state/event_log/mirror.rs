@@ -34,13 +34,19 @@
 //! late leaves its marker in history while the outage stays open, so
 //! the next marker's count overlaps it.
 //!
-//! The blocking write settles the health state itself when it
-//! finishes, so a publish future dropped mid-await (plugin trap,
-//! watchdog kill) still records the outcome.
+//! Callers serialize [`EventLog::mirror`] calls (the host holds the
+//! bus's `publish_sequence` gate around it). A publish future dropped
+//! mid-await (plugin trap, watchdog kill) releases the gate while its
+//! write still runs, so:
 //!
-//! Callers must serialize [`EventLog::mirror`] calls (the host holds
-//! the bus's `publish_sequence` gate around it); the plan → write →
-//! settle sequence assumes no other mirror call interleaves.
+//! - the blocking write settles the health state itself when it
+//!   finishes, and the outcome still counts;
+//! - no write starts while an earlier one is in flight — the publish
+//!   is delivered unrecorded instead (entering degraded mode if
+//!   needed), so writes can't pile up behind a hung connection or
+//!   commit out of order;
+//! - events skipped while a recovery probe's write runs aren't in its
+//!   marker and stay owed to the next one.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -134,6 +140,36 @@ struct Outage {
     unrecorded: u64,
     last_error: String,
     next_probe: Instant,
+    /// `unrecorded` when the current recovery probe was planned —
+    /// what its marker covers. Events skipped while that probe's
+    /// write runs (possible after a cancelled publish released the
+    /// gate) are counted past it and survive the recovery.
+    probe_covers: Option<u64>,
+    /// Receive time of the first event skipped past `probe_covers`.
+    first_after_probe_ms: i64,
+}
+
+impl Outage {
+    fn new(received_ms: i64, reason: String, next_probe: Instant) -> Self {
+        Self {
+            since_ms: now_unix_ms(),
+            first_received_ms: received_ms,
+            last_received_ms: received_ms,
+            unrecorded: 1,
+            last_error: reason,
+            next_probe,
+            probe_covers: None,
+            first_after_probe_ms: 0,
+        }
+    }
+
+    fn count(&mut self, received_ms: i64) {
+        if self.probe_covers == Some(self.unrecorded) {
+            self.first_after_probe_ms = received_ms;
+        }
+        self.unrecorded += 1;
+        self.last_received_ms = received_ms;
+    }
 }
 
 impl Outage {
@@ -327,16 +363,32 @@ impl EventLog {
     }
 
     fn plan(&self, received_ms: i64) -> Plan {
+        // A write still in flight here was orphaned: its publish
+        // timed out or was cancelled and released the sequence gate.
+        // Writing behind it would queue another blocking thread on
+        // the connection mutex, so deliver unrecorded instead.
+        let busy = self.mirror.in_flight.load(Ordering::Acquire) > 0;
         let mut st = self.mirror.lock();
-        let Some(outage) = st.outage.as_mut() else {
-            return Plan::Write(None);
-        };
-        if Instant::now() >= outage.next_probe && self.mirror.in_flight.load(Ordering::Acquire) == 0
-        {
-            return Plan::Write(Some(outage.marker()));
+        match st.outage.as_mut() {
+            None if !busy => return Plan::Write(None),
+            Some(outage) if !busy && Instant::now() >= outage.next_probe => {
+                outage.probe_covers = Some(outage.unrecorded);
+                return Plan::Write(Some(outage.marker()));
+            }
+            Some(outage) => outage.count(received_ms),
+            None => {
+                let reason = "an earlier event-log write is still running \
+                              (its publish was cancelled)"
+                    .to_owned();
+                tracing::error!(
+                    target: "event_log.mirror",
+                    error = %reason,
+                    "event log degraded: live delivery continues without durable row ids \
+                     and history will carry a gap marker once writes recover",
+                );
+                st.outage = Some(Outage::new(received_ms, reason, Instant::now()));
+            }
         }
-        outage.unrecorded += 1;
-        outage.last_received_ms = received_ms;
         st.unrecorded_total += 1;
         Plan::Skip
     }
@@ -346,15 +398,15 @@ impl EventLog {
         let mut st = self.mirror.lock();
         st.unrecorded_total += 1;
         if let Some(outage) = st.outage.as_mut() {
-            outage.unrecorded += 1;
-            outage.last_received_ms = received_ms;
+            outage.count(received_ms);
+            outage.probe_covers = None;
             outage.next_probe = next_probe;
             tracing::warn!(
                 target: "event_log.mirror",
                 probing,
                 unrecorded = outage.unrecorded,
                 error = %reason,
-                "event log still degraded: recovery probe failed; live delivery continues without durable row ids",
+                "event log still degraded: write failed; live delivery continues without durable row ids",
             );
             outage.last_error = reason;
         } else {
@@ -366,14 +418,7 @@ impl EventLog {
                 "event log degraded: durable write failed; live delivery continues without durable row ids \
                  and history will carry a gap marker once writes recover",
             );
-            st.outage = Some(Outage {
-                since_ms: now_unix_ms(),
-                first_received_ms: received_ms,
-                last_received_ms: received_ms,
-                unrecorded: 1,
-                last_error: reason,
-                next_probe,
-            });
+            st.outage = Some(Outage::new(received_ms, reason, next_probe));
         }
     }
 
@@ -384,13 +429,29 @@ impl EventLog {
         };
         st.gap_markers_total += 1;
         st.last_recovered_ms = Some(now_unix_ms());
+        let covered = outage.probe_covers.unwrap_or(outage.unrecorded);
         tracing::warn!(
             target: "event_log.mirror",
-            unrecorded = outage.unrecorded,
+            unrecorded = covered,
             degraded_since_ms = outage.since_ms,
             first_row_id,
             "event log recovered: gap marker written to history",
         );
+        let remainder = outage.unrecorded.saturating_sub(covered);
+        if remainder > 0 {
+            // Skipped while the probe's write ran: not covered by its
+            // marker, so keep them for the next one (due right away).
+            st.outage = Some(Outage {
+                since_ms: now_unix_ms(),
+                first_received_ms: outage.first_after_probe_ms,
+                last_received_ms: outage.last_received_ms,
+                unrecorded: remainder,
+                last_error: "events skipped while the recovery write was running".to_owned(),
+                next_probe: Instant::now(),
+                probe_covers: None,
+                first_after_probe_ms: 0,
+            });
+        }
     }
 
     /// One transaction: optional gap marker, then the event.
@@ -467,7 +528,7 @@ mod tests {
     use crate::state::db::Db;
 
     const FAST: MirrorPolicy = MirrorPolicy {
-        write_deadline: Duration::from_millis(500),
+        write_deadline: Duration::from_secs(5),
         probe_interval: Duration::from_millis(50),
     };
 
@@ -692,7 +753,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_write_hits_deadline_and_blocks_probes_until_it_drains() {
         let policy = MirrorPolicy {
-            write_deadline: Duration::from_millis(100),
+            write_deadline: Duration::from_secs(1),
             probe_interval: Duration::from_millis(10),
         };
         let log = log_with(policy);
@@ -800,5 +861,113 @@ mod tests {
         let h = log.health();
         assert!(h.degraded, "{h:?}");
         assert_eq!(h.unrecorded_total, 1);
+    }
+
+    /// Holds the connection mutex on another thread until the returned
+    /// sender is used (or dropped) — a stand-in for a hung disk.
+    fn hold_connection(
+        log: &EventLog,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let db = Arc::clone(&log.db);
+        let holder = std::thread::spawn(move || {
+            db.write(|_| {
+                held_tx.send(()).expect("signal");
+                let _ = release_rx.recv();
+                Ok::<_, rusqlite::Error>(())
+            })
+            .expect("hold");
+        });
+        held_rx.recv().expect("holder took the lock");
+        (release_tx, holder)
+    }
+
+    async fn drain(log: &EventLog) {
+        let wait = Instant::now();
+        while log.mirror.in_flight.load(Ordering::Acquire) != 0 {
+            assert!(
+                wait.elapsed() < Duration::from_secs(10),
+                "write never drained"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orphaned_write_makes_later_publishes_skip_the_disk() {
+        // A cancelled publish releases the sequence gate while its
+        // write still runs. The next publish must not queue a second
+        // blocking write behind it: it goes out unrecorded and the
+        // mirror reports degraded until a probe covers the gap.
+        let log = log_with(MirrorPolicy {
+            write_deadline: Duration::from_secs(30),
+            probe_interval: Duration::from_millis(10),
+        });
+        let (release, holder) = hold_connection(&log);
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), publish(&log, 1)).await;
+        assert!(cancelled.is_err());
+
+        assert_eq!(publish(&log, 2).await, None);
+        assert_eq!(log.mirror.in_flight.load(Ordering::Acquire), 1);
+        let h = log.health();
+        assert!(h.degraded);
+        assert!(
+            h.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("still running"))
+        );
+
+        release.send(()).expect("release");
+        holder.join().expect("holder");
+        drain(&log).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let recovered = publish_full(&log, 3).await;
+        assert!(recovered.row_id.is_some());
+        assert!(recovered.gap_marker.is_some());
+        let topics: Vec<String> = all_rows(&log).into_iter().map(|r| r.topic).collect();
+        // The orphaned event committed late, below the marker.
+        assert_eq!(topics, ["switch", GAP_MARKER_TOPIC, "switch"]);
+        assert!(!log.health().degraded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_skipped_during_a_cancelled_probe_survive_its_recovery() {
+        let log = log_with(MirrorPolicy {
+            write_deadline: Duration::from_secs(30),
+            probe_interval: Duration::from_millis(10),
+        });
+        break_writes(&log);
+        assert_eq!(publish(&log, 1).await, None);
+        fix_writes(&log);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Probe parks on the connection, then its publish is dropped.
+        let (release, holder) = hold_connection(&log);
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(20), publish_full(&log, 2)).await;
+        assert!(cancelled.is_err());
+        // Skipped while the probe's write runs: not in its marker.
+        assert_eq!(publish(&log, 3).await, None);
+
+        release.send(()).expect("release");
+        holder.join().expect("holder");
+        drain(&log).await;
+        let h = log.health();
+        assert_eq!(h.gap_markers_total, 1, "{h:?}");
+        assert!(
+            h.degraded,
+            "the event skipped during the probe is still owed a marker"
+        );
+        assert_eq!(h.unrecorded_pending, 1);
+
+        let recovered = publish_full(&log, 4).await;
+        let EventPayload::Custom(c) = recovered.gap_marker.expect("second marker").payload else {
+            panic!("marker payload must be custom");
+        };
+        let gap: GapMarker = serde_json::from_str(&c.payload).expect("gap json");
+        assert_eq!(gap.unrecorded, 1);
+        assert_eq!(gap.first_received_ms, 3);
+        assert!(!log.health().degraded);
     }
 }
