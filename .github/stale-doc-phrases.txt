@@ -1,0 +1,17 @@
+# Phrases that describe superseded decisions. The "Check docs for stale
+# claims" job in checks.yaml fails when any repo doc outside docs/adr/
+# contains one (case-insensitive, fixed-string match). ADRs are exempt
+# because they quote the positions they replace.
+#
+# One phrase per line; blank lines and lines starting with # are ignored.
+# Add a phrase when an ADR supersedes a claim the docs used to make.
+
+# ADR-0005: Connect RPC ships alongside REST.
+REST-only
+gRPC explicitly deferred
+gRPC deferred
+
+# ADR-0006: host resource ceilings replace "no compute limits".
+not limited by design
+no compute limits
+does not cap a plugin's CPU
