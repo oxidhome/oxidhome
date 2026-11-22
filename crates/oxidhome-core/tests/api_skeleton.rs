@@ -5788,10 +5788,12 @@ async fn rest_refuses_constraint_bearing_token() {
         .auth_tokens()
         .create(
             "constrained",
+            // H6 made `device.send_command` enforced on REST, so the
+            // refusal is pinned on a key REST still does not consume.
             br#"{
                 "scopes": ["*"],
                 "constraints": {
-                    "device.send_command": {"devices": ["dev-a1b2c3d4*"]}
+                    "plugins.install": {"plugins": ["acme.*"]}
                 }
             }"#,
         )
@@ -5837,7 +5839,7 @@ async fn rest_refuses_constraint_bearing_token() {
         // refusal without cross-referencing the log line.
         // 14.4a enforces no keys, so this is
         // `KeyNotEnforced`.
-        Some("<constraint-key-unenforced:device.send_command>"),
+        Some("<constraint-key-unenforced:plugins.install>"),
     );
 }
 
@@ -5868,4 +5870,248 @@ async fn rest_accepts_legacy_scope_array_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── H6: device allowlist on every transport + invocation context ──
+
+/// Start a simulated switch and return `(engine, handle, device_id)`.
+async fn start_switch() -> (Engine, oxidhome_core::InstanceHandle, String) {
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+    let handle = engine
+        .start_instance(switch_dir, "switch", None)
+        .await
+        .expect("start_instance");
+    handle.wait_for_running().await.expect("reach Running");
+    let device_id = engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|m| m.owner_instance == "switch")
+        .expect("simulated-switch registered a device")
+        .id
+        .clone();
+    (engine, handle, device_id)
+}
+
+fn device_allowlist_token(engine: &Engine, label: &str, allowed: &str) -> String {
+    let policy = format!(
+        r#"{{"scopes":["devices:command"],"constraints":{{"device.send_command":{{"devices":["{allowed}"]}}}}}}"#
+    );
+    engine
+        .auth_tokens()
+        .create(label, policy.as_bytes())
+        .expect("create constrained token")
+        .plaintext
+}
+
+/// H6: `devices:command` no longer grants every device on REST when
+/// the token carries a `device.send_command` allowlist — the same
+/// shared check MCP applies. The allowed device dispatches and its
+/// audit row records the request's invocation (call id + REST root).
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_device_command_enforces_allowlist_and_records_invocation() {
+    use oxidhome_core::state::AuditQuery;
+
+    let (engine, handle, device_id) = start_switch().await;
+    let allowed = device_allowlist_token(&engine, "allowed", &device_id);
+    let other = device_allowlist_token(&engine, "other", "dev-0000000000000000");
+    let command = |bearer: &str| {
+        Request::builder()
+            .uri(format!("/api/v1/devices/{device_id}/command"))
+            .method("POST")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"capability":"switch","action":"toggle","args":[]}"#,
+            ))
+            .unwrap()
+    };
+
+    let denied = build_router(engine.clone())
+        .oneshot(command(&other))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let ok = build_router(engine.clone())
+        .oneshot(command(&allowed))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    let path = format!("/api/v1/devices/{device_id}/command");
+    let rows = engine
+        .audit_log()
+        .query(
+            &AuditQuery {
+                path: Some(path),
+                ..AuditQuery::default()
+            },
+            10,
+        )
+        .expect("query audit");
+    let deny = rows.iter().find(|r| r.status == 403).expect("deny row");
+    assert_eq!(
+        deny.required_scope.as_deref(),
+        Some("constraint:device.send_command:devices"),
+    );
+    let allow = rows.iter().find(|r| r.status == 200).expect("allow row");
+    let call_id = allow.call_id.as_deref().expect("call_id on entry row");
+    assert!(call_id.starts_with("call-"));
+    let inv: Value = serde_json::from_str(allow.invocation.as_deref().unwrap()).unwrap();
+    assert_eq!(inv["root"]["transport"], "rest");
+    assert_eq!(inv["root"]["kind"], "api");
+    assert_eq!(inv["root"]["credential_id"], allow.token_id.as_str());
+    assert_ne!(
+        deny.call_id, allow.call_id,
+        "each request is its own invocation"
+    );
+
+    handle.stop().await.expect("stop");
+}
+
+/// H6: same allowlist on Connect `DevicesService.ExecuteCommand`.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_device_command_enforces_allowlist_and_records_invocation() {
+    use oxidhome_core::state::AuditQuery;
+
+    let (engine, handle, device_id) = start_switch().await;
+    let allowed = device_allowlist_token(&engine, "allowed", &device_id);
+    let other = device_allowlist_token(&engine, "other", "dev-0000000000000000");
+    let command = |bearer: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/oxidhome.v1.DevicesService/ExecuteCommand")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::from(format!(
+                r#"{{"deviceId":"{device_id}","capability":"switch","action":"toggle"}}"#,
+            )))
+            .unwrap()
+    };
+
+    let denied = build_router(engine.clone())
+        .oneshot(command(&other))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body = body_to_json(denied.into_body()).await;
+    assert_eq!(body["code"], "permission_denied");
+    let ok = build_router(engine.clone())
+        .oneshot(command(&allowed))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    let rows = engine
+        .audit_log()
+        .query(
+            &AuditQuery {
+                path: Some("/oxidhome.v1.DevicesService/ExecuteCommand".into()),
+                ..AuditQuery::default()
+            },
+            10,
+        )
+        .expect("query audit");
+    let deny = rows
+        .iter()
+        .find(|r| r.decision == "deny")
+        .expect("deny row");
+    assert_eq!(
+        deny.required_scope.as_deref(),
+        Some("constraint:device.send_command:devices"),
+    );
+    let allow = rows
+        .iter()
+        .find(|r| r.decision == "allow")
+        .expect("allow row");
+    let inv: Value = serde_json::from_str(allow.invocation.as_deref().unwrap()).unwrap();
+    assert_eq!(inv["root"]["transport"], "connect");
+
+    handle.stop().await.expect("stop");
+}
+
+/// H6: `GET /api/v1/audit?call_id=…` narrows to one invocation and
+/// exposes the decoded context.
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_endpoint_filters_by_call_id() {
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let get = |uri: String| {
+        Request::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {}", admin.plaintext))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let first = build_router(engine.clone())
+        .oneshot(get("/api/v1/instances".into()))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let call_id = engine
+        .audit_log()
+        .query(&oxidhome_core::state::AuditQuery::default(), 1)
+        .unwrap()[0]
+        .call_id
+        .clone()
+        .expect("call id");
+
+    let resp = build_router(engine.clone())
+        .oneshot(get(format!("/api/v1/audit?call_id={call_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    let audit = body["audit"].as_array().expect("audit array");
+    assert_eq!(audit.len(), 1, "{body}");
+    assert_eq!(audit[0]["call_id"], call_id.as_str());
+    assert_eq!(audit[0]["path"], "/api/v1/instances");
+    assert_eq!(audit[0]["invocation"]["root"]["transport"], "rest");
+}
+
+/// H6: a command whose invocation deadline passed before the owning
+/// supervisor dequeued it is refused without running the plugin, so a
+/// device is never actuated on behalf of a caller that gave up.
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_invocation_is_refused_before_plugin_runs() {
+    use oxidhome_core::auth::{ActorKind, InvocationContext, Principal, Transport};
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::Command;
+
+    let (engine, handle, device_id) = start_switch().await;
+    let mut events = engine.events().subscribe_all();
+    let actor = oxidhome_core::Actor::api("tok-late", vec!["*".into()]);
+    let expired =
+        InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
+            .with_deadline(Some(tokio::time::Instant::now()));
+    let toggle = || Command {
+        capability: "switch".into(),
+        action: "toggle".into(),
+        args: Vec::new(),
+    };
+
+    let err = handle
+        .execute_command_in(expired, device_id.clone(), toggle())
+        .await
+        .expect_err("expired invocation must be refused");
+    assert!(format!("{err:#}").contains("deadline exceeded"), "{err:#}");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            events.receiver.recv()
+        )
+        .await
+        .is_err(),
+        "plugin must not have run (no state-changed event)",
+    );
+    // The instance is still healthy and serves a live invocation.
+    handle
+        .execute_command(device_id, toggle())
+        .await
+        .expect("fresh command runs");
+
+    handle.stop().await.expect("stop");
 }

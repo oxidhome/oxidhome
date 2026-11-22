@@ -581,6 +581,7 @@ pub(super) async fn call(
     engine: Engine,
     request: CallToolRequestParams,
     actor: &Actor,
+    principal: crate::auth::Principal,
     cancelled: CancelSignal,
 ) -> Result<CallToolResult, McpError> {
     let Ok(audit_permit) = Arc::clone(&AUDIT_QUEUE_SEMAPHORE).try_acquire_owned() else {
@@ -638,7 +639,12 @@ pub(super) async fn call(
     // still queued. Without this, a disconnect-flooded caller
     // could enqueue unbounded writers even though the
     // semaphore's `try_acquire` above returned successfully.
-    let intent_entry = new_pending_audit_entry(&token_id, family);
+    // H6: one invocation per dispatched tool call. Its id lands on
+    // the intent row and on every downstream row the tool causes.
+    let invocation = crate::auth::InvocationContext::external(principal);
+    let mut intent_entry = new_pending_audit_entry(&token_id, family);
+    intent_entry.call_id = Some(invocation.call_id().to_owned());
+    intent_entry.invocation = Some(invocation.audit_json());
     let audit_log_for_intent = engine.audit_log();
     let intent_join = tokio::task::spawn_blocking(move || {
         let result = audit_log_for_intent.record_intent(&intent_entry);
@@ -673,7 +679,7 @@ pub(super) async fn call(
     // Actually dispatch.
     let outcome = match name {
         "device.send_command" => {
-            device_send_command_call(engine.clone(), request.arguments, actor).await
+            device_send_command_call(engine.clone(), request.arguments, actor, invocation).await
         }
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => events_history_call(engine.clone(), request.arguments).await,
@@ -1092,9 +1098,9 @@ impl ToolOutcome {
 /// `EnforcedConstraint` entry in
 /// `api::mcp::server::mount_inner` — adding an entry there
 /// without a matching sentinel (or vice versa) would drift
-/// the audit shape from the enforcement shape.
-pub(super) const CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES: &str =
-    "constraint:device.send_command:devices";
+/// the audit shape from the enforcement shape. The
+/// `device.send_command` sentinel lives with the shared check in
+/// `crate::auth::policy::DEVICE_COMMAND_DENIED_SENTINEL` (H6).
 pub(super) const CONSTRAINT_PLUGINS_SHOW_PLUGINS: &str = "constraint:plugins.show:plugins";
 pub(super) const CONSTRAINT_PLUGINS_STOP_PLUGINS: &str = "constraint:plugins.stop:plugins";
 pub(super) const CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS: &str =
@@ -1118,6 +1124,7 @@ async fn device_send_command_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
     actor: &Actor,
+    invocation: crate::auth::InvocationContext,
 ) -> ToolOutcome {
     let args: DeviceSendCommandArgs = match arguments {
         Some(map) => match serde_json::from_value(JsonValue::Object(map)) {
@@ -1149,12 +1156,11 @@ async fn device_send_command_call(
     // allowlist doesn't cover the id can't learn whether the
     // id exists — the constraint is a pure string match on
     // caller input and independent of registry state.
-    if let Some(cx) = actor.constraint("device.send_command")
-        && !cx.allows_device(&args.device_id)
-    {
-        return ToolOutcome::Denied {
-            required: CONSTRAINT_DEVICE_SEND_COMMAND_DEVICES,
-        };
+    //
+    // H6: the check is `crate::auth::authorize_device_command`, shared
+    // with the REST and Connect device-command handlers.
+    if let Err(required) = crate::auth::authorize_device_command(actor, &args.device_id) {
+        return ToolOutcome::Denied { required };
     }
 
     // Resolve device → owning instance the same way the REST
@@ -1189,7 +1195,10 @@ async fn device_send_command_call(
             .collect(),
     };
 
-    let result = match handle.execute_command(args.device_id, cmd).await {
+    let result = match handle
+        .execute_command_in(invocation, args.device_id, cmd)
+        .await
+    {
         Ok(r) => r,
         Err(err) => {
             tracing::error!(target: "mcp.tool.device.send_command", %err, "dispatch failed");
@@ -3136,6 +3145,8 @@ fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+        call_id: None,
+        invocation: None,
     }
 }
 
@@ -3159,6 +3170,8 @@ fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+        call_id: None,
+        invocation: None,
     }
 }
 

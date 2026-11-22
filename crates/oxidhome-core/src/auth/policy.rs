@@ -74,6 +74,12 @@
 //! `("device.send_command", devices)` on MCP; 14.4c adds the
 //! five `plugins.*` entries with `plugins` on MCP; …
 //!
+//! H6 made `device.send_command` / `devices` transport-neutral:
+//! REST, Connect and MCP all list [`DEVICE_COMMAND_ENFORCED`] and
+//! call [`authorize_device_command`] at their device-command
+//! dispatch boundary, so the allowlist can't be bypassed by
+//! switching transport.
+//!
 //! See round-3 / round-4 / round-5 / round-6 P1 on PR #147
 //! for the iteration history (bool → key set → (key, field)
 //! set) and why each refinement matters.
@@ -353,6 +359,46 @@ impl EnforcedConstraint {
     }
 }
 
+/// The `device.send_command` / `devices` enforcement entry. Every
+/// transport that can dispatch a device command (REST
+/// `POST /api/v1/devices/{id}/command`, Connect
+/// `DevicesService.ExecuteCommand`, MCP `device.send_command`) lists it
+/// and calls [`authorize_device_command`] at its dispatch boundary
+/// (H6), so a per-device allowlist cannot be sidestepped by switching
+/// transport.
+pub const DEVICE_COMMAND_ENFORCED: EnforcedConstraint = EnforcedConstraint {
+    key: "device.send_command",
+    enforce_devices: true,
+    enforce_plugins: false,
+};
+
+/// Audit sentinel recorded as `required_scope` when
+/// [`authorize_device_command`] refuses.
+pub const DEVICE_COMMAND_DENIED_SENTINEL: &str = "constraint:device.send_command:devices";
+
+/// Shared device-command resource check (H6). The flat
+/// `devices:command` scope is checked by the caller first; this then
+/// applies the token's per-device allowlist, if it carries one. A token
+/// without a `device.send_command` constraint is unrestricted (legacy
+/// behaviour).
+///
+/// Pure string match on caller input — run it **before** resolving the
+/// device so a refused caller learns nothing about which ids exist.
+///
+/// # Errors
+///
+/// Returns [`DEVICE_COMMAND_DENIED_SENTINEL`] when the constraint does
+/// not cover `device_id`.
+pub fn authorize_device_command(
+    actor: &crate::auth::Actor,
+    device_id: &str,
+) -> Result<(), &'static str> {
+    match actor.constraint(DEVICE_COMMAND_ENFORCED.key) {
+        Some(cx) if !cx.allows_device(device_id) => Err(DEVICE_COMMAND_DENIED_SENTINEL),
+        _ => Ok(()),
+    }
+}
+
 /// Decode the `scope_json` blob into a [`TokenPolicy`].
 ///
 /// Returns `None` when the blob is malformed. The
@@ -377,6 +423,29 @@ pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorize_device_command_applies_allowlist_only_when_present() {
+        use crate::auth::Actor;
+        // Legacy token: no constraint ⇒ every device allowed.
+        let legacy = Actor::api("tok", vec!["devices:command".into()]);
+        assert!(authorize_device_command(&legacy, "dev-0000000000000000").is_ok());
+
+        let mut constraints = HashMap::new();
+        constraints.insert(
+            "device.send_command".to_string(),
+            ToolConstraint {
+                devices: Some(vec!["dev-a1b2*".into()]),
+                plugins: None,
+            },
+        );
+        let narrowed = Actor::api_with_policy("tok", vec!["*".into()], constraints);
+        assert!(authorize_device_command(&narrowed, "dev-a1b2c3d4e5f60718").is_ok());
+        assert_eq!(
+            authorize_device_command(&narrowed, "dev-ffff000000000000"),
+            Err(DEVICE_COMMAND_DENIED_SENTINEL),
+        );
+    }
 
     #[test]
     fn legacy_scope_array_round_trips() {

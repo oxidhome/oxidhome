@@ -787,6 +787,19 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX evt_instance ON event_log(instance_id, id);
     CREATE INDEX evt_plugin   ON event_log(plugin_id, id);
     ",
+    // 17 — architecture-review H6: invocation context on the audit
+    // ledger. Every authenticated request now runs under a
+    // host-minted `call_id`; the entry point's row and every
+    // downstream row it causes (delegated `call-service` hops,
+    // `method = 'CALL'`) carry the same id plus a JSON summary of
+    // the root principal and delegation chain. Both nullable:
+    // pre-17 rows and anonymous probes have no invocation. The
+    // partial index serves `GET /api/v1/audit?call_id=…`.
+    "
+    ALTER TABLE audit_event ADD COLUMN call_id TEXT;
+    ALTER TABLE audit_event ADD COLUMN invocation_json TEXT;
+    CREATE INDEX audit_call ON audit_event(call_id) WHERE call_id IS NOT NULL;
+    ",
 ];
 
 /// Wrapper around the host's `rusqlite::Connection`.

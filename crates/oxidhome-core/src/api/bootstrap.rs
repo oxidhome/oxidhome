@@ -616,6 +616,8 @@ fn record_intent(
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+        call_id: None,
+        invocation: None,
     };
     // Durable: every caller follows the intent with a durable
     // filesystem or token change that must not outlive its evidence.

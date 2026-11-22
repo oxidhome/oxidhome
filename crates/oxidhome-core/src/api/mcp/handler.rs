@@ -186,6 +186,22 @@ impl ServerHandler for OxidHomeMcpHandler {
     + '_ {
         let engine = self.engine.clone();
         let actor = self.resolve_actor(&context);
+        // H6: the root principal of the tool's invocation. stdio is
+        // authorized by the parent process, not a credential, so its
+        // principal carries no `credential_id`.
+        let principal = if self.stdio_actor.is_some() {
+            crate::auth::Principal::local_process(
+                crate::auth::ActorKind::Mcp,
+                actor.id(),
+                crate::auth::Transport::McpStdio,
+            )
+        } else {
+            crate::auth::Principal::token(
+                crate::auth::ActorKind::Mcp,
+                &actor,
+                crate::auth::Transport::McpHttp,
+            )
+        };
         async move {
             // 14.7c: standardised completion event. See
             // `read_resource` above for the rationale.
@@ -208,7 +224,7 @@ impl ServerHandler for OxidHomeMcpHandler {
             // long-poll tool must observe the token itself.
             let ct = context.ct.clone();
             let cancelled: tools::CancelSignal = Box::pin(async move { ct.cancelled().await });
-            let result = tools::call(engine, request, &actor, cancelled).await;
+            let result = tools::call(engine, request, &actor, principal, cancelled).await;
             emit_completion(
                 "mcp.tool.complete",
                 canonical,

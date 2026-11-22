@@ -147,6 +147,18 @@ pub struct AuditEntry {
     /// verified (the `token_id` already identifies the caller) or
     /// when no bearer header was present.
     pub credential_fp: Option<String>,
+    /// H6: host-minted invocation id (`call-<32 hex>`). The entry
+    /// point's row and every downstream row the invocation caused
+    /// (delegated `call-service` hops, `method = "CALL"`) share it.
+    /// `None` on probe rows and rows written before migration 17.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// H6: JSON summary of the invocation context — root principal
+    /// (`kind`, `subject`, `credential_id`, `transport`), the
+    /// executing actor (`current`), and the delegation `chain`. See
+    /// `crate::auth::InvocationContext::audit_json`.
+    #[serde(default)]
+    pub invocation: Option<String>,
 }
 
 /// Query shape for [`AuditLog::query`]. Every field is optional and
@@ -168,6 +180,9 @@ pub struct AuditQuery {
     /// `path = "/api/v1/devices/dev-abc/command"` returns every
     /// command dispatch against that device.
     pub path: Option<String>,
+    /// Exact `call_id` match (H6): every row one invocation produced —
+    /// the entry point's row plus its delegated `call-service` hops.
+    pub call_id: Option<String>,
     /// Cursor-based pagination floor: return only rows strictly
     /// *older* than `(before.0, before.1)` in `(intent_ms, id)`
     /// order. The default `ORDER BY intent_ms DESC, id DESC LIMIT
@@ -290,8 +305,8 @@ impl AuditLog {
     ) -> Result<i64, AuditLogError> {
         conn.execute(
                     "INSERT INTO audit_event \
-                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error) \
-                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6, NULL, NULL)",
+                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json) \
+                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6, NULL, NULL, ?7, ?8)",
                     params![
                         intent_ms,
                         &entry.token_id,
@@ -299,6 +314,8 @@ impl AuditLog {
                         &entry.method,
                         &entry.path,
                         &entry.credential_fp,
+                        &entry.call_id,
+                        &entry.invocation,
                     ],
                 )?;
         Ok(conn.last_insert_rowid())
@@ -373,8 +390,8 @@ impl AuditLog {
             .write(|conn| -> Result<i64, AuditLogError> {
                 conn.execute(
                     "INSERT INTO audit_event \
-                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error) \
-                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json) \
+                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         now,
                         &entry.token_id,
@@ -387,6 +404,8 @@ impl AuditLog {
                         &entry.credential_fp,
                         &entry.execution_outcome,
                         &entry.domain_error,
+                        &entry.call_id,
+                        &entry.invocation,
                     ],
                 )?;
                 Ok(conn.last_insert_rowid())
@@ -410,7 +429,7 @@ impl AuditLog {
         use std::fmt::Write as _;
 
         let mut sql = String::from(
-            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error \
+            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json \
              FROM audit_event WHERE 1=1",
         );
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -435,6 +454,9 @@ impl AuditLog {
         }
         if let Some(p) = &filter.path {
             push(&mut binds, &mut sql, "path =", p.clone().into());
+        }
+        if let Some(c) = &filter.call_id {
+            push(&mut binds, &mut sql, "call_id =", c.clone().into());
         }
         // Cursor pagination — lexicographic `(intent_ms, id) <
         // (before_ms, before_id)`. SQLite's row-value comparison
@@ -490,6 +512,8 @@ impl AuditLog {
                     credential_fp: row.get(10)?,
                     execution_outcome: row.get(11)?,
                     domain_error: row.get(12)?,
+                    call_id: row.get(13)?,
+                    invocation: row.get(14)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -561,6 +585,8 @@ mod tests {
             execution_outcome: None,
             domain_error: None,
             credential_fp: None,
+            call_id: None,
+            invocation: None,
         }
     }
 
@@ -688,6 +714,8 @@ mod tests {
             execution_outcome: None,
             domain_error: None,
             credential_fp: Some("deadbeef".into()),
+            call_id: None,
+            invocation: None,
         };
         log.record_completed(&entry).unwrap();
         let rows = log.query(&AuditQuery::default(), 1).unwrap();
@@ -716,6 +744,8 @@ mod tests {
                 execution_outcome: None,
                 domain_error: None,
                 credential_fp: None,
+                call_id: None,
+                invocation: None,
             }
         }
         let log = store();
@@ -780,6 +810,8 @@ mod tests {
             execution_outcome: None,
             domain_error: None,
             credential_fp: None,
+            call_id: None,
+            invocation: None,
         };
         let id = log.record_intent_durable(&entry).unwrap();
         let sync: i64 = db

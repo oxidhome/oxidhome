@@ -268,11 +268,7 @@ fn mount_inner(
         //   against the manifest-derived id BEFORE any FS
         //   or SQL side effect. Orphan state is impossible.
         enforced_constraints: &[
-            crate::auth::EnforcedConstraint {
-                key: "device.send_command",
-                enforce_devices: true,
-                enforce_plugins: false,
-            },
+            crate::auth::DEVICE_COMMAND_ENFORCED,
             crate::auth::EnforcedConstraint {
                 key: "plugins.show",
                 enforce_devices: false,
@@ -299,6 +295,7 @@ fn mount_inner(
                 enforce_plugins: true,
             },
         ],
+        transport: crate::auth::Transport::McpHttp,
     };
 
     // `route_service` — the exact `/api/v1/mcp` path only, no

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::Engine;
-use crate::auth::Actor;
+use crate::auth::{Actor, InvocationContext};
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
@@ -71,11 +71,13 @@ pub fn build_router(engine: Engine) -> Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // REST does not consume per-tool constraints in
-        // 14.4a: empty enforced set → refuse any
-        // constraint-bearing token. See
-        // [`AuthState::enforced_constraints`] docs.
-        enforced_constraints: &[],
+        // H6: `POST /api/v1/devices/{id}/command` applies the
+        // `device.send_command` per-device allowlist through the
+        // shared `authorize_device_command` check, same as Connect
+        // and MCP. Every other constraint key is still refused here.
+        // See [`AuthState::enforced_constraints`] docs.
+        enforced_constraints: &[crate::auth::DEVICE_COMMAND_ENFORCED],
+        transport: crate::auth::Transport::Rest,
     };
     let connect_service = super::connect_rpc::axum_service(engine.clone());
     // The authenticated cluster — every JSON handler except the
@@ -1105,19 +1107,30 @@ pub(crate) fn command_result_to_wire(r: CommandResult) -> WireCommandResult {
 /// - `404 not_found` — no device with that id, or its owning
 ///   instance isn't currently running. Indistinguishable from
 ///   "wrong id" so a probing caller can't enumerate device ids.
-/// - `403` — scope check failed.
+/// - `403` — scope check failed, or the token's `device.send_command`
+///   allowlist does not cover `device_id` (audited with
+///   `required_scope = "constraint:device.send_command:devices"`).
 /// - `500` — supervisor channel error / plugin trap (the dispatch
-///   path crashed the owning instance).
+///   path crashed the owning instance), or the request's invocation
+///   deadline passed before the owning supervisor dequeued it.
+///
+/// The plugin runs under the request's [`InvocationContext`] (H6), so
+/// any `call-service` it makes is audited against this token.
 /// - `200` — plugin processed the command; the body's
 ///   `WireCommandResult` says whether the plugin returned `Ok`,
 ///   `OkWithState`, or `Err`.
 async fn send_command(
     Extension(actor): Extension<Actor>,
+    Extension(invocation): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(device_id): Path<String>,
     Json(body): Json<CommandBody>,
 ) -> Result<axum::response::Response, CommandError> {
     require_scope(&actor, DEVICES_COMMAND).map_err(CommandError::Scope)?;
+    // H6: per-device resource check, shared with Connect and MCP.
+    // Before the lookup so a refused token can't probe device ids.
+    crate::auth::authorize_device_command(&actor, &device_id)
+        .map_err(|required| CommandError::Scope(ScopeDenied { required }))?;
 
     // Resolve device → owning instance via the registry's
     // cross-instance owner-only lookup (mirrors the dispatcher's
@@ -1151,7 +1164,7 @@ async fn send_command(
     };
 
     let result = handle
-        .execute_command(device_id, cmd)
+        .execute_command_in(invocation, device_id, cmd)
         .await
         .map_err(CommandError::Dispatch)?;
 
@@ -2936,6 +2949,9 @@ struct AuditParams {
     /// specific endpoint, e.g.
     /// `path=/api/v1/devices/dev-abc/command`.
     path: Option<String>,
+    /// Exact `call_id` match (H6) — the entry point's row plus every
+    /// delegated `call-service` hop it caused.
+    call_id: Option<String>,
     /// Cursor for lossless pagination. Opaque `"<intent_ms>:<id>"`
     /// string returned as `next_cursor` on the previous page.
     /// Callers should not construct it by hand — pass the previous
@@ -2977,6 +2993,7 @@ async fn query_audit(
         token_id: params.token_id,
         decision: params.decision,
         path: params.path,
+        call_id: params.call_id,
         before,
         // F3 self-exclusion: hide the query's own pending intent
         // row from its results.
@@ -3078,6 +3095,14 @@ struct WireAuditEntry {
     domain_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential_fp: Option<String>,
+    /// H6 invocation id shared by an entry point's row and its
+    /// downstream `CALL` rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
+    /// H6 invocation context (root principal + delegation chain),
+    /// decoded from the ledger's JSON column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invocation: Option<serde_json::Value>,
 }
 
 impl WireAuditEntry {
@@ -3096,6 +3121,11 @@ impl WireAuditEntry {
             execution_outcome: row.execution_outcome,
             domain_error: row.domain_error,
             credential_fp: row.credential_fp,
+            call_id: row.call_id,
+            invocation: row
+                .invocation
+                .as_deref()
+                .and_then(|j| serde_json::from_str(j).ok()),
         }
     }
 }

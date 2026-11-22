@@ -845,7 +845,8 @@ impl PluginInstance {
             engine.services(),
             engine.instances(),
         )
-        .with_granted_capabilities(granted_capabilities);
+        .with_granted_capabilities(granted_capabilities)
+        .with_audit_log(engine.audit_log());
         let mut store = Store::new(engine.raw(), state);
         // C4: install the wasmtime resource limiter so linear-memory
         // grows / table extensions / additional instance/memory/table
