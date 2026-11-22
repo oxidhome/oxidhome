@@ -24,6 +24,9 @@ oxidhome-sdk = { path = "../../crates/oxidhome-sdk" }
 
 [lints.rust]
 unsafe_code = "deny"
+# The WIT world export `shutdown` shares its core symbol with wasi-libc's socket
+# `shutdown`, which rust-lld reports as a signature mismatch since Rust 1.100.
+linker_messages = "allow"
 
 [lints.cargo]
 unused_dependencies = "deny"
