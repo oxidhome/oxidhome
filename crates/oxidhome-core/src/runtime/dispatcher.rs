@@ -299,6 +299,24 @@ pub(crate) async fn call_service(
         .filter(|_| callee_ctx.root().is_external())
         .map(|log| HopAudit::new(Arc::clone(log), &callee_ctx, &command));
 
+    // H6: refuse work the root has already given up on — before the
+    // grant gate, so an expired invocation can't queue deny-row
+    // writes either. The budget left also bounds every wait below.
+    let timeout = match callee_ctx.remaining() {
+        Some(r) if r.is_zero() => {
+            return Err(WitError::Unavailable(format!(
+                "call-service to `{target}` refused: invocation `{}` deadline exceeded",
+                callee_ctx.call_id(),
+            )));
+        }
+        Some(r) => r.min(DISPATCH_TIMEOUT),
+        None => DISPATCH_TIMEOUT,
+    };
+    // One absolute bound for everything the caller's supervisor waits
+    // on from here: a deny-row write, or the audit intent write *and*
+    // the dispatch.
+    let wait_until = tokio::time::Instant::now() + timeout;
+
     // 3. H10 structured capability gate. Runs before `acquire_call`
     //    so a refused call spends no refcount and cannot influence
     //    `remove-service` timing. Matches on the immutable
@@ -349,7 +367,7 @@ pub(crate) async fn call_service(
             (true, true) => unreachable!("both matched but guard fired"),
         };
         if let Some(hop_audit) = hop_audit {
-            hop_audit.record_denied();
+            hop_audit.record_denied(wait_until).await;
         }
         return Err(WitError::PermissionDenied(format!(
             "caller `{caller_instance}` refused: {failed_clause} a matching \
@@ -362,22 +380,6 @@ pub(crate) async fn call_service(
              authorizes the same selector"
         )));
     }
-
-    // H6: refuse work the root has already given up on. The budget
-    // left also bounds the wait below.
-    let timeout = match callee_ctx.remaining() {
-        Some(r) if r.is_zero() => {
-            return Err(WitError::Unavailable(format!(
-                "call-service to `{target}` refused: invocation `{}` deadline exceeded",
-                callee_ctx.call_id(),
-            )));
-        }
-        Some(r) => r.min(DISPATCH_TIMEOUT),
-        None => DISPATCH_TIMEOUT,
-    };
-    // One absolute bound for everything the caller's supervisor waits
-    // on from here: the audit intent write *and* the dispatch.
-    let wait_until = tokio::time::Instant::now() + timeout;
 
     // 4. Resolve target instance handle; refuse if it isn't running.
     let target_handle = instances.get(&target_instance).ok_or_else(|| {
@@ -490,18 +492,29 @@ impl HopAudit {
         Self { log, entry }
     }
 
-    /// Single-shot `deny` row. Detached: the refusal is already
-    /// decided, so the caller doesn't wait on the ledger.
-    fn record_denied(self) {
+    /// Single-shot `deny` row. Awaited (up to `wait_until`) rather than
+    /// detached: a refused call returns instantly, so without the wait
+    /// a plugin looping on refused calls could queue blocking ledger
+    /// writes without bound. The refusal itself never depends on the
+    /// write.
+    async fn record_denied(self, wait_until: tokio::time::Instant) {
         let Self { log, mut entry } = self;
         entry.status = 403;
         entry.decision = "deny".into();
         entry.required_scope = Some("consumes_services".into());
-        tokio::task::spawn_blocking(move || {
-            if let Err(err) = log.record_completed(&entry) {
+        let write = tokio::task::spawn_blocking(move || log.record_completed(&entry));
+        match tokio::time::timeout_at(wait_until, write).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(err))) => {
                 tracing::error!(target: "host.audit", error = %err, "service-call deny row failed");
             }
-        });
+            Ok(Err(err)) => {
+                tracing::error!(target: "host.audit", error = %err, "service-call deny row panicked");
+            }
+            Err(_) => {
+                tracing::warn!(target: "host.audit", "service-call deny row still pending at hop deadline");
+            }
+        }
     }
 
     async fn record_intent(&self) -> Result<u64, String> {
