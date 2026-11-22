@@ -8,6 +8,8 @@ pub const MAX_PIPELINE_STEPS: usize = 32;
 pub const MAX_PIPELINE_SINKS: usize = 8;
 /// Most `preprocessing` steps in one `inference-tap-config`.
 pub const MAX_PREPROCESSING_STEPS: usize = 8;
+/// Most bytes in one `pipe-writer.write` call (1 MiB).
+pub const MAX_PIPE_WRITE_BYTES: usize = 1 << 20;
 /// Largest width or height of a `frame-size` / `crop-rect`.
 pub const MAX_FRAME_DIMENSION: u32 = 8192;
 /// Highest `max-framerate` filter value or inference-tap `fps`.
@@ -30,6 +32,8 @@ pub enum PipelineError {
     TooManySinks(usize),
     #[error("inference tap has {0} preprocessing steps; at most {MAX_PREPROCESSING_STEPS} allowed")]
     TooManyPreprocessingSteps(usize),
+    #[error("pipe write of {0} bytes exceeds {MAX_PIPE_WRITE_BYTES}")]
+    PipeWriteTooLarge(usize),
     #[error("frame size {width}x{height} is outside 1..={MAX_FRAME_DIMENSION} per side")]
     FrameSize { width: u32, height: u32 },
     #[error("crop rectangle does not fit inside the {frame_width}x{frame_height} frame")]
@@ -62,6 +66,15 @@ pub fn validate_pipeline_size(steps: usize, sinks: usize) -> Result<(), Pipeline
 pub fn validate_preprocessing_len(steps: usize) -> Result<(), PipelineError> {
     if steps > MAX_PREPROCESSING_STEPS {
         Err(PipelineError::TooManyPreprocessingSteps(steps))
+    } else {
+        Ok(())
+    }
+}
+
+/// Check the length of one `pipe-writer.write` chunk.
+pub fn validate_pipe_write_len(len: usize) -> Result<(), PipelineError> {
+    if len > MAX_PIPE_WRITE_BYTES {
+        Err(PipelineError::PipeWriteTooLarge(len))
     } else {
         Ok(())
     }
@@ -189,6 +202,16 @@ mod tests {
             Err(PipelineError::TooManyPreprocessingSteps(
                 MAX_PREPROCESSING_STEPS + 1
             ))
+        );
+    }
+
+    #[test]
+    fn pipe_write_len() {
+        assert_eq!(validate_pipe_write_len(0), Ok(()));
+        assert_eq!(validate_pipe_write_len(MAX_PIPE_WRITE_BYTES), Ok(()));
+        assert_eq!(
+            validate_pipe_write_len(MAX_PIPE_WRITE_BYTES + 1),
+            Err(PipelineError::PipeWriteTooLarge(MAX_PIPE_WRITE_BYTES + 1))
         );
     }
 

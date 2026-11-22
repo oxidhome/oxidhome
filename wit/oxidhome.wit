@@ -653,8 +653,9 @@ interface media {
   /// smuggle a scheme, userinfo, or a second authority into it.
   record network-endpoint {
     security: transport-security,
-    /// DNS name (LDH labels, at most 253 bytes) or IP literal, with IPv6
-    /// written without brackets. No scheme, userinfo, port, or path.
+    /// DNS name (LDH labels, at most 253 bytes, last label not a decimal
+    /// or `0x` hex number) or IP literal, with IPv6 written without
+    /// brackets or zone id. No scheme, userinfo, port, or path.
     host: string,
     /// TCP port. `none` uses the scheme default (554 for `rtsp://`,
     /// 322 for `rtsps://`, 80 for `http://`, 443 for `https://`).
@@ -680,7 +681,8 @@ interface media {
   /// check:
   ///
   /// - always denies unspecified, broadcast, multicast, and reserved
-  ///   addresses;
+  ///   addresses (for IPv6, anything outside global unicast `2000::/3`
+  ///   and the classes below, plus special-purpose blocks inside it);
   /// - denies loopback, link-local, and private addresses (RFC 1918,
   ///   100.64.0.0/10 shared address space, IPv6 unique-local) unless the
   ///   plugin's manifest grant allows that address class;
@@ -914,7 +916,8 @@ interface media {
   /// into this; the host's pipeline consumes them.
   resource pipe-writer {
     /// Write a chunk of pre-framed bytes (matching the format declared in
-    /// the plugin-pipe-config). Returns bytes written.
+    /// the plugin-pipe-config). At most 1 MiB per call. Returns bytes
+    /// written.
     write: func(data: list<u8>) -> result<u64, error>;
     /// Signal end-of-stream and close.
     close: func();

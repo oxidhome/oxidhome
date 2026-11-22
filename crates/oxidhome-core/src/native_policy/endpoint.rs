@@ -101,9 +101,9 @@ pub enum EndpointError {
 ///
 /// `host` is a DNS name or an IP literal (IPv6 without brackets or zone
 /// id). A DNS name is LDH labels of 1–63 bytes, not starting or ending
-/// with `-`, and its last label must start with a letter — so numeric
-/// forms such as `127.1` or `0x7f.1`, which some resolvers treat as IPv4
-/// addresses, can't pose as names.
+/// with `-`, and its last label must not be a decimal or `0x` hex number
+/// — so numeric forms such as `127.1` or `0x7f.1`, which URL parsers and
+/// `inet_aton` treat as IPv4 addresses, can't pose as names.
 pub fn validate_endpoint(host: &str, port: Option<u16>, path: &str) -> Result<(), EndpointError> {
     validate_host(host)?;
     if port == Some(0) {
@@ -136,10 +136,21 @@ fn validate_host(host: &str) -> Result<(), EndpointError> {
         }
         last = label;
     }
-    if !last.starts_with(|c: char| c.is_ascii_alphabetic()) {
+    if is_numeric_label(last) {
         return Err(EndpointError::InvalidHost);
     }
     Ok(())
+}
+
+/// A decimal or `0x` hex number. A host whose last label is one is
+/// parsed as an IPv4 address by URL parsers and `inet_aton` (`127.1`,
+/// `0x7f.1`, `2130706433`), so it can't be accepted as a name.
+fn is_numeric_label(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    match lower.strip_prefix("0x") {
+        Some(hex) => hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => lower.bytes().all(|b| b.is_ascii_digit()),
+    }
 }
 
 fn validate_path(path: &str) -> Result<(), EndpointError> {
@@ -236,25 +247,22 @@ fn classify_v6(ip: Ipv6Addr) -> AddressClass {
     let seg = ip.segments();
     match seg {
         [0, 0, 0, 0, 0, 0, 0, 1] => AddressClass::Loopback,
-        // `::` and the deprecated IPv4-compatible `::/96`; IETF protocol
-        // assignments 2001::/23 (Teredo, benchmarking, ORCHID, ...);
-        // documentation 2001:db8::/32 and 3fff::/20; discard 100::/64;
-        // SRv6 SIDs 5f00::/16.
-        [0, 0, 0, 0, 0, 0, _, _]
-        | [0x2001, 0..=0x1ff | 0xdb8, ..]
-        | [0x3fff, 0..=0x0fff, ..]
-        | [0x100, 0, 0, 0, ..]
-        | [0x5f00, ..] => AddressClass::Forbidden,
+        // Special-purpose blocks inside global unicast: IETF protocol
+        // assignments 2001::/23 (Teredo, benchmarking, ORCHID, ...) and
+        // documentation 2001:db8::/32 and 3fff::/20.
+        [0x2001, 0..=0x1ff | 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..] => AddressClass::Forbidden,
         // NAT64 local-use prefix (RFC 8215): a site-local translator.
         [0x64, 0xff9b, 1, ..] => AddressClass::Private,
         [s0, ..] => match s0 {
-            // Multicast ff00::/8.
-            0xff00..=0xffff => AddressClass::Forbidden,
             // Link-local fe80::/10.
             0xfe80..=0xfebf => AddressClass::LinkLocal,
             // Unique-local fc00::/7 and deprecated site-local fec0::/10.
             0xfc00..=0xfdff | 0xfec0..=0xfeff => AddressClass::Private,
-            _ => AddressClass::Public,
+            // Global unicast 2000::/3. Everything else is unassigned or
+            // reserved: `::`, IPv4-compatible `::/96`, discard 100::/64,
+            // SRv6 5f00::/16, multicast ff00::/8, ...
+            0x2000..=0x3fff => AddressClass::Public,
+            _ => AddressClass::Forbidden,
         },
     }
 }
@@ -331,7 +339,12 @@ mod tests {
         assert_eq!(class("3fff:1000::1"), AddressClass::Public);
         assert_eq!(class("5f00::1"), AddressClass::Forbidden);
         assert_eq!(class("100::1"), AddressClass::Forbidden);
-        assert_eq!(class("100:0:0:1::1"), AddressClass::Public);
+        assert_eq!(class("100:0:0:1::1"), AddressClass::Forbidden);
+        // Outside global unicast 2000::/3: unassigned / reserved.
+        assert_eq!(class("4000::1"), AddressClass::Forbidden);
+        assert_eq!(class("1::1"), AddressClass::Forbidden);
+        assert_eq!(class("fe00::1"), AddressClass::Forbidden);
+        assert_eq!(class("2000::1"), AddressClass::Public);
     }
 
     #[test]
@@ -398,7 +411,15 @@ mod tests {
             link_local: true,
             private: true,
         };
-        for ip in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "::", "ff02::1"] {
+        for ip in [
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "ff02::1",
+            "4000::1",
+            "fe00::1",
+        ] {
             assert_eq!(
                 check_resolved_addr(addr(ip), all),
                 Err(EndpointError::AddressDenied {
@@ -435,6 +456,10 @@ mod tests {
             "fe80::1",
             "2001:db8::5",
             "a",
+            "3d-camera",
+            "1cam.lan",
+            "cam.1x",
+            "0xcam",
         ] {
             assert_eq!(
                 validate_endpoint(host, Some(554), "/stream1"),
@@ -475,6 +500,8 @@ mod tests {
             "0x7f.1",
             "2130706433",
             "cam.123",
+            "0X7F000001",
+            "0x",
             &format!("{}.lan", "a".repeat(64)),
         ] {
             assert_eq!(

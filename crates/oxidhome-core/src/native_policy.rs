@@ -18,8 +18,8 @@
 //! - [`endpoint`]: `network-endpoint` syntax and the resolved-address
 //!   policy (applied on every connection and every redirect hop).
 //! - [`names`]: sink, recording-profile, and model name grammar.
-//! - [`pipeline`]: pipeline-size, frame, frame-rate, audio, encoder, and
-//!   normalize bounds.
+//! - [`pipeline`]: pipeline-size, pipe-write, frame, frame-rate, audio,
+//!   encoder, and normalize bounds.
 //! - [`tensor`]: tensor rank, shape, element-count, and byte limits with
 //!   overflow-checked arithmetic.
 

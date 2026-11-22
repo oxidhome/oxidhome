@@ -130,7 +130,7 @@ Native media and inference run inside the host process, not in out-of-process wo
 
 - **Network sources.** The host resolves the endpoint's host itself and checks every resolved address — and every redirect hop, at most 5 and never TLS → plaintext — before connecting to exactly the address it checked. Loopback, link-local, and private ranges are denied unless the plugin's grant allows that class; unspecified, multicast, broadcast, and reserved addresses are always denied. IPv6 addresses that embed IPv4 (mapped, NAT64, 6to4) are classified by the embedded address.
 - **Names.** Sink names, recording profiles, and model names are `[a-z0-9_-]{1,64}`; model versions are `[A-Za-z0-9.+-]{1,32}` without `..`. None is ever used as a path.
-- **Pipeline bounds.** At most 32 steps, 8 sinks, and 8 preprocessing steps per inference tap; frame sizes 1–8192 per side; frame rates finite, in (0, 120].
+- **Pipeline bounds.** At most 32 steps, 8 sinks, and 8 preprocessing steps per inference tap; at most 1 MiB per `pipe-writer.write`; frame sizes 1–8192 per side; frame rates finite, in (0, 120].
 - **Tensors.** Rank ≤ 8, every dimension ≥ 1, ≤ 2^26 elements and ≤ 64 MiB per tensor, data length exactly elements × element width, ≤ 16 tensors and ≤ 256 MiB per `infer` call — computed with overflow-checked arithmetic, on inputs and on model outputs.
 
 The WIT `media` and `inference` doc comments are the contract for these rules; `oxidhome_core::native_policy` implements them as unit-tested helpers. They aren't called yet because no pipeline or inference runtime exists — Phases 9 (media) and 10 (inference) run them before handing anything to native code.
