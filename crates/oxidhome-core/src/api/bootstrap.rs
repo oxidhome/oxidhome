@@ -325,7 +325,7 @@ fn stale_subject(secret: &str) -> String {
 /// Which existing tokens [`recover_admin_token`] revokes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RevokeScope {
-    /// Revoke every active token labelled [`ADMIN_TOKEN_LABEL`] —
+    /// Revoke every active token labelled `ADMIN_TOKEN_LABEL` —
     /// the previous bootstrap / recovery tokens. Other tokens keep
     /// working.
     #[default]
@@ -616,6 +616,8 @@ fn record_intent(
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+        call_id: None,
+        invocation: None,
     };
     // Durable: every caller follows the intent with a durable
     // filesystem or token change that must not outlive its evidence.

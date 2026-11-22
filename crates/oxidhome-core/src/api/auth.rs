@@ -61,7 +61,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::auth::Actor;
+use crate::auth::{Actor, InvocationContext, Principal};
 use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
 use crate::state::{
     AuditEntry, AuditLog, TokenError, TokenRecord, TokenStore, credential_fingerprint,
@@ -151,9 +151,9 @@ pub(crate) struct AuthState {
     /// scope check passes and no dispatch site reads the
     /// constraint / field).
     ///
-    /// In 14.4a every transport passes `&[]`: no dispatch
-    /// site consumes constraints yet, so *every*
-    /// constraint-bearing token is refused. Each per-tool
+    /// In 14.4a every transport passed `&[]`: no dispatch
+    /// site consumed constraints yet, so *every*
+    /// constraint-bearing token was refused. Each per-tool
     /// enforcement slice adds its own entry to the transport
     /// that consumes it, atomically with wiring the
     /// dispatch-site check — 14.4b adds `("device.send_command",
@@ -162,7 +162,10 @@ pub(crate) struct AuthState {
     /// on MCP; 14.4d adds `plugins.install` with `plugins`
     /// (enforced inside `installed_plugins::install_gated`
     /// against the manifest-derived id before any FS or SQL
-    /// side effect).
+    /// side effect). H6 adds
+    /// [`crate::auth::DEVICE_COMMAND_ENFORCED`] to REST and
+    /// Connect, whose device-command handlers call the shared
+    /// [`crate::auth::authorize_device_command`].
     ///
     /// Round-6 P1 on PR #147 replaced the per-key-only set
     /// with per-(key, field) entries — a plain key set would
@@ -172,6 +175,10 @@ pub(crate) struct AuthState {
     /// the constraint would be inert and the actor would have
     /// unrestricted device access.
     pub enforced_constraints: &'static [crate::auth::EnforcedConstraint],
+    /// Transport this mount serves (H6). Recorded on the root
+    /// [`crate::auth::Principal`] of every invocation the middleware
+    /// mints.
+    pub transport: crate::auth::Transport,
 }
 
 /// Axum middleware. Wired via `axum::middleware::from_fn_with_state`
@@ -268,7 +275,7 @@ pub(crate) async fn require_token(
         None => state.tokens.verify(&bearer),
     };
 
-    let (token_id, actor_kind) = match verify_result {
+    let (token_id, actor_kind, invocation) = match verify_result {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
             // Round-3 P1 on PR #147: a token whose policy blob
@@ -312,14 +319,25 @@ pub(crate) async fn require_token(
                     execution_outcome: None,
                     domain_error: None,
                     credential_fp: None,
+                    call_id: None,
+                    invocation: None,
                 };
                 record_authenticated_denial(&state.audit_log, inflight.as_ref(), entry).await;
                 return (StatusCode::FORBIDDEN, "").into_response();
             }
             let token_id = actor.id().to_string();
             let actor_kind = actor.kind().as_str().to_string();
+            // H6: one invocation per authenticated request. Handlers
+            // that dispatch into plugins hand it to the supervisor so
+            // the root principal survives into downstream host calls.
+            let invocation = InvocationContext::external(Principal::token(
+                actor.kind(),
+                &actor,
+                state.transport,
+            ));
+            req.extensions_mut().insert(invocation.clone());
             req.extensions_mut().insert(actor);
-            (token_id, actor_kind)
+            (token_id, actor_kind, invocation)
         }
         Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
             // Malformed / unknown / revoked — record the probe with
@@ -360,6 +378,8 @@ pub(crate) async fn require_token(
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+        call_id: Some(invocation.call_id().to_owned()),
+        invocation: Some(invocation.audit_json()),
     };
     let audit_id = match record_intent_blocking(&state.audit_log, intent, inflight.as_ref()).await {
         Ok(id) => id,
@@ -465,6 +485,8 @@ async fn try_best_effort_probe(
         execution_outcome: None,
         domain_error: None,
         credential_fp,
+        call_id: None,
+        invocation: None,
     };
     let al = Arc::clone(audit_log);
     // Round-7 P2 on PR #140: preserve the original
@@ -706,6 +728,8 @@ pub(super) async fn record_anonymous_probe(
         execution_outcome: None,
         domain_error: None,
         credential_fp,
+        call_id: None,
+        invocation: None,
     };
     let al = Arc::clone(audit_log);
     let join = tokio::task::spawn_blocking(move || al.record_completed(&entry)).await;

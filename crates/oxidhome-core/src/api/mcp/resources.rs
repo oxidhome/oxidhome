@@ -718,6 +718,8 @@ fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> Audit
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+        call_id: None,
+        invocation: None,
     }
 }
 

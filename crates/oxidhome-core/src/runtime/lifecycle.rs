@@ -35,9 +35,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use crate::Engine;
+use crate::auth::invocation::{self, InvocationContext};
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
-use crate::runtime::dispatcher::{CALL_STACK, CallFrame};
 use crate::state::CallGuard;
 
 use super::instance::{InitError, PluginInstance};
@@ -158,18 +158,25 @@ fn classify_post_init_trap(err: &anyhow::Error) -> TrapReason {
 #[derive(Debug)]
 enum ControlCommand {
     /// Run the plugin's `execute-command` for a device it owns.
+    /// `ctx` is the invocation the command belongs to (H6); the
+    /// supervisor scopes it on its task while the wasm runs and
+    /// refuses the command if its deadline has passed by the time it
+    /// is dequeued.
     Execute {
+        ctx: InvocationContext,
         device: DeviceId,
         cmd: Command,
         reply: oneshot::Sender<anyhow::Result<CommandResult>>,
     },
     /// Run the plugin's `execute-service-command` on a service it owns
     /// — the dispatcher hops to this on the owner's supervisor task so
-    /// the single-`Store` contract holds. `chain` is the full
+    /// the single-`Store` contract holds. `ctx` is the callee's
+    /// invocation context, whose delegation chain is the full
     /// in-flight `call-service` chain (caller's parent chain + the
-    /// frame for this call); the supervisor scopes it on its task
+    /// hop for this call); the supervisor scopes it on its task
     /// before driving the wasm so nested `call-service`s from inside
-    /// `execute-service-command` see the full chain for cycle checks.
+    /// `execute-service-command` see the full chain for cycle checks
+    /// and inherit the root principal and deadline (H6).
     ///
     /// `guard` is the [`CallGuard`] the dispatcher acquired before
     /// sending the message. It rides with the work so the in-flight
@@ -179,7 +186,7 @@ enum ControlCommand {
     /// channel closes before the supervisor consumes it. Nothing
     /// *reads* it — `Drop` does the decrement.
     ExecuteService {
-        chain: Vec<CallFrame>,
+        ctx: InvocationContext,
         guard: CallGuard,
         service: ServiceId,
         command: String,
@@ -345,7 +352,9 @@ impl InstanceHandle {
         }
     }
 
-    /// Run the plugin's `execute-command` for `device`.
+    /// Run the plugin's `execute-command` for `device` as a
+    /// host-origin invocation (no external principal, no deadline).
+    /// External entry points use [`Self::execute_command_in`].
     ///
     /// # Errors
     ///
@@ -357,9 +366,34 @@ impl InstanceHandle {
         device: DeviceId,
         cmd: Command,
     ) -> anyhow::Result<CommandResult> {
+        let ctx = InvocationContext::host_origin(&self.instance_id);
+        self.execute_command_in(ctx, device, cmd).await
+    }
+
+    /// Run the plugin's `execute-command` for `device` on behalf of
+    /// `ctx` (H6). The supervisor installs `ctx` while the wasm runs,
+    /// so a `call-service` the plugin makes is attributed to `ctx`'s
+    /// root principal and bounded by its deadline.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::execute_command`]; additionally `Err` when `ctx`'s
+    /// deadline passed before the supervisor dequeued the command (the
+    /// plugin is not invoked).
+    pub async fn execute_command_in(
+        &self,
+        ctx: InvocationContext,
+        device: DeviceId,
+        cmd: Command,
+    ) -> anyhow::Result<CommandResult> {
         let (reply, rx) = oneshot::channel();
         self.control
-            .send(ControlCommand::Execute { device, cmd, reply })
+            .send(ControlCommand::Execute {
+                ctx,
+                device,
+                cmd,
+                reply,
+            })
             .await
             .map_err(|_| {
                 anyhow!(
@@ -380,9 +414,10 @@ impl InstanceHandle {
     /// always hops to the *owner*'s supervisor task so the
     /// single-`Store` contract holds.
     ///
-    /// `chain` is the full in-flight `call-service` chain leading to
-    /// this call; the callee's supervisor scopes it on its own task
-    /// before invoking the wasm, so cycle detection works across the
+    /// `ctx` is the callee's invocation context (its chain is the full
+    /// in-flight `call-service` chain leading to this call); the
+    /// callee's supervisor scopes it on its own task before invoking
+    /// the wasm, so cycle detection and root attribution survive the
     /// task hop.
     ///
     /// **Caller blocking note.** The caller's supervisor task is
@@ -399,7 +434,7 @@ impl InstanceHandle {
     /// `Ok(CommandResult::Err(..))`.
     pub(crate) async fn execute_service_command(
         &self,
-        chain: Vec<CallFrame>,
+        ctx: InvocationContext,
         guard: CallGuard,
         service: ServiceId,
         command: String,
@@ -413,7 +448,7 @@ impl InstanceHandle {
         // on the supervisor-gone path.
         self.control
             .send(ControlCommand::ExecuteService {
-                chain,
+                ctx,
                 guard,
                 service,
                 command,
@@ -1195,8 +1230,28 @@ async fn handle_control(
                 Err(err) => Ok(LoopAction::StopFailed(format!("shutdown trapped: {err:#}"))),
             }
         }
-        Some(ControlCommand::Execute { device, cmd, reply }) => {
-            match instance.execute_command(device, cmd).await {
+        Some(ControlCommand::Execute {
+            ctx,
+            device,
+            cmd,
+            reply,
+        }) => {
+            // H6: the root gave up (or its budget ran out while the
+            // command sat in this queue). Running it now would actuate
+            // a device nobody is waiting on any more.
+            if ctx.is_expired() {
+                let _ = reply.send(Err(anyhow!(
+                    "instance `{instance_id}` refused execute-command: invocation `{}` \
+                     deadline exceeded before dispatch",
+                    ctx.call_id(),
+                )));
+                return Ok(LoopAction::Continue);
+            }
+            let ctx = ctx.entering(instance_id);
+            let outcome = invocation::CURRENT
+                .scope(ctx, instance.execute_command(device, cmd))
+                .await;
+            match outcome {
                 Ok(result) => {
                     let _ = reply.send(Ok(result));
                     Ok(LoopAction::Continue)
@@ -1212,14 +1267,14 @@ async fn handle_control(
             }
         }
         Some(ControlCommand::ExecuteService {
-            chain,
+            ctx,
             guard,
             service,
             command,
             args,
             reply,
         }) => {
-            // Scope `CALL_STACK` to the chain handed to us by the
+            // Scope the invocation context handed to us by the
             // caller's dispatcher *on this supervisor's task*. That's
             // how cycle detection survives the task hop: any nested
             // `host::call_service` from inside the wasm we're about
@@ -1234,9 +1289,22 @@ async fn handle_control(
             // wasm finishes inside the `scope(...).await` above the
             // drop, so the drop happens strictly after the work is
             // done.)
-            let outcome = CALL_STACK
+            //
+            // H6: a hop whose deadline already passed is dropped
+            // unexecuted — the caller's dispatcher has stopped
+            // waiting for it.
+            if ctx.is_expired() {
+                drop(guard);
+                let _ = reply.send(Err(anyhow!(
+                    "instance `{instance_id}` refused execute-service-command: invocation \
+                     `{}` deadline exceeded before dispatch",
+                    ctx.call_id(),
+                )));
+                return Ok(LoopAction::Continue);
+            }
+            let outcome = invocation::CURRENT
                 .scope(
-                    chain,
+                    ctx,
                     instance.execute_service_command(service, command, args),
                 )
                 .await;

@@ -424,6 +424,10 @@ pub struct PluginState {
     /// the target's owner through `services.get_any(...)` and then
     /// looks up that owner's handle here to dispatch.
     pub instances: Arc<InstanceRegistry>,
+    /// Audit ledger for delegated `call-service` hops of
+    /// externally-rooted invocations (H6). `None` for low-level
+    /// test states; the loader sets it via [`Self::with_audit_log`].
+    pub audit_log: Option<Arc<crate::state::AuditLog>>,
     /// Per-instance wake `Notify` — C2d wake-isolation. Signaled by
     /// the [`EventBus`] every time a published event matches one
     /// of this plugin's active subscription filters. The
@@ -515,6 +519,7 @@ impl PluginState {
             blobs,
             services,
             instances,
+            audit_log: None,
             subscriptions: Vec::new(),
             manifest,
             actor,
@@ -538,6 +543,14 @@ impl PluginState {
         granted: Arc<oxidhome_manifest::CapabilitiesSection>,
     ) -> Self {
         self.granted_capabilities = granted;
+        self
+    }
+
+    /// H6: attach the audit ledger that records delegated
+    /// `call-service` hops made on behalf of external principals.
+    #[must_use]
+    pub fn with_audit_log(mut self, audit_log: Arc<crate::state::AuditLog>) -> Self {
+        self.audit_log = Some(audit_log);
         self
     }
 }
@@ -1160,6 +1173,7 @@ impl host_services::Host for PluginState {
         crate::runtime::dispatcher::call_service(
             &self.services,
             &self.instances,
+            self.audit_log.as_ref(),
             self.instance_id.clone(),
             &self.consumes_services_requested,
             &self.granted_capabilities.consumes_services,

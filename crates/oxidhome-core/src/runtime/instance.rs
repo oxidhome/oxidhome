@@ -845,7 +845,8 @@ impl PluginInstance {
             engine.services(),
             engine.instances(),
         )
-        .with_granted_capabilities(granted_capabilities);
+        .with_granted_capabilities(granted_capabilities)
+        .with_audit_log(engine.audit_log());
         let mut store = Store::new(engine.raw(), state);
         // C4: install the wasmtime resource limiter so linear-memory
         // grows / table extensions / additional instance/memory/table
@@ -994,6 +995,11 @@ impl PluginInstance {
         let data = self.store.data();
         let span = info_span!(
             "plugin.execute_command",
+            // H6: the invocation the supervisor scoped around this
+            // call (empty for direct, unsupervised calls).
+            call_id = crate::auth::invocation::current()
+                .map(|c| c.call_id().to_owned())
+                .unwrap_or_default(),
             instance_id = %data.instance_id,
             plugin_id = %data.manifest.plugin.id,
             device_id = %device,
@@ -1169,6 +1175,9 @@ impl PluginInstance {
         let data = self.store.data();
         let span = info_span!(
             "plugin.execute_service_command",
+            call_id = crate::auth::invocation::current()
+                .map(|c| c.call_id().to_owned())
+                .unwrap_or_default(),
             instance_id = %data.instance_id,
             plugin_id = %data.manifest.plugin.id,
             service_id = %service,

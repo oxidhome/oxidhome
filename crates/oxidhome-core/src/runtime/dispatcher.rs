@@ -8,14 +8,18 @@
 //!
 //! ## Recursion-stack design (cross-task)
 //!
-//! Each supervisor task has its own `tokio::task_local` `CALL_STACK`
-//! holding the chain of in-flight `call-service` invocations *that
-//! led to whatever wasm it is currently driving*. The dispatcher:
+//! Each supervisor task scopes the [`InvocationContext`] of the wasm it
+//! is currently driving in a `tokio::task_local`
+//! (`crate::auth::invocation::CURRENT`). The context's delegation
+//! chain is the chain of in-flight `call-service` invocations *that led
+//! to that wasm* (H6 folded the former `CALL_STACK` into it, so the
+//! root principal, call id and deadline travel with the same value).
+//! The dispatcher:
 //!
 //! 1. Resolves `target_service` → `target_instance` via the engine's
 //!    [`ServiceRegistry`].
-//! 2. Reads the *parent* chain from `CALL_STACK` (unset on outermost
-//!    calls — treated as empty) and runs the cycle check:
+//! 2. Reads the *parent* chain from the current context (unset on
+//!    host-origin calls — treated as empty) and runs the cycle check:
 //!    **reject if `target_instance` would dispatch to a supervisor
 //!    that is already parked awaiting a reply.** A supervisor is
 //!    parked exactly while it is the `caller_instance` in some
@@ -36,14 +40,16 @@
 //!    future — so a dispatcher-side timeout can't release the
 //!    refcount while the supervisor is still about to run the
 //!    handler.
-//! 5. Builds `chain = parent_chain ++ [(caller, target_instance,
-//!    target_service)]` and hands it through `ControlCommand::ExecuteService`
-//!    to the owner's supervisor. The owner's supervisor **scopes
-//!    `CALL_STACK` to that chain on its own task** before invoking
+//! 5. Derives the callee context (`parent.delegate(hop)`, i.e. the
+//!    parent chain plus this hop) and hands it through
+//!    `ControlCommand::ExecuteService` to the owner's supervisor. The
+//!    owner's supervisor **scopes that context on its own task** before
+//!    invoking
 //!    `instance.execute_service_command(...)`, so any nested
 //!    `host::call_service` from inside the callee's wasm reads the
 //!    full chain and the cycle check works across the task hop.
-//! 6. Races the reply against `DISPATCH_TIMEOUT` and returns the
+//! 6. Races the reply against `DISPATCH_TIMEOUT` (clamped to the
+//!    invocation's remaining deadline) and returns the
 //!    result. The guard is owned by the supervisor's match arm at
 //!    this point and drops there when the wasm call returns (or when
 //!    the message is dropped without being processed — e.g. on
@@ -80,44 +86,27 @@
 //! bypass or shadow a grant. The gate runs before `acquire_call`,
 //! so a refused call spends no refcount and cannot influence
 //! `remove-service` timing.
+//!
+//! **Delegation audit (H6)**: when the invocation is rooted at an
+//! external principal (REST / Connect / MCP), every hop is written to
+//! the audit ledger with the root's `token_id` / `actor_kind`, the
+//! root's `call_id`, and the context JSON (root, executing actor,
+//! chain). Allowed hops use the same two-phase intent/finalize contract
+//! as API requests and fail closed if the intent cannot be written;
+//! grant refusals are single-shot `deny` rows. Host-origin chains
+//! (`init`, `tick`, `on-event`) are traced but not audited.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use oxidhome_manifest::ServiceGrant;
-use tokio::task_local;
 
+use crate::auth::invocation::{self, DelegationHop, InvocationContext};
 use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, ServiceId};
-use crate::state::ServiceRegistry;
+use crate::state::{AuditEntry, AuditLog, ServiceRegistry};
 
 use super::registry::InstanceRegistry;
-
-/// One frame on the recursion stack. `caller_instance` is the unit
-/// of cycle detection (a parked-supervisor identifier — see
-/// [`call_service`]); the other fields are kept for diagnostics and
-/// for the Phase-12+ structured trace surface (audit-log per
-/// `call-service` hop) that will consume them.
-#[derive(Debug, Clone)]
-pub(crate) struct CallFrame {
-    pub caller_instance: String,
-    #[allow(dead_code)] // diagnostic / future audit-log field
-    pub target_instance: String,
-    #[allow(dead_code)] // diagnostic / future audit-log field
-    pub target_service: ServiceId,
-}
-
-task_local! {
-    /// Chain of in-flight `call-service` invocations on the current
-    /// tokio task. Outermost first. Unset / empty ⇒ no service call
-    /// in progress (the normal case for `init`, `tick`,
-    /// `execute-command`, `on-event` entry points).
-    ///
-    /// `pub(crate)` so the supervisor (in [`super::lifecycle`]) can
-    /// re-scope it when receiving a `ControlCommand::ExecuteService`
-    /// — that's how the chain rides across the task boundary.
-    pub(crate) static CALL_STACK: Vec<CallFrame>;
-}
 
 /// Per-dispatcher-call wall-clock timeout. Independent of the
 /// per-call liveness watchdog (which lives on the *callee's* store
@@ -134,13 +123,21 @@ task_local! {
 /// supervisor (inside `ControlCommand::ExecuteService`), so the
 /// refcount only drops once the supervisor finishes the wasm —
 /// `remove-service` can't succeed mid-handler.
+///
+/// An externally-rooted invocation additionally clamps this to its
+/// remaining deadline (H6).
+///
+/// [`CallGuard`]: crate::state::CallGuard
 pub(crate) const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Audit `method` for a delegated `call-service` hop.
+pub const SERVICE_CALL_AUDIT_METHOD: &str = "CALL";
 
 /// Public test-only entry point. The `host-services::call-service`
 /// path runs from inside a wasm `execute-service-command`; an
 /// integration test that wants to drive the dispatcher from the
 /// outside (e.g. to set up a cross-instance call chain) goes
-/// through here.
+/// through here. Runs as a host-origin invocation.
 ///
 /// **Not** a stable API — the `dispatcher` module is otherwise
 /// `pub(crate)`. Keep this thin so the regular `call_service` path
@@ -157,9 +154,11 @@ pub async fn call_service_from_host(
 ) -> Result<CommandResult, WitError> {
     let services = engine.services();
     let instances = engine.instances();
+    let audit = engine.audit_log();
     call_service(
         &services,
         &instances,
+        Some(&audit),
         caller_instance.into(),
         caller_requested_grants,
         caller_granted_grants,
@@ -168,6 +167,37 @@ pub async fn call_service_from_host(
         args,
     )
     .await
+}
+
+/// [`call_service_from_host`] run under an explicit
+/// [`InvocationContext`] — lets tests drive a delegated chain on behalf
+/// of an external principal. Same stability caveat.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn call_service_from_host_in(
+    engine: &crate::Engine,
+    ctx: InvocationContext,
+    caller_instance: impl Into<String>,
+    caller_requested_grants: &[ServiceGrant],
+    caller_granted_grants: &[ServiceGrant],
+    target: ServiceId,
+    command: impl Into<String>,
+    args: Vec<KeyValue>,
+) -> Result<CommandResult, WitError> {
+    invocation::CURRENT
+        .scope(
+            ctx,
+            call_service_from_host(
+                engine,
+                caller_instance,
+                caller_requested_grants,
+                caller_granted_grants,
+                target,
+                command,
+                args,
+            ),
+        )
+        .await
 }
 
 /// Entry point for the `host-services::call-service` host impl.
@@ -190,10 +220,14 @@ pub async fn call_service_from_host(
 /// grant lists against the target's `(owner_plugin_id,
 /// owner_instance, local_id, command)`, and hops to the owning
 /// instance's supervisor via `instances`.
-#[allow(clippy::too_many_arguments)]
+///
+/// `audit` receives one row per hop of an externally-rooted invocation
+/// (H6); `None` disables hop auditing (unit tests only).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn call_service(
     services: &Arc<ServiceRegistry>,
     instances: &Arc<InstanceRegistry>,
+    audit: Option<&Arc<AuditLog>>,
     caller_instance: String,
     caller_requested_grants: &[ServiceGrant],
     caller_granted_grants: &[ServiceGrant],
@@ -211,14 +245,19 @@ pub(crate) async fn call_service(
         .get_owner_plugin_and_local_id(&target)
         .ok_or_else(|| WitError::NotFound(format!("service {target} not registered")))?;
 
+    // H6: the invocation this call is part of. Unset ⇒ the caller's
+    // wasm was entered by the host itself (`init` / `tick` /
+    // `on-event`), so the hop is rooted at the caller instance.
+    let parent = invocation::current_or_host(&caller_instance);
+
     // 2. Cycle detection at instance granularity.
     //
     //    The deadlock condition is: dispatching to a supervisor that
     //    is *currently parked* awaiting a reply from an upstream
     //    `call-service`. A supervisor is parked exactly while it is
-    //    the **caller** in an in-flight frame — its `handle_control`
+    //    the **caller** in an in-flight hop — its `handle_control`
     //    is blocked on the oneshot. So the "blocked" set is the
-    //    `caller_instance` of every frame on the chain *plus* this
+    //    `caller_instance` of every hop on the chain *plus* this
     //    very call's caller (we're about to park them on the oneshot
     //    below). If `target_instance` is in that set, the dispatch
     //    would queue an `ExecuteService` to a supervisor that can't
@@ -230,7 +269,6 @@ pub(crate) async fn call_service(
     //    A→B→…→A case is a genuine cycle. Both stay
     //    `InvalidArgument` on the wire; the distinct messages let
     //    operators and plugin authors tell them apart.
-    let parent_chain: Vec<CallFrame> = CALL_STACK.try_with(Clone::clone).unwrap_or_default();
     if caller_instance == target_instance {
         return Err(WitError::InvalidArgument(format!(
             "same-instance dispatch is not supported: target service `{target}` is \
@@ -239,9 +277,10 @@ pub(crate) async fn call_service(
              going through host-services::call-service"
         )));
     }
-    if parent_chain
+    if parent
+        .chain()
         .iter()
-        .any(|f| f.caller_instance == target_instance)
+        .any(|h| h.caller_instance == target_instance)
     {
         return Err(WitError::InvalidArgument(format!(
             "cycle detected: instance `{target_instance}` is already on the \
@@ -249,6 +288,43 @@ pub(crate) async fn call_service(
              supervisor already parked on a reply would deadlock"
         )));
     }
+
+    let callee_ctx = parent.delegate(DelegationHop {
+        caller_instance: caller_instance.clone(),
+        target_plugin: target_plugin_id.clone(),
+        target_instance: target_instance.clone(),
+        target_service: target_local_id.clone(),
+    });
+    let hop_audit = audit
+        .filter(|_| callee_ctx.root().is_external())
+        .map(|log| HopAudit::new(Arc::clone(log), &callee_ctx, &command));
+
+    // H6: refuse work the root has already given up on — before the
+    // grant gate, so an expired invocation can't queue deny-row
+    // writes either. The budget left also bounds every wait below.
+    let timeout = match callee_ctx.remaining() {
+        Some(r) if r.is_zero() => {
+            return Err(WitError::Unavailable(format!(
+                "call-service to `{target}` refused: invocation `{}` deadline exceeded",
+                callee_ctx.call_id(),
+            )));
+        }
+        Some(r) => r.min(DISPATCH_TIMEOUT),
+        None => DISPATCH_TIMEOUT,
+    };
+    // One absolute bound for everything the caller's supervisor waits
+    // on from here: a deny-row write, or the audit intent write *and*
+    // the dispatch.
+    let wait_until = tokio::time::Instant::now() + timeout;
+    // The caller stops waiting at `wait_until`, so the callee must not
+    // start after it either: fold the cutoff into the callee's deadline,
+    // which its supervisor checks on dequeue (and which bounds any
+    // nested hop the callee makes).
+    let callee_ctx = callee_ctx.with_deadline(Some(
+        callee_ctx
+            .deadline()
+            .map_or(wait_until, |d| d.min(wait_until)),
+    ));
 
     // 3. H10 structured capability gate. Runs before `acquire_call`
     //    so a refused call spends no refcount and cannot influence
@@ -299,6 +375,9 @@ pub(crate) async fn call_service(
             (true, false) => "the operator's granted list does not contain",
             (true, true) => unreachable!("both matched but guard fired"),
         };
+        if let Some(hop_audit) = hop_audit {
+            hop_audit.record_denied(wait_until).await;
+        }
         return Err(WitError::PermissionDenied(format!(
             "caller `{caller_instance}` refused: {failed_clause} a matching \
              `consumes_services` selector for target \
@@ -311,14 +390,44 @@ pub(crate) async fn call_service(
         )));
     }
 
-    // 3. Resolve target instance handle; refuse if it isn't running.
+    // 4. Resolve target instance handle; refuse if it isn't running.
     let target_handle = instances.get(&target_instance).ok_or_else(|| {
         WitError::Unavailable(format!(
             "service `{target}` owner instance `{target_instance}` is not running"
         ))
     })?;
 
-    // 4. Acquire the in-flight refcount. The guard travels in the
+    // H6: two-phase hop audit, fail-closed — the intent row must exist
+    // before the callee can act on the root's behalf.
+    // Bounded by `wait_until`: ledger contention must not hold the
+    // caller past its deadline. A write that lands after we gave up
+    // leaves a `pending` row — evidence of an attempt that never ran.
+    let audit_id = match &hop_audit {
+        Some(hop_audit) => {
+            let intent = tokio::time::timeout_at(wait_until, hop_audit.record_intent())
+                .await
+                .unwrap_or_else(|_| Err("intent write timed out".into()));
+            Some(intent.map_err(|msg| {
+                WitError::Unavailable(format!(
+                    "call-service to `{target}` refused: audit ledger unavailable ({msg})"
+                ))
+            })?)
+        }
+        None => None,
+    };
+    // The intent write may have finished right at the cutoff; don't
+    // enqueue work the caller is about to stop waiting for.
+    if tokio::time::Instant::now() >= wait_until {
+        let outcome = Err(WitError::Unavailable(format!(
+            "call-service to `{target}` refused: hop deadline reached before dispatch",
+        )));
+        if let (Some(hop_audit), Some(id)) = (hop_audit, audit_id) {
+            hop_audit.finalize(id, &outcome);
+        }
+        return outcome;
+    }
+
+    // 5. Acquire the in-flight refcount. The guard travels in the
     //    `ExecuteService` message — the callee's supervisor holds it
     //    across the wasm call and `Drop` decrements when the work
     //    actually finishes. This is what makes the refcount track
@@ -328,32 +437,140 @@ pub(crate) async fn call_service(
     //    handler. If the supervisor's mpsc is closed (send fails),
     //    the `SendError` carries the message back and the guard
     //    drops with it.
-    let guard = services.acquire_call(&target)?;
+    let outcome = match services.acquire_call(&target) {
+        Ok(guard) => {
+            // 6. Hand the callee context (parent chain + this hop) to
+            //    the owner's supervisor, which scopes it on its own
+            //    task so nested `call-service`s see the full chain.
+            let dispatch_future = target_handle.execute_service_command(
+                callee_ctx,
+                guard,
+                target.clone(),
+                command,
+                args,
+            );
+            match tokio::time::timeout_at(wait_until, dispatch_future).await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(trap)) => Err(WitError::Unavailable(format!(
+                    "call-service to `{target}` (owner `{target_instance}`) failed: {trap:#}"
+                ))),
+                Err(_) => Err(WitError::Unavailable(format!(
+                    "call-service to `{target}` (owner `{target_instance}`) timed out after {} ms",
+                    timeout.as_millis(),
+                ))),
+            }
+        }
+        Err(err) => Err(err),
+    };
+    if let (Some(hop_audit), Some(id)) = (hop_audit, audit_id) {
+        hop_audit.finalize(id, &outcome);
+    }
+    outcome
+}
 
-    // 5. Build the chain we'll *hand to the callee*: parent + the
-    //    frame for this call. The callee's supervisor wraps its
-    //    `execute_service_command` in `CALL_STACK::scope(chain, ...)`
-    //    on its own task, so any nested `call-service` from inside
-    //    the callee's wasm sees the full chain (this is how cycle
-    //    detection works across the task hop).
-    let mut chain = parent_chain;
-    chain.push(CallFrame {
-        caller_instance,
-        target_instance: target_instance.clone(),
-        target_service: target.clone(),
-    });
+/// Audit writer for one delegated hop (H6). Built only for
+/// externally-rooted invocations.
+struct HopAudit {
+    log: Arc<AuditLog>,
+    entry: AuditEntry,
+}
 
-    let dispatch_future =
-        target_handle.execute_service_command(chain, guard, target.clone(), command, args);
-    match tokio::time::timeout(DISPATCH_TIMEOUT, dispatch_future).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(trap)) => Err(WitError::Unavailable(format!(
-            "call-service to `{target}` (owner `{target_instance}`) failed: {trap:#}"
-        ))),
-        Err(_) => Err(WitError::Unavailable(format!(
-            "call-service to `{target}` (owner `{target_instance}`) timed out after {} ms",
-            DISPATCH_TIMEOUT.as_millis(),
-        ))),
+impl HopAudit {
+    fn new(log: Arc<AuditLog>, callee_ctx: &InvocationContext, command: &str) -> Self {
+        let root = callee_ctx.root();
+        let hop = callee_ctx
+            .chain()
+            .last()
+            .expect("delegate() always appends a hop");
+        // Every segment is capped: command names come from wasm and
+        // service `local-id`s from `register-service`, neither
+        // otherwise length-bounded.
+        let path = format!(
+            "service.call/{}/{}/{}/{}",
+            invocation::audit_cap(&hop.target_plugin),
+            invocation::audit_cap(&hop.target_instance),
+            invocation::audit_cap(&hop.target_service),
+            invocation::audit_cap(command),
+        );
+        let entry = AuditEntry {
+            id: 0,
+            intent_ms: 0,
+            finalized_ms: None,
+            token_id: root.audit_token_id().to_owned(),
+            actor_kind: root.kind().as_str().to_owned(),
+            method: SERVICE_CALL_AUDIT_METHOD.to_owned(),
+            path,
+            status: 0,
+            decision: "pending".into(),
+            required_scope: None,
+            execution_outcome: None,
+            domain_error: None,
+            credential_fp: None,
+            call_id: Some(callee_ctx.call_id().to_owned()),
+            invocation: Some(callee_ctx.audit_json()),
+        };
+        Self { log, entry }
+    }
+
+    /// Single-shot `deny` row. Awaited (up to `wait_until`) rather than
+    /// detached: a refused call returns instantly, so without the wait
+    /// a plugin looping on refused calls could queue blocking ledger
+    /// writes without bound. The refusal itself never depends on the
+    /// write.
+    async fn record_denied(self, wait_until: tokio::time::Instant) {
+        let Self { log, mut entry } = self;
+        entry.status = 403;
+        entry.decision = "deny".into();
+        entry.required_scope = Some("consumes_services".into());
+        let write = tokio::task::spawn_blocking(move || log.record_completed(&entry));
+        match tokio::time::timeout_at(wait_until, write).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(err))) => {
+                tracing::error!(target: "host.audit", error = %err, "service-call deny row failed");
+            }
+            Ok(Err(err)) => {
+                tracing::error!(target: "host.audit", error = %err, "service-call deny row panicked");
+            }
+            Err(_) => {
+                tracing::warn!(target: "host.audit", "service-call deny row still pending at hop deadline");
+            }
+        }
+    }
+
+    async fn record_intent(&self) -> Result<u64, String> {
+        let log = Arc::clone(&self.log);
+        let entry = self.entry.clone();
+        match tokio::task::spawn_blocking(move || log.record_intent(&entry)).await {
+            Ok(Ok(id)) => Ok(id),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// Best-effort finalize, detached so the caller's supervisor isn't
+    /// held on the ledger after the hop finished (the intent row is
+    /// already the durable evidence).
+    fn finalize(self, id: u64, outcome: &Result<CommandResult, WitError>) {
+        let (status, decision, execution_outcome, domain_error): (u16, &str, _, _) = match outcome {
+            Ok(CommandResult::Ok | CommandResult::OkWithState(_)) => {
+                (200, "allow", Some("success"), None)
+            }
+            Ok(CommandResult::Err(err)) => (
+                200,
+                "allow",
+                Some("failed"),
+                Some(crate::api::wit_error_kind(err)),
+            ),
+            Err(_) => (503, "error", None, None),
+        };
+        let log = self.log;
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) =
+                log.finalize(id, status, decision, None, execution_outcome, domain_error)
+            {
+                tracing::error!(target: "host.audit", error = %err, id, "service-call finalize failed");
+            }
+        });
     }
 }
 
@@ -362,26 +579,20 @@ mod tests {
     use super::*;
     use crate::host_impl::plugin::oxidhome::plugin::services::ServiceInfo;
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn task_local_default_to_empty_when_unset() {
-        // Outside a scope, `try_with` is an Err — covered by the
-        // dispatcher's `try_with(...).unwrap_or_default()` (empty
-        // chain ⇒ no cycle check fires).
-        assert!(CALL_STACK.try_with(Vec::is_empty).is_err());
-        // Inside a scope, the stack is visible.
-        let frame = CallFrame {
-            caller_instance: "a".into(),
-            target_instance: "b".into(),
-            target_service: "svc-1".into(),
-        };
-        CALL_STACK
-            .scope(vec![frame.clone()], async {
-                let on_chain = CALL_STACK
-                    .try_with(|s| s.iter().any(|f| f.target_instance == "b"))
-                    .unwrap_or(false);
-                assert!(on_chain);
-            })
-            .await;
+    /// Chain fixture: a context whose delegation chain holds one hop
+    /// per `(caller, target)` pair.
+    fn ctx_with_chain(pairs: &[(&str, &str)]) -> InvocationContext {
+        pairs.iter().fold(
+            InvocationContext::host_origin("root"),
+            |ctx, (caller, target)| {
+                ctx.delegate(DelegationHop {
+                    caller_instance: (*caller).into(),
+                    target_plugin: "irrelevant".into(),
+                    target_instance: (*target).into(),
+                    target_service: "irrelevant".into(),
+                })
+            },
+        )
     }
 
     fn fixture_info(name: &str) -> ServiceInfo {
@@ -439,6 +650,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &grants,
             &grants,
@@ -479,18 +691,15 @@ mod tests {
         let instances = Arc::new(InstanceRegistry::new());
         let grants = [grant_any("com.example.alpha", "ring", "kick")];
 
-        let chain = vec![CallFrame {
-            caller_instance: "alpha".into(),
-            target_instance: "beta".into(),
-            target_service: "irrelevant".into(),
-        }];
+        let chain = ctx_with_chain(&[("alpha", "beta")]);
 
-        let err = CALL_STACK
+        let err = invocation::CURRENT
             .scope(
                 chain,
                 call_service(
                     &services,
                     &instances,
+                    None,
                     "beta".into(),
                     &grants,
                     &grants,
@@ -530,6 +739,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &[],
             &[],
@@ -554,6 +764,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &wrong_command,
             &wrong_command,
@@ -577,6 +788,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &wrong_instance,
             &wrong_instance,
@@ -601,6 +813,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &wrong_service,
             &wrong_service,
@@ -640,6 +853,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &grants,
             &grants,
@@ -674,24 +888,14 @@ mod tests {
             .expect("register");
         let grants = [grant_any("com.example.delta", "ring", "kick")];
 
-        let chain = vec![
-            CallFrame {
-                caller_instance: "alpha".into(),
-                target_instance: "beta".into(),
-                target_service: "irrelevant".into(),
-            },
-            CallFrame {
-                caller_instance: "beta".into(),
-                target_instance: "gamma".into(),
-                target_service: "irrelevant".into(),
-            },
-        ];
-        let err = CALL_STACK
+        let chain = ctx_with_chain(&[("alpha", "beta"), ("beta", "gamma")]);
+        let err = invocation::CURRENT
             .scope(
                 chain,
                 call_service(
                     &services,
                     &instances,
+                    None,
                     "gamma".into(),
                     &grants,
                     &grants,
@@ -753,6 +957,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &requested_wildcard,
             &granted_get,
@@ -767,6 +972,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &requested_wildcard,
             &granted_get,
@@ -799,6 +1005,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             "alpha".into(),
             &requested_get_only,
             &granted_wildcard,
@@ -810,5 +1017,133 @@ mod tests {
         .expect_err("requested is the ceiling; `set` isn't asked for");
         assert!(matches!(err, WitError::PermissionDenied(_)));
         assert_eq!(services.active_call_count(&target), 0);
+    }
+
+    fn api_root() -> InvocationContext {
+        let actor = crate::auth::Actor::api("tok-root", vec!["*".into()]);
+        InvocationContext::external(crate::auth::Principal::token(
+            crate::auth::ActorKind::Api,
+            &actor,
+            crate::auth::Transport::Rest,
+        ))
+    }
+
+    /// H6: a hop whose invocation deadline already passed is refused
+    /// after the grant gate and before any routing or refcount work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_hop_after_invocation_deadline() {
+        let services = Arc::new(ServiceRegistry::new());
+        let target = services
+            .register(
+                "beta".into(),
+                "com.example.beta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let instances = Arc::new(InstanceRegistry::new());
+        let grants = [grant_any("com.example.beta", "ring", "kick")];
+        let expired = api_root().with_deadline(Some(tokio::time::Instant::now()));
+
+        let err = invocation::CURRENT
+            .scope(
+                expired,
+                call_service(
+                    &services,
+                    &instances,
+                    None,
+                    "alpha".into(),
+                    &grants,
+                    &grants,
+                    target.clone(),
+                    "kick".into(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect_err("expired invocation must be refused");
+        assert!(matches!(err, WitError::Unavailable(_)), "got {err:?}");
+        assert_msg_contains(&err, "deadline exceeded");
+        assert_eq!(services.active_call_count(&target), 0);
+    }
+
+    /// H6: a refused hop of an externally-rooted invocation lands in
+    /// the ledger attributed to the root token, with the root's call id
+    /// and the delegation chain; a host-origin refusal does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn audits_denied_hop_against_external_root_only() {
+        use crate::state::{AuditQuery, Db};
+
+        let services = Arc::new(ServiceRegistry::new());
+        let target = services
+            .register(
+                "beta".into(),
+                "com.example.beta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let instances = Arc::new(InstanceRegistry::new());
+        let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
+
+        // Host-origin: refused, not audited.
+        let _ = call_service(
+            &services,
+            &instances,
+            Some(&audit),
+            "alpha".into(),
+            &[],
+            &[],
+            target.clone(),
+            "kick".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("no grant");
+        // Deny rows are detached writes; give one a chance to land.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(audit.count().unwrap(), 0);
+
+        let root = api_root().entering("alpha");
+        let call_id = root.call_id().to_owned();
+        let _ = invocation::CURRENT
+            .scope(
+                root,
+                call_service(
+                    &services,
+                    &instances,
+                    Some(&audit),
+                    "alpha".into(),
+                    &[],
+                    &[],
+                    target.clone(),
+                    "kick".into(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect_err("no grant");
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = audit.query(&AuditQuery::default(), 10).unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.token_id, "tok-root");
+        assert_eq!(row.actor_kind, "api");
+        assert_eq!(row.method, SERVICE_CALL_AUDIT_METHOD);
+        assert_eq!(row.path, "service.call/com.example.beta/beta/ring/kick");
+        assert_eq!(row.decision, "deny");
+        assert_eq!(row.status, 403);
+        assert_eq!(row.required_scope.as_deref(), Some("consumes_services"));
+        assert_eq!(row.call_id.as_deref(), Some(call_id.as_str()));
+        let inv: serde_json::Value =
+            serde_json::from_str(row.invocation.as_deref().unwrap()).unwrap();
+        assert_eq!(inv["root"]["transport"], "rest");
+        assert_eq!(inv["chain"][0]["caller"], "alpha");
+        assert_eq!(inv["chain"][0]["instance"], "beta");
     }
 }

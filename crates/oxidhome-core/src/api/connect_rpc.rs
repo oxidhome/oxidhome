@@ -315,6 +315,33 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
     ) -> ServiceResult<impl Encodable<ExecuteCommandResponse> + Send + use<'a>> {
         require_scope_connect(&ctx, DEVICES_COMMAND)?;
         let req = request.to_owned_message();
+        // H6: per-device resource check shared with REST and MCP,
+        // before the lookup so a refused token can't probe ids.
+        // `require_scope_connect` already proved the Actor is present.
+        if let Some(actor) = ctx.extensions().get::<Actor>()
+            && let Err(required) = crate::auth::authorize_device_command(actor, &req.device_id)
+        {
+            if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
+                slot.set(HandlerOutcome {
+                    status: Some(axum::http::StatusCode::FORBIDDEN),
+                    denied_scope: Some(Scope::new(required)),
+                    domain_error: None,
+                });
+            }
+            return Err(ConnectError::permission_denied(format!(
+                "scope {required} required"
+            )));
+        }
+        let invocation = ctx
+            .extensions()
+            .get::<crate::auth::InvocationContext>()
+            .cloned()
+            .ok_or_else(|| {
+                rpc_err(
+                    &ctx,
+                    ConnectError::internal("connect handler ran without an invocation context"),
+                )
+            })?;
 
         // Resolve device → owning instance via the same
         // `get_owner` primitive the JSON side uses (single read-
@@ -340,7 +367,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             args: req.args.into_iter().map(proto_key_value_to_wit).collect(),
         };
         let result = handle
-            .execute_command(req.device_id.clone(), cmd)
+            .execute_command_in(invocation, req.device_id.clone(), cmd)
             .await
             .map_err(|err| {
                 tracing::error!(target: "api.devices", error = %err, "device command dispatch failed");
@@ -1174,10 +1201,12 @@ pub fn axum_service(engine: Engine) -> axum::Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // Connect-RPC doesn't consume per-tool constraints
-        // in 14.4a. Empty set → refuse constraint-bearing
-        // tokens. See [`AuthState::enforced_constraints`].
-        enforced_constraints: &[],
+        // H6: `DevicesService.ExecuteCommand` applies the
+        // `device.send_command` per-device allowlist through the
+        // shared `authorize_device_command` check, same as REST and
+        // MCP. Every other constraint key is still refused here.
+        enforced_constraints: &[crate::auth::DEVICE_COMMAND_ENFORCED],
+        transport: crate::auth::Transport::Connect,
     };
     let inner = router(engine).into_axum_service();
     axum::Router::new()
@@ -1229,7 +1258,7 @@ async fn connect_auth_middleware(
         );
     };
     let outcome_slot = HandlerOutcomeSlot::default();
-    let (token_id, actor_kind) = match state.tokens.verify(&bearer) {
+    let (token_id, actor_kind, invocation) = match state.tokens.verify(&bearer) {
         Ok(rec) => {
             let actor = actor_from_record(&rec);
             // Round-3 P1 on PR #147: same reasoning as
@@ -1266,6 +1295,8 @@ async fn connect_auth_middleware(
                     execution_outcome: None,
                     domain_error: None,
                     credential_fp: None,
+                    call_id: None,
+                    invocation: None,
                 };
                 super::auth::record_authenticated_denial(&state.audit_log, None, entry).await;
                 return connect_error_response(
@@ -1277,6 +1308,12 @@ async fn connect_auth_middleware(
             }
             let token_id = actor.id().to_string();
             let actor_kind = actor.kind().as_str().to_string();
+            // H6: one invocation per authenticated RPC; see the JSON
+            // middleware.
+            let invocation = crate::auth::InvocationContext::external(
+                crate::auth::Principal::token(actor.kind(), &actor, state.transport),
+            );
+            req.extensions_mut().insert(invocation.clone());
             req.extensions_mut().insert(actor);
             // Give the handler a way to smuggle back its outcome
             // (scope-deny name + a synthesized HTTP status for the
@@ -1284,7 +1321,7 @@ async fn connect_auth_middleware(
             // docstring for why we can't just read the response
             // status on gRPC / gRPC-Web transports.
             req.extensions_mut().insert(outcome_slot.clone());
-            (token_id, actor_kind)
+            (token_id, actor_kind, invocation)
         }
         Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
             let fp = crate::state::credential_fingerprint(&bearer);
@@ -1316,6 +1353,8 @@ async fn connect_auth_middleware(
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
+        call_id: Some(invocation.call_id().to_owned()),
+        invocation: Some(invocation.audit_json()),
     };
     let audit_id = {
         let al = Arc::clone(&state.audit_log);

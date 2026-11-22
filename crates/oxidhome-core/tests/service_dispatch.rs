@@ -397,3 +397,167 @@ description = "Target"
     assert_eq!(engine.services().active_call_count(&target_id), 0);
     counter.stop().await.expect("stop counter");
 }
+
+/// H6: an externally-rooted invocation keeps its root principal across
+/// the wasm boundary and the supervisor task hop. The test drives
+/// driver → alpha (bouncer wasm) → beta (bouncer wasm) under an API
+/// root; both hops must land in the audit ledger attributed to the root
+/// token, sharing its call id, with the delegation chain growing by one
+/// hop each time. The same chain driven host-origin writes no rows.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one linear end-to-end narrative
+async fn delegated_chain_is_audited_against_external_root() {
+    use oxidhome_core::auth::{ActorKind, InvocationContext, Principal, Transport};
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
+    use oxidhome_core::runtime::dispatcher;
+    use oxidhome_core::state::AuditQuery;
+    use oxidhome_core::{Actor, host_impl::plugin::oxidhome::plugin::types::Value};
+
+    let _wasm = support::build_example("service-bouncer", "service_bouncer.wasm");
+    let bouncer_dir = support::workspace_root()
+        .join("examples")
+        .join("service-bouncer");
+    let state_dir = support::tempdir("dispatch-h6-state");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+
+    let alpha = engine
+        .start_instance(bouncer_dir.clone(), "alpha", None)
+        .await
+        .expect("start alpha");
+    alpha.wait_for_running().await.expect("alpha Running");
+    let beta = engine
+        .start_instance(bouncer_dir, "beta", None)
+        .await
+        .expect("start beta");
+    beta.wait_for_running().await.expect("beta Running");
+
+    let services = engine.services().list();
+    let svc_of = |owner: &str| {
+        services
+            .iter()
+            .find(|m| m.owner_instance == owner)
+            .expect("service registered")
+            .id
+            .clone()
+    };
+    let (svc_a, svc_b) = (svc_of("alpha"), svc_of("beta"));
+    // alpha forwards to beta; beta has no `bounce_to` and returns Ok.
+    engine
+        .kv()
+        .set(
+            "example.service-bouncer",
+            "alpha",
+            "bounce_to",
+            Value::StringVal(svc_b),
+        )
+        .expect("set alpha.bounce_to");
+
+    let driver_grants = [oxidhome_manifest::ServiceGrant {
+        plugin: "example.service-bouncer".into(),
+        instance: "*".into(),
+        service: "bouncer".into(),
+        commands: vec!["kick".into()],
+        caller_instance: "*".into(),
+    }];
+    let audit = engine.audit_log();
+
+    // Host-origin: same chain, no ledger rows.
+    let outcome = dispatcher::call_service_from_host(
+        &engine,
+        "test-driver",
+        &driver_grants,
+        &driver_grants,
+        svc_a.clone(),
+        "kick",
+        Vec::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    let host_rows: Vec<_> = audit
+        .query(&AuditQuery::default(), 50)
+        .expect("query")
+        .into_iter()
+        .filter(|r| r.method == dispatcher::SERVICE_CALL_AUDIT_METHOD)
+        .collect();
+    assert!(
+        host_rows.is_empty(),
+        "host-origin hops audited: {host_rows:?}"
+    );
+
+    // API-rooted.
+    let actor = Actor::api("tok-h6", vec!["*".into()]);
+    let root =
+        InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
+    let call_id = root.call_id().to_owned();
+    let outcome = dispatcher::call_service_from_host_in(
+        &engine,
+        root,
+        "test-driver",
+        &driver_grants,
+        &driver_grants,
+        svc_a,
+        "kick",
+        Vec::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+
+    // Finalize writes are detached from the caller; wait for both rows
+    // to be finalized.
+    let started = Instant::now();
+    let mut rows = loop {
+        let rows = audit
+            .query(
+                &AuditQuery {
+                    call_id: Some(call_id.clone()),
+                    ..AuditQuery::default()
+                },
+                50,
+            )
+            .expect("query");
+        if rows.len() == 2 && rows.iter().all(|r| r.finalized_ms.is_some()) {
+            break rows;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "hop rows not finalized: {rows:?}",
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    rows.sort_by_key(|r| r.id);
+    assert_eq!(rows.len(), 2, "one row per hop: {rows:?}");
+    for (depth, row) in rows.iter().enumerate() {
+        assert_eq!(row.token_id, "tok-h6");
+        assert_eq!(row.actor_kind, "api");
+        assert_eq!(row.method, dispatcher::SERVICE_CALL_AUDIT_METHOD);
+        assert_eq!(row.decision, "allow");
+        assert_eq!(row.status, 200);
+        assert_eq!(row.execution_outcome.as_deref(), Some("success"));
+        assert!(row.finalized_ms.is_some());
+        let inv: serde_json::Value =
+            serde_json::from_str(row.invocation.as_deref().expect("invocation json"))
+                .expect("json");
+        assert_eq!(inv["root"]["subject"], "tok-h6");
+        assert_eq!(inv["root"]["transport"], "rest");
+        assert_eq!(inv["chain"].as_array().unwrap().len(), depth + 1);
+    }
+    // Outer hop: driver → alpha. Inner hop: alpha's wasm → beta, which
+    // only carries the root because the context crossed into alpha's
+    // supervisor task and back out through its `call-service` import.
+    assert_eq!(
+        rows[0].path,
+        "service.call/example.service-bouncer/alpha/bouncer/kick"
+    );
+    assert_eq!(
+        rows[1].path,
+        "service.call/example.service-bouncer/beta/bouncer/kick"
+    );
+    let inner: serde_json::Value =
+        serde_json::from_str(rows[1].invocation.as_deref().unwrap()).unwrap();
+    assert_eq!(inner["chain"][0]["caller"], "test-driver");
+    assert_eq!(inner["chain"][1]["caller"], "alpha");
+    assert_eq!(inner["current"], "beta");
+
+    alpha.stop().await.expect("stop alpha");
+    beta.stop().await.expect("stop beta");
+}

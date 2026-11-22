@@ -20,6 +20,11 @@
 //! plugin actors get a minimal scope set derived from their manifest's
 //! `[capabilities]` block.
 //!
+//! What happens *after* the route check — the root principal, call
+//! id, deadline and delegation chain that follow a request into plugin
+//! dispatch — lives in [`invocation::InvocationContext`] (H6). `Actor`
+//! stays the credential-scoped authorization view.
+//!
 //! See `ARCHITECTURE.md` "Auth & actor identity" for the
 //! cross-cutting design and `00_OVERVIEW.md` for the per-phase
 //! breakdown.
@@ -27,9 +32,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod invocation;
 pub mod policy;
 
-pub use policy::{EnforcedConstraint, TokenPolicy, ToolConstraint, parse_policy};
+pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
+pub use policy::{
+    DEVICE_COMMAND_ENFORCED, EnforcedConstraint, TokenPolicy, ToolConstraint,
+    authorize_device_command, parse_policy,
+};
 
 /// What kind of caller this `Actor` represents. Drives where the
 /// audit log attributes the action and which scope policy the

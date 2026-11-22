@@ -36,3 +36,4 @@ pub use server::{ApiConfig, bind, build_router, serve};
 
 #[cfg(test)]
 pub(crate) use auth::parse_scopes;
+pub(crate) use auth::wit_error_kind;
