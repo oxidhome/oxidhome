@@ -802,6 +802,16 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
+/// File name of the host database inside the state dir.
+pub const DB_FILE_NAME: &str = "oxidhome.db";
+
+/// Schema version this binary migrates to (`PRAGMA user_version`
+/// after every migration has applied).
+#[must_use]
+pub fn schema_version() -> i64 {
+    i64::try_from(MIGRATIONS.len()).expect("migration count fits in i64")
+}
+
 /// Wrapper around the host's `rusqlite::Connection`.
 ///
 /// The connection is mutex-guarded — `SQLite` in WAL mode supports many
@@ -843,14 +853,20 @@ impl Db {
     /// mode and `synchronous = NORMAL` (the durability sweet spot per
     /// Phase 5's appendix-A choice).
     ///
+    /// M3: refuses a state dir with an interrupted restore, and runs
+    /// the migration preflight
+    /// ([`crate::backup::snapshot_before_migration`]) before applying
+    /// pending migrations to an existing database.
+    ///
     /// # Errors
     ///
     /// Returns the first failure across directory creation, file
-    /// open, pragma application, or migration.
+    /// open, pragma application, preflight, or migration.
     pub fn open_file(state_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("creating state dir {}", state_dir.display()))?;
-        let path = state_dir.join("oxidhome.db");
+        crate::backup::ensure_no_interrupted_restore(state_dir)?;
+        let path = state_dir.join(DB_FILE_NAME);
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database at {}", path.display()))?;
         // WAL: many concurrent readers + one writer, plus crash safety
@@ -883,6 +899,35 @@ impl Db {
         let pre_open_user_version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading user_version pre-migration")?;
+        let target = schema_version();
+        // M3: no silent downgrade. Running against a newer schema
+        // would skip migrations this binary doesn't know about and
+        // read / write tables in a shape it wasn't built for.
+        anyhow::ensure!(
+            pre_open_user_version <= target,
+            "database schema v{pre_open_user_version} is newer than this binary supports \
+             (v{target}) — run a newer oxidhome, or restore a backup taken with this version",
+        );
+        // M3 migration preflight: an existing file-backed database
+        // with pending migrations gets an integrity check + snapshot
+        // first. A fresh database (v0) has nothing to protect.
+        if let Some(state_dir) = path.as_deref().and_then(Path::parent)
+            && pre_open_user_version > 0
+            && pre_open_user_version < target
+        {
+            let snapshot = crate::backup::snapshot_before_migration(
+                &conn,
+                state_dir,
+                pre_open_user_version,
+                target,
+            )?;
+            tracing::warn!(
+                from = pre_open_user_version,
+                to = target,
+                snapshot = %snapshot.display(),
+                "applying schema migrations; pre-migration snapshot written",
+            );
+        }
         let db = Self {
             path,
             conn: Mutex::new(conn),
@@ -1357,6 +1402,130 @@ mod tests {
         assert_eq!(
             used, 23,
             "rebaseline should produce 6 byte key + 17 byte value = 23",
+        );
+    }
+
+    /// Build `<dir>/oxidhome.db` at schema `version` by applying the
+    /// first `version` migrations directly (no preflight).
+    fn seed_db_at(dir: &Path, version: usize) {
+        let conn = Connection::open(dir.join(DB_FILE_NAME)).expect("open seed db");
+        let _: String = conn
+            .query_row("PRAGMA journal_mode = WAL", (), |r| r.get(0))
+            .expect("wal");
+        for body in &MIGRATIONS[..version] {
+            conn.execute_batch(body).expect("seed migration");
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {version}"))
+            .expect("seed user_version");
+    }
+
+    fn pre_migration_snapshots(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir.join(crate::backup::PRE_MIGRATION_DIR)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        out.sort();
+        out
+    }
+
+    /// M3: pending migrations on an existing file get a snapshot of
+    /// the pre-migration database first — self-contained (rollback
+    /// journal) and still at the old version.
+    #[test]
+    fn migration_preflight_snapshots_the_pre_migration_database() {
+        let dir = tempdir_for_test();
+        let from = MIGRATIONS.len() - 1;
+        seed_db_at(dir.path(), from);
+        let db = Db::open_file(dir.path()).expect("open + migrate");
+        let version: i64 = db
+            .read(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
+            .unwrap();
+        assert_eq!(version, schema_version());
+
+        let snapshots = pre_migration_snapshots(dir.path());
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        let name = snapshots[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.ends_with(&format!("-v{from}-to-v{}.db", schema_version())),
+            "{name}"
+        );
+        let snap =
+            Connection::open_with_flags(&snapshots[0], rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let snap_version: i64 = snap
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(snap_version, i64::try_from(from).unwrap());
+        let mode: String = snap
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+    }
+
+    #[test]
+    fn fresh_and_current_databases_skip_the_preflight() {
+        let dir = tempdir_for_test();
+        drop(Db::open_file(dir.path()).expect("fresh"));
+        drop(Db::open_file(dir.path()).expect("current"));
+        assert!(pre_migration_snapshots(dir.path()).is_empty());
+    }
+
+    /// No snapshot, no migration: the database stays at its old
+    /// version.
+    #[test]
+    fn failed_preflight_refuses_to_migrate() {
+        let dir = tempdir_for_test();
+        let from = MIGRATIONS.len() - 1;
+        seed_db_at(dir.path(), from);
+        // A file where the snapshot directory should go.
+        std::fs::write(dir.path().join(crate::backup::PRE_MIGRATION_DIR), b"x").unwrap();
+        let err = Db::open_file(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("pre-migration snapshot"),
+            "{err:#}"
+        );
+        let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, i64::try_from(from).unwrap());
+    }
+
+    #[test]
+    fn newer_schema_is_refused() {
+        let dir = tempdir_for_test();
+        seed_db_at(dir.path(), MIGRATIONS.len());
+        {
+            let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len() + 1))
+                .unwrap();
+        }
+        let err = Db::open_file(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("newer than this binary"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn pre_migration_snapshots_are_pruned_to_the_newest() {
+        let dir = tempdir_for_test();
+        seed_db_at(dir.path(), MIGRATIONS.len());
+        let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+        let mut written = Vec::new();
+        for _ in 0..crate::backup::PRE_MIGRATION_KEEP + 2 {
+            written
+                .push(crate::backup::snapshot_before_migration(&conn, dir.path(), 1, 2).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        let kept = pre_migration_snapshots(dir.path());
+        assert_eq!(
+            kept,
+            written[written.len() - crate::backup::PRE_MIGRATION_KEEP..]
         );
     }
 
