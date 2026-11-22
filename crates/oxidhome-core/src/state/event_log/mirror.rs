@@ -180,9 +180,7 @@ impl Outage {
         self.first_received_ms = first;
         self.last_received_ms = last;
     }
-}
 
-impl Outage {
     fn marker(&self) -> GapMarker {
         GapMarker {
             unrecorded: self.unrecorded,
@@ -215,10 +213,11 @@ struct MirrorState {
 pub(super) struct MirrorShared {
     policy: MirrorPolicy,
     state: Mutex<MirrorState>,
-    /// Blocking writes started but not finished. Non-zero outside a
-    /// `mirror` call only when a write outlived its deadline; no probe
-    /// starts until it drains, so a hung disk can't pile up blocking
-    /// threads behind the connection mutex.
+    /// Blocking writes started but not finished. Non-zero at `plan`
+    /// time only when a write was orphaned (it outlived its deadline,
+    /// or its publish future was dropped); no write starts until it
+    /// drains, so a hung disk can't pile up blocking threads behind
+    /// the connection mutex.
     in_flight: Arc<AtomicUsize>,
 }
 
@@ -815,7 +814,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_write_hits_deadline_and_blocks_probes_until_it_drains() {
         let policy = MirrorPolicy {
-            write_deadline: Duration::from_secs(1),
+            write_deadline: Duration::from_secs(2),
             probe_interval: Duration::from_millis(10),
         };
         let log = log_with(policy);
@@ -1074,7 +1073,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn late_committed_probe_marker_is_still_delivered() {
         let log = log_with(MirrorPolicy {
-            write_deadline: Duration::from_millis(200),
+            write_deadline: Duration::from_secs(2),
             probe_interval: Duration::from_millis(10),
         });
         break_writes(&log);
