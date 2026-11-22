@@ -2,7 +2,7 @@
 //!
 //! The harness loads a plugin component in-process and lets a test
 //! drive its lifecycle (`init`, `tick`, `execute-command`, `on-event`,
-//! `shutdown`) and inspect what it did (devices registered, events
+//! `on-shutdown`) and inspect what it did (devices registered, events
 //! published, storage written) without starting the `oxidhome-core`
 //! daemon.
 //!

@@ -130,8 +130,11 @@ pub struct CapabilitiesSection {
     /// `blob-store::*` calls return `permission-denied`.
     #[serde(default)]
     pub blob_quota_mb: u64,
-    /// Device capabilities this plugin may register. Other capability
-    /// names hit `permission-denied` from `register-device`.
+    /// Device capabilities this plugin may register: standard names
+    /// (`"switch"`, `"sensor"`, ...) or plugin-defined
+    /// `"extension(<namespace>/<name>@<version>)"` keys (see
+    /// [`crate::ExtensionId`]). Other capabilities hit
+    /// `permission-denied` from `register-device`.
     #[serde(default)]
     pub declares_devices: Vec<String>,
     /// Service names this plugin may register (Phase 7). Empty / absent

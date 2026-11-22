@@ -960,7 +960,7 @@ impl PluginInstance {
         .await
     }
 
-    /// Call the plugin's exported `shutdown`. The plugin can't fail this
+    /// Call the plugin's exported `on-shutdown`. The plugin can't fail this
     /// call by contract; trapping bubbles up as an error.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         let data = self.store.data();
@@ -972,7 +972,7 @@ impl PluginInstance {
         async {
             self.arm_watchdog();
             self.bindings
-                .call_shutdown(&mut self.store)
+                .call_on_shutdown(&mut self.store)
                 .await
                 .map_err(anyhow::Error::from)
                 .context("invoking plugin shutdown")
@@ -1098,6 +1098,14 @@ impl PluginInstance {
                     "execute-command returned OkWithState for a capability the device \
                      doesn't declare; skipping state projection",
                 );
+            }
+            // M2: a sensor reading must carry the spec's unit.
+            if let Err(e) = super::schema::check_sensor_fields(&meta.info, &capability, &fields) {
+                return Ok(CommandResult::Err(
+                    crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(
+                        format!("OkWithState on `{device_for_projection}/{capability}`: {e}"),
+                    ),
+                ));
             }
             capability_declared
         } else {

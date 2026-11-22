@@ -213,8 +213,10 @@ pub fn resolve_service(
 /// [`Error::NotFound`] (no such service),
 /// [`Error::PermissionDenied`] (no matching `consumes_services`
 /// grant), [`Error::InvalidArgument`] (same-instance target,
-/// A→…→A cycle, or bad command/args), [`Error::Unavailable`]
-/// (owner not running or dispatch timed out).
+/// A→…→A cycle, a command the target doesn't declare, or `args`
+/// that violate its `params` schema), [`Error::Internal`] (the
+/// target's reply violates its `returns` schema),
+/// [`Error::Unavailable`] (owner not running or dispatch timed out).
 pub fn call_service(
     target: &ServiceId,
     command: &str,

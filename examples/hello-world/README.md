@@ -69,5 +69,5 @@ the lifecycle bridge is broken — the integration test
 
     wasm-tools component wit target/wasm32-wasip2/debug/hello_world.wasm
 
-Look for `world root` exporting `init`, `shutdown`, `on-event`,
+Look for `world root` exporting `init`, `on-shutdown`, `on-event`,
 `execute-command`, `tick` — the standard `oxidhome:plugin/plugin` world.

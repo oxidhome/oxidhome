@@ -79,6 +79,6 @@ wasm-tools component wit target/wasm32-wasip2/debug/simulated_switch.wasm
 ```
 
 The world this implements should match `oxidhome:plugin/plugin` —
-exports `init`, `shutdown`, `on-event`, `execute-command`, `tick`;
+exports `init`, `on-shutdown`, `on-event`, `execute-command`, `tick`;
 imports `host-devices`, `host-events`, `host-config`, `storage`,
 `logging` plus the WASI imports libstd pulls in.

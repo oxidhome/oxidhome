@@ -148,7 +148,7 @@ impl TestPluginInstance {
             .map_err(|e| TestHostError::call("on-event", e))
     }
 
-    /// Call the plugin's `shutdown` export, then run the host-side
+    /// Call the plugin's `on-shutdown` export, then run the host-side
     /// teardown (see the type docs).
     ///
     /// # Errors
@@ -160,7 +160,7 @@ impl TestPluginInstance {
         self.inner
             .shutdown()
             .await
-            .map_err(|e| TestHostError::call("shutdown", e))
+            .map_err(|e| TestHostError::call("on-shutdown", e))
     }
 
     /// Devices this instance currently has registered, sorted by

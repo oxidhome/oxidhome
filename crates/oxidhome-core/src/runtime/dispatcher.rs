@@ -390,6 +390,19 @@ pub(crate) async fn call_service(
         )));
     }
 
+    // M2: the command must be one the service declares, and `args`
+    //    must match its `params` schema. Runs after authorization so
+    //    an unauthorized caller learns nothing about the schema, and
+    //    before the hop's audit intent: like the other pre-dispatch
+    //    refusals that aren't authorization decisions (same-instance,
+    //    cycle, deadline, owner not running), a malformed call never
+    //    reaches the callee and writes no hop row. Only grant
+    //    refusals produce H6 `deny` rows. The reply is checked
+    //    against this same registration snapshot.
+    let target_meta = services.get_any(&target)?;
+    let command_spec = super::schema::find_command(&target_meta.info, &target, &command)?;
+    super::schema::check_args(&target, command_spec, &args)?;
+
     // 4. Resolve target instance handle; refuse if it isn't running.
     let target_handle = instances.get(&target_instance).ok_or_else(|| {
         WitError::Unavailable(format!(
@@ -462,8 +475,19 @@ pub(crate) async fn call_service(
         }
         Err(err) => Err(err),
     };
+    // M2: the callee's reply must match the command's `returns`
+    // schema; a violation reaches the caller as `internal`. The hop
+    // row still records that the callee ran (allow / failed /
+    // `internal`), not a dispatch error.
+    let (outcome, audited) = match outcome {
+        Ok(result) => match super::schema::check_result(&target, command_spec, result) {
+            Ok(result) => (Ok(result), None),
+            Err(err) => (Err(err.clone()), Some(Ok(CommandResult::Err(err)))),
+        },
+        Err(err) => (Err(err), None),
+    };
     if let (Some(hop_audit), Some(id)) = (hop_audit, audit_id) {
-        hop_audit.finalize(id, &outcome);
+        hop_audit.finalize(id, audited.as_ref().unwrap_or(&outcome));
     }
     outcome
 }
@@ -595,12 +619,24 @@ mod tests {
         )
     }
 
+    /// M2: the dispatcher refuses undeclared commands, so the
+    /// fixture declares every command the tests below call (no
+    /// params, plain-`ok` reply).
     fn fixture_info(name: &str) -> ServiceInfo {
+        use crate::host_impl::plugin::oxidhome::plugin::services::CommandSpec;
         ServiceInfo {
             local_id: name.into(),
             name: name.into(),
             metadata: Vec::new(),
-            commands: Vec::new(),
+            commands: ["kick", "get", "set", "anything", "irrelevant"]
+                .into_iter()
+                .map(|c| CommandSpec {
+                    name: c.into(),
+                    description: None,
+                    params: Vec::new(),
+                    returns: Vec::new(),
+                })
+                .collect(),
         }
     }
 

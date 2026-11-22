@@ -107,11 +107,56 @@ interface capabilities {
     color-temp-kelvin: option<u32>,
   }
 
-  /// Numeric reading with a unit. Units are SI-ish strings:
-  /// "celsius", "percent", "lux", "watt", "ppm", etc.
+  /// Unit of a numeric sensor reading. The named cases are the
+  /// contract: consumers may convert, compare, and aggregate readings
+  /// by unit. Each case's kebab-case name is also its stable code in
+  /// the host's state projection (`"celsius"`, `"kilowatt-hour"`, ...).
+  variant unit {
+    /// Dimensionless count or index (e.g. UV index, people count).
+    unitless,
+    percent,
+    celsius,
+    fahrenheit,
+    kelvin,
+    lux,
+    watt,
+    kilowatt,
+    watt-hour,
+    kilowatt-hour,
+    volt,
+    ampere,
+    hertz,
+    pascal,
+    hectopascal,
+    /// Parts per million.
+    ppm,
+    /// Parts per billion.
+    ppb,
+    microgram-per-cubic-meter,
+    millimeter,
+    meter,
+    meter-per-second,
+    liter,
+    cubic-meter,
+    gram,
+    kilogram,
+    second,
+    /// Plane angle in degrees (wind direction, tilt).
+    degree,
+    decibel,
+    /// Signal power in decibel-milliwatts.
+    dbm,
+    /// Escape hatch for a quantity the named set doesn't cover. The
+    /// payload is a display label only and is NOT part of the
+    /// contract: consumers must not parse, convert, or compare it.
+    /// The host refuses a label that spells a named unit's code.
+    other(string),
+  }
+
+  /// Numeric reading with a unit.
   record measurement {
     value: f64,
-    unit: string,
+    unit: unit,
   }
 
   /// A button press / scene-controller event. Stateless; only delivered
@@ -139,13 +184,37 @@ interface capabilities {
     color-temp-max-kelvin: option<u32>,
   }
 
-  /// Spec hints for a sensor: unit and reasonable display range.
+  /// Spec for a sensor: unit and reasonable display range.
   record sensor-spec {
-    /// Unit string ("celsius", "percent", "lux", ...).
-    unit: string,
-    /// Optional reasonable range for UIs and validation.
+    /// Unit every reading of this sensor carries. The host refuses an
+    /// `initial-state` measurement whose unit differs. Every sensor
+    /// `state-change` / `ok-with-state` must carry a `unit` field with
+    /// this unit's code (plus `unit_label` with the label, for
+    /// `other`); the host refuses one that omits or contradicts them.
+    unit: unit,
+    /// Optional reasonable range for UIs and validation. Both bounds
+    /// must be finite, and `min <= max` when both are set.
     min: option<f64>,
     max: option<f64>,
+  }
+
+  /// Identity of a plugin-defined capability: a namespaced name plus
+  /// an explicit schema version. The host refuses malformed ids at
+  /// `register-device`, and the manifest declares the same identity
+  /// as `"extension(<namespace>/<name>@<version>)"`.
+  record extension-spec {
+    /// Reverse-DNS namespace of whoever defines the extension's
+    /// contract, e.g. `com.acme`. At least two dot-separated labels of
+    /// `[a-z0-9][a-z0-9-]*`. Namespaces whose first label is
+    /// `oxidhome` are reserved for the host.
+    namespace: string,
+    /// Extension name within the namespace, e.g. `window-shade`. One
+    /// label of `[a-z0-9][a-z0-9-]*`.
+    name: string,
+    /// Major schema version, starting at 1. Bump it when the
+    /// extension's state fields or commands change incompatibly;
+    /// `(namespace, name, version)` is the identity consumers match on.
+    version: u32,
   }
 
   /// What a device CAN do. Lists at registration time; describes shape, not
@@ -162,9 +231,10 @@ interface capabilities {
     video-stream,
     /// The device exposes an audio stream. See video-stream.
     audio-stream,
-    /// Capability name; semantics negotiated separately. Consumers that
-    /// don't recognize the name simply ignore the capability.
-    extension(string),
+    /// Plugin-defined capability, identified by namespace, name, and
+    /// schema version. Consumers that don't recognize the identity
+    /// simply ignore the capability.
+    extension(extension-spec),
   }
 
   /// Current state for a stateful capability. Carried as the optional
@@ -242,14 +312,71 @@ interface devices {
 interface services {
   use types.{local-id, key-value};
 
-  /// Metadata for one command a service exposes. Argument / return
-  /// shapes stay textual in 0.1 (no structured-type-in-WIT); plugin
-  /// authors match on `name` from `execute-service-command`.
-  record command-spec {
+  /// Which `types.value` case a field carries.
+  enum value-kind {
+    bool-val,
+    int-val,
+    float-val,
+    string-val,
+    bytes-val,
+    json-val,
+  }
+
+  /// Inclusive bounds for an `int-val` field. `none` = unbounded.
+  record int-range {
+    min: option<s64>,
+    max: option<s64>,
+  }
+
+  /// Inclusive bounds for a `float-val` field. `none` = unbounded.
+  /// Bounds must be finite; a bounded field refuses NaN.
+  record float-range {
+    min: option<f64>,
+    max: option<f64>,
+  }
+
+  /// Restriction on a field's value. Must match the field's kind.
+  variant field-constraint {
+    /// `string-val` only: the value must be one of these.
+    one-of(list<string>),
+    /// `int-val` only.
+    int-range(int-range),
+    /// `float-val` only.
+    float-range(float-range),
+  }
+
+  /// Machine-readable schema for one named field of a command's
+  /// arguments or result.
+  record field-spec {
+    /// Field key, matched against `key-value.key`. 1-64 characters of
+    /// `[A-Za-z0-9_-]`, starting with a letter or digit; unique within
+    /// its list.
     name: string,
+    kind: value-kind,
+    /// Whether the field must be present.
+    required: bool,
+    /// Human-readable description. Informational only; never parsed.
     description: option<string>,
-    /// Free-form hints like `"mode: string — one of occupied/vacant"`.
-    arg-hints: list<string>,
+    constraint: option<field-constraint>,
+  }
+
+  /// Schema for one command a service exposes. The host validates it at
+  /// `register-service` / `update-service`, checks every
+  /// `call-service`'s `args` against `params` before dispatch
+  /// (unknown, duplicate, missing-required, mistyped, or out-of-range
+  /// fields are `invalid-argument`), and checks the callee's
+  /// `ok-with-state` fields against `returns` before returning them.
+  record command-spec {
+    /// Command name, unique within the service. Same grammar as
+    /// `field-spec.name`.
+    name: string,
+    /// Human-readable description. Informational only; never parsed.
+    description: option<string>,
+    /// Accepted arguments. Empty = the command takes none.
+    params: list<field-spec>,
+    /// Fields of an `ok-with-state` reply. Empty = the reply carries no
+    /// fields: plain `ok`, an empty `ok-with-state`, or `err`.
+    returns: list<field-spec>,
   }
 
   record service-info {
@@ -802,7 +929,10 @@ interface host-services {
   /// Errors: `not-found` (no such service); `permission-denied`
   /// (no matching entry in the caller's `consumes_services`
   /// grants); `invalid-argument` (same-instance target, A→…→A
-  /// cycle, or bad command/args); `unavailable` (owner not
+  /// cycle, a command the service's `command-spec` list doesn't
+  /// declare, or `args` that violate its `params` schema);
+  /// `internal` (the callee's `ok-with-state` reply violates the
+  /// command's `returns` schema); `unavailable` (owner not
   /// running, or the call timed out).
   call-service: func(
     target: service-id,
@@ -872,9 +1002,10 @@ world plugin {
   use devices.{command, command-result};
   use events.{event};
 
-  // Lifecycle
+  // Lifecycle. `on-shutdown`, not `shutdown`: a bare `shutdown` core
+  // export collides with wasi-libc's socket `shutdown` symbol.
   export init: func() -> result<_, string>;
-  export shutdown: func();
+  export on-shutdown: func();
 
   // Event delivery from the host's bus to the plugin
   export on-event: func(ev: event);

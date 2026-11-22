@@ -87,8 +87,10 @@ one) and record the new version's baseline:
 OXIDHOME_BLESS_WIT_BASELINE=1 cargo test -p oxidhome-wit --test contract_baseline
 ```
 
-Blessing only creates a missing baseline. Existing baselines are immutable (CI rejects PRs that edit or delete one), and
-a bump that claims to be compatible must pass `wit_component::semver_check` against the previous version.
+Blessing only creates a missing baseline. Once `oxidhome-sdk` is published, existing baselines are immutable (CI rejects
+PRs that edit or delete one), and a bump that claims to be compatible must pass `wit_component::semver_check` against the
+previous version. Until then nothing targets a released contract, so the current version may change in place: delete its
+baseline and bless it again.
 
 ## Code conventions
 

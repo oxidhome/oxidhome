@@ -79,8 +79,16 @@ pub use oxidhome_wit::plugin as bindings;
 mod device;
 pub use device::Device;
 
+/// Sensor unit (re-exported from the WIT `capabilities` interface).
+/// The named cases are the contract; `Unit::Other(label)` is a
+/// display-only fallback consumers must not interpret.
+pub use bindings::oxidhome::plugin::capabilities::Unit;
+
+mod unit;
+pub use unit::{sensor_fields, unit_code};
+
 mod service;
-pub use service::{CommandSpec, Service};
+pub use service::{CommandSpec, Field, Service};
 
 pub mod host;
 

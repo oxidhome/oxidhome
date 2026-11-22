@@ -271,10 +271,10 @@ fn draft_automation_message(trigger: &str, action: &str) -> String {
          gives you the real `device_id` and the `capabilities: []` list — an array of \
          capability *names* the device exposes. The host's built-in capability names are: \
          `switch`, `dimmer`, `color-light`, `sensor`, `button`, `video-stream`, \
-         `audio-stream`. Anything else appears in the list as `extension(<name>)` — that \
-         literal wrapped form is what you must pass as the `capability` argument (a plugin \
-         that declares a custom `lock` capability shows up as `extension(lock)`, NOT bare \
-         `lock`). Ground the draft in the exact strings the resource returned — never invent \
+         `audio-stream`. Anything else appears in the list as \
+         `extension(<namespace>/<name>@<version>)` — that literal wrapped form is what you \
+         must pass as the `capability` argument (a plugin that declares a custom `lock` \
+         capability shows up as e.g. `extension(com.acme/lock@1)`, NOT bare `lock`). Ground the draft in the exact strings the resource returned — never invent \
          a `device_id` or a capability name that isn't in the list.\n\
          \n\
          IMPORTANT — action verbs are NOT enumerable from the host: `device.send_command` \
@@ -283,7 +283,7 @@ fn draft_automation_message(trigger: &str, action: &str) -> String {
          well-known convention where one clearly applies (e.g. `switch` → `on` / `off` / \
          `toggle`; `dimmer` → `set` with a `level` arg; `color-light` → `set-color`) and mark \
          it as a convention that the operator should confirm; when no obvious convention \
-         fits (any `extension(<name>)` capability, or a built-in used in a non-standard way), \
+         fits (any `extension(...)` capability, or a built-in used in a non-standard way), \
          defer the exact verb to the operator rather than guess.\n\
          \n\
          Then produce a draft automation with:\n\

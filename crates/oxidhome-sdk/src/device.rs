@@ -22,7 +22,9 @@
 //! .expect("register-device");
 //! ```
 
-use crate::bindings::oxidhome::plugin::capabilities::{CapabilitySpec, CapabilityState};
+use crate::bindings::oxidhome::plugin::capabilities::{
+    CapabilitySpec, CapabilityState, ExtensionSpec,
+};
 use crate::bindings::oxidhome::plugin::devices::DeviceInfo;
 use crate::bindings::oxidhome::plugin::types::KeyValue;
 
@@ -79,6 +81,26 @@ impl Device {
     pub fn capability(mut self, spec: CapabilitySpec) -> Self {
         self.info.capabilities.push(spec);
         self
+    }
+
+    /// Append a plugin-defined extension capability identified by a
+    /// reverse-DNS `namespace` (e.g. `"com.acme"`), a `name` (e.g.
+    /// `"window-shade"`), and a major schema `version` (starting at
+    /// 1). The manifest must declare it in `declares_devices` as
+    /// `"extension(com.acme/window-shade@1)"`; the host refuses
+    /// malformed ids at `register-device`.
+    #[must_use]
+    pub fn extension(
+        self,
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        version: u32,
+    ) -> Self {
+        self.capability(CapabilitySpec::Extension(ExtensionSpec {
+            namespace: namespace.into(),
+            name: name.into(),
+            version,
+        }))
     }
 
     /// Append an initial-state snapshot for one stateful capability.
@@ -185,14 +207,20 @@ mod tests {
     fn capabilities_and_initial_state_append_in_order() {
         let info = Device::new("d-1", "Sensor")
             .capability(CapabilitySpec::Sensor(SensorSpec {
-                unit: "celsius".into(),
+                unit: crate::Unit::Celsius,
                 min: Some(-40.0),
                 max: Some(125.0),
             }))
             .capability(CapabilitySpec::Button)
+            .extension("com.acme", "window-shade", 1)
             .build();
         assert!(matches!(info.capabilities[0], CapabilitySpec::Sensor(_)));
         assert!(matches!(info.capabilities[1], CapabilitySpec::Button));
+        assert!(matches!(
+            &info.capabilities[2],
+            CapabilitySpec::Extension(ExtensionSpec { namespace, name, version: 1 })
+                if namespace == "com.acme" && name == "window-shade"
+        ));
     }
 
     #[test]
