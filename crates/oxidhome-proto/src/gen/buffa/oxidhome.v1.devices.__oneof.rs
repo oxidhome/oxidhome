@@ -54,6 +54,9 @@ pub mod value {
 pub mod execute_command_response {
     #[allow(unused_imports)]
     use super::*;
+    /// Outcome detail. `ok` / `ok_with_state` mean `completed`, `err`
+    /// means `rejected`; the H5 cases below cover the rest. Read
+    /// `command_outcome` for the state itself.
     #[derive(Clone, PartialEq, Debug)]
     pub enum Outcome {
         Ok(
@@ -65,6 +68,21 @@ pub mod execute_command_response {
             >,
         ),
         Err(::buffa::alloc::boxed::Box<super::super::super::ExecuteCommandError>),
+        Accepted(
+            ::buffa::alloc::boxed::Box<
+                super::super::super::execute_command_response::Accepted,
+            >,
+        ),
+        TimedOut(
+            ::buffa::alloc::boxed::Box<
+                super::super::super::execute_command_response::TimedOut,
+            >,
+        ),
+        OutcomeUnknown(
+            ::buffa::alloc::boxed::Box<
+                super::super::super::execute_command_response::OutcomeUnknown,
+            >,
+        ),
     }
     impl ::buffa::Oneof for Outcome {}
     impl From<super::super::super::execute_command_response::Ok> for Outcome {
@@ -100,6 +118,44 @@ pub mod execute_command_response {
             Self::Some(Outcome::from(v))
         }
     }
+    impl From<super::super::super::execute_command_response::Accepted> for Outcome {
+        fn from(v: super::super::super::execute_command_response::Accepted) -> Self {
+            Self::Accepted(::buffa::alloc::boxed::Box::new(v))
+        }
+    }
+    impl From<super::super::super::execute_command_response::Accepted>
+    for ::core::option::Option<Outcome> {
+        fn from(v: super::super::super::execute_command_response::Accepted) -> Self {
+            Self::Some(Outcome::from(v))
+        }
+    }
+    impl From<super::super::super::execute_command_response::TimedOut> for Outcome {
+        fn from(v: super::super::super::execute_command_response::TimedOut) -> Self {
+            Self::TimedOut(::buffa::alloc::boxed::Box::new(v))
+        }
+    }
+    impl From<super::super::super::execute_command_response::TimedOut>
+    for ::core::option::Option<Outcome> {
+        fn from(v: super::super::super::execute_command_response::TimedOut) -> Self {
+            Self::Some(Outcome::from(v))
+        }
+    }
+    impl From<super::super::super::execute_command_response::OutcomeUnknown>
+    for Outcome {
+        fn from(
+            v: super::super::super::execute_command_response::OutcomeUnknown,
+        ) -> Self {
+            Self::OutcomeUnknown(::buffa::alloc::boxed::Box::new(v))
+        }
+    }
+    impl From<super::super::super::execute_command_response::OutcomeUnknown>
+    for ::core::option::Option<Outcome> {
+        fn from(
+            v: super::super::super::execute_command_response::OutcomeUnknown,
+        ) -> Self {
+            Self::Some(Outcome::from(v))
+        }
+    }
     impl serde::Serialize for Outcome {
         fn serialize<S: serde::Serializer>(
             &self,
@@ -116,6 +172,15 @@ pub mod execute_command_response {
                 }
                 Self::Err(v) => {
                     map.serialize_entry("err", v)?;
+                }
+                Self::Accepted(v) => {
+                    map.serialize_entry("accepted", v)?;
+                }
+                Self::TimedOut(v) => {
+                    map.serialize_entry("timedOut", v)?;
+                }
+                Self::OutcomeUnknown(v) => {
+                    map.serialize_entry("outcomeUnknown", v)?;
                 }
             }
             map.end()

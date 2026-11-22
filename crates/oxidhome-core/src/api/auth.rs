@@ -67,35 +67,45 @@ use crate::state::{
     AuditEntry, AuditLog, TokenError, TokenRecord, TokenStore, credential_fingerprint,
 };
 
-/// Smuggled on a response's extension map by JSON handlers when the
-/// wire response is HTTP 200 but the *plugin's domain outcome* is a
-/// failure — the canonical case being `POST
-/// /api/v1/devices/{id}/command` returning `WireCommandResult::Err`.
-/// The auth middleware reads this back post-handler and populates
-/// the audit row's `execution_outcome` and `domain_error` fields
-/// (see [`crate::state::AuditEntry`]), leaving `status` at the wire
-/// 200 and `decision` at the authorization outcome (`"allow"` — the
-/// request was authorized before it reached the plugin).
+/// Smuggled from a device-command handler to the audit middleware
+/// (F4, H5): the command id and explicit outcome of the dispatch. The
+/// middleware records them in the audit row's `command_id` /
+/// `command_outcome` columns, the coarse `execution_outcome` (`success`
+/// / `failed` / NULL) and, for `rejected`, the WIT error kind in
+/// `domain_error`.
 ///
-/// **Independence** — architecture-review F4 pushback. An earlier
-/// cut of this signal fed a synthesized status into the classifier,
-/// which collapsed execution failure into `decision = "deny"` and
-/// broke forensic queries: plugin validation errors mixed with real
-/// authorization denials in `WHERE decision = 'deny'` results. The
-/// current shape keeps authorization and execution outcomes as
-/// distinct audit fields so operators can filter each independently.
+/// **Independence** — architecture-review F4 pushback. Authorization
+/// and execution outcomes are distinct audit fields so operators can
+/// filter each independently: a dispatched command records
+/// `decision = "allow"` (the request was authorized and reached the
+/// plugin's queue) whatever its outcome and whatever HTTP status the
+/// REST handler picked for that outcome.
 ///
 /// The Connect side smuggles the same information via
-/// [`super::connect_rpc::HandlerOutcomeSlot`] — a request-side
-/// slot that already existed for gRPC / gRPC-Web scope-denial
-/// classification.
-#[derive(Debug, Clone, Copy)]
+/// [`super::connect_rpc::HandlerOutcomeSlot`]; MCP writes its own
+/// rows from the same fields.
+#[derive(Debug, Clone)]
 pub(crate) struct DomainOutcome {
-    /// The plugin's WIT error kind (`"not_found"`,
-    /// `"invalid_argument"`, `"permission_denied"`, `"unavailable"`,
-    /// `"internal"`), stamped when the handler returns
-    /// `CommandResult::Err(<variant>)`.
-    pub(crate) domain_error: &'static str,
+    /// Host-minted `cmd-<32 hex>` id.
+    pub(crate) command_id: String,
+    /// `CommandOutcome::as_str()`.
+    pub(crate) outcome: &'static str,
+    /// Coarse pre-H5 value: `success` / `failed` / `None`.
+    pub(crate) execution_outcome: Option<&'static str>,
+    /// WIT error kind (`"not_found"`, `"invalid_argument"`, …) of a
+    /// `rejected` outcome.
+    pub(crate) domain_error: Option<&'static str>,
+}
+
+impl DomainOutcome {
+    pub(crate) fn from_report(report: &crate::runtime::CommandReport) -> Self {
+        Self {
+            command_id: report.command_id.clone(),
+            outcome: report.outcome.as_str(),
+            execution_outcome: report.outcome.execution_outcome(),
+            domain_error: report.outcome.domain_error(),
+        }
+    }
 }
 
 /// WIT `error` variant → the stable `snake_case` tag written to the
@@ -321,6 +331,8 @@ pub(crate) async fn require_token(
                     credential_fp: None,
                     call_id: None,
                     invocation: None,
+                    command_id: None,
+                    command_outcome: None,
                 };
                 record_authenticated_denial(&state.audit_log, inflight.as_ref(), entry).await;
                 return (StatusCode::FORBIDDEN, "").into_response();
@@ -380,6 +392,8 @@ pub(crate) async fn require_token(
         credential_fp: None,
         call_id: Some(invocation.call_id().to_owned()),
         invocation: Some(invocation.audit_json()),
+        command_id: None,
+        command_outcome: None,
     };
     let audit_id = match record_intent_blocking(&state.audit_log, intent, inflight.as_ref()).await {
         Ok(id) => id,
@@ -422,7 +436,7 @@ pub(crate) async fn require_token(
     // at the authorization outcome. See `DomainOutcome`'s
     // docstring for why authorization and execution outcomes are
     // kept independent.
-    let domain_outcome = response.extensions().get::<DomainOutcome>().copied();
+    let domain_outcome = response.extensions().get::<DomainOutcome>().cloned();
     let status = response.status();
     finalize_audit(
         &state.audit_log,
@@ -487,6 +501,8 @@ async fn try_best_effort_probe(
         credential_fp,
         call_id: None,
         invocation: None,
+        command_id: None,
+        command_outcome: None,
     };
     let al = Arc::clone(audit_log);
     // Round-7 P2 on PR #140: preserve the original
@@ -730,6 +746,8 @@ pub(super) async fn record_anonymous_probe(
         credential_fp,
         call_id: None,
         invocation: None,
+        command_id: None,
+        command_outcome: None,
     };
     let al = Arc::clone(audit_log);
     let join = tokio::task::spawn_blocking(move || al.record_completed(&entry)).await;
@@ -822,33 +840,28 @@ pub(super) async fn finalize_audit(
     required_scope: Option<&'static str>,
     domain_outcome: Option<DomainOutcome>,
 ) {
-    // Authorization outcome — depends *only* on the transport
-    // status. A plugin returning `CommandResult::Err` on an
-    // authorized request still records `decision = "allow"` here
-    // (the auth check succeeded); the execution failure lives in
-    // the separate `execution_outcome` / `domain_error` columns.
-    let decision = if status.is_success() {
+    // Authorization outcome. A dispatched device command
+    // (`domain_outcome` present) was authorized and reached the
+    // plugin's queue: `allow`, whatever status the handler chose for
+    // its outcome (H5) — the outcome lives in the separate
+    // `execution_outcome` / `domain_error` / `command_outcome` columns
+    // (F4). Everything else is classified by the transport status.
+    let decision = if domain_outcome.is_some() || status.is_success() {
         "allow"
     } else if status.is_server_error() {
         "error"
     } else {
         "deny"
     };
-    // Execution outcome — orthogonal to authorization. Populated
-    // when the request reached the plugin and the plugin reported
-    // a domain-level result; `None` when the request was rejected
-    // at auth / dispatch (or when the handler doesn't expose a
-    // domain outcome at all, which is every current endpoint
-    // except device-command dispatch).
-    let (execution_outcome, domain_error) = match (status.is_success(), domain_outcome) {
-        (true, Some(o)) => (Some("failed"), Some(o.domain_error)),
-        // Success without a `DomainOutcome` extension = the handler
-        // has no domain-outcome contract or the plugin returned Ok.
-        // Recording "success" here overreaches for handlers that
-        // aren't in the domain-outcome contract at all (list /
-        // query endpoints), so treat every other case as "not
-        // applicable" and leave the columns NULL.
-        _ => (None, None),
+    // Execution outcome — orthogonal to authorization, `None` for
+    // every request that isn't a dispatched device command.
+    let (execution_outcome, domain_error, command) = match &domain_outcome {
+        Some(o) => (
+            o.execution_outcome,
+            o.domain_error,
+            Some((o.command_id.clone(), o.outcome)),
+        ),
+        None => (None, None, None),
     };
 
     let al = Arc::clone(audit_log);
@@ -859,13 +872,16 @@ pub(super) async fn finalize_audit(
     let execution_for_task = execution_outcome.map(str::to_owned);
     let domain_error_for_task = domain_error.map(str::to_owned);
     let join = tokio::task::spawn_blocking(move || {
-        al.finalize(
+        al.finalize_with_command(
             audit_id,
             status_u16,
             &decision_owned,
             required_for_task.as_deref(),
             execution_for_task.as_deref(),
             domain_error_for_task.as_deref(),
+            command
+                .as_ref()
+                .map(|(id, outcome)| (id.as_str(), *outcome)),
         )
     })
     .await;

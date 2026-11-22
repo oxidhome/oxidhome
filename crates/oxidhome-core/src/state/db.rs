@@ -800,6 +800,17 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE audit_event ADD COLUMN invocation_json TEXT;
     CREATE INDEX audit_call ON audit_event(call_id) WHERE call_id IS NOT NULL;
     ",
+    // 18 — architecture-review H5 / ADR-0003: explicit device-command
+    // outcomes. A device-command row carries the host-minted
+    // `command_id` and its outcome (`accepted` / `completed` /
+    // `rejected` / `timed_out` / `outcome_unknown`); the
+    // `method = 'COMMAND'` resolution rows written when an accepted
+    // command completes or expires carry the same id. Both nullable:
+    // every other row leaves them NULL.
+    "
+    ALTER TABLE audit_event ADD COLUMN command_id TEXT;
+    ALTER TABLE audit_event ADD COLUMN command_outcome TEXT;
+    ",
 ];
 
 /// File name of the host database inside the state dir.
@@ -1195,6 +1206,9 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 18 (H5): audit_event command columns.
+                    ALTER TABLE audit_event DROP COLUMN command_outcome;
+                    ALTER TABLE audit_event DROP COLUMN command_id;
                     -- 17 (H6): audit_event invocation columns.
                     DROP INDEX audit_call;
                     ALTER TABLE audit_event DROP COLUMN invocation_json;

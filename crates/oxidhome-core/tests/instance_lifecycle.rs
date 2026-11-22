@@ -10,7 +10,7 @@ mod support;
 
 use std::time::Duration;
 
-use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::Command;
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
     CustomEvent, Event, EventPayload,
 };
@@ -185,16 +185,18 @@ async fn read_count(handle: &InstanceHandle, capability: &str, action: &str) -> 
         .execute_command(
             "no-device".into(),
             Command {
+                id: String::new(),
                 capability: capability.into(),
                 action: action.into(),
                 args: Vec::new(),
             },
         )
-        .await
-        .expect("command through handle");
-    let fields = match result {
-        CommandResult::OkWithState(fields) => fields,
-        other => panic!("expected OkWithState, got {other:?}"),
+        .await;
+    let fields = match result.outcome {
+        oxidhome_core::CommandOutcome::Completed {
+            state: Some(fields),
+        } => fields,
+        other => panic!("expected completed with state, got {other:?}"),
     };
     match fields
         .iter()

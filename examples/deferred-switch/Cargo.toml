@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "deferred-switch"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "OxidHome example plugin: a switch whose commands finish asynchronously — it answers `accepted` and reports the result with `complete-command` on its next tick."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oxidhome-sdk = { path = "../../crates/oxidhome-sdk" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.cargo]
+unused_dependencies = "deny"

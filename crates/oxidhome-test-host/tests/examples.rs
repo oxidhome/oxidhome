@@ -14,12 +14,12 @@ use std::time::Duration;
 use oxidhome_test_host::wit::devices::{Command, CommandResult};
 use oxidhome_test_host::wit::types::{Error as WitError, KeyValue, Value};
 use oxidhome_test_host::{
-    CapabilitiesSection, InitError, InstanceState, LoadOptions, ServiceGrant, SupervisorTuning,
-    TestHost, TestHostError, block_on, test_supervision,
+    CapabilitiesSection, CommandOutcome, InitError, InstanceState, LoadOptions, ServiceGrant,
+    SupervisedInstance, SupervisorTuning, TestHost, TestHostError, block_on, test_supervision,
 };
 use support::{
-    CRASHER, HANG, HELLO_WORLD, KV_COUNTER, SERVICE_BOUNCER, SERVICE_CALLER, SERVICE_COUNTER,
-    SIMULATED_SWITCH, SNAPSHOT_SAVER, stage_unchanged,
+    CRASHER, DEFERRED_SWITCH, HANG, HELLO_WORLD, KV_COUNTER, SERVICE_BOUNCER, SERVICE_CALLER,
+    SERVICE_COUNTER, SIMULATED_SWITCH, SNAPSHOT_SAVER, stage_unchanged,
 };
 
 fn config(text: &str) -> toml::Value {
@@ -334,6 +334,7 @@ async fn service_bouncer_cycles_are_rejected() {
 
 fn write_snapshot(name: &str, payload: Vec<u8>) -> Command {
     Command {
+        id: "cmd-test".into(),
         capability: "snapshot".into(),
         action: "write".into(),
         args: vec![
@@ -362,6 +363,7 @@ async fn snapshot_saver_writes_blobs() {
     assert_eq!(saver.read_blob("frame-1").unwrap(), b"pixels");
 
     let list = Command {
+        id: "cmd-test".into(),
         capability: "snapshot".into(),
         action: "list".into(),
         args: Vec::new(),
@@ -640,10 +642,257 @@ async fn advance_stops_at_a_trapping_tick() {
     assert_eq!(crasher.elapsed(), Duration::from_millis(50));
 }
 
+// ── command outcomes (H5) ──────────────────────────────────────────
+
+fn switch_command(action: &str, args: Vec<KeyValue>) -> Command {
+    Command {
+        id: String::new(),
+        capability: "switch".into(),
+        action: action.into(),
+        args,
+    }
+}
+
+fn only_device(instance: &SupervisedInstance) -> String {
+    instance.devices()[0].id.clone()
+}
+
+/// Poll `done` every 10 ms for up to 5 s.
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Success is `completed` with the plugin's state; a plugin refusal is
+/// `rejected` and retry-safe. Each dispatch gets its own host-minted id,
+/// whatever id the caller put on the command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_outcomes_completed_and_rejected() {
+    let staged = stage_unchanged(SIMULATED_SWITCH);
+    let host = TestHost::new().unwrap();
+    let switch = host.start(staged.path()).await.unwrap();
+    switch.wait_for_running().await.unwrap();
+    let device = only_device(&switch);
+
+    let first = switch
+        .send_command(device.clone(), switch_command("toggle", Vec::new()))
+        .await;
+    match &first.outcome {
+        CommandOutcome::Completed { state: Some(state) } => {
+            assert_eq!(state[0].key, "state");
+        }
+        other => panic!("expected completed with state, got {other:?}"),
+    }
+    assert!(first.command_id.starts_with("cmd-"), "{first:?}");
+    assert!(!first.outcome.is_retry_safe());
+
+    let refused = switch
+        .send_command(device, switch_command("self-destruct", Vec::new()))
+        .await;
+    match &refused.outcome {
+        CommandOutcome::Rejected {
+            error: WitError::InvalidArgument(_),
+        } => {}
+        other => panic!("expected rejected, got {other:?}"),
+    }
+    assert!(refused.outcome.is_retry_safe());
+    assert_ne!(first.command_id, refused.command_id);
+    switch.stop().await.unwrap();
+}
+
+/// A trap after the plugin started the command is `outcome_unknown`:
+/// whatever it did to the device may stand. The trap still crashes the
+/// instance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_trap_after_start_is_outcome_unknown() {
+    let staged = stage_unchanged(CRASHER);
+    let host = TestHost::new().unwrap();
+    let crasher = host
+        .start_with(
+            staged.path(),
+            LoadOptions::new()
+                .config(config("crash_on = \"command\""))
+                .supervision(SupervisorTuning {
+                    max_restarts: 0,
+                    ..test_supervision()
+                }),
+        )
+        .await
+        .unwrap();
+    crasher.wait_for_running().await.unwrap();
+    let device = only_device(&crasher);
+
+    let report = crasher
+        .send_command(device, switch_command("toggle", Vec::new()))
+        .await;
+    match &report.outcome {
+        CommandOutcome::Unknown { message } => {
+            assert!(
+                message.contains("crashed during execute-command"),
+                "{message}"
+            );
+        }
+        other => panic!("expected outcome_unknown, got {other:?}"),
+    }
+    assert!(!report.outcome.is_retry_safe());
+    let error = failed_error(crasher.wait_terminal().await);
+    assert!(error.contains("invoking plugin execute-command"), "{error}");
+}
+
+/// The deadline rules. The first command wedges the plugin; its
+/// deadline passes while it runs, so it is `outcome_unknown`. The
+/// second command's deadline passes while it waits in the queue behind
+/// the first, so it is `timed_out` — and it never runs, even after the
+/// watchdog frees the supervisor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_deadline_before_and_after_start() {
+    let staged = stage_unchanged(HANG);
+    let host = TestHost::new().unwrap();
+    let hang = host
+        .start_with(
+            staged.path(),
+            LoadOptions::new()
+                .config(config("phase = \"command\""))
+                .supervision(SupervisorTuning {
+                    watchdog: Duration::from_secs(1),
+                    max_restarts: 0,
+                    ..test_supervision()
+                }),
+        )
+        .await
+        .unwrap();
+    hang.wait_for_running().await.unwrap();
+    let device = only_device(&hang);
+
+    let (running, queued) = tokio::join!(
+        hang.send_command_with_deadline(
+            device.clone(),
+            switch_command("toggle", Vec::new()),
+            Duration::from_millis(300),
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            hang.send_command_with_deadline(
+                device.clone(),
+                switch_command("toggle", Vec::new()),
+                Duration::from_millis(100),
+            )
+            .await
+        },
+    );
+    match &running.outcome {
+        CommandOutcome::Unknown { message } => {
+            assert!(message.contains("while instance"), "{message}");
+        }
+        other => panic!("expected outcome_unknown, got {other:?}"),
+    }
+    match &queued.outcome {
+        CommandOutcome::TimedOut { message } => {
+            assert!(message.contains("did not run"), "{message}");
+        }
+        other => panic!("expected timed_out, got {other:?}"),
+    }
+    assert!(queued.outcome.is_retry_safe());
+    // The watchdog ends the wedged call; the instance fails as
+    // unresponsive.
+    let error = failed_error(hang.wait_terminal().await);
+    assert!(error.contains("unresponsive"), "{error}");
+}
+
+/// `accepted`: the caller hears it at once, the plugin completes the
+/// command on its next tick with `complete-command`, and the pending
+/// entry goes away with the state projected and published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_accepted_then_completed() {
+    let staged = stage_unchanged(DEFERRED_SWITCH);
+    let host = TestHost::new().unwrap();
+    let switch = host.start(staged.path()).await.unwrap();
+    switch.wait_for_running().await.unwrap();
+    let device = only_device(&switch);
+
+    let report = switch
+        .send_command(device.clone(), switch_command("toggle", Vec::new()))
+        .await;
+    assert!(
+        matches!(report.outcome, CommandOutcome::Accepted),
+        "{report:?}"
+    );
+    let pending = switch.pending_commands();
+    eventually("the tick to complete the command", || pending.is_empty()).await;
+    let events = switch.events().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.device_id.as_deref() == Some(device.as_str())),
+        "the completion published the new state: {events:?}"
+    );
+    switch.stop().await.unwrap();
+}
+
+/// An accepted command that never completes expires as
+/// `outcome_unknown`; stopping the instance expires what it still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_accepted_then_expired() {
+    let staged = stage_unchanged(DEFERRED_SWITCH);
+    let host = TestHost::new().unwrap();
+    let switch = host.start(staged.path()).await.unwrap();
+    switch.wait_for_running().await.unwrap();
+    let device = only_device(&switch);
+    let lost = || switch_command("toggle", vec![arg("lost", Value::BoolVal(true))]);
+    let pending = switch.pending_commands();
+
+    pending.set_ttl(Duration::from_millis(100));
+    let report = switch.send_command(device.clone(), lost()).await;
+    assert!(
+        matches!(report.outcome, CommandOutcome::Accepted),
+        "{report:?}"
+    );
+    assert_eq!(pending.len(), 1);
+    eventually("the pending command to expire", || pending.is_empty()).await;
+
+    pending.set_ttl(Duration::from_mins(5));
+    let report = switch.send_command(device, lost()).await;
+    assert!(matches!(report.outcome, CommandOutcome::Accepted));
+    assert_eq!(pending.len(), 1);
+    switch.stop().await.unwrap();
+    assert!(
+        pending.is_empty(),
+        "stop expires the instance's pending commands"
+    );
+}
+
+/// The direct harness registers `accepted` commands too, so a plugin's
+/// asynchronous path is testable tick by tick on the virtual clock.
+#[tokio::test(flavor = "current_thread")]
+async fn command_accepted_completes_on_a_direct_tick() {
+    let staged = stage_unchanged(DEFERRED_SWITCH);
+    let host = TestHost::new().unwrap();
+    let mut switch = host.load(staged.path()).await.unwrap();
+    switch.init().await.unwrap();
+    let device = switch.devices()[0].id.clone();
+    let pending = host.engine().pending_commands();
+
+    let mut command = switch_command("set", vec![arg("state", Value::BoolVal(true))]);
+    command.id = "cmd-00000000000000000000000000000001".into();
+    let reply = switch.send_command(device, command).await.unwrap();
+    assert!(matches!(reply, CommandResult::Accepted), "{reply:?}");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(switch.advance(Duration::from_millis(50)).await.unwrap(), 1);
+    assert!(pending.is_empty(), "the tick completed the command");
+    assert_eq!(switch.events().unwrap().len(), 1);
+}
+
 // ── snapshots ──────────────────────────────────────────────────────
 
 fn toggle() -> Command {
     Command {
+        id: "cmd-test".into(),
         capability: "switch".into(),
         action: "toggle".into(),
         args: Vec::new(),

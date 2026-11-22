@@ -40,3 +40,28 @@ Not adopted for now; each can be added later on top of the command id:
   [ADR-0007](0007-0x-publication-policy.md)).
 - The REST, Connect and MCP command APIs change to return the command id and outcome state.
 - A caller still cannot safely retry after `outcome_unknown`; it has to read the device state first.
+
+## Implementation notes
+
+Shipped in the H5 implementation PR. The command id is `cmd-<32 hex>`, minted by the host at dispatch; WIT
+`command-result` gained `unknown(string)` and `accepted`, and `host-devices` gained `complete-command` (contract stays at
+`oxidhome:plugin@0.1.0`, baseline re-blessed). `accepted` means "the plugin took the command and will finish it later",
+not "queued by the host": a host-side queue that answers before the plugin runs would leave every command
+`outcome_unknown`-prone.
+
+| What happened | Outcome |
+|---|---|
+| plugin replied `ok` / `ok-with-state` | `completed` |
+| plugin replied `err` | `rejected` |
+| host refused before queueing (instance not running, restarting, stopped before the command ran) | `rejected` |
+| deadline passed, or the caller went away, while the command was still queued | `timed_out` (it never runs) |
+| plugin replied `unknown` | `outcome_unknown` |
+| trap, watchdog kill or deadline after the plugin started the command | `outcome_unknown` |
+| `ok-with-state` the projection refuses (size caps, sensor units) | `outcome_unknown` |
+| plugin replied `accepted` | `accepted`, then pending |
+| pending, plugin calls `complete-command` | the reply's outcome, as above |
+| pending, 5 min pass or the instance restarts or stops | `outcome_unknown` |
+
+`rejected` and `timed_out` are safe to retry. REST maps the outcomes to 200 / 202 / 422 / 504 / 502; Connect keeps an
+OK status and carries `command_outcome`; MCP sets `isError` for the three failure outcomes. Pending and late results
+are recorded as `COMMAND` audit rows sharing the request's `call_id`; there is still no lookup API.

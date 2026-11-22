@@ -721,6 +721,8 @@ fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> Audit
         credential_fp: None,
         call_id: None,
         invocation: None,
+        command_id: None,
+        command_outcome: None,
     }
 }
 

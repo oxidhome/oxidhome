@@ -44,6 +44,7 @@ async fn toggle_flips_the_switch() -> Result<(), TestHostError> {
 
     // Send it a command, exactly as the daemon routes one.
     let toggle = Command {
+        id: "cmd-test".into(),
         capability: "switch".into(),
         action: "toggle".into(),
         args: Vec::new(),

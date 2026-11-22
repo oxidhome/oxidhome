@@ -97,6 +97,7 @@ async fn drain_events_dispatches_to_plugin_on_event() {
         .execute_command(
             device_id.clone(),
             WitCommand {
+                id: String::new(),
                 capability: "switch".into(),
                 action: "toggle".into(),
                 args: Vec::new(),

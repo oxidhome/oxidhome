@@ -106,6 +106,24 @@ pub fn get_device(id: &DeviceId) -> Result<DeviceInfo, Error> {
     host_devices::get_device(id)
 }
 
+/// Report the final result of a device command this instance answered
+/// with [`CommandResult::Accepted`] (H5). `command_id` is the
+/// [`Command::id`](crate::bindings::oxidhome::plugin::devices::Command)
+/// of the original command; keep it when you return `Accepted`.
+///
+/// Each accepted command completes once. The host expires a pending
+/// command (recording `outcome_unknown`) after a few minutes, or when
+/// this instance restarts, so finish promptly.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] if `reply` is `Accepted`;
+/// [`Error::NotFound`] if `command_id` isn't pending for this instance
+/// (never accepted, already completed, or expired).
+pub fn complete_command(command_id: &str, reply: &CommandResult) -> Result<(), Error> {
+    host_devices::complete_command(command_id, reply)
+}
+
 // ── Services (Phase 7) ───────────────────────────────────────────────
 
 /// Register a service with the host. Accepts either a

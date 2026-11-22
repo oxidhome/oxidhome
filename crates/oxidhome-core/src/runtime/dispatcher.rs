@@ -532,6 +532,8 @@ impl HopAudit {
             credential_fp: None,
             call_id: Some(callee_ctx.call_id().to_owned()),
             invocation: Some(callee_ctx.audit_json()),
+            command_id: None,
+            command_outcome: None,
         };
         Self { log, entry }
     }
@@ -585,6 +587,10 @@ impl HopAudit {
                 Some("failed"),
                 Some(crate::api::wit_error_kind(err)),
             ),
+            // H5: the callee may have acted; neither success nor a
+            // refusal. (`accepted` never reaches here — the callee's
+            // instance turns it into `unknown`.)
+            Ok(CommandResult::Unknown(_) | CommandResult::Accepted) => (200, "allow", None, None),
             Err(_) => (503, "error", None, None),
         };
         let log = self.log;

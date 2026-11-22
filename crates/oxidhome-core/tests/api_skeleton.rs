@@ -1239,21 +1239,20 @@ async fn device_command_end_to_end_through_simulated_switch() {
         "command dispatch should succeed for an admin token",
     );
     let body = body_to_json(response.into_body()).await;
-    // The plugin returns either `Ok` or `OkWithState`; both are
-    // structural successes — assert `kind` is present and not
-    // `err`.
-    let kind = body["kind"].as_str().expect("kind field on response");
+    // H5: a host-minted command id and the explicit outcome.
+    assert_eq!(body["outcome"], "completed", "{body:?}");
+    assert_eq!(body["retry_safe"], false, "{body:?}");
     assert!(
-        kind == "ok" || kind == "ok_with_state",
-        "expected ok / ok_with_state, got kind={kind} body={body:?}",
+        body["command_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("cmd-")),
+        "{body:?}",
     );
     // If the plugin returned state, each entry must use the tagged
     // `WireValue` shape (`{"t":..,"v":..}`) — pins the response-
     // side round-trip contract that 12-API-d's review surfaced.
-    if kind == "ok_with_state" {
-        let state = body["state"]
-            .as_object()
-            .expect("state object on ok_with_state");
+    if let Some(state) = body.get("state") {
+        let state = state.as_object().expect("state object");
         for (key, value) in state {
             assert!(
                 value.get("t").and_then(Value::as_str).is_some(),
@@ -2990,12 +2989,12 @@ async fn connect_devices_execute_command_end_to_end_through_simulated_switch() {
 /// (simulated-switch's `execute_command` refuses any action that
 /// isn't a `switch` toggle/on/off — see
 /// `examples/simulated-switch/src/lib.rs:82`). The wire response
-/// is HTTP 200 with the error inside the body, and — this is the
-/// F4 invariant, revised on the PR-#79 review — the audit ledger
-/// records the transport and authorization outcomes *independently*
-/// from the execution outcome:
+/// is H5 `rejected` (HTTP 422) with the error inside the body, and —
+/// this is the F4 invariant, revised on the PR-#79 review — the audit
+/// ledger records the transport and authorization outcomes
+/// *independently* from the execution outcome:
 ///
-/// - `status = 200` (wire status)
+/// - `status = 422` (wire status)
 /// - `decision = "allow"` (authorization passed — the plugin ran)
 /// - `execution_outcome = "failed"` (plugin's domain result)
 /// - `domain_error = "invalid_argument"` (WIT error kind)
@@ -3045,12 +3044,14 @@ async fn send_command_domain_error_audits_execution_failure() {
         )
         .await
         .unwrap();
-    // Wire response is HTTP 200 with the error inside the body —
-    // that's the whole shape F4 is about. Confirm before checking
-    // the audit ledger.
-    assert_eq!(response.status(), StatusCode::OK);
+    // H5: a plugin refusal is `rejected` — 422 with the typed error
+    // and the command id in the body.
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = body_to_json(response.into_body()).await;
-    assert_eq!(body["kind"], "err");
+    assert_eq!(body["outcome"], "rejected", "{body:?}");
+    assert_eq!(body["retry_safe"], true, "{body:?}");
+    assert_eq!(body["error"]["kind"], "invalid_argument", "{body:?}");
+    let command_id = body["command_id"].as_str().expect("command id").to_owned();
 
     // The audit row keeps authorization and execution outcomes
     // as distinct fields.
@@ -3059,7 +3060,7 @@ async fn send_command_domain_error_audits_execution_failure() {
         .iter()
         .find(|r| r.path == format!("/api/v1/devices/{device_id}/command"))
         .expect("command audit row present");
-    assert_eq!(hit.status, 200, "wire status preserved, got {hit:?}");
+    assert_eq!(hit.status, 422, "wire status preserved, got {hit:?}");
     assert_eq!(hit.decision, "allow", "auth outcome, got {hit:?}");
     assert_eq!(
         hit.execution_outcome.as_deref(),
@@ -3071,8 +3072,197 @@ async fn send_command_domain_error_audits_execution_failure() {
         Some("invalid_argument"),
         "domain error kind, got {hit:?}",
     );
+    assert_eq!(hit.command_id.as_deref(), Some(command_id.as_str()));
+    assert_eq!(hit.command_outcome.as_deref(), Some("rejected"));
 
     handle.stop().await.expect("stop");
+}
+
+/// POST one JSON device command as `bearer`; returns the status and body.
+async fn post_device_command(
+    engine: &Engine,
+    bearer: &str,
+    device_id: &str,
+    body: &str,
+) -> (StatusCode, Value) {
+    let response = build_router(engine.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{device_id}/command"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_to_json(response.into_body()).await)
+}
+
+/// Poll the audit ledger until a `COMMAND` resolution row for
+/// `command_id` lands, and return it.
+async fn resolution_row(engine: &Engine, command_id: &str) -> oxidhome_core::state::AuditEntry {
+    use oxidhome_core::state::AuditQuery;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let rows = engine
+            .audit_log()
+            .query(&AuditQuery::default(), 50)
+            .expect("audit");
+        if let Some(row) = rows
+            .into_iter()
+            .find(|r| r.method == "COMMAND" && r.command_id.as_deref() == Some(command_id))
+        {
+            return row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no COMMAND resolution row for {command_id}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn first_device_of(engine: &Engine, instance: &str) -> String {
+    engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|m| m.owner_instance == instance)
+        .expect("instance registered a device")
+        .id
+        .clone()
+}
+
+/// H5 `accepted`: REST answers `202` with the command id; the plugin
+/// completes the command on its next tick and the audit ledger gains a
+/// `COMMAND` resolution row (same `call_id` and `command_id`) with the
+/// final `completed` outcome. A command that never completes expires
+/// into a resolution row with `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_accepted_command_resolves_in_the_audit_ledger() {
+    let _wasm = support::build_example("deferred-switch", "deferred_switch.wasm");
+    let dir = support::workspace_root()
+        .join("examples")
+        .join("deferred-switch");
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let handle = engine
+        .start_instance(dir, "deferred", None)
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("running");
+    let device_id = first_device_of(&engine, "deferred");
+
+    let (status, body) = post_device_command(
+        &engine,
+        &admin.plaintext,
+        &device_id,
+        r#"{"capability":"switch","action":"toggle","args":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body:?}");
+    assert_eq!(body["outcome"], "accepted", "{body:?}");
+    assert_eq!(body["retry_safe"], false, "{body:?}");
+    let command_id = body["command_id"].as_str().expect("command id").to_owned();
+
+    let resolved = resolution_row(&engine, &command_id).await;
+    assert_eq!(resolved.command_outcome.as_deref(), Some("completed"));
+    assert_eq!(resolved.execution_outcome.as_deref(), Some("success"));
+    assert_eq!(resolved.path, format!("device.command/{device_id}"));
+    let request_row = engine
+        .audit_log()
+        .query(
+            &oxidhome_core::state::AuditQuery {
+                path: Some(format!("/api/v1/devices/{device_id}/command")),
+                ..Default::default()
+            },
+            5,
+        )
+        .expect("audit")
+        .into_iter()
+        .find(|r| r.command_id.as_deref() == Some(command_id.as_str()))
+        .expect("request row");
+    assert_eq!(request_row.status, 202);
+    assert_eq!(request_row.decision, "allow");
+    assert_eq!(request_row.command_outcome.as_deref(), Some("accepted"));
+    assert_eq!(request_row.call_id, resolved.call_id, "one invocation");
+
+    engine
+        .pending_commands()
+        .set_ttl(std::time::Duration::from_millis(100));
+    let (status, body) = post_device_command(
+        &engine,
+        &admin.plaintext,
+        &device_id,
+        r#"{"capability":"switch","action":"toggle","args":[{"key":"lost","value":{"t":"Bool","v":true}}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body:?}");
+    let lost_id = body["command_id"].as_str().expect("command id").to_owned();
+    let expired = resolution_row(&engine, &lost_id).await;
+    assert_eq!(expired.command_outcome.as_deref(), Some("outcome_unknown"));
+    assert_eq!(expired.execution_outcome, None);
+
+    handle.stop().await.expect("stop");
+}
+
+/// H5: a trap after the plugin started the command is
+/// `outcome_unknown` — `502` with the command id, not a bare `500`,
+/// and the audit row keeps `decision = "allow"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_trap_after_start_is_outcome_unknown() {
+    let _wasm = support::build_example("crasher", "crasher.wasm");
+    let dir = support::workspace_root().join("examples").join("crasher");
+    let engine = Engine::new().expect("engine");
+    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let overrides: toml::Value = toml::from_str("crash_on = \"command\"").unwrap();
+    let handle = engine
+        .start_instance(dir, "crasher", Some(overrides))
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("running");
+    let device_id = first_device_of(&engine, "crasher");
+
+    let (status, body) = post_device_command(
+        &engine,
+        &admin.plaintext,
+        &device_id,
+        r#"{"capability":"switch","action":"toggle","args":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+    assert_eq!(body["outcome"], "outcome_unknown", "{body:?}");
+    assert_eq!(body["retry_safe"], false, "{body:?}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("crashed during execute-command")),
+        "{body:?}"
+    );
+    let command_id = body["command_id"].as_str().expect("command id");
+    let row = engine
+        .audit_log()
+        .query(
+            &oxidhome_core::state::AuditQuery {
+                path: Some(format!("/api/v1/devices/{device_id}/command")),
+                ..Default::default()
+            },
+            5,
+        )
+        .expect("audit")
+        .into_iter()
+        .next()
+        .expect("command row");
+    assert_eq!(row.status, 502);
+    assert_eq!(row.decision, "allow", "{row:?}");
+    assert_eq!(row.command_id.as_deref(), Some(command_id));
+    assert_eq!(row.command_outcome.as_deref(), Some("outcome_unknown"));
+    assert_eq!(row.execution_outcome, None);
+
+    let _ = handle.stop().await;
 }
 
 /// F4 regression — Connect path. Same shape as the JSON test
@@ -3129,6 +3319,13 @@ async fn connect_execute_command_domain_error_audits_execution_failure() {
         body.get("err").is_some(),
         "expected err outcome, got {body:?}",
     );
+    // H5: the command id and explicit outcome ride next to the oneof.
+    assert_eq!(
+        body["commandOutcome"], "COMMAND_OUTCOME_REJECTED",
+        "{body:?}"
+    );
+    let command_id = body["commandId"].as_str().expect("command id").to_owned();
+    assert!(command_id.starts_with("cmd-"), "{body:?}");
 
     // Audit row records execution + authorization separately.
     let rows = audit_log.query(&AuditQuery::default(), 8).expect("audit");
@@ -3148,6 +3345,8 @@ async fn connect_execute_command_domain_error_audits_execution_failure() {
         Some("invalid_argument"),
         "got {hit:?}",
     );
+    assert_eq!(hit.command_id.as_deref(), Some(command_id.as_str()));
+    assert_eq!(hit.command_outcome.as_deref(), Some("rejected"));
 
     handle.stop().await.expect("stop");
 }
@@ -6114,16 +6313,20 @@ async fn expired_invocation_is_refused_before_plugin_runs() {
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
             .with_deadline(Some(tokio::time::Instant::now()));
     let toggle = || Command {
+        id: String::new(),
         capability: "switch".into(),
         action: "toggle".into(),
         args: Vec::new(),
     };
 
-    let err = handle
+    // H5: the deadline passed before the plugin started, so the host
+    // reports `timed_out` — the command did not run.
+    let report = handle
         .execute_command_in(expired, device_id.clone(), toggle())
-        .await
-        .expect_err("expired invocation must be refused");
-    assert!(format!("{err:#}").contains("deadline exceeded"), "{err:#}");
+        .await;
+    assert_eq!(report.outcome.as_str(), "timed_out", "{report:?}");
+    assert!(report.outcome.is_retry_safe());
+    assert!(report.command_id.starts_with("cmd-"), "{report:?}");
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -6134,10 +6337,8 @@ async fn expired_invocation_is_refused_before_plugin_runs() {
         "plugin must not have run (no state-changed event)",
     );
     // The instance is still healthy and serves a live invocation.
-    handle
-        .execute_command(device_id, toggle())
-        .await
-        .expect("fresh command runs");
+    let report = handle.execute_command(device_id, toggle()).await;
+    assert_eq!(report.outcome.as_str(), "completed", "{report:?}");
 
     handle.stop().await.expect("stop");
 }

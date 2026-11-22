@@ -846,7 +846,8 @@ impl PluginInstance {
             engine.instances(),
         )
         .with_granted_capabilities(granted_capabilities)
-        .with_audit_log(engine.audit_log());
+        .with_audit_log(engine.audit_log())
+        .with_pending_commands(engine.pending_commands());
         let mut store = Store::new(engine.raw(), state);
         // C4: install the wasmtime resource limiter so linear-memory
         // grows / table extensions / additional instance/memory/table
@@ -981,12 +982,23 @@ impl PluginInstance {
         .await
     }
 
+    /// H6/H5: the audit ledger this instance records delegated hops
+    /// and command resolutions in, if attached.
+    pub(crate) fn audit_log(&self) -> Option<Arc<crate::state::AuditLog>> {
+        self.store.data().audit_log.clone()
+    }
+
     /// Call the plugin's exported `execute-command` for a device this
     /// instance owns. Phase 3's host-side command routing (in tests
     /// today, in the API/MCP layers later) looks up the device's
     /// owner in [`DeviceRegistry`](crate::DeviceRegistry) and calls
     /// this method on the matching [`PluginInstance`].
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// H5: `cmd.id` is the host-minted command id. An `accepted` reply
+    /// is registered in the engine's pending-command table here (so
+    /// supervised and directly-driven instances behave alike); when it
+    /// can't be tracked the reply becomes `unknown`, because the plugin
+    /// believes it holds the command.
     pub async fn execute_command(
         &mut self,
         device: DeviceId,
@@ -1011,6 +1023,7 @@ impl PluginInstance {
         // correct `(device, capability)` slot with the owning
         // instance id.
         let capability = cmd.capability.clone();
+        let command_id = cmd.id.clone();
         let device_for_projection = device.clone();
         let owner_instance = data.instance_id.clone();
         let result = async {
@@ -1028,149 +1041,46 @@ impl PluginInstance {
             &mut result,
             &crate::redact::config_secrets(&self.store.data().config),
         );
-        // H9 round-2 finding 4: `OkWithState` is authoritative
-        // state (per proto docs) — project it into the store so
-        // the snapshot / delta APIs reflect the post-command
-        // value. `Ok` and `Err` don't carry state; skip.
-        //
-        // H9 round-3 finding 1: use `replace_snapshot` (not
-        // `apply_delta`). `OkWithState` is the plugin's
-        // authoritative post-command state, not a partial
-        // change list — merging would preserve stale fields the
-        // fresh snapshot doesn't declare.
-        //
-        // H9 round-3 finding 2: re-validate **after** the guest
-        // call before projecting. A plugin may have called
-        // `remove-device` mid-`execute-command` and then
-        // returned `OkWithState`; without the re-check the
-        // projection would resurrect the removed slot as
-        // `Fresh`. Similarly, the WIT surface accepts any
-        // command capability string, so a plugin could return
-        // `OkWithState` for a capability the device doesn't
-        // declare. Refuse both silently — return the plugin's
-        // result unchanged (the caller made no state-projection
-        // promise) and log a warn so operators can spot the
-        // misbehavior.
-        // H9 round-18 finding 2: consume the guest's returned
-        // vec instead of holding a reference (which forced the
-        // canonicalization + admission helpers to clone every
-        // KeyValue up front — a guest can return data
-        // approaching its 128 MiB memory cap, and each clone
-        // was a full host-side copy). Now we take ownership
-        // once and canonicalize by consuming.
-        let fields = match result {
-            CommandResult::OkWithState(fields) => fields,
-            other => return Ok(other),
-        };
-        // Round-18 finding 2: **enforce the per-slot cap first,
-        // before any ownership / capability check**. Pre-fix,
-        // size checks lived inside `if projection_ok`, so a
-        // plugin that removed the device mid-call (or returned
-        // state for an undeclared capability) got its
-        // unrestricted result returned unchecked. The check
-        // is O(fields.len()) on borrowed data — no allocations
-        // — so it's safe to run before the ownership lookup.
-        if let Err(overflow) = crate::state::DeviceStateStore::check_snapshot_admission(&fields) {
-            tracing::warn!(
-                instance_id = %owner_instance,
-                device_id = %device_for_projection,
-                capability = %capability,
-                overflow = %overflow,
-                "execute-command OkWithState exceeds the per-slot cap; downgrading to Err",
-            );
-            return Ok(CommandResult::Err(
-                crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(format!(
-                    "OkWithState on `{device_for_projection}/{capability}` would exceed \
-                     the projection's per-slot cap ({overflow})",
-                )),
-            ));
-        }
+        // H9: `OkWithState` is authoritative state — validate and
+        // project it (see `project_command_state`).
         let data = self.store.data();
-        let devices = Arc::clone(&data.devices);
-        let device_state = Arc::clone(&data.device_state);
-        let projection_ok = if let Ok(meta) = devices.get(&owner_instance, &device_for_projection) {
-            let capability_declared = meta
-                .info
-                .capabilities
-                .iter()
-                .any(|spec| super::state::capability_name(spec) == capability);
-            if !capability_declared {
-                tracing::warn!(
-                    instance_id = %owner_instance,
-                    device_id = %device_for_projection,
-                    capability = %capability,
-                    "execute-command returned OkWithState for a capability the device \
-                     doesn't declare; skipping state projection",
-                );
-            }
-            // M2: a sensor reading must carry the spec's unit.
-            if let Err(e) = super::schema::check_sensor_fields(&meta.info, &capability, &fields) {
-                return Ok(CommandResult::Err(
-                    crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(
-                        format!("OkWithState on `{device_for_projection}/{capability}`: {e}"),
-                    ),
-                ));
-            }
-            capability_declared
-        } else {
-            tracing::warn!(
-                instance_id = %owner_instance,
-                device_id = %device_for_projection,
-                "execute-command returned OkWithState for a device this instance no \
-                 longer owns; skipping state projection",
-            );
-            false
-        };
-        if projection_ok {
-            // H9 round-16 finding 2: per-instance
-            // aggregate-bytes cap check. Same downgrade
-            // semantics as the per-slot cap. Round-19
-            // finding 1: measures against `&fields`
-            // (borrowed, no clone) via
-            // `projected_slot_size` internally.
-            if let Err(overflow) = device_state.check_instance_snapshot_admission(
-                &device_for_projection,
+        match result {
+            CommandResult::OkWithState(fields) => Ok(project_command_state(
+                &data.devices,
+                &data.device_state,
                 &owner_instance,
+                &device_for_projection,
                 &capability,
-                &fields,
-            ) {
-                tracing::warn!(
-                    instance_id = %owner_instance,
-                    device_id = %device_for_projection,
-                    capability = %capability,
-                    overflow = %overflow,
-                    "execute-command OkWithState exceeds the per-instance cap; downgrading to Err",
-                );
-                return Ok(CommandResult::Err(
-                    crate::host_impl::plugin::oxidhome::plugin::types::Error::InvalidArgument(
-                        format!(
-                            "OkWithState on `{device_for_projection}/{capability}` would exceed \
-                             the projection's per-instance aggregate cap ({overflow})",
-                        ),
+                fields,
+            )),
+            CommandResult::Accepted => {
+                let tracked = match &data.pending_commands {
+                    Some(table) => table.register(
+                        &command_id,
+                        &owner_instance,
+                        &device_for_projection,
+                        &capability,
+                        crate::auth::invocation::current_or_host(&owner_instance),
                     ),
-                ));
+                    None => Err("this host cannot track accepted commands".to_owned()),
+                };
+                Ok(match tracked {
+                    Ok(()) => CommandResult::Accepted,
+                    Err(why) => {
+                        tracing::warn!(
+                            instance_id = %owner_instance,
+                            command_id = %command_id,
+                            reason = %why,
+                            "execute-command returned accepted but the host can't track it",
+                        );
+                        CommandResult::Unknown(format!(
+                            "plugin accepted the command but the host cannot track it: {why}"
+                        ))
+                    }
+                })
             }
+            other => Ok(other),
         }
-        // H9 round-19 finding 1: canonicalize by **consuming**
-        // the owned `fields` vec — moves values, only
-        // clones keys for the dedup index (bounded by
-        // `MAX_FIELDS_PER_SLOT` since admission already
-        // passed). Runs unconditionally so both the
-        // projection write AND the returned wire response
-        // see the same last-wins vec.
-        let canonical = crate::state::DeviceStateStore::canonicalize_snapshot_fields(fields);
-        if projection_ok {
-            let received_ms = crate::state::event_log::now_unix_ms();
-            device_state.replace_snapshot(
-                device_for_projection,
-                owner_instance,
-                capability,
-                canonical.clone(),
-                0, // observed_ms — commands don't carry a plugin timestamp
-                received_ms,
-            );
-        }
-        Ok(CommandResult::OkWithState(canonical))
     }
 
     /// Call the plugin's exported `execute-service-command` for a
@@ -1194,7 +1104,7 @@ impl PluginInstance {
             service_id = %service,
             command = %command,
         );
-        async {
+        let result = async {
             self.arm_watchdog();
             self.bindings
                 .call_execute_service_command(&mut self.store, &service, &command, &args)
@@ -1203,13 +1113,20 @@ impl PluginInstance {
                 .context("invoking plugin execute-service-command")
         }
         .instrument(span)
-        .await
-        .map(|mut result| {
-            crate::redact::scrub_command_error(
-                &mut result,
-                &crate::redact::config_secrets(&self.store.data().config),
-            );
-            result
+        .await?;
+        let mut result = result;
+        crate::redact::scrub_command_error(
+            &mut result,
+            &crate::redact::config_secrets(&self.store.data().config),
+        );
+        // H5: service commands complete synchronously. A callee that
+        // answers `accepted` may still act later, so the caller hears
+        // `unknown`, never `accepted`.
+        Ok(match result {
+            CommandResult::Accepted => CommandResult::Unknown(
+                "service commands complete synchronously; the callee answered `accepted`".into(),
+            ),
+            other => other,
         })
     }
 
@@ -1402,6 +1319,117 @@ fn resolve_wasm_path(plugin_dir: &Path, rel_wasm: &Path) -> anyhow::Result<std::
         ));
     }
     Ok(canonical_wasm)
+}
+
+/// Validate and project an `ok-with-state` command reply into the
+/// device-state store (H9). Shared by a synchronous `execute-command`
+/// reply and an asynchronous `complete-command` (H5); returns the
+/// canonicalized reply.
+///
+/// - Round-3 findings 1/2: the reply is the plugin's authoritative
+///   post-command state, so it *replaces* the slot, and it is
+///   re-validated after the guest call — a plugin may have removed the
+///   device mid-call, or named a capability the device doesn't
+///   declare; both skip the projection with a warn.
+/// - Round-18 finding 2: the per-slot cap is enforced first, before any
+///   ownership / capability check, on borrowed data.
+/// - Round-19 finding 1: canonicalization consumes the owned vec, so a
+///   large reply is never cloned field by field.
+///
+/// A reply whose state violates the projection contract (size caps,
+/// sensor units) becomes `unknown`, not `err`: the plugin reported
+/// success, so the command may well have taken effect, but the host
+/// can't vouch for the report (H5: `err` means "did not act").
+pub(crate) fn project_command_state(
+    devices: &crate::state::DeviceRegistry,
+    device_state: &crate::state::DeviceStateStore,
+    owner_instance: &str,
+    device: &DeviceId,
+    capability: &str,
+    fields: Vec<KeyValue>,
+) -> CommandResult {
+    if let Err(overflow) = crate::state::DeviceStateStore::check_snapshot_admission(&fields) {
+        tracing::warn!(
+            instance_id = %owner_instance,
+            device_id = %device,
+            capability = %capability,
+            overflow = %overflow,
+            "command OkWithState exceeds the per-slot cap; reporting outcome_unknown",
+        );
+        return CommandResult::Unknown(format!(
+            "plugin reported success, but its state for `{device}/{capability}` would \
+             exceed the projection's per-slot cap ({overflow})",
+        ));
+    }
+    let projection_ok = if let Ok(meta) = devices.get(owner_instance, device) {
+        let capability_declared = meta
+            .info
+            .capabilities
+            .iter()
+            .any(|spec| super::state::capability_name(spec) == capability);
+        if !capability_declared {
+            tracing::warn!(
+                instance_id = %owner_instance,
+                device_id = %device,
+                capability = %capability,
+                "command returned OkWithState for a capability the device doesn't \
+                 declare; skipping state projection",
+            );
+        }
+        // M2: a sensor reading must carry the spec's unit.
+        if let Err(e) = super::schema::check_sensor_fields(&meta.info, capability, &fields) {
+            return CommandResult::Unknown(format!(
+                "plugin reported success, but its state for `{device}/{capability}` is \
+                 invalid: {e}"
+            ));
+        }
+        capability_declared
+    } else {
+        tracing::warn!(
+            instance_id = %owner_instance,
+            device_id = %device,
+            "command returned OkWithState for a device this instance no longer owns; \
+             skipping state projection",
+        );
+        false
+    };
+    // H9 round-16 finding 2: per-instance aggregate-bytes cap, same
+    // semantics as the per-slot cap.
+    if projection_ok
+        && let Err(overflow) = device_state.check_instance_snapshot_admission(
+            device,
+            owner_instance,
+            capability,
+            &fields,
+        )
+    {
+        tracing::warn!(
+            instance_id = %owner_instance,
+            device_id = %device,
+            capability = %capability,
+            overflow = %overflow,
+            "command OkWithState exceeds the per-instance cap; reporting outcome_unknown",
+        );
+        return CommandResult::Unknown(format!(
+            "plugin reported success, but its state for `{device}/{capability}` would \
+             exceed the projection's per-instance aggregate cap ({overflow})",
+        ));
+    }
+    // Runs unconditionally so the projection write and the returned
+    // reply see the same last-wins vec.
+    let canonical = crate::state::DeviceStateStore::canonicalize_snapshot_fields(fields);
+    if projection_ok {
+        let received_ms = crate::state::event_log::now_unix_ms();
+        device_state.replace_snapshot(
+            device.to_owned(),
+            owner_instance.to_owned(),
+            capability.to_owned(),
+            canonical.clone(),
+            0, // observed_ms — commands don't carry a plugin timestamp
+            received_ms,
+        );
+    }
+    CommandResult::OkWithState(canonical)
 }
 
 #[cfg(test)]

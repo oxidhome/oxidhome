@@ -23,7 +23,9 @@ service DevicesService {
   // `POST /api/v1/devices/{id}/command`: the host looks up the
   // device's owning instance and forwards `execute-command` to
   // it. Unknown device and non-running owner both collapse to
-  // NotFound (no enumeration leak).
+  // NotFound (no enumeration leak). Every routed command returns OK
+  // with a host-minted `command_id` and an explicit
+  // `command_outcome` (H5, ADR-0003).
   rpc ExecuteCommand(ExecuteCommandRequest) returns (ExecuteCommandResponse);
 }
 
@@ -84,6 +86,9 @@ message KeyValue {
 }
 
 message ExecuteCommandResponse {
+  // Outcome detail. `ok` / `ok_with_state` mean `completed`, `err`
+  // means `rejected`; the H5 cases below cover the rest. Read
+  // `command_outcome` for the state itself.
   oneof outcome {
     // Command executed, no state readout.
     Ok ok = 1;
@@ -91,17 +96,56 @@ message ExecuteCommandResponse {
     // caller should treat as authoritative until the next
     // `state-changed` event.
     OkWithState ok_with_state = 2;
-    // Plugin-returned structured error (as opposed to a Connect
-    // transport error). RPC-level failures (unknown device, no
-    // running owner) come back as ConnectError codes on the wire.
+    // The plugin (or the host) refused the command before acting.
+    // RPC-level failures (unknown device, no running owner) come back
+    // as ConnectError codes on the wire.
     ExecuteCommandError err = 3;
+    // H5: the plugin took the command and finishes it asynchronously.
+    Accepted accepted = 6;
+    // H5: the deadline passed before the plugin started; the command
+    // did not run.
+    TimedOut timed_out = 7;
+    // H5: the command may or may not have taken effect.
+    OutcomeUnknown outcome_unknown = 8;
   }
+
+  // H5: host-minted id of this command dispatch (`cmd-<32 hex>`),
+  // recorded in the audit trail.
+  string command_id = 4;
+  // H5: the explicit outcome.
+  CommandOutcome command_outcome = 5;
 
   message Ok {}
 
   message OkWithState {
     repeated KeyValue state = 1;
   }
+
+  message Accepted {}
+
+  message TimedOut {
+    string message = 1;
+  }
+
+  message OutcomeUnknown {
+    string message = 1;
+  }
+}
+
+// H5 (ADR-0003): how a device command ended.
+enum CommandOutcome {
+  COMMAND_OUTCOME_UNSPECIFIED = 0;
+  // Taken by the plugin; the final result is recorded later.
+  COMMAND_OUTCOME_ACCEPTED = 1;
+  // The plugin reported success.
+  COMMAND_OUTCOME_COMPLETED = 2;
+  // Refused before acting; safe to retry once the cause is fixed.
+  COMMAND_OUTCOME_REJECTED = 3;
+  // The deadline passed before the plugin started; safe to retry.
+  COMMAND_OUTCOME_TIMED_OUT = 4;
+  // May or may not have taken effect; read the device state before
+  // retrying.
+  COMMAND_OUTCOME_UNKNOWN = 5;
 }
 
 // Wire mirror of the WIT `error` variant returned by the plugin.

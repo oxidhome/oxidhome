@@ -110,6 +110,7 @@ trait Driver {
 
 fn command(capability: &str, action: &str) -> Command {
     Command {
+        id: "cmd-test".into(),
         capability: capability.into(),
         action: action.into(),
         args: Vec::new(),

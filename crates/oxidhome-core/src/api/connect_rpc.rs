@@ -54,25 +54,26 @@ use oxidhome_proto::connect::oxidhome::v1::{
 };
 use oxidhome_proto::proto::oxidhome::v1::{
     Button as ProtoButton, ButtonKind as ProtoButtonKind, CheckRequest, CheckResponse,
-    CustomEvent as ProtoCustomEvent, Device, Event as ProtoEvent,
-    ExecuteCommandError as ProtoCmdError, ExecuteCommandRequest, ExecuteCommandResponse,
-    Inference as ProtoInference, InstallPluginRequest, InstallPluginResponse, Instance,
-    KeyValue as ProtoKeyValue, Lagged as ProtoLagged, ListDevicesRequest, ListDevicesResponse,
-    ListInstancesRequest, ListInstancesResponse, ListPluginsRequest, ListPluginsResponse,
-    LogEvent as ProtoLogEvent, LogField as ProtoLogField, LogLevel as ProtoLogLevel,
-    LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest, QueryLogsResponse,
-    StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged, StopPluginRequest,
-    StopPluginResponse, TailEventsRequest, TailEventsResponse, UninstallPluginRequest,
-    UninstallPluginResponse, Value as ProtoValue, event as proto_event, execute_command_error,
-    execute_command_response, log_value, tail_events_response, value,
+    CommandOutcome as ProtoCommandOutcome, CustomEvent as ProtoCustomEvent, Device,
+    Event as ProtoEvent, ExecuteCommandError as ProtoCmdError, ExecuteCommandRequest,
+    ExecuteCommandResponse, Inference as ProtoInference, InstallPluginRequest,
+    InstallPluginResponse, Instance, KeyValue as ProtoKeyValue, Lagged as ProtoLagged,
+    ListDevicesRequest, ListDevicesResponse, ListInstancesRequest, ListInstancesResponse,
+    ListPluginsRequest, ListPluginsResponse, LogEvent as ProtoLogEvent, LogField as ProtoLogField,
+    LogLevel as ProtoLogLevel, LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest,
+    QueryLogsResponse, StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged,
+    StopPluginRequest, StopPluginResponse, TailEventsRequest, TailEventsResponse,
+    UninstallPluginRequest, UninstallPluginResponse, Value as ProtoValue, event as proto_event,
+    execute_command_error, execute_command_response, log_value, tail_events_response, value,
 };
 
 use crate::Engine;
 use crate::auth::Actor;
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent as WitButtonEvent;
-use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event as WitEvent, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
+use crate::runtime::{CommandOutcome, CommandReport};
 use crate::state::{
     HistoricalLogEvent, InstallError, LogLevel, LogQuery, LogValue, TokenError, UninstallError,
 };
@@ -116,7 +117,7 @@ impl oxidhome_proto::connect::oxidhome::v1::HealthService for OxidHomeHealth {
 
 /// What a Connect handler recorded as it returned. Serves the
 /// middleware's audit classifier — see [`connect_auth_middleware`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HandlerOutcome {
     /// Synthesized HTTP status for the audit row. `ConnectError::http_status()`
     /// on the error path (403 for `PermissionDenied`, 404 for `NotFound`,
@@ -128,7 +129,7 @@ struct HandlerOutcome {
     ///
     /// `None` when this outcome was recorded by
     /// [`record_domain_outcome`] — the RPC itself succeeded (HTTP
-    /// 200 / gRPC OK) but the plugin returned `CommandResult::Err`.
+    /// 200 / gRPC OK) and carries a device command's outcome.
     /// See the module doc + [`super::auth::DomainOutcome`] for why
     /// authorization and execution outcomes must not share the
     /// same audit field.
@@ -138,11 +139,10 @@ struct HandlerOutcome {
     /// Middleware populates the `required_scope` audit field from
     /// this — mirrors the JSON side's `DeniedScope` smuggle.
     denied_scope: Option<Scope>,
-    /// The plugin's WIT error kind for a `CommandResult::Err` on
-    /// an authorized RPC. Populated by [`record_domain_outcome`];
-    /// the middleware forwards it to the audit ledger's
-    /// `domain_error` column (F4).
-    domain_error: Option<&'static str>,
+    /// H5: the dispatched device command's id and explicit outcome.
+    /// Populated by [`record_domain_outcome`]; the middleware forwards
+    /// it to the audit ledger's command / execution columns (F4).
+    command: Option<super::auth::DomainOutcome>,
 }
 
 /// Request-scoped smuggling channel from Connect handlers to the
@@ -205,7 +205,7 @@ fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
         slot.set(HandlerOutcome {
             status: Some(err.http_status()),
             denied_scope: None,
-            domain_error: None,
+            command: None,
         });
     }
     err
@@ -240,7 +240,7 @@ fn require_scope_connect(ctx: &RequestContext, required: Scope) -> Result<(), Co
             slot.set(HandlerOutcome {
                 status: Some(axum::http::StatusCode::FORBIDDEN),
                 denied_scope: Some(Scope::new(required)),
-                domain_error: None,
+                command: None,
             });
         }
         return Err(ConnectError::permission_denied(format!(
@@ -335,7 +335,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
                 slot.set(HandlerOutcome {
                     status: Some(axum::http::StatusCode::FORBIDDEN),
                     denied_scope: Some(Scope::new(required)),
-                    domain_error: None,
+                    command: None,
                 });
             }
             return Err(ConnectError::permission_denied(format!(
@@ -371,45 +371,38 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .get(&owner)
             .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("device not found")))?;
 
+        // The supervisor handle mints `id` (H5).
         let cmd = Command {
+            id: String::new(),
             capability: req.capability,
             action: req.action,
             args: req.args.into_iter().map(proto_key_value_to_wit).collect(),
         };
-        let result = handle
+        let report = handle
             .execute_command_in(invocation, req.device_id.clone(), cmd)
-            .await
-            .map_err(|err| {
-                tracing::error!(target: "api.devices", error = %err, "device command dispatch failed");
-                rpc_err(&ctx, ConnectError::internal("device command dispatch failed"))
-            })?;
-        // F4: the RPC succeeded (wire response is HTTP 200 / gRPC
-        // OK / Connect Ok) but a `CommandResult::Err` payload is a
-        // domain failure. Record it on the outcome slot so the
-        // middleware audits with a synthesized status instead of a
-        // spurious `allow`. Mirrors the JSON side's `DomainOutcome`
-        // response-extension smuggle.
-        if let CommandResult::Err(ref err) = result {
-            record_domain_outcome(&ctx, err);
-        }
-        Response::ok(command_result_to_proto(result, ctx_can_read_blobs(&ctx)))
+            .await;
+        // F4 + H5: every routed command is an RPC success carrying
+        // its explicit outcome. Record the command id and outcome on
+        // the slot so the middleware audits them next to the
+        // authorization decision. Mirrors the JSON side's
+        // `DomainOutcome` response-extension smuggle.
+        record_domain_outcome(&ctx, &report);
+        Response::ok(command_report_to_proto(report, ctx_can_read_blobs(&ctx)))
     }
 }
 
-/// F4 helper — stamps the [`HandlerOutcomeSlot`] with the *domain*
-/// error kind for a WIT failure carried inside an otherwise-
-/// successful RPC response. The middleware reads
-/// `domain_error` off the slot and writes it into the audit ledger's
-/// `execution_outcome` / `domain_error` columns — *without* touching
-/// the transport status or the authorization decision. See
-/// [`super::auth::DomainOutcome`] for why authorization and
-/// execution outcomes are kept as distinct audit fields.
-fn record_domain_outcome(ctx: &RequestContext, err: &WitError) {
+/// F4 + H5 helper — stamps the [`HandlerOutcomeSlot`] with the
+/// dispatched command's id and explicit outcome. The middleware writes
+/// them into the audit ledger's command / execution columns *without*
+/// touching the transport status or the authorization decision. See
+/// [`super::auth::DomainOutcome`] for why authorization and execution
+/// outcomes are kept as distinct audit fields.
+fn record_domain_outcome(ctx: &RequestContext, report: &CommandReport) {
     if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
         slot.set(HandlerOutcome {
             status: None,
             denied_scope: None,
-            domain_error: Some(super::auth::wit_error_kind(err)),
+            command: Some(super::auth::DomainOutcome::from_report(report)),
         });
     }
 }
@@ -450,32 +443,56 @@ fn wit_value_to_proto(value: Value) -> ProtoValue {
 
 /// M7: `blobs` is the caller's `blobs:read`; without it returned
 /// `bytes-val` state is withheld.
-fn command_result_to_proto(mut result: CommandResult, blobs: bool) -> ExecuteCommandResponse {
+fn command_report_to_proto(mut report: CommandReport, blobs: bool) -> ExecuteCommandResponse {
     if !blobs {
-        crate::redact::withhold_bytes_in_command_result(&mut result);
+        report.withhold_bytes();
     }
-    let outcome = match result {
-        CommandResult::Ok => {
+    let command_outcome = match &report.outcome {
+        CommandOutcome::Accepted => ProtoCommandOutcome::Accepted,
+        CommandOutcome::Completed { .. } => ProtoCommandOutcome::Completed,
+        CommandOutcome::Rejected { .. } => ProtoCommandOutcome::Rejected,
+        CommandOutcome::TimedOut { .. } => ProtoCommandOutcome::TimedOut,
+        CommandOutcome::Unknown { .. } => ProtoCommandOutcome::Unknown,
+    };
+    let outcome = match report.outcome {
+        CommandOutcome::Completed { state: None } => {
             execute_command_response::Outcome::Ok(Box::<execute_command_response::Ok>::default())
         }
-        CommandResult::OkWithState(kvs) => execute_command_response::Outcome::OkWithState(
-            Box::new(execute_command_response::OkWithState {
-                state: kvs
-                    .into_iter()
-                    .map(|kv| ProtoKeyValue {
-                        key: kv.key,
-                        value: wit_value_to_proto(kv.value).into(),
-                        ..Default::default()
-                    })
-                    .collect(),
+        CommandOutcome::Completed { state: Some(kvs) } => {
+            execute_command_response::Outcome::OkWithState(Box::new(
+                execute_command_response::OkWithState {
+                    state: kvs
+                        .into_iter()
+                        .map(|kv| ProtoKeyValue {
+                            key: kv.key,
+                            value: wit_value_to_proto(kv.value).into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            ))
+        }
+        CommandOutcome::Rejected { error } => {
+            execute_command_response::Outcome::Err(Box::new(wit_error_to_proto(error)))
+        }
+        CommandOutcome::Accepted => execute_command_response::Outcome::Accepted(Box::default()),
+        CommandOutcome::TimedOut { message } => execute_command_response::Outcome::TimedOut(
+            Box::new(execute_command_response::TimedOut {
+                message,
                 ..Default::default()
             }),
         ),
-        CommandResult::Err(err) => {
-            execute_command_response::Outcome::Err(Box::new(wit_error_to_proto(err)))
-        }
+        CommandOutcome::Unknown { message } => execute_command_response::Outcome::OutcomeUnknown(
+            Box::new(execute_command_response::OutcomeUnknown {
+                message,
+                ..Default::default()
+            }),
+        ),
     };
     ExecuteCommandResponse {
+        command_id: report.command_id,
+        command_outcome: command_outcome.into(),
         outcome: Some(outcome),
         ..Default::default()
     }
@@ -1323,6 +1340,8 @@ async fn connect_auth_middleware(
                     credential_fp: None,
                     call_id: None,
                     invocation: None,
+                    command_id: None,
+                    command_outcome: None,
                 };
                 super::auth::record_authenticated_denial(&state.audit_log, None, entry).await;
                 return connect_error_response(
@@ -1381,6 +1400,8 @@ async fn connect_auth_middleware(
         credential_fp: None,
         call_id: Some(invocation.call_id().to_owned()),
         invocation: Some(invocation.audit_json()),
+        command_id: None,
+        command_outcome: None,
     };
     let audit_id = {
         let al = Arc::clone(&state.audit_log);
@@ -1446,17 +1467,19 @@ async fn connect_auth_middleware(
     // `None` handles both a normal 200 and any handler that didn't
     // touch the slot.
     let audit_status = outcome
+        .as_ref()
         .and_then(|o| o.status)
         .unwrap_or_else(|| response.status());
-    let denied_scope = outcome.and_then(|o| o.denied_scope).map(Scope::name);
-    // F4: execution outcome (`CommandResult::Err` kind). Lives on
-    // the same slot but is orthogonal to the transport status —
-    // see `super::auth::DomainOutcome` for the split. The JSON
-    // side smuggles the same information through a
-    // `DomainOutcome` response extension.
-    let domain_outcome = outcome
-        .and_then(|o| o.domain_error)
-        .map(|domain_error| super::auth::DomainOutcome { domain_error });
+    let denied_scope = outcome
+        .as_ref()
+        .and_then(|o| o.denied_scope)
+        .map(Scope::name);
+    // F4 + H5: a dispatched command's id and outcome. Lives on the
+    // same slot but is orthogonal to the transport status — see
+    // `super::auth::DomainOutcome` for the split. The JSON side
+    // smuggles the same information through a `DomainOutcome`
+    // response extension.
+    let domain_outcome = outcome.and_then(|o| o.command);
     finalize_audit(
         &state.audit_log,
         audit_id,

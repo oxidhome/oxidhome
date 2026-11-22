@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use oxidhome_core::runtime::PendingCommands;
 use oxidhome_core::state::{BlobInfo, DeviceMeta, HistoricalEvent, ServiceMeta};
-use oxidhome_core::{Engine, InstanceHandle, InstanceState};
+use oxidhome_core::{CommandReport, Engine, InstanceHandle, InstanceState};
 use tokio::task::JoinHandle;
 
 use crate::TestHostError;
@@ -12,7 +13,7 @@ use crate::live::IdLease;
 use crate::snapshot::Snapshot;
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
-use crate::wit::devices::{Command, CommandResult};
+use crate::wit::devices::Command;
 use crate::wit::types::{DeviceId, ServiceId};
 
 /// A plugin instance started by [`crate::TestHost::start`] and run by
@@ -140,20 +141,42 @@ impl SupervisedInstance {
     /// supervisor task, as a host-origin command — the daemon's
     /// command path minus the API surface.
     ///
-    /// # Errors
-    ///
-    /// [`TestHostError::Call`] when the supervisor isn't running or
-    /// the export traps (which also crashes the instance). A command
-    /// the plugin rejects is an `Ok(CommandResult::Err(_))`.
+    /// Returns the host-minted command id and the explicit outcome
+    /// (H5), exactly as the API surfaces see them: a trap is
+    /// `outcome_unknown` (and crashes the instance), a refusal is
+    /// `rejected`, an `accepted` reply stays pending until the plugin
+    /// calls `complete-command`. The host overwrites `command.id`.
     pub async fn send_command(
         &self,
         device: impl Into<DeviceId>,
         command: Command,
-    ) -> Result<CommandResult, TestHostError> {
+    ) -> CommandReport {
+        self.handle.execute_command(device.into(), command).await
+    }
+
+    /// [`Self::send_command`] bounded by a deadline `budget` from now,
+    /// like an API request's invocation deadline (H6). Shows the H5
+    /// deadline rules: a command still queued when the deadline passes
+    /// is `timed_out` and never runs; one the plugin already started is
+    /// `outcome_unknown`.
+    pub async fn send_command_with_deadline(
+        &self,
+        device: impl Into<DeviceId>,
+        command: Command,
+        budget: Duration,
+    ) -> CommandReport {
+        let ctx = oxidhome_core::auth::InvocationContext::host_origin(self.handle.instance_id())
+            .with_deadline(Some(tokio::time::Instant::now() + budget));
         self.handle
-            .execute_command(device.into(), command)
+            .execute_command_in(ctx, device.into(), command)
             .await
-            .map_err(|e| TestHostError::call("execute-command", e))
+    }
+
+    /// The engine's table of accepted-but-unfinished commands (H5), for
+    /// asserting that an `accepted` command completed or expired.
+    #[must_use]
+    pub fn pending_commands(&self) -> Arc<PendingCommands> {
+        self.engine.pending_commands()
     }
 
     /// Ask the supervisor to call `on-shutdown` and stop, then wait

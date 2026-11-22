@@ -109,8 +109,11 @@ impl TestPluginInstance {
     /// Call the plugin's `execute-command` export for `device`. The
     /// result goes through the same post-processing as in the daemon:
     /// an `ok-with-state` reply updates the host's device-state
-    /// projection (or is downgraded to an error when it exceeds the
-    /// projection's caps).
+    /// projection (or becomes `unknown` when it breaks the
+    /// projection's caps), and an `accepted` reply is registered as a
+    /// pending command the plugin can finish with `complete-command`.
+    /// `command.id` is passed through as given; use a `cmd-` prefixed
+    /// id if the plugin may answer `accepted`.
     ///
     /// # Errors
     ///

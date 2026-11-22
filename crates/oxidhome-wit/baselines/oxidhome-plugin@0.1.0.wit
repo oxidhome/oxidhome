@@ -13,6 +13,8 @@ interface types {
 
   type subscription-id = u64;
 
+  type command-id = string;
+
   variant value {
     bool-val(bool),
     int-val(s64),
@@ -138,7 +140,7 @@ interface capabilities {
 }
 
 interface devices {
-  use types.{device-id, local-id, key-value, error};
+  use types.{device-id, local-id, key-value, error, command-id};
   use capabilities.{capability-spec, capability-state};
 
   record device-info {
@@ -153,6 +155,7 @@ interface devices {
   }
 
   record command {
+    id: command-id,
     capability: string,
     action: string,
     args: list<key-value>,
@@ -162,6 +165,8 @@ interface devices {
     ok,
     ok-with-state(list<key-value>),
     err(error),
+    unknown(string),
+    accepted,
   }
 }
 
@@ -540,8 +545,8 @@ interface inference {
 }
 
 interface host-devices {
-  use types.{device-id, error};
-  use devices.{device-info};
+  use types.{device-id, error, command-id};
+  use devices.{device-info, command-result};
 
   register-device: func(info: device-info) -> result<device-id, error>;
 
@@ -550,6 +555,8 @@ interface host-devices {
   remove-device: func(id: device-id) -> result<_, error>;
 
   get-device: func(id: device-id) -> result<device-info, error>;
+
+  complete-command: func(id: command-id, reply: command-result) -> result<_, error>;
 }
 
 interface host-services {

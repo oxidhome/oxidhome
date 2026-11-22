@@ -18,11 +18,16 @@ wasm = "target/wasm32-wasip2/debug/crasher.wasm"
 tick_interval_ms = 50
 restart = "on-trap"
 
+[capabilities]
+# Only the "command" mode registers a device.
+declares_devices = ["switch"]
+
 [config.crash_on]
 # "tick" → init succeeds, the first tick traps;
 # "init" → init fails;
-# "shutdown" → init + tick succeed, guest shutdown traps.
+# "shutdown" → init + tick succeed, guest shutdown traps;
+# "command" → init registers a switch, execute-command traps.
 type = "enum"
-values = ["tick", "init", "shutdown"]
+values = ["tick", "init", "shutdown", "command"]
 default = "tick"
 description = "Which lifecycle hook the crasher fails in."

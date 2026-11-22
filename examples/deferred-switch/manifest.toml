@@ -1,0 +1,21 @@
+manifest_version = 1
+
+[plugin]
+id = "example.deferred-switch"
+name = "Deferred Switch"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "A simulated switch whose commands finish asynchronously (H5 `accepted` + `complete-command`)."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/deferred-switch"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "switch", "async"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/deferred_switch.wasm"
+# Accepted commands complete on the next tick.
+tick_interval_ms = 50
+
+[capabilities]
+declares_devices = ["switch"]

@@ -42,6 +42,19 @@ pub trait Plugin: Default + 'static {
     /// Invoked when the host routes a command to a device this plugin
     /// owns. Default returns
     /// [`Error::Unavailable`] — override to handle real commands.
+    ///
+    /// The reply decides the outcome the caller sees (H5):
+    ///
+    /// - [`CommandResult::Ok`] / [`CommandResult::OkWithState`] —
+    ///   `completed`;
+    /// - [`CommandResult::Err`] — `rejected`: return it only when the
+    ///   device was **not** touched, since callers may retry;
+    /// - [`CommandResult::Unknown`] — `outcome_unknown`: the command
+    ///   may have taken effect but you can't confirm it (sent, no
+    ///   acknowledgement);
+    /// - [`CommandResult::Accepted`] — `accepted`: keep `cmd.id` and
+    ///   report the final result later with
+    ///   [`host::complete_command`](crate::host::complete_command).
     fn execute_command(&mut self, _device: String, _cmd: Command) -> CommandResult {
         CommandResult::Err(Error::Unavailable(
             "execute-command not implemented by this plugin".into(),
@@ -122,6 +135,7 @@ mod tests {
         let result = p.execute_command(
             "d-1".into(),
             Command {
+                id: "cmd-test".into(),
                 capability: "switch".into(),
                 action: "toggle".into(),
                 args: Vec::new(),

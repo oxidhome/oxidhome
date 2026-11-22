@@ -82,6 +82,7 @@ async fn simulated_switch_round_trip() {
         .execute_command(
             device_id.clone(),
             WitCommand {
+                id: String::new(),
                 capability: "switch".into(),
                 action: "toggle".into(),
                 args: Vec::new(),

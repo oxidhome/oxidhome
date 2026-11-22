@@ -54,6 +54,7 @@ async fn lifecycle_tick_increments_persistent_counter() {
         .execute_command(
             "no-device".into(),
             Command {
+                id: String::new(),
                 capability: "counter".into(),
                 action: "read".into(),
                 args: Vec::new(),

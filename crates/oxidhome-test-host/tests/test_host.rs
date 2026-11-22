@@ -15,6 +15,7 @@ use support::{HELLO_WORLD, KV_COUNTER, SIMULATED_SWITCH, stage, stage_unchanged}
 
 fn toggle() -> Command {
     Command {
+        id: "cmd-test".into(),
         capability: "switch".into(),
         action: "toggle".into(),
         args: Vec::new(),

@@ -159,6 +159,19 @@ pub struct AuditEntry {
     /// `crate::auth::InvocationContext::audit_json`.
     #[serde(default)]
     pub invocation: Option<String>,
+    /// H5: host-minted device-command id (`cmd-<32 hex>`) on rows for
+    /// a device-command dispatch and on the `method = "COMMAND"`
+    /// resolution rows that record how an `accepted` (or abandoned)
+    /// command finally ended. `None` everywhere else and on rows
+    /// written before migration 18.
+    #[serde(default)]
+    pub command_id: Option<String>,
+    /// H5: the explicit command outcome (`accepted`, `completed`,
+    /// `rejected`, `timed_out`, `outcome_unknown`) for the row's
+    /// `command_id`. Finer-grained than [`Self::execution_outcome`],
+    /// which keeps its coarse `success` / `failed` meaning.
+    #[serde(default)]
+    pub command_outcome: Option<String>,
 }
 
 /// Query shape for [`AuditLog::query`]. Every field is optional and
@@ -321,8 +334,8 @@ impl AuditLog {
     ) -> Result<i64, AuditLogError> {
         conn.execute(
                     "INSERT INTO audit_event \
-                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json) \
-                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6, NULL, NULL, ?7, ?8)",
+                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome) \
+                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6, NULL, NULL, ?7, ?8, ?9, NULL)",
                     params![
                         intent_ms,
                         &entry.token_id,
@@ -332,6 +345,7 @@ impl AuditLog {
                         &entry.credential_fp,
                         &entry.call_id,
                         scrub_opt(entry.invocation.as_deref()),
+                        &entry.command_id,
                     ],
                 )?;
         Ok(conn.last_insert_rowid())
@@ -361,6 +375,36 @@ impl AuditLog {
         execution_outcome: Option<&str>,
         domain_error: Option<&str>,
     ) -> Result<(), AuditLogError> {
+        self.finalize_with_command(
+            id,
+            status,
+            decision,
+            required_scope,
+            execution_outcome,
+            domain_error,
+            None,
+        )
+    }
+
+    /// [`Self::finalize`] for a device-command row (H5): additionally
+    /// stamps `command` = `(command_id, command_outcome)` when `Some`.
+    /// `None` leaves both columns as they are.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::finalize`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_with_command(
+        &self,
+        id: u64,
+        status: u16,
+        decision: &str,
+        required_scope: Option<&str>,
+        execution_outcome: Option<&str>,
+        domain_error: Option<&str>,
+        command: Option<(&str, &str)>,
+    ) -> Result<(), AuditLogError> {
+        let (command_id, command_outcome) = command.unzip();
         let finalized_ms = now_unix_ms();
         let rows = self.db.write(|conn| -> Result<usize, AuditLogError> {
             #[allow(clippy::cast_possible_wrap)]
@@ -368,7 +412,9 @@ impl AuditLog {
             Ok(conn.execute(
                 "UPDATE audit_event \
                  SET finalized_ms = ?1, status = ?2, decision = ?3, required_scope = ?4, \
-                     execution_outcome = ?5, domain_error = ?6 \
+                     execution_outcome = ?5, domain_error = ?6, \
+                     command_id = COALESCE(?8, command_id), \
+                     command_outcome = COALESCE(?9, command_outcome) \
                  WHERE id = ?7",
                 params![
                     finalized_ms,
@@ -378,6 +424,8 @@ impl AuditLog {
                     execution_outcome,
                     scrub_opt(domain_error),
                     id_i,
+                    command_id,
+                    command_outcome,
                 ],
             )?)
         })?;
@@ -406,8 +454,8 @@ impl AuditLog {
             .write(|conn| -> Result<i64, AuditLogError> {
                 conn.execute(
                     "INSERT INTO audit_event \
-                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json) \
-                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome) \
+                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         now,
                         &entry.token_id,
@@ -422,6 +470,8 @@ impl AuditLog {
                         scrub_opt(entry.domain_error.as_deref()),
                         &entry.call_id,
                         scrub_opt(entry.invocation.as_deref()),
+                        &entry.command_id,
+                        &entry.command_outcome,
                     ],
                 )?;
                 Ok(conn.last_insert_rowid())
@@ -445,7 +495,7 @@ impl AuditLog {
         use std::fmt::Write as _;
 
         let mut sql = String::from(
-            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json \
+            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome \
              FROM audit_event WHERE 1=1",
         );
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -530,6 +580,8 @@ impl AuditLog {
                     domain_error: row.get(12)?,
                     call_id: row.get(13)?,
                     invocation: row.get(14)?,
+                    command_id: row.get(15)?,
+                    command_outcome: row.get(16)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -603,6 +655,8 @@ mod tests {
             credential_fp: None,
             call_id: None,
             invocation: None,
+            command_id: None,
+            command_outcome: None,
         }
     }
 
@@ -765,6 +819,8 @@ mod tests {
             credential_fp: Some("deadbeef".into()),
             call_id: None,
             invocation: None,
+            command_id: None,
+            command_outcome: None,
         };
         log.record_completed(&entry).unwrap();
         let rows = log.query(&AuditQuery::default(), 1).unwrap();
@@ -795,6 +851,8 @@ mod tests {
                 credential_fp: None,
                 call_id: None,
                 invocation: None,
+                command_id: None,
+                command_outcome: None,
             }
         }
         let log = store();
@@ -861,6 +919,8 @@ mod tests {
             credential_fp: None,
             call_id: None,
             invocation: None,
+            command_id: None,
+            command_outcome: None,
         };
         let id = log.record_intent_durable(&entry).unwrap();
         let sync: i64 = db

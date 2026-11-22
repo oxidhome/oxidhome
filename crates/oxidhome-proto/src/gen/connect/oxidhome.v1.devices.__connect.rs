@@ -180,7 +180,9 @@ pub trait DevicesService: Send + Sync + 'static {
     /// `POST /api/v1/devices/{id}/command`: the host looks up the
     /// device's owning instance and forwards `execute-command` to
     /// it. Unknown device and non-running owner both collapse to
-    /// NotFound (no enumeration leak).
+    /// NotFound (no enumeration leak). Every routed command returns OK
+    /// with a host-minted `command_id` and an explicit
+    /// `command_outcome` (H5, ADR-0003).
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
