@@ -21,8 +21,8 @@ pub(crate) type LiveIds = Arc<Mutex<HashSet<String>>>;
 /// An in-process plugin host for tests.
 ///
 /// Wraps a production [`Engine`] backed by a fresh `SQLite` database
-/// and blob root in a temporary directory, removed when the host is
-/// dropped. Instances loaded on the same host share its device
+/// and blob root in a temporary directory, removed once the host and
+/// every instance and storage view it handed out are dropped. Instances loaded on the same host share its device
 /// registry, event bus, and stores, exactly as instances in one daemon
 /// do; use separate hosts for isolated tests.
 pub struct TestHost {
@@ -31,7 +31,7 @@ pub struct TestHost {
     engine: Engine,
     live: LiveIds,
     next_id: AtomicU64,
-    state_dir: TempDir,
+    state_dir: Arc<TempDir>,
 }
 
 /// Per-load knobs for [`TestHost::load_with`]. `Default` loads the
@@ -107,7 +107,7 @@ impl TestHost {
             engine,
             live: LiveIds::default(),
             next_id: AtomicU64::new(1),
-            state_dir,
+            state_dir: Arc::new(state_dir),
         })
     }
 
@@ -218,6 +218,7 @@ impl TestHost {
             self.engine.clone(),
             inner,
             reservation.keep(),
+            Arc::clone(&self.state_dir),
         ))
     }
 }

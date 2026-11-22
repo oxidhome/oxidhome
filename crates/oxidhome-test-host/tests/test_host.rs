@@ -263,3 +263,26 @@ async fn events_are_oldest_first_and_storage_lists_keys() {
     assert!(counter.storage().keys("x").unwrap().is_empty());
     assert!(host.state_dir().join("oxidhome.db").is_file());
 }
+
+/// An instance keeps the host's state directory alive after the host
+/// itself is gone; the directory goes with the last handle.
+#[tokio::test(flavor = "current_thread")]
+async fn instance_outlives_its_host() {
+    let staged = stage_unchanged(KV_COUNTER);
+    let (mut counter, state_dir) = {
+        let host = TestHost::new().unwrap();
+        let counter = host.load(staged.path()).await.unwrap();
+        (counter, host.state_dir().to_path_buf())
+    };
+    assert!(state_dir.is_dir());
+    counter.init().await.unwrap();
+    counter.tick().await.unwrap();
+    let storage = counter.storage();
+    drop(counter);
+    assert!(matches!(
+        storage.get("count").unwrap(),
+        Some(Value::IntVal(1))
+    ));
+    drop(storage);
+    assert!(!state_dir.exists());
+}

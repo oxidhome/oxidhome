@@ -8,6 +8,7 @@ use oxidhome_manifest::PluginManifest;
 
 use crate::TestHostError;
 use crate::host::LiveIds;
+use crate::tempdir::TempDir;
 use crate::wit::devices::{Command, CommandResult};
 use crate::wit::events::Event;
 use crate::wit::types::{DeviceId, Value};
@@ -23,18 +24,30 @@ use crate::wit::types::{DeviceId, Value};
 /// host-side teardown the daemon's supervisor runs when an instance
 /// stops: its devices and services leave the registries and its
 /// device-state projection turns stale.
+///
+/// The instance keeps its host's state directory alive, so it stays
+/// usable even after the [`crate::TestHost`] that loaded it is dropped.
 pub struct TestPluginInstance {
-    engine: Engine,
+    // Field order: the store and engine close before the state
+    // directory they live in is removed.
     inner: PluginInstance,
+    engine: Engine,
     live: LiveIds,
+    state_dir: Arc<TempDir>,
 }
 
 impl TestPluginInstance {
-    pub(crate) fn new(engine: Engine, inner: PluginInstance, live: LiveIds) -> Self {
+    pub(crate) fn new(
+        engine: Engine,
+        inner: PluginInstance,
+        live: LiveIds,
+        state_dir: Arc<TempDir>,
+    ) -> Self {
         Self {
-            engine,
             inner,
+            engine,
             live,
+            state_dir,
         }
     }
 
@@ -190,6 +203,7 @@ impl TestPluginInstance {
     pub fn storage(&self) -> StorageView {
         StorageView {
             kv: self.engine.kv(),
+            _state_dir: Arc::clone(&self.state_dir),
             installation_uuid: self.installation_uuid(),
             instance_id: self.instance_id().to_owned(),
         }
@@ -217,6 +231,8 @@ impl Drop for TestPluginInstance {
 /// Read-only access to one instance's KV storage, for assertions.
 pub struct StorageView {
     kv: Arc<KvStore>,
+    // Keeps the database's directory alive as long as the view.
+    _state_dir: Arc<TempDir>,
     installation_uuid: Arc<str>,
     instance_id: String,
 }

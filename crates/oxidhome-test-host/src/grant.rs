@@ -48,11 +48,7 @@ pub fn grant_excess(requested: &CapabilitiesSection, granted: &CapabilitiesSecti
         }
     }
     for (index, grant) in granted.consumes_services.iter().enumerate() {
-        if !requested
-            .consumes_services
-            .iter()
-            .any(|req| service_grant_covers(req, grant))
-        {
+        if !service_grant_covered(&requested.consumes_services, grant) {
             excess.push(format!(
                 "consumes_services[{index}] ({}/{}) is not covered by any requested entry",
                 grant.plugin, grant.service
@@ -65,18 +61,29 @@ pub fn grant_excess(requested: &CapabilitiesSection, granted: &CapabilitiesSecti
     excess
 }
 
-/// Whether every call `grant` authorizes is also authorized by `req`.
-fn service_grant_covers(req: &ServiceGrant, grant: &ServiceGrant) -> bool {
+/// Whether every call `grant` authorizes is also authorized by at
+/// least one entry in `requested` — checked per command, because the
+/// dispatcher accepts a call when *any* requested entry matches it, so
+/// several narrower requested entries can together cover one wider
+/// grant.
+fn service_grant_covered(requested: &[ServiceGrant], grant: &ServiceGrant) -> bool {
     let selector_covers = |req: &str, granted: &str| req == ServiceGrant::ANY || req == granted;
-    let req_any_command = req.commands.iter().any(|c| c == ServiceGrant::ANY_COMMAND);
-    req.plugin == grant.plugin
-        && req.service == grant.service
-        && selector_covers(&req.instance, &grant.instance)
-        && selector_covers(&req.caller_instance, &grant.caller_instance)
-        && grant
-            .commands
-            .iter()
-            .all(|c| req_any_command || req.commands.contains(c))
+    let covers_command = |req: &ServiceGrant, command: &str| {
+        req.plugin == grant.plugin
+            && req.service == grant.service
+            && selector_covers(&req.instance, &grant.instance)
+            && selector_covers(&req.caller_instance, &grant.caller_instance)
+            && req
+                .commands
+                .iter()
+                .any(|c| c == ServiceGrant::ANY_COMMAND || c == command)
+    };
+    // A granted `*` command means "any command", so only a requested
+    // `*` covers it; an empty command list authorizes nothing.
+    grant
+        .commands
+        .iter()
+        .all(|command| requested.iter().any(|req| covers_command(req, command)))
 }
 
 #[cfg(test)]
@@ -144,6 +151,24 @@ mod tests {
             };
             assert_eq!(grant_excess(&req, &grant).len(), 1, "{wider:?}");
         }
+    }
+
+    #[test]
+    fn several_requested_entries_cover_one_wider_grant() {
+        let req = CapabilitiesSection {
+            consumes_services: vec![svc("c", &["get"], "*"), svc("c", &["increment"], "*")],
+            ..CapabilitiesSection::default()
+        };
+        let grant = CapabilitiesSection {
+            consumes_services: vec![svc("c", &["get", "increment"], "me")],
+            ..CapabilitiesSection::default()
+        };
+        assert!(grant_excess(&req, &grant).is_empty());
+        let wider = CapabilitiesSection {
+            consumes_services: vec![svc("c", &["get", "reset"], "me")],
+            ..CapabilitiesSection::default()
+        };
+        assert_eq!(grant_excess(&req, &wider).len(), 1);
     }
 
     #[test]
