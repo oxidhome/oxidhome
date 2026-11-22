@@ -17,6 +17,7 @@ pub mod contract;
 pub mod dispatcher;
 mod instance;
 mod lifecycle;
+mod plugin_stdio;
 mod registry;
 mod schema;
 mod state;

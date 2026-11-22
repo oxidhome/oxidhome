@@ -269,7 +269,7 @@ pub struct LogRateBucket {
 }
 
 impl LogRateBucket {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tokens: LOG_RATE_BURST,
             capacity: LOG_RATE_BURST,
@@ -280,7 +280,7 @@ impl LogRateBucket {
 
     /// Consume one token if available; return `false` when
     /// exhausted so the caller can drop the log call.
-    fn consume(&mut self) -> bool {
+    pub(crate) fn consume(&mut self) -> bool {
         let now = Instant::now();
         let elapsed = now
             .saturating_duration_since(self.last_refill)
@@ -455,7 +455,9 @@ pub struct PluginState {
     /// can't drive the `LogStore` queue into multi-GiB retention.
     /// `std::sync::Mutex` because the check runs synchronously
     /// inside the host import; the critical section is O(1).
-    pub log_rate: std::sync::Mutex<LogRateBucket>,
+    /// Shared with the instance's stdout / stderr sinks
+    /// (`runtime::plugin_stdio`), so WASI output spends the same budget.
+    pub log_rate: Arc<std::sync::Mutex<LogRateBucket>>,
 }
 
 impl PluginState {
@@ -479,8 +481,19 @@ impl PluginState {
         services: Arc<ServiceRegistry>,
         instances: Arc<InstanceRegistry>,
     ) -> Self {
+        let instance_id: InstanceId = instance_id.into();
+        // M7: WASI stdout / stderr feed the host log pipeline with the
+        // instance's own secrets scrubbed, rather than the host's
+        // console; stdin stays empty.
+        let log_rate = Arc::new(std::sync::Mutex::new(LogRateBucket::new()));
+        let (stdout, stderr) = super::plugin_stdio::PluginOutput::pair(
+            instance_id.as_str(),
+            manifest.plugin.id.as_str(),
+            &crate::redact::config_secrets(&config),
+            &log_rate,
+        );
         let mut wasi = WasiCtxBuilder::new();
-        wasi.inherit_stdio();
+        wasi.stdout(stdout).stderr(stderr);
         // C5: `PluginState::new` doesn't know about
         // `InstalledPluginRegistry` (it's the low-level
         // constructor used by tests + the loader). Default the
@@ -505,7 +518,7 @@ impl PluginState {
         // tables (C4 review P1 F1) and traps on refusal (P2 F1).
         let limits = PluginResourceLimits::new();
         Self {
-            instance_id: instance_id.into(),
+            instance_id,
             installation_uuid: installation_uuid.into(),
             granted_capabilities,
             consumes_services_requested,
@@ -526,7 +539,7 @@ impl PluginState {
             config,
             wake: Arc::new(tokio::sync::Notify::new()),
             limits,
-            log_rate: std::sync::Mutex::new(LogRateBucket::new()),
+            log_rate,
         }
     }
 
