@@ -119,10 +119,21 @@ Therefore: **WASM plugins describe media pipelines; the host runs them natively*
 
 A streaming plugin's `setup-pipeline` returns a `media-pipeline` describing:
 
-- A **source** — either a URL the host opens directly (RTSP/HTTP), or a `plugin-pipe` where the plugin produces re-framed bytes
-- A list of **steps** — demux, decode, re-encode, transcode, filter, inference-tap
-- A list of **sinks** — RTSP path, WebRTC track, HLS path, recording profile
+- A **source** — a typed RTSP or HTTP `network-endpoint` the host opens directly (TLS flag, host, port, path, and an optional `credential-ref` naming the instance-config keys that hold the username and password), or a `plugin-pipe` where the plugin produces re-framed bytes. There is no URL string and no local-file source.
+- A list of **steps** — demux, decode, re-encode, transcode, filter, inference-tap. Containers, codecs, and filters are WIT enums/variants, so the allowlist is the contract.
+- A list of **sinks** — RTSP mount, WebRTC track, HLS mount, recording profile. Sinks are logical names the host places in the plugin instance's own namespace; plugins never pass filesystem paths.
 - An **activation policy** — on-demand, always-on, motion-triggered
+
+### Native execution policy: in-process, with strict limits
+
+Native media and inference run inside the host process, not in out-of-process workers ([ADR-0002](docs/adr/0002-in-process-native-media-and-inference.md)). The cost of that choice is that a native parser bug can take the daemon down, so the host validates every plugin-controlled value before native code sees it:
+
+- **Network sources.** The host resolves the endpoint's host itself and checks every resolved address — and every redirect hop, at most 5 — before connecting to exactly the address it checked. Loopback, link-local, and private ranges are denied unless the plugin's grant allows that class; unspecified, multicast, broadcast, and reserved addresses are always denied. IPv6 addresses that embed IPv4 (mapped, NAT64, 6to4) are classified by the embedded address.
+- **Names.** Sink names, recording profiles, and model names are `[a-z0-9_-]{1,64}`; model versions are `[A-Za-z0-9.+-]{1,32}` without `..`. None is ever used as a path.
+- **Pipeline bounds.** At most 32 steps and 8 sinks; frame sizes 1–8192 per side; frame rates finite, in (0, 120].
+- **Tensors.** Rank ≤ 8, every dimension ≥ 1, ≤ 2^26 elements and ≤ 64 MiB per tensor, data length exactly elements × element width, ≤ 16 tensors and ≤ 256 MiB per `infer` call — computed with overflow-checked arithmetic, on inputs and on model outputs.
+
+The WIT `media` and `inference` doc comments are the contract for these rules; `oxidhome_core::native_policy` implements them as unit-tested helpers. They aren't called yet because no pipeline or inference runtime exists — Phases 9 (media) and 10 (inference) run them before handing anything to native code.
 
 ### How it handles real-world cameras
 
@@ -193,7 +204,7 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 - Models in the official registry are signed and reviewed
 - Plugin manifests declare which models they need; user approves at install
 - ONNX-only as the model format (well-defined operator set; no arbitrary code paths)
-- Resource limits on inference (max memory per model, max time per call)
+- Resource limits on inference (max memory per model, max time per call) and validated tensor shapes and sizes (see [Native execution policy](#native-execution-policy-in-process-with-strict-limits))
 - User-provided models always supported as an escape hatch (drop ONNX in `/var/lib/oxidhome/models/`)
 
 ### Hardware backend strategy

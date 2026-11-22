@@ -44,7 +44,9 @@
 #![allow(missing_docs, clippy::all, clippy::pedantic)]
 
 /// Placeholder for a running media pipeline owned by the host. Real
-/// pipeline state lands in Phase 9 (`media::Pipeline`).
+/// pipeline state lands in Phase 9 (`media::Pipeline`), which must run
+/// the [`crate::native_policy`] checks on a `media-pipeline` before
+/// native code sees it.
 pub struct HostPipelineHandle;
 
 /// Placeholder for a host-side writer feeding a `plugin-pipe` source.
@@ -52,7 +54,9 @@ pub struct HostPipelineHandle;
 pub struct HostPipeWriter;
 
 /// Placeholder for a loaded ML model handle. Real `ort`-backed handle
-/// lands in Phase 10 (`inference::ModelRegistry`).
+/// lands in Phase 10 (`inference::ModelRegistry`), which must run the
+/// [`crate::native_policy::tensor`] checks on every input and output
+/// tensor.
 pub struct HostModel;
 
 /// Standard plugin world — no raw I/O. No resource mappings needed

@@ -309,34 +309,113 @@ interface logging {
 }
 
 interface media {
-  use types.{key-value, error};
+  use types.{error};
+
+  record credential-ref {
+    username-key: string,
+    password-key: string,
+  }
+
+  enum transport-security {
+    plain,
+    tls,
+  }
+
+  record network-endpoint {
+    security: transport-security,
+    host: string,
+    port: option<u16>,
+    path: string,
+    credential: option<credential-ref>,
+  }
+
+  enum video-codec {
+    h264,
+    h265,
+    vp8,
+    vp9,
+    av1,
+    mjpeg,
+  }
+
+  enum audio-codec {
+    aac,
+    opus,
+    pcm-s16le,
+    pcm-mulaw,
+    pcm-alaw,
+    g722,
+  }
+
+  variant media-codec {
+    video(video-codec),
+    audio(audio-codec),
+  }
+
+  enum pipe-format {
+    rtp,
+    mpeg-ts,
+    elementary-stream,
+  }
 
   record plugin-pipe-config {
-    format: string,
-    codec: string,
-    parameters: list<key-value>,
+    format: pipe-format,
+    codec: media-codec,
+    clock-rate: option<u32>,
+    sample-rate: option<u32>,
+    channels: option<u8>,
   }
 
   variant media-source {
-    url(string),
+    rtsp(network-endpoint),
+    http(network-endpoint),
     plugin-pipe(plugin-pipe-config),
   }
 
+  enum container-format {
+    rtp,
+    mpeg-ts,
+    matroska,
+    mp4,
+    flv,
+    multipart-jpeg,
+  }
+
   record encode-params {
-    codec: string,
+    codec: video-codec,
     bitrate-kbps: option<u32>,
     keyframe-interval: option<u32>,
   }
 
   record audio-params {
-    codec: string,
+    codec: audio-codec,
     sample-rate: option<u32>,
     channels: option<u8>,
   }
 
-  record filter-config {
-    name: string,
-    parameters: list<key-value>,
+  record frame-size {
+    width: u32,
+    height: u32,
+  }
+
+  record crop-rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+  }
+
+  enum rotation {
+    rotate90,
+    rotate180,
+    rotate270,
+  }
+
+  variant video-filter {
+    scale(frame-size),
+    crop(crop-rect),
+    rotate(rotation),
+    max-framerate(f32),
   }
 
   enum tap-point {
@@ -345,8 +424,8 @@ interface media {
   }
 
   variant preprocessing-step {
-    resize(tuple<u32, u32>),
-    letterbox(tuple<u32, u32>),
+    resize(frame-size),
+    letterbox(frame-size),
     normalize(tuple<f32, f32>),
     to-rgb,
     to-bgr,
@@ -362,19 +441,23 @@ interface media {
   }
 
   variant pipeline-step {
-    demux(string),
+    demux(container-format),
     decode-video,
     encode-video(encode-params),
     transcode-audio(audio-params),
-    filter(filter-config),
+    filter(video-filter),
     inference-tap(inference-tap-config),
   }
 
+  type sink-name = string;
+
+  type recording-profile = string;
+
   variant output-sink {
-    rtsp(string),
+    rtsp(sink-name),
     webrtc,
-    hls(string),
-    record-to-storage(string),
+    hls(sink-name),
+    record-to-storage(recording-profile),
   }
 
   enum activation-policy {
@@ -413,9 +496,14 @@ interface inference {
     i64,
   }
 
+  variant tensor-dim {
+    fixed(u32),
+    dynamic,
+  }
+
   record tensor-spec {
     name: string,
-    shape: list<s32>,
+    shape: list<tensor-dim>,
     dtype: tensor-dtype,
   }
 
@@ -426,12 +514,21 @@ interface inference {
     data: list<u8>,
   }
 
+  enum execution-provider {
+    cpu,
+    cuda,
+    tensorrt,
+    core-ml,
+    openvino,
+    rocm,
+  }
+
   record model-info {
     name: string,
     version: string,
     inputs: list<tensor-spec>,
     outputs: list<tensor-spec>,
-    runtime: string,
+    runtime: execution-provider,
   }
 
   resource model {
