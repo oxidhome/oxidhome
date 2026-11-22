@@ -606,18 +606,19 @@ interface logging {
 // natively. This keeps codec work out of WASM (where it would be slow and
 // can't reach hardware accelerators) while letting plugins handle the
 // fiddly proprietary protocol parts where Rust-in-WASM shines.
-//
-// Native media runs inside the host process with strict limits
-// (docs/adr/0002-in-process-native-media-and-inference.md). So every field
-// the host acts on is typed and bounded: there are no free-form URLs, no
-// local-file sources, no filesystem paths, and no free-form codec or
-// filter names. The host validates a whole `media-pipeline` before any
-// native code sees it and rejects a violation with
-// `error::invalid-argument(...)`; a well-formed request for something
-// this host build can't do (e.g. an encoder it lacks) returns
-// `error::unavailable(...)`.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Media pipeline descriptions.
+///
+/// Native media runs inside the host process with strict limits
+/// (docs/adr/0002-in-process-native-media-and-inference.md). So every
+/// field the host acts on is typed and bounded: there are no free-form
+/// URLs, no local-file sources, no filesystem paths, and no free-form
+/// codec or filter names. The host validates a whole `media-pipeline`
+/// before any native code sees it and rejects a violation with
+/// `error::invalid-argument(...)`; a well-formed request for something
+/// this host build can't do (e.g. an encoder it lacks) returns
+/// `error::unavailable(...)`.
 interface media {
   use types.{error};
 
@@ -673,9 +674,10 @@ interface media {
   /// itself and checks every resolved address before it connects, then
   /// connects to the address it checked (no second lookup, so DNS
   /// rebinding can't swap it). It repeats the check on every redirect
-  /// hop, follows at most 5 redirects, and never lets a redirect leave
-  /// the source's own protocol family (`http` may go to `https`, never
-  /// to another scheme). The check:
+  /// hop, follows at most 5 redirects, never lets a redirect leave the
+  /// source's own protocol family (`http` may go to `https`, never to
+  /// another scheme), and never follows one from TLS to plaintext. The
+  /// check:
   ///
   /// - always denies unspecified, broadcast, multicast, and reserved
   ///   addresses;
@@ -834,7 +836,8 @@ interface media {
     tap-point: tap-point,
     /// Event topic to publish results under.
     event-topic: string,
-    /// Optional preprocessing applied by the host before inference.
+    /// Optional preprocessing applied by the host before inference. At
+    /// most 8 steps.
     preprocessing: list<preprocessing-step>,
   }
 
@@ -926,22 +929,24 @@ interface media {
 // host loads, runs, and accelerates them; plugins request inference and
 // orchestrate around the results. Capability gated at the call site by
 // the manifest's declared model dependencies.
-//
-// Inference runs inside the host process with strict limits
-// (docs/adr/0002-in-process-native-media-and-inference.md). The host checks
-// every tensor against the limits below — with overflow-checked
-// arithmetic — before it reaches the native runtime, and applies the
-// same limits to the tensors a model returns before copying them into
-// the guest. A violation returns `error::invalid-argument(...)`.
-//
-// Tensor limits:
-// - rank (number of dimensions): at most 8;
-// - every dimension: at least 1;
-// - elements per tensor (product of the shape): at most 67_108_864 (2^26);
-// - bytes per tensor: exactly elements × element width, at most 64 MiB;
-// - per `infer` call: at most 16 tensors and 256 MiB of tensor data.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Host-managed ML inference.
+///
+/// Inference runs inside the host process with strict limits
+/// (docs/adr/0002-in-process-native-media-and-inference.md). The host
+/// checks every tensor against the limits below — with overflow-checked
+/// arithmetic — before it reaches the native runtime, and applies the
+/// same limits to the tensors a model returns before copying them into
+/// the guest. A violation returns `error::invalid-argument(...)`.
+///
+/// Tensor limits:
+/// - rank (number of dimensions): at most 8;
+/// - every dimension: at least 1;
+/// - elements per tensor (product of the shape): at most 67_108_864 (2^26);
+/// - bytes per tensor: exactly elements × element width, at most 64 MiB;
+/// - per `infer` call: at most 16 tensors and 256 MiB of tensor data,
+///   for the inputs and, separately, for the outputs.
 interface inference {
   use types.{error};
 
@@ -972,7 +977,8 @@ interface inference {
     shape: list<u32>,
     dtype: tensor-dtype,
     /// Raw bytes, row-major, little-endian. Length must equal the
-    /// element count × the dtype's width (see the limits above).
+    /// element count × the dtype's width, at most 64 MiB (see the
+    /// `inference` interface limits).
     data: list<u8>,
   }
 
@@ -993,7 +999,8 @@ interface inference {
   /// handles for models its manifest authorizes.
   resource model {
     /// Run inference on a single input set (or batch).
-    /// Tensors are matched by name to the model's signature.
+    /// Tensors are matched by name to the model's signature. At most 16
+    /// tensors and 256 MiB of tensor data in each direction.
     infer: func(inputs: list<named-tensor>) -> result<list<named-tensor>, error>;
     /// Model metadata.
     info: func() -> model-info;
