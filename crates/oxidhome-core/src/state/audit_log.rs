@@ -251,7 +251,8 @@ impl AuditLog {
     /// Used by the host-local admin-token lifecycle (M4), whose
     /// follow-up action is a durable filesystem change (a secret
     /// file removed or promoted) that would otherwise outlive its
-    /// own audit evidence. The pragma is restored to `NORMAL`.
+    /// own audit evidence. The pragma is restored to `NORMAL`
+    /// (a failed restore is logged; the row is committed regardless).
     ///
     /// # Errors
     ///
@@ -267,11 +268,14 @@ impl AuditLog {
                 conn.pragma_update(None, "synchronous", "FULL")?;
             }
             let result = Self::insert_intent_row(conn, intent_ms, entry);
-            if durable {
-                let restore = conn.pragma_update(None, "synchronous", "NORMAL");
-                let id = result?;
-                restore?;
-                return Ok(id);
+            // A failed restore leaves the connection at FULL (safe,
+            // only slower); the intent row is committed either way,
+            // so it's logged rather than turned into an error.
+            if durable && let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                tracing::warn!(
+                    error = %err,
+                    "failed to restore synchronous = NORMAL after durable audit intent",
+                );
             }
             result
         })?;

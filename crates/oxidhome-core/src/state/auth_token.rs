@@ -409,7 +409,11 @@ impl TokenStore {
     /// can be lost on power failure. The bootstrap / recovery paths
     /// order file operations (promote or unlink a secret) after a
     /// token commit, so that commit must be durable first (M4).
-    /// The pragma is restored to `NORMAL` afterwards.
+    /// The pragma is restored to `NORMAL` afterwards. A failed
+    /// restore is logged, not returned: `f` has already committed,
+    /// and reporting failure would make the caller discard the
+    /// secret of a token that exists. The connection then stays at
+    /// `FULL`, which is safe (only slower).
     fn durable_write<R: Send>(
         &self,
         f: impl FnOnce(&mut rusqlite::Connection) -> Result<R, TokenError>,
@@ -417,10 +421,14 @@ impl TokenStore {
         self.db.write(move |conn| -> Result<R, TokenError> {
             conn.pragma_update(None, "synchronous", "FULL")?;
             let result = f(conn);
-            let restore = conn.pragma_update(None, "synchronous", "NORMAL");
-            let out = result?;
-            restore?;
-            Ok(out)
+            if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                tracing::warn!(
+                    target: "auth.token",
+                    error = %err,
+                    "failed to restore synchronous = NORMAL; connection stays at FULL",
+                );
+            }
+            result
         })
     }
 }
