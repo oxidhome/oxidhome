@@ -20,7 +20,7 @@ mod registry;
 mod state;
 pub(crate) mod watchdog;
 
-pub use instance::{InitError, LoadMode, PluginInstance};
+pub use instance::{InitError, LoadMode, PluginInstance, read_manifest_with_bytes};
 pub use lifecycle::{
     InstanceHandle, InstanceState, SupervisorTuning, supervise, supervise_with_tuning,
 };
@@ -879,24 +879,7 @@ impl Engine {
                     // the top of every load attempt; this is the
                     // final post-terminal cleanup so a Stopped /
                     // Failed instance leaves nothing behind.
-                    engine_for_reaper
-                        .devices()
-                        .remove_by_owner(&instance_id_for_reaper);
-                    engine_for_reaper
-                        .services()
-                        .remove_by_owner(&instance_id_for_reaper);
-                    // H9: device-state entries survive the terminal
-                    // (unlike `DeviceRegistry` entries, which are
-                    // reaped) so consumers can still read the last
-                    // observed values with `quality: "stale"`.
-                    // Flipping the marker here catches the case
-                    // where the instance reached Stopped / Failed
-                    // and no restart follows — the pre-restart
-                    // sweep in `spawn_supervisor_lifecycle` won't
-                    // fire in that path.
-                    engine_for_reaper
-                        .device_state()
-                        .mark_instance_stale(&instance_id_for_reaper);
+                    engine_for_reaper.release_instance_state(&instance_id_for_reaper);
                     registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
                     // Round-2 F2: conditional remove —
                     // don't yank a replacement reaper's
@@ -1204,6 +1187,26 @@ impl Engine {
             }
         }
         report
+    }
+
+    /// Post-terminal cleanup for one instance: drop the device and
+    /// service registry entries it owns and mark its device-state
+    /// projection `Stale`. The supervisor's reaper runs this once an
+    /// instance reaches `Stopped` / `Failed`; harnesses that drive a
+    /// [`PluginInstance`] directly (`oxidhome-test-host`) call it when
+    /// they tear an instance down, so both leave the same state
+    /// behind. Idempotent.
+    pub fn release_instance_state(&self, instance_id: &str) {
+        self.devices().remove_by_owner(instance_id);
+        self.services().remove_by_owner(instance_id);
+        // H9: device-state entries survive the terminal (unlike
+        // `DeviceRegistry` entries, which are reaped) so consumers
+        // can still read the last observed values with
+        // `quality: "stale"`. Flipping the marker here catches the
+        // case where the instance reached Stopped / Failed and no
+        // restart follows — the pre-restart sweep in
+        // `spawn_supervisor_lifecycle` won't fire in that path.
+        self.device_state().mark_instance_stale(instance_id);
     }
 
     /// Look up a running instance by id. `None` if no such

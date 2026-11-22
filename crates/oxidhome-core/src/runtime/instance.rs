@@ -70,7 +70,7 @@ fn loaded_dir_matches_registry(wasm_path: &Path, registry_path: &Path) -> bool {
 /// downstream `PluginInstance::load_with_mode` path already works
 /// in `&[u8]` — feeding them straight through avoids a re-UTF-8
 /// check.
-pub(crate) async fn read_manifest_with_bytes(
+pub async fn read_manifest_with_bytes(
     plugin_dir: &Path,
 ) -> anyhow::Result<(Vec<u8>, PluginManifest)> {
     let manifest_path = plugin_dir.join("manifest.toml");
@@ -149,6 +149,19 @@ pub enum LoadMode {
     ///   argv-loaded plugins in `main.rs`, integration tests,
     ///   the `Engine::new()` in-memory harness.
     Dev,
+    /// Phase 11 (M5): dev-time load with an explicit, caller-supplied
+    /// grant — the `oxidhome-test-host` harness's capability
+    /// injection. Never shadows an installed package: the loader
+    /// refuses whenever a registry row claims `manifest.plugin.id`.
+    /// Otherwise the grant goes through the same boundary an
+    /// installed grant does: the capability-count caps
+    /// ([`oxidhome_manifest::check_capability_limits_owned`]) and
+    /// the requested ∩ granted intersection
+    /// ([`crate::state::effective_capabilities`]), so a caller
+    /// can't authorize anything the manifest doesn't request.
+    Granted {
+        granted: Arc<oxidhome_manifest::CapabilitiesSection>,
+    },
 }
 
 /// Why a [`PluginInstance::init`] call failed. The supervisor's
@@ -717,6 +730,39 @@ impl PluginInstance {
                     row.path.display(),
                     wasm_path.display(),
                 ));
+            }
+            (LoadMode::Granted { .. }, Some(row)) => {
+                // Same shadowing hazard as the `Dev` arms above,
+                // but an injected grant is never allowed to stand
+                // in for an operator-issued one: refuse outright.
+                return Err(anyhow!(
+                    "plugin {} is installed at {}; an explicitly granted dev-time load \
+                     must not shadow an installed package",
+                    manifest.plugin.id,
+                    row.path.display(),
+                ));
+            }
+            (LoadMode::Granted { granted }, None) => {
+                // Phase 11 (M5): validate the injected grant exactly
+                // like a persisted one, then intersect it with the
+                // manifest's request — the same two steps the
+                // installed arms above apply.
+                oxidhome_manifest::check_capability_limits_owned(granted).map_err(|errors| {
+                    anyhow!(
+                        "grant for plugin {} is invalid:\n  - {}",
+                        manifest.plugin.id,
+                        errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n  - "),
+                    )
+                })?;
+                let effective = crate::state::effective_capabilities(requested, granted);
+                (
+                    Arc::<str>::from(manifest.plugin.id.as_str()),
+                    Arc::new(effective),
+                )
             }
             (LoadMode::Dev, None) => {
                 // Genuine dev load: no installed row claims this
