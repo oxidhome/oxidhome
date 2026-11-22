@@ -6,8 +6,9 @@
 //!
 //! - real SDK-built example components are accepted;
 //! - a component synthesized from the committed baseline of every
-//!   contract version is accepted when the host implements that
-//!   version and refused otherwise;
+//!   contract version is accepted when the host serves that version
+//!   (its own, or an older one on the same compatibility line) and
+//!   refused otherwise;
 //! - components whose types drift from the host's (changed signature,
 //!   unknown function, missing export, other package version, no
 //!   contract at all) are refused with an error naming the item;
@@ -87,7 +88,7 @@ fn prebuilt_example_components_are_accepted() {
 }
 
 /// One fixture per committed contract version: the host accepts the
-/// version it implements and refuses every other one.
+/// versions it serves and refuses every other one.
 #[test]
 fn every_baseline_contract_version_is_classified() {
     let host_version = host_contract_version();
@@ -118,8 +119,17 @@ fn every_baseline_contract_version_is_classified() {
         let wasm = synthesize(&resolve, plugin_world(&resolve, pkg));
 
         let result = verify_component(&wasm);
+        let parsed: semver::Version = version.parse().expect("baseline version");
+        let host: semver::Version = host_version.parse().expect("host version");
+        let same_line = if host.major == 0 {
+            parsed.major == 0 && parsed.minor == host.minor
+        } else {
+            parsed.major == host.major
+        };
         if version == host_version {
             saw_host_version = true;
+        }
+        if same_line && parsed <= host {
             result.unwrap_or_else(|e| panic!("baseline {version} must be accepted: {e}"));
         } else {
             assert_eq!(
@@ -215,6 +225,31 @@ fn changed_world_export_is_refused() {
     let err = verify_component(&wasm).expect_err("drifted export");
     assert!(
         matches!(&err, ContractError::SignatureMismatch { item, .. } if item == "tick"),
+        "{err}"
+    );
+}
+
+/// The decoder merges an interface the component both imports and
+/// exports, which would hide one side's types from the check.
+#[test]
+fn interface_imported_and_exported_is_refused() {
+    let wasm = plugin_component(|resolve, pkg| {
+        let id = resolve.packages[pkg].interfaces["host-config"];
+        let world = plugin_world(resolve, pkg);
+        resolve.worlds[world].exports.insert(
+            WorldKey::Interface(id),
+            wit_parser::WorldItem::Interface {
+                id,
+                stability: wit_parser::Stability::default(),
+                external_id: None,
+                docs: wit_parser::Docs::default(),
+                span: wit_parser::Span::default(),
+            },
+        );
+    });
+    let err = verify_component(&wasm).expect_err("import + export of one interface");
+    assert!(
+        matches!(&err, ContractError::ImportedAndExported { interface } if interface.contains("host-config")),
         "{err}"
     );
 }
