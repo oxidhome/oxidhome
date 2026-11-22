@@ -1,0 +1,6 @@
+# Advisories OSV Scanner reports that cargo-deny also ignores; keep this
+# list in step with `[advisories].ignore` in deny.toml.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono is unmaintained; only pulled transitively by rmcp/schemars, no replacement upstream yet"
