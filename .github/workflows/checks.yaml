@@ -276,7 +276,8 @@ jobs:
           fi
           if [ "$status" -eq 0 ]; then
             while IFS=: read -r file line text; do
-              echo "::error file=$file,line=$line::Stale doc claim (see .github/stale-doc-phrases.txt): $text"
+              # `%` starts an escape in workflow commands.
+              echo "::error file=$file,line=$line::Stale doc claim (see .github/stale-doc-phrases.txt): ${text//%/%25}"
             done <<<"$matches"
             exit 1
           fi
