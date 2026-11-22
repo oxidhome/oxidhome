@@ -39,7 +39,9 @@ oxidhome-wit = { path = "crates/oxidhome-wit", version = "0.1.0" }
 # the `oxidhome:plugin` package `build.rs` encodes (`wit-component`);
 # `oxidhome-wit`'s baseline test prints and semver-checks the package.
 # Pinned exact to the versions `wit-bindgen` already pulls in, so the
-# graph keeps one copy and decoding understands what bindgen embeds.
+# runtime/build graph keeps one copy and decoding understands what
+# bindgen embeds. (The dev-only `dummy-module` / `semver-check` features
+# add `wat` and a newer `wasmparser` to test builds.)
 wit-parser = { version = "=0.259.0", default-features = false, features = ["std", "decoding"] }
 wit-component = { version = "=0.259.0", default-features = false }
 anyhow = "1.0.102"
