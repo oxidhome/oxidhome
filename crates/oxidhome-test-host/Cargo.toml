@@ -27,6 +27,10 @@ path = "tests/conformance.rs"
 name = "test_host"
 path = "tests/test_host.rs"
 
+[[test]]
+name = "examples"
+path = "tests/examples.rs"
+
 [dependencies]
 # The harness runs plugins on the production runtime: same loader,
 # same host-import impls, same state stores (on a throwaway state
@@ -35,6 +39,9 @@ anyhow.workspace = true
 oxidhome-core.workspace = true
 oxidhome-manifest.workspace = true
 thiserror.workspace = true
+# Supervised instances run on Tokio (the supervisor is a task), and
+# `block_on` owns a runtime for synchronous tests.
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 toml.workspace = true
 
 [dev-dependencies]

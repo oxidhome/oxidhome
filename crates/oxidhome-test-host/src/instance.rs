@@ -1,17 +1,20 @@
 //! [`TestPluginInstance`] — one loaded plugin plus assertion helpers.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use oxidhome_core::state::{DeviceMeta, EventQuery, HistoricalEvent, KvStore};
+use oxidhome_core::state::{BlobInfo, DeviceMeta, HistoricalEvent, ServiceMeta};
 use oxidhome_core::{Engine, PluginInstance};
 use oxidhome_manifest::PluginManifest;
 
 use crate::TestHostError;
-use crate::host::LiveIds;
+use crate::live::IdLease;
+use crate::snapshot::Snapshot;
 use crate::tempdir::TempDir;
+use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::{Command, CommandResult};
 use crate::wit::events::Event;
-use crate::wit::types::{DeviceId, Value};
+use crate::wit::types::{DeviceId, ServiceId};
 
 /// A plugin instance loaded by a [`crate::TestHost`].
 ///
@@ -27,27 +30,36 @@ use crate::wit::types::{DeviceId, Value};
 ///
 /// The instance keeps its host's state directory alive, so it stays
 /// usable even after the [`crate::TestHost`] that loaded it is dropped.
+///
+/// A directly driven instance can call other plugins' services (its
+/// `call-service` goes through the production dispatcher), but it
+/// can't *serve* them: the dispatcher routes a call to the owner's
+/// supervisor task. Run a service provider with
+/// [`crate::TestHost::start`] instead.
 pub struct TestPluginInstance {
     // Field order: the store and engine close before the state
-    // directory they live in is removed.
+    // directory they live in is removed; the id lease goes after the
+    // `Drop` teardown has run.
     inner: PluginInstance,
     engine: Engine,
-    live: LiveIds,
+    lease: IdLease,
     state_dir: Arc<TempDir>,
+    elapsed: Duration,
 }
 
 impl TestPluginInstance {
     pub(crate) fn new(
         engine: Engine,
         inner: PluginInstance,
-        live: LiveIds,
+        lease: IdLease,
         state_dir: Arc<TempDir>,
     ) -> Self {
         Self {
             inner,
             engine,
-            live,
+            lease,
             state_dir,
+            elapsed: Duration::ZERO,
         }
     }
 
@@ -80,7 +92,9 @@ impl TestPluginInstance {
         Ok(self.inner.init().await?)
     }
 
-    /// Call the plugin's `tick` export once.
+    /// Call the plugin's `tick` export once, now. Doesn't move the
+    /// virtual clock; see [`Self::advance`] for ticking on the
+    /// manifest's schedule.
     ///
     /// # Errors
     ///
@@ -167,16 +181,22 @@ impl TestPluginInstance {
     /// device id.
     #[must_use]
     pub fn devices(&self) -> Vec<Arc<DeviceMeta>> {
-        let id = self.instance_id();
-        let mut devices: Vec<_> = self
-            .engine
-            .devices()
-            .list()
-            .into_iter()
-            .filter(|d| d.owner_instance == id)
-            .collect();
-        devices.sort_by(|a, b| a.id.cmp(&b.id));
-        devices
+        self.view().devices()
+    }
+
+    /// Services this instance currently has registered, sorted by
+    /// local id.
+    #[must_use]
+    pub fn services(&self) -> Vec<Arc<ServiceMeta>> {
+        self.view().services()
+    }
+
+    /// The host-minted id (`svc-N`) of this instance's service with
+    /// `local_id`, if it has registered one — what another plugin
+    /// passes to `call-service`.
+    #[must_use]
+    pub fn service_id(&self, local_id: &str) -> Option<ServiceId> {
+        self.view().service_id(local_id)
     }
 
     /// Every event this instance id has published, oldest first, as
@@ -188,75 +208,117 @@ impl TestPluginInstance {
     ///
     /// [`TestHostError::EventLog`] if the log can't be read.
     pub fn events(&self) -> Result<Vec<HistoricalEvent>, TestHostError> {
-        let query = EventQuery {
-            instance_id: Some(self.instance_id().to_owned()),
-            ..EventQuery::default()
-        };
-        let mut events = self.engine.event_log().query(&query, usize::MAX)?;
-        // The log returns newest first.
-        events.reverse();
-        Ok(events)
+        self.view().events()
     }
 
-    /// Read-only view of this instance's KV storage.
+    /// This instance's KV storage.
     #[must_use]
     pub fn storage(&self) -> StorageView {
-        StorageView {
-            kv: self.engine.kv(),
-            _state_dir: Arc::clone(&self.state_dir),
-            installation_uuid: self.installation_uuid(),
-            instance_id: self.instance_id().to_owned(),
+        self.view().storage()
+    }
+
+    /// Blobs this instance has written, sorted by name.
+    ///
+    /// # Errors
+    ///
+    /// [`TestHostError::Blobs`] if the blob index can't be read.
+    pub fn blobs(&self) -> Result<Vec<BlobInfo>, TestHostError> {
+        self.view().blobs()
+    }
+
+    /// The contents of this instance's blob called `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`TestHostError::Blobs`] if there is no such blob or it can't
+    /// be read.
+    pub fn read_blob(&self, name: &str) -> Result<Vec<u8>, TestHostError> {
+        self.view().read_blob(name)
+    }
+
+    /// A [`Snapshot`] of everything this instance has in the host.
+    ///
+    /// # Errors
+    ///
+    /// When the event log, storage, or blob index can't be read.
+    pub fn snapshot(&self) -> Result<Snapshot, TestHostError> {
+        self.view().snapshot()
+    }
+
+    /// Virtual time since the instance was loaded, as moved by
+    /// [`Self::advance`]. Starts at zero; real time never moves it.
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    /// Move the instance's virtual clock forward by `by` and call
+    /// `tick` once for every `runtime.tick_interval_ms` boundary
+    /// crossed, the way the daemon's supervisor would over that much
+    /// real time: the first tick lands one interval after load (the
+    /// supervisor's first lands one interval after `Running`), then one
+    /// per interval. A plugin without `tick_interval_ms` is never
+    /// ticked. Returns how many ticks ran.
+    ///
+    /// The schedule is the one the supervisor aims for; it doesn't
+    /// model a host that falls behind (the supervisor then delays
+    /// rather than bursts missed ticks). The clock is the harness's
+    /// own: the guest's WASI clocks and the host's event timestamps
+    /// still read real time, so a plugin that measures time itself
+    /// doesn't see the jump. See the crate docs, "Time".
+    ///
+    /// # Errors
+    ///
+    /// [`TestHostError::Call`] when a tick traps or times out. The
+    /// clock then stays at that tick's boundary and the remaining
+    /// ticks don't run.
+    pub async fn advance(&mut self, by: Duration) -> Result<usize, TestHostError> {
+        let target = self.elapsed.saturating_add(by);
+        let mut ticks = 0;
+        if let Some(interval) = self
+            .manifest()
+            .runtime
+            .tick_interval_ms
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+        {
+            loop {
+                // Next boundary strictly after the current time.
+                let done = self.elapsed.as_nanos() / interval.as_nanos();
+                let next = interval.saturating_mul(u32::try_from(done + 1).unwrap_or(u32::MAX));
+                if next > target {
+                    break;
+                }
+                self.elapsed = next;
+                self.tick().await?;
+                ticks += 1;
+            }
         }
+        self.elapsed = target;
+        Ok(ticks)
     }
 
     /// The production instance this wraps, for calls the harness
-    /// doesn't cover yet (e.g. `execute-service-command`).
+    /// doesn't cover (e.g. `execute-service-command` without going
+    /// through the dispatcher).
     #[must_use]
     pub fn inner_mut(&mut self) -> &mut PluginInstance {
         &mut self.inner
+    }
+
+    fn view(&self) -> InstanceRef<'_> {
+        InstanceRef {
+            engine: &self.engine,
+            state_dir: &self.state_dir,
+            installation_uuid: self.installation_uuid(),
+            instance_id: self.instance_id(),
+        }
     }
 }
 
 impl Drop for TestPluginInstance {
     fn drop(&mut self) {
-        let id = self.inner.instance_id().to_owned();
-        self.engine.release_instance_state(&id);
-        self.live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
-    }
-}
-
-/// Read-only access to one instance's KV storage, for assertions.
-pub struct StorageView {
-    kv: Arc<KvStore>,
-    // Keeps the database's directory alive as long as the view.
-    _state_dir: Arc<TempDir>,
-    installation_uuid: Arc<str>,
-    instance_id: String,
-}
-
-impl StorageView {
-    /// The value stored under `key`, if any.
-    ///
-    /// # Errors
-    ///
-    /// [`TestHostError::Storage`] if the store can't be read.
-    pub fn get(&self, key: &str) -> Result<Option<Value>, TestHostError> {
-        Ok(self
-            .kv
-            .get(&self.installation_uuid, &self.instance_id, key)?)
-    }
-
-    /// Keys starting with `prefix` (`""` for all), sorted.
-    ///
-    /// # Errors
-    ///
-    /// [`TestHostError::Storage`] if the store can't be read.
-    pub fn keys(&self, prefix: &str) -> Result<Vec<String>, TestHostError> {
-        Ok(self
-            .kv
-            .list_keys(&self.installation_uuid, &self.instance_id, prefix)?)
+        // The lease (a field) frees the id after this teardown.
+        self.engine.release_instance_state(self.lease.id());
     }
 }

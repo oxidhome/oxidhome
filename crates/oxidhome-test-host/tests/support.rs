@@ -26,6 +26,12 @@ pub const SIMULATED_SWITCH: (&str, &str) = ("simulated-switch", "simulated_switc
 pub const KV_COUNTER: (&str, &str) = ("kv-counter", "kv_counter.wasm");
 pub const EVENT_RECORDER: (&str, &str) = ("event-recorder", "event_recorder.wasm");
 pub const HELLO_WORLD: (&str, &str) = ("hello-world", "hello_world.wasm");
+pub const SERVICE_COUNTER: (&str, &str) = ("service-counter", "service_counter.wasm");
+pub const SERVICE_CALLER: (&str, &str) = ("service-caller", "service_caller.wasm");
+pub const SERVICE_BOUNCER: (&str, &str) = ("service-bouncer", "service_bouncer.wasm");
+pub const SNAPSHOT_SAVER: (&str, &str) = ("snapshot-saver", "snapshot_saver.wasm");
+pub const CRASHER: (&str, &str) = ("crasher", "crasher.wasm");
+pub const HANG: (&str, &str) = ("hang", "hang.wasm");
 
 /// Build `examples/<dir>` for `wasm32-wasip2` (once per test binary)
 /// and return the artifact path.

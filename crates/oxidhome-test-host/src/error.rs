@@ -69,7 +69,8 @@ pub enum TestHostError {
     #[error(transparent)]
     Init(#[from] oxidhome_core::InitError),
     /// A call into the plugin (`tick`, `execute-command`, `on-event`,
-    /// `on-shutdown`) trapped or timed out.
+    /// `on-shutdown`) trapped or timed out, or a supervised instance's
+    /// supervisor was gone.
     #[error("calling plugin export `{export}`")]
     Call {
         /// WIT export that was called.
@@ -84,6 +85,24 @@ pub enum TestHostError {
     /// Reading the event history failed.
     #[error("reading the event log")]
     EventLog(#[from] oxidhome_core::state::EventLogError),
+    /// Reading the instance's blobs failed (or the named blob doesn't
+    /// exist).
+    #[error("reading plugin blobs")]
+    Blobs(#[from] oxidhome_core::state::BlobError),
+    /// A supervised instance stopped or failed before reaching
+    /// `Running`.
+    #[error("instance `{instance_id}` did not reach Running: {state:?}")]
+    NotRunning {
+        /// The instance's id.
+        instance_id: String,
+        /// The state it ended in, e.g. `Failed { error }` naming the
+        /// crash.
+        state: oxidhome_core::InstanceState,
+    },
+    /// The harness's own bookkeeping task for a supervised instance
+    /// failed.
+    #[error("tracking a supervised instance")]
+    Supervisor(#[source] Source),
 }
 
 impl TestHostError {
