@@ -624,16 +624,6 @@ fn now_ms() -> i64 {
     }
 }
 
-/// Validates a `plugin_id` for use as a filesystem segment.
-/// Shared between [`InstalledPluginRegistry::install`] (which
-/// rejects on entry to the registry) and
-/// [`InstalledPluginRegistry::scan`] (which skips with a warn so
-/// a corrupt hand-placed manifest doesn't poison the index).
-///
-/// 12-API-f review surfaced this as defense-in-depth — the
-/// destructive `uninstall` path relies on "all registry ids are
-/// FS-safe," and without a check in both insertion sites that
-/// invariant rests on an undocumented assumption. Now enforced.
 /// Reject an install `source_dir` that is relative or contains a
 /// `..` component before it reaches the filesystem. Every transport
 /// (REST, Connect, MCP) funnels through here, so they share one
@@ -655,6 +645,16 @@ fn validate_source_dir(source_dir: &Path) -> Result<(), InstallError> {
     })
 }
 
+/// Validates a `plugin_id` for use as a filesystem segment.
+/// Shared between [`InstalledPluginRegistry::install`] (which
+/// rejects on entry to the registry) and
+/// [`InstalledPluginRegistry::scan`] (which skips with a warn so
+/// a corrupt hand-placed manifest doesn't poison the index).
+///
+/// 12-API-f review surfaced this as defense-in-depth — the
+/// destructive `uninstall` path relies on "all registry ids are
+/// FS-safe," and without a check in both insertion sites that
+/// invariant rests on an undocumented assumption. Now enforced.
 fn is_safe_plugin_id(plugin_id: &str) -> bool {
     !plugin_id.is_empty()
         && !plugin_id.contains('/')
