@@ -36,6 +36,10 @@ Best Component Model support, async host functions, mature embedding API, well-m
 
 The `oxidhome.wit` file is the *real product* in a sense. Once plugins exist in the wild against version 0.1 of the WIT, breaking changes get expensive. The WIT deserves real care on the first cut.
 
+Compatibility is proven from the component binary, not taken from the manifest. Every component carries the WIT types of what it imports and exports, under their full names (`oxidhome:plugin/host-devices@0.1.0`). Before compiling a plugin, the loader (`oxidhome_core::runtime::contract`) decodes those types and compares them with the host's own `oxidhome:plugin` package, which `build.rs` bakes in from `wit/`. The package version must match, and every function the component imports or exports from the package, plus every export the `plugin` world requires, must match the host's signature structurally. A component may import a subset of an interface. A component that fails the check is refused with an error naming the offending item. So is a component that carries no `oxidhome:plugin` types at all, or whose types can't be decoded: there is no warn-only mode. The manifest's `sdk_version` check still runs, but only as a secondary signal of the author's intent.
+
+A contract version is immutable once it has a baseline in `crates/oxidhome-wit/baselines/`. The `contract_baseline` test fails when `wit/` drifts from the current version's baseline, and it semver-checks compatible bumps against the previous version. CONTRIBUTING.md describes the bump-and-bless workflow.
+
 ## The plugin model
 
 ### Plugin vs. plugin instance

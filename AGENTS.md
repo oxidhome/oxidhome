@@ -17,6 +17,8 @@ top-level directories.
 - `cargo deny check` audits licenses, advisories, bans, and sources using `deny.toml`.
 - `cargo machete` checks for unused dependencies before dependency cleanup.
 - `wasm-tools component wit wit/`: validates the full WIT package and vendored deps.
+- `cargo test -p oxidhome-wit --test contract_baseline`: fails when `wit/` changes the contract without a package
+  version bump; see CONTRIBUTING.md for the `OXIDHOME_BLESS_WIT_BASELINE=1` baseline workflow.
 
 ## Coding Style & Naming Conventions
 

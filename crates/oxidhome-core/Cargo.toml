@@ -37,6 +37,10 @@ name = "event_dispatch"
 path = "tests/event_dispatch.rs"
 
 [[test]]
+name = "wit_contract"
+path = "tests/wit_contract.rs"
+
+[[test]]
 name = "manifest_loader"
 path = "tests/manifest_loader.rs"
 
@@ -135,6 +139,9 @@ wasmtime = { version = "=48.0.10", default-features = false, features = [
   "anyhow",
 ] }
 wasmtime-wasi = { version = "=48.0.10", default-features = false, features = ["p2"] }
+# Decodes each plugin component's embedded WIT types for the load-time
+# contract check (`runtime::contract`).
+wit-parser.workspace = true
 anyhow.workspace = true
 oxidhome-manifest.workspace = true
 rusqlite.workspace = true
@@ -206,7 +213,16 @@ http-body-util.workspace = true
 http-body.workspace = true
 bytes.workspace = true
 
+[build-dependencies]
+# `build.rs` parses `wit/` and encodes the `oxidhome:plugin` package
+# the runtime contract check compares plugins against.
+wit-parser.workspace = true
+wit-component.workspace = true
+
 [dev-dependencies]
+# Synthesizes plugin components from a (possibly mutated) WIT world for
+# the contract-compatibility fixtures in `tests/wit_contract.rs`.
+wit-component = { workspace = true, features = ["dummy-module"] }
 # 12-API-e — real WS round-trip test. Already in the dep graph via
 # `axum`'s `ws` feature, pinned to the same version so the lockfile
 # stays single-copy.

@@ -75,7 +75,20 @@ To validate the WIT file:
 
 ```sh
 wasm-tools component wit wit/
+cargo test -p oxidhome-wit --test contract_baseline
 ```
+
+The second command compares `wit/` against the committed baseline of the current `oxidhome:plugin` version in
+`crates/oxidhome-wit/baselines/`. Doc-comment and formatting edits pass; any change to the contract itself fails until
+you bump the package version in `wit/oxidhome.wit` (next `0.x` minor for a breaking change, next patch for an additive
+one) and record the new version's baseline:
+
+```sh
+OXIDHOME_BLESS_WIT_BASELINE=1 cargo test -p oxidhome-wit --test contract_baseline
+```
+
+Blessing only creates a missing baseline. Existing baselines are immutable (CI rejects PRs that edit or delete one), and
+a bump that claims to be compatible must pass `wit_component::semver_check` against the previous version.
 
 ## Code conventions
 

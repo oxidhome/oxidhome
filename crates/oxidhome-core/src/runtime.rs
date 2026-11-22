@@ -13,6 +13,7 @@
 // `#[doc(hidden)]` `call_service_from_host` helper; the regular
 // surface is everything else accessed via `pub(crate)` inside the
 // module.
+pub mod contract;
 pub mod dispatcher;
 mod instance;
 mod lifecycle;

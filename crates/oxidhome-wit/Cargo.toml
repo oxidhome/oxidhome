@@ -31,3 +31,11 @@ streaming-ai-plugin = []
 # as deliberate PRs that re-run both bindgens. See the exact-pinning
 # policy in ARCHITECTURE.md "Implementation decisions".
 wit-bindgen = "=0.62.0"
+
+[dev-dependencies]
+# `tests/contract_baseline.rs`: print the normalized `oxidhome:plugin`
+# package, compare it against `baselines/`, and semver-check version
+# bumps (architecture review M1).
+semver.workspace = true
+wit-component = { workspace = true, features = ["semver-check"] }
+wit-parser.workspace = true
