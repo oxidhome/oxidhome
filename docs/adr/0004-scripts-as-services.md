@@ -18,7 +18,8 @@ had one plugin instance per manifest entry and no way to create instances dynami
 A script is a **service**. A plugin instance registers services with `host-services::register-service`, gated by
 `[capabilities] declares_services`, and handles their commands in its `execute-service-command` export. Any plugin
 calls a service through `host-services::call-service`; the host dispatcher routes the call to the owning instance's
-supervisor task, checks the caller's `consumes_services` grants, detects cycles and bounds the call with a timeout.
+supervisor task, detects cycles and bounds the call with a timeout. (Caller-side `consumes_services` grants were added
+later, by H10 in PR #107.)
 For Phase 7 all scripts of one scripting plugin live in that plugin's single instance and Wasmtime `Store`.
 
 ## Rejected options

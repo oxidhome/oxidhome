@@ -20,15 +20,17 @@ The host enforces fixed resource ceilings on every plugin instance. They are pla
 per-plugin tuning, and there are no manifest knobs for them:
 
 - **Per `Store`** (aggregated over all memories and tables of the instance): 128 MiB linear memory, 100,000 table
-  elements, at most 8 memories, 16 tables and 128 instances. Going over is a trap, which the supervisor
-  handles as a crash under the instance's restart policy.
+  elements, at most 8 memories, 16 tables and 128 instances. Growth past a ceiling at run time traps,
+  which the supervisor handles as a crash under the instance's restart policy; a component that exceeds a count cap
+  at instantiation fails to load, which is terminal.
 - **Per host call:** 64 KiB per KV value, 16 MiB per blob write, 64 KiB per event payload, 64 live subscriptions per
   instance, and 4 KiB per log message (longer messages are truncated), plus per-instance rate limits on event
   publishing and logging.
 - **CPU:** no fuel or instruction budget. The per-call liveness watchdog (Wasmtime epoch interruption, 30 s) still
   reclaims a wedged instance, and CPU use is left to metrics.
 
-Refusals of host calls surface to the plugin as `permission-denied`.
+Byte-cap and subscription-cap refusals surface to the plugin as `permission-denied`; a throttled publish returns
+`unavailable`, and throttled log calls are dropped silently.
 
 ## Rejected options
 
