@@ -32,8 +32,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use tokio::io::AsyncWrite;
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
+use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
 
 use super::state::{LogRateBucket, MAX_LOG_MESSAGE_BYTES};
 
@@ -269,7 +271,7 @@ impl PluginOutput {
         (make(Stream::Stdout), make(Stream::Stderr))
     }
 
-    fn write(&self, bytes: &[u8]) {
+    fn feed(&self, bytes: &[u8]) {
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -287,6 +289,40 @@ impl StdoutStream for PluginOutput {
     fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
         Box::new(self.clone())
     }
+
+    /// The WASI p2 stream writes straight into the redacting line
+    /// buffer. The trait's default wraps [`Self::async_stream`] in
+    /// wasmtime's `AsyncWriteStream`, whose worker logs every chunk's
+    /// raw bytes at DEBUG before handing it on — which the log store
+    /// would capture with the plaintext.
+    fn p2_stream(&self) -> Box<dyn OutputStream> {
+        Box::new(self.clone())
+    }
+}
+
+/// How much the guest may write per `check-write`. Writes never block
+/// (the line buffer is bounded), so this only sizes the guest's chunks.
+const P2_WRITE_BUDGET: usize = 64 * 1024;
+
+#[wasmtime_wasi::async_trait]
+impl OutputStream for PluginOutput {
+    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        self.feed(&bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> StreamResult<()> {
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> StreamResult<usize> {
+        Ok(P2_WRITE_BUDGET)
+    }
+}
+
+#[wasmtime_wasi::async_trait]
+impl Pollable for PluginOutput {
+    async fn ready(&mut self) {}
 }
 
 impl AsyncWrite for PluginOutput {
@@ -295,7 +331,7 @@ impl AsyncWrite for PluginOutput {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        self.write(buf);
+        self.feed(buf);
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -337,8 +373,8 @@ mod tests {
     #[test]
     fn secret_printed_to_stdout_is_redacted_and_attributed() {
         let (out, err, lines) = capture(&["hunter2-secret"]);
-        out.write(b"\n\r\nconnecting with hunter2-secret now\n");
-        err.write(b"retry: password=other\r\n");
+        out.feed(b"\n\r\nconnecting with hunter2-secret now\n");
+        err.feed(b"retry: password=other\r\n");
         let got = lines.lock().unwrap().clone();
         assert_eq!(
             got,
@@ -363,8 +399,8 @@ mod tests {
     fn lines_are_buffered_across_writes_and_handles() {
         let (out, _err, lines) = capture(&["hunter2-secret"]);
         let other = out.clone();
-        out.write(b"a hunt");
-        other.write(b"er2-secret b\nsecond");
+        out.feed(b"a hunt");
+        other.feed(b"er2-secret b\nsecond");
         assert_eq!(texts(&lines), vec!["a *** b".to_owned()]);
         // The partial line is emitted once the last handle goes away.
         drop(out);
@@ -384,7 +420,7 @@ mod tests {
         line.push_str(&secret);
         line.push_str(&"b".repeat(10_000));
         line.push('\n');
-        out.write(line.as_bytes());
+        out.feed(line.as_bytes());
         let got = texts(&lines);
         assert_eq!(got.len(), 1);
         assert!(!got[0].contains("ssss"), "secret fragment leaked");
@@ -406,7 +442,7 @@ mod tests {
         line.push_str(&"x".repeat(MAX_LOG_MESSAGE_BYTES - line.len() - 1));
         line.push_str(&secret);
         line.push('\n');
-        out.write(line.as_bytes());
+        out.feed(line.as_bytes());
         let got = texts(&lines);
         assert_eq!(got.len(), 1);
         assert!(!got[0].contains("SS"), "secret fragment leaked");
@@ -416,7 +452,7 @@ mod tests {
     #[test]
     fn multiline_secret_lines_are_scrubbed() {
         let (out, _err, lines) = capture(&["alpha-secret\r\nbeta-secret\nab"]);
-        out.write(b"key:\nalpha-secret\nbeta-secret\nab\n");
+        out.feed(b"key:\nalpha-secret\nbeta-secret\nab\n");
         assert_eq!(
             texts(&lines),
             vec![
@@ -428,11 +464,50 @@ mod tests {
         );
     }
 
+    /// The real p2 path (what a WASI p2 guest's `print!` drives) under a
+    /// TRACE-level subscriber: no event anywhere carries the plaintext,
+    /// and the line arrives redacted as a `plugin.stdout` event.
+    #[test]
+    fn p2_stream_never_logs_plaintext() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let rate = Arc::new(Mutex::new(LogRateBucket::new()));
+            let (out, _err) = PluginOutput::pair("i-1", "example.p", &["hunter2-secret"], &rate);
+            let mut stream = out.p2_stream();
+            assert_eq!(stream.check_write().unwrap(), P2_WRITE_BUDGET);
+            stream
+                .write(Bytes::from_static(b"pw hunter2-secret\n"))
+                .unwrap();
+            stream.flush().unwrap();
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("plugin.stdout"), "{text}");
+        assert!(text.contains("pw ***"), "{text}");
+    }
+
     #[test]
     fn lines_spend_the_shared_rate_budget() {
         let (out, _err, lines) = capture(&[]);
         let many = "x\n".repeat(1_000);
-        out.write(many.as_bytes());
+        out.feed(many.as_bytes());
         let emitted = texts(&lines).len();
         // The burst admits LOG_RATE_BURST lines (plus whatever refilled
         // while the loop ran); the rest are dropped.
