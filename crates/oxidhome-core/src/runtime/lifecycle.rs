@@ -462,7 +462,10 @@ impl InstanceHandle {
                     return timed_out();
                 }
                 // Entered before the deadline; the reply may have
-                // landed in the same instant.
+                // landed in the same instant. Closing first makes the
+                // race binary: a reply sent after this point fails, and
+                // the supervisor audits it as a late result.
+                rx.close();
                 return rx.try_recv().unwrap_or_else(|_| CommandOutcome::Unknown {
                     message: format!(
                         "invocation `{call_id}` deadline passed while instance `{}` was \
@@ -1311,13 +1314,28 @@ async fn run_execute(
     // deadline (and its disconnect).
     if ctx.is_expired() || !ticket.try_start() {
         let _ = ticket.try_abandon();
-        let _ = reply.send(CommandOutcome::TimedOut {
+        let refused = CommandOutcome::TimedOut {
             message: format!(
                 "instance `{instance_id}` refused execute-command: invocation `{}` \
                  deadline exceeded before dispatch",
                 ctx.call_id(),
             ),
-        });
+        };
+        if let Err(outcome) = reply.send(refused)
+            && !ctx.is_expired()
+        {
+            // The caller went away (disconnect, not its deadline:
+            // that path reports `timed_out` itself) while the command
+            // was queued; its request row has no outcome, so record
+            // that it never ran.
+            super::command::record_resolution(
+                instance.audit_log().as_ref(),
+                &ctx,
+                &cmd.id,
+                &device,
+                &outcome,
+            );
+        }
         return Ok(LoopAction::Continue);
     }
     let command_id = cmd.id.clone();

@@ -201,12 +201,18 @@ impl DispatchTicket {
             .is_ok()
     }
 
-    /// Caller side: withdraw a still-queued command. `false` means the
-    /// supervisor already entered the plugin.
+    /// Withdraw a still-queued command. `true` means the command will
+    /// never run: this call abandoned it, or the supervisor already did
+    /// (an expired command it refused). `false` means the supervisor
+    /// already entered the plugin.
     pub(crate) fn try_abandon(&self) -> bool {
-        self.0
+        match self
+            .0
             .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        {
+            Ok(_) => true,
+            Err(current) => current == ABANDONED,
+        }
     }
 
     /// Whether the supervisor entered the plugin.
@@ -625,6 +631,9 @@ mod tests {
         assert!(t.try_abandon());
         assert!(!t.try_start());
         assert!(!t.started());
+        // Abandoned by the supervisor first: the caller still learns
+        // the command never ran.
+        assert!(t.try_abandon());
     }
 
     #[test]
