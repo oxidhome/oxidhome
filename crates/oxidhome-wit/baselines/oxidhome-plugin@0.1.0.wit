@@ -52,9 +52,42 @@ interface capabilities {
     color-temp-kelvin: option<u32>,
   }
 
+  variant unit {
+    unitless,
+    percent,
+    celsius,
+    fahrenheit,
+    kelvin,
+    lux,
+    watt,
+    kilowatt,
+    watt-hour,
+    kilowatt-hour,
+    volt,
+    ampere,
+    hertz,
+    pascal,
+    hectopascal,
+    ppm,
+    ppb,
+    microgram-per-cubic-meter,
+    millimeter,
+    meter,
+    meter-per-second,
+    liter,
+    cubic-meter,
+    gram,
+    kilogram,
+    second,
+    degree,
+    decibel,
+    dbm,
+    other(string),
+  }
+
   record measurement {
     value: f64,
-    unit: string,
+    unit: unit,
   }
 
   variant button-event {
@@ -74,9 +107,15 @@ interface capabilities {
   }
 
   record sensor-spec {
-    unit: string,
+    unit: unit,
     min: option<f64>,
     max: option<f64>,
+  }
+
+  record extension-spec {
+    namespace: string,
+    name: string,
+    version: u32,
   }
 
   variant capability-spec {
@@ -87,7 +126,7 @@ interface capabilities {
     button,
     video-stream,
     audio-stream,
-    extension(string),
+    extension(extension-spec),
   }
 
   variant capability-state {
@@ -129,10 +168,44 @@ interface devices {
 interface services {
   use types.{local-id, key-value};
 
+  enum value-kind {
+    bool-val,
+    int-val,
+    float-val,
+    string-val,
+    bytes-val,
+    json-val,
+  }
+
+  record int-range {
+    min: option<s64>,
+    max: option<s64>,
+  }
+
+  record float-range {
+    min: option<f64>,
+    max: option<f64>,
+  }
+
+  variant field-constraint {
+    one-of(list<string>),
+    int-range(int-range),
+    float-range(float-range),
+  }
+
+  record field-spec {
+    name: string,
+    kind: value-kind,
+    required: bool,
+    description: option<string>,
+    constraint: option<field-constraint>,
+  }
+
   record command-spec {
     name: string,
     description: option<string>,
-    arg-hints: list<string>,
+    params: list<field-spec>,
+    returns: list<field-spec>,
   }
 
   record service-info {

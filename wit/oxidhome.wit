@@ -22,7 +22,7 @@
 // `error::permission-denied(...)`. Manifests, gating policy, and the audit
 // trail live in oxidhome-core.
 
-package oxidhome:plugin@0.2.0;
+package oxidhome:plugin@0.1.0;
 
 
 // ─────────────────────────────────────────────────────────────────────────

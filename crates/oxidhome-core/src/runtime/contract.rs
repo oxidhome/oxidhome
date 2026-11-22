@@ -4,7 +4,7 @@
 //! hand; nothing ties it to the code in the `.wasm`. Every component,
 //! though, carries the full type of every interface it imports and
 //! exports, and `wit-bindgen` keeps the original WIT names
-//! (`oxidhome:plugin/host-devices@0.2.0`). [`verify_component`] decodes
+//! (`oxidhome:plugin/host-devices@0.1.0`). [`verify_component`] decodes
 //! that type information and checks it against the host's own copy of
 //! the `oxidhome:plugin` package, which `build.rs` bakes in from `wit/`.
 //!
@@ -116,7 +116,7 @@ static HOST: LazyLock<HostContract> = LazyLock::new(|| {
 });
 
 /// Version of the `oxidhome:plugin` WIT package this host implements,
-/// e.g. `0.2.0`.
+/// e.g. `0.1.0`.
 #[must_use]
 pub fn host_contract_version() -> String {
     let host = &*HOST;
