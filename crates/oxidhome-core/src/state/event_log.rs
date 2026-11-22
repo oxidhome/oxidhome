@@ -37,6 +37,10 @@ use crate::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value as WitVa
 
 use super::db::Db;
 
+mod mirror;
+
+pub use mirror::{EventLogHealth, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, MirrorPolicy};
+
 /// Errors returned by [`EventLog`]. Maps onto the WIT `error` variant
 /// in `host_impl::events::publish_event` via the same `Internal`-or-
 /// pass-through shape `KvError` uses.
@@ -164,16 +168,30 @@ pub enum TopicMatch {
 }
 
 /// Per-engine durable event history. Cheap to clone — holds an
-/// `Arc<Db>`.
+/// `Arc<Db>` plus the shared H3 mirror-health state (see
+/// [`EventLogHealth`]), so every clone observes the same degraded / healthy
+/// status.
 #[derive(Clone)]
 pub struct EventLog {
     db: Arc<Db>,
+    mirror: Arc<mirror::MirrorShared>,
 }
 
 impl EventLog {
     #[must_use]
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        Self::with_mirror_policy(db, MirrorPolicy::default())
+    }
+
+    /// Same as [`Self::new`] with an explicit H3 mirror policy
+    /// (write deadline + recovery-probe interval). Tests shrink both
+    /// so a degraded → recovered cycle runs in milliseconds.
+    #[must_use]
+    pub fn with_mirror_policy(db: Arc<Db>, policy: MirrorPolicy) -> Self {
+        Self {
+            db,
+            mirror: Arc::new(mirror::MirrorShared::new(policy)),
+        }
     }
 
     /// Insert one event. `received_ms` is the host's wall-clock at
@@ -225,35 +243,15 @@ impl EventLog {
         plugin_id: &str,
         payload_blob: Vec<u8>,
     ) -> Result<u64, EventLogError> {
-        let topic = topic_of(event).to_owned();
-        let device_id = event.device.clone();
-        // WIT `unix-ms` is `u64`; `SQLite` INTEGER is `i64`. Clamp the
-        // upper end so a plugin that claims `u64::MAX` lands as
-        // `i64::MAX` on disk rather than wrapping negative.
-        let payload_ms = i64::try_from(event.timestamp).unwrap_or(i64::MAX);
-        let instance_id_owned = instance_id.to_owned();
-        let plugin_id_owned = plugin_id.to_owned();
-
         self.db.write(move |conn| -> Result<u64, EventLogError> {
-            conn.execute(
-                "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    received_ms,
-                    payload_ms,
-                    device_id,
-                    instance_id_owned,
-                    plugin_id_owned,
-                    topic,
-                    payload_blob,
-                ],
-            )?;
-            // `last_insert_rowid` returns the just-inserted PRIMARY
-            // KEY for the active connection. Safe to cast: `SQLite`'s
-            // ROWID is a signed i64 but always positive for normal
-            // INTEGER PRIMARY KEY values.
-            #[allow(clippy::cast_sign_loss)]
-            Ok(conn.last_insert_rowid() as u64)
+            insert_row(
+                conn,
+                received_ms,
+                event,
+                instance_id,
+                plugin_id,
+                &payload_blob,
+            )
         })
     }
 
@@ -625,6 +623,43 @@ impl StoredValue {
             Self::Json(s) => WitValue::JsonVal(s),
         }
     }
+}
+
+/// Insert one `event_log` row on an already-locked connection and
+/// return its `AUTOINCREMENT` id. Shared by [`EventLog::record_prepared`]
+/// and the H3 mirror's gap-marker + event transaction.
+fn insert_row(
+    conn: &rusqlite::Connection,
+    received_ms: i64,
+    event: &Event,
+    instance_id: &str,
+    plugin_id: &str,
+    payload_blob: &[u8],
+) -> Result<u64, EventLogError> {
+    let topic = topic_of(event);
+    // WIT `unix-ms` is `u64`; `SQLite` INTEGER is `i64`. Clamp the
+    // upper end so a plugin that claims `u64::MAX` lands as
+    // `i64::MAX` on disk rather than wrapping negative.
+    let payload_ms = i64::try_from(event.timestamp).unwrap_or(i64::MAX);
+    conn.execute(
+        "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            received_ms,
+            payload_ms,
+            event.device,
+            instance_id,
+            plugin_id,
+            topic,
+            payload_blob,
+        ],
+    )?;
+    // `last_insert_rowid` returns the just-inserted PRIMARY KEY for
+    // the active connection. Safe to cast: `SQLite`'s ROWID is a
+    // signed i64 but always positive for normal INTEGER PRIMARY KEY
+    // values.
+    #[allow(clippy::cast_sign_loss)]
+    Ok(conn.last_insert_rowid() as u64)
 }
 
 /// C4 review P2 F2: serialize a WIT [`EventPayload`] into the

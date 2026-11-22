@@ -2308,6 +2308,8 @@ async fn readyz_returns_ok_without_auth() {
     // daemon binary lives in the same crate so this moves in
     // lockstep with workspace bumps.
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    // H3: the durable event mirror's state rides on the probe.
+    assert_eq!(body["event_log"], "ok");
 }
 
 /// The C3 audit ledger must not record `/readyz` — it's an

@@ -211,13 +211,26 @@ pub fn build_router(engine: Engine) -> Router {
 /// Unavailable` with `{"status": "not_ready"}`. An orchestrator
 /// pointed at this endpoint pulls the daemon out of load-balancer
 /// rotation on DB failure instead of routing traffic to a shell.
+///
+/// H3: `event_log` reports the durable event mirror as `"ok"` or
+/// `"degraded"`. A degraded mirror keeps the probe at 200 — live
+/// device control and event delivery still work, only history is
+/// missing rows — so an orchestrator doesn't restart a daemon whose
+/// disk is full. Details are on the authenticated MCP
+/// `oxidhome://status` resource.
 async fn readyz(State(state): State<ApiState>) -> Response {
+    let event_log = if state.engine.event_log().health().degraded {
+        "degraded"
+    } else {
+        "ok"
+    };
     match state.engine.db_ping() {
         Ok(()) => (
             StatusCode::OK,
             Json(ReadyzBody {
                 status: "ok",
                 version: env!("CARGO_PKG_VERSION"),
+                event_log,
             }),
         )
             .into_response(),
@@ -228,6 +241,7 @@ async fn readyz(State(state): State<ApiState>) -> Response {
                 Json(ReadyzBody {
                     status: "not_ready",
                     version: env!("CARGO_PKG_VERSION"),
+                    event_log,
                 }),
             )
                 .into_response()
@@ -239,6 +253,7 @@ async fn readyz(State(state): State<ApiState>) -> Response {
 struct ReadyzBody {
     status: &'static str,
     version: &'static str,
+    event_log: &'static str,
 }
 
 /// Bind a TCP listener at the configured address.
@@ -2466,11 +2481,13 @@ async fn tail_events_loop(mut socket: WebSocket, mut sub: crate::state::EventSub
 #[derive(Serialize)]
 pub(crate) struct WireEvent {
     /// H5: the durable `event_log` row id assigned when this event
-    /// was persisted. `None` for events published via a code path
-    /// that doesn't hit `event_log` (host-side simulators,
-    /// in-process test harnesses). Tail clients use this to
-    /// reconcile against a later `GET /api/v1/events` history
-    /// query across a reconnect.
+    /// was persisted. Tail clients use this to reconcile against a
+    /// later `GET /api/v1/events` history query across a reconnect.
+    /// Absent when the event is not in history: the event-log
+    /// mirror was degraded (H3; history gets a `host.event_log.gap`
+    /// marker on recovery) or the event came from a host-side
+    /// simulator / test harness. Clients don't advance their cursor
+    /// on an event without `id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
     device_id: Option<String>,

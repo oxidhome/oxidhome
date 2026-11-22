@@ -83,7 +83,8 @@ pub enum SubscriberMessage {
     /// (Connect tail, JSON tail, plugin `on-event`) read it directly
     /// from the event. `None` when the event was published via
     /// [`EventBus::publish`] (host-side simulators, in-process
-    /// tests) — that path skips the durable log.
+    /// tests) — that path skips the durable log — or when the H3
+    /// event-log mirror was degraded and the event isn't in history.
     Event {
         event: Arc<Event>,
         skipped_before: u64,
@@ -190,11 +191,12 @@ pub struct EventBus {
     ///
     /// Hold this async mutex across the persist + publish pair
     /// so a second publisher can't observe an intermediate
-    /// state. The gate itself is cheap — the critical section
-    /// is one `spawn_blocking` join + one `publish_with_id` — and
-    /// publishes are already per-instance rate-limited (C2d),
-    /// so contention stays bounded. `Arc` so `EventBus` stays
-    /// `Clone`-friendly.
+    /// state. The critical section is at most one durable write
+    /// (bounded by the H3 `MirrorPolicy::write_deadline`, skipped
+    /// entirely while the mirror is degraded) + one
+    /// `publish_with_id`, and publishes are already per-instance
+    /// rate-limited (C2d), so contention stays bounded. `Arc` so
+    /// `EventBus` stays `Clone`-friendly.
     publish_sequence: Arc<tokio::sync::Mutex<()>>,
 }
 

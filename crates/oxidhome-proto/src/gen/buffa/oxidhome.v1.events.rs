@@ -634,12 +634,13 @@ pub struct Event {
     )]
     pub origin_instance_id: ::buffa::alloc::string::String,
     /// H5: durable `event_log` row id assigned when this event was
-    /// persisted. `0` (proto3 default) when the event was published
-    /// via a code path that doesn't hit the durable log (host-side
-    /// simulators, in-process tests). A tail client saves the
-    /// highest observed `row_id` and passes it as
-    /// `EventsService.QueryEvents.after_id` (once landed) to
-    /// reconcile across a reconnect without gaps or duplicates.
+    /// persisted. A tail client saves the highest observed `row_id`
+    /// and passes it as `after_id` to the history query to reconcile
+    /// across a reconnect. `0` (proto3 default) means the event is
+    /// not in history: the host's event-log mirror was degraded
+    /// (H3: disk full or failing; history gets a
+    /// `host.event_log.gap` marker row on recovery) or the event came
+    /// from a host-side simulator. Don't advance the cursor on `0`.
     ///
     /// Field 9: `row_id`
     #[serde(
