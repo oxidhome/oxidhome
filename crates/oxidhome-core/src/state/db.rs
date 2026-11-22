@@ -1148,6 +1148,12 @@ mod tests {
             db.write(|conn| -> rusqlite::Result<()> {
                 conn.execute_batch(
                     "
+                    -- Undo every migration after 16 so the file is a
+                    -- genuine v15 state; reopening re-applies them.
+                    -- 17 (H6): audit_event invocation columns.
+                    DROP INDEX audit_call;
+                    ALTER TABLE audit_event DROP COLUMN invocation_json;
+                    ALTER TABLE audit_event DROP COLUMN call_id;
                     DROP TABLE IF EXISTS event_log;
                     -- Pre-migration-16 schema: `INTEGER PRIMARY
                     -- KEY` without `AUTOINCREMENT` (ROWID
@@ -1185,14 +1191,17 @@ mod tests {
         }
 
         // Phase 2: reopen — `apply_migrations` sees v15 and
-        // applies exactly migration 16.
+        // applies migration 16 onward.
         let db = Db::open_file(dir.path()).expect("reopen");
 
-        // user_version bumped to 16.
         let version: i64 = db
             .read(|c| c.pragma_query_value(None, "user_version", |row| row.get(0)))
             .expect("user_version");
-        assert_eq!(version, 16, "migration 16 must have applied");
+        assert_eq!(
+            version,
+            i64::try_from(MIGRATIONS.len()).unwrap(),
+            "migration 16 onward must have applied",
+        );
 
         // Existing rows preserved verbatim.
         let (id_5_ms, id_9_ms): (i64, i64) = db

@@ -405,6 +405,7 @@ description = "Target"
 /// token, sharing its call id, with the delegation chain growing by one
 /// hop each time. The same chain driven host-origin writes no rows.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one linear end-to-end narrative
 async fn delegated_chain_is_audited_against_external_root() {
     use oxidhome_core::auth::{ActorKind, InvocationContext, Principal, Transport};
     use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
@@ -501,15 +502,28 @@ async fn delegated_chain_is_audited_against_external_root() {
     .await;
     assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
 
-    let mut rows = audit
-        .query(
-            &AuditQuery {
-                call_id: Some(call_id.clone()),
-                ..AuditQuery::default()
-            },
-            50,
-        )
-        .expect("query");
+    // Finalize writes are detached from the caller; wait for both rows
+    // to be finalized.
+    let started = Instant::now();
+    let mut rows = loop {
+        let rows = audit
+            .query(
+                &AuditQuery {
+                    call_id: Some(call_id.clone()),
+                    ..AuditQuery::default()
+                },
+                50,
+            )
+            .expect("query");
+        if rows.len() == 2 && rows.iter().all(|r| r.finalized_ms.is_some()) {
+            break rows;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "hop rows not finalized: {rows:?}",
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     rows.sort_by_key(|r| r.id);
     assert_eq!(rows.len(), 2, "one row per hop: {rows:?}");
     for (depth, row) in rows.iter().enumerate() {

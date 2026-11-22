@@ -28,7 +28,7 @@
 //! The context is host-only: it is never serialized into the WIT
 //! surface, so a plugin can neither read nor forge it. It rides the
 //! supervisor control messages across the task hop and is installed as
-//! a `tokio::task_local` ([`CURRENT`]) while the instance's wasm runs,
+//! a `tokio::task_local` (`CURRENT`) while the instance's wasm runs,
 //! so host imports executed on that task see it.
 //!
 //! Work that starts inside the host (plugin `init`, `tick`, `on-event`,
@@ -373,10 +373,10 @@ impl InvocationContext {
             .iter()
             .map(|h| {
                 serde_json::json!({
-                    "caller": h.caller_instance,
-                    "plugin": h.target_plugin,
-                    "instance": h.target_instance,
-                    "service": h.target_service,
+                    "caller": audit_cap(&h.caller_instance),
+                    "plugin": audit_cap(&h.target_plugin),
+                    "instance": audit_cap(&h.target_instance),
+                    "service": audit_cap(&h.target_service),
                 })
             })
             .collect();
@@ -387,7 +387,7 @@ impl InvocationContext {
                 "credential_id": root.credential_id,
                 "transport": root.transport.as_str(),
             },
-            "current": self.inner.current,
+            "current": self.inner.current.as_deref().map(audit_cap),
             "chain": chain,
         })
         .to_string()
@@ -408,6 +408,23 @@ impl InvocationContext {
             depth = self.inner.chain.len(),
         )
     }
+}
+
+/// Longest identifier copied into an audit row. Service `local-id`s,
+/// command names and test-driver caller ids come from plugins or
+/// callers and are not otherwise length-bounded; capping keeps one hop
+/// row small no matter what a plugin registers.
+pub const MAX_AUDIT_IDENT_BYTES: usize = 128;
+
+/// `s` truncated to at most [`MAX_AUDIT_IDENT_BYTES`] on a char
+/// boundary.
+#[must_use]
+pub fn audit_cap(s: &str) -> &str {
+    let mut cut = s.len().min(MAX_AUDIT_IDENT_BYTES);
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
 }
 
 /// `call-<32 lowercase hex>` — 128 random bits, same shape as the
@@ -533,6 +550,22 @@ mod tests {
         assert_eq!(v["chain"][0]["caller"], "alpha");
         assert_eq!(v["chain"][0]["instance"], "beta");
         assert_eq!(v["chain"][0]["service"], "svc");
+    }
+
+    #[test]
+    fn audit_cap_bounds_identifiers_on_char_boundaries() {
+        assert_eq!(audit_cap("short"), "short");
+        let long = "é".repeat(MAX_AUDIT_IDENT_BYTES);
+        let capped = audit_cap(&long);
+        assert!(capped.len() <= MAX_AUDIT_IDENT_BYTES);
+        assert!(capped.len() >= MAX_AUDIT_IDENT_BYTES - 1);
+        let ctx = InvocationContext::host_origin("a").delegate(DelegationHop {
+            caller_instance: "a".into(),
+            target_plugin: "p".into(),
+            target_instance: "b".into(),
+            target_service: "x".repeat(10_000),
+        });
+        assert!(ctx.audit_json().len() < 1_000);
     }
 
     #[tokio::test]

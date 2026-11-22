@@ -10,7 +10,7 @@
 //!
 //! Each supervisor task scopes the [`InvocationContext`] of the wasm it
 //! is currently driving in a `tokio::task_local`
-//! ([`crate::auth::invocation::CURRENT`]). The context's delegation
+//! (`crate::auth::invocation::CURRENT`). The context's delegation
 //! chain is the chain of in-flight `call-service` invocations *that led
 //! to that wasm* (H6 folded the former `CALL_STACK` into it, so the
 //! root principal, call id and deadline travel with the same value).
@@ -132,11 +132,6 @@ pub(crate) const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Audit `method` for a delegated `call-service` hop.
 pub const SERVICE_CALL_AUDIT_METHOD: &str = "CALL";
-
-/// Longest command name copied into an audit row's `path`. Command
-/// strings come from wasm; under a wildcard `commands` grant they are
-/// otherwise unbounded.
-const MAX_AUDIT_COMMAND_BYTES: usize = 128;
 
 /// Public test-only entry point. The `host-services::call-service`
 /// path runs from inside a wasm `execute-service-command`; an
@@ -354,7 +349,7 @@ pub(crate) async fn call_service(
             (true, true) => unreachable!("both matched but guard fired"),
         };
         if let Some(hop_audit) = hop_audit {
-            hop_audit.record_denied().await;
+            hop_audit.record_denied();
         }
         return Err(WitError::PermissionDenied(format!(
             "caller `{caller_instance}` refused: {failed_clause} a matching \
@@ -380,6 +375,9 @@ pub(crate) async fn call_service(
         Some(r) => r.min(DISPATCH_TIMEOUT),
         None => DISPATCH_TIMEOUT,
     };
+    // One absolute bound for everything the caller's supervisor waits
+    // on from here: the audit intent write *and* the dispatch.
+    let wait_until = tokio::time::Instant::now() + timeout;
 
     // 4. Resolve target instance handle; refuse if it isn't running.
     let target_handle = instances.get(&target_instance).ok_or_else(|| {
@@ -390,12 +388,20 @@ pub(crate) async fn call_service(
 
     // H6: two-phase hop audit, fail-closed — the intent row must exist
     // before the callee can act on the root's behalf.
+    // Bounded by `wait_until`: ledger contention must not hold the
+    // caller past its deadline. A write that lands after we gave up
+    // leaves a `pending` row — evidence of an attempt that never ran.
     let audit_id = match &hop_audit {
-        Some(hop_audit) => Some(hop_audit.record_intent().await.map_err(|msg| {
-            WitError::Unavailable(format!(
-                "call-service to `{target}` refused: audit ledger unavailable ({msg})"
-            ))
-        })?),
+        Some(hop_audit) => {
+            let intent = tokio::time::timeout_at(wait_until, hop_audit.record_intent())
+                .await
+                .unwrap_or_else(|_| Err("intent write timed out".into()));
+            Some(intent.map_err(|msg| {
+                WitError::Unavailable(format!(
+                    "call-service to `{target}` refused: audit ledger unavailable ({msg})"
+                ))
+            })?)
+        }
         None => None,
     };
 
@@ -421,7 +427,7 @@ pub(crate) async fn call_service(
                 command,
                 args,
             );
-            match tokio::time::timeout(timeout, dispatch_future).await {
+            match tokio::time::timeout_at(wait_until, dispatch_future).await {
                 Ok(Ok(result)) => Ok(result),
                 Ok(Err(trap)) => Err(WitError::Unavailable(format!(
                     "call-service to `{target}` (owner `{target_instance}`) failed: {trap:#}"
@@ -435,7 +441,7 @@ pub(crate) async fn call_service(
         Err(err) => Err(err),
     };
     if let (Some(hop_audit), Some(id)) = (hop_audit, audit_id) {
-        hop_audit.finalize(id, &outcome).await;
+        hop_audit.finalize(id, &outcome);
     }
     outcome
 }
@@ -454,16 +460,15 @@ impl HopAudit {
             .chain()
             .last()
             .expect("delegate() always appends a hop");
-        let mut cut = command.len().min(MAX_AUDIT_COMMAND_BYTES);
-        while !command.is_char_boundary(cut) {
-            cut -= 1;
-        }
+        // Every segment is capped: command names come from wasm and
+        // service `local-id`s from `register-service`, neither
+        // otherwise length-bounded.
         let path = format!(
             "service.call/{}/{}/{}/{}",
-            hop.target_plugin,
-            hop.target_instance,
-            hop.target_service,
-            &command[..cut],
+            invocation::audit_cap(&hop.target_plugin),
+            invocation::audit_cap(&hop.target_instance),
+            invocation::audit_cap(&hop.target_service),
+            invocation::audit_cap(command),
         );
         let entry = AuditEntry {
             id: 0,
@@ -485,20 +490,18 @@ impl HopAudit {
         Self { log, entry }
     }
 
-    async fn record_denied(self) {
+    /// Single-shot `deny` row. Detached: the refusal is already
+    /// decided, so the caller doesn't wait on the ledger.
+    fn record_denied(self) {
         let Self { log, mut entry } = self;
         entry.status = 403;
         entry.decision = "deny".into();
         entry.required_scope = Some("consumes_services".into());
-        match tokio::task::spawn_blocking(move || log.record_completed(&entry)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => {
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = log.record_completed(&entry) {
                 tracing::error!(target: "host.audit", error = %err, "service-call deny row failed");
             }
-            Err(err) => {
-                tracing::error!(target: "host.audit", error = %err, "service-call deny row panicked");
-            }
-        }
+        });
     }
 
     async fn record_intent(&self) -> Result<u64, String> {
@@ -511,7 +514,10 @@ impl HopAudit {
         }
     }
 
-    async fn finalize(self, id: u64, outcome: &Result<CommandResult, WitError>) {
+    /// Best-effort finalize, detached so the caller's supervisor isn't
+    /// held on the ledger after the hop finished (the intent row is
+    /// already the durable evidence).
+    fn finalize(self, id: u64, outcome: &Result<CommandResult, WitError>) {
         let (status, decision, execution_outcome, domain_error): (u16, &str, _, _) = match outcome {
             Ok(CommandResult::Ok | CommandResult::OkWithState(_)) => {
                 (200, "allow", Some("success"), None)
@@ -525,19 +531,13 @@ impl HopAudit {
             Err(_) => (503, "error", None, None),
         };
         let log = self.log;
-        let res = tokio::task::spawn_blocking(move || {
-            log.finalize(id, status, decision, None, execution_outcome, domain_error)
-        })
-        .await;
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) =
+                log.finalize(id, status, decision, None, execution_outcome, domain_error)
+            {
                 tracing::error!(target: "host.audit", error = %err, id, "service-call finalize failed");
             }
-            Err(err) => {
-                tracing::error!(target: "host.audit", error = %err, id, "service-call finalize panicked");
-            }
-        }
+        });
     }
 }
 
@@ -1065,6 +1065,9 @@ mod tests {
         )
         .await
         .expect_err("no grant");
+        // Deny rows are detached writes; give one a chance to land.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(audit.count().unwrap(), 0);
 
         let root = api_root().entering("alpha");
@@ -1086,7 +1089,14 @@ mod tests {
             )
             .await
             .expect_err("no grant");
-        let rows = audit.query(&AuditQuery::default(), 10).unwrap();
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = audit.query(&AuditQuery::default(), 10).unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.token_id, "tok-root");
