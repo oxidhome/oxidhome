@@ -379,7 +379,12 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
     if escaped {
         start += 1;
     }
-    let end = if start < bytes.len() && matches!(bytes[start], b'"' | b'\'') {
+    let end = if !escaped && start < bytes.len() && matches!(bytes[start], b'{' | b'[') {
+        // A structured value (`"password": {"value": "x"}`): mask the
+        // whole structure, through its closing bracket or, when the
+        // text was cut short, to the end.
+        scan_structure(bytes, start)
+    } else if start < bytes.len() && matches!(bytes[start], b'"' | b'\'') {
         let quote = bytes[start];
         start += 1;
         let mut end = start;
@@ -429,6 +434,31 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
         }
     };
     (end > start && &bytes[start..end] != REDACTED.as_bytes()).then_some((start, end))
+}
+
+/// End of the bracketed structure opening at `start` (`{` or `[`):
+/// one past its matching close bracket, or the end of `bytes` if it is
+/// never closed. Brackets inside double-quoted strings don't count.
+fn scan_structure(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'{' | b'[' if !in_string => depth += 1,
+            b'}' | b']' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 /// The plaintext of every declared secret in a resolved config.
@@ -688,6 +718,16 @@ mod tests {
                 r#"{"api_key": String("***"), "n": Int(1)}"#,
             ),
             ("pin: Some(1234)", "pin: Some(***)"),
+            (
+                r#"{"password":{"value":"hunter2","n":[1]},"ok":1}"#,
+                r#"{"password":***,"ok":1}"#,
+            ),
+            (
+                // Cut short (a capped line): masked to the end.
+                r#"{"password":{"value":"hun}ter2","pad":"xx"#,
+                r#"{"password":***"#,
+            ),
+            ("secret=[1, 2] rest", "secret=*** rest"),
             ("password=\thunter2", "password=\t***"),
             ("password\t:\thunter2", "password\t:\t***"),
             (

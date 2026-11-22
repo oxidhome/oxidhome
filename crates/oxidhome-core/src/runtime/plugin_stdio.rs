@@ -450,6 +450,20 @@ mod tests {
     }
 
     #[test]
+    fn capped_json_line_keeps_nested_credentials_masked() {
+        let (out, _err, lines) = capture(&[]);
+        let line = format!(
+            "{{\"password\":{{\"value\":\"hunter2\"}},\"padding\":\"{}\"}}\n",
+            "x".repeat(5_000)
+        );
+        out.feed(line.as_bytes());
+        let got = texts(&lines);
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].contains("hunter2"), "{}", &got[0][..80]);
+        assert!(got[0].starts_with("{\"password\":***"), "{}", &got[0][..80]);
+    }
+
+    #[test]
     fn multiline_secret_lines_are_scrubbed() {
         let (out, _err, lines) = capture(&["alpha-secret\r\nbeta-secret\nab"]);
         out.feed(b"key:\nalpha-secret\nbeta-secret\nab\n");
