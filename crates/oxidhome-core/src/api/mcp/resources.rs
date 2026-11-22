@@ -1030,6 +1030,7 @@ async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
         topic,
         after_id,
         before_id,
+        order: crate::state::EventOrder::Desc,
     };
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     // The shared `SQLite` mutex is std, not tokio — running

@@ -52,6 +52,7 @@ share one axum listener, so a household hub only exposes one endpoint.
 | Tool | `device.send_command` | `devices:command` | Dispatch a capability command; sensitive. |
 | Tool | `logs.query` | `logs:read` | Tool-shape of `oxidhome://logs`. |
 | Tool | `events.history` | `events:read` | Tool-shape of `oxidhome://events`. |
+| Tool | `events.subscribe` | `events:read` | Long-poll for events past an `after_id` cursor (`timeout_ms` default 5 s, cap 30 s). |
 | Tool | `plugins.list` / `plugins.show` | `plugins:list` | Read-only. |
 | Tool | `plugins.install` | `plugins:install` | Takes a `source_dir` that must exist on the daemon-local filesystem — the tool copies from there into `<state_dir>/plugins/`. |
 | Tool | `plugins.start` / `plugins.stop` | `plugins:start` / `plugins:stop` | Runtime lifecycle. |
