@@ -33,7 +33,6 @@ use anyhow::anyhow;
 use oxidhome_manifest::RestartPolicy;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
-use tracing::Instrument as _;
 
 use crate::Engine;
 use crate::auth::invocation::{self, InvocationContext};
@@ -1249,10 +1248,8 @@ async fn handle_control(
                 return Ok(LoopAction::Continue);
             }
             let ctx = ctx.entering(instance_id);
-            let span = ctx.span();
             let outcome = invocation::CURRENT
                 .scope(ctx, instance.execute_command(device, cmd))
-                .instrument(span)
                 .await;
             match outcome {
                 Ok(result) => {
@@ -1305,13 +1302,11 @@ async fn handle_control(
                 )));
                 return Ok(LoopAction::Continue);
             }
-            let span = ctx.span();
             let outcome = invocation::CURRENT
                 .scope(
                     ctx,
                     instance.execute_service_command(service, command, args),
                 )
-                .instrument(span)
                 .await;
             drop(guard);
             match outcome {

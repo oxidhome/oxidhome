@@ -316,6 +316,15 @@ pub(crate) async fn call_service(
     // on from here: a deny-row write, or the audit intent write *and*
     // the dispatch.
     let wait_until = tokio::time::Instant::now() + timeout;
+    // The caller stops waiting at `wait_until`, so the callee must not
+    // start after it either: fold the cutoff into the callee's deadline,
+    // which its supervisor checks on dequeue (and which bounds any
+    // nested hop the callee makes).
+    let callee_ctx = callee_ctx.with_deadline(Some(
+        callee_ctx
+            .deadline()
+            .map_or(wait_until, |d| d.min(wait_until)),
+    ));
 
     // 3. H10 structured capability gate. Runs before `acquire_call`
     //    so a refused call spends no refcount and cannot influence
@@ -406,6 +415,17 @@ pub(crate) async fn call_service(
         }
         None => None,
     };
+    // The intent write may have finished right at the cutoff; don't
+    // enqueue work the caller is about to stop waiting for.
+    if tokio::time::Instant::now() >= wait_until {
+        let outcome = Err(WitError::Unavailable(format!(
+            "call-service to `{target}` refused: hop deadline reached before dispatch",
+        )));
+        if let (Some(hop_audit), Some(id)) = (hop_audit, audit_id) {
+            hop_audit.finalize(id, &outcome);
+        }
+        return outcome;
+    }
 
     // 5. Acquire the in-flight refcount. The guard travels in the
     //    `ExecuteService` message — the callee's supervisor holds it

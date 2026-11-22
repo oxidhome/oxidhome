@@ -203,3 +203,72 @@ fn tempdir() -> TempDir {
     std::fs::create_dir_all(&path).expect("mk tempdir");
     TempDir { path }
 }
+
+/// H6: running a supervised command under an invocation context must
+/// not change the persisted span path — `span_path_prefix=plugin.`
+/// queries (advertised by MCP `logs.query`) still find the plugin's
+/// log lines.
+#[tokio::test(flavor = "current_thread")]
+async fn supervised_invocation_keeps_plugin_span_path_prefix() {
+    use oxidhome_core::auth::{ActorKind, InvocationContext, Principal, Transport};
+
+    let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let plugin_dir = support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let state_dir = tempdir();
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let subscriber = tracing_subscriber::registry().with(engine.log_store().layer());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let handle = engine
+        .start_instance(plugin_dir, "switch_h6", None)
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("running");
+    let device_id = engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|m| m.owner_instance == "switch_h6")
+        .expect("device")
+        .id
+        .clone();
+    let actor = oxidhome_core::Actor::api("tok-log", vec!["*".into()]);
+    let ctx =
+        InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
+    handle
+        .execute_command_in(
+            ctx,
+            device_id,
+            Command {
+                capability: "switch".into(),
+                action: "toggle".into(),
+                args: Vec::new(),
+            },
+        )
+        .await
+        .expect("toggle");
+    handle.stop().await.expect("stop");
+    engine.log_store().wait_drained_for_test();
+
+    let rows = engine
+        .log_store()
+        .query(
+            &LogQuery {
+                instance_id: Some("switch_h6".into()),
+                span_path_prefix: Some("plugin.".into()),
+                ..LogQuery::default()
+            },
+            64,
+        )
+        .expect("query");
+    assert!(
+        rows.iter()
+            .any(|r| r.message.contains("switch state changed")),
+        "supervised command log missing under span_path_prefix=plugin.: {:?}",
+        rows.iter()
+            .map(|r| (&r.span_path, &r.message))
+            .collect::<Vec<_>>(),
+    );
+}

@@ -29,7 +29,9 @@
 //! surface, so a plugin can neither read nor forge it. It rides the
 //! supervisor control messages across the task hop and is installed as
 //! a `tokio::task_local` (`CURRENT`) while the instance's wasm runs,
-//! so host imports executed on that task see it.
+//! so host imports executed on that task see it. The
+//! `plugin.execute_command` / `plugin.execute_service_command` tracing
+//! spans record its `call_id`.
 //!
 //! Work that starts inside the host (plugin `init`, `tick`, `on-event`,
 //! and test drivers that call `InstanceHandle::execute_command`) runs
@@ -391,22 +393,6 @@ impl InvocationContext {
             "chain": chain,
         })
         .to_string()
-    }
-
-    /// Tracing span carrying the context's attribution fields. The
-    /// supervisor instruments wasm calls with it so every log line a
-    /// host import emits on behalf of the invocation carries the root.
-    #[must_use]
-    pub fn span(&self) -> tracing::Span {
-        let root = &self.inner.root;
-        tracing::info_span!(
-            "invocation",
-            call_id = %self.inner.call_id,
-            root_kind = root.kind.as_str(),
-            root_subject = %root.subject,
-            transport = root.transport.as_str(),
-            depth = self.inner.chain.len(),
-        )
     }
 }
 
