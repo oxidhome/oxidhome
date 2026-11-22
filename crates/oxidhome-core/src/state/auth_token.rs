@@ -257,7 +257,7 @@ impl TokenStore {
     }
 
     /// Row count. Used by tests + the CLI's future `token list`.
-    /// (Bootstrap goes through [`Self::create_if_empty`] so the
+    /// (Bootstrap goes through [`Self::insert_if_empty`] so the
     /// check-then-insert race doesn't matter.)
     pub fn count(&self) -> Result<u64, TokenError> {
         let n = self.db.read(|conn| -> Result<i64, TokenError> {
@@ -281,18 +281,47 @@ impl TokenStore {
         label: &str,
         scope_json: &[u8],
     ) -> Result<Option<IssuedToken>, TokenError> {
+        let issued = Self::generate();
+        Ok(if self.insert_if_empty(&issued, label, scope_json)? {
+            Some(issued)
+        } else {
+            None
+        })
+    }
+
+    /// Generate a fresh token **without** touching the database.
+    ///
+    /// M4: the first-run bootstrap and the offline recovery command
+    /// need the secret (and its id) in hand *before* the row is
+    /// committed, so the plaintext can be durably written to disk
+    /// first. A row whose secret was never delivered is exactly
+    /// the unrecoverable state M4 removes. Pair with
+    /// [`Self::insert_if_empty`] or [`Self::insert_and_revoke`].
+    #[must_use]
+    pub fn generate() -> IssuedToken {
         let secret = generate_secret();
         let plaintext = format_token(&secret);
-        let hash = sha256(&secret);
-        let id = derive_id(&hash);
-        let now = now_ms();
+        let id = derive_id(&sha256(&secret));
+        IssuedToken { id, plaintext }
+    }
 
-        let label_owned = label.to_string();
-        let scope_owned = scope_json.to_vec();
-        let id_for_db = id.clone();
-        let hash_for_db = hash.to_vec();
-
-        let inserted = self.db.write(move |conn| -> Result<bool, TokenError> {
+    /// Insert a token produced by [`Self::generate`] iff the table
+    /// is empty, inside one `BEGIN IMMEDIATE` transaction (see
+    /// [`Self::create_if_empty`] for the race argument). Returns
+    /// `true` if the row was inserted.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Malformed`] if `issued.plaintext` isn't a token
+    /// this module produced; [`TokenError::Sqlite`] on DB failure.
+    pub fn insert_if_empty(
+        &self,
+        issued: &IssuedToken,
+        label: &str,
+        scope_json: &[u8],
+    ) -> Result<bool, TokenError> {
+        let row = PendingRow::new(issued, label, scope_json)?;
+        self.durable_write(move |conn| -> Result<bool, TokenError> {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let existing: i64 =
                 tx.query_row("SELECT COUNT(*) FROM auth_token", [], |r| r.get(0))?;
@@ -300,21 +329,160 @@ impl TokenStore {
                 // Implicit rollback on drop; no row was written.
                 return Ok(false);
             }
-            tx.execute(
-                "INSERT INTO auth_token \
-                   (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
-                params![id_for_db, label_owned, hash_for_db, scope_owned, now],
-            )?;
+            row.insert(&tx)?;
             tx.commit()?;
             Ok(true)
-        })?;
-
-        Ok(if inserted {
-            Some(IssuedToken { id, plaintext })
-        } else {
-            None
         })
+    }
+
+    /// Insert a token produced by [`Self::generate`] and revoke
+    /// every still-active id in `revoke_ids`, all in one
+    /// transaction — the offline recovery command's rotation step.
+    /// Either the new token exists *and* the old ones are revoked,
+    /// or nothing changed. Returns the ids that were newly revoked
+    /// (already-revoked or unknown ids are skipped).
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Malformed`] if `issued.plaintext` isn't a token
+    /// this module produced; [`TokenError::Sqlite`] on DB failure.
+    pub fn insert_and_revoke(
+        &self,
+        issued: &IssuedToken,
+        label: &str,
+        scope_json: &[u8],
+        revoke_ids: &[String],
+    ) -> Result<Vec<String>, TokenError> {
+        let row = PendingRow::new(issued, label, scope_json)?;
+        let revoke_ids = revoke_ids.to_vec();
+        let now = row.created_ms;
+        self.durable_write(move |conn| -> Result<Vec<String>, TokenError> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut revoked = Vec::with_capacity(revoke_ids.len());
+            for id in revoke_ids {
+                let n = tx.execute(
+                    "UPDATE auth_token SET revoked_ms = ?1 \
+                     WHERE id = ?2 AND revoked_ms IS NULL",
+                    params![now, id],
+                )?;
+                if n > 0 {
+                    revoked.push(id);
+                }
+            }
+            row.insert(&tx)?;
+            tx.commit()?;
+            Ok(revoked)
+        })
+    }
+
+    /// Hard-delete a token row that was **never used** (null
+    /// `last_used_ms`, not revoked). Only the bootstrap uses this,
+    /// to roll back a freshly-minted admin row whose secret could
+    /// not be delivered to `<state_dir>/admin-token` — leaving the
+    /// row behind would make the store non-empty and block the
+    /// next boot's re-mint (M4). A tombstone (`revoke`) would have
+    /// the same blocking effect, so a delete is the only rollback
+    /// that keeps the bootstrap retryable; the guard keeps it from
+    /// erasing the lineage of a token that ever authenticated
+    /// anything. Returns `true` if a row was deleted.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Sqlite`] on DB failure.
+    pub(crate) fn delete_undelivered(&self, token_id: &str) -> Result<bool, TokenError> {
+        let id_owned = token_id.to_string();
+        self.durable_write(move |conn| -> Result<bool, TokenError> {
+            let n = conn.execute(
+                "DELETE FROM auth_token \
+                 WHERE id = ?1 AND last_used_ms IS NULL AND revoked_ms IS NULL",
+                params![id_owned],
+            )?;
+            Ok(n > 0)
+        })
+    }
+}
+
+impl TokenStore {
+    /// Run `f` with `PRAGMA synchronous = FULL` so its commit is
+    /// fsynced before returning. The shared connection runs WAL +
+    /// `synchronous = NORMAL`, under which a committed transaction
+    /// can be lost on power failure. The bootstrap / recovery paths
+    /// order file operations (promote or unlink a secret) after a
+    /// token commit, so that commit must be durable first (M4).
+    /// The pragma is restored to `NORMAL` afterwards. A failed
+    /// restore is logged, not returned: `f` has already committed,
+    /// and reporting failure would make the caller discard the
+    /// secret of a token that exists. The connection then stays at
+    /// `FULL`, which is safe (only slower).
+    fn durable_write<R: Send>(
+        &self,
+        f: impl FnOnce(&mut rusqlite::Connection) -> Result<R, TokenError>,
+    ) -> Result<R, TokenError> {
+        self.db.write(move |conn| -> Result<R, TokenError> {
+            conn.pragma_update(None, "synchronous", "FULL")?;
+            let result = f(conn);
+            if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                tracing::warn!(
+                    target: "auth.token",
+                    error = %err,
+                    "failed to restore synchronous = NORMAL; connection stays at FULL",
+                );
+            }
+            result
+        })
+    }
+}
+
+/// Id of the token `plaintext` encodes, without a DB lookup.
+/// `None` if it isn't a well-formed token. Lets the bootstrap
+/// audit a stale secret file against the token it named even
+/// when that token is revoked or unknown.
+pub(crate) fn token_id_of(plaintext: &str) -> Option<String> {
+    parse_token(plaintext).map(|s| derive_id(&sha256(&s)))
+}
+
+/// Row values for an INSERT of a [`TokenStore::generate`]d token.
+/// Re-derives the hash + id from the plaintext so a caller can't
+/// insert a row whose id doesn't match its secret.
+struct PendingRow {
+    id: String,
+    label: String,
+    hash: Vec<u8>,
+    scope_json: Vec<u8>,
+    created_ms: i64,
+}
+
+impl PendingRow {
+    fn new(issued: &IssuedToken, label: &str, scope_json: &[u8]) -> Result<Self, TokenError> {
+        let secret = parse_token(&issued.plaintext).ok_or(TokenError::Malformed)?;
+        let hash = sha256(&secret);
+        let id = derive_id(&hash);
+        if id != issued.id {
+            return Err(TokenError::Malformed);
+        }
+        Ok(Self {
+            id,
+            label: label.to_string(),
+            hash: hash.to_vec(),
+            scope_json: scope_json.to_vec(),
+            created_ms: now_ms(),
+        })
+    }
+
+    fn insert(&self, conn: &rusqlite::Connection) -> Result<(), TokenError> {
+        conn.execute(
+            "INSERT INTO auth_token \
+               (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+            params![
+                self.id,
+                self.label,
+                self.hash,
+                self.scope_json,
+                self.created_ms
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -615,6 +783,112 @@ mod tests {
             .expect("second call");
         assert!(second.is_none(), "second call must see the row and bail");
         assert_eq!(store.count().unwrap(), 1, "still exactly one row");
+    }
+
+    #[test]
+    fn insert_and_revoke_is_atomic_rotation() {
+        let store = TokenStore::new(fresh());
+        let old = store.create("admin", b"[\"*\"]").unwrap();
+        let other = store.create("ci", b"[]").unwrap();
+        let new = TokenStore::generate();
+        let revoked = store
+            .insert_and_revoke(
+                &new,
+                "admin",
+                b"[\"*\"]",
+                &[old.id.clone(), "no-such-id".into()],
+            )
+            .unwrap();
+        assert_eq!(revoked, vec![old.id.clone()]);
+        assert!(matches!(
+            store.verify(&old.plaintext),
+            Err(TokenError::Revoked)
+        ));
+        assert!(store.verify(&new.plaintext).is_ok());
+        assert!(store.verify(&other.plaintext).is_ok());
+    }
+
+    /// Every auth-lifecycle write goes through `durable_write`,
+    /// which hands the shared connection back at
+    /// `synchronous = NORMAL` (1) on both the success and error
+    /// paths. Each call starts from `OFF` (0) so a method that
+    /// bypasses `durable_write` leaves 0 behind and fails here.
+    #[test]
+    fn auth_lifecycle_writes_go_through_durable_write() {
+        let db = fresh();
+        let store = TokenStore::new(Arc::clone(&db));
+        let reset = || {
+            db.write(|c| c.pragma_update(None, "synchronous", "OFF"))
+                .unwrap();
+        };
+        let sync = || -> i64 {
+            db.read(|c| c.pragma_query_value(None, "synchronous", |r| r.get(0)))
+                .unwrap()
+        };
+
+        reset();
+        let first = TokenStore::generate();
+        assert!(store.insert_if_empty(&first, "admin", b"[]").unwrap());
+        assert_eq!(sync(), 1, "insert_if_empty");
+
+        reset();
+        store
+            .insert_and_revoke(
+                &TokenStore::generate(),
+                "admin",
+                b"[]",
+                std::slice::from_ref(&first.id),
+            )
+            .unwrap();
+        assert_eq!(sync(), 1, "insert_and_revoke");
+
+        reset();
+        let unused = store.create("x", b"[]").unwrap();
+        reset();
+        assert!(store.delete_undelivered(&unused.id).unwrap());
+        assert_eq!(sync(), 1, "delete_undelivered");
+
+        db.write(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON auth_token \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+        })
+        .unwrap();
+        reset();
+        assert!(
+            store
+                .insert_and_revoke(&TokenStore::generate(), "admin", b"[]", &[])
+                .is_err()
+        );
+        assert_eq!(sync(), 1, "error path");
+    }
+
+    #[test]
+    fn insert_rejects_mismatched_id() {
+        let store = TokenStore::new(fresh());
+        let mut forged = TokenStore::generate();
+        forged.id = "not-the-derived-id".into();
+        assert!(matches!(
+            store.insert_if_empty(&forged, "admin", b"[]"),
+            Err(TokenError::Malformed)
+        ));
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_undelivered_spares_used_or_revoked_tokens() {
+        let store = TokenStore::new(fresh());
+        let fresh_tok = store.create("admin", b"[]").unwrap();
+        let used = store.create("used", b"[]").unwrap();
+        store.verify(&used.plaintext).unwrap();
+        let revoked = store.create("revoked", b"[]").unwrap();
+        store.revoke(&revoked.id).unwrap();
+
+        assert!(store.delete_undelivered(&fresh_tok.id).unwrap());
+        assert!(!store.delete_undelivered(&used.id).unwrap());
+        assert!(!store.delete_undelivered(&revoked.id).unwrap());
+        assert_eq!(store.count().unwrap(), 2);
     }
 
     /// Verify still bumps `last_used_ms` after the split into

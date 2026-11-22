@@ -14,12 +14,22 @@
 //!   (Claude Desktop, MCP Inspector, agent SDKs) that spawn
 //!   subprocesses. Runs until stdin EOF or client shutdown;
 //!   does not bind the HTTP listener.
+//! - **`recover-admin-token [--revoke-all]` subcommand (M4)** —
+//!   offline break-glass recovery for a lost admin secret. Takes
+//!   the exclusive state-dir lock (so it refuses to run while the
+//!   daemon or an `mcp-stdio` session is up), mints a fresh
+//!   full-access `admin` token, revokes the previous
+//!   `admin`-labelled tokens (every token with `--revoke-all`) in
+//!   the same transaction, and writes the secret to
+//!   `<state_dir>/admin-token`. Never reachable over the network:
+//!   it needs filesystem access to the state dir.
 //!
 //! ## Environment
 //!
 //! - `OXIDHOME_STATE_DIR` — path to the daemon's state dir.
 //!   Default: `<cwd>/.oxidhome-state`. Contains `oxidhome.db` +
-//!   the first-run `admin-token` file.
+//!   the first-run `admin-token` file (removed on the first start
+//!   after the token has been used).
 //! - `OXIDHOME_BIND` — `<ip>:<port>` the API listens on, parsed
 //!   as a [`SocketAddr`] (IPv4 / IPv6 literals only — hostnames
 //!   like `localhost` are **not** resolved). Default:
@@ -44,7 +54,10 @@ use std::time::Duration;
 use anyhow::Context;
 use oxidhome_core::Engine;
 use oxidhome_core::api::mcp::serve_stdio;
-use oxidhome_core::api::{ApiConfig, bind, ensure_admin_token, serve};
+use oxidhome_core::api::{
+    ApiConfig, RevokeScope, bind, ensure_admin_token, reconcile_admin_token_files,
+    recover_admin_token_offline, serve,
+};
 use oxidhome_core::exclusive_lock::acquire_state_dir_lock;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -105,6 +118,12 @@ async fn main() -> anyhow::Result<()> {
     if std::env::args_os().nth(1).is_some_and(|a| a == "mcp-stdio") {
         return run_stdio().await;
     }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == "recover-admin-token")
+    {
+        return run_recover_admin_token();
+    }
 
     let state_dir = resolve_state_dir()?;
     // Round-1 P1 on PR #143: enforce single-process ownership of
@@ -156,9 +175,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // First-run admin token. Idempotent — only mints when the
-    // token store is empty.
-    ensure_admin_token(&engine.auth_tokens(), &state_dir)?;
+    // M4: finish any interrupted admin-token delivery and drop the
+    // plaintext file once its token has been enrolled, then mint
+    // the first-run admin token if the store is empty (crash-safe:
+    // the secret is on disk before its row is committed).
+    reconcile_admin_token_files(&engine.auth_tokens(), &engine.audit_log(), &state_dir)?;
+    ensure_admin_token(&engine.auth_tokens(), &engine.audit_log(), &state_dir)?;
 
     // Optional dev-time plugin start. Preserves the Phase-6 demo
     // affordance (point at one plugin dir on argv to get it
@@ -288,6 +310,52 @@ async fn main() -> anyhow::Result<()> {
     // restart.
     if let Some(err) = serve_error {
         return Err(err);
+    }
+    Ok(())
+}
+
+/// M4: `oxidhome recover-admin-token [--revoke-all]`. Offline only —
+/// [`recover_admin_token_offline`] takes the exclusive state-dir
+/// lock, so this fails while the daemon is running. Prints the new
+/// token's id and file path, never the secret itself.
+fn run_recover_admin_token() -> anyhow::Result<()> {
+    const USAGE: &str = "usage: oxidhome recover-admin-token [--revoke-all]";
+    let mut scope = RevokeScope::AdminTokens;
+    for arg in std::env::args_os().skip(2) {
+        match arg.to_str() {
+            Some("--revoke-all") => scope = RevokeScope::All,
+            Some("-h" | "--help") => {
+                println!("{USAGE}");
+                println!(
+                    "Mints a new full-access `admin` token while the daemon is stopped and \
+                     writes it to $OXIDHOME_STATE_DIR/admin-token. Revokes previous `admin` \
+                     tokens, or every token with --revoke-all."
+                );
+                return Ok(());
+            }
+            _ => anyhow::bail!("unexpected argument `{}`\n{USAGE}", arg.to_string_lossy()),
+        }
+    }
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(filter),
+        )
+        .try_init();
+
+    let state_dir = resolve_state_dir()?;
+    let report = recover_admin_token_offline(&state_dir, scope)?;
+    println!(
+        "new admin token {} written to {}",
+        report.token_id,
+        report.path.display()
+    );
+    if report.revoked.is_empty() {
+        println!("no tokens revoked");
+    } else {
+        println!("revoked: {}", report.revoked.join(", "));
     }
     Ok(())
 }
