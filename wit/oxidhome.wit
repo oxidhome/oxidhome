@@ -608,33 +608,159 @@ interface logging {
 // fiddly proprietary protocol parts where Rust-in-WASM shines.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Media pipeline descriptions.
+///
+/// Native media runs inside the host process with strict limits
+/// (docs/adr/0002-in-process-native-media-and-inference.md). So every
+/// field the host acts on is typed and bounded: there are no free-form
+/// URLs, no local-file sources, no filesystem paths, and no free-form
+/// codec or filter names. The host validates a whole `media-pipeline`
+/// before any native code sees it and rejects a violation with
+/// `error::invalid-argument(...)`; a well-formed request for something
+/// this host build can't do (e.g. an encoder it lacks) returns
+/// `error::unavailable(...)`.
 interface media {
-  use types.{key-value, error};
+  use types.{error};
+
+  /// Reference to a credential the host holds. A plugin never puts a
+  /// username or password into a pipeline description: it names the
+  /// config keys that hold them, and the host reads those values only
+  /// when it opens the connection. Secrets therefore never appear in
+  /// pipeline descriptions, host logs, or events.
+  ///
+  /// Both keys name fields of this plugin instance's configuration (the
+  /// values `host-config` returns). Each must resolve to a
+  /// `value::string-val`; anything else fails the pipeline with
+  /// `error::invalid-argument(...)`.
+  record credential-ref {
+    username-key: string,
+    password-key: string,
+  }
+
+  /// Transport security for a `network-endpoint`. Together with the
+  /// `media-source` case this fixes the scheme: `rtsp` + `plain` is
+  /// `rtsp://`, `rtsp` + `tls` is `rtsps://`, `http` + `plain` is
+  /// `http://`, `http` + `tls` is `https://`.
+  enum transport-security {
+    plain,
+    /// TLS, with the server certificate verified against the host's
+    /// trust store. There is no "skip verification" mode.
+    tls,
+  }
+
+  /// A network location the host connects to on the plugin's behalf.
+  /// The host builds the URL from these parts itself; a plugin can't
+  /// smuggle a scheme, userinfo, or a second authority into it.
+  record network-endpoint {
+    security: transport-security,
+    /// DNS name (LDH labels, at most 253 bytes, last label not a decimal
+    /// or `0x` hex number) or IP literal, with IPv6 written without
+    /// brackets or zone id. No scheme, userinfo, port, or path.
+    host: string,
+    /// TCP port. `none` uses the scheme default (554 for `rtsp://`,
+    /// 322 for `rtsps://`, 80 for `http://`, 443 for `https://`).
+    /// Port 0 is rejected.
+    port: option<u16>,
+    /// Absolute path with an optional `?query`, starting with `/`. At
+    /// most 2048 bytes; no whitespace, control characters, or `#`
+    /// fragment.
+    path: string,
+    /// Credentials the host applies (RTSP/HTTP basic or digest auth).
+    credential: option<credential-ref>,
+  }
 
   /// A source of media bytes.
+  ///
+  /// **Network policy for `rtsp` / `http`.** The host resolves `host`
+  /// itself and checks every resolved address before it connects, then
+  /// connects to the address it checked (no second lookup, so DNS
+  /// rebinding can't swap it). It repeats the check on every redirect
+  /// hop, follows at most 5 redirects, never lets a redirect leave the
+  /// source's own protocol family (`http` may go to `https`, never to
+  /// another scheme), and never follows one from TLS to plaintext. The
+  /// check:
+  ///
+  /// - always denies unspecified, broadcast, multicast, and reserved
+  ///   addresses (for IPv6, anything outside global unicast `2000::/3`
+  ///   and the classes below, plus special-purpose blocks inside it);
+  /// - denies loopback, link-local, and private addresses (RFC 1918,
+  ///   100.64.0.0/10 shared address space, IPv6 unique-local) unless the
+  ///   plugin's manifest grant allows that address class;
+  /// - classifies IPv6 addresses that carry an IPv4 address (IPv4-mapped,
+  ///   NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) by that IPv4 address.
+  ///
+  /// Local cameras normally sit on a private network, so camera plugins
+  /// ask for the private-address grant at install time and the user
+  /// approves it.
+  ///
+  /// There is no local-file source: the host never opens a filesystem
+  /// path on a plugin's behalf.
   variant media-source {
-    /// Standard URL the host can open directly: rtsp://, http://, file://
-    url(string),
+    /// RTSP (`rtsp://` or `rtsps://`).
+    rtsp(network-endpoint),
+    /// HTTP (`http://` or `https://`), e.g. MJPEG-over-HTTP or HLS
+    /// pulled from a camera.
+    http(network-endpoint),
     /// Plugin produces bytes via a host-managed pipe. Used for proprietary
     /// protocols where the plugin must do auth/decryption/re-framing
     /// before bytes can enter a standard pipeline.
     plugin-pipe(plugin-pipe-config),
   }
 
+  /// Video codecs the host pipeline knows. Adding one is a contract
+  /// change; the allowlist is the enum.
+  enum video-codec { h264, h265, vp8, vp9, av1, mjpeg }
+
+  /// Audio codecs the host pipeline knows. `pcm-s16le` is raw
+  /// little-endian signed 16-bit PCM; `pcm-mulaw` / `pcm-alaw` are G.711.
+  enum audio-codec { aac, opus, pcm-s16le, pcm-mulaw, pcm-alaw, g722 }
+
+  /// The codec of one elementary stream.
+  variant media-codec {
+    video(video-codec),
+    audio(audio-codec),
+  }
+
+  /// Framing of the bytes a plugin writes into a `pipe-writer`.
+  enum pipe-format {
+    /// RTP packets, one per `pipe-writer.write` call.
+    rtp,
+    /// MPEG transport stream (188-byte packets).
+    mpeg-ts,
+    /// Bare elementary stream of the declared codec (H.264/H.265
+    /// Annex B, concatenated JPEG frames for MJPEG, raw PCM, ...).
+    elementary-stream,
+  }
+
   record plugin-pipe-config {
-    /// Container/framing the plugin will emit: "rtp", "mpegts",
-    /// "raw-h264", "raw-mjpeg", etc.
-    format: string,
-    /// Codec inside that container.
-    codec: string,
-    /// Sample rate / clock rate / framerate hints (format-dependent).
-    parameters: list<key-value>,
+    /// Framing the plugin will emit.
+    format: pipe-format,
+    /// Codec inside that framing.
+    codec: media-codec,
+    /// RTP clock rate in Hz. Required when `format` is `rtp`; ignored
+    /// otherwise.
+    clock-rate: option<u32>,
+    /// Audio sample rate in Hz (8000–192000). Audio codecs only.
+    sample-rate: option<u32>,
+    /// Audio channel count (1–8). Audio codecs only.
+    channels: option<u8>,
+  }
+
+  /// Container formats the host can demultiplex.
+  enum container-format {
+    rtp,
+    mpeg-ts,
+    matroska,
+    mp4,
+    flv,
+    /// `multipart/x-mixed-replace` JPEG streams (MJPEG over HTTP).
+    multipart-jpeg,
   }
 
   /// A pipeline step the host should apply after the source.
   variant pipeline-step {
-    /// Demux/depacketize using a named handler.
-    demux(string),
+    /// Demux/depacketize the given container.
+    demux(container-format),
     /// Decode the video. Host may use hardware acceleration.
     decode-video,
     /// Re-encode video to a target codec (used when consumer needs
@@ -642,48 +768,78 @@ interface media {
     encode-video(encode-params),
     /// Transcode audio.
     transcode-audio(audio-params),
-    /// Apply per-frame filtering (downscale, crop, overlay).
-    filter(filter-config),
+    /// Apply a per-frame video filter.
+    filter(video-filter),
     /// Tap the pipeline to feed frames into a host-managed ML model.
     /// Inference results are delivered to the plugin as events.
     inference-tap(inference-tap-config),
   }
 
   record encode-params {
-    /// Target codec: `"h264"`, `"h265"`, `"vp9"`, etc.
-    codec: string,
+    codec: video-codec,
+    /// Target bitrate, 16–100000 kbit/s. `none` lets the host choose.
     bitrate-kbps: option<u32>,
+    /// Frames between keyframes, 1–1000. `none` lets the host choose.
     keyframe-interval: option<u32>,
   }
 
   record audio-params {
-    /// Target codec: `"opus"`, `"aac"`, `"pcm"`, etc.
-    codec: string,
+    codec: audio-codec,
+    /// Sample rate in Hz (8000–192000). `none` keeps the source rate.
     sample-rate: option<u32>,
+    /// Channel count (1–8). `none` keeps the source layout.
     channels: option<u8>,
   }
 
-  record filter-config {
-    /// Filter name: `"scale"`, `"crop"`, `"overlay"`, etc.
-    name: string,
-    parameters: list<key-value>,
+  /// A frame size in pixels. Each side is 1–8192.
+  record frame-size {
+    width: u32,
+    height: u32,
+  }
+
+  /// A crop rectangle in pixels, relative to the incoming frame. The
+  /// host rejects a rectangle that doesn't fit inside the frame.
+  record crop-rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+  }
+
+  /// Clockwise rotation.
+  enum rotation { rotate90, rotate180, rotate270 }
+
+  /// Per-frame video filters. The allowlist is the variant: there is no
+  /// way to name an arbitrary native filter.
+  variant video-filter {
+    /// Scale to the given size (aspect ratio not preserved).
+    scale(frame-size),
+    crop(crop-rect),
+    rotate(rotation),
+    /// Drop frames to at most this many per second. Finite, greater
+    /// than 0 and at most 120.
+    max-framerate(f32),
   }
 
   /// Configuration for an in-pipeline inference tap.
   /// All per-frame work happens natively. The plugin only sees the
   /// (small) structured inference output as events.
   record inference-tap-config {
-    /// Model registry name.
+    /// Model registry name. Same grammar as `inference.load-model`'s
+    /// `name`, and the model must be one the plugin's manifest declares.
     model: string,
-    /// Optional version pin. None = latest compatible.
+    /// Optional version pin. None = latest compatible. Same grammar as
+    /// `inference.load-model`'s `version`.
     model-version: option<string>,
-    /// Sample rate. None = match source framerate.
+    /// Sample rate in frames per second. Finite, greater than 0 and at
+    /// most 120. None = match source framerate.
     fps: option<f32>,
     /// Where in the pipeline to tap.
     tap-point: tap-point,
     /// Event topic to publish results under.
     event-topic: string,
-    /// Optional preprocessing applied by the host before inference.
+    /// Optional preprocessing applied by the host before inference. At
+    /// most 8 steps.
     preprocessing: list<preprocessing-step>,
   }
 
@@ -697,26 +853,39 @@ interface media {
   }
 
   variant preprocessing-step {
-    /// Resize to (width, height).
-    resize(tuple<u32, u32>),
-    /// Letterbox to (width, height) — preserves aspect ratio with padding.
-    letterbox(tuple<u32, u32>),
-    /// Per-channel normalize with (mean, std).
+    /// Resize to the given size.
+    resize(frame-size),
+    /// Letterbox to the given size — preserves aspect ratio with padding.
+    letterbox(frame-size),
+    /// Per-channel normalize with (mean, std). Both finite; std non-zero.
     normalize(tuple<f32, f32>),
     to-rgb,
     to-bgr,
   }
 
+  /// Logical name of an output sink. 1–64 characters from `a-z`, `0-9`,
+  /// `-`, and `_`, starting with a letter or digit. It is never a path:
+  /// the host places it inside this plugin instance's own namespace
+  /// (`<plugin-id>/<instance-id>/<sink-name>` for RTSP and HLS), so
+  /// plugins can't collide with each other or reach outside their
+  /// namespace.
+  type sink-name = string;
+
+  /// Name of a recording profile the operator configured on the host.
+  /// Same grammar as `sink-name`. The profile, not the plugin, decides
+  /// where and how recordings are stored.
+  type recording-profile = string;
+
   /// What the host should expose this stream as, downstream.
   variant output-sink {
-    /// Path under the host's RTSP server.
-    rtsp(string),
+    /// Mount on the host's RTSP server under the instance namespace.
+    rtsp(sink-name),
     /// The host adds a WebRTC track for on-demand peers.
     webrtc,
-    /// Path under the host's HLS server.
-    hls(string),
-    /// Recording-profile name; the host records to storage under that profile.
-    record-to-storage(string),
+    /// Mount on the host's HLS server under the instance namespace.
+    hls(sink-name),
+    /// Record to host-managed storage using the named profile.
+    record-to-storage(recording-profile),
   }
 
   enum activation-policy {
@@ -728,7 +897,8 @@ interface media {
     motion-triggered,
   }
 
-  /// Full pipeline description the plugin hands to the host.
+  /// Full pipeline description the plugin hands to the host. At most 32
+  /// `steps` and 8 `sinks`.
   record media-pipeline {
     source: media-source,
     steps: list<pipeline-step>,
@@ -746,7 +916,8 @@ interface media {
   /// into this; the host's pipeline consumes them.
   resource pipe-writer {
     /// Write a chunk of pre-framed bytes (matching the format declared in
-    /// the plugin-pipe-config). Returns bytes written.
+    /// the plugin-pipe-config). At most 1 MiB per call. Returns bytes
+    /// written.
     write: func(data: list<u8>) -> result<u64, error>;
     /// Signal end-of-stream and close.
     close: func();
@@ -763,40 +934,76 @@ interface media {
 // the manifest's declared model dependencies.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Host-managed ML inference.
+///
+/// Inference runs inside the host process with strict limits
+/// (docs/adr/0002-in-process-native-media-and-inference.md). The host
+/// checks every tensor against the limits below — with overflow-checked
+/// arithmetic — before it reaches the native runtime, and applies the
+/// same limits to the tensors a model returns before copying them into
+/// the guest. A violation returns `error::invalid-argument(...)`.
+///
+/// Tensor limits:
+/// - rank (number of dimensions): at most 8;
+/// - every dimension: at least 1;
+/// - elements per tensor (product of the shape): at most 67_108_864 (2^26);
+/// - bytes per tensor: exactly elements × element width, at most 64 MiB;
+/// - per `infer` call: at most 16 tensors and 256 MiB of tensor data,
+///   for the inputs and, separately, for the outputs.
 interface inference {
   use types.{error};
 
+  /// Tensor element type. Element widths: `f32` / `i32` 4 bytes, `f16`
+  /// 2 bytes, `i8` / `u8` 1 byte, `i64` 8 bytes.
   enum tensor-dtype { %f32, %f16, %i8, %u8, %i32, %i64 }
+
+  /// One dimension of a model's declared tensor shape.
+  variant tensor-dim {
+    /// A fixed size (at least 1).
+    fixed(u32),
+    /// Any size, chosen by the caller per call (e.g. batch size).
+    dynamic,
+  }
 
   record tensor-spec {
     name: string,
-    /// Shape in elements per dim. `-1` denotes a dynamic dimension.
-    shape: list<s32>,
+    /// Declared shape; at most 8 dimensions.
+    shape: list<tensor-dim>,
     dtype: tensor-dtype,
   }
 
   record named-tensor {
+    /// Name from the model's `tensor-spec` list.
     name: string,
+    /// Concrete shape: at most 8 dimensions, each at least 1, matching
+    /// the model's `tensor-spec` (fixed dimensions exactly).
     shape: list<u32>,
     dtype: tensor-dtype,
-    /// Raw bytes; layout is row-major, dtype-defined.
+    /// Raw bytes, row-major, little-endian. Length must equal the
+    /// element count × the dtype's width, at most 64 MiB (see the
+    /// `inference` interface limits).
     data: list<u8>,
   }
+
+  /// Execution provider a loaded model runs on. The host never falls
+  /// back silently: if a model can't run where it was configured to,
+  /// `load-model` fails.
+  enum execution-provider { cpu, cuda, tensorrt, core-ml, openvino, rocm }
 
   record model-info {
     name: string,
     version: string,
     inputs: list<tensor-spec>,
     outputs: list<tensor-spec>,
-    /// Hint about where it runs: "cuda", "cpu", "metal", "openvino", "cpu-fallback".
-    runtime: string,
+    runtime: execution-provider,
   }
 
   /// A handle to a loaded model. Capability-scoped: plugin can only hold
   /// handles for models its manifest authorizes.
   resource model {
     /// Run inference on a single input set (or batch).
-    /// Tensors are matched by name to the model's signature.
+    /// Tensors are matched by name to the model's signature. At most 16
+    /// tensors and 256 MiB of tensor data in each direction.
     infer: func(inputs: list<named-tensor>) -> result<list<named-tensor>, error>;
     /// Model metadata.
     info: func() -> model-info;
@@ -804,6 +1011,12 @@ interface inference {
 
   /// Plugin asks the host to load a model from the registry.
   /// Returns a handle the plugin uses for inference.
+  ///
+  /// `name` is a registry name: 1–64 characters from `a-z`, `0-9`, `-`,
+  /// and `_`, starting with a letter or digit. `version` is 1–32
+  /// characters from `A-Z`, `a-z`, `0-9`, `.`, `+`, and `-`, starting
+  /// with a letter or digit and never containing `..`. Neither is ever
+  /// used as a filesystem path.
   load-model: func(name: string, version: option<string>) -> result<model, error>;
 }
 

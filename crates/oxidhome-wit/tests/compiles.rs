@@ -40,15 +40,37 @@ mod plugin_world {
 #[cfg(feature = "streaming-plugin")]
 mod streaming_plugin_world {
     use oxidhome_wit::streaming_plugin::oxidhome::plugin::media::{
-        MediaPipeline, MediaSource, OutputSink, PipelineStep,
+        ActivationPolicy, ContainerFormat, CredentialRef, FrameSize, MediaPipeline, MediaSource,
+        NetworkEndpoint, OutputSink, PipelineStep, TransportSecurity, VideoFilter,
     };
 
+    /// H7: sources are typed endpoints with credential references and
+    /// sinks are logical names — no URL or path strings.
     #[test]
     fn streaming_types_resolve() {
-        let _: MediaPipeline;
-        let _: MediaSource;
-        let _: OutputSink;
-        let _: PipelineStep;
+        let pipeline = MediaPipeline {
+            source: MediaSource::Rtsp(NetworkEndpoint {
+                security: TransportSecurity::Tls,
+                host: "camera.lan".to_string(),
+                port: None,
+                path: "/stream1".to_string(),
+                credential: Some(CredentialRef {
+                    username_key: String::new(),
+                    password_key: String::new(),
+                }),
+            }),
+            steps: vec![
+                PipelineStep::Demux(ContainerFormat::Rtp),
+                PipelineStep::DecodeVideo,
+                PipelineStep::Filter(VideoFilter::Scale(FrameSize {
+                    width: 640,
+                    height: 360,
+                })),
+            ],
+            sinks: vec![OutputSink::Rtsp("main".to_string()), OutputSink::Webrtc],
+            activation: ActivationPolicy::OnDemand,
+        };
+        assert_eq!(pipeline.sinks.len(), 2);
     }
 }
 
@@ -56,14 +78,25 @@ mod streaming_plugin_world {
 #[cfg(feature = "ai-plugin")]
 mod ai_plugin_world {
     use oxidhome_wit::ai_plugin::oxidhome::plugin::inference::{
-        ModelInfo, NamedTensor, TensorDtype,
+        ExecutionProvider, ModelInfo, NamedTensor, TensorDim, TensorDtype, TensorSpec,
     };
 
     #[test]
     fn ai_types_resolve() {
         let _ = TensorDtype::F32;
         let _: NamedTensor;
-        let _: ModelInfo;
+        let info = ModelInfo {
+            name: "yolo".to_string(),
+            version: "1".to_string(),
+            inputs: vec![TensorSpec {
+                name: "images".to_string(),
+                shape: vec![TensorDim::Dynamic, TensorDim::Fixed(3)],
+                dtype: TensorDtype::F32,
+            }],
+            outputs: Vec::new(),
+            runtime: ExecutionProvider::Cpu,
+        };
+        assert_eq!(info.inputs.len(), 1);
     }
 }
 
