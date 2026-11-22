@@ -203,16 +203,24 @@ impl TestHost {
         let inner = PluginInstance::load_with_pinned_manifest(
             &self.engine,
             plugin_dir,
-            instance_id,
+            instance_id.clone(),
             config.as_ref(),
             mode,
             manifest_bytes,
             manifest,
         )
         .await
-        .map_err(|e| TestHostError::Load {
-            plugin_id,
-            source: e.into(),
+        .map_err(|e| {
+            // Component initializers run during instantiation and may
+            // already have called host imports; tear down whatever
+            // they left behind, as the supervisor's reaper does after
+            // a failed load. The id is still reserved, so nothing
+            // else owns state under it.
+            self.engine.release_instance_state(&instance_id);
+            TestHostError::Load {
+                plugin_id,
+                source: e.into(),
+            }
         })?;
         Ok(TestPluginInstance::new(
             self.engine.clone(),
