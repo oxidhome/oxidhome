@@ -28,6 +28,17 @@ env:
 permissions:
   contents: read
 
+# A new push to a PR cancels that PR's run still in progress. Every
+# other run (push to main, schedule, and the tag runs where
+# `publish.yaml` calls this workflow) gets a group of its own through
+# `run_id`, so it is never cancelled and never left pending behind
+# another. Under `workflow_call`, `github.workflow` and `run_id` are the
+# caller's, so the `checks-` prefix keeps this group apart from any
+# group the caller might declare for itself.
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   RustMeta:
     name: Collect crate metadata
@@ -37,6 +48,7 @@ jobs:
       publish: ${{ steps.rustmeta.outputs.publish }}
       tag-package: ${{ steps.rustmeta.outputs.tag-package }}
       tag-version: ${{ steps.rustmeta.outputs.tag-version }}
+      rust-version: ${{ steps.rustmeta.outputs.rust-version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # On a `<crate>/v<x.y.z>` tag push (`publish.yaml` calls this
@@ -103,17 +115,33 @@ jobs:
         # being silently resolved on the runner.
         working-directory: examples/${{ matrix.example }}
         run: cargo build --target wasm32-wasip2 --locked --verbose
+  MSRV:
+    name: Check the minimum supported Rust version
+    needs: RustMeta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # `rust-version` is the highest `rust-version` any crate declares.
+      # The action sets it as a `rustup override`, which wins over
+      # `rust-toolchain.toml`.
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ needs.RustMeta.outputs.rust-version }}
+          target: wasm32-wasip2
+      - run: cargo check --workspace --all-features --all-targets --verbose
+      - run: cargo check --package oxidhome-sdk --target wasm32-wasip2 --all-features --all-targets --verbose
   Build:
     name: Build
     needs:
       - BuildJob
       - WasmBuildJob
       - ExamplesBuildJob
+      - MSRV
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - name: Check status
-        if: ${{ needs.BuildJob.result != 'success' || needs.WasmBuildJob.result != 'success' || needs.ExamplesBuildJob.result != 'success' }}
+        if: ${{ needs.BuildJob.result != 'success' || needs.WasmBuildJob.result != 'success' || needs.ExamplesBuildJob.result != 'success' || needs.MSRV.result != 'success' }}
         run: exit 1
   Format:
     name: Check Rust code formatting
@@ -206,16 +234,61 @@ jobs:
       - name: Prepare coverage report
         if: ${{ !cancelled() }}
         run: cargo llvm-cov report --lcov --output-path coverage.lcov
-      - name: Upload coverage reports to Codecov
+      # Not sent to Codecov from here: every upload makes Codecov
+      # recompute its statuses from the reports it has so far, so a
+      # matrix of uploads flips them until the last row lands. The
+      # `Coverage` job below sends all of them at once.
+      - name: Store coverage and test reports
         if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-test-${{ strategy.job-index }}
+          path: |
+            coverage.lcov
+            target/nextest/default/junit.xml
+          retention-days: 1
+  Coverage:
+    name: Publish coverage to Codecov
+    # One upload for the whole run, once every test job is done, so
+    # Codecov computes each status a single time from the complete
+    # report. Runs after a test failure too. Deliberately not part of
+    # `AllChecks`: the Codecov statuses are informational.
+    needs: TestsJob
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      # Codecov resolves the report paths against the repository tree.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          # One directory per artifact, so same-named reports from
+          # different jobs don't overwrite each other.
+          pattern: coverage-*
+          path: coverage-reports
+      - name: List the reports
+        id: reports
+        run: |
+          set -euo pipefail
+          mkdir -p coverage-reports
+          list() { find coverage-reports -type f -name "$1" | sort | paste -sd, -; }
+          echo "lcov=$(list coverage.lcov)" >> "$GITHUB_OUTPUT"
+          echo "junit=$(list junit.xml)" >> "$GITHUB_OUTPUT"
+          find coverage-reports -type f | sort
+      - name: Upload coverage reports to Codecov
+        if: ${{ steps.reports.outputs.lcov != '' }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ steps.reports.outputs.lcov }}
+          disable_search: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
       - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
+        if: ${{ steps.reports.outputs.junit != '' }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           report_type: test_results
+          files: ${{ steps.reports.outputs.junit }}
+          disable_search: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
   Tests:
@@ -278,6 +351,28 @@ jobs:
         run: cargo machete
       - name: Deny
         run: cargo deny check all
+  OsvScannerPR:
+    name: OSV Scanner (PR diff)
+    # Comparative scan: diffs the base branch's dependencies against the
+    # PR head and reports newly introduced vulnerable ones. `OsvScanner`
+    # below does a flat scan on every other event. Both read
+    # `osv-scanner.toml` for ignored advisories.
+    if: github.event_name == 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write  # SARIF upload to the Security tab
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+  OsvScanner:
+    name: OSV Scanner
+    # Flat scan of the current tree on push to main, schedule, and the
+    # publish flow (`workflow_call`).
+    if: github.event_name != 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write  # SARIF upload to the Security tab
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
   PublishJob:
     name: Test publishing per crate
     needs: RustMeta
@@ -319,10 +414,14 @@ jobs:
       - WasmClippy
       - Tests
       - Deps
+      - OsvScannerPR
+      - OsvScanner
       - Publish
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      # Exactly one of `OsvScannerPR` / `OsvScanner` is skipped per event,
+      # so `skipped` is expected; every other job always runs.
       - name: Verify all checks succeeded
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: exit 1

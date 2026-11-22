@@ -12,6 +12,12 @@ permissions:
 
 jobs:
   Checks:
+    # The union of what the called jobs request: the OSV Scanner job
+    # uploads SARIF to the Security tab.
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
     uses: ./.github/workflows/checks.yaml
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
