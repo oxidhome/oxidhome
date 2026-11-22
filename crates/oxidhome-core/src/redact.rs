@@ -157,6 +157,26 @@ pub fn redact_json(value: &mut JsonValue) -> bool {
     }
 }
 
+/// [`scrub_text`] for free text that may be a whole JSON document: a
+/// text that parses as a JSON object or array is redacted structurally
+/// (nested credentials included) and re-encoded, so it stays valid
+/// JSON; anything else goes through [`scrub_text`].
+#[must_use]
+pub fn redact_text(text: &str) -> Cow<'_, str> {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return scrub_text(text);
+    }
+    let mut value = JsonValue::String(text.to_owned());
+    if !redact_json(&mut value) {
+        return Cow::Borrowed(text);
+    }
+    match value {
+        JsonValue::String(s) => Cow::Owned(s),
+        _ => Cow::Borrowed(text),
+    }
+}
+
 /// Replace every string / number leaf under `value` with
 /// [`REDACTED`]. Object keys are kept so the shape stays readable;
 /// tag fields such as a wire value's `"t"` are kept too.
@@ -285,15 +305,24 @@ fn match_api_token(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
     (end - start >= 16).then_some((start, end))
 }
 
+/// Horizontal whitespace between a key, its separator, an auth scheme
+/// and the value. Line breaks are not crossed, so a bare `password:` at
+/// the end of a line never masks the next one.
+fn is_blank(b: u8) -> bool {
+    matches!(b, b' ' | b'\t')
+}
+
 /// `Bearer <credential>` at `pos` → the credential's byte range.
 fn match_bearer(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
-    if !starts_with_ignore_case(&bytes[pos..], b"bearer ")
+    let after = pos + "bearer".len();
+    if !starts_with_ignore_case(&bytes[pos..], b"bearer")
+        || !bytes.get(after).is_some_and(|&b| is_blank(b))
         || (pos > 0 && is_ident_byte(bytes[pos - 1]))
     {
         return None;
     }
-    let mut start = pos + "bearer ".len();
-    while start < bytes.len() && bytes[start] == b' ' {
+    let mut start = after;
+    while start < bytes.len() && is_blank(bytes[start]) {
         start += 1;
     }
     let end = scan_value(bytes, start);
@@ -311,7 +340,7 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
     }
     // Walk back over spaces and an optional closing quote to the key.
     let mut key_end = pos;
-    while key_end > floor && bytes[key_end - 1] == b' ' {
+    while key_end > floor && is_blank(bytes[key_end - 1]) {
         key_end -= 1;
     }
     if key_end > floor && matches!(bytes[key_end - 1], b'"' | b'\'') {
@@ -332,7 +361,7 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
     // `Some(` (how `{:?}` renders `serde_json` / `toml` values), and an
     // optional opening quote to the value.
     let mut start = pos + 1;
-    while start < bytes.len() && bytes[start] == b' ' {
+    while start < bytes.len() && is_blank(bytes[start]) {
         start += 1;
     }
     let mut wrapper = start;
@@ -388,10 +417,10 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
         let is_scheme = [&b"bearer"[..], b"basic", b"digest", b"token"]
             .iter()
             .any(|s| word.eq_ignore_ascii_case(s));
-        if is_scheme && word_end < bytes.len() && bytes[word_end] == b' ' {
+        if is_scheme && word_end < bytes.len() && is_blank(bytes[word_end]) {
             // Keep the scheme name, mask the credential after it.
             start = word_end;
-            while start < bytes.len() && bytes[start] == b' ' {
+            while start < bytes.len() && is_blank(bytes[start]) {
                 start += 1;
             }
             scan_value(bytes, start)
@@ -659,6 +688,14 @@ mod tests {
                 r#"{"api_key": String("***"), "n": Int(1)}"#,
             ),
             ("pin: Some(1234)", "pin: Some(***)"),
+            ("password=\thunter2", "password=\t***"),
+            ("password\t:\thunter2", "password\t:\t***"),
+            (
+                "Authorization:\tBasic dXNlcjpwYXNz",
+                "Authorization:\tBasic ***",
+            ),
+            ("auth: Bearer\tabc.def", "auth: Bearer\t***"),
+            ("password:\nnext line", "password:\nnext line"),
             (
                 r#"payload="{\"password\":\"hunter2\",\"user\":\"bob\"}""#,
                 r#"payload="{\"password\":\"***\",\"user\":\"bob\"}""#,
@@ -761,6 +798,21 @@ mod tests {
             json!({"password": {"value": "***"}, "pin": "***", "ok": 1})
         );
         assert_eq!(v["plain"], "[not json");
+    }
+
+    #[test]
+    fn redact_text_handles_nested_json_documents() {
+        let out = redact_text(r#"{"password":{"value":"hunter2"},"n":1}"#);
+        assert!(!out.contains("hunter2"), "{out}");
+        let v: JsonValue = serde_json::from_str(&out).expect("still JSON");
+        assert_eq!(v["n"], 1);
+        // A value whose text would trip the unquoted-value scanner stays
+        // valid JSON when redacted structurally.
+        let out = redact_text(r#"{"service":"password=abc\"tail"}"#);
+        let v: JsonValue = serde_json::from_str(&out).expect("still JSON");
+        assert_eq!(v["service"], "password=***\"tail");
+        assert!(matches!(redact_text(r#"{"ok":1}"#), Cow::Borrowed(_)));
+        assert_eq!(redact_text("password=x"), "password=***");
     }
 
     #[test]

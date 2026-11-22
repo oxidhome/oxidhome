@@ -221,9 +221,10 @@ pub enum AuditLogError {
     NotFound(u64),
 }
 
-/// M7: free-text audit columns (`path`, `domain_error`,
-/// `invocation_json`) go through [`crate::redact::scrub_text`] on every
-/// write, so a credential in a request path or an invocation summary
+/// M7: free-text audit columns go through redaction on every write:
+/// `path` via [`crate::redact::scrub_text`], and `domain_error` /
+/// `invocation_json` via [`crate::redact::redact_text`] (structural for
+/// JSON, so the invocation stays parseable), so a credential in a request path or an invocation summary
 /// never reaches the ledger. The ledger records *who did what*, never
 /// command arguments or config values; a future column that does (the
 /// UI plan's audited parameter values) must pass them through
@@ -233,7 +234,7 @@ fn scrub(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn scrub_opt(text: Option<&str>) -> Option<std::borrow::Cow<'_, str>> {
-    text.map(crate::redact::scrub_text)
+    text.map(crate::redact::redact_text)
 }
 
 /// Per-host audit ledger.
@@ -626,6 +627,16 @@ mod tests {
         let first = rows.iter().find(|r| r.id == id).unwrap();
         assert_eq!(first.path, "/api/v1/x?api_key=***");
         assert_eq!(first.domain_error.as_deref(), Some("token=***"));
+        // Redaction keeps the invocation summary valid JSON, even when a
+        // value's text would trip the unquoted-value scanner.
+        let mut entry = sample_intent("tok", "/api/v1/y");
+        entry.invocation = Some(r#"{"service":"password=abc\"tail"}"#.into());
+        let id = log.record_intent(&entry).unwrap();
+        let rows = log.query(&AuditQuery::default(), 10).unwrap();
+        let row = rows.iter().find(|r| r.id == id).unwrap();
+        let invocation: serde_json::Value =
+            serde_json::from_str(row.invocation.as_deref().unwrap()).expect("still JSON");
+        assert_eq!(invocation["service"], "password=***\"tail");
     }
 
     #[test]

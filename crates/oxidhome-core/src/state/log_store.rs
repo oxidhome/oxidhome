@@ -949,7 +949,7 @@ impl EventFields {
     /// whatever its type; every string value and the message go
     /// through [`crate::redact::scrub_text`].
     fn redact(&mut self) {
-        use crate::redact::{REDACTED, is_sensitive_key, scrub_text};
+        use crate::redact::{REDACTED, is_sensitive_key, redact_text as scrub_text};
         if let Some(message) = &mut self.message
             && let std::borrow::Cow::Owned(scrubbed) = scrub_text(message)
         {
@@ -1252,15 +1252,29 @@ mod tests {
                 "login with password=hunter2 for bob",
             );
             tracing::info!(target: "test", device_id = "password=hunter2", "denied");
+            tracing::info!(
+                target: "test",
+                body = r#"{"password":{"value":"nested-pw"}}"#,
+                "nested",
+            );
         });
         store.wait_drained_for_test();
 
         let rows = store.query(&LogQuery::default(), 16).expect("query");
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         let row = rows
             .iter()
-            .find(|r| r.message != "denied")
+            .find(|r| r.message.starts_with("login"))
             .expect("login row");
+        let nested = rows
+            .iter()
+            .find(|r| r.message == "nested")
+            .expect("nested row");
+        assert!(
+            !format!("{:?}", nested.fields).contains("nested-pw"),
+            "{:?}",
+            nested.fields
+        );
         let denied = rows
             .iter()
             .find(|r| r.message == "denied")
