@@ -374,8 +374,8 @@ interface services {
     description: option<string>,
     /// Accepted arguments. Empty = the command takes none.
     params: list<field-spec>,
-    /// Fields of an `ok-with-state` reply. Empty = the command replies
-    /// with plain `ok` (or `err`).
+    /// Fields of an `ok-with-state` reply. Empty = the reply carries no
+    /// fields: plain `ok`, an empty `ok-with-state`, or `err`.
     returns: list<field-spec>,
   }
 

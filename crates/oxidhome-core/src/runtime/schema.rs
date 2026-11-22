@@ -297,8 +297,9 @@ fn check_sensor_spec(spec: &SensorSpec) -> Result<(), String> {
 /// sensor's `initial-state` reading uses its spec's unit. Every
 /// failure is `invalid-argument`.
 pub(crate) fn check_device_info(info: &DeviceInfo) -> Result<(), WitError> {
-    let invalid =
-        |msg: String| WitError::InvalidArgument(format!("device `{}`: {msg}", info.local_id));
+    let invalid = |msg: String| {
+        WitError::InvalidArgument(format!("device {:?}: {msg}", clip(&info.local_id)))
+    };
     let mut sensor_unit = None;
     for spec in &info.capabilities {
         match spec {
@@ -488,8 +489,9 @@ fn check_field_list(list: &str, fields: &[FieldSpec]) -> Result<(), String> {
 /// Validate a `register-service` / `update-service` payload's command
 /// schemas. Every failure is `invalid-argument`.
 pub(crate) fn check_service_info(info: &ServiceInfo) -> Result<(), WitError> {
-    let invalid =
-        |msg: String| WitError::InvalidArgument(format!("service `{}`: {msg}", info.local_id));
+    let invalid = |msg: String| {
+        WitError::InvalidArgument(format!("service {:?}: {msg}", clip(&info.local_id)))
+    };
     if info.commands.len() > MAX_COMMANDS_PER_SERVICE {
         return Err(invalid(format!(
             "declares {} commands; the cap is {MAX_COMMANDS_PER_SERVICE}",
@@ -703,6 +705,21 @@ mod tests {
         }
         let info = service(vec![command(vec![], vec![])]);
         let Err(WitError::InvalidArgument(msg)) = find_command(&info, "svc-1", &long) else {
+            panic!("should be refused");
+        };
+        assert!(msg.len() < 1024, "message is {} bytes", msg.len());
+
+        // Registration diagnostics clip the plugin's own local id too.
+        let mut bad = service(vec![command(vec![], vec![])]);
+        bad.local_id.clone_from(&long);
+        bad.commands[0].name = "bad name".into();
+        let Err(WitError::InvalidArgument(msg)) = check_service_info(&bad) else {
+            panic!("should be refused");
+        };
+        assert!(msg.len() < 1024, "message is {} bytes", msg.len());
+        let mut dev = device(vec![sensor(Unit::Celsius, Some(2.0), Some(1.0))], vec![]);
+        dev.local_id = long;
+        let Err(WitError::InvalidArgument(msg)) = check_device_info(&dev) else {
             panic!("should be refused");
         };
         assert!(msg.len() < 1024, "message is {} bytes", msg.len());
@@ -1105,9 +1122,10 @@ mod tests {
                 "reply should break the schema"
             );
         }
-        // No `returns` schema: plain `ok` is the only valid success.
+        // No `returns` schema: the reply carries no fields.
         let none = command(vec![], vec![]);
         assert!(check_result("svc-1", &none, CommandResult::Ok).is_ok());
+        assert!(check_result("svc-1", &none, CommandResult::OkWithState(vec![])).is_ok());
         assert!(
             check_result(
                 "svc-1",

@@ -84,6 +84,9 @@ pub use device::Device;
 /// display-only fallback consumers must not interpret.
 pub use bindings::oxidhome::plugin::capabilities::Unit;
 
+mod unit;
+pub use unit::{sensor_fields, unit_code};
+
 mod service;
 pub use service::{CommandSpec, Field, Service};
 
