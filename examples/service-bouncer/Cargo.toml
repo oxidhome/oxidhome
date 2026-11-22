@@ -8,7 +8,7 @@ members = ["."]
 name = "service-bouncer"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "OxidHome example plugin: a service whose `kick` command bounces to a configured target (Phase 7c cycle-detection fixture)."
@@ -21,3 +21,6 @@ oxidhome-sdk = { path = "../../crates/oxidhome-sdk" }
 
 [lints.rust]
 unsafe_code = "deny"
+
+[lints.cargo]
+unused_dependencies = "deny"

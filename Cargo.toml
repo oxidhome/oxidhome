@@ -12,10 +12,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/oxidhome/oxidhome"
-homepage = "https://github.com/oxidhome/oxidhome"
 authors = ["The OxidHome Contributors"]
 
 [workspace.lints.rust]
@@ -27,12 +26,20 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# The flagged impls are wasmtime-bindgen `Host` / Connect-RPC service traits whose
+# `async fn` shape is codegen-dictated; `future::ready` would also run auth checks eagerly.
+unused_async_trait_impl = "allow"
+
+# Fails any build or clippy run that selects a crate with an unused `[dependencies]` or
+# `[build-dependencies]` entry. It complements cargo-machete rather than replacing it:
+# it skips `[dev-dependencies]` and direct deps that are also pulled in transitively.
+[workspace.lints.cargo]
+unused_dependencies = "deny"
 
 [workspace.dependencies]
 oxidhome-core = { path = "crates/oxidhome-core" }
 oxidhome-manifest = { path = "crates/oxidhome-manifest" }
 oxidhome-proto = { path = "crates/oxidhome-proto" }
-oxidhome-sdk = { path = "crates/oxidhome-sdk" }
 oxidhome-wit = { path = "crates/oxidhome-wit" }
 
 # Shared external deps.

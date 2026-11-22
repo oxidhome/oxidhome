@@ -746,7 +746,7 @@ mod tests {
             fx.read_admin_file().as_deref(),
             Some(issued.plaintext.as_str())
         );
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files(), Vec::<PathBuf>::new());
         assert!(fx.tokens.verify_read_only(&issued.plaintext).is_ok());
 
         let rows = fx.audit_rows(AUDIT_PATH_BOOTSTRAP);
@@ -763,7 +763,10 @@ mod tests {
         fx.tokens.create("preexisting", b"{}").unwrap();
         assert!(fx.bootstrap().unwrap().is_none());
         assert!(!fx.admin_file().exists());
-        assert!(fx.audit_rows(AUDIT_PATH_BOOTSTRAP).is_empty());
+        assert_eq!(
+            fx.audit_rows(AUDIT_PATH_BOOTSTRAP),
+            Vec::<AuditEntry>::new()
+        );
     }
 
     #[cfg(unix)]
@@ -792,7 +795,10 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(fx.tokens.count().unwrap(), 0, "no undelivered row");
-        assert!(fx.audit_rows(AUDIT_PATH_BOOTSTRAP).is_empty());
+        assert_eq!(
+            fx.audit_rows(AUDIT_PATH_BOOTSTRAP),
+            Vec::<AuditEntry>::new()
+        );
 
         let issued = fx.bootstrap().unwrap().expect("retry mints");
         assert_eq!(
@@ -810,7 +816,7 @@ mod tests {
         );
         assert!(fx.bootstrap().is_err());
         assert_eq!(fx.tokens.count().unwrap(), 0);
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files(), Vec::<PathBuf>::new());
         assert!(!fx.admin_file().exists());
     }
 
@@ -860,7 +866,7 @@ mod tests {
             fx.read_admin_file().as_deref(),
             Some(issued.plaintext.as_str())
         );
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files(), Vec::<PathBuf>::new());
     }
 
     /// Rename into place fails (here: `admin-token` is a non-empty
@@ -873,7 +879,7 @@ mod tests {
         std::fs::write(fx.admin_file().join("blocker"), b"x").unwrap();
         assert!(fx.bootstrap().is_err());
         assert_eq!(fx.tokens.count().unwrap(), 0, "row rolled back");
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files(), Vec::<PathBuf>::new());
         assert_eq!(fx.audit_rows(AUDIT_PATH_BOOTSTRAP)[0].decision, "error");
 
         std::fs::remove_dir_all(fx.admin_file()).unwrap();
@@ -904,7 +910,7 @@ mod tests {
         std::fs::remove_dir_all(fx.admin_file()).unwrap();
         fx.reconcile().unwrap();
         assert_eq!(fx.read_admin_file().as_deref(), Some(secret.trim()));
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files(), Vec::<PathBuf>::new());
         assert_eq!(fx.audit_rows(AUDIT_PATH_PENDING_PROMOTED).len(), 1);
     }
 
@@ -928,7 +934,7 @@ mod tests {
             fx.read_admin_file().as_deref(),
             Some(live.plaintext.as_str())
         );
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files(), Vec::<PathBuf>::new());
         // The store is non-empty, so the bootstrap is a no-op.
         assert!(fx.bootstrap().unwrap().is_none());
         assert_eq!(
@@ -1017,7 +1023,7 @@ mod tests {
             Err(TokenError::Revoked)
         ));
         assert!(fx.tokens.verify_read_only(&other.plaintext).is_ok());
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files(), Vec::<PathBuf>::new());
 
         let minted = fx.audit_rows(AUDIT_PATH_RECOVER);
         assert_eq!(minted.len(), 1);
@@ -1097,7 +1103,7 @@ mod tests {
         );
         assert_eq!(fx.tokens.count().unwrap(), 1);
         assert!(fx.tokens.verify_read_only(&old.plaintext).is_ok());
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files(), Vec::<PathBuf>::new());
     }
 
     /// Delivery fails after the commit: the error names the

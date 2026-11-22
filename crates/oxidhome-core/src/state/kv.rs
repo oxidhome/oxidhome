@@ -646,7 +646,7 @@ mod tests {
         let bs = kv.list_keys(INST_A, "alpha", "b").expect("list");
         assert_eq!(bs, vec!["ba".to_string(), "bb".to_string()]);
         let none = kv.list_keys(INST_A, "alpha", "z").expect("list");
-        assert!(none.is_empty());
+        assert_eq!(none, Vec::<String>::new());
     }
 
     /// Regression for the byte-level `prefix_upper_bound` shape we

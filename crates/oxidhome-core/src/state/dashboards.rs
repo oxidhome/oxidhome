@@ -487,7 +487,10 @@ mod tests {
         assert_eq!(listed[1].id, a.id);
         // Metadata carries the size, not the bytes themselves.
         assert!(listed[0].layout_bytes > 0);
-        assert!(s.list_metadata_by_owner("nobody").expect("list").is_empty());
+        assert_eq!(
+            s.list_metadata_by_owner("nobody").expect("list"),
+            Vec::<DashboardMetadata>::new()
+        );
     }
 
     #[test]

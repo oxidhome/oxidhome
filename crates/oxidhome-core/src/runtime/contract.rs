@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(pkg.name.namespace, CONTRACT_NAMESPACE);
         assert_eq!(pkg.name.name, CONTRACT_NAME);
         assert!(pkg.worlds.contains_key(HOST_WORLD));
-        assert!(!host_contract_version().is_empty());
+        assert_ne!(host_contract_version(), "");
     }
 
     #[test]

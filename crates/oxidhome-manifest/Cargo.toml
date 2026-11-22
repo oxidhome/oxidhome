@@ -6,7 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 # Path-depends on no other workspace crates today, but the cross-cutting
 # 0.x publication policy (see ARCHITECTURE.md "Implementation decisions")

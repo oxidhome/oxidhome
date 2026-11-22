@@ -17,7 +17,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 description = "Generated Connect-RPC types for OxidHome."
 # Unpublished through 0.x like every workspace crate (see the
@@ -35,6 +34,9 @@ publish = false
 # `buffa`, not here.
 [lints.rust]
 unsafe_code = "deny"
+
+[lints.cargo]
+unused_dependencies = "deny"
 
 [dependencies]
 buffa.workspace = true

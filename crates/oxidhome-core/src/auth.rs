@@ -233,7 +233,7 @@ mod tests {
         let a = Actor::plugin("example.simulated-switch#0");
         assert_eq!(a.kind(), ActorKind::Plugin);
         assert_eq!(a.id(), "example.simulated-switch#0");
-        assert!(a.scopes().is_empty());
+        assert_eq!(a.scopes(), Vec::<String>::new());
     }
 
     #[test]

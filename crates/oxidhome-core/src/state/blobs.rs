@@ -1202,7 +1202,7 @@ mod tests {
                 Some("image/jpeg"),
             )
             .expect("write");
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
 
         let by_id = store.read(INST_A, "alpha", &id).expect("read by id");
         assert_eq!(by_id, b"hello blob");
@@ -1381,7 +1381,7 @@ mod tests {
         assert_eq!(names, vec!["aa", "ab"]);
 
         let none = store.list_blobs(INST_A, "alpha", "z").expect("list");
-        assert!(none.is_empty());
+        assert_eq!(none, Vec::<BlobInfo>::new());
     }
 
     #[test]

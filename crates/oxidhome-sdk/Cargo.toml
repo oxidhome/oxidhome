@@ -6,7 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 # `oxidhome-sdk` depends on the internal `oxidhome-wit` crate; cargo can't
 # publish a crate that path-depends on an unpublished one. Both stay
