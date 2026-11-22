@@ -187,10 +187,10 @@ interface capabilities {
   /// Spec for a sensor: unit and reasonable display range.
   record sensor-spec {
     /// Unit every reading of this sensor carries. The host refuses an
-    /// `initial-state` measurement whose unit differs, and a sensor
-    /// `state-change` / `ok-with-state` whose `unit` (or `unit_label`)
-    /// field restates anything other than this unit's code (or label).
-    /// An `ok-with-state` replaces the reading, so it must include them.
+    /// `initial-state` measurement whose unit differs. Every sensor
+    /// `state-change` / `ok-with-state` must carry a `unit` field with
+    /// this unit's code (plus `unit_label` with the label, for
+    /// `other`); the host refuses one that omits or contradicts them.
     unit: unit,
     /// Optional reasonable range for UIs and validation. Both bounds
     /// must be finite, and `min <= max` when both are set.

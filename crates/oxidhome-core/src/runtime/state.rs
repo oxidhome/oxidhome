@@ -1272,15 +1272,12 @@ fn require_publish_authorized(
                 )));
             }
             if let EventPayload::StateChanged(sc) = payload {
-                super::schema::check_sensor_fields(
-                    &meta.info,
-                    &sc.capability,
-                    &sc.fields,
-                    super::schema::SensorWrite::Delta,
-                )
-                .map_err(|e| {
-                    WitError::InvalidArgument(format!("publish-event: device `{device_id}`: {e}"))
-                })?;
+                super::schema::check_sensor_fields(&meta.info, &sc.capability, &sc.fields)
+                    .map_err(|e| {
+                        WitError::InvalidArgument(format!(
+                            "publish-event: device `{device_id}`: {e}"
+                        ))
+                    })?;
             }
             Ok(())
         }

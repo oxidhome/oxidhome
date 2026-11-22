@@ -610,7 +610,7 @@ async fn call_service_args_are_checked_against_the_declared_schema() {
     };
 
     for (command, args, needle) in [
-        ("reset", Vec::new(), "declares no command `reset`"),
+        ("reset", Vec::new(), "declares no command \"reset\""),
         ("increment", by(Value::StringVal("2".into())), "`int-val`"),
         ("increment", by(Value::IntVal(0)), "expected 1..=1000"),
         (
