@@ -264,6 +264,18 @@ pub fn create_backup(state_dir: &Path, out: &Path) -> anyhow::Result<BackupRepor
         "parent directory of the backup target {} does not exist",
         out.display(),
     );
+    // Inside the state dir the archive could land in a tree it is
+    // copying (a plugin package) or one a restore moves / deletes.
+    let canonical_state = fs::canonicalize(state_dir)
+        .with_context(|| format!("resolving {}", state_dir.display()))?;
+    let canonical_parent =
+        fs::canonicalize(&parent).with_context(|| format!("resolving {}", parent.display()))?;
+    ensure!(
+        !canonical_parent.starts_with(&canonical_state),
+        "the backup target {} is inside the state dir {}; write it elsewhere",
+        out.display(),
+        state_dir.display(),
+    );
     let partial = parent.join(format!(".{name}.partial-{}", std::process::id()));
 
     let mut last_race = String::new();

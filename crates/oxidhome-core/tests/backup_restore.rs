@@ -239,10 +239,26 @@ fn online_backup_then_restore_round_trips_db_blobs_and_plugins() {
 /// An archive inside the state dir could be moved or deleted by the
 /// swap / staging cleanup; restore refuses it up front.
 #[test]
-fn restore_refuses_an_archive_inside_the_state_dir() {
+fn backup_and_restore_refuse_archives_inside_the_state_dir() {
     let fx = fixture();
+    let out_dir = support::tempdir("backup-out");
+    // Backups refuse to write into the state dir in the first place.
+    let inside = fx
+        .state
+        .path()
+        .join("plugins")
+        .join(PLUGIN_ID)
+        .join("backup");
+    let err = backup::create_backup(fx.state.path(), &inside).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("inside the state dir"),
+        "{err:#}"
+    );
+    assert!(!inside.exists());
+
     let archive = fx.state.path().join(RESTORE_STAGING_DIR);
-    backup::create_backup(fx.state.path(), &archive).unwrap();
+    backup::create_backup(fx.state.path(), &out_path(&out_dir)).unwrap();
+    std::fs::rename(out_path(&out_dir), &archive).unwrap();
     let err = backup::restore_offline(fx.state.path(), &archive).unwrap_err();
     assert!(
         format!("{err:#}").contains("inside the state dir"),
