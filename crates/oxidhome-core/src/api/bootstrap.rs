@@ -19,8 +19,12 @@
 //! 4. Insert the row iff the store is empty.
 //! 5. Atomically rename the pending file to `admin-token`.
 //!
-//! A failure at 2–4 removes the pending file and leaves the store
-//! untouched, so the next start mints again. A failure at 5 deletes
+//! A failure at 2–3 removes the pending file and leaves the store
+//! untouched, so the next start mints again. A failure at 4 keeps
+//! the pending file, because a commit error can be ambiguous (the
+//! transaction may still be durable); the next start's
+//! reconciliation promotes it if its token is live and discards it
+//! otherwise. A failure at 5 deletes
 //! the never-used row ([`TokenStore::delete_undelivered`]) so the
 //! next start mints again; if even that delete fails, the pending
 //! file is kept and [`reconcile_admin_token_files`] promotes it on
@@ -170,9 +174,16 @@ pub fn ensure_admin_token(
             return Ok(None);
         }
         Err(err) => {
-            remove_quietly(&pending);
+            // Keep the pending file: a commit error can be ambiguous
+            // (e.g. a WAL fsync IOERR whose frames still survive a
+            // restart), and the file may hold the only copy of a
+            // live secret. Startup reconciliation promotes it if the
+            // token turns out to be live and discards it otherwise.
             finalize(audit, audit_id, Outcome::Error);
-            return Err(anyhow::Error::new(err).context("minting admin token"));
+            return Err(anyhow::Error::new(err).context(format!(
+                "minting admin token (secret kept at {} until the next start resolves it)",
+                pending.display()
+            )));
         }
     }
 
@@ -420,11 +431,17 @@ pub fn recover_admin_token(
         match tokens.insert_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &to_revoke) {
             Ok(revoked) => revoked,
             Err(err) => {
-                remove_quietly(&pending);
+                // Keep the pending file — see the matching branch in
+                // `ensure_admin_token`: the commit may have landed.
                 for id in intents {
                     finalize(audit, id, Outcome::Error);
                 }
-                return Err(anyhow::Error::new(err).context("minting recovery admin token"));
+                return Err(anyhow::Error::new(err).context(format!(
+                    "minting recovery admin token failed; if the change did commit, the new \
+                     secret is in {} and the next daemon start promotes it (otherwise it is \
+                     discarded) — re-running recovery is also safe",
+                    pending.display()
+                )));
             }
         };
     // The mutation is committed: finalize as allowed regardless of
@@ -795,8 +812,11 @@ mod tests {
         assert!(!fx.admin_file().exists());
     }
 
+    /// A token-commit error may be ambiguous, so the pending secret
+    /// is kept; reconciliation then discards it because its token
+    /// never became live, and the next bootstrap mints cleanly.
     #[test]
-    fn db_insert_failure_removes_pending_secret() {
+    fn db_insert_failure_keeps_pending_for_reconcile() {
         let fx = fixture();
         fx.sql(
             "CREATE TRIGGER no_tokens BEFORE INSERT ON auth_token \
@@ -804,11 +824,41 @@ mod tests {
         );
         assert!(fx.bootstrap().is_err());
         assert_eq!(fx.tokens.count().unwrap(), 0);
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(fx.pending_files().len(), 1, "secret kept");
         assert!(!fx.admin_file().exists());
         let rows = fx.audit_rows(AUDIT_PATH_BOOTSTRAP);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].decision, "error");
+
+        fx.sql("DROP TRIGGER no_tokens;");
+        fx.reconcile().unwrap();
+        assert!(fx.pending_files().is_empty(), "never-live secret discarded");
+        assert_eq!(fx.audit_rows(AUDIT_PATH_PENDING_DISCARDED).len(), 1);
+        let issued = fx.bootstrap().unwrap().expect("retry mints");
+        assert_eq!(
+            fx.read_admin_file().as_deref(),
+            Some(issued.plaintext.as_str())
+        );
+    }
+
+    /// The ambiguous case itself: the commit is durable but the
+    /// caller saw an error. Simulated by committing the row and
+    /// leaving the pending file as the error branch does;
+    /// reconciliation must promote it instead of losing it.
+    #[test]
+    fn ambiguous_commit_is_promoted_not_lost() {
+        let fx = fixture();
+        let issued = TokenStore::generate();
+        write_new_secret(&pending_path(fx.dir.path(), &issued.id), &issued.plaintext).unwrap();
+        fx.tokens
+            .insert_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &[])
+            .unwrap();
+        fx.reconcile().unwrap();
+        assert_eq!(
+            fx.read_admin_file().as_deref(),
+            Some(issued.plaintext.as_str())
+        );
+        assert!(fx.pending_files().is_empty());
     }
 
     /// Rename into place fails (here: `admin-token` is a non-empty
@@ -997,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_db_failure_changes_nothing() {
+    fn recovery_db_failure_changes_no_tokens_and_keeps_pending() {
         let fx = fixture();
         let old = fx
             .tokens
@@ -1015,7 +1065,11 @@ mod tests {
             fx.tokens.verify_read_only(&old.plaintext).is_ok(),
             "revoke rolled back"
         );
-        assert!(fx.pending_files().is_empty());
+        assert_eq!(
+            fx.pending_files().len(),
+            1,
+            "secret kept: the commit error may be ambiguous"
+        );
         assert!(!fx.admin_file().exists());
         assert_eq!(fx.audit_rows(AUDIT_PATH_RECOVER)[0].decision, "error");
         assert_eq!(
