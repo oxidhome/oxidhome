@@ -49,6 +49,10 @@ pub(crate) const MAX_DESCRIPTION_LEN: usize = 1024;
 /// Longest `unit::other` label, in bytes.
 pub(crate) const MAX_UNIT_LABEL_LEN: usize = 32;
 
+/// Longest excerpt of a caller-controlled string an error message
+/// quotes, in characters.
+const MAX_QUOTED_CHARS: usize = 64;
+
 /// Code `unit::other` is projected as. Never a named unit's code.
 pub(crate) const OTHER_UNIT_CODE: &str = "other";
 
@@ -123,6 +127,16 @@ pub(crate) fn unit_code(unit: &Unit) -> &'static str {
     }
 }
 
+/// The first [`MAX_QUOTED_CHARS`] characters of `s`, for quoting a
+/// caller-controlled string in an error message without letting it
+/// size a host allocation.
+fn clip(s: &str) -> String {
+    match s.char_indices().nth(MAX_QUOTED_CHARS) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_owned(),
+    }
+}
+
 /// `(code, label)` identity of a unit, for equality without a
 /// `PartialEq` derive on the generated type.
 fn unit_identity(unit: &Unit) -> (&'static str, Option<&str>) {
@@ -173,6 +187,22 @@ pub(crate) fn measurement_fields(value: f64, unit: &Unit) -> Vec<KeyValue> {
     fields
 }
 
+fn sensor_unit(info: &DeviceInfo) -> Option<&Unit> {
+    info.capabilities.iter().find_map(|c| match c {
+        CapabilitySpec::Sensor(s) => Some(&s.unit),
+        _ => None,
+    })
+}
+
+/// Whether `update-device` changes the unit of a sensor both the old
+/// and the new registration declare.
+pub(crate) fn sensor_unit_changed(old: &DeviceInfo, new: &DeviceInfo) -> bool {
+    match (sensor_unit(old), sensor_unit(new)) {
+        (Some(a), Some(b)) => unit_identity(a) != unit_identity(b),
+        _ => false,
+    }
+}
+
 /// How a sensor field bag reaches the projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SensorWrite {
@@ -198,10 +228,7 @@ pub(crate) fn check_sensor_fields(
     if capability != "sensor" {
         return Ok(());
     }
-    let Some(spec_unit) = info.capabilities.iter().find_map(|c| match c {
-        CapabilitySpec::Sensor(s) => Some(&s.unit),
-        _ => None,
-    }) else {
+    let Some(spec_unit) = sensor_unit(info) else {
         return Ok(());
     };
     let (code, label) = unit_identity(spec_unit);
@@ -296,9 +323,13 @@ pub(crate) fn check_device_info(info: &DeviceInfo) -> Result<(), WitError> {
                     ext.version,
                 )
                 .map_err(|e| {
+                    // Not yet validated, so the parts may be huge.
                     invalid(format!(
-                        "extension capability `{}` is invalid: {e}",
-                        extension_capability_key(ext)
+                        "extension capability {:?}/{:?}@{} is invalid: {}",
+                        clip(&ext.namespace),
+                        clip(&ext.name),
+                        ext.version,
+                        clip(&e.to_string()),
                     ))
                 })?;
             }
@@ -377,7 +408,7 @@ fn check_field_spec(list: &str, field: &FieldSpec) -> Result<(), String> {
         return Err(format!(
             "{list} field name {:?} must be 1-{MAX_NAME_LEN} characters of [A-Za-z0-9_-], \
              starting with a letter or digit",
-            field.name
+            clip(&field.name)
         ));
     }
     check_description(&at(), field.description.as_ref())?;
@@ -485,7 +516,7 @@ pub(crate) fn check_service_info(info: &ServiceInfo) -> Result<(), WitError> {
             return Err(invalid(format!(
                 "command name {:?} must be 1-{MAX_NAME_LEN} characters of [A-Za-z0-9_-], \
                  starting with a letter or digit",
-                cmd.name
+                clip(&cmd.name)
             )));
         }
         if !seen.insert(cmd.name.as_str()) {
@@ -517,8 +548,9 @@ fn check_value(field: &FieldSpec, value: &Value) -> Result<(), String> {
     match (&field.constraint, value) {
         (Some(FieldConstraint::OneOf(allowed)), Value::StringVal(s)) if !allowed.contains(s) => {
             Err(format!(
-                "field `{}` is {s:?}; expected one of {allowed:?}",
-                field.name
+                "field `{}` is {:?}; expected one of {allowed:?}",
+                field.name,
+                clip(s)
             ))
         }
         (Some(FieldConstraint::IntRange(r)), Value::IntVal(n))
@@ -554,12 +586,12 @@ fn check_fields(schema: &[FieldSpec], values: &[KeyValue]) -> Result<(), String>
     let mut seen = HashSet::new();
     for kv in values {
         if !seen.insert(kv.key.as_str()) {
-            return Err(format!("field `{}` appears more than once", kv.key));
+            return Err(format!("field {:?} appears more than once", clip(&kv.key)));
         }
         let field = schema
             .iter()
             .find(|f| f.name == kv.key)
-            .ok_or_else(|| format!("field `{}` is not declared", kv.key))?;
+            .ok_or_else(|| format!("field {:?} is not declared", clip(&kv.key)))?;
         check_value(field, &kv.value)?;
     }
     if let Some(missing) = schema
@@ -583,7 +615,8 @@ pub(crate) fn find_command<'a>(
         .find(|c| c.name == command)
         .ok_or_else(|| {
             WitError::InvalidArgument(format!(
-                "service `{service}` declares no command `{command}`"
+                "service `{service}` declares no command {:?}",
+                clip(command)
             ))
         })
 }
@@ -661,6 +694,33 @@ mod tests {
         Unit::Decibel,
         Unit::Dbm,
     ];
+
+    #[test]
+    fn diagnostics_quote_at_most_a_clipped_excerpt() {
+        assert_eq!(clip("short"), "short");
+        let long = "\u{1}".repeat(1 << 16);
+        let spec = command(
+            vec![with(
+                field("mode", ValueKind::StringVal),
+                FieldConstraint::OneOf(vec!["home".into()]),
+            )],
+            vec![],
+        );
+        for args in [
+            vec![kv("mode", Value::StringVal(long.clone()))],
+            vec![kv(&long, Value::BoolVal(true))],
+        ] {
+            let Err(WitError::InvalidArgument(msg)) = check_args("svc-1", &spec, &args) else {
+                panic!("should be refused");
+            };
+            assert!(msg.len() < 1024, "message is {} bytes", msg.len());
+        }
+        let info = service(vec![command(vec![], vec![])]);
+        let Err(WitError::InvalidArgument(msg)) = find_command(&info, "svc-1", &long) else {
+            panic!("should be refused");
+        };
+        assert!(msg.len() < 1024, "message is {} bytes", msg.len());
+    }
 
     #[test]
     fn named_unit_codes_match() {

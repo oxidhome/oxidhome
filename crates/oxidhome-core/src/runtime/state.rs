@@ -973,8 +973,21 @@ impl host_devices::Host for PluginState {
         // lands, so a dropped capability's entries flip to `Stale`
         // instead of continuing to advertise as `Fresh` on a
         // device that no longer declares them.
-        let live_capabilities: Vec<String> =
-            info.capabilities.iter().map(capability_name).collect();
+        //
+        // M2: a sensor whose unit changes keeps its capability name,
+        // but its projected reading (and `unit` / `unit_label`) is in
+        // the old unit. Treat it as dropped so it flips `Stale` and
+        // the next reading replaces it instead of merging into it.
+        let unit_changed = self
+            .devices
+            .get(&self.instance_id, &id)
+            .is_ok_and(|old| super::schema::sensor_unit_changed(&old.info, &info));
+        let live_capabilities: Vec<String> = info
+            .capabilities
+            .iter()
+            .map(capability_name)
+            .filter(|name| !(unit_changed && name == "sensor"))
+            .collect();
         let outcome = self.devices.update(&self.instance_id, &id, info);
         if outcome.is_ok() {
             self.device_state
@@ -2299,6 +2312,58 @@ mod tests {
         host_devices::Host::get_device(&mut alpha, id)
             .await
             .expect("alpha still owns");
+    }
+
+    /// M2: `update-device` that changes a sensor's unit flips the
+    /// projected reading `Stale`, so a later delta can't merge into
+    /// a reading (and `unit_label`) recorded in the old unit. An
+    /// update that keeps the unit leaves it `Fresh`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_devices_update_changing_sensor_unit_stales_reading() {
+        use crate::state::StateQuality;
+
+        let mut state = fresh_state("alpha");
+        let sensor = |unit: capabilities::Unit| {
+            let mut info = empty_device("thermo");
+            info.capabilities = vec![capabilities::CapabilitySpec::Sensor(
+                capabilities::SensorSpec {
+                    unit: unit.clone(),
+                    min: None,
+                    max: None,
+                },
+            )];
+            info.initial_state = vec![capabilities::CapabilityState::Sensor(
+                capabilities::Measurement { value: 1.0, unit },
+            )];
+            info
+        };
+        let steps = || capabilities::Unit::Other("steps".into());
+        let id = host_devices::Host::register_device(&mut state, sensor(steps()))
+            .await
+            .expect("register");
+        let quality = |state: &PluginState| {
+            state
+                .device_state
+                .snapshot_device(&id)
+                .iter()
+                .find(|e| e.capability == "sensor")
+                .map(|e| e.quality)
+        };
+        assert_eq!(quality(&state), Some(StateQuality::Fresh));
+
+        host_devices::Host::update_device(&mut state, id.clone(), sensor(steps()))
+            .await
+            .expect("same-unit update");
+        assert_eq!(quality(&state), Some(StateQuality::Fresh));
+
+        host_devices::Host::update_device(
+            &mut state,
+            id.clone(),
+            sensor(capabilities::Unit::Celsius),
+        )
+        .await
+        .expect("unit-changing update");
+        assert_eq!(quality(&state), Some(StateQuality::Stale));
     }
 
     #[tokio::test(flavor = "current_thread")]
