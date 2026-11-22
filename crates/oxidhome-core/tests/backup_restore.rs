@@ -236,6 +236,28 @@ fn online_backup_then_restore_round_trips_db_blobs_and_plugins() {
     );
 }
 
+/// Disaster recovery: restore onto a machine with no state yet.
+#[test]
+fn restore_into_an_empty_state_dir() {
+    let fx = fixture();
+    let out_dir = support::tempdir("backup-out");
+    let archive = out_path(&out_dir);
+    backup::create_backup(fx.state.path(), &archive).unwrap();
+
+    let fresh = support::tempdir("backup-fresh");
+    let state = fresh.path().join("state");
+    backup::restore_offline(&state, &archive).expect("restore into empty dir");
+    let engine = Engine::with_state_dir(&state).unwrap();
+    assert!(engine.installed_plugins().get(PLUGIN_ID).is_some());
+    assert_eq!(
+        engine
+            .blobs()
+            .read_by_name(&fx.uuid, INSTANCE, "keep")
+            .unwrap(),
+        b"keep-bytes"
+    );
+}
+
 #[test]
 fn backup_refuses_existing_target_and_missing_database() {
     let fx = fixture();
@@ -271,10 +293,11 @@ fn backup_gives_up_when_an_indexed_blob_file_is_missing() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
-/// A live installation whose package directory is missing is an
-/// inconsistent state, not a race: fail at once with a clear error.
+/// A live installation whose package directory is missing looks
+/// like an install / uninstall in flight; when it persists the
+/// backup fails with an error naming the expected location.
 #[test]
-fn backup_fails_fast_when_a_live_plugin_has_no_package_dir() {
+fn backup_fails_when_a_live_plugin_has_no_package_dir() {
     let fx = fixture();
     std::fs::rename(
         fx.state.path().join("plugins").join(PLUGIN_ID),
@@ -284,10 +307,7 @@ fn backup_fails_fast_when_a_live_plugin_has_no_package_dir() {
     let out_dir = support::tempdir("backup-out");
     let err = backup::create_backup(fx.state.path(), &out_path(&out_dir)).unwrap_err();
     let msg = format!("{err:#}");
-    assert!(
-        msg.contains("live installation row") && !msg.contains("attempts"),
-        "{msg}"
-    );
+    assert!(msg.contains("not at plugins/<plugin_id>"), "{msg}");
     assert!(std::fs::read_dir(out_dir.path()).unwrap().next().is_none());
 }
 
@@ -585,6 +605,72 @@ fn interrupted_restore_blocks_startup_until_resumed() {
             .unwrap(),
         b"keep-bytes"
     );
+}
+
+/// A crash between the swap and the audit row leaves
+/// `.restore-audit-pending`; the daemon can start, and `--resume`
+/// records the missing row.
+#[test]
+fn resume_records_a_missing_restore_audit_row() {
+    let fx = fixture();
+    let out_dir = support::tempdir("backup-out");
+    let archive = out_path(&out_dir);
+    let report = backup::create_backup(fx.state.path(), &archive).unwrap();
+    let restored = backup::restore_offline(fx.state.path(), &archive).unwrap();
+    let previous = restored
+        .previous
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(
+        fx.state.path().join(backup::RESTORE_AUDIT_PENDING_FILE),
+        format!(
+            r#"{{"previous":"{previous}","archive_created_ms":{}}}"#,
+            report.manifest.created_ms
+        ),
+    )
+    .unwrap();
+    drop(Db::open_file(fx.state.path()).expect("audit-pending does not block startup"));
+
+    let resumed = backup::resume_restore_offline(fx.state.path()).unwrap();
+    assert_eq!(resumed.unwrap().previous, restored.previous);
+    assert!(
+        !fx.state
+            .path()
+            .join(backup::RESTORE_AUDIT_PENDING_FILE)
+            .exists()
+    );
+    let engine = Engine::with_state_dir(fx.state.path()).unwrap();
+    let rows = engine
+        .audit_log()
+        .query(
+            &AuditQuery {
+                path: Some(AUDIT_PATH_RESTORE.into()),
+                ..AuditQuery::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+/// A FIFO planted as the manifest is rejected, not waited on.
+#[cfg(unix)]
+#[test]
+fn verify_rejects_a_fifo_manifest_without_hanging() {
+    let fx = fixture();
+    let out_dir = support::tempdir("backup-out");
+    let archive = out_path(&out_dir);
+    backup::create_backup(fx.state.path(), &archive).unwrap();
+    std::fs::remove_file(archive.join(MANIFEST_FILE)).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(archive.join(MANIFEST_FILE))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let err = backup::verify_backup(&archive).unwrap_err();
+    assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
 }
 
 fn copy_tree(from: &Path, to: &Path) {

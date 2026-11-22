@@ -65,9 +65,10 @@
 //!    the current `oxidhome.db` (with its `-wal` / `-shm`), `blobs/`
 //!    and `plugins/` into `<state_dir>/pre-restore-<unix_ms>/` and
 //!    the staged copies into place;
-//! 4. removes the journal and boots an [`crate::Engine`] on the
-//!    restored state (applying any pending migrations) to record a
-//!    `cli.state.restore` audit row.
+//! 4. renames the journal to `.restore-audit-pending` and boots an
+//!    [`crate::Engine`] on the restored state (applying any pending
+//!    migrations) to record a `cli.state.restore` audit row, then
+//!    removes the marker. If that fails, `--resume` retries it.
 //!
 //! The swap is a handful of renames, not one. A crash in the middle
 //! leaves the journal behind; [`crate::state::Db::open_file`] then
@@ -128,6 +129,9 @@ pub const PLUGINS_DIR: &str = "plugins";
 /// Present while a restore swap is in flight. Its presence makes
 /// [`crate::state::Db::open_file`] refuse the state dir.
 pub const RESTORE_JOURNAL_FILE: &str = ".restore-journal";
+/// Present after the swap until the restore's audit row is recorded;
+/// `oxidhome restore --resume` retries the audit while it exists.
+pub const RESTORE_AUDIT_PENDING_FILE: &str = ".restore-audit-pending";
 /// Where a restore stages the archive before the swap.
 pub const RESTORE_STAGING_DIR: &str = ".restore-staging";
 /// Prefix of the directory a restore moves the previous state into.
@@ -373,7 +377,7 @@ fn backup_attempt(
     create_private_dir(&dest.join(PLUGINS_DIR))?;
 
     copy_indexed_blobs(state_dir, dest, &index, &mut files)?;
-    copy_live_plugins(state_dir, dest, &index, &source, &mut files)?;
+    copy_live_plugins(state_dir, dest, &index, &mut files)?;
 
     // The snapshot only pins the blob list; plugin trees are copied
     // from the live dir. An install / uninstall that committed after
@@ -452,7 +456,6 @@ fn copy_live_plugins(
     state_dir: &Path,
     dest: &Path,
     index: &SnapshotIndex,
-    source: &Connection,
     files: &mut Vec<FileEntry>,
 ) -> Result<(), AttemptError> {
     for plugin in &index.plugins {
@@ -466,20 +469,14 @@ fn copy_live_plugins(
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Raced an uninstall only if the row is gone by now;
-                // a live row without its directory (e.g. a package
-                // hand-placed under another directory name) won't fix
-                // itself on retry.
-                if read_live_plugins(source)?.contains(plugin) {
-                    return Err(anyhow::anyhow!(
-                        "installed plugin {} has a live installation row but no {rel} \
-                         directory; backups only archive packages at plugins/<plugin_id>",
-                        plugin.plugin_id,
-                    )
-                    .into());
-                }
+                // An install renames its package into place after the
+                // row commits; an uninstall removes it before the
+                // tombstone. Both are transient. A package hand-placed
+                // under another directory name is not, and fails once
+                // the retries run out.
                 return Err(AttemptError::Raced(format!(
-                    "installed plugin directory {rel} disappeared"
+                    "installed plugin directory {rel} is missing (install / uninstall in \
+                     progress, or the package is not at plugins/<plugin_id>)"
                 )));
             }
             Err(e) => {
@@ -947,8 +944,17 @@ pub fn resume_restore_offline(state_dir: &Path) -> anyhow::Result<Option<Restore
     let _lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
         .context("restore needs exclusive access — stop the daemon first")?;
     let _backup_lock = crate::exclusive_lock::acquire_backup_lock(state_dir, true)?;
-    let path = state_dir.join(RESTORE_JOURNAL_FILE);
-    let bytes = match fs::read(&path) {
+    if let Some(journal) = read_journal(&state_dir.join(RESTORE_JOURNAL_FILE))? {
+        return finish_restore(state_dir, &journal).map(Some);
+    }
+    if let Some(journal) = read_journal(&state_dir.join(RESTORE_AUDIT_PENDING_FILE))? {
+        return complete_restore_audit(state_dir, &journal).map(Some);
+    }
+    Ok(None)
+}
+
+fn read_journal(path: &Path) -> anyhow::Result<Option<RestoreJournal>> {
+    let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
@@ -957,10 +963,11 @@ pub fn resume_restore_offline(state_dir: &Path) -> anyhow::Result<Option<Restore
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     ensure!(
         journal.previous.starts_with(PRE_RESTORE_PREFIX) && is_safe_segment(&journal.previous),
-        "restore journal names an invalid previous-state directory {:?}",
+        "{} names an invalid previous-state directory {:?}",
+        path.display(),
         journal.previous,
     );
-    finish_restore(state_dir, &journal).map(Some)
+    Ok(Some(journal))
 }
 
 /// Refuse to touch a state dir whose restore swap was interrupted.
@@ -1034,6 +1041,7 @@ fn finish_restore(state_dir: &Path, journal: &RestoreJournal) -> anyhow::Result<
         rename_synced(
             &staging.join(DB_FILE_NAME),
             &state_dir.join(DB_FILE_NAME),
+            &staging,
             state_dir,
         )?;
     }
@@ -1041,22 +1049,44 @@ fn finish_restore(state_dir: &Path, journal: &RestoreJournal) -> anyhow::Result<
         if staging.join(dir).exists() {
             move_aside(&state_dir.join(dir), &previous.join(dir))?;
             sync_dir(&previous)?;
-            rename_synced(&staging.join(dir), &state_dir.join(dir), state_dir)?;
+            rename_synced(
+                &staging.join(dir),
+                &state_dir.join(dir),
+                &staging,
+                state_dir,
+            )?;
         }
     }
     remove_dir_if_exists(&staging)?;
-    let journal_path = state_dir.join(RESTORE_JOURNAL_FILE);
-    fs::remove_file(&journal_path)
-        .with_context(|| format!("removing {}", journal_path.display()))?;
+    // The swap is done: the journal becomes the audit-pending marker
+    // (one atomic rename), which no longer blocks `Db::open_file`.
+    fs::rename(
+        state_dir.join(RESTORE_JOURNAL_FILE),
+        state_dir.join(RESTORE_AUDIT_PENDING_FILE),
+    )
+    .context("retiring the restore journal")?;
     sync_dir(state_dir)?;
+    complete_restore_audit(state_dir, journal)
+}
 
+/// Record the restore's audit row, then drop the audit-pending
+/// marker. A crash in between records a duplicate row on resume —
+/// never a missing one.
+fn complete_restore_audit(
+    state_dir: &Path,
+    journal: &RestoreJournal,
+) -> anyhow::Result<RestoreReport> {
+    let previous = state_dir.join(&journal.previous);
     record_restore(state_dir, journal.archive_created_ms).with_context(|| {
         format!(
-            "the backup was swapped in, but opening the restored state failed; \
-             the previous state is in {}",
+            "the backup was swapped in, but opening the restored state or recording its \
+             audit row failed (retry with `oxidhome restore --resume`); the previous state \
+             is in {}",
             previous.display()
         )
     })?;
+    remove_file_if_exists(&state_dir.join(RESTORE_AUDIT_PENDING_FILE))?;
+    sync_dir(state_dir)?;
     Ok(RestoreReport {
         previous,
         archive_created_ms: journal.archive_created_ms,
@@ -1106,10 +1136,14 @@ fn move_aside(from: &Path, to: &Path) -> anyhow::Result<()> {
     fs::rename(from, to).with_context(|| format!("moving {} to {}", from.display(), to.display()))
 }
 
-fn rename_synced(from: &Path, to: &Path, dir: &Path) -> anyhow::Result<()> {
+/// Rename across two directories and sync both: resume uses the
+/// entry's absence from `from_dir` as its progress marker, so that
+/// removal must be as durable as the arrival in `to_dir`.
+fn rename_synced(from: &Path, to: &Path, from_dir: &Path, to_dir: &Path) -> anyhow::Result<()> {
     fs::rename(from, to)
         .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
-    sync_dir(dir)
+    sync_dir(to_dir)?;
+    sync_dir(from_dir)
 }
 
 // ── migration preflight ──────────────────────────────────────────
@@ -1349,7 +1383,9 @@ fn open_no_follow(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        // O_NONBLOCK: opening a FIFO planted in an archive must not
+        // hang; the regular-file check below then rejects it.
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = opts.open(path)?;
     if !file.metadata()?.is_file() {
