@@ -378,6 +378,18 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             action: req.action,
             args: req.args.into_iter().map(proto_key_value_to_wit).collect(),
         };
+        // H5: a client `Connect-Timeout-Ms` / `grpc-timeout` earlier
+        // than the invocation deadline bounds dispatch too, so a
+        // command still queued when the client gives up is `timed_out`
+        // and never runs.
+        let invocation = match ctx.deadline() {
+            Some(rpc) => {
+                let rpc = tokio::time::Instant::from_std(rpc);
+                let deadline = invocation.deadline().map_or(rpc, |d| d.min(rpc));
+                invocation.with_deadline(Some(deadline))
+            }
+            None => invocation,
+        };
         let report = handle
             .execute_command_in(invocation, req.device_id.clone(), cmd)
             .await;

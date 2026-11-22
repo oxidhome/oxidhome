@@ -65,6 +65,11 @@ pub const MAX_PENDING_COMMANDS_PER_INSTANCE: usize = 64;
 /// records `outcome_unknown` for it.
 pub const PENDING_COMMAND_TTL: Duration = Duration::from_mins(5);
 
+/// Longest capability name a pending entry retains. Real capability
+/// names are short; the bound keeps the table's footprint small even
+/// for a plugin that accepts whatever capability a caller sends.
+pub const MAX_PENDING_CAPABILITY_BYTES: usize = 256;
+
 /// Mint a fresh `cmd-<32 hex>` command id (128 random bits).
 #[must_use]
 pub fn mint_command_id() -> String {
@@ -185,6 +190,9 @@ impl CommandReport {
 const QUEUED: u8 = 0;
 const STARTED: u8 = 1;
 const ABANDONED: u8 = 2;
+/// Withdrawn by the caller's own deadline: the caller reports
+/// `timed_out` itself, so the supervisor doesn't audit it again.
+const WITHDRAWN: u8 = 3;
 
 /// Shared between the caller waiting on a command and the supervisor
 /// that will run it; decides `timed_out` vs `outcome_unknown` (see the
@@ -201,18 +209,33 @@ impl DispatchTicket {
             .is_ok()
     }
 
-    /// Withdraw a still-queued command. `true` means the command will
-    /// never run: this call abandoned it, or the supervisor already did
-    /// (an expired command it refused). `false` means the supervisor
+    /// Abandon a still-queued command nobody will report on (caller
+    /// dropped, or the supervisor refusing an expired one). `true`
+    /// means the command will never run; `false` means the supervisor
     /// already entered the plugin.
     pub(crate) fn try_abandon(&self) -> bool {
+        self.withdraw(ABANDONED)
+    }
+
+    /// Caller side, on its own deadline: like [`Self::try_abandon`],
+    /// but the caller reports `timed_out` itself.
+    pub(crate) fn try_withdraw(&self) -> bool {
+        self.withdraw(WITHDRAWN)
+    }
+
+    fn withdraw(&self, to: u8) -> bool {
         match self
             .0
-            .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(QUEUED, to, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => true,
-            Err(current) => current == ABANDONED,
+            Err(current) => current != STARTED,
         }
+    }
+
+    /// Whether the caller already reported this command as `timed_out`.
+    pub(crate) fn withdrawn_by_caller(&self) -> bool {
+        self.0.load(Ordering::Acquire) == WITHDRAWN
     }
 
     /// Whether the supervisor entered the plugin.
@@ -242,6 +265,9 @@ struct Pending {
     /// The entry's TTL timer, aborted when the entry leaves the table
     /// any other way, so finished commands don't leave sleeping tasks.
     expiry: tokio::task::AbortHandle,
+    /// When the entry expires; `take` refuses a completion after it
+    /// even if the timer task hasn't run yet.
+    expires_at: tokio::time::Instant,
 }
 
 /// What [`PendingCommands::take`] hands back for the completing
@@ -325,6 +351,11 @@ impl PendingCommands {
         capability: &str,
         ctx: InvocationContext,
     ) -> Result<(), String> {
+        if capability.len() > MAX_PENDING_CAPABILITY_BYTES {
+            return Err(format!(
+                "capability name is longer than {MAX_PENDING_CAPABILITY_BYTES} bytes"
+            ));
+        }
         if !command_id.starts_with(COMMAND_ID_PREFIX) {
             return Err(format!(
                 "command id `{}` was not minted by the host; it cannot be completed later",
@@ -354,10 +385,11 @@ impl PendingCommands {
             // Spawned under the lock so the timer can't fire before its
             // entry exists; it only takes the lock after sleeping.
             let ttl = Duration::from_millis(self.ttl_ms.load(Ordering::Relaxed));
+            let expires_at = tokio::time::Instant::now() + ttl;
             let weak: Weak<Self> = Arc::downgrade(self);
             let id = command_id.to_owned();
             let expiry = tokio::spawn(async move {
-                tokio::time::sleep(ttl).await;
+                tokio::time::sleep_until(expires_at).await;
                 if let Some(table) = weak.upgrade() {
                     table.expire(
                         &id,
@@ -374,6 +406,7 @@ impl PendingCommands {
                     capability: capability.to_owned(),
                     ctx,
                     expiry,
+                    expires_at,
                 },
             );
         }
@@ -405,7 +438,18 @@ impl PendingCommands {
         let p = entries
             .remove(command_id)
             .expect("entry checked under the same lock");
+        drop(entries);
         p.expiry.abort();
+        if tokio::time::Instant::now() >= p.expires_at {
+            // The TTL passed; the timer just hasn't run yet. Expire it
+            // here so a late completion can't count as `completed`.
+            let reason = "no completion arrived before the pending command expired";
+            self.expired(command_id, p, reason);
+            return Err(WitError::NotFound(format!(
+                "command `{}` expired before it was completed",
+                audit_cap(command_id),
+            )));
+        }
         Ok(PendingCommand {
             device_id: p.device_id,
             capability: p.capability,
@@ -633,7 +677,13 @@ mod tests {
         assert!(!t.started());
         // Abandoned by the supervisor first: the caller still learns
         // the command never ran.
-        assert!(t.try_abandon());
+        assert!(t.try_withdraw());
+        assert!(!t.withdrawn_by_caller());
+
+        let t = DispatchTicket::default();
+        assert!(t.try_withdraw());
+        assert!(t.withdrawn_by_caller());
+        assert!(!t.try_start());
     }
 
     #[test]
@@ -694,6 +744,29 @@ mod tests {
         table
             .register(&mint_command_id(), "inst-b", "dev-2", "switch", host_ctx())
             .expect("other instance");
+    }
+
+    #[tokio::test]
+    async fn pending_command_bounds_capability_and_refuses_late_completion() {
+        let table = Arc::new(PendingCommands::new(None));
+        let long = "x".repeat(MAX_PENDING_CAPABILITY_BYTES + 1);
+        assert!(
+            table
+                .register(&mint_command_id(), "inst-a", "dev-1", &long, host_ctx())
+                .is_err()
+        );
+        // The TTL has passed by the time the plugin completes; the
+        // completion loses even though the timer hasn't fired yet.
+        table.set_ttl(Duration::ZERO);
+        let id = mint_command_id();
+        table
+            .register(&id, "inst-a", "dev-1", "switch", host_ctx())
+            .expect("register");
+        assert!(matches!(
+            table.take("inst-a", &id),
+            Err(WitError::NotFound(_))
+        ));
+        assert!(table.is_empty());
     }
 
     #[tokio::test]

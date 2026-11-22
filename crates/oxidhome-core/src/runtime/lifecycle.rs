@@ -458,7 +458,7 @@ impl InstanceHandle {
         }
         let received = if let Some(d) = deadline {
             let Ok(received) = tokio::time::timeout_at(d, &mut rx).await else {
-                if ticket.try_abandon() {
+                if ticket.try_withdraw() {
                     return timed_out();
                 }
                 // Entered before the deadline; the reply may have
@@ -1322,7 +1322,7 @@ async fn run_execute(
             ),
         };
         if let Err(outcome) = reply.send(refused)
-            && !ctx.is_expired()
+            && !ticket.withdrawn_by_caller()
         {
             // The caller went away (disconnect, not its deadline:
             // that path reports `timed_out` itself) while the command
