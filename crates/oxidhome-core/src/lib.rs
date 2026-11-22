@@ -32,6 +32,11 @@ pub use state::{DeviceMeta, DeviceRegistry, EventBus, EventSubscription};
 /// [`oxidhome_manifest::compatibility::check`] against this constant
 /// (and [`MIN_SUPPORTED_SDK_VERSION`]) before instantiating.
 ///
+/// That check is a secondary signal: it only trusts what the plugin
+/// author wrote. The authoritative check is
+/// [`runtime::contract::verify_component`], which proves from the
+/// component binary that its WIT types match this host's contract.
+///
 /// Bumped in lockstep with the `oxidhome-sdk` release for external
 /// plugin authors — see the WIT/SDK versioning note in
 /// `ARCHITECTURE.md`.

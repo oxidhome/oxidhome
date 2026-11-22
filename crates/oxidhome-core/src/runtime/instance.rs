@@ -198,9 +198,14 @@ impl PluginInstance {
     /// 3. Compatibility-check the plugin's declared `sdk_version`
     ///    against this host's [`OXIDHOME_SDK_VERSION`] and
     ///    [`MIN_SUPPORTED_SDK_VERSION`].
+    ///    This is a secondary signal: the manifest is the author's
+    ///    claim.
     /// 4. Resolve the per-instance config (`merge` with the
     ///    optional override blob).
-    /// 5. Instantiate the wasm component.
+    /// 5. Prove from the component binary that its WIT types match
+    ///    this host's `oxidhome:plugin` contract
+    ///    ([`super::contract::verify_component`]).
+    /// 6. Instantiate the wasm component.
     ///
     /// Does **not** call [`Self::init`] — callers run that next.
     pub async fn load(
@@ -521,6 +526,21 @@ impl PluginInstance {
         // where an attacker with FS write access could swap
         // `plugin.wasm` between the digest walk and
         // `Component::from_file`.
+        let instance_id = instance_id.into();
+        // M1: prove from the binary itself that the component was
+        // built against this host's `oxidhome:plugin` contract. The
+        // manifest's `sdk_version` (checked earlier) is only the
+        // author's claim; this is the authoritative check, and it
+        // runs on the same in-memory bytes that get compiled.
+        super::contract::verify_component(wasm_bytes).with_context(|| {
+            format!(
+                "rejecting plugin {} (instance {}): component {} is incompatible with this host's \
+                 WIT contract",
+                manifest.plugin.id,
+                instance_id,
+                wasm_path.display(),
+            )
+        })?;
         let component = Component::from_binary(engine.raw(), wasm_bytes)
             .map_err(anyhow::Error::from)
             .with_context(|| format!("loading component from {}", wasm_path.display()))?;
@@ -548,7 +568,6 @@ impl PluginInstance {
             .map_err(anyhow::Error::from)
             .context("adding plugin world host imports to linker")?;
 
-        let instance_id = instance_id.into();
         let actor = Actor::plugin(instance_id.clone());
 
         // C1b: pin the installation UUID at load time. If the plugin

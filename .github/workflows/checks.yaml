@@ -155,6 +155,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # On a PR, HEAD is the merge commit; depth 2 brings in its
+          # first parent (the base) for the baseline-immutability diff.
+          fetch-depth: 2
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
       - run: cargo install-tools
       - name: Verify wit/deps is populated
@@ -173,6 +177,22 @@ jobs:
           fi
       - name: Validate WIT package + WASI imports
         run: wasm-tools component wit wit/
+      - name: Verify the WIT contract matches its version's baseline
+        # Fails when `wit/` changes `oxidhome:plugin` without a package
+        # version bump, or when a bump that claims to be compatible
+        # isn't (architecture review M1). See CONTRIBUTING.md for the
+        # bump-and-bless workflow.
+        run: cargo test -p oxidhome-wit --test contract_baseline
+      - name: Verify released WIT baselines are unchanged
+        # A baseline records a contract version plugins may already
+        # target, so a PR may add one but never edit or delete one.
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          changed=$(git diff --name-only --diff-filter=DMRT HEAD^1 HEAD -- crates/oxidhome-wit/baselines/)
+          if [ -n "$changed" ]; then
+            echo "::error::Released WIT contract baselines are immutable. Bump the package version in wit/oxidhome.wit and bless a new baseline instead of changing: $changed"
+            exit 1
+          fi
   Clippy:
     name: Check Rust code with Clippy
     runs-on: ubuntu-latest
