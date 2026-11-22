@@ -116,7 +116,7 @@ impl Snapshot {
                     "{} {}B {}",
                     tok(&b.name),
                     b.size_bytes,
-                    b.mime.as_deref().map_or_else(|| "-".to_owned(), tok)
+                    b.mime.as_deref().map_or_else(|| "-".to_owned(), esc)
                 )
             })
             .collect();
@@ -237,14 +237,14 @@ pub fn render_value(value: &Value) -> String {
 }
 
 /// A name in a delimited position (key, id, topic, …): bare when it
-/// is a plain word (letters, digits, `_-.:/@+`), otherwise quoted and
+/// is a plain word (letters, digits, `_-.:`), otherwise quoted and
 /// escaped like a Rust string, so no name can imitate the separators
 /// around it and every item stays on one line.
 fn tok(text: &str) -> String {
     let plain = !text.is_empty()
         && text
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-.:/@+".contains(c));
+            .all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c));
     if plain {
         text.to_owned()
     } else {
@@ -252,7 +252,8 @@ fn tok(text: &str) -> String {
     }
 }
 
-/// Trailing free text (an event's payload): escaped onto one line.
+/// Trailing free text (an event payload, a blob mime type): escaped
+/// onto one line.
 fn esc(text: &str) -> String {
     text.escape_debug().to_string()
 }
@@ -475,6 +476,7 @@ mod tests {
     fn names_cannot_imitate_separators() {
         assert_eq!(tok("count"), "count");
         assert_eq!(tok("automation.morning"), "automation.morning");
+        assert_eq!(tok("a/b@1"), "\"a/b@1\"");
         assert_eq!(tok(""), "\"\"");
         assert_eq!(tok("a = 1\n  b"), "\"a = 1\\n  b\"");
         let kv = |k: &str, v: bool| KeyValue {
