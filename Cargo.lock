@@ -1623,6 +1623,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxidhome-test-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "oxidhome-core",
+ "oxidhome-manifest",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "oxidhome-wit"
 version = "0.1.0"
 dependencies = [

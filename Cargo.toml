@@ -5,6 +5,7 @@ members = [
   "crates/oxidhome-manifest",
   "crates/oxidhome-proto",
   "crates/oxidhome-sdk",
+  "crates/oxidhome-test-host",
   "crates/oxidhome-wit",
 ]
 
@@ -28,6 +29,7 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
+oxidhome-core = { path = "crates/oxidhome-core", version = "0.1.0" }
 oxidhome-manifest = { path = "crates/oxidhome-manifest", version = "0.1.0" }
 oxidhome-proto = { path = "crates/oxidhome-proto", version = "0.1.0" }
 oxidhome-sdk = { path = "crates/oxidhome-sdk", version = "0.1.0" }
