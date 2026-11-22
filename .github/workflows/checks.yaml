@@ -186,8 +186,18 @@ jobs:
       - name: Verify released WIT baselines are unchanged
         # A baseline records a contract version plugins may already
         # target, so a PR may add one but never edit or delete one.
+        # Nothing targets a contract before the SDK is published, so
+        # the check switches on by itself once `oxidhome-sdk` drops
+        # `publish = false`; until then a baseline may be re-blessed
+        # in place.
         if: ${{ github.event_name == 'pull_request' }}
         run: |
+          sdk_publish=$(cargo metadata --no-deps --format-version 1 \
+            | jq -c '.packages[] | select(.name == "oxidhome-sdk") | .publish')
+          if [ "$sdk_publish" = "[]" ]; then
+            echo "::notice::oxidhome-sdk is unpublished (publish = false); WIT baselines may still change in place."
+            exit 0
+          fi
           changed=$(git diff --name-only --diff-filter=DMRT HEAD^1 HEAD -- crates/oxidhome-wit/baselines/)
           if [ -n "$changed" ]; then
             echo "::error::Released WIT contract baselines are immutable. Bump the package version in wit/oxidhome.wit and bless a new baseline instead of changing: $changed"
