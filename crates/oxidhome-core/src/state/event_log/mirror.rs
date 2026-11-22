@@ -77,6 +77,9 @@ pub fn is_gap_marker(event: &Event) -> bool {
         && matches!(&event.payload, EventPayload::Custom(c) if c.topic == GAP_MARKER_TOPIC)
 }
 
+const ORPHANED_WRITE: &str =
+    "an earlier event-log write is still running (its publish timed out or was cancelled)";
+
 /// Deadline and probe cadence for the degraded-mode state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MirrorPolicy {
@@ -377,14 +380,17 @@ impl EventLog {
     }
 
     fn park_late_marker(&self, marker: Event) {
-        let mut st = self.mirror.lock();
-        st.gap_markers_total += 1;
+        let marker_row_id = marker.row_id;
+        {
+            let mut st = self.mirror.lock();
+            st.gap_markers_total += 1;
+            st.undelivered_markers.push(marker);
+        }
         tracing::warn!(
             target: "event_log.mirror",
-            marker_row_id = marker.row_id,
+            marker_row_id,
             "event log: a timed-out recovery write committed late; its gap marker is in history",
         );
-        st.undelivered_markers.push(marker);
     }
 
     fn take_undelivered_markers(&self) -> Vec<Event> {
@@ -400,7 +406,7 @@ impl EventLog {
         match result {
             Ok((id, marker)) if probing => self.note_recovered(id, marker),
             Ok(_) => {}
-            Err(reason) => self.note_unrecorded(received_ms, reason, probing),
+            Err(reason) => self.note_unrecorded(received_ms, &reason, probing),
         }
     }
 
@@ -435,38 +441,52 @@ impl EventLog {
             }
             Some(outage) => outage.count(received_ms),
             None => {
-                let reason = "an earlier event-log write is still running \
-                              (its publish was cancelled)"
-                    .to_owned();
+                st.outage = Some(Outage::new(
+                    received_ms,
+                    ORPHANED_WRITE.to_owned(),
+                    Instant::now(),
+                ));
+                st.unrecorded_total += 1;
+                drop(st);
+                // Logged after the health lock is released (as are all
+                // mirror diagnostics), so a slow log sink can't stall
+                // `health()` or other publishers on it.
                 tracing::error!(
                     target: "event_log.mirror",
-                    error = %reason,
+                    error = ORPHANED_WRITE,
                     "event log degraded: live delivery continues without durable row ids \
                      and history will carry a gap marker once writes recover",
                 );
-                st.outage = Some(Outage::new(received_ms, reason, Instant::now()));
+                return Plan::Skip;
             }
         }
         st.unrecorded_total += 1;
         Plan::Skip
     }
 
-    fn note_unrecorded(&self, received_ms: i64, reason: String, probing: bool) {
+    fn note_unrecorded(&self, received_ms: i64, reason: &str, probing: bool) {
         let next_probe = Instant::now() + self.mirror.policy.probe_interval;
         let mut st = self.mirror.lock();
         st.unrecorded_total += 1;
-        if let Some(outage) = st.outage.as_mut() {
+        let still_degraded = if let Some(outage) = st.outage.as_mut() {
             outage.count(received_ms);
             outage.probe_covers = None;
             outage.next_probe = next_probe;
+            reason.clone_into(&mut outage.last_error);
+            Some(outage.unrecorded)
+        } else {
+            st.outage = Some(Outage::new(received_ms, reason.to_owned(), next_probe));
+            None
+        };
+        drop(st);
+        if let Some(unrecorded) = still_degraded {
             tracing::warn!(
                 target: "event_log.mirror",
                 probing,
-                unrecorded = outage.unrecorded,
+                unrecorded,
                 error = %reason,
                 "event log still degraded: write failed; live delivery continues without durable row ids",
             );
-            outage.last_error = reason;
         } else {
             tracing::error!(
                 target: "event_log.mirror",
@@ -476,7 +496,6 @@ impl EventLog {
                 "event log degraded: durable write failed; live delivery continues without durable row ids \
                  and history will carry a gap marker once writes recover",
             );
-            st.outage = Some(Outage::new(received_ms, reason, next_probe));
         }
     }
 
@@ -491,13 +510,6 @@ impl EventLog {
         st.gap_markers_total += 1;
         st.last_recovered_ms = Some(now_unix_ms());
         let covered = outage.probe_covers.unwrap_or(outage.unrecorded);
-        tracing::warn!(
-            target: "event_log.mirror",
-            unrecorded = covered,
-            degraded_since_ms = outage.since_ms,
-            first_row_id,
-            "event log recovered: gap marker written to history",
-        );
         let remainder = outage.unrecorded.saturating_sub(covered);
         if remainder > 0 {
             // Skipped while the probe's write ran: not covered by its
@@ -513,6 +525,14 @@ impl EventLog {
                 after_probe_ms: None,
             });
         }
+        drop(st);
+        tracing::warn!(
+            target: "event_log.mirror",
+            unrecorded = covered,
+            degraded_since_ms = outage.since_ms,
+            first_row_id,
+            "event log recovered: gap marker written to history",
+        );
     }
 
     /// One transaction: optional gap marker, then the event. Returns

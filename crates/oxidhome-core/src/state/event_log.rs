@@ -86,6 +86,10 @@ pub struct HistoricalEvent {
 /// rows from the whole table. Time bounds are inclusive on both ends
 /// and use `received_ms` (host-side, never the plugin's claim).
 ///
+/// H3 exception: host gap markers ([`GAP_MARKER_TOPIC`]) ignore the
+/// `device_id`, `instance_id`, `plugin_id` and `topic` selectors and
+/// are returned whenever they fall inside the time and cursor bounds.
+///
 /// Topic semantics:
 ///
 /// - `Some((s, TopicMatch::Exact))` → `topic = s`. Use for
