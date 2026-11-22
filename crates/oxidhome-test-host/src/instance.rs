@@ -108,7 +108,10 @@ impl TestPluginInstance {
     /// event if it subscribed with a matching filter, which in turn
     /// needs the `subscribes_events` capability. Other instances on
     /// the same host receive the event too, on their next
-    /// [`Self::deliver_pending_events`].
+    /// [`Self::deliver_pending_events`]. The event is published the
+    /// way host-side simulators publish: it skips the durable event
+    /// log, so the plugin sees `row-id: none` and the origin fields
+    /// exactly as the test set them.
     ///
     /// # Errors
     ///

@@ -176,9 +176,14 @@ async fn instance_ids_are_validated_and_unique() {
         .await
         .expect("id is free again after drop");
 
-    // Generated ids are distinct.
+    // Generated ids are distinct and skip ids a caller chose.
+    let taken = host
+        .load_with(staged.path(), LoadOptions::new().instance_id("test-1"))
+        .await
+        .unwrap();
     let a = host.load(staged.path()).await.unwrap();
     let b = host.load(staged.path()).await.unwrap();
+    assert_ne!(a.instance_id(), taken.instance_id());
     assert_ne!(a.instance_id(), b.instance_id());
 
     // A failed load releases its id.

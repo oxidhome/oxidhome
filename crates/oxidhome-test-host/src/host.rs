@@ -99,10 +99,8 @@ impl TestHost {
     /// be created; [`TestHostError::Engine`] if the engine or its
     /// database can't be set up.
     pub fn new() -> Result<Self, TestHostError> {
-        let state_dir = TempDir::new().map_err(|source| TestHostError::StateDir {
-            path: std::env::temp_dir(),
-            source,
-        })?;
+        let state_dir =
+            TempDir::new().map_err(|(path, source)| TestHostError::StateDir { path, source })?;
         let engine = Engine::with_state_dir(state_dir.path())
             .map_err(|e| TestHostError::Engine(e.into()))?;
         Ok(Self {
@@ -166,11 +164,16 @@ impl TestHost {
             config,
             grant,
         } = options;
-        let instance_id = instance_id
-            .unwrap_or_else(|| format!("test-{}", self.next_id.fetch_add(1, Ordering::Relaxed)));
-        if !oxidhome_core::state::is_safe_instance_id(&instance_id) {
-            return Err(TestHostError::InvalidInstanceId(instance_id));
-        }
+        let reservation = match instance_id {
+            Some(id) => {
+                if !oxidhome_core::state::is_safe_instance_id(&id) {
+                    return Err(TestHostError::InvalidInstanceId(id));
+                }
+                Reservation::claim(&self.live, id)?
+            }
+            None => Reservation::claim_generated(&self.live, &self.next_id),
+        };
+        let instance_id = reservation.id().to_owned();
 
         // Read the manifest once and pin it for the load, as
         // `Engine::start_instance` does, so the grant check below and
@@ -197,7 +200,6 @@ impl TestHost {
             }
         };
 
-        let reservation = Reservation::claim(&self.live, &instance_id)?;
         let inner = PluginInstance::load_with_pinned_manifest(
             &self.engine,
             plugin_dir,
@@ -229,17 +231,32 @@ struct Reservation {
 }
 
 impl Reservation {
-    fn claim(live: &LiveIds, id: &str) -> Result<Self, TestHostError> {
+    fn claim(live: &LiveIds, id: String) -> Result<Self, TestHostError> {
         let mut guard = live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !guard.insert(id.to_owned()) {
-            return Err(TestHostError::DuplicateInstanceId(id.to_owned()));
+        if !guard.insert(id.clone()) {
+            return Err(TestHostError::DuplicateInstanceId(id));
         }
         Ok(Self {
             live: Arc::clone(live),
-            id: Some(id.to_owned()),
+            id: Some(id),
         })
+    }
+
+    /// Claim the next free `test-<n>` id, skipping any a caller chose
+    /// explicitly.
+    fn claim_generated(live: &LiveIds, next: &AtomicU64) -> Self {
+        loop {
+            let id = format!("test-{}", next.fetch_add(1, Ordering::Relaxed));
+            if let Ok(reservation) = Self::claim(live, id) {
+                return reservation;
+            }
+        }
+    }
+
+    fn id(&self) -> &str {
+        self.id.as_deref().unwrap_or_default()
     }
 
     fn keep(mut self) -> LiveIds {

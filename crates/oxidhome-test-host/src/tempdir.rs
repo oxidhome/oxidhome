@@ -13,7 +13,8 @@ impl TempDir {
     /// Create `oxidhome-test-host-<pid>-<nanos>-<n>` under the system
     /// temp dir. The counter keeps two hosts created in the same
     /// nanosecond by one process apart.
-    pub(crate) fn new() -> std::io::Result<Self> {
+    /// On failure, returns the path it tried to create with the error.
+    pub(crate) fn new() -> Result<Self, (PathBuf, std::io::Error)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -23,8 +24,10 @@ impl TempDir {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
-        std::fs::create_dir(&path)?;
-        Ok(Self { path })
+        match std::fs::create_dir(&path) {
+            Ok(()) => Ok(Self { path }),
+            Err(e) => Err((path, e)),
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
