@@ -637,7 +637,9 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
 
 fn validate_config_field(path: &str, field: &ConfigField, errors: &mut Vec<ValidationError>) {
     match &field.ty {
-        ConfigFieldType::Bool { .. } | ConfigFieldType::String { .. } => {}
+        ConfigFieldType::Bool { .. }
+        | ConfigFieldType::String { .. }
+        | ConfigFieldType::Secret { .. } => {}
         ConfigFieldType::Int { default, min, max } => {
             validate_int_field(path, *default, *min, *max, errors);
         }

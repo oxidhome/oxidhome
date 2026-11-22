@@ -48,7 +48,7 @@ share one axum listener, so a household hub only exposes one endpoint.
 | Resource | `oxidhome://logs` | `logs:read` | Structured logs with `since`/`level`/`plugin`/… filters. |
 | Resource | `oxidhome://plugins` [+ `/{id}`] | `plugins:list` | Installed + running plugins; per-plugin detail. |
 | Resource | `oxidhome://status` | `status:read` | Version, uptime, DB ping, counts. |
-| Resource | `oxidhome://blobs/{instance}/{name}` | `blobs:read` | Base64-encoded blob store entries. |
+| Resource | `oxidhome://blobs/{instance}/{name}` | `blobs:read` | Base64-encoded blob store entries. `blobs:read` also unlocks raw `bytes-val` fields in events, device state, and command results on every surface; without it they come back as a `json-val` "withheld" marker. |
 | Tool | `device.send_command` | `devices:command` | Dispatch a capability command; sensitive. |
 | Tool | `logs.query` | `logs:read` | Tool-shape of `oxidhome://logs`. |
 | Tool | `events.history` | `events:read` | Tool-shape of `oxidhome://events`. |
@@ -60,6 +60,13 @@ share one axum listener, so a household hub only exposes one endpoint.
 | Prompt | `summarize_today` | `events:read` + `logs:read` | 24 h household summary. |
 | Prompt | `draft_automation` | `devices:list` | Composes `oxidhome://devices` + per-device detail. |
 | Prompt | `explain_recent_errors` | `logs:read` | 24 h error-log walk. |
+
+Every resource and tool body passes through the host's redaction pass
+(`crates/oxidhome-core/src/redact.rs`): values under credential-looking
+keys (`password`, `token`, `secret`, `api_key`, `authorization`, …) and
+`Bearer` / `oxh_` credentials in text come back as `***`, and a plugin's
+`type = "secret"` config fields appear as `{"secret": true, "set": …,
+"value": "***"}`.
 
 Every tool call lands in the audit ledger under a `mcp.tool.<name>` path;
 resource reads land as `mcp.resource.<family>`. Mutating tools use a

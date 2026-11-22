@@ -1648,6 +1648,8 @@ fn config_value_to_wit(v: &ConfigValue) -> Option<WitValue> {
         ConfigValue::Int(n) => Some(WitValue::IntVal(*n)),
         ConfigValue::Float(n) => Some(WitValue::FloatVal(*n)),
         ConfigValue::String(s) => Some(WitValue::StringVal(s.clone())),
+        // M7: the owning plugin is the one reader that sees the plaintext.
+        ConfigValue::Secret(s) => Some(WitValue::StringVal(s.expose().to_owned())),
         ConfigValue::Nested(_) => None,
     }
 }
@@ -2034,6 +2036,12 @@ impl logging::Host for PluginState {
         } else {
             message
         };
+        // M7: a plugin that logs its own declared secret doesn't get
+        // it persisted (the log layer then applies the generic rules).
+        let message = crate::redact::scrub_secret_values(
+            &message,
+            &crate::redact::config_secrets(&self.config),
+        );
         let instance_id = self.instance_id.as_str();
         match level {
             WitLevel::Trace => tracing::trace!(instance_id, "{message}"),

@@ -69,7 +69,7 @@ use crate::Engine;
 use crate::api::auth::wit_error_kind;
 use crate::api::scopes::{
     DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START,
-    PLUGINS_STOP, PLUGINS_UNINSTALL, require_scope,
+    PLUGINS_STOP, PLUGINS_UNINSTALL, can_read_blobs, require_scope,
 };
 use crate::api::server::{WireCommandResult, command_result_to_wire};
 use crate::auth::Actor;
@@ -682,9 +682,17 @@ pub(super) async fn call(
             device_send_command_call(engine.clone(), request.arguments, actor, invocation).await
         }
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
-        "events.history" => events_history_call(engine.clone(), request.arguments).await,
+        "events.history" => {
+            events_history_call(engine.clone(), request.arguments, can_read_blobs(actor)).await
+        }
         "events.subscribe" => {
-            events_subscribe_call(engine.clone(), request.arguments, cancelled).await
+            events_subscribe_call(
+                engine.clone(),
+                request.arguments,
+                cancelled,
+                can_read_blobs(actor),
+            )
+            .await
         }
         "plugins.list" => plugins_list_call(&engine, request.arguments),
         "plugins.show" => plugins_show_call(&engine, request.arguments, actor),
@@ -995,9 +1003,13 @@ enum ToolOutcome {
 }
 
 impl ToolOutcome {
+    /// M7: this is the single exit for every tool body, so the
+    /// [`crate::redact::redact_json`] pass over `Ok` values and
+    /// `ExecErr` bodies / messages lives here.
     fn into_result(self) -> Result<CallToolResult, McpError> {
         match self {
-            Self::Ok { value, .. } => {
+            Self::Ok { mut value, .. } => {
+                crate::redact::redact_json(&mut value);
                 // Round-3 F1 on PR #124: always keep
                 // `CallToolResult::structured`'s text mirror
                 // — legacy MCP clients that predate
@@ -1023,8 +1035,13 @@ impl ToolOutcome {
                 structured,
                 domain_kind: _,
             } => Ok(match structured {
-                Some(v) => CallToolResult::structured_error(v),
-                None => CallToolResult::error(vec![ContentBlock::text(message)]),
+                Some(mut v) => {
+                    crate::redact::redact_json(&mut v);
+                    CallToolResult::structured_error(v)
+                }
+                None => CallToolResult::error(vec![ContentBlock::text(
+                    crate::redact::scrub_text(&message).into_owned(),
+                )]),
             }),
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
@@ -1218,7 +1235,7 @@ async fn device_send_command_call(
     // rides on the `is_error: true` branch so clients see the
     // domain-error, and the wire body's `error.kind` is the
     // same tagged shape REST already returns.
-    let wire = command_result_to_wire(result);
+    let wire = command_result_to_wire(result, can_read_blobs(actor));
     let structured = match serde_json::to_value(&wire) {
         Ok(v) => v,
         Err(err) => {
@@ -1604,6 +1621,7 @@ struct EventsHistoryArgs {
 async fn events_history_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    blobs: bool,
 ) -> ToolOutcome {
     // `arguments = None` → empty filter, latest 100 rows.
     let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
@@ -1739,7 +1757,7 @@ async fn events_history_call(
 
     let events: Vec<_> = rows
         .into_iter()
-        .map(super::super::server::WireHistoricalEvent::from_row)
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
         .collect();
     let body = super::resources::EventsBody { events };
     match super::resources::encode_body_capped(&body, "events.history", MAX_TOOL_BODY_BYTES) {
@@ -1888,6 +1906,7 @@ async fn events_subscribe_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
     mut cancelled: CancelSignal,
+    blobs: bool,
 ) -> ToolOutcome {
     let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
     let args: EventsSubscribeArgs = match serde_json::from_value(args_value) {
@@ -2169,7 +2188,7 @@ async fn events_subscribe_call(
 
     let events: Vec<_> = rows
         .into_iter()
-        .map(super::super::server::WireHistoricalEvent::from_row)
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
         .collect();
     let body = super::resources::EventsBody { events };
     match super::resources::encode_body_capped(&body, "events.subscribe", MAX_TOOL_BODY_BYTES) {

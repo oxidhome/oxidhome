@@ -753,6 +753,10 @@ where
             Some(span_names.join("/"))
         };
 
+        // M7: redact at capture, before the row is queued, so no
+        // read surface (REST, Connect, MCP, CLI) ever sees the value.
+        event_fields.redact();
+
         let meta = event.metadata();
         let fields_blob = if event_fields.extra.is_empty() {
             Vec::new()
@@ -925,6 +929,30 @@ impl EventFields {
             }
             _ => {
                 self.extra.push((field.name().to_owned(), value));
+            }
+        }
+    }
+}
+
+impl EventFields {
+    /// Mask sensitive values in place: a field whose *name* is on the
+    /// [`crate::redact::is_sensitive_key`] denylist loses its value
+    /// whatever its type; every string value and the message go
+    /// through [`crate::redact::scrub_text`].
+    fn redact(&mut self) {
+        use crate::redact::{REDACTED, is_sensitive_key, scrub_text};
+        if let Some(message) = &mut self.message
+            && let std::borrow::Cow::Owned(scrubbed) = scrub_text(message)
+        {
+            *message = scrubbed;
+        }
+        for (name, value) in &mut self.extra {
+            if is_sensitive_key(name) {
+                *value = LogValue::String(REDACTED.to_owned());
+            } else if let LogValue::String(s) | LogValue::Debug(s) = value
+                && let std::borrow::Cow::Owned(scrubbed) = scrub_text(s)
+            {
+                *s = scrubbed;
             }
         }
     }
@@ -1197,6 +1225,39 @@ mod tests {
             "ratio should round-trip as Float(0.5)",
         );
         assert!(matches!(by_name["ok"], LogValue::Bool(true)));
+    }
+
+    /// M7: sensitive field names and credential-looking text are
+    /// masked before the row is queued.
+    #[test]
+    fn sensitive_values_are_redacted_at_capture() {
+        let store = store();
+        with_log_subscriber(&store, || {
+            tracing::info!(
+                target: "test",
+                password = "hunter2",
+                api_key = 1234_i64,
+                url = "https://h/x?token=abc123&page=2",
+                note = ?"Bearer qwerty",
+                host = "mqtt.local",
+                "login with password=hunter2 for bob",
+            );
+        });
+        store.wait_drained_for_test();
+
+        let rows = store.query(&LogQuery::default(), 16).expect("query");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.message, "login with password=*** for bob");
+        let by_name: std::collections::HashMap<&str, &LogValue> =
+            row.fields.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        assert!(matches!(by_name["password"], LogValue::String(s) if s == "***"));
+        assert!(matches!(by_name["api_key"], LogValue::String(s) if s == "***"));
+        assert!(
+            matches!(by_name["url"], LogValue::String(s) if s == "https://h/x?token=***&page=2")
+        );
+        assert!(matches!(by_name["note"], LogValue::Debug(s) if s == "Bearer ***"));
+        assert!(matches!(by_name["host"], LogValue::String(s) if s == "mqtt.local"));
     }
 
     /// Non-finite floats (`NaN`, `±inf`) round-trip as

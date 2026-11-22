@@ -1327,6 +1327,14 @@ impl PluginInstance {
         &self.store.data().manifest
     }
 
+    /// The resolved per-instance config, secrets included. Host-side
+    /// only: read surfaces must go through
+    /// [`crate::redact::masked_config_view`].
+    #[must_use]
+    pub fn config(&self) -> &InstanceConfig {
+        &self.store.data().config
+    }
+
     /// Per-instance wake `Notify` — C2d wake-isolation. Held on
     /// the `PluginState` inside `store.data()` and shared with the
     /// [`EventBus`](crate::state::EventBus) at

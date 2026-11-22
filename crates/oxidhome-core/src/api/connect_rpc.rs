@@ -83,7 +83,7 @@ use super::auth::{
 use super::scopes::{
     DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL,
     PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope, ScopeDenied,
-    require_scope,
+    can_read_blobs, require_scope,
 };
 
 /// `HealthService` implementation. Anonymous — no engine state is
@@ -216,6 +216,12 @@ fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
 /// contract with the middleware (which stamps it during auth);
 /// missing it is an internal bug rather than a client error →
 /// `ConnectError::internal`, not `Unauthenticated`.
+/// M7: does the request's `Actor` hold `blobs:read` (see
+/// [`can_read_blobs`])? `false` when the extension is missing.
+fn ctx_can_read_blobs(ctx: &RequestContext) -> bool {
+    ctx.extensions().get::<Actor>().is_some_and(can_read_blobs)
+}
+
 fn require_scope_connect(ctx: &RequestContext, required: Scope) -> Result<(), ConnectError> {
     // If the middleware failed to stamp `Actor` into extensions,
     // wrap the internal error through `rpc_err` too — otherwise a
@@ -269,6 +275,10 @@ impl oxidhome_proto::connect::oxidhome::v1::InstancesService for OxidHomeInstanc
                 instance_id: handle.instance_id().to_string(),
                 plugin_id: handle.plugin_id().to_string(),
                 state: format!("{:?}", handle.state()),
+                // M7: masked config view; empty until first load.
+                config_json: handle
+                    .config_view()
+                    .map_or_else(String::new, |v| v.to_string()),
                 ..Default::default()
             })
             .collect();
@@ -382,7 +392,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         if let CommandResult::Err(ref err) = result {
             record_domain_outcome(&ctx, err);
         }
-        Response::ok(command_result_to_proto(result))
+        Response::ok(command_result_to_proto(result, ctx_can_read_blobs(&ctx)))
     }
 }
 
@@ -438,7 +448,12 @@ fn wit_value_to_proto(value: Value) -> ProtoValue {
     }
 }
 
-fn command_result_to_proto(result: CommandResult) -> ExecuteCommandResponse {
+/// M7: `blobs` is the caller's `blobs:read`; without it returned
+/// `bytes-val` state is withheld.
+fn command_result_to_proto(mut result: CommandResult, blobs: bool) -> ExecuteCommandResponse {
+    if !blobs {
+        crate::redact::withhold_bytes_in_command_result(&mut result);
+    }
     let outcome = match result {
         CommandResult::Ok => {
             execute_command_response::Outcome::Ok(Box::<execute_command_response::Ok>::default())
@@ -998,13 +1013,15 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         // clients still see the pre-C2e "Lagged then Event"
         // ordering on the wire without the two-slot mpsc pressure
         // that starved fresh events under a tight consumer.
+        let blobs = ctx_can_read_blobs(&ctx);
         let response_stream = futures_util::stream::unfold(
             (subscription, None::<std::sync::Arc<WitEvent>>),
-            |(mut subscription, buffered_event)| async move {
+            move |(mut subscription, buffered_event)| async move {
                 use crate::state::SubscriberMessage;
                 if let Some(event) = buffered_event {
                     let body = tail_events_response::Body::Event(Box::new(wit_event_to_proto(
                         std::sync::Arc::unwrap_or_clone(event),
+                        blobs,
                     )));
                     return Some((
                         Ok(TailEventsResponse {
@@ -1021,6 +1038,7 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
                     }) => {
                         let body = tail_events_response::Body::Event(Box::new(wit_event_to_proto(
                             std::sync::Arc::unwrap_or_clone(event),
+                            blobs,
                         )));
                         Some((
                             Ok(TailEventsResponse {
@@ -1058,7 +1076,12 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
     }
 }
 
-fn wit_event_to_proto(event: WitEvent) -> ProtoEvent {
+/// M7: `blobs` is the subscriber's `blobs:read`; without it
+/// `bytes-val` state-change fields are withheld.
+fn wit_event_to_proto(mut event: WitEvent, blobs: bool) -> ProtoEvent {
+    if !blobs {
+        crate::redact::withhold_bytes_in_event(&mut event.payload);
+    }
     let payload = match event.payload {
         EventPayload::StateChanged(sc) => Some(proto_event::Payload::StateChanged(Box::new(
             ProtoStateChanged {

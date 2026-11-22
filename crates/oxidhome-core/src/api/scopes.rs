@@ -216,6 +216,17 @@ pub(crate) const STATUS_READ: Scope = Scope::new("status:read");
 /// name.
 pub(crate) const BLOBS_READ: Scope = Scope::new("blobs:read");
 
+/// M7: may this caller see raw `bytes-val` payloads? Camera
+/// snapshots, audio clips and inference frames ride device state,
+/// events and command results as `bytes-val`; a token needs
+/// `blobs:read` (or the wildcard) to receive them. Without it every
+/// read surface (REST, Connect, MCP) replaces the bytes with a
+/// `json-val` marker naming the size and this scope, see
+/// [`crate::redact::withhold_bytes`].
+pub(crate) fn can_read_blobs(actor: &Actor) -> bool {
+    BLOBS_READ.satisfied_by(actor.scopes())
+}
+
 /// C6: `plugins:ui` — see `GET /api/v1/plugins/{plugin_id}/ui`.
 /// Gates the sandboxed-iframe wrapper endpoint that hosts the
 /// plugin's UI. The wrapper page mints a short-lived

@@ -54,7 +54,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::Engine;
 use crate::api::scopes::{
     BLOBS_READ, DEVICES_LIST, EVENTS_READ, LOGS_READ, PLUGINS_LIST, STATUS_READ, Scope,
-    require_scope,
+    can_read_blobs, require_scope,
 };
 use crate::auth::Actor;
 use crate::state::audit_log::AuditEntry;
@@ -693,7 +693,7 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         Kind::PluginsDetail(id) => plugins_detail(&engine, id),
         // Events + logs hit `SQLite`, so parse the query
         // and run the read under `spawn_blocking`.
-        Kind::Events => events_read(engine, query_str).await,
+        Kind::Events => events_read(engine, query_str, can_read_blobs(actor)).await,
         Kind::Logs => logs_read(engine, query_str).await,
         Kind::Status => status_read(engine.clone()).await,
         // Blob reads also hit `SQLite` (the blob index) plus
@@ -853,6 +853,9 @@ fn plugins_list(engine: &Engine) -> ReadOutcome {
 pub(super) struct PluginInstanceDetail {
     pub(super) instance_id: String,
     pub(super) state: String,
+    /// M7: masked config view (see
+    /// [`crate::InstanceHandle::config_view`]).
+    pub(super) config: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -889,6 +892,7 @@ pub(super) fn plugins_detail_body(engine: &Engine, id: &str) -> Option<PluginDet
             instances.push(PluginInstanceDetail {
                 instance_id: handle.instance_id().to_string(),
                 state: format!("{:?}", handle.state()),
+                config: handle.config_view(),
             });
         }
     }
@@ -974,7 +978,7 @@ const EVENTS_KNOWN_KEYS: &[&str] = &[
     "until",
 ];
 
-async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
+async fn events_read(engine: Engine, raw_query: &str, blobs: bool) -> ReadOutcome {
     let query = match parse_query(raw_query) {
         Ok(q) => q,
         Err(err) => return ReadOutcome::InvalidParams(err),
@@ -1069,7 +1073,7 @@ async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
     };
     let events: Vec<_> = rows
         .into_iter()
-        .map(super::super::server::WireHistoricalEvent::from_row)
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
         .collect();
     encode(&EventsBody { events }, "events")
 }
@@ -2032,7 +2036,7 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     // tripped the cap).
     let mut writer = CappedWriter::with_cap(MAX_TEXT_BODY_BYTES);
     match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => match writer.into_string() {
+        Ok(()) => match writer.into_string().map(redact_body) {
             Ok(body) => ReadOutcome::OkText {
                 body,
                 mime: "application/json",
@@ -2070,6 +2074,22 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
 /// them to its own outcome enum without opening this
 /// module's `ReadOutcome` (which carries resource-side
 /// semantics the tool layer doesn't want).
+/// M7: apply [`crate::redact::redact_json`] to an encoded resource
+/// body. The body is already under [`MAX_TEXT_BODY_BYTES`], so the
+/// parse-back is bounded; a redaction can only grow it by a few bytes
+/// per masked number, well inside the transport headroom. Re-encodes
+/// only when something was masked.
+fn redact_body(body: String) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if crate::redact::redact_json(&mut value) {
+        serde_json::to_string(&value).unwrap_or(body)
+    } else {
+        body
+    }
+}
+
 pub(super) enum EncodedBody {
     Value(serde_json::Value),
     /// Body exceeded the caller-supplied cap; the reason
