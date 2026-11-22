@@ -18,6 +18,7 @@ pub mod dispatcher;
 mod instance;
 mod lifecycle;
 mod registry;
+mod schema;
 mod state;
 pub(crate) mod watchdog;
 

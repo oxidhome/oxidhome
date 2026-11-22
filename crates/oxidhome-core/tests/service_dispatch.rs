@@ -561,3 +561,82 @@ async fn delegated_chain_is_audited_against_external_root() {
     alpha.stop().await.expect("stop alpha");
     beta.stop().await.expect("stop beta");
 }
+
+/// M2: the dispatcher enforces the counter's declared command
+/// schemas before the callee runs. An undeclared command, an
+/// undeclared / mistyped / out-of-range argument are all
+/// `invalid-argument` and never reach the wasm (the counter's value
+/// stays untouched); a well-typed `by` lands and the reply passes the
+/// `returns` check.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_service_args_are_checked_against_the_declared_schema() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{
+        Error as WitError, KeyValue, Value,
+    };
+    use oxidhome_core::runtime::dispatcher;
+
+    let (engine, counter_dir, _caller_dir, _state) = setup();
+    let counter = engine
+        .start_instance(counter_dir, "counter", None)
+        .await
+        .expect("start counter");
+    counter.wait_for_running().await.expect("counter Running");
+    let target = await_service_id(&engine).await;
+
+    let grants = [oxidhome_manifest::ServiceGrant {
+        plugin: "example.service-counter".into(),
+        instance: "*".into(),
+        service: "counter".into(),
+        commands: vec!["*".into()],
+        caller_instance: "*".into(),
+    }];
+    let call = |command: &'static str, args: Vec<KeyValue>| {
+        dispatcher::call_service_from_host(
+            &engine,
+            "test-driver",
+            &grants,
+            &grants,
+            target.clone(),
+            command,
+            args,
+        )
+    };
+    let by = |value: Value| {
+        vec![KeyValue {
+            key: "by".into(),
+            value,
+        }]
+    };
+
+    for (command, args, needle) in [
+        ("reset", Vec::new(), "declares no command `reset`"),
+        ("increment", by(Value::StringVal("2".into())), "`int-val`"),
+        ("increment", by(Value::IntVal(0)), "expected 1..=1000"),
+        (
+            "get",
+            vec![KeyValue {
+                key: "extra".into(),
+                value: Value::BoolVal(true),
+            }],
+            "not declared",
+        ),
+    ] {
+        match call(command, args).await {
+            Err(WitError::InvalidArgument(msg)) => {
+                assert!(msg.contains(needle), "`{command}`: {msg}");
+            }
+            other => panic!("`{command}` should be invalid-argument, got {other:?}"),
+        }
+    }
+
+    match call("increment", by(Value::IntVal(5))).await {
+        Ok(CommandResult::OkWithState(fields)) => assert!(
+            matches!(fields.as_slice(), [KeyValue { key, value: Value::IntVal(5) }] if key == "value"),
+            "refused calls must not have reached the counter: {fields:?}",
+        ),
+        other => panic!("well-typed increment should succeed, got {other:?}"),
+    }
+
+    counter.stop().await.expect("stop counter");
+}

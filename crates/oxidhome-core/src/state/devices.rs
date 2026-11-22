@@ -389,7 +389,7 @@ pub const MAX_DEVICES_PER_INSTANCE: usize = 1024;
 /// `DeviceInfo.capabilities` list caps at this many entries.
 /// Without it, a plugin can grow one device's projection
 /// footprint arbitrarily via unique
-/// `capability-spec::extension(<name>)` values — bypassing
+/// `capability-spec::extension(...)` values — bypassing
 /// the per-instance device quota (that device counts as
 /// one) and forcing every capability onto the same snapshot
 /// page (all-caps-for-one-device is atomic). Chosen

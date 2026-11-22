@@ -585,7 +585,7 @@ impl services::Host for PluginState {}
 // tracked so commands can be routed back to the registering instance.
 // Phase 4 layers in the manifest's `declares_devices` capability
 // gate: each capability the device declares must be in the manifest's
-// declared list (or the `extension(<name>)` escape hatch), otherwise
+// declared list (or a namespaced `extension(<ns>/<name>@<v>)` key), otherwise
 // `register-device` returns `permission-denied`. Phase 6 adds multi-
 // instance lifecycle and crash-isolated re-registration.
 
@@ -601,7 +601,9 @@ pub(crate) fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
         capabilities::CapabilitySpec::Button => "button".into(),
         capabilities::CapabilitySpec::VideoStream => "video-stream".into(),
         capabilities::CapabilitySpec::AudioStream => "audio-stream".into(),
-        capabilities::CapabilitySpec::Extension(name) => format!("extension({name})"),
+        capabilities::CapabilitySpec::Extension(ext) => {
+            super::schema::extension_capability_key(ext)
+        }
     }
 }
 
@@ -664,16 +666,9 @@ fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
                     }
                     fields
                 }
-                capabilities::CapabilityState::Sensor(m) => vec![
-                    KeyValue {
-                        key: "value".into(),
-                        value: Value::FloatVal(m.value),
-                    },
-                    KeyValue {
-                        key: "unit".into(),
-                        value: Value::StringVal(m.unit.clone()),
-                    },
-                ],
+                capabilities::CapabilityState::Sensor(m) => {
+                    super::schema::measurement_fields(m.value, &m.unit)
+                }
             };
             (name, fields)
         })
@@ -712,6 +707,11 @@ fn authorize_device_info(declared: &[String], info: &DeviceInfo) -> Result<(), W
             info.capabilities.len(),
         )));
     }
+    // M2: extension ids are namespaced + versioned, sensor units
+    // come from the defined set (or a non-contractual `other` label),
+    // sensor ranges are sane, and an initial reading uses its spec's
+    // unit.
+    super::schema::check_device_info(info)?;
     // H9 round-14 finding 1: reject oversized `initial_state`
     // entries at the WIT boundary. Pre-fix, the store
     // silently truncated them and the caller saw success.
@@ -1070,6 +1070,7 @@ impl host_services::Host for PluginState {
             return Err(err);
         }
         check_no_wildcard_command_names(&info)?;
+        super::schema::check_service_info(&info)?;
         // H10: registry now enforces `(owner_instance, local_id)`
         // uniqueness and surfaces the collision as
         // `InvalidArgument` — pass it through.
@@ -1107,6 +1108,7 @@ impl host_services::Host for PluginState {
             return Err(err);
         }
         check_no_wildcard_command_names(&info)?;
+        super::schema::check_service_info(&info)?;
         self.services.update(&self.instance_id, &id, info)
     }
 
@@ -2917,16 +2919,85 @@ mod tests {
             .expect("switch is declared, register should succeed");
     }
 
-    /// The `extension(<name>)` escape hatch must round-trip through
-    /// the gate: a manifest declaring `extension(window-shade)`
-    /// accepts a device with that capability.
+    /// M2: `register-service` / `update-service` refuse a malformed
+    /// command schema with `invalid-argument` before the registry is
+    /// touched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_services_register_refuses_malformed_schema() {
+        use crate::host_impl::plugin::oxidhome::plugin::services::{
+            CommandSpec, FieldConstraint, FieldSpec, ValueKind,
+        };
+        use oxidhome_manifest::CapabilitiesSection;
+
+        let mut manifest = (*fixture_manifest("test.schema")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            declares_services: vec!["svc".into()],
+            ..CapabilitiesSection::default()
+        };
+        let services = Arc::new(ServiceRegistry::new());
+        let mut state = PluginState::new(
+            "alpha",
+            "test.schema",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
+            Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
+            fresh_event_log(),
+            fresh_blobs(),
+            Arc::clone(&services),
+            Arc::new(InstanceRegistry::new()),
+        );
+        let info = |constraint| ServiceInfo {
+            local_id: "svc".into(),
+            name: "svc".into(),
+            metadata: Vec::new(),
+            commands: vec![CommandSpec {
+                name: "set".into(),
+                description: None,
+                params: vec![FieldSpec {
+                    name: "level".into(),
+                    kind: ValueKind::IntVal,
+                    required: true,
+                    description: None,
+                    constraint,
+                }],
+                returns: Vec::new(),
+            }],
+        };
+
+        let bad = Some(FieldConstraint::OneOf(vec!["a".into()]));
+        let err = host_services::Host::register_service(&mut state, info(bad.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::InvalidArgument(ref msg) if msg.contains("one-of")),
+            "got {err:?}",
+        );
+        assert!(services.list().is_empty(), "registry must be untouched");
+
+        let id = host_services::Host::register_service(&mut state, info(None))
+            .await
+            .expect("well-formed schema registers");
+        let err = host_services::Host::update_service(&mut state, id, info(bad))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    /// M2: a namespaced, versioned extension must round-trip through
+    /// the gate: a manifest declaring
+    /// `extension(com.acme/window-shade@1)` accepts a device with that
+    /// capability, and refuses the same extension at another version.
     #[tokio::test(flavor = "current_thread")]
     async fn host_devices_register_allows_declared_extension() {
         use oxidhome_manifest::CapabilitiesSection;
 
         let mut manifest = (*fixture_manifest("test.window-shade")).clone();
         manifest.capabilities = CapabilitiesSection {
-            declares_devices: vec!["extension(window-shade)".into()],
+            declares_devices: vec!["extension(com.acme/window-shade@1)".into()],
             ..CapabilitiesSection::default()
         };
         let mut state = PluginState::new(
@@ -2945,13 +3016,28 @@ mod tests {
             Arc::new(InstanceRegistry::new()),
         );
 
+        let shade = |version| {
+            capabilities::CapabilitySpec::Extension(capabilities::ExtensionSpec {
+                namespace: "com.acme".into(),
+                name: "window-shade".into(),
+                version,
+            })
+        };
         let mut info = empty_device("d-shade");
-        info.capabilities = vec![capabilities::CapabilitySpec::Extension(
-            "window-shade".into(),
-        )];
+        info.capabilities = vec![shade(1)];
         host_devices::Host::register_device(&mut state, info)
             .await
             .expect("declared extension should pass");
+
+        let mut info = empty_device("d-shade-v2");
+        info.capabilities = vec![shade(2)];
+        let err = host_devices::Host::register_device(&mut state, info)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WitError::PermissionDenied(ref msg) if msg.contains("window-shade@2")),
+            "an undeclared schema version must be refused, got {err:?}",
+        );
     }
 
     /// `initial_state` for a capability the device's `capabilities`
@@ -2971,7 +3057,7 @@ mod tests {
             capabilities::CapabilityState::Switch(capabilities::Switchable { state: true }),
             capabilities::CapabilityState::Sensor(capabilities::Measurement {
                 value: 21.5,
-                unit: "celsius".into(),
+                unit: capabilities::Unit::Celsius,
             }),
         ];
         let err = host_devices::Host::register_device(&mut state, info)
@@ -3042,7 +3128,7 @@ mod tests {
         bad.initial_state = vec![capabilities::CapabilityState::Sensor(
             capabilities::Measurement {
                 value: 21.5,
-                unit: "celsius".into(),
+                unit: capabilities::Unit::Celsius,
             },
         )];
         let err = host_devices::Host::update_device(&mut state, id, bad)

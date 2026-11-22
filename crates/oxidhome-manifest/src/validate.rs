@@ -9,6 +9,7 @@
 use thiserror::Error;
 
 use crate::config::{ConfigField, ConfigFieldType};
+use crate::extension::ExtensionId;
 use crate::manifest::PluginManifest;
 
 /// One validator finding. Variants carry the field-specific context
@@ -49,6 +50,12 @@ pub enum ValidationError {
          is not a known device capability"
     )]
     UnknownDeclaredDeviceCapability { got: String },
+
+    #[error("extension capability `{got}` in `capabilities.declares_devices` is invalid: {reason}")]
+    InvalidExtensionCapability {
+        got: String,
+        reason: crate::extension::ExtensionIdError,
+    },
 
     #[error(
         "capabilities.consumes_services has {count} entries; the cap is {max}. \
@@ -327,7 +334,8 @@ pub const MAX_CONSUMES_SERVICES_GRANTS: usize = 128;
 /// Chosen generously — the known capability universe is
 /// small (`switch`, `dimmer`, `color-light`, `sensor`,
 /// `button`, `video-stream`, `audio-stream`, plus
-/// `extension(<name>)` — a real plugin picks a handful).
+/// `extension(<namespace>/<name>@<version>)` keys — a real plugin
+/// picks a handful).
 pub const MAX_DECLARES_DEVICES: usize = 64;
 
 /// H10 round-4: hard cap on a single grant's `commands` list.
@@ -573,8 +581,16 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
         });
     }
     for cap in &m.capabilities.declares_devices {
-        if !is_known_device_capability(cap) {
-            errors.push(ValidationError::UnknownDeclaredDeviceCapability { got: cap.clone() });
+        match ExtensionId::parse_capability(cap) {
+            Some(Ok(_)) => {}
+            Some(Err(reason)) => errors.push(ValidationError::InvalidExtensionCapability {
+                got: cap.clone(),
+                reason,
+            }),
+            None if KNOWN_DEVICE_CAPABILITIES.contains(&cap.as_str()) => {}
+            None => {
+                errors.push(ValidationError::UnknownDeclaredDeviceCapability { got: cap.clone() });
+            }
         }
     }
 
@@ -903,12 +919,11 @@ fn is_valid_label(label: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// 0.1 capability names the WIT knows. Kept in sync with
-/// `wit/oxidhome.wit` `capability-spec`. The `extension(string)`
-/// variant of `capability-spec` is the escape hatch — manifests
-/// spell it as the string form `"extension(<name>)"`. A plain
-/// capability not on this list and not matching that shape fails
-/// validation.
+/// Standard capability names the WIT knows. Kept in sync with
+/// `wit/oxidhome.wit` `capability-spec`. Plugin-defined capabilities
+/// use the `extension(extension-spec)` variant instead, which
+/// manifests spell as `"extension(<namespace>/<name>@<version>)"`
+/// (see [`ExtensionId`]). Anything else fails validation.
 const KNOWN_DEVICE_CAPABILITIES: &[&str] = &[
     "switch",
     "dimmer",
@@ -918,27 +933,6 @@ const KNOWN_DEVICE_CAPABILITIES: &[&str] = &[
     "video-stream",
     "audio-stream",
 ];
-
-fn is_known_device_capability(s: &str) -> bool {
-    // The `extension(string)` variant of `capability-spec` in
-    // `wit/oxidhome.wit` is the escape hatch plugin authors use for
-    // capabilities outside the standard set. The WIT carries an
-    // opaque string payload; the manifest spells the same idea as
-    // `"extension(<name>)"`, e.g. `extension(window-shade)`. Accept
-    // anything matching that shape verbatim — but require a
-    // non-empty, non-whitespace payload between the parens.
-    // `extension()` or `extension(   )` is almost certainly a typo
-    // and silently letting it through would be hard to diagnose
-    // later. We don't validate the payload's *grammar* beyond
-    // "non-blank" (that's a per-extension concern).
-    if let Some(payload) = s
-        .strip_prefix("extension(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        return !payload.trim().is_empty();
-    }
-    KNOWN_DEVICE_CAPABILITIES.contains(&s)
-}
 
 #[cfg(test)]
 mod tests {
@@ -1016,26 +1010,34 @@ mod tests {
         }
     }
 
+    /// M2: extension capabilities are namespaced and versioned.
     #[test]
     fn accepts_extension_capabilities() {
         let mut m = ok_manifest();
-        m.capabilities.declares_devices = vec!["extension(window-shade)".into()];
-        validate(&m).expect("extension(<name>) is the escape hatch");
+        m.capabilities.declares_devices = vec!["extension(com.acme/window-shade@1)".into()];
+        validate(&m).expect("a namespaced, versioned extension id is valid");
     }
 
-    /// `extension()` and `extension(   )` are almost certainly typos;
-    /// the validator should reject them rather than silently accept
-    /// an empty-name escape hatch.
+    /// M2: the pre-0.2 bare `extension(<name>)` form, blank payloads,
+    /// missing versions, and reserved namespaces are refused with the
+    /// reason.
     #[test]
-    fn rejects_extension_with_blank_payload() {
-        for bad in ["extension()", "extension( )", "extension(   )"] {
+    fn rejects_malformed_extension_capabilities() {
+        for bad in [
+            "extension()",
+            "extension( )",
+            "extension(window-shade)",
+            "extension(com.acme/window-shade)",
+            "extension(com.acme/window-shade@0)",
+            "extension(oxidhome.core/thing@1)",
+        ] {
             let mut m = ok_manifest();
             m.capabilities.declares_devices = vec![bad.into()];
             let errs = validate(&m).unwrap_err();
             assert!(
                 errs.iter().any(|e| matches!(
                     e,
-                    ValidationError::UnknownDeclaredDeviceCapability { got } if got == bad
+                    ValidationError::InvalidExtensionCapability { got, .. } if got == bad
                 )),
                 "expected `{bad}` to be rejected, got {errs:?}",
             );

@@ -24,6 +24,7 @@
 
 pub mod compatibility;
 pub mod config;
+pub mod extension;
 pub mod network;
 pub mod validate;
 
@@ -31,6 +32,7 @@ mod manifest;
 
 pub use compatibility::{CompatError, check as check_compatibility};
 pub use config::{ConfigField, ConfigFieldType, ConfigValue, InstanceConfig, merge};
+pub use extension::{ExtensionId, ExtensionIdError};
 pub use manifest::{
     CapabilitiesSection, PluginManifest, PluginSection, RestartPolicy, RuntimeSection,
     ServiceGrant, UiPermissions, UiSection, World,

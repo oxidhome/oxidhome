@@ -12,7 +12,7 @@
 
 use oxidhome_sdk::Plugin;
 use oxidhome_sdk::bindings::oxidhome::plugin::devices::CommandResult;
-use oxidhome_sdk::bindings::oxidhome::plugin::types::Value;
+use oxidhome_sdk::bindings::oxidhome::plugin::types::{KeyValue, Value};
 use oxidhome_sdk::host;
 
 #[derive(Default)]
@@ -44,8 +44,14 @@ impl Plugin for ServiceCaller {
             .map_err(|e| format!("reading target_service_id config: {e}"))?
             .ok_or_else(|| "target_service_id not configured".to_string())?;
 
-        for _ in 0..3 {
-            let result = host::call_service(&target, "increment", &[])
+        // `by` is an optional, host-validated int param (defaults to
+        // 1); pass it explicitly once to exercise the typed path.
+        let by_one = [KeyValue {
+            key: "by".into(),
+            value: Value::IntVal(1),
+        }];
+        for args in [&by_one[..], &[], &[]] {
+            let result = host::call_service(&target, "increment", args)
                 .map_err(|e| format!("call counter.increment: {e:?}"))?;
             let _ = extract_value(&result)?;
         }
