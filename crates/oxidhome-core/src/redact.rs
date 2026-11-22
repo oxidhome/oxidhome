@@ -354,10 +354,23 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
         let quote = bytes[start];
         start += 1;
         let mut end = start;
+        // Inside an escaped string, `\\` decodes to a backslash and
+        // `\"` to a quote; that quote closes the value only when it is
+        // not itself escaped at the inner level, i.e. preceded by an
+        // even number of decoded backslashes (`\\\"` is data).
+        let mut inner_backslashes = 0usize;
         while end < bytes.len() {
             if bytes[end] == b'\\' {
-                if escaped && end + 1 < bytes.len() && bytes[end + 1] == quote {
-                    break;
+                let next = bytes.get(end + 1).copied();
+                if escaped {
+                    if next == Some(quote) && inner_backslashes.is_multiple_of(2) {
+                        break;
+                    }
+                    inner_backslashes = if next == Some(b'\\') {
+                        inner_backslashes + 1
+                    } else {
+                        0
+                    };
                 }
                 end += 2;
                 continue;
@@ -365,6 +378,7 @@ fn match_key_value(text: &str, pos: usize, floor: usize) -> Option<(usize, usize
             if bytes[end] == quote {
                 break;
             }
+            inner_backslashes = 0;
             end += 1;
         }
         end.min(bytes.len())
@@ -418,40 +432,56 @@ pub fn scrub_secret_values<'a>(text: &'a str, secrets: &[&str]) -> Cow<'a, str> 
     if secrets.is_empty() {
         return Cow::Borrowed(text);
     }
-    // One pass over the original text, merging overlapping matches as
-    // they are found: replacing one secret before searching for the
-    // next would break up an overlapping match and leave a fragment,
-    // and collecting every occurrence first would let a repetitive
-    // message allocate per match. Bookkeeping here is O(1); the output
-    // is never longer than the input plus one marker per merged run.
+    // One Aho-Corasick pass (linear in text + secrets + matches)
+    // reporting overlapping matches in order of their end offset.
+    // Replacing one secret before searching for the next would break
+    // up an overlapping match and leave a fragment, so matches merge
+    // into runs first. A later match can still reach back into an
+    // earlier run (a long secret ending after a short one), but never
+    // further back than the longest secret, so only runs inside that
+    // window stay pending; older ones are final and are copied out.
+    // Pinned to the contiguous NFA: the default would pick a DFA for a
+    // small pattern set, whose construction is quadratic in a long
+    // repetitive secret.
+    let Ok(matcher) = aho_corasick::AhoCorasick::builder()
+        .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+        .build(&secrets)
+    else {
+        // Only fails on pathological sizes; withhold the text rather
+        // than risk passing a secret through.
+        return Cow::Borrowed(REDACTED);
+    };
+    let window = secrets.iter().map(|s| s.len()).max().unwrap_or(0);
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    let mut run: Option<(usize, usize)> = None;
-    for (i, _) in text.char_indices() {
-        let Some(end) = secrets
-            .iter()
-            .filter(|s| text[i..].starts_with(**s))
-            .map(|s| i + s.len())
-            .max()
-        else {
-            continue;
-        };
-        match &mut run {
-            Some((_, run_end)) if i <= *run_end => *run_end = (*run_end).max(end),
-            _ => {
-                if let Some((start, run_end)) = run.take() {
-                    out.push_str(&text[copied..start]);
-                    out.push_str(REDACTED);
-                    copied = run_end;
-                }
-                run = Some((i, end));
-            }
+    let mut pending: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
+    let flush = |out: &mut String, copied: &mut usize, (start, end): (usize, usize)| {
+        out.push_str(&text[*copied..start]);
+        out.push_str(REDACTED);
+        *copied = end;
+    };
+    for m in matcher.find_overlapping_iter(text) {
+        let (mut start, mut end) = (m.start(), m.end());
+        while let Some(&(s, e)) = pending.back()
+            && e >= start
+        {
+            pending.pop_back();
+            start = start.min(s);
+            end = end.max(e);
+        }
+        pending.push_back((start, end));
+        // Every later match ends at or after `m.end()`, so it starts at
+        // or after `m.end() - window`; a run ending before that is final.
+        let horizon = m.end().saturating_sub(window);
+        while let Some(&run) = pending.front()
+            && run.1 < horizon
+        {
+            pending.pop_front();
+            flush(&mut out, &mut copied, run);
         }
     }
-    if let Some((start, run_end)) = run {
-        out.push_str(&text[copied..start]);
-        out.push_str(REDACTED);
-        copied = run_end;
+    for run in pending {
+        flush(&mut out, &mut copied, run);
     }
     out.push_str(&text[copied..]);
     Cow::Owned(out)
@@ -637,6 +667,16 @@ mod tests {
                 r#"{"password":"a\"b","n":1}"#,
                 r#"{"password":"***","n":1}"#,
             ),
+            (
+                // An escaped data quote inside an escaped string.
+                r#"x={\"password\":\"a\\\"suffix\",\"n\":1}"#,
+                r#"x={\"password\":\"***\",\"n\":1}"#,
+            ),
+            (
+                // An escaped backslash right before the closing quote.
+                r#"x={\"password\":\"a\\\\\",\"n\":1}"#,
+                r#"x={\"password\":\"***\",\"n\":1}"#,
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(scrub_text(input), want, "input {input}");
@@ -808,10 +848,23 @@ default = 1883
             scrub_secret_values("abcdefghi", &["abcdef", "defghi"]),
             "***"
         );
+        // A long secret reaching back over an earlier, shorter run.
+        assert_eq!(
+            scrub_secret_values("abcdefgh cd", &["cdef", "abcdefgh"]),
+            "*** cd"
+        );
+        assert_eq!(
+            scrub_secret_values("xbcdx abcdefgh", &["bcdx", "abcdefgh"]),
+            "x*** ***"
+        );
         assert_eq!(scrub_secret_values("aaaaa", &["aaaa"]), "***");
         assert_eq!(scrub_secret_values("aaaa-aaaa", &["aaaa"]), "***-***");
         let big = "a".repeat(1 << 20);
         assert_eq!(scrub_secret_values(&big, &["aaaa"]), "***");
+        // A long repetitive secret against a long repetitive line stays
+        // linear (the old prefix-compare loop was quadratic here).
+        let long_secret = "a".repeat(512 << 10);
+        assert_eq!(scrub_secret_values(&big, &[&long_secret]), "***");
         assert!(matches!(
             scrub_secret_values("clean", &["hunter2"]),
             Cow::Borrowed(_)

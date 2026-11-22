@@ -756,6 +756,15 @@ where
         // M7: redact at capture, before the row is queued, so no
         // read surface (REST, Connect, MCP, CLI) ever sees the value.
         event_fields.redact();
+        // The attribution columns are free text too (a denied call's
+        // `device_id` is whatever the caller sent).
+        for column in [&mut instance_id, &mut plugin_id, &mut device_id] {
+            if let Some(v) = column
+                && let std::borrow::Cow::Owned(scrubbed) = crate::redact::scrub_text(v)
+            {
+                *v = scrubbed;
+            }
+        }
 
         let meta = event.metadata();
         let fields_blob = if event_fields.extra.is_empty() {
@@ -1242,12 +1251,21 @@ mod tests {
                 host = "mqtt.local",
                 "login with password=hunter2 for bob",
             );
+            tracing::info!(target: "test", device_id = "password=hunter2", "denied");
         });
         store.wait_drained_for_test();
 
         let rows = store.query(&LogQuery::default(), 16).expect("query");
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
+        assert_eq!(rows.len(), 2);
+        let row = rows
+            .iter()
+            .find(|r| r.message != "denied")
+            .expect("login row");
+        let denied = rows
+            .iter()
+            .find(|r| r.message == "denied")
+            .expect("denied row");
+        assert_eq!(denied.device_id.as_deref(), Some("password=***"));
         assert_eq!(row.message, "login with password=*** for bob");
         let by_name: std::collections::HashMap<&str, &LogValue> =
             row.fields.iter().map(|(k, v)| (k.as_str(), v)).collect();
