@@ -11,7 +11,7 @@ members = ["."]
 name = "hang"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "OxidHome example plugin: never returns from a chosen hook (Phase 7a liveness-watchdog test fixture)."
@@ -24,3 +24,6 @@ oxidhome-sdk = { path = "../../crates/oxidhome-sdk" }
 
 [lints.rust]
 unsafe_code = "deny"
+
+[lints.cargo]
+unused_dependencies = "deny"

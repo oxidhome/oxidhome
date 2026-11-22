@@ -520,7 +520,7 @@ async fn device_registration_needs_capability<B: Backend>() {
         plugin_error_mentions(&outcome, "PermissionDenied"),
         "{outcome:?}"
     );
-    assert!(switch.devices().is_empty());
+    assert_eq!(switch.devices(), Vec::<ObservedDevice>::new());
 }
 
 /// storage: writes from `tick` and from a command land in the

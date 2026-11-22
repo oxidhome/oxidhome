@@ -242,10 +242,7 @@ pub fn read_installed_bytes(
     } else {
         None
     };
-    let frames = ui_assets
-        .as_ref()
-        .map(ui_asset_digest_frames)
-        .unwrap_or_default();
+    let frames = ui_assets.as_ref().map_or_default(ui_asset_digest_frames);
     let digest = content_digest(&manifest_bytes, &wasm_bytes, &frames);
     Ok((digest, manifest_bytes, wasm_bytes))
 }
@@ -282,10 +279,7 @@ pub fn recompute_installed_digest(
         Some(ui) => Some(read_declared_ui_asset_bytes(ui, plugin_dir)?),
         None => None,
     };
-    let frames = ui_assets
-        .as_ref()
-        .map(ui_asset_digest_frames)
-        .unwrap_or_default();
+    let frames = ui_assets.as_ref().map_or_default(ui_asset_digest_frames);
     Ok(content_digest(manifest_bytes, wasm_bytes, &frames))
 }
 
@@ -318,7 +312,7 @@ pub(crate) fn scan_digest_with_validated_ui(
     ui_assets: Option<&ValidatedUiAssets>,
 ) -> std::io::Result<String> {
     let wasm_bytes = read_no_follow_within(plugin_dir, &plugin_dir.join(runtime_wasm_rel))?;
-    let frames = ui_assets.map(ui_asset_digest_frames).unwrap_or_default();
+    let frames = ui_assets.map_or_default(ui_asset_digest_frames);
     Ok(content_digest(manifest_bytes, &wasm_bytes, &frames))
 }
 
@@ -1899,8 +1893,7 @@ impl InstalledPluginRegistry {
             };
         let ui_frames = staged_ui_assets
             .as_ref()
-            .map(ui_asset_digest_frames)
-            .unwrap_or_default();
+            .map_or_default(ui_asset_digest_frames);
         let staged_digest = content_digest(&staged_manifest_bytes, &staged_wasm_bytes, &ui_frames);
         drop(staged_manifest_bytes);
         drop(staged_wasm_bytes);
@@ -2698,10 +2691,7 @@ pub fn recompute_digest_and_manifest(
         ),
         None => None,
     };
-    let frames = ui_assets
-        .as_ref()
-        .map(ui_asset_digest_frames)
-        .unwrap_or_default();
+    let frames = ui_assets.as_ref().map_or_default(ui_asset_digest_frames);
     let digest = content_digest(&manifest_bytes, &wasm_bytes, &frames);
     Ok((digest, manifest))
 }
@@ -3453,7 +3443,7 @@ wasm = "plugin.wasm"
         let effective = effective_capabilities(&requested, &granted);
         // Set-shaped fields intersect on equality.
         assert_eq!(effective.declares_devices, vec!["dimmer".to_string()]);
-        assert!(effective.declares_services.is_empty());
+        assert_eq!(effective.declares_services, Vec::<String>::new());
         // Quotas take the minimum.
         assert_eq!(effective.storage_quota_kb, 100);
         assert_eq!(effective.blob_quota_mb, 10);

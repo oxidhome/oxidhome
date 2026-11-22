@@ -9,7 +9,7 @@ members = ["."]
 name = "snapshot-saver"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "OxidHome example plugin: writes snapshot blobs via host::blobs (Phase 5b)."
@@ -22,3 +22,6 @@ oxidhome-sdk = { path = "../../crates/oxidhome-sdk" }
 
 [lints.rust]
 unsafe_code = "deny"
+
+[lints.cargo]
+unused_dependencies = "deny"

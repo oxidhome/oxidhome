@@ -728,10 +728,8 @@ async fn get_prompt_explain_recent_errors_requires_only_logs_read() {
         response["error"].is_null(),
         "logs:read alone must satisfy explain_recent_errors post-fix; got {response}",
     );
-    assert!(
-        !response["result"]["messages"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_ne!(
+        response["result"]["messages"].as_array().unwrap(),
+        &Vec::<Value>::new()
     );
 }

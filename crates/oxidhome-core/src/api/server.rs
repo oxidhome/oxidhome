@@ -1526,7 +1526,7 @@ async fn start_plugin_instance(
     body: Option<Json<StartBody>>,
 ) -> Result<Json<StartedRow>, PluginLifecycleError> {
     require_scope(&actor, PLUGINS_START)?;
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = body.map_or_default(|Json(b)| b);
     let instance_id = body
         .instance_id
         .clone()
@@ -1608,7 +1608,7 @@ async fn stop_plugin_instances(
     body: Option<Json<StopBody>>,
 ) -> Result<Json<StoppedRow>, PluginLifecycleError> {
     require_scope(&actor, PLUGINS_STOP)?;
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = body.map_or_default(|Json(b)| b);
     let mut stopped = Vec::new();
     let registry = state.engine.instances();
     for handle in registry.list() {

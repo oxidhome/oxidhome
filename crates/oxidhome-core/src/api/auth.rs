@@ -1164,7 +1164,7 @@ mod tests {
             revoked_ms: None,
         };
         let actor = actor_from_record(&rec);
-        assert!(actor.scopes().is_empty());
+        assert_eq!(actor.scopes(), Vec::<String>::new());
         assert!(actor.constraint("device.send_command").is_none());
     }
 

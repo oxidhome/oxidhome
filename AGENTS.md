@@ -15,14 +15,15 @@ top-level directories.
 - `cargo fmt --all`: formats Rust code.
 - `cargo clippy --all-features --all-targets -- -D warnings`: runs lints with warnings treated as errors.
 - `cargo deny check` audits licenses, advisories, bans, and sources using `deny.toml`.
-- `cargo machete` checks for unused dependencies before dependency cleanup.
+- `cargo machete` checks for unused dependencies before dependency cleanup. Cargo's own `unused_dependencies` lint is
+  also denied workspace-wide, so an unused `[dependencies]` / `[build-dependencies]` entry fails the build.
 - `wasm-tools component wit wit/`: validates the full WIT package and vendored deps.
 - `cargo test -p oxidhome-wit --test contract_baseline`: fails when `wit/` changes the contract without a package
   version bump; see CONTRIBUTING.md for the `OXIDHOME_BLESS_WIT_BASELINE=1` baseline workflow.
 
 ## Coding Style & Naming Conventions
 
-Use Rust 1.95.0, edition 2024, as pinned in `rust-toolchain.toml`. Follow `rustfmt` output. The workspace denies
+Use Rust 1.100.0, edition 2024, as pinned in `rust-toolchain.toml`. Follow `rustfmt` output. The workspace denies
 `unsafe_code`; any explicit opt-in must include a focused `// SAFETY:` justification. Prefer `tracing` for logging, not
 `log`. Use `anyhow` in binaries and host-internal crates, and typed errors for externally consumed library APIs when
 introduced. Public items should have useful doc comments.

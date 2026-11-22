@@ -257,10 +257,10 @@ async fn events_are_oldest_first_and_storage_lists_keys() {
     let staged = stage_unchanged(KV_COUNTER);
     let mut counter = host.load(staged.path()).await.unwrap();
     counter.init().await.unwrap();
-    assert!(counter.storage().keys("").unwrap().is_empty());
+    assert_eq!(counter.storage().keys("").unwrap(), Vec::<String>::new());
     counter.tick().await.unwrap();
     assert_eq!(counter.storage().keys("").unwrap(), ["count"]);
-    assert!(counter.storage().keys("x").unwrap().is_empty());
+    assert_eq!(counter.storage().keys("x").unwrap(), Vec::<String>::new());
     assert!(host.state_dir().join("oxidhome.db").is_file());
 }
 

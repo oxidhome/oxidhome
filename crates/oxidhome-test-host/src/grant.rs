@@ -115,14 +115,17 @@ mod tests {
     #[test]
     fn identical_and_narrowed_grants_have_no_excess() {
         let req = requested();
-        assert!(grant_excess(&req, &req).is_empty());
-        assert!(grant_excess(&req, &CapabilitiesSection::default()).is_empty());
+        assert_eq!(grant_excess(&req, &req), Vec::<String>::new());
+        assert_eq!(
+            grant_excess(&req, &CapabilitiesSection::default()),
+            Vec::<String>::new()
+        );
         let narrowed = CapabilitiesSection {
             storage_quota_kb: 1,
             consumes_services: vec![svc("counter-1", &["get"], "me")],
             ..req.clone()
         };
-        assert!(grant_excess(&req, &narrowed).is_empty());
+        assert_eq!(grant_excess(&req, &narrowed), Vec::<String>::new());
     }
 
     #[test]
@@ -163,7 +166,7 @@ mod tests {
             consumes_services: vec![svc("c", &["get", "increment"], "me")],
             ..CapabilitiesSection::default()
         };
-        assert!(grant_excess(&req, &grant).is_empty());
+        assert_eq!(grant_excess(&req, &grant), Vec::<String>::new());
         let wider = CapabilitiesSection {
             consumes_services: vec![svc("c", &["get", "reset"], "me")],
             ..CapabilitiesSection::default()
@@ -181,6 +184,6 @@ mod tests {
             consumes_services: vec![svc("x", &["anything", "*"], "y")],
             ..CapabilitiesSection::default()
         };
-        assert!(grant_excess(&req, &grant).is_empty());
+        assert_eq!(grant_excess(&req, &grant), Vec::<String>::new());
     }
 }

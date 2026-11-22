@@ -158,7 +158,7 @@ async fn valid_token_grants_access_and_bumps_last_used() {
         body["instances"].is_array(),
         "expected `instances` array, got {body:?}"
     );
-    assert!(body["instances"].as_array().unwrap().is_empty());
+    assert_eq!(body["instances"], serde_json::json!([]));
 
     // `verify` set `last_used_ms`; rereading the row reflects it.
     let post = engine.auth_tokens().get(&issued.id).unwrap().unwrap();
@@ -246,7 +246,7 @@ async fn devices_list_enforces_scope() {
     assert_eq!(ok_resp.status(), StatusCode::OK);
     let body = body_to_json(ok_resp.into_body()).await;
     assert!(body["devices"].is_array(), "got {body:?}");
-    assert!(body["devices"].as_array().unwrap().is_empty());
+    assert_eq!(body["devices"], serde_json::json!([]));
 }
 
 /// Every authenticated request lands exactly one row in the C3
@@ -1022,7 +1022,7 @@ async fn logs_query_enforces_scope_and_returns_empty_array() {
     assert_eq!(ok_resp.status(), StatusCode::OK);
     let body = body_to_json(ok_resp.into_body()).await;
     assert!(body["logs"].is_array(), "got {body:?}");
-    assert!(body["logs"].as_array().unwrap().is_empty());
+    assert_eq!(body["logs"], serde_json::json!([]));
 }
 
 /// Logs emitted via `tracing::info!` while the `LogStore` layer is
@@ -1327,7 +1327,7 @@ async fn plugins_list_enforces_scope_and_returns_empty_array() {
     assert_eq!(ok_resp.status(), StatusCode::OK);
     let body = body_to_json(ok_resp.into_body()).await;
     assert!(body["plugins"].is_array(), "got {body:?}");
-    assert!(body["plugins"].as_array().unwrap().is_empty());
+    assert_eq!(body["plugins"], serde_json::json!([]));
 }
 
 /// Plugins endpoint aggregates running instances by plugin id and
@@ -2024,7 +2024,7 @@ async fn install_start_stop_uninstall_end_to_end() {
         .await
         .unwrap();
     let listing = body_to_json(final_list.into_body()).await;
-    assert!(listing["plugins"].as_array().unwrap().is_empty());
+    assert_eq!(listing["plugins"], serde_json::json!([]));
     assert!(!state_dir.path().join("plugins/example.kv-counter").exists());
 }
 
