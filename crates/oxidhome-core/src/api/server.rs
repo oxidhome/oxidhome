@@ -66,7 +66,7 @@ impl Default for ApiConfig {
 ///   `fallback_service` so any path not matched by the JSON routes
 ///   above falls through to the Connect dispatcher (this is where
 ///   `HealthService.Check` and the rest of the migrating surface
-///   live). See [`super::connect_rpc`] for the registered services.
+///   live). See `super::connect_rpc` for the registered services.
 pub fn build_router(engine: Engine) -> Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),

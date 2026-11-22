@@ -205,7 +205,7 @@ pub const MAX_INSTANCE_ID_BYTES: usize = 128;
 /// Enforced at [`BlobStore::write`] time (round-10 F1 on
 /// PR #122) so an unbounded plugin-supplied mime can't make
 /// it into the persisted `blob` row. Every SQL query that
-/// projects `mime` (see [`BLOB_SELECT_COLUMNS`]) also filters
+/// projects `mime` (see `BLOB_SELECT_COLUMNS`) also filters
 /// legacy over-cap rows so pre-cap data doesn't force a
 /// materialise-then-drop dance either.
 ///

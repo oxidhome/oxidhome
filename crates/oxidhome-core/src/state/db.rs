@@ -18,7 +18,7 @@
 //! Two construction paths:
 //!
 //! - [`Db::open_in_memory`] — `":memory:"`. Used by every existing
-//!   integration test and the no-arg [`Engine::new`] entry point so
+//!   integration test and the no-arg [`Engine::new`](crate::Engine::new) entry point so
 //!   the "engine without a state dir" shape still works.
 //! - [`Db::open_file`] — `<state_dir>/oxidhome.db` with WAL mode +
 //!   `synchronous = NORMAL`. The combination chosen by Phase 5's

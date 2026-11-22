@@ -45,8 +45,8 @@
 //! - **Lifecycle reconciliation (round-2 review fix).** Removing
 //!   a device — or shipping an `update-device` with a narrower
 //!   `capabilities` list — used to leave stale projection entries
-//!   `Fresh` indefinitely. [`Self::mark_device_stale`] and
-//!   [`Self::reconcile_capabilities`] now flip the affected
+//!   `Fresh` indefinitely. [`DeviceStateStore::mark_device_stale`] and
+//!   [`DeviceStateStore::reconcile_capabilities`] now flip the affected
 //!   entries and bump the global revision so a delta poller
 //!   catches the transition. The host runtime wires these into
 //!   `register-device` / `update-device` / `remove-device`.
@@ -61,7 +61,7 @@
 //!   [`StateQuality`] (`Fresh` or `Stale`) and the supervisor
 //!   generation of the owning instance at write time. When the
 //!   owning instance stops (or a new supervisor life begins),
-//!   [`Self::mark_instance_stale`] flips every entry owned by that
+//!   [`DeviceStateStore::mark_instance_stale`] flips every entry owned by that
 //!   instance to `Stale`. Consumers filter on `quality` rather than
 //!   assuming any value they see is current — the review's
 //!   "silently retain old values across restart" failure mode.
@@ -679,7 +679,7 @@ impl DeviceStateStore {
     /// (round-13's silent truncation).
     ///
     /// H9 round-15 finding 1: the admission math mirrors
-    /// [`Self::write_entry`]'s merge-vs-replace rule.
+    /// `Self::write_entry`'s merge-vs-replace rule.
     /// `apply_delta` only *merges* into a Fresh entry from
     /// the caller's current generation; otherwise it treats
     /// the incoming vec as a replace. Round-14 baselined
@@ -879,7 +879,7 @@ impl DeviceStateStore {
     /// `"<epoch>.<pinned_revision>.<after_device_id>.<hmac>"`
     /// where `hmac` is a 128-bit prefix of HMAC-SHA256 keyed
     /// on this store's per-process
-    /// [`StoreInner::cursor_secret`]. Because the secret is
+    /// `StoreInner::cursor_secret`. Because the secret is
     /// server-side only, a client can neither forge a valid
     /// cursor from scratch nor mutate the pinned revision /
     /// device id in an existing one without the MAC failing
@@ -909,8 +909,8 @@ impl DeviceStateStore {
     /// before MAC verification**. A cursor issued by a
     /// prior life of the daemon has both a stale epoch AND
     /// a stale MAC (because a restart rotates
-    /// [`StoreInner::cursor_secret`] alongside
-    /// [`StoreInner::epoch`]); round-14 checked the MAC
+    /// `StoreInner::cursor_secret` alongside
+    /// `StoreInner::epoch`); round-14 checked the MAC
     /// first, so every legitimate pre-restart cursor
     /// failed as `Bad` (→ 400) instead of `EpochChanged`
     /// (→ 409). Reordering is safe: the epoch is public
@@ -1279,8 +1279,8 @@ impl DeviceStateStore {
 /// and pre-checked at the WIT boundary
 /// (`publish_event` / `execute_command` / `register-device`)
 /// so an overflow is rejected before the event log records
-/// it — see [`Self::check_delta_admission`] and
-/// [`Self::check_snapshot_admission`].
+/// it — see [`DeviceStateStore::check_delta_admission`] and
+/// [`DeviceStateStore::check_snapshot_admission`].
 pub const MAX_FIELDS_PER_SLOT: usize = 64;
 
 /// H9 round-14 finding 2 / round-16 finding 2: per-slot cap
@@ -1669,7 +1669,7 @@ pub struct DeltaPage {
 const MAX_CAP_SENTINEL: &str = "\u{10FFFF}";
 
 /// H9 round-6 finding 2: total-Stale-entries cap, enforced by
-/// [`DeviceStateStore::stale_where_locked`] via LRU eviction on
+/// `DeviceStateStore::stale_where_locked` via LRU eviction on
 /// `global_revision`. Without a cap, a plugin that
 /// registers-then-removes unique `local_id`s in a tight loop
 /// would grow the projection map indefinitely (each `remove`

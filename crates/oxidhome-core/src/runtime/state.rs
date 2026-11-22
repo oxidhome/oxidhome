@@ -336,7 +336,7 @@ pub struct PluginState {
     /// [`crate::state::InstalledPluginRegistry`]. Pinned at
     /// [`PluginInstance::load`](crate::PluginInstance::load) time
     /// so all device ids minted by this instance derive from the
-    /// same installation identity (see [`crate::state::stable_device_id`]).
+    /// same installation identity (see [`crate::state::devices::stable_device_id`]).
     /// For in-memory loads that don't go through the installed-plugin
     /// registry (test harness, `Engine::new()`), the fallback is
     /// `manifest.plugin.id` itself — cheap synthetic UUID; identity
@@ -441,13 +441,13 @@ pub struct PluginState {
     /// constants and installed via `store.limiter(|s| &mut s.limits)`
     /// in the loader. A plugin whose linear-memory / table / instance
     /// growth would breach a cap traps at wasmtime's allocation path
-    /// (C4 review P2 F1: [`PluginResourceLimits`] returns `Err(_)` on
+    /// (C4 review P2 F1: `PluginResourceLimits` returns `Err(_)` on
     /// refusal, which wasmtime converts to a trap); the supervisor
     /// catches the trap and applies the manifest's restart policy.
     pub limits: PluginResourceLimits,
     /// C4 review P1 F2: per-instance token bucket for
     /// `logging::log` admission. Refuses log calls past
-    /// [`LOG_RATE_PER_SEC`] / [`LOG_RATE_BURST`] so a flooder
+    /// `LOG_RATE_PER_SEC` / `LOG_RATE_BURST` so a flooder
     /// can't drive the `LogStore` queue into multi-GiB retention.
     /// `std::sync::Mutex` because the check runs synchronously
     /// inside the host import; the critical section is O(1).

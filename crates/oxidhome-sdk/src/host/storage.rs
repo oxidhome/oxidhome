@@ -17,8 +17,16 @@
 //! example.
 //!
 //! Error shape mirrors [`super::config`]: a plain [`Error`] for
-//! straight host failures, [`StorageError`] (`Host` / `Deserialize`)
+//! straight host failures, [`StorageError`] (`Host` / `Codec`)
 //! for the `get_typed` / `set_typed` helpers.
+//!
+//! [`super::config`]: crate::host::config
+//! [`Error`]: crate::bindings::oxidhome::plugin::types::Error
+//! [`StorageError`]: crate::host::storage::StorageError
+//
+// rustdoc merges these docs with the `storage` item docs in `host.rs`
+// and resolves links from the `host` module, so the targets above
+// are crate-absolute paths.
 
 use crate::bindings::oxidhome::plugin::storage;
 use crate::bindings::oxidhome::plugin::types::{Error, Value};

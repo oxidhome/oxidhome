@@ -22,9 +22,9 @@
 //!    so a plugin whose instance has zero subscriptions is quiet
 //!    under any flood.
 //! 3. **C2e — per-subscriber `mpsc` queues.** Delivery uses one
-//!    [`mpsc::channel`](tokio::sync::mpsc::channel) per subscriber
+//!    [`mpsc::channel`] per subscriber
 //!    instead of a shared [`broadcast`](tokio::sync::broadcast)
-//!    ring. Each subscriber owns [`SUBSCRIBER_CAPACITY`] slots; a
+//!    ring. Each subscriber owns `SUBSCRIBER_CAPACITY` slots; a
 //!    slow subscriber whose queue fills drops events **for itself
 //!    only** (`tracing::warn` + a per-subscriber drop counter). The
 //!    pre-C2e broadcast ring shared its 256-slot capacity across
@@ -303,7 +303,7 @@ impl Default for EventBus {
 }
 
 /// Why a publish attempt was refused. Only produced by
-/// [`EventBus::try_publish`] — the raw [`EventBus::publish`] path
+/// [`EventBus::admit_publish`] — the raw [`EventBus::publish`] path
 /// bypasses the rate limiter and never fails.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PublishDenied {
@@ -349,7 +349,7 @@ impl EventBus {
 
     /// Push an event onto the bus. Each subscriber whose filter
     /// matches gets the event delivered to its private
-    /// [`SUBSCRIBER_CAPACITY`]-slot mpsc queue via
+    /// `SUBSCRIBER_CAPACITY`-slot mpsc queue via
     /// [`mpsc::Sender::try_send`]; a subscriber whose queue is
     /// full drops the event **for itself** (per-subscriber drop
     /// counter incremented, `tracing::warn` emitted) without
@@ -580,7 +580,7 @@ impl EventBus {
     /// Used by external tailers (JSON `/events/tail`, Connect
     /// `Events.TailEvents`) and by integration tests.
     ///
-    /// C2e — each call opens a **private** [`SUBSCRIBER_CAPACITY`]-
+    /// C2e — each call opens a **private** `SUBSCRIBER_CAPACITY`-
     /// slot mpsc queue; the receiver's back-pressure isolates it
     /// from every other subscriber.
     pub fn subscribe_all(&self) -> EventSubscription {
@@ -664,7 +664,7 @@ impl EventBus {
     /// C2d wake-isolation entry point.
     ///
     /// The returned subscription owns both a [`WakeToken`] (drops
-    /// the wake registration) and a [`SubscriberToken`] (drops the
+    /// the wake registration) and a `SubscriberToken` (drops the
     /// per-subscriber queue slot). The subscription's lifetime
     /// bounds both.
     pub fn subscribe_with_wake(
@@ -752,13 +752,13 @@ impl Drop for WakeToken {
 
 /// One subscriber's receiver + the filter the host promised to
 /// apply. C2e: the receiver is a private
-/// [`SUBSCRIBER_CAPACITY`]-slot [`mpsc::Receiver`]; back-pressure
+/// `SUBSCRIBER_CAPACITY`-slot [`mpsc::Receiver`]; back-pressure
 /// on this subscriber can't evict events from other subscribers.
 ///
 /// Owns an optional [`WakeToken`] — set by
 /// [`EventBus::subscribe_with_wake`] for plugin-side subscriptions
 /// that need their supervisor woken on delivery. Owns a
-/// [`SubscriberToken`] that removes this subscription's slot from
+/// `SubscriberToken` that removes this subscription's slot from
 /// the bus on Drop.
 #[derive(Debug)]
 pub struct EventSubscription {

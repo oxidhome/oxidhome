@@ -6,7 +6,7 @@
 //!
 //! **Phase 4 scope.** Introduce the type and give every
 //! [`PluginState`](crate::runtime::PluginState) an
-//! [`Actor::plugin(instance_id)`]. Host-call entry points (e.g.
+//! [`Actor::plugin(instance_id)`](Actor::plugin). Host-call entry points (e.g.
 //! `execute_command`, `on_event`) do **not** take an `Actor` parameter
 //! yet — every host call from a `PluginState` is by construction a
 //! plugin actor with the state's `instance_id`, so a separate field
@@ -173,7 +173,7 @@ impl Actor {
     ///
     /// Callers combine this with the flat scope check — a
     /// dispatch site first calls
-    /// [`crate::api::scopes::require_scope`] to confirm the
+    /// `crate::api::scopes::require_scope` to confirm the
     /// actor holds `<tool>:...`, then, if a constraint
     /// exists, checks the tool's argument shape against
     /// [`ToolConstraint::allows_device`] /
@@ -201,7 +201,7 @@ impl Actor {
     /// The bearer middleware iterates this to reject tokens
     /// carrying any constraint the current transport does not
     /// enforce — see `AuthState::enforced_constraints`
-    /// (`&[EnforcedConstraint]`) in [`crate::api::auth`]. Each
+    /// (`&[EnforcedConstraint]`) in `crate::api::auth`. Each
     /// enforced entry names a key **and** which
     /// [`ToolConstraint`] fields the dispatch site actually
     /// consults; a bearer whose policy names an unenforced

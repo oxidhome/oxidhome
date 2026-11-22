@@ -180,7 +180,7 @@ impl DeviceRegistry {
     /// one. Callers that don't go through the installed-plugin
     /// registry (in-memory dev / test loads) may pass the
     /// `manifest.plugin.id` as a synthetic UUID — see
-    /// [`PluginState`](crate::runtime::state::PluginState) for the
+    /// [`PluginState`](crate::runtime::PluginState) for the
     /// fallback used by [`PluginInstance::load`](crate::PluginInstance::load).
     ///
     /// C1 note: a repeat registration of the same tuple overwrites
@@ -397,7 +397,7 @@ pub const MAX_DEVICES_PER_INSTANCE: usize = 1024;
 /// capabilities.
 pub const MAX_CAPABILITIES_PER_DEVICE: usize = 32;
 
-/// Bundle the registry into a shared `Arc` for [`Engine`] /
+/// Bundle the registry into a shared `Arc` for [`Engine`](crate::Engine) /
 /// [`PluginState`](crate::runtime::PluginState) clones.
 pub type SharedDeviceRegistry = Arc<DeviceRegistry>;
 

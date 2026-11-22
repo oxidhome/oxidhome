@@ -390,7 +390,7 @@ impl Engine {
     }
 
     /// C6: HMAC secret for `plugins:ui` tickets. See
-    /// [`crate::api::ui_ticket`]. Rotated on daemon restart.
+    /// `crate::api::ui_ticket`. Rotated on daemon restart.
     #[must_use]
     pub fn ui_ticket_secret(&self) -> Arc<[u8; 32]> {
         Arc::clone(&self.ui_ticket_secret)
@@ -665,7 +665,7 @@ impl Engine {
     /// **Manifest immutability guarantee (Phase-6 leftover
     /// TOCTOU fix + round-2 F3).** The manifest is read
     /// ONCE at pre-flight via
-    /// [`crate::runtime::instance::read_manifest_with_bytes`],
+    /// `crate::runtime::instance::read_manifest_with_bytes`,
     /// yielding the parsed manifest AND the raw bytes. That
     /// snapshot is pinned into the supervisor and used on
     /// **every** load attempt (first load and every

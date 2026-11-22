@@ -163,7 +163,7 @@ pub enum LogValue {
     String(String),
     /// Captured from the `?` formatter — what `tracing` calls
     /// `record_debug` — plus non-finite floats that
-    /// [`Visit::record_f64`](tracing::field::Visit::record_f64)
+    /// [`Visit::record_f64`]
     /// can't otherwise round-trip through JSON. The field visitor
     /// trims a single pair of surrounding `"` quotes when the
     /// `Debug` output is a quoted string literal so

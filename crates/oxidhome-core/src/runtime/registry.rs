@@ -51,7 +51,7 @@ pub struct InstanceRegistry {
     inner: Mutex<RegistryInner>,
 }
 
-/// Why a [`InstanceRegistry::register`] call was rejected.
+/// Why a `InstanceRegistry::register` call was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
     /// Another instance with the same `instance_id` is already
@@ -68,9 +68,9 @@ pub enum RegistryError {
         existing_instance_id: String,
     },
     /// Round-8 F1: engine is shutting down. Set by
-    /// [`InstanceRegistry::begin_shutdown`] under the
+    /// `InstanceRegistry::begin_shutdown` under the
     /// registry lock, checked inside
-    /// [`InstanceRegistry::register`] under the same
+    /// `InstanceRegistry::register` under the same
     /// lock — an in-flight start that raced shutdown past
     /// the outer `AtomicBool` fast-path lands here rather
     /// than slipping a supervisor into the registry.
