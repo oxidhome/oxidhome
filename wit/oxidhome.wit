@@ -1285,6 +1285,86 @@ interface host-config {
   list-config: func() -> result<list<key-value>, error>;
 }
 
+/// Read access to the host-owned device-state projection (H2): the
+/// current value of each capability of each device, as the host
+/// last recorded it.
+///
+/// A plugin can always read the devices it registered itself. Reading
+/// another instance's devices needs a matching
+/// `[[capabilities.reads_state]]` grant (owner plugin, capability,
+/// device); without one, `get-state` answers `not-found` (the same as
+/// for an unknown device) and `list-state` leaves those entries out. `bytes-val` fields are
+/// replaced by a `json-val` marker
+/// `{"withheld":"bytes","size_bytes":N,"required_scope":"reads_state.bytes"}`
+/// unless the matching grant sets `bytes = true`; a plugin's own
+/// entries are returned as written. Refused reads are recorded in the
+/// host's audit ledger.
+interface host-state {
+  use types.{device-id, unix-ms, key-value, error};
+
+  /// `fresh` while the owning instance runs and has reported the
+  /// value in its current life. `stale` when the owner stopped, the
+  /// device or capability was removed, or the value was restored
+  /// after a host restart and not yet republished.
+  enum state-quality {
+    fresh,
+    stale,
+  }
+
+  /// The current value of one capability on one device.
+  record device-state {
+    device: device-id,
+    capability: string,
+    /// Merged current fields (every key reported so far, latest value).
+    fields: list<key-value>,
+    /// Store-wide revision at which this value was written. Higher
+    /// means newer; comparable across devices.
+    revision: u64,
+    /// Host clock when the value was recorded.
+    received-ms: unix-ms,
+    /// Owner-supplied observation time; informational only.
+    observed-ms: unix-ms,
+    quality: state-quality,
+  }
+
+  /// Both fields optional; `none` matches everything.
+  record state-filter {
+    device: option<device-id>,
+    capability: option<string>,
+  }
+
+  /// One page of `list-state`.
+  record state-page {
+    /// Store revision at the time of the read.
+    revision: u64,
+    /// Visible entries, grouped by device (sorted by device id, then
+    /// capability).
+    entries: list<device-state>,
+    /// Opaque cursor for the next page; `none` once the scan reached
+    /// the end. Valid only in this host process.
+    next-cursor: option<string>,
+  }
+
+  /// Every visible capability entry of `device`. `not-found` when
+  /// none is visible: the host has no state for it, or none of it is
+  /// visible to this plugin (the two are not told apart, so a plugin
+  /// can't learn which device ids exist).
+  get-state: func(device: device-id) -> result<list<device-state>, error>;
+
+  /// Visible entries matching `filter`, from the start (`cursor` is
+  /// `none`) or from a previous page's `next-cursor`, at most `limit`
+  /// devices per page (0 means 64; capped at 256) and about 1 MiB.
+  /// One call looks at a bounded number of entries, so a page can
+  /// hold fewer devices than `limit`, or none, while `next-cursor` is
+  /// still set: keep reading until it is `none`. A cursor from an
+  /// earlier host process is `invalid-argument`; start over.
+  list-state: func(
+    filter: state-filter,
+    cursor: option<string>,
+    limit: u32,
+  ) -> result<state-page, error>;
+}
+
 /// Media pipeline orchestration. Imported only by the streaming worlds —
 /// reachability is what gives the standard `plugin` world its no-raw-I/O
 /// guarantee. Capability is still gated by the manifest at the call site.
@@ -1317,6 +1397,7 @@ world plugin {
   import host-devices;
   import host-events;
   import host-config;
+  import host-state;
   import host-services;
   import host-sandboxes;
   import storage;

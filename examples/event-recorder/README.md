@@ -8,8 +8,13 @@ plugin-side `on-event` dispatch path that
 
 This example exists for the integration test in
 `crates/oxidhome-core/tests/event_dispatch.rs`. It registers no
-devices, handles no commands, and keeps no state — the only
-observable behaviour is the log line emitted from `on_event`.
+devices and keeps no state beyond a count of received events. It
+answers three `recorder` commands: `count` (events seen so far),
+`read-state device=<id>` and `list-state`. The last two read the
+host's device-state projection through the `host-state` import (H2).
+Reading another plugin's devices needs a
+`[[capabilities.reads_state]]` grant, which this manifest leaves out
+on purpose; `crates/oxidhome-test-host/tests/test_host.rs` stages one.
 
 ## Build
 

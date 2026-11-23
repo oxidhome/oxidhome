@@ -66,16 +66,20 @@
 //!   assuming any value they see is current — the review's
 //!   "silently retain old values across restart" failure mode.
 //!
-//! - **In-memory only for the H9 first cut.** Matches
-//!   [`super::DeviceRegistry`]. Persistence to `SQLite` is a
-//!   follow-up if a use case surfaces (post-restart state
-//!   reconciliation without re-observing).
+//! - **Durable (H2).** [`DeviceStateStore::open_persistent`] restores
+//!   the store from the `device_state` table at boot and starts a
+//!   flusher thread that writes changed slots back in coalesced
+//!   batches, off the publish path. See the `persist` submodule for
+//!   the freshness and revision rules across a restart.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rand::TryRng;
+
+mod persist;
+pub use persist::{FlushError, REVISION_GAP, invalidate_cursors_after_restore};
 
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue};
 
@@ -136,6 +140,16 @@ pub struct DeviceState {
     /// the slot — the same operator-facing name maps to the same
     /// entry, just with a new generation).
     pub owner_instance: String,
+    /// `plugin.id` of the owning instance's plugin, or empty when the
+    /// host doesn't know it (an instance loaded without
+    /// [`DeviceStateStore::bind_owner_plugin`]). Matched by the H2
+    /// `reads_state` grant's `plugin` selector.
+    pub owner_plugin: String,
+    /// Installation UUID of the owning plugin at write time (empty
+    /// when unknown). A reinstall under the same plugin and instance
+    /// id is a different owner: it doesn't get the predecessor's
+    /// entries as its own (H2).
+    pub owner_install: String,
     pub quality: StateQuality,
 }
 
@@ -183,10 +197,12 @@ struct StoreInner {
     /// `current_revision()` sees every entry with
     /// `global_revision ≤ N` already in the map.
     global_revision: u64,
-    /// H9 round-6 finding 1: opaque store epoch, minted per
-    /// process. The projection is in-memory only (no `SQLite`
-    /// persistence), so on daemon restart `global_revision`
-    /// resets to 0. A client holding `since_revision = 100`
+    /// H9 round-6 finding 1: opaque store epoch. H2: persisted with
+    /// the projection, so it changes only when the projection is
+    /// discarded (a fresh database, or [`DeviceStateStore::new`]);
+    /// restart continuity is handled by the revision gap and
+    /// `holes`. Pre-H2, when every restart reset
+    /// `global_revision` to 0, a client holding `since_revision = 100`
     /// pre-restart would otherwise silently receive no changes
     /// forever — the new store never reaches 100. The API
     /// returns the epoch on every response; a client that
@@ -233,6 +249,25 @@ struct StoreInner {
     /// life fails epoch verification long before the MAC
     /// check ever fires.
     cursor_secret: [u8; 32],
+    /// H2: per-process nonce carried in the pagination cursor. The
+    /// epoch survives a restart now that the store is durable, but the
+    /// cursor secret doesn't, so a cursor from an earlier process is
+    /// told apart by this value (409, restart the resync) instead of
+    /// failing its MAC (400).
+    boot: String,
+    /// H2: plugin and installation per live `instance_id` (with the
+    /// number of live `PluginState`s holding the binding), stamped onto
+    /// every entry the instance writes. See
+    /// [`DeviceStateStore::bind_owner_plugin`].
+    owner_plugins: HashMap<String, (OwnerIdentity, usize)>,
+    /// H2: revision ranges `(lo, hi)` that a boot skipped over (`hi` is
+    /// the restored store's base revision, a valid cursor itself). A
+    /// cursor inside one may come from writes that were lost before
+    /// they were flushed, so it must resync. See [`persist`].
+    holes: Vec<(u64, u64)>,
+    /// H2: slots changed since the last flush. `None` for a store
+    /// without a backing database.
+    dirty: Option<persist::Dirty>,
 }
 
 impl Default for StoreInner {
@@ -244,8 +279,34 @@ impl Default for StoreInner {
             evicted_through_revision: 0,
             generations: HashMap::new(),
             cursor_secret: mint_cursor_secret(),
+            boot: mint_boot_nonce(),
+            owner_plugins: HashMap::new(),
+            holes: Vec::new(),
+            dirty: None,
         }
     }
+}
+
+/// H2: the plugin and installation an owning instance runs as.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OwnerIdentity {
+    plugin: String,
+    install: String,
+}
+
+/// H2: 64-bit OS-random per-process nonce, hex. See
+/// [`StoreInner::boot`].
+fn mint_boot_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system RNG must be available");
+    let mut hex = String::with_capacity(16);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// H9 round-14 finding 3: 256-bit OS-random secret used to
@@ -265,6 +326,14 @@ fn mint_cursor_secret() -> [u8; 32] {
 /// string. String encoding sidesteps JavaScript's 2⁵³ integer
 /// precision limit; hex is the same shape as
 /// `installed_plugins::mint_installation_uuid`.
+/// H2: whether a persisted epoch has the shape [`mint_epoch`] gives
+/// (the pagination cursor splits on `.`).
+fn is_valid_epoch(epoch: &str) -> bool {
+    epoch.strip_prefix("epoch-").is_some_and(|hex| {
+        !hex.is_empty() && hex.len() <= 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
 fn mint_epoch() -> String {
     let mut bytes = [0u8; 16];
     // `SysRng::try_fill_bytes` returns `Result<(), Infallible>` on
@@ -290,6 +359,20 @@ impl StoreInner {
         self.global_revision += 1;
         self.global_revision
     }
+
+    /// H2: record that `key` changed (written, flipped or evicted)
+    /// so the flusher persists it. No-op without a backing database.
+    fn touch(&mut self, key: &(DeviceId, String)) {
+        if let Some(dirty) = self.dirty.as_mut() {
+            dirty.touch(key);
+        }
+    }
+
+    fn owner_identity(&self, owner_instance: &str) -> OwnerIdentity {
+        self.owner_plugins
+            .get(owner_instance)
+            .map_or_else(OwnerIdentity::default, |(identity, _)| identity.clone())
+    }
 }
 
 /// H9 host-owned device-state projection. One per
@@ -297,12 +380,57 @@ impl StoreInner {
 #[derive(Debug, Default)]
 pub struct DeviceStateStore {
     inner: RwLock<StoreInner>,
+    /// H2: the database the store flushes to, and its flusher thread.
+    /// `None` for [`Self::new`] (in-memory only).
+    backing: Option<persist::Backing>,
 }
 
 impl DeviceStateStore {
+    /// An in-memory store with no backing database: nothing survives
+    /// the process. The daemon uses [`Self::open_persistent`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// H2: remember which plugin and installation `owner_instance`
+    /// runs as, so the entries it writes carry them. Called when an
+    /// instance's `PluginState` is built; released by
+    /// [`Self::unbind_owner_plugin`] when it is dropped.
+    pub fn bind_owner_plugin(
+        &self,
+        owner_instance: &str,
+        plugin_id: &str,
+        installation_uuid: &str,
+    ) {
+        let identity = OwnerIdentity {
+            plugin: plugin_id.to_owned(),
+            install: installation_uuid.to_owned(),
+        };
+        let mut inner = self.inner_write();
+        match inner.owner_plugins.get_mut(owner_instance) {
+            Some((bound, refs)) if *bound == identity => *refs += 1,
+            _ => {
+                inner
+                    .owner_plugins
+                    .insert(owner_instance.to_owned(), (identity, 1));
+            }
+        }
+    }
+
+    /// H2: release one [`Self::bind_owner_plugin`]. The binding goes
+    /// away with its last holder; a binding since replaced by another
+    /// installation is left alone. Entries keep their owner identity.
+    pub fn unbind_owner_plugin(&self, owner_instance: &str, installation_uuid: &str) {
+        let mut inner = self.inner_write();
+        if let Some((bound, refs)) = inner.owner_plugins.get_mut(owner_instance)
+            && bound.install == installation_uuid
+        {
+            *refs -= 1;
+            if *refs == 0 {
+                inner.owner_plugins.remove(owner_instance);
+            }
+        }
     }
 
     fn inner_read(&self) -> RwLockReadGuard<'_, StoreInner> {
@@ -323,13 +451,12 @@ impl DeviceStateStore {
         self.inner_read().global_revision
     }
 
-    /// H9 round-6 finding 1: store epoch, opaque nonce that
-    /// changes on every process start. Clients compare the
-    /// value they saw last against the current one; a change
-    /// means the store was reset (daemon restart, since the
-    /// projection isn't persisted) and every previously-held
-    /// `since_revision` cursor is invalid — the client should
-    /// resync from the snapshot.
+    /// H9 round-6 finding 1: store epoch, opaque nonce. Clients
+    /// compare the value they saw last against the current one; a
+    /// change means the projection was discarded and every
+    /// previously-held `since_revision` cursor is invalid — the
+    /// client should resync from the snapshot. H2: a restart of a
+    /// persistent store keeps the epoch.
     ///
     /// Round-7 finding 2: string, not integer — a 128-bit
     /// OS-random nonce so distinct stores collide with
@@ -545,6 +672,10 @@ impl DeviceStateStore {
         // fits `MAX_BYTES_PER_SLOT`, matching the
         // field-count backstop pattern above.
         let final_fields = truncate_to_byte_cap(final_fields, &device_id, &capability);
+        let OwnerIdentity {
+            plugin: owner_plugin,
+            install: owner_install,
+        } = inner.owner_identity(&owner_instance);
         let entry = Arc::new(DeviceState {
             device_id,
             capability,
@@ -554,8 +685,11 @@ impl DeviceStateStore {
             observed_ms,
             source_generation: generation,
             owner_instance,
+            owner_plugin,
+            owner_install,
             quality: StateQuality::Fresh,
         });
+        inner.touch(&key);
         inner.entries.insert(key, entry);
     }
 
@@ -589,10 +723,14 @@ impl DeviceStateStore {
         device_id: &str,
     ) -> (String, u64, Vec<Arc<DeviceState>>) {
         let inner = self.inner_read();
+        // H2: range scan over the device's keys instead of the whole
+        // map. Bounded by the device id itself, not a sentinel
+        // capability, so no capability name can sort past the end.
+        let lo = (device_id.to_string(), String::new());
         let entries: Vec<Arc<DeviceState>> = inner
             .entries
-            .iter()
-            .filter(|((did, _), _)| did == device_id)
+            .range(lo..)
+            .take_while(|((did, _), _)| did == device_id)
             .map(|(_, meta)| Arc::clone(meta))
             .collect();
         (inner.epoch.clone(), inner.global_revision, entries)
@@ -653,6 +791,109 @@ impl DeviceStateStore {
             entries.push(Arc::clone(entry));
         }
         (inner.epoch.clone(), inner.global_revision, entries)
+    }
+
+    /// H2: one page of the full-store snapshot, grouped by device and
+    /// capped by both a device count and a byte budget, read under one
+    /// lock. Shared by REST `GET /api/v1/devices/state`, Connect
+    /// `ListDeviceState` and the plugin `host-state::list-state`
+    /// import.
+    ///
+    /// Devices sort by id after `after_device_id`; `keep` drops
+    /// entries the caller may not see (a device with no kept entry is
+    /// skipped). A device is committed whole: the page stops before a
+    /// device that would exceed `device_limit` or push the page past
+    /// `byte_cap` (the first device is always kept, so paging makes
+    /// progress). Bytes are estimated as capability name plus field
+    /// bytes. The scan also stops at a device boundary once it has
+    /// looked at `scan_budget` entries, which bounds the lock hold for
+    /// a sparse `keep`. `resume_after` is set when the caller should
+    /// read on: the last device committed (page full) or scanned
+    /// (budget spent).
+    #[must_use]
+    pub fn snapshot_page_capped(
+        &self,
+        after_device_id: Option<&str>,
+        device_limit: usize,
+        byte_cap: usize,
+        scan_budget: usize,
+        keep: impl Fn(&DeviceState) -> bool,
+    ) -> CappedPage {
+        let inner = self.inner_read();
+        let start = match after_device_id {
+            Some(cursor) => Bound::Excluded((cursor.to_string(), MAX_CAP_SENTINEL.to_string())),
+            None => Bound::Unbounded,
+        };
+        let mut devices: Vec<Vec<Arc<DeviceState>>> = Vec::new();
+        let mut page_bytes: usize = 0;
+        let mut pending: Vec<Arc<DeviceState>> = Vec::new();
+        let mut pending_bytes: usize = 0;
+        let mut pending_device: Option<&DeviceId> = None;
+        let mut resume_after: Option<DeviceId> = None;
+        let mut full = false;
+        // Commit `pending` if it fits; `false` means the page is full
+        // and `pending` is the first device of the next page.
+        let mut commit = |pending: &mut Vec<Arc<DeviceState>>, pending_bytes: &mut usize| {
+            if pending.is_empty() {
+                return true;
+            }
+            let total = page_bytes.saturating_add(*pending_bytes);
+            if devices.len() >= device_limit || (!devices.is_empty() && total > byte_cap) {
+                return false;
+            }
+            page_bytes = total;
+            devices.push(std::mem::take(pending));
+            *pending_bytes = 0;
+            true
+        };
+        // Seek past the cursor device by id, not only by the sentinel
+        // capability: a capability sorting after the sentinel must not
+        // put the cursor device on the next page again.
+        for (scanned, ((did, _cap), entry)) in inner
+            .entries
+            .range((start, Bound::Unbounded))
+            .skip_while(|((did, _), _)| Some(did.as_str()) == after_device_id)
+            .enumerate()
+        {
+            if pending_device != Some(did) {
+                if !commit(&mut pending, &mut pending_bytes) {
+                    full = true;
+                    break;
+                }
+                if scanned >= scan_budget {
+                    // Resume after the last device looked at, whether
+                    // or not it had a kept entry.
+                    resume_after = pending_device.cloned();
+                    break;
+                }
+                pending_device = Some(did);
+            }
+            if keep(entry) {
+                // Plus a per-field allowance: a withheld `bytes-val`
+                // (even an empty one) is sent as a JSON marker.
+                pending_bytes = pending_bytes
+                    .saturating_add(entry.capability.len())
+                    .saturating_add(entry.field_byte_estimate())
+                    .saturating_add(entry.fields.len().saturating_mul(PAGE_FIELD_OVERHEAD));
+                pending.push(Arc::clone(entry));
+            }
+        }
+        if !full && resume_after.is_none() && !commit(&mut pending, &mut pending_bytes) {
+            full = true;
+        }
+        // Page full: resume after the last committed device.
+        if full {
+            resume_after = devices
+                .last()
+                .and_then(|d| d.first())
+                .map(|e| e.device_id.clone());
+        }
+        CappedPage {
+            epoch: inner.epoch.clone(),
+            revision: inner.global_revision,
+            devices,
+            resume_after,
+        }
     }
 
     /// Snapshot a single `(device, capability)` slot.
@@ -887,7 +1128,10 @@ impl DeviceStateStore {
     #[must_use]
     pub fn issue_cursor(&self, pinned_revision: u64, after_device_id: &str) -> String {
         let inner = self.inner_read();
-        let payload = format!("{}.{pinned_revision}.{after_device_id}", inner.epoch);
+        let payload = format!(
+            "{}.{}.{pinned_revision}.{after_device_id}",
+            inner.epoch, inner.boot
+        );
         let mac = hmac_sha256(&inner.cursor_secret, payload.as_bytes());
         let mut hex = String::with_capacity(32);
         for b in &mac[..16] {
@@ -895,6 +1139,54 @@ impl DeviceStateStore {
             let _ = write!(hex, "{b:02x}");
         }
         format!("{payload}.{hex}")
+    }
+
+    /// H2: seal a scan position for the plugin `list-state` cursor.
+    /// The plugin must not learn the id of a device it can't see (the
+    /// scan may stop on one), so the id is encrypted with an
+    /// HMAC-derived keystream under this process's cursor secret and
+    /// authenticated. Format: `<nonce hex><ciphertext hex>.<mac hex>`.
+    #[must_use]
+    pub fn seal_scan_position(&self, device_id: &str) -> String {
+        let random = || {
+            rand::rngs::SysRng
+                .try_next_u64()
+                .expect("system RNG must be available")
+        };
+        let nonce: Vec<u8> = [random(), random()]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let secret = self.inner_read().cursor_secret;
+        let ct = position_keystream_xor(&secret, &nonce, device_id.as_bytes());
+        let mac = position_mac(&secret, &nonce, &ct);
+        format!(
+            "{}{}.{}",
+            hex_lower(&nonce),
+            hex_lower(&ct),
+            hex_lower(&mac)
+        )
+    }
+
+    /// Inverse of [`Self::seal_scan_position`]. `None` for a token
+    /// that is malformed, forged, or from another process.
+    #[must_use]
+    pub fn open_scan_position(&self, token: &str) -> Option<String> {
+        if token.len() > MAX_SCAN_TOKEN_LEN {
+            return None;
+        }
+        let (body, mac_hex) = token.split_once('.')?;
+        let body = hex_bytes(body)?;
+        let mac = hex_bytes(mac_hex)?;
+        if body.len() < 16 || mac.len() != 16 {
+            return None;
+        }
+        let (nonce, ct) = body.split_at(16);
+        let secret = self.inner_read().cursor_secret;
+        if !constant_time_eq(&position_mac(&secret, nonce, ct), &mac) {
+            return None;
+        }
+        String::from_utf8(position_keystream_xor(&secret, nonce, ct)).ok()
     }
 
     /// H9 round-14 finding 3: verify + decode a paginated
@@ -924,24 +1216,47 @@ impl DeviceStateStore {
     /// # Errors
     /// See [`CursorError`].
     pub fn verify_cursor(&self, raw: &str) -> Result<(String, u64, String), CursorError> {
+        if raw.len() > MAX_CURSOR_LEN {
+            return Err(CursorError::Bad);
+        }
         let (payload, mac_hex) = raw.rsplit_once('.').ok_or(CursorError::Bad)?;
-        let mut parts = payload.splitn(3, '.');
+        let mut parts = payload.splitn(4, '.');
         let epoch = parts.next().ok_or(CursorError::Bad)?;
+        let boot = parts.next().ok_or(CursorError::Bad)?;
         let rev = parts.next().ok_or(CursorError::Bad)?;
-        let device = parts.next().ok_or(CursorError::Bad)?;
-        if epoch.is_empty() || device.is_empty() || mac_hex.len() != 32 {
+        let Some(device) = parts.next() else {
+            // H2: a pre-H2 cursor (`<epoch>.<revision>.<device>.<mac>`)
+            // comes from an earlier daemon process: restart the resync
+            // (409) rather than report a client bug (400).
+            let legacy_mac_ok =
+                mac_hex.len() == 32 && mac_hex.bytes().all(|b| b.is_ascii_hexdigit());
+            if !epoch.is_empty() && boot.parse::<u64>().is_ok() && !rev.is_empty() && legacy_mac_ok
+            {
+                return Err(CursorError::EpochChanged);
+            }
+            return Err(CursorError::Bad);
+        };
+        let is_hex =
+            |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
+        if epoch.is_empty() || device.is_empty() || !is_hex(boot, 16) || !is_hex(mac_hex, 32) {
             return Err(CursorError::Bad);
         }
         let pinned_revision = rev.parse::<u64>().map_err(|_| CursorError::Bad)?;
-        let inner = self.inner_read();
+        // Compare and copy under the lock; hash outside it.
+        let secret = {
+            let inner = self.inner_read();
+            if epoch != inner.epoch || boot != inner.boot {
+                return Err(CursorError::EpochChanged);
+            }
+            inner.cursor_secret
+        };
         // Round-15 finding 3: epoch check first — a
         // pre-restart cursor cleanly surfaces as
         // `EpochChanged` even though its MAC is signed
         // with the previous life's secret.
-        if epoch != inner.epoch {
-            return Err(CursorError::EpochChanged);
-        }
-        let expected = hmac_sha256(&inner.cursor_secret, payload.as_bytes());
+        // H2: the epoch survives a clean restart, the cursor secret
+        // doesn't; a cursor from an earlier process is a restart too.
+        let expected = hmac_sha256(&secret, payload.as_bytes());
         let mut supplied = [0u8; 16];
         for (i, chunk) in mac_hex.as_bytes().chunks(2).enumerate() {
             supplied[i] = u8::from_str_radix(
@@ -991,8 +1306,8 @@ impl DeviceStateStore {
     /// H9 round-6 finding 1: returned as [`DeltaPage`] carrying
     /// `epoch`, `current_revision`, `entries`, and
     /// `reset_required`. When `since_revision > current_revision`
-    /// (typical after a daemon restart drops the in-memory store
-    /// back to 0), `reset_required = true` and `entries` is
+    /// (a cursor from a discarded store, or one restored from an
+    /// older backup), `reset_required = true` and `entries` is
     /// empty — the client must discard its cursor and re-fetch
     /// the snapshot instead of quietly waiting for the store to
     /// catch up (which it never will, because the pre-restart
@@ -1010,7 +1325,12 @@ impl DeviceStateStore {
     #[must_use]
     pub fn deltas_since_with_revision(&self, since_revision: u64, limit: usize) -> DeltaPage {
         let inner = self.inner_read();
-        if since_revision > inner.global_revision || since_revision < inner.evicted_through_revision
+        if since_revision > inner.global_revision
+            || since_revision < inner.evicted_through_revision
+            || inner
+                .holes
+                .iter()
+                .any(|&(lo, hi)| since_revision > lo && since_revision < hi)
         {
             return DeltaPage {
                 epoch: inner.epoch.clone(),
@@ -1118,6 +1438,7 @@ impl DeviceStateStore {
         // as `write_entry` so post-restart writes stamp the right
         // generation onto the reseeded slots.
         let generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
+        let owner = inner.owner_identity(owner_instance);
         for (capability, fields) in initial_state {
             // H9 round-16 finding 1: canonicalize the input
             // by folding duplicate keys last-wins BEFORE
@@ -1148,8 +1469,11 @@ impl DeviceStateStore {
                 observed_ms,
                 source_generation: generation,
                 owner_instance: owner_instance.to_string(),
+                owner_plugin: owner.plugin.clone(),
+                owner_install: owner.install.clone(),
                 quality: StateQuality::Fresh,
             });
+            inner.touch(&key);
             inner.entries.insert(key, entry);
         }
     }
@@ -1197,9 +1521,16 @@ impl DeviceStateStore {
                 quality: StateQuality::Stale,
                 ..(*prev).clone()
             });
+            inner.touch(key);
             inner.entries.insert(key.clone(), updated);
         }
-        Self::enforce_stale_cap_locked(inner);
+        // Only a sweep that made something stale can push the count
+        // past the cap. A no-op sweep must not evict: right after a
+        // restore the store may hold more stale slots than the cap
+        // (persisted state kept until owners return, H2).
+        if !keys_to_stale.is_empty() {
+            Self::enforce_stale_cap_locked(inner);
+        }
         keys_to_stale.len()
     }
 
@@ -1249,6 +1580,7 @@ impl DeviceStateStore {
         stale_by_age.sort_by_key(|(rev, _)| *rev);
         for (rev, key) in stale_by_age.into_iter().take(excess) {
             inner.entries.remove(&key);
+            inner.touch(&key);
             // Round-7 finding 1: advance the watermark to the
             // highest evicted revision. Cursors at or below
             // this value need a reset (they may have missed
@@ -1259,6 +1591,60 @@ impl DeviceStateStore {
             }
         }
     }
+}
+
+/// Per-field bytes a snapshot page charges on top of the field's own
+/// estimate: covers the withheld-bytes marker (about 80 bytes) and
+/// per-field framing.
+const PAGE_FIELD_OVERHEAD: usize = 96;
+
+/// Longest pagination cursor accepted (an epoch, nonce, revision, a
+/// device id and a MAC are far shorter).
+const MAX_CURSOR_LEN: usize = 1024;
+
+/// Longest `list-state` cursor accepted (a sealed device id is about
+/// 2 × (16 + id length) + 33 characters).
+const MAX_SCAN_TOKEN_LEN: usize = 1024;
+
+fn position_keystream_xor(secret: &[u8; 32], nonce: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for (i, chunk) in data.chunks(32).enumerate() {
+        let mut msg = b"oxidhome-scan-ks".to_vec();
+        msg.extend_from_slice(nonce);
+        msg.extend_from_slice(&u64::try_from(i).unwrap_or(u64::MAX).to_be_bytes());
+        let ks = hmac_sha256(secret, &msg);
+        out.extend(chunk.iter().zip(ks).map(|(a, b)| a ^ b));
+    }
+    out
+}
+
+fn position_mac(secret: &[u8; 32], nonce: &[u8], ct: &[u8]) -> [u8; 16] {
+    let mut msg = b"oxidhome-scan-mac".to_vec();
+    msg.extend_from_slice(nonce);
+    msg.extend_from_slice(ct);
+    let full = hmac_sha256(secret, &msg);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// H9 round-13 finding 2: per-slot cap on distinct field
@@ -1642,11 +2028,11 @@ pub type SharedDeviceStateStore = Arc<DeviceStateStore>;
 /// H9 round-6 finding 1: return of [`DeviceStateStore::deltas_since_with_revision`].
 /// Callers persist `epoch` alongside `current_revision`; any
 /// response whose `epoch` differs from the previously-persisted
-/// value means the store was reset (daemon restart, since the
-/// projection isn't durable), and any response with
+/// value means the projection was discarded, and any response with
 /// `reset_required = true` means the caller's `since_revision`
-/// cursor is above the current store revision (same underlying
-/// cause). Both signals: discard the cursor and resync from
+/// cursor can't be continued (above the current revision, below
+/// the eviction watermark, or inside a revision range skipped at
+/// boot, H2). Both signals: discard the cursor and resync from
 /// [`DeviceStateStore::snapshot_device_with_revision`].
 #[derive(Debug)]
 pub struct DeltaPage {
@@ -1657,6 +2043,21 @@ pub struct DeltaPage {
     pub current_revision: u64,
     pub entries: Vec<Arc<DeviceState>>,
     pub reset_required: bool,
+}
+
+/// H2: return of [`DeviceStateStore::snapshot_page_capped`].
+#[derive(Debug)]
+pub struct CappedPage {
+    /// Store epoch at read time.
+    pub epoch: String,
+    /// Store revision at read time.
+    pub revision: u64,
+    /// Kept entries, one inner vec per device, sorted by device id
+    /// then capability.
+    pub devices: Vec<Vec<Arc<DeviceState>>>,
+    /// Set when more entries may follow: pass it as the next page's
+    /// `after_device_id`. See [`DeviceStateStore::snapshot_page_capped`].
+    pub resume_after: Option<DeviceId>,
 }
 
 /// H9 round-12 finding 2: sentinel string that sorts strictly
@@ -2921,15 +3322,16 @@ mod tests {
 
         // Mutate the pinned revision — MAC fails.
         let (payload, mac) = cursor.rsplit_once('.').unwrap();
-        let mut parts = payload.splitn(3, '.');
+        let mut parts = payload.splitn(4, '.');
         let stored_epoch = parts.next().unwrap();
+        let stored_boot = parts.next().unwrap();
         let _rev = parts.next().unwrap();
         let stored_device = parts.next().unwrap();
-        let mutated = format!("{stored_epoch}.999.{stored_device}.{mac}");
+        let mutated = format!("{stored_epoch}.{stored_boot}.999.{stored_device}.{mac}");
         assert_eq!(store.verify_cursor(&mutated), Err(CursorError::Bad));
 
         // Mutate the device id — MAC fails.
-        let mutated = format!("{stored_epoch}.42.dev-forged.{mac}");
+        let mutated = format!("{stored_epoch}.{stored_boot}.42.dev-forged.{mac}");
         assert_eq!(store.verify_cursor(&mutated), Err(CursorError::Bad));
 
         // A cursor issued by a *different* store fails.
@@ -3195,5 +3597,93 @@ mod tests {
         assert!(matches!(before.fields[0].value, Value::BoolVal(true)));
         let after = store.snapshot_capability("dev-1", "switch").unwrap();
         assert!(matches!(after.fields[0].value, Value::BoolVal(false)));
+    }
+
+    /// H2: `snapshot_page_capped` honours the device limit, skips
+    /// devices without kept entries, and stops at a device boundary
+    /// once the scan budget is spent, with a resume point.
+    #[test]
+    fn capped_page_limits_filters_and_scan_budget() {
+        let store = DeviceStateStore::new();
+        for d in 0..6 {
+            for cap in ["a", "b"] {
+                store.apply_delta(
+                    format!("dev-{d}"),
+                    "inst".into(),
+                    cap.into(),
+                    vec![kv("x", Value::IntVal(d))],
+                    0,
+                    0,
+                );
+            }
+        }
+        let ids = |p: &CappedPage| {
+            p.devices
+                .iter()
+                .map(|d| d[0].device_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let page = store.snapshot_page_capped(None, 2, usize::MAX, usize::MAX, |_| true);
+        assert_eq!(ids(&page), ["dev-0", "dev-1"]);
+        assert_eq!(page.devices[0].len(), 2, "a device is committed whole");
+        assert_eq!(page.resume_after.as_deref(), Some("dev-1"));
+        let last = store.snapshot_page_capped(Some("dev-3"), 10, usize::MAX, usize::MAX, |_| true);
+        assert_eq!(ids(&last), ["dev-4", "dev-5"]);
+        assert_eq!(last.resume_after, None);
+        // Only odd devices kept, capability `b` only.
+        let odd = store.snapshot_page_capped(None, 10, usize::MAX, usize::MAX, |e| {
+            e.device_id.ends_with(['1', '3', '5']) && e.capability == "b"
+        });
+        assert_eq!(ids(&odd), ["dev-1", "dev-3", "dev-5"]);
+        assert!(odd.devices.iter().all(|d| d.len() == 1));
+        // Budget of 3 entries: stops after the second device's entries,
+        // at a device boundary, and resumes after the last one scanned.
+        let none = store.snapshot_page_capped(None, 10, usize::MAX, 3, |_| false);
+        assert!(none.devices.is_empty());
+        assert_eq!(none.resume_after.as_deref(), Some("dev-1"));
+        // Byte cap: the first device always fits, the second doesn't.
+        let tiny = store.snapshot_page_capped(None, 10, 1, usize::MAX, |_| true);
+        assert_eq!(ids(&tiny), ["dev-0"]);
+        assert_eq!(tiny.resume_after.as_deref(), Some("dev-0"));
+    }
+
+    /// H2: a sealed `list-state` position hides the device id, round-
+    /// trips in this process, and is refused by another one or when
+    /// tampered with.
+    #[test]
+    fn scan_position_is_sealed() {
+        let store = DeviceStateStore::new();
+        let id = "hidden-device-with-a-long-id-over-32-bytes";
+        let token = store.seal_scan_position(id);
+        assert!(!token.contains("hidden"));
+        assert_eq!(store.open_scan_position(&token).as_deref(), Some(id));
+        assert_eq!(DeviceStateStore::new().open_scan_position(&token), None);
+        let mut tampered = token.clone().into_bytes();
+        tampered[40] = if tampered[40] == b'0' { b'1' } else { b'0' };
+        let tampered = String::from_utf8(tampered).expect("ascii");
+        assert_eq!(store.open_scan_position(&tampered), None);
+        assert_eq!(store.open_scan_position("zz.zz"), None);
+        assert_eq!(store.open_scan_position(""), None);
+    }
+
+    /// PR round 4: a continuation page never repeats the cursor
+    /// device, even for a capability sorting after the sentinel.
+    #[test]
+    fn capped_page_seeks_past_the_cursor_device_by_id() {
+        let store = DeviceStateStore::new();
+        for (d, cap) in [
+            ("dev-a", "\u{10ffff}x"),
+            ("dev-a", "switch"),
+            ("dev-b", "switch"),
+        ] {
+            store.apply_delta(d.into(), "inst".into(), cap.into(), Vec::new(), 0, 0);
+        }
+        let page = store.snapshot_page_capped(Some("dev-a"), 1, usize::MAX, usize::MAX, |_| true);
+        let ids: Vec<_> = page
+            .devices
+            .iter()
+            .map(|d| d[0].device_id.clone())
+            .collect();
+        assert_eq!(ids, ["dev-b"]);
     }
 }

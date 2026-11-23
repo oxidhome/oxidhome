@@ -67,6 +67,13 @@ pub mod blobs;
 /// `[capabilities] script_sandboxes`.
 pub mod sandboxes;
 
+/// Device-state reads (H2). Plugin authors call
+/// `oxidhome_sdk::host::state::get(device_id)` or
+/// `oxidhome_sdk::host::state::list_all(&filter)` to read the host's
+/// current state of devices: their own always, other plugins' devices
+/// with a `[[capabilities.reads_state]]` grant.
+pub mod state;
+
 // ── Devices ──────────────────────────────────────────────────────────
 
 /// Register a device with the host. Accepts either a

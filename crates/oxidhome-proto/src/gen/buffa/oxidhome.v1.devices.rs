@@ -190,6 +190,160 @@ impl ::buffa::Enumeration for CommandOutcome {
         ]
     }
 }
+/// H2: freshness of a projected state entry.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(i32)]
+pub enum StateQuality {
+    STATE_QUALITY_UNSPECIFIED = 0i32,
+    /// The owning instance is live and reported this value.
+    STATE_QUALITY_FRESH = 1i32,
+    /// The owner stopped, the device or capability was removed, or the
+    /// value was restored at boot and not yet republished.
+    STATE_QUALITY_STALE = 2i32,
+}
+impl StateQuality {
+    ///Idiomatic alias for [`Self::STATE_QUALITY_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unspecified: Self = Self::STATE_QUALITY_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::STATE_QUALITY_FRESH`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Fresh: Self = Self::STATE_QUALITY_FRESH;
+    ///Idiomatic alias for [`Self::STATE_QUALITY_STALE`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Stale: Self = Self::STATE_QUALITY_STALE;
+}
+impl ::core::default::Default for StateQuality {
+    fn default() -> Self {
+        Self::STATE_QUALITY_UNSPECIFIED
+    }
+}
+impl ::serde::Serialize for StateQuality {
+    fn serialize<S: ::serde::Serializer>(
+        &self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        s.serialize_str(::buffa::Enumeration::proto_name(self))
+    }
+}
+impl<'de> ::serde::Deserialize<'de> for StateQuality {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        struct _V;
+        impl ::serde::de::Visitor<'_> for _V {
+            type Value = StateQuality;
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
+                f.write_str(
+                    concat!("a string, integer, or null for ", stringify!(StateQuality)),
+                )
+            }
+            fn visit_str<E: ::serde::de::Error>(
+                self,
+                v: &str,
+            ) -> ::core::result::Result<StateQuality, E> {
+                <StateQuality as ::buffa::Enumeration>::from_proto_name(v)
+                    .ok_or_else(|| { ::serde::de::Error::unknown_variant(v, &[]) })
+            }
+            fn visit_i64<E: ::serde::de::Error>(
+                self,
+                v: i64,
+            ) -> ::core::result::Result<StateQuality, E> {
+                let v32 = i32::try_from(v)
+                    .map_err(|_| {
+                        ::serde::de::Error::custom(
+                            ::buffa::alloc::format!("enum value {v} out of i32 range"),
+                        )
+                    })?;
+                <StateQuality as ::buffa::Enumeration>::from_i32(v32)
+                    .ok_or_else(|| {
+                        ::serde::de::Error::custom(
+                            ::buffa::alloc::format!("unknown enum value {v32}"),
+                        )
+                    })
+            }
+            fn visit_u64<E: ::serde::de::Error>(
+                self,
+                v: u64,
+            ) -> ::core::result::Result<StateQuality, E> {
+                let v32 = i32::try_from(v)
+                    .map_err(|_| {
+                        ::serde::de::Error::custom(
+                            ::buffa::alloc::format!("enum value {v} out of i32 range"),
+                        )
+                    })?;
+                <StateQuality as ::buffa::Enumeration>::from_i32(v32)
+                    .ok_or_else(|| {
+                        ::serde::de::Error::custom(
+                            ::buffa::alloc::format!("unknown enum value {v32}"),
+                        )
+                    })
+            }
+            fn visit_unit<E: ::serde::de::Error>(
+                self,
+            ) -> ::core::result::Result<StateQuality, E> {
+                ::core::result::Result::Ok(::core::default::Default::default())
+            }
+        }
+        d.deserialize_any(_V)
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for StateQuality {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+impl ::buffa::Enumeration for StateQuality {
+    fn from_i32(value: i32) -> ::core::option::Option<Self> {
+        match value {
+            0i32 => ::core::option::Option::Some(Self::STATE_QUALITY_UNSPECIFIED),
+            1i32 => ::core::option::Option::Some(Self::STATE_QUALITY_FRESH),
+            2i32 => ::core::option::Option::Some(Self::STATE_QUALITY_STALE),
+            _ => ::core::option::Option::None,
+        }
+    }
+    fn to_i32(&self) -> i32 {
+        *self as i32
+    }
+    fn proto_name(&self) -> &'static str {
+        match self {
+            Self::STATE_QUALITY_UNSPECIFIED => "STATE_QUALITY_UNSPECIFIED",
+            Self::STATE_QUALITY_FRESH => "STATE_QUALITY_FRESH",
+            Self::STATE_QUALITY_STALE => "STATE_QUALITY_STALE",
+        }
+    }
+    fn from_proto_name(name: &str) -> ::core::option::Option<Self> {
+        match name {
+            "STATE_QUALITY_UNSPECIFIED" => {
+                ::core::option::Option::Some(Self::STATE_QUALITY_UNSPECIFIED)
+            }
+            "STATE_QUALITY_FRESH" => {
+                ::core::option::Option::Some(Self::STATE_QUALITY_FRESH)
+            }
+            "STATE_QUALITY_STALE" => {
+                ::core::option::Option::Some(Self::STATE_QUALITY_STALE)
+            }
+            _ => ::core::option::Option::None,
+        }
+    }
+    fn values() -> &'static [Self] {
+        &[
+            Self::STATE_QUALITY_UNSPECIFIED,
+            Self::STATE_QUALITY_FRESH,
+            Self::STATE_QUALITY_STALE,
+        ]
+    }
+}
 #[derive(Clone, PartialEq, Default)]
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
@@ -3039,3 +3193,1543 @@ pub mod execute_command_error {
     #[doc(inline)]
     pub use super::__buffa::view::oneof::execute_command_error::Kind as KindView;
 }
+/// H2: the current value of one capability on one device.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct DeviceStateEntry {
+    /// Field 1: `device_id`
+    #[serde(
+        rename = "deviceId",
+        alias = "device_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub device_id: ::buffa::alloc::string::String,
+    /// Field 2: `capability`
+    #[serde(
+        rename = "capability",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub capability: ::buffa::alloc::string::String,
+    /// Merged current fields.
+    ///
+    /// Field 3: `fields`
+    #[serde(
+        rename = "fields",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub fields: ::buffa::alloc::vec::Vec<KeyValue>,
+    /// Store-wide revision at write time; the only ordering axis.
+    ///
+    /// Field 4: `global_revision`
+    #[serde(
+        rename = "globalRevision",
+        alias = "global_revision",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub global_revision: u64,
+    /// Host wall clock (ms) when the value was applied.
+    ///
+    /// Field 5: `received_ms`
+    #[serde(
+        rename = "receivedMs",
+        alias = "received_ms",
+        with = "::buffa::json_helpers::int64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+    )]
+    pub received_ms: i64,
+    /// Plugin-supplied observation time (ms); informational.
+    ///
+    /// Field 6: `observed_ms`
+    #[serde(
+        rename = "observedMs",
+        alias = "observed_ms",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub observed_ms: u64,
+    /// Supervisor generation of the owner at write time.
+    ///
+    /// Field 7: `source_generation`
+    #[serde(
+        rename = "sourceGeneration",
+        alias = "source_generation",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub source_generation: u64,
+    /// Field 8: `quality`
+    #[serde(
+        rename = "quality",
+        with = "::buffa::json_helpers::proto_enum",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_default_enum_value"
+    )]
+    pub quality: ::buffa::EnumValue<StateQuality>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for DeviceStateEntry {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("DeviceStateEntry")
+            .field("device_id", &self.device_id)
+            .field("capability", &self.capability)
+            .field("fields", &self.fields)
+            .field("global_revision", &self.global_revision)
+            .field("received_ms", &self.received_ms)
+            .field("observed_ms", &self.observed_ms)
+            .field("source_generation", &self.source_generation)
+            .field("quality", &self.quality)
+            .finish()
+    }
+}
+impl DeviceStateEntry {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.DeviceStateEntry";
+}
+::buffa::impl_default_instance!(DeviceStateEntry);
+impl ::buffa::MessageName for DeviceStateEntry {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "DeviceStateEntry";
+    const FULL_NAME: &'static str = "oxidhome.v1.DeviceStateEntry";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.DeviceStateEntry";
+}
+impl ::buffa::Message for DeviceStateEntry {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.device_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.device_id) as u64;
+        }
+        if !self.capability.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.capability) as u64;
+        }
+        for v in &self.fields {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.global_revision != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.global_revision) as u64;
+        }
+        if self.received_ms != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.received_ms) as u64;
+        }
+        if self.observed_ms != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.observed_ms) as u64;
+        }
+        if self.source_generation != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.source_generation) as u64;
+        }
+        {
+            let val = self.quality.to_i32();
+            if val != 0 {
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+            }
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.device_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.device_id, buf);
+        }
+        if !self.capability.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.capability, buf);
+        }
+        for v in &self.fields {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if self.global_revision != 0u64 {
+            ::buffa::types::put_uint64_field(4u32, self.global_revision, buf);
+        }
+        if self.received_ms != 0i64 {
+            ::buffa::types::put_int64_field(5u32, self.received_ms, buf);
+        }
+        if self.observed_ms != 0u64 {
+            ::buffa::types::put_uint64_field(6u32, self.observed_ms, buf);
+        }
+        if self.source_generation != 0u64 {
+            ::buffa::types::put_uint64_field(7u32, self.source_generation, buf);
+        }
+        {
+            let val = self.quality.to_i32();
+            if val != 0 {
+                ::buffa::types::put_int32_field(8u32, val, buf);
+            }
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.device_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.capability, buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.fields.push(elem);
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.global_revision = ::buffa::types::decode_uint64(buf)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.received_ms = ::buffa::types::decode_int64(buf)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.observed_ms = ::buffa::types::decode_uint64(buf)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.source_generation = ::buffa::types::decode_uint64(buf)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.quality = ::buffa::EnumValue::from(
+                    ::buffa::types::decode_int32(buf)?,
+                );
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.device_id.clear();
+        self.capability.clear();
+        self.fields.clear();
+        self.global_revision = 0u64;
+        self.received_ms = 0i64;
+        self.observed_ms = 0u64;
+        self.source_generation = 0u64;
+        self.quality = ::buffa::EnumValue::from(0);
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for DeviceStateEntry {
+    const PROTO_FQN: &'static str = "oxidhome.v1.DeviceStateEntry";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for DeviceStateEntry {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __DEVICE_STATE_ENTRY_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.DeviceStateEntry",
+    to_json: ::buffa::type_registry::any_to_json::<DeviceStateEntry>,
+    from_json: ::buffa::type_registry::any_from_json::<DeviceStateEntry>,
+    is_wkt: false,
+};
+/// H2: every projected capability of one device, read atomically.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct DeviceStateSnapshot {
+    /// Field 1: `device_id`
+    #[serde(
+        rename = "deviceId",
+        alias = "device_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub device_id: ::buffa::alloc::string::String,
+    /// Opaque store epoch; changes only when the projection is discarded.
+    ///
+    /// Field 2: `epoch`
+    #[serde(
+        rename = "epoch",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub epoch: ::buffa::alloc::string::String,
+    /// Store revision of the read (or the pinned resync revision).
+    ///
+    /// Field 3: `revision`
+    #[serde(
+        rename = "revision",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub revision: u64,
+    /// Field 4: `capabilities`
+    #[serde(
+        rename = "capabilities",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub capabilities: ::buffa::alloc::vec::Vec<DeviceStateEntry>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for DeviceStateSnapshot {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("DeviceStateSnapshot")
+            .field("device_id", &self.device_id)
+            .field("epoch", &self.epoch)
+            .field("revision", &self.revision)
+            .field("capabilities", &self.capabilities)
+            .finish()
+    }
+}
+impl DeviceStateSnapshot {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.DeviceStateSnapshot";
+}
+::buffa::impl_default_instance!(DeviceStateSnapshot);
+impl ::buffa::MessageName for DeviceStateSnapshot {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "DeviceStateSnapshot";
+    const FULL_NAME: &'static str = "oxidhome.v1.DeviceStateSnapshot";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.DeviceStateSnapshot";
+}
+impl ::buffa::Message for DeviceStateSnapshot {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.device_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.device_id) as u64;
+        }
+        if !self.epoch.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.epoch) as u64;
+        }
+        if self.revision != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.revision) as u64;
+        }
+        for v in &self.capabilities {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.device_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.device_id, buf);
+        }
+        if !self.epoch.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.epoch, buf);
+        }
+        if self.revision != 0u64 {
+            ::buffa::types::put_uint64_field(3u32, self.revision, buf);
+        }
+        for v in &self.capabilities {
+            ::buffa::types::put_len_delimited_header(
+                4u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.device_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.epoch, buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.revision = ::buffa::types::decode_uint64(buf)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.capabilities.push(elem);
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.device_id.clear();
+        self.epoch.clear();
+        self.revision = 0u64;
+        self.capabilities.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for DeviceStateSnapshot {
+    const PROTO_FQN: &'static str = "oxidhome.v1.DeviceStateSnapshot";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for DeviceStateSnapshot {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __DEVICE_STATE_SNAPSHOT_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.DeviceStateSnapshot",
+    to_json: ::buffa::type_registry::any_to_json::<DeviceStateSnapshot>,
+    from_json: ::buffa::type_registry::any_from_json::<DeviceStateSnapshot>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct GetDeviceStateRequest {
+    /// Field 1: `device_id`
+    #[serde(
+        rename = "deviceId",
+        alias = "device_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub device_id: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for GetDeviceStateRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("GetDeviceStateRequest")
+            .field("device_id", &self.device_id)
+            .finish()
+    }
+}
+impl GetDeviceStateRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.GetDeviceStateRequest";
+}
+::buffa::impl_default_instance!(GetDeviceStateRequest);
+impl ::buffa::MessageName for GetDeviceStateRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "GetDeviceStateRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.GetDeviceStateRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.GetDeviceStateRequest";
+}
+impl ::buffa::Message for GetDeviceStateRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.device_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.device_id) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.device_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.device_id, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.device_id, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.device_id.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for GetDeviceStateRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.GetDeviceStateRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for GetDeviceStateRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __GET_DEVICE_STATE_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.GetDeviceStateRequest",
+    to_json: ::buffa::type_registry::any_to_json::<GetDeviceStateRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<GetDeviceStateRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct GetDeviceStateResponse {
+    /// Field 1: `state`
+    #[serde(
+        rename = "state",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+    )]
+    pub state: ::buffa::MessageField<
+        DeviceStateSnapshot,
+        ::buffa::Inline<DeviceStateSnapshot>,
+    >,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for GetDeviceStateResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("GetDeviceStateResponse").field("state", &self.state).finish()
+    }
+}
+impl GetDeviceStateResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.GetDeviceStateResponse";
+}
+::buffa::impl_default_instance!(GetDeviceStateResponse);
+impl ::buffa::MessageName for GetDeviceStateResponse {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "GetDeviceStateResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.GetDeviceStateResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.GetDeviceStateResponse";
+}
+impl ::buffa::Message for GetDeviceStateResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.state.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.state.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.state.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                1u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.state.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::Message::merge_length_delimited(
+                    self.state.get_or_insert_default(),
+                    buf,
+                    ctx,
+                )?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.state = ::buffa::MessageField::none();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for GetDeviceStateResponse {
+    const PROTO_FQN: &'static str = "oxidhome.v1.GetDeviceStateResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for GetDeviceStateResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __GET_DEVICE_STATE_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.GetDeviceStateResponse",
+    to_json: ::buffa::type_registry::any_to_json::<GetDeviceStateResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<GetDeviceStateResponse>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct ListDeviceStateRequest {
+    /// Opaque continuation cursor from `next_cursor`; empty for the
+    /// first page.
+    ///
+    /// Field 1: `cursor`
+    #[serde(
+        rename = "cursor",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub cursor: ::buffa::alloc::string::String,
+    /// Devices per page; 0 means the default (64), capped at 256.
+    ///
+    /// Field 2: `limit`
+    #[serde(
+        rename = "limit",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub limit: u32,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for ListDeviceStateRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ListDeviceStateRequest")
+            .field("cursor", &self.cursor)
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+impl ListDeviceStateRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateRequest";
+}
+::buffa::impl_default_instance!(ListDeviceStateRequest);
+impl ::buffa::MessageName for ListDeviceStateRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ListDeviceStateRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.ListDeviceStateRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateRequest";
+}
+impl ::buffa::Message for ListDeviceStateRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.cursor.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
+        }
+        if self.limit != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.limit) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.cursor.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.cursor, buf);
+        }
+        if self.limit != 0u32 {
+            ::buffa::types::put_uint32_field(2u32, self.limit, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.cursor, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.limit = ::buffa::types::decode_uint32(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.cursor.clear();
+        self.limit = 0u32;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for ListDeviceStateRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.ListDeviceStateRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for ListDeviceStateRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __LIST_DEVICE_STATE_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.ListDeviceStateRequest",
+    to_json: ::buffa::type_registry::any_to_json::<ListDeviceStateRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<ListDeviceStateRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct ListDeviceStateResponse {
+    /// Field 1: `epoch`
+    #[serde(
+        rename = "epoch",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub epoch: ::buffa::alloc::string::String,
+    /// Resync anchor: the first page's revision, echoed on every page.
+    /// After the last page, use it as `since_revision`.
+    ///
+    /// Field 2: `revision`
+    #[serde(
+        rename = "revision",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub revision: u64,
+    /// Field 3: `devices`
+    #[serde(
+        rename = "devices",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub devices: ::buffa::alloc::vec::Vec<DeviceStateSnapshot>,
+    /// Empty on the last page.
+    ///
+    /// Field 4: `next_cursor`
+    #[serde(
+        rename = "nextCursor",
+        alias = "next_cursor",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub next_cursor: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for ListDeviceStateResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ListDeviceStateResponse")
+            .field("epoch", &self.epoch)
+            .field("revision", &self.revision)
+            .field("devices", &self.devices)
+            .field("next_cursor", &self.next_cursor)
+            .finish()
+    }
+}
+impl ListDeviceStateResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateResponse";
+}
+::buffa::impl_default_instance!(ListDeviceStateResponse);
+impl ::buffa::MessageName for ListDeviceStateResponse {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ListDeviceStateResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.ListDeviceStateResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateResponse";
+}
+impl ::buffa::Message for ListDeviceStateResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.epoch.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.epoch) as u64;
+        }
+        if self.revision != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.revision) as u64;
+        }
+        for v in &self.devices {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if !self.next_cursor.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.next_cursor) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.epoch.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.epoch, buf);
+        }
+        if self.revision != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.revision, buf);
+        }
+        for v in &self.devices {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if !self.next_cursor.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.next_cursor, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.epoch, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.revision = ::buffa::types::decode_uint64(buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.devices.push(elem);
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.next_cursor, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.epoch.clear();
+        self.revision = 0u64;
+        self.devices.clear();
+        self.next_cursor.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for ListDeviceStateResponse {
+    const PROTO_FQN: &'static str = "oxidhome.v1.ListDeviceStateResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for ListDeviceStateResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __LIST_DEVICE_STATE_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.ListDeviceStateResponse",
+    to_json: ::buffa::type_registry::any_to_json::<ListDeviceStateResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<ListDeviceStateResponse>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct ListDeviceStateChangesRequest {
+    /// Return entries with `global_revision > since_revision`.
+    ///
+    /// Field 1: `since_revision`
+    #[serde(
+        rename = "sinceRevision",
+        alias = "since_revision",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub since_revision: u64,
+    /// 0 means the default (256), capped at 1024.
+    ///
+    /// Field 2: `limit`
+    #[serde(
+        rename = "limit",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub limit: u32,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for ListDeviceStateChangesRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ListDeviceStateChangesRequest")
+            .field("since_revision", &self.since_revision)
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+impl ListDeviceStateChangesRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateChangesRequest";
+}
+::buffa::impl_default_instance!(ListDeviceStateChangesRequest);
+impl ::buffa::MessageName for ListDeviceStateChangesRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ListDeviceStateChangesRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.ListDeviceStateChangesRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateChangesRequest";
+}
+impl ::buffa::Message for ListDeviceStateChangesRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.since_revision != 0u64 {
+            size
+                += 1u64 + ::buffa::types::uint64_encoded_len(self.since_revision) as u64;
+        }
+        if self.limit != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.limit) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.since_revision != 0u64 {
+            ::buffa::types::put_uint64_field(1u32, self.since_revision, buf);
+        }
+        if self.limit != 0u32 {
+            ::buffa::types::put_uint32_field(2u32, self.limit, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.since_revision = ::buffa::types::decode_uint64(buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.limit = ::buffa::types::decode_uint32(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.since_revision = 0u64;
+        self.limit = 0u32;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for ListDeviceStateChangesRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.ListDeviceStateChangesRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for ListDeviceStateChangesRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __LIST_DEVICE_STATE_CHANGES_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.ListDeviceStateChangesRequest",
+    to_json: ::buffa::type_registry::any_to_json::<ListDeviceStateChangesRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<ListDeviceStateChangesRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct ListDeviceStateChangesResponse {
+    /// Field 1: `epoch`
+    #[serde(
+        rename = "epoch",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub epoch: ::buffa::alloc::string::String,
+    /// Field 2: `current_revision`
+    #[serde(
+        rename = "currentRevision",
+        alias = "current_revision",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub current_revision: u64,
+    /// Latest value of each changed slot, ascending by revision.
+    ///
+    /// Field 3: `changes`
+    #[serde(
+        rename = "changes",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub changes: ::buffa::alloc::vec::Vec<DeviceStateEntry>,
+    /// The cursor is invalid (above the current revision, below the
+    /// eviction watermark, or inside a revision range skipped at boot):
+    /// resync with `ListDeviceState`.
+    ///
+    /// Field 4: `reset_required`
+    #[serde(
+        rename = "resetRequired",
+        alias = "reset_required",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub reset_required: bool,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for ListDeviceStateChangesResponse {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ListDeviceStateChangesResponse")
+            .field("epoch", &self.epoch)
+            .field("current_revision", &self.current_revision)
+            .field("changes", &self.changes)
+            .field("reset_required", &self.reset_required)
+            .finish()
+    }
+}
+impl ListDeviceStateChangesResponse {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateChangesResponse";
+}
+::buffa::impl_default_instance!(ListDeviceStateChangesResponse);
+impl ::buffa::MessageName for ListDeviceStateChangesResponse {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ListDeviceStateChangesResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.ListDeviceStateChangesResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateChangesResponse";
+}
+impl ::buffa::Message for ListDeviceStateChangesResponse {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.epoch.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.epoch) as u64;
+        }
+        if self.current_revision != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.current_revision) as u64;
+        }
+        for v in &self.changes {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.reset_required {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.epoch.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.epoch, buf);
+        }
+        if self.current_revision != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.current_revision, buf);
+        }
+        for v in &self.changes {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if self.reset_required {
+            ::buffa::types::put_bool_field(4u32, self.reset_required, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.epoch, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.current_revision = ::buffa::types::decode_uint64(buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.changes.push(elem);
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.reset_required = ::buffa::types::decode_bool(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.epoch.clear();
+        self.current_revision = 0u64;
+        self.changes.clear();
+        self.reset_required = false;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for ListDeviceStateChangesResponse {
+    const PROTO_FQN: &'static str = "oxidhome.v1.ListDeviceStateChangesResponse";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for ListDeviceStateChangesResponse {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __LIST_DEVICE_STATE_CHANGES_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.ListDeviceStateChangesResponse",
+    to_json: ::buffa::type_registry::any_to_json::<ListDeviceStateChangesResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<ListDeviceStateChangesResponse>,
+    is_wkt: false,
+};

@@ -60,7 +60,8 @@
 //!    dir**;
 //! 2. copies it into `<state_dir>/.restore-staging/`, re-checking
 //!    every checksum on the way in, and re-runs the database /
-//!    index / package checks on the staged copy;
+//!    index / package checks on the staged copy, then expires every
+//!    device-state cursor in it (H2: the backup is an older history);
 //! 3. writes a durable `<state_dir>/.restore-journal`, then moves
 //!    the current `oxidhome.db` (with its `-wal` / `-shm`), `blobs/`
 //!    and `plugins/` into `<state_dir>/pre-restore-<unix_ms>/` and
@@ -947,6 +948,7 @@ pub fn restore_offline(state_dir: &Path, archive: &Path) -> anyhow::Result<Resto
     // could have shown different bytes to each pass.
     stage_archive(archive, &verified.manifest, &staging)
         .and_then(|()| check_tree(&staging, &verified.manifest).map(|_| ()))
+        .and_then(|()| invalidate_staged_device_state(&staging))
         .with_context(|| format!("staging {}", archive.display()))
         .inspect_err(|_| {
             let _ = fs::remove_dir_all(&staging);
@@ -1130,6 +1132,35 @@ fn complete_restore_audit(
 
 /// Boot an engine on the restored state (proves it opens, applies
 /// pending migrations) and record the restore in its audit ledger.
+/// H2: the restored projection is an older history, so cursors held
+/// by clients of the replaced database must resync. Done on the staged
+/// copy, after its checks and before the journal is written, so no
+/// crash point can swap in a database that still accepts them.
+fn invalidate_staged_device_state(staging: &Path) -> anyhow::Result<()> {
+    let path = staging.join(DB_FILE_NAME);
+    if !path.exists() {
+        return Ok(());
+    }
+    {
+        let conn = rusqlite::Connection::open(&path)
+            .with_context(|| format!("opening staged database {}", path.display()))?;
+        crate::state::device_state::invalidate_cursors_after_restore(&conn)
+            .context("invalidating device-state cursors")?;
+        // Fold any WAL back into the file: only the main file is
+        // swapped in.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .context("checkpointing the staged database")?;
+    }
+    let wal = staging.join(format!("{DB_FILE_NAME}-wal"));
+    if wal.exists() {
+        anyhow::bail!("staged database left a WAL file behind");
+    }
+    fs::File::open(&path)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("syncing {}", path.display()))?;
+    Ok(())
+}
+
 fn record_restore(state_dir: &Path, archive_created_ms: u64) -> anyhow::Result<()> {
     let engine = crate::Engine::with_state_dir(state_dir)
         .with_context(|| format!("opening engine state at {}", state_dir.display()))?;

@@ -439,8 +439,8 @@ struct DeviceStateSnapshot {
     device_id: String,
     /// H9 round-6 finding 1: opaque store epoch. Clients
     /// persist this alongside `revision`; a subsequent response
-    /// carrying a different `epoch` means the daemon restarted
-    /// (the projection is in-memory), the previously-held
+    /// carrying a different `epoch` means the projection was
+    /// discarded (H2: it survives a restart), the previously-held
     /// `revision` cursor is invalid, and the client should
     /// resync by re-fetching this endpoint. Round-7 finding 2:
     /// serialized as a string (128-bit OS-random nonce, hex)
@@ -484,6 +484,29 @@ struct DeviceStateEntry {
     /// `"fresh"` while the owning instance is alive; `"stale"`
     /// after it stops. Safety-critical consumers filter on this.
     quality: crate::state::StateQuality,
+}
+
+impl DeviceStateSnapshot {
+    /// One device's retained entries (non-empty, sorted by
+    /// capability) as a wire snapshot.
+    fn from_entries(
+        caps: &[Arc<crate::state::DeviceState>],
+        epoch: &str,
+        revision: u64,
+        blobs: bool,
+    ) -> Self {
+        Self {
+            device_id: caps
+                .first()
+                .map_or_else(String::new, |c| c.device_id.clone()),
+            epoch: epoch.to_owned(),
+            revision,
+            capabilities: caps
+                .iter()
+                .map(|c| DeviceStateEntry::from_state(c, blobs))
+                .collect(),
+        }
+    }
 }
 
 impl DeviceStateEntry {
@@ -616,11 +639,11 @@ struct AllDevicesStateParams {
 /// to comfortably carry a household-sized deployment in one
 /// round-trip while capping the worst-case response body.
 /// H9 round-16 finding 2: reduced from 128 to 64.
-const DEFAULT_ALL_DEVICES_STATE_LIMIT: usize = 64;
+pub(crate) const DEFAULT_ALL_DEVICES_STATE_LIMIT: usize = 64;
 /// Hard ceiling for the same endpoint — a caller can't push
 /// the page past this even if they explicitly ask.
 /// H9 round-16 finding 2: reduced from 512 to 256.
-const MAX_ALL_DEVICES_STATE_LIMIT: usize = 256;
+pub(crate) const MAX_ALL_DEVICES_STATE_LIMIT: usize = 256;
 /// H9 round-16 finding 2: hard cap on the cumulative
 /// serialized *bytes* of one snapshot page. The `limit`
 /// (device count) cap alone can't bound the response body
@@ -632,7 +655,13 @@ const MAX_ALL_DEVICES_STATE_LIMIT: usize = 256;
 /// MAX_BYTES_PER_SLOT (16 KiB) = 512 KiB`, so a well-
 /// behaved plugin's single device never triggers the byte
 /// cap before the count cap does.
-const MAX_ALL_DEVICES_STATE_PAGE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_ALL_DEVICES_STATE_PAGE_BYTES: usize = 1024 * 1024;
+
+/// H2: entries one snapshot page looks at. A continuation page skips
+/// entries newer than its pin, so without a budget a page could walk
+/// the rest of the store under the read lock; past it the page ends
+/// early (possibly empty) with a `next_cursor`.
+pub(crate) const MAX_ALL_DEVICES_STATE_SCAN: usize = 16_384;
 
 /// Body of `GET /api/v1/devices/state`. Same shape as
 /// [`DeviceStateSnapshot`] but returns entries across every
@@ -748,151 +777,40 @@ async fn get_all_device_state(
         },
         None => None,
     };
-    // Ask for `limit + 1` distinct devices so we can tell
-    // whether another page exists without a second lookup.
-    let (epoch, current_revision, entries) =
-        state.engine.device_state().snapshot_page_with_revision(
-            cursor_fields.as_ref().map(|(_, _, did)| did.as_str()),
-            limit + 1,
-        );
+    // H2: grouping and the count / byte caps live in the store
+    // (shared with Connect and the plugin `list-state` import). Caps
+    // are applied on the raw `Arc` entries; only the retained ones are
+    // converted to wire values (H9 round-18/19).
+    // H2: a continuation page leaves out entries newer than the pinned
+    // revision. The client picks them up from `/state/changes` since
+    // that revision, so a slot written mid-resync and then lost in a
+    // crash is never in the client's snapshot with nothing to retract
+    // it (the restored store accepts the pinned cursor).
+    let pinned = cursor_fields.as_ref().map(|(_, r, _)| *r);
+    let page = state.engine.device_state().snapshot_page_capped(
+        cursor_fields.as_ref().map(|(_, _, did)| did.as_str()),
+        limit,
+        MAX_ALL_DEVICES_STATE_PAGE_BYTES,
+        MAX_ALL_DEVICES_STATE_SCAN,
+        |e| pinned.is_none_or(|r| e.global_revision <= r),
+    );
+    let epoch = page.epoch;
     // On page one (no cursor), report the store's current
     // revision; on continuation, echo the pinned revision
     // from the (verified) cursor so all pages of one resync
     // agree.
     let revision = match cursor_fields.as_ref() {
         Some((_, r, _)) => *r,
-        None => current_revision,
+        None => page.revision,
     };
-    // H9 round-18 finding 1: apply the cumulative-byte and
-    // count caps to the raw `Arc<DeviceState>` entries FIRST
-    // — cheap `Arc::clone` per retained entry, no wire
-    // conversion — and only deep-clone into wire values for
-    // the survivors. Pre-fix, `DeviceStateEntry::from_state`
-    // ran on every fetched entry (up to `(limit+1) *
-    // MAX_CAPABILITIES_PER_DEVICE * MAX_BYTES_PER_SLOT` ≈
-    // 128 MiB at max limit) before truncation.
-    //
-    // Entries are already sorted `(device_id, capability)` by
-    // `snapshot_page_with_revision`, so we can group into
-    // devices on the fly while tracking cumulative bytes.
-    // H9 round-19 finding 2: accumulate an entire pending
-    // device before committing it as one unit. Pre-fix, the
-    // byte-cap check ran only on the first capability of a
-    // new device — once that fit, every remaining capability
-    // for that device was appended unchecked, so a page could
-    // silently exceed the 1 MiB ceiling by up to
-    // `MAX_CAPABILITIES_PER_DEVICE × MAX_BYTES_PER_SLOT`
-    // (~512 KiB) per device. Whole-device admission keeps
-    // per-device atomicity while honouring the page ceiling.
-    let mut retained_devices: Vec<Vec<Arc<crate::state::DeviceState>>> = Vec::new();
-    let mut running_bytes: usize = 0;
-    let mut pending: Vec<Arc<crate::state::DeviceState>> = Vec::new();
-    let mut pending_bytes: usize = 0;
-    let mut byte_capped = false;
-    let mut count_capped = false;
-
-    // Try to commit the current `pending` device to
-    // `retained_devices`. Returns whether to keep iterating
-    // (false = we hit a cap and should break).
-    #[allow(clippy::items_after_statements)]
-    let commit = |retained: &mut Vec<Vec<Arc<crate::state::DeviceState>>>,
-                  running: &mut usize,
-                  pending: &mut Vec<Arc<crate::state::DeviceState>>,
-                  pending_bytes: &mut usize,
-                  count_capped: &mut bool,
-                  byte_capped: &mut bool|
-     -> bool {
-        if pending.is_empty() {
-            return true;
-        }
-        if retained.len() >= limit {
-            *count_capped = true;
-            return false;
-        }
-        // Always keep the first device even if it exceeds
-        // the ceiling on its own (bounded by per-device
-        // caps, ~512 KiB), so pagination always makes
-        // progress.
-        let would_be_total = running.saturating_add(*pending_bytes);
-        if !retained.is_empty() && would_be_total > MAX_ALL_DEVICES_STATE_PAGE_BYTES {
-            *byte_capped = true;
-            return false;
-        }
-        *running = would_be_total;
-        retained.push(std::mem::take(pending));
-        *pending_bytes = 0;
-        true
-    };
-
-    for entry in entries {
-        let is_new_device = pending
-            .first()
-            .is_none_or(|first| first.device_id != entry.device_id);
-        if is_new_device
-            && !commit(
-                &mut retained_devices,
-                &mut running_bytes,
-                &mut pending,
-                &mut pending_bytes,
-                &mut count_capped,
-                &mut byte_capped,
-            )
-        {
-            break;
-        }
-        pending_bytes = pending_bytes
-            .saturating_add(entry.capability.len())
-            .saturating_add(entry.field_byte_estimate());
-        pending.push(entry);
-    }
-    // Commit the trailing pending device unless we already
-    // broke out on a cap.
-    if !count_capped && !byte_capped {
-        let _ = commit(
-            &mut retained_devices,
-            &mut running_bytes,
-            &mut pending,
-            &mut pending_bytes,
-            &mut count_capped,
-            &mut byte_capped,
-        );
-    }
-    // Wire conversion only for retained entries.
-    let devices: Vec<DeviceStateSnapshot> = retained_devices
+    let devices: Vec<DeviceStateSnapshot> = page
+        .devices
         .into_iter()
-        .map(|caps| {
-            let device_id = caps
-                .first()
-                .expect("retained device has at least one entry")
-                .device_id
-                .clone();
-            let mut wire: Vec<DeviceStateEntry> = caps
-                .iter()
-                .map(|a| DeviceStateEntry::from_state(a, blobs))
-                .collect();
-            wire.sort_by(|a, b| a.capability.cmp(&b.capability));
-            DeviceStateSnapshot {
-                device_id,
-                epoch: epoch.clone(),
-                revision,
-                capabilities: wire,
-            }
-        })
+        .map(|caps| DeviceStateSnapshot::from_entries(&caps, &epoch, revision, blobs))
         .collect();
-    let next_cursor = if count_capped || byte_capped {
-        // Issue an HMAC-signed cursor anchored at the last
-        // device we returned. `devices.last()` is guaranteed
-        // non-empty because either the count-cap or byte-cap
-        // truncation kept at least one device.
-        devices.last().map(|d| {
-            state
-                .engine
-                .device_state()
-                .issue_cursor(revision, &d.device_id)
-        })
-    } else {
-        None
-    };
+    let next_cursor = page
+        .resume_after
+        .map(|after| state.engine.device_state().issue_cursor(revision, &after));
     Ok(Json(AllDevicesStateSnapshot {
         epoch,
         revision,
@@ -940,14 +858,13 @@ struct StateChangesParams {
 /// every changed slot's latest value is within the current page —
 /// advance and re-poll.
 ///
-/// H9 round-6 finding 1: `epoch` is the store's opaque
-/// process-scoped nonce; a client that persists the last-seen
-/// epoch and observes a change knows the daemon restarted, the
-/// in-memory projection reset, and its cursor is invalid. As a
-/// belt-and-suspenders check, `reset_required` is `true` when
-/// `since_revision > current_revision` (typical after a
-/// restart drops the store back to 0) — the client discards
-/// its cursor and re-fetches the snapshot.
+/// H9 round-6 finding 1: `epoch` is the store's opaque nonce; a
+/// client that persists the last-seen epoch and observes a change
+/// knows the projection was discarded and its cursor is invalid.
+/// `reset_required` covers the cases the epoch can't (H2: the
+/// epoch survives restarts): a cursor above the current revision,
+/// below the eviction watermark, or inside a revision range a boot
+/// skipped because its writes may not have been flushed.
 #[derive(Serialize)]
 struct StateChangesBody {
     /// See [`DeviceStateSnapshot::epoch`] — 128-bit OS-random
@@ -955,9 +872,9 @@ struct StateChangesBody {
     epoch: String,
     current_revision: u64,
     changes: Vec<DeviceStateEntry>,
-    /// True when the caller's cursor is invalid — either it's
-    /// beyond the store's current revision (typical after a
-    /// daemon restart drops the store back to 0), or it's below
+    /// True when the caller's cursor is invalid — it's beyond the
+    /// store's current revision, inside a revision range a boot
+    /// skipped (H2: changes lost before they were flushed), or below
     /// the store's `evicted_through_revision` watermark (an
     /// evicted stale slot may have been the client's last
     /// chance to observe a `Fresh → Stale` flip). Recovery:
@@ -974,10 +891,10 @@ struct StateChangesBody {
 /// carry the initial-sync case (a few dozen devices × a few
 /// capabilities each) in one round-trip, while capping the
 /// worst-case JSON body for a caller that forgets to send `limit`.
-const DEFAULT_STATE_CHANGES_LIMIT: usize = 256;
+pub(crate) const DEFAULT_STATE_CHANGES_LIMIT: usize = 256;
 /// Hard ceiling — a caller can't push the page past this even if
 /// they explicitly ask.
-const MAX_STATE_CHANGES_LIMIT: usize = 1024;
+pub(crate) const MAX_STATE_CHANGES_LIMIT: usize = 1024;
 
 /// H9 `GET /api/v1/devices/state/changes`. Cursor-based catch-up.
 /// See [`StateChangesParams`] for the parameter shapes and the

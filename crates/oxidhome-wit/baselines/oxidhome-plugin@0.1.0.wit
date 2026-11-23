@@ -619,6 +619,40 @@ interface host-config {
   list-config: func() -> result<list<key-value>, error>;
 }
 
+interface host-state {
+  use types.{device-id, unix-ms, key-value, error};
+
+  enum state-quality {
+    fresh,
+    stale,
+  }
+
+  record device-state {
+    device: device-id,
+    capability: string,
+    fields: list<key-value>,
+    revision: u64,
+    received-ms: unix-ms,
+    observed-ms: unix-ms,
+    quality: state-quality,
+  }
+
+  record state-filter {
+    device: option<device-id>,
+    capability: option<string>,
+  }
+
+  record state-page {
+    revision: u64,
+    entries: list<device-state>,
+    next-cursor: option<string>,
+  }
+
+  get-state: func(device: device-id) -> result<list<device-state>, error>;
+
+  list-state: func(filter: state-filter, cursor: option<string>, limit: u32) -> result<state-page, error>;
+}
+
 interface host-media {
   use types.{device-id, error};
   use media.{media-pipeline, pipeline-handle, plugin-pipe-config, pipe-writer};
@@ -643,6 +677,7 @@ world plugin {
   import events;
   import host-events;
   import host-config;
+  import host-state;
   import services;
   import host-services;
   import host-sandboxes;
@@ -679,6 +714,7 @@ world streaming-plugin {
   import events;
   import host-events;
   import host-config;
+  import host-state;
   import services;
   import host-services;
   import host-sandboxes;
@@ -706,6 +742,7 @@ world ai-plugin {
   import events;
   import host-events;
   import host-config;
+  import host-state;
   import services;
   import host-services;
   import host-sandboxes;
@@ -743,6 +780,7 @@ world streaming-ai-plugin {
   import events;
   import host-events;
   import host-config;
+  import host-state;
   import services;
   import host-services;
   import host-sandboxes;

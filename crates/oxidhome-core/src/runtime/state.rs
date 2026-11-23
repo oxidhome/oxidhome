@@ -525,9 +525,15 @@ impl PluginState {
         // cap a true per-instance ceiling across all memories /
         // tables (C4 review P1 F1) and traps on refusal (P2 F1).
         let limits = PluginResourceLimits::new();
+        // H2: entries this instance writes carry its plugin id, which
+        // the `reads_state` grant's `plugin` selector matches on.
+        let installation_uuid: Arc<str> = installation_uuid.into();
+        device_state.bind_owner_plugin(&instance_id, &manifest.plugin.id, &installation_uuid);
+        // Start the `host-state` deny-audit worker off the read path.
+        let _ = super::state_read::deny_audit_queue();
         Self {
             instance_id,
-            installation_uuid: installation_uuid.into(),
+            installation_uuid,
             granted_capabilities,
             consumes_services_requested,
             table: ResourceTable::new(),
@@ -582,6 +588,15 @@ impl PluginState {
     pub fn with_pending_commands(mut self, pending: Arc<super::PendingCommands>) -> Self {
         self.pending_commands = Some(pending);
         self
+    }
+}
+
+impl Drop for PluginState {
+    fn drop(&mut self) {
+        // H2: release the owner binding taken in `new`, so bindings
+        // don't outlive their instances.
+        self.device_state
+            .unbind_owner_plugin(&self.instance_id, &self.installation_uuid);
     }
 }
 

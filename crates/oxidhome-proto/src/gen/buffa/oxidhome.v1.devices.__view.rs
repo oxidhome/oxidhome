@@ -4283,3 +4283,2758 @@ impl ::serde::Serialize for ExecuteCommandErrorOwnedView {
         ::serde::Serialize::serialize(&self.0, __s)
     }
 }
+/// H2: the current value of one capability on one device.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceStateEntryView<'a> {
+    /// Field 1: `device_id`
+    pub device_id: &'a str,
+    /// Field 2: `capability`
+    pub capability: &'a str,
+    /// Merged current fields.
+    ///
+    /// Field 3: `fields`
+    pub fields: ::buffa::RepeatedView<'a, super::super::__buffa::view::KeyValueView<'a>>,
+    /// Store-wide revision at write time; the only ordering axis.
+    ///
+    /// Field 4: `global_revision`
+    pub global_revision: u64,
+    /// Host wall clock (ms) when the value was applied.
+    ///
+    /// Field 5: `received_ms`
+    pub received_ms: i64,
+    /// Plugin-supplied observation time (ms); informational.
+    ///
+    /// Field 6: `observed_ms`
+    pub observed_ms: u64,
+    /// Supervisor generation of the owner at write time.
+    ///
+    /// Field 7: `source_generation`
+    pub source_generation: u64,
+    /// Field 8: `quality`
+    pub quality: ::buffa::EnumValue<super::super::StateQuality>,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for DeviceStateEntryView<'a> {
+    type Owned = super::super::DeviceStateEntry;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.device_id = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.capability = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.global_revision = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.received_ms = ::buffa::types::decode_int64(&mut cur)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.observed_ms = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.source_generation = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.quality = ::buffa::EnumValue::from(
+                    ::buffa::types::decode_int32(&mut cur)?,
+                );
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<super::super::__buffa::view::KeyValueView>(),
+                )?;
+                view.fields
+                    .push(
+                        <super::super::__buffa::view::KeyValueView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<super::super::DeviceStateEntry, ::buffa::DecodeError> {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<super::super::DeviceStateEntry, ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::DeviceStateEntry {
+            device_id: self.device_id.to_string(),
+            capability: self.capability.to_string(),
+            fields: self
+                .fields
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            global_revision: self.global_revision,
+            received_ms: self.received_ms,
+            observed_ms: self.observed_ms,
+            source_generation: self.source_generation,
+            quality: self.quality,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for DeviceStateEntryView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.device_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.device_id) as u64;
+        }
+        if !self.capability.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.capability) as u64;
+        }
+        for v in &self.fields {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.global_revision != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.global_revision) as u64;
+        }
+        if self.received_ms != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.received_ms) as u64;
+        }
+        if self.observed_ms != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.observed_ms) as u64;
+        }
+        if self.source_generation != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.source_generation) as u64;
+        }
+        {
+            let val = self.quality.to_i32();
+            if val != 0 {
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+            }
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.device_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.device_id, buf);
+        }
+        if !self.capability.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.capability, buf);
+        }
+        for v in &self.fields {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if self.global_revision != 0u64 {
+            ::buffa::types::put_uint64_field(4u32, self.global_revision, buf);
+        }
+        if self.received_ms != 0i64 {
+            ::buffa::types::put_int64_field(5u32, self.received_ms, buf);
+        }
+        if self.observed_ms != 0u64 {
+            ::buffa::types::put_uint64_field(6u32, self.observed_ms, buf);
+        }
+        if self.source_generation != 0u64 {
+            ::buffa::types::put_uint64_field(7u32, self.source_generation, buf);
+        }
+        {
+            let val = self.quality.to_i32();
+            if val != 0 {
+                ::buffa::types::put_int32_field(8u32, val, buf);
+            }
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for DeviceStateEntryView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.device_id) {
+            __map.serialize_entry("deviceId", self.device_id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.capability) {
+            __map.serialize_entry("capability", self.capability)?;
+        }
+        if !self.fields.is_empty() {
+            __map.serialize_entry("fields", &*self.fields)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.global_revision) {
+            __map
+                .serialize_entry(
+                    "globalRevision",
+                    &::buffa::json_helpers::ProtoJson(&self.global_revision),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.received_ms) {
+            __map
+                .serialize_entry(
+                    "receivedMs",
+                    &::buffa::json_helpers::ProtoJson(&self.received_ms),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.observed_ms) {
+            __map
+                .serialize_entry(
+                    "observedMs",
+                    &::buffa::json_helpers::ProtoJson(&self.observed_ms),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.source_generation) {
+            __map
+                .serialize_entry(
+                    "sourceGeneration",
+                    &::buffa::json_helpers::ProtoJson(&self.source_generation),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.quality) {
+            __map.serialize_entry("quality", &self.quality)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for DeviceStateEntryView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "DeviceStateEntry";
+    const FULL_NAME: &'static str = "oxidhome.v1.DeviceStateEntry";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.DeviceStateEntry";
+}
+::buffa::impl_default_view_instance!(DeviceStateEntryView);
+::buffa::impl_view_reborrow!(DeviceStateEntryView);
+/** Self-contained, `'static` owned view of a `DeviceStateEntry` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`DeviceStateEntryView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`DeviceStateEntryView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct DeviceStateEntryOwnedView(::buffa::OwnedView<DeviceStateEntryView<'static>>);
+impl DeviceStateEntryOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DeviceStateEntryOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DeviceStateEntryOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::DeviceStateEntry,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DeviceStateEntryOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`DeviceStateEntryView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &DeviceStateEntryView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::DeviceStateEntry {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `device_id`
+    #[must_use]
+    pub fn device_id(&self) -> &'_ str {
+        self.0.reborrow().device_id
+    }
+    /// Field 2: `capability`
+    #[must_use]
+    pub fn capability(&self) -> &'_ str {
+        self.0.reborrow().capability
+    }
+    /// Merged current fields.
+    ///
+    /// Field 3: `fields`
+    #[must_use]
+    pub fn fields(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::KeyValueView<'_>> {
+        &self.0.reborrow().fields
+    }
+    /// Store-wide revision at write time; the only ordering axis.
+    ///
+    /// Field 4: `global_revision`
+    #[must_use]
+    pub fn global_revision(&self) -> u64 {
+        self.0.reborrow().global_revision
+    }
+    /// Host wall clock (ms) when the value was applied.
+    ///
+    /// Field 5: `received_ms`
+    #[must_use]
+    pub fn received_ms(&self) -> i64 {
+        self.0.reborrow().received_ms
+    }
+    /// Plugin-supplied observation time (ms); informational.
+    ///
+    /// Field 6: `observed_ms`
+    #[must_use]
+    pub fn observed_ms(&self) -> u64 {
+        self.0.reborrow().observed_ms
+    }
+    /// Supervisor generation of the owner at write time.
+    ///
+    /// Field 7: `source_generation`
+    #[must_use]
+    pub fn source_generation(&self) -> u64 {
+        self.0.reborrow().source_generation
+    }
+    /// Field 8: `quality`
+    #[must_use]
+    pub fn quality(&self) -> ::buffa::EnumValue<super::super::StateQuality> {
+        self.0.reborrow().quality
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<DeviceStateEntryView<'static>>>
+for DeviceStateEntryOwnedView {
+    fn from(inner: ::buffa::OwnedView<DeviceStateEntryView<'static>>) -> Self {
+        DeviceStateEntryOwnedView(inner)
+    }
+}
+impl ::core::convert::From<DeviceStateEntryOwnedView>
+for ::buffa::OwnedView<DeviceStateEntryView<'static>> {
+    fn from(wrapper: DeviceStateEntryOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<DeviceStateEntryView<'static>>>
+for DeviceStateEntryOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<DeviceStateEntryView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::DeviceStateEntry {
+    type View<'a> = DeviceStateEntryView<'a>;
+    type ViewHandle = DeviceStateEntryOwnedView;
+}
+impl ::serde::Serialize for DeviceStateEntryOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// H2: every projected capability of one device, read atomically.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceStateSnapshotView<'a> {
+    /// Field 1: `device_id`
+    pub device_id: &'a str,
+    /// Opaque store epoch; changes only when the projection is discarded.
+    ///
+    /// Field 2: `epoch`
+    pub epoch: &'a str,
+    /// Store revision of the read (or the pinned resync revision).
+    ///
+    /// Field 3: `revision`
+    pub revision: u64,
+    /// Field 4: `capabilities`
+    pub capabilities: ::buffa::RepeatedView<
+        'a,
+        super::super::__buffa::view::DeviceStateEntryView<'a>,
+    >,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for DeviceStateSnapshotView<'a> {
+    type Owned = super::super::DeviceStateSnapshot;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.device_id = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.epoch = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.revision = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<
+                        super::super::__buffa::view::DeviceStateEntryView,
+                    >(),
+                )?;
+                view.capabilities
+                    .push(
+                        <super::super::__buffa::view::DeviceStateEntryView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::DeviceStateSnapshot,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::DeviceStateSnapshot,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::DeviceStateSnapshot {
+            device_id: self.device_id.to_string(),
+            epoch: self.epoch.to_string(),
+            revision: self.revision,
+            capabilities: self
+                .capabilities
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for DeviceStateSnapshotView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.device_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.device_id) as u64;
+        }
+        if !self.epoch.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.epoch) as u64;
+        }
+        if self.revision != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.revision) as u64;
+        }
+        for v in &self.capabilities {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.device_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.device_id, buf);
+        }
+        if !self.epoch.is_empty() {
+            ::buffa::types::put_string_field(2u32, &self.epoch, buf);
+        }
+        if self.revision != 0u64 {
+            ::buffa::types::put_uint64_field(3u32, self.revision, buf);
+        }
+        for v in &self.capabilities {
+            ::buffa::types::put_len_delimited_header(
+                4u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for DeviceStateSnapshotView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.device_id) {
+            __map.serialize_entry("deviceId", self.device_id)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.epoch) {
+            __map.serialize_entry("epoch", self.epoch)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.revision) {
+            __map
+                .serialize_entry(
+                    "revision",
+                    &::buffa::json_helpers::ProtoJson(&self.revision),
+                )?;
+        }
+        if !self.capabilities.is_empty() {
+            __map.serialize_entry("capabilities", &*self.capabilities)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for DeviceStateSnapshotView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "DeviceStateSnapshot";
+    const FULL_NAME: &'static str = "oxidhome.v1.DeviceStateSnapshot";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.DeviceStateSnapshot";
+}
+::buffa::impl_default_view_instance!(DeviceStateSnapshotView);
+::buffa::impl_view_reborrow!(DeviceStateSnapshotView);
+/** Self-contained, `'static` owned view of a `DeviceStateSnapshot` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`DeviceStateSnapshotView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`DeviceStateSnapshotView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct DeviceStateSnapshotOwnedView(
+    ::buffa::OwnedView<DeviceStateSnapshotView<'static>>,
+);
+impl DeviceStateSnapshotOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DeviceStateSnapshotOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DeviceStateSnapshotOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::DeviceStateSnapshot,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DeviceStateSnapshotOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`DeviceStateSnapshotView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &DeviceStateSnapshotView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::DeviceStateSnapshot {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `device_id`
+    #[must_use]
+    pub fn device_id(&self) -> &'_ str {
+        self.0.reborrow().device_id
+    }
+    /// Opaque store epoch; changes only when the projection is discarded.
+    ///
+    /// Field 2: `epoch`
+    #[must_use]
+    pub fn epoch(&self) -> &'_ str {
+        self.0.reborrow().epoch
+    }
+    /// Store revision of the read (or the pinned resync revision).
+    ///
+    /// Field 3: `revision`
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.0.reborrow().revision
+    }
+    /// Field 4: `capabilities`
+    #[must_use]
+    pub fn capabilities(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        super::super::__buffa::view::DeviceStateEntryView<'_>,
+    > {
+        &self.0.reborrow().capabilities
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<DeviceStateSnapshotView<'static>>>
+for DeviceStateSnapshotOwnedView {
+    fn from(inner: ::buffa::OwnedView<DeviceStateSnapshotView<'static>>) -> Self {
+        DeviceStateSnapshotOwnedView(inner)
+    }
+}
+impl ::core::convert::From<DeviceStateSnapshotOwnedView>
+for ::buffa::OwnedView<DeviceStateSnapshotView<'static>> {
+    fn from(wrapper: DeviceStateSnapshotOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<DeviceStateSnapshotView<'static>>>
+for DeviceStateSnapshotOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<DeviceStateSnapshotView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::DeviceStateSnapshot {
+    type View<'a> = DeviceStateSnapshotView<'a>;
+    type ViewHandle = DeviceStateSnapshotOwnedView;
+}
+impl ::serde::Serialize for DeviceStateSnapshotOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct GetDeviceStateRequestView<'a> {
+    /// Field 1: `device_id`
+    pub device_id: &'a str,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for GetDeviceStateRequestView<'a> {
+    type Owned = super::super::GetDeviceStateRequest;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.device_id = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::GetDeviceStateRequest,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::GetDeviceStateRequest,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::GetDeviceStateRequest {
+            device_id: self.device_id.to_string(),
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for GetDeviceStateRequestView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.device_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.device_id) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.device_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.device_id, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for GetDeviceStateRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.device_id) {
+            __map.serialize_entry("deviceId", self.device_id)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for GetDeviceStateRequestView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "GetDeviceStateRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.GetDeviceStateRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.GetDeviceStateRequest";
+}
+::buffa::impl_default_view_instance!(GetDeviceStateRequestView);
+::buffa::impl_view_reborrow!(GetDeviceStateRequestView);
+/** Self-contained, `'static` owned view of a `GetDeviceStateRequest` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`GetDeviceStateRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`GetDeviceStateRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct GetDeviceStateRequestOwnedView(
+    ::buffa::OwnedView<GetDeviceStateRequestView<'static>>,
+);
+impl GetDeviceStateRequestOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            GetDeviceStateRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            GetDeviceStateRequestOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::GetDeviceStateRequest,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            GetDeviceStateRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`GetDeviceStateRequestView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &GetDeviceStateRequestView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::GetDeviceStateRequest {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `device_id`
+    #[must_use]
+    pub fn device_id(&self) -> &'_ str {
+        self.0.reborrow().device_id
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<GetDeviceStateRequestView<'static>>>
+for GetDeviceStateRequestOwnedView {
+    fn from(inner: ::buffa::OwnedView<GetDeviceStateRequestView<'static>>) -> Self {
+        GetDeviceStateRequestOwnedView(inner)
+    }
+}
+impl ::core::convert::From<GetDeviceStateRequestOwnedView>
+for ::buffa::OwnedView<GetDeviceStateRequestView<'static>> {
+    fn from(wrapper: GetDeviceStateRequestOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<GetDeviceStateRequestView<'static>>>
+for GetDeviceStateRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<GetDeviceStateRequestView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::GetDeviceStateRequest {
+    type View<'a> = GetDeviceStateRequestView<'a>;
+    type ViewHandle = GetDeviceStateRequestOwnedView;
+}
+impl ::serde::Serialize for GetDeviceStateRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct GetDeviceStateResponseView<'a> {
+    /// Field 1: `state`
+    pub state: ::buffa::MessageFieldView<
+        super::super::__buffa::view::DeviceStateSnapshotView<'a>,
+    >,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for GetDeviceStateResponseView<'a> {
+    type Owned = super::super::GetDeviceStateResponse;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.state.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.state = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::DeviceStateSnapshotView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::GetDeviceStateResponse,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::GetDeviceStateResponse,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::GetDeviceStateResponse {
+            state: match self.state.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::DeviceStateSnapshot,
+                        ::buffa::Inline<super::super::DeviceStateSnapshot>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for GetDeviceStateResponseView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.state.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.state.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.state.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                1u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.state.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for GetDeviceStateResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        {
+            if let ::core::option::Option::Some(__v) = self.state.as_option() {
+                __map.serialize_entry("state", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for GetDeviceStateResponseView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "GetDeviceStateResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.GetDeviceStateResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.GetDeviceStateResponse";
+}
+::buffa::impl_default_view_instance!(GetDeviceStateResponseView);
+::buffa::impl_view_reborrow!(GetDeviceStateResponseView);
+/** Self-contained, `'static` owned view of a `GetDeviceStateResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`GetDeviceStateResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`GetDeviceStateResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct GetDeviceStateResponseOwnedView(
+    ::buffa::OwnedView<GetDeviceStateResponseView<'static>>,
+);
+impl GetDeviceStateResponseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            GetDeviceStateResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            GetDeviceStateResponseOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::GetDeviceStateResponse,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            GetDeviceStateResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`GetDeviceStateResponseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &GetDeviceStateResponseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::GetDeviceStateResponse {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `state`
+    #[must_use]
+    pub fn state(
+        &self,
+    ) -> &::buffa::MessageFieldView<
+        super::super::__buffa::view::DeviceStateSnapshotView<'_>,
+    > {
+        &self.0.reborrow().state
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<GetDeviceStateResponseView<'static>>>
+for GetDeviceStateResponseOwnedView {
+    fn from(inner: ::buffa::OwnedView<GetDeviceStateResponseView<'static>>) -> Self {
+        GetDeviceStateResponseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<GetDeviceStateResponseOwnedView>
+for ::buffa::OwnedView<GetDeviceStateResponseView<'static>> {
+    fn from(wrapper: GetDeviceStateResponseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<GetDeviceStateResponseView<'static>>>
+for GetDeviceStateResponseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<GetDeviceStateResponseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::GetDeviceStateResponse {
+    type View<'a> = GetDeviceStateResponseView<'a>;
+    type ViewHandle = GetDeviceStateResponseOwnedView;
+}
+impl ::serde::Serialize for GetDeviceStateResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct ListDeviceStateRequestView<'a> {
+    /// Opaque continuation cursor from `next_cursor`; empty for the
+    /// first page.
+    ///
+    /// Field 1: `cursor`
+    pub cursor: &'a str,
+    /// Devices per page; 0 means the default (64), capped at 256.
+    ///
+    /// Field 2: `limit`
+    pub limit: u32,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for ListDeviceStateRequestView<'a> {
+    type Owned = super::super::ListDeviceStateRequest;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.cursor = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.limit = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::ListDeviceStateRequest,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::ListDeviceStateRequest,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::ListDeviceStateRequest {
+            cursor: self.cursor.to_string(),
+            limit: self.limit,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for ListDeviceStateRequestView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.cursor.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
+        }
+        if self.limit != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.limit) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.cursor.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.cursor, buf);
+        }
+        if self.limit != 0u32 {
+            ::buffa::types::put_uint32_field(2u32, self.limit, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ListDeviceStateRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.cursor) {
+            __map.serialize_entry("cursor", self.cursor)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.limit) {
+            __map
+                .serialize_entry(
+                    "limit",
+                    &::buffa::json_helpers::ProtoJson(&self.limit),
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ListDeviceStateRequestView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ListDeviceStateRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.ListDeviceStateRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateRequest";
+}
+::buffa::impl_default_view_instance!(ListDeviceStateRequestView);
+::buffa::impl_view_reborrow!(ListDeviceStateRequestView);
+/** Self-contained, `'static` owned view of a `ListDeviceStateRequest` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ListDeviceStateRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ListDeviceStateRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ListDeviceStateRequestOwnedView(
+    ::buffa::OwnedView<ListDeviceStateRequestView<'static>>,
+);
+impl ListDeviceStateRequestOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateRequestOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ListDeviceStateRequest,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ListDeviceStateRequestView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ListDeviceStateRequestView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ListDeviceStateRequest {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Opaque continuation cursor from `next_cursor`; empty for the
+    /// first page.
+    ///
+    /// Field 1: `cursor`
+    #[must_use]
+    pub fn cursor(&self) -> &'_ str {
+        self.0.reborrow().cursor
+    }
+    /// Devices per page; 0 means the default (64), capped at 256.
+    ///
+    /// Field 2: `limit`
+    #[must_use]
+    pub fn limit(&self) -> u32 {
+        self.0.reborrow().limit
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ListDeviceStateRequestView<'static>>>
+for ListDeviceStateRequestOwnedView {
+    fn from(inner: ::buffa::OwnedView<ListDeviceStateRequestView<'static>>) -> Self {
+        ListDeviceStateRequestOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ListDeviceStateRequestOwnedView>
+for ::buffa::OwnedView<ListDeviceStateRequestView<'static>> {
+    fn from(wrapper: ListDeviceStateRequestOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ListDeviceStateRequestView<'static>>>
+for ListDeviceStateRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ListDeviceStateRequestView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ListDeviceStateRequest {
+    type View<'a> = ListDeviceStateRequestView<'a>;
+    type ViewHandle = ListDeviceStateRequestOwnedView;
+}
+impl ::serde::Serialize for ListDeviceStateRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct ListDeviceStateResponseView<'a> {
+    /// Field 1: `epoch`
+    pub epoch: &'a str,
+    /// Resync anchor: the first page's revision, echoed on every page.
+    /// After the last page, use it as `since_revision`.
+    ///
+    /// Field 2: `revision`
+    pub revision: u64,
+    /// Field 3: `devices`
+    pub devices: ::buffa::RepeatedView<
+        'a,
+        super::super::__buffa::view::DeviceStateSnapshotView<'a>,
+    >,
+    /// Empty on the last page.
+    ///
+    /// Field 4: `next_cursor`
+    pub next_cursor: &'a str,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for ListDeviceStateResponseView<'a> {
+    type Owned = super::super::ListDeviceStateResponse;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.epoch = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.revision = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.next_cursor = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<
+                        super::super::__buffa::view::DeviceStateSnapshotView,
+                    >(),
+                )?;
+                view.devices
+                    .push(
+                        <super::super::__buffa::view::DeviceStateSnapshotView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::ListDeviceStateResponse,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::ListDeviceStateResponse,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::ListDeviceStateResponse {
+            epoch: self.epoch.to_string(),
+            revision: self.revision,
+            devices: self
+                .devices
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            next_cursor: self.next_cursor.to_string(),
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for ListDeviceStateResponseView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.epoch.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.epoch) as u64;
+        }
+        if self.revision != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.revision) as u64;
+        }
+        for v in &self.devices {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if !self.next_cursor.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.next_cursor) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.epoch.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.epoch, buf);
+        }
+        if self.revision != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.revision, buf);
+        }
+        for v in &self.devices {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if !self.next_cursor.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.next_cursor, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ListDeviceStateResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.epoch) {
+            __map.serialize_entry("epoch", self.epoch)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.revision) {
+            __map
+                .serialize_entry(
+                    "revision",
+                    &::buffa::json_helpers::ProtoJson(&self.revision),
+                )?;
+        }
+        if !self.devices.is_empty() {
+            __map.serialize_entry("devices", &*self.devices)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.next_cursor) {
+            __map.serialize_entry("nextCursor", self.next_cursor)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ListDeviceStateResponseView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ListDeviceStateResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.ListDeviceStateResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateResponse";
+}
+::buffa::impl_default_view_instance!(ListDeviceStateResponseView);
+::buffa::impl_view_reborrow!(ListDeviceStateResponseView);
+/** Self-contained, `'static` owned view of a `ListDeviceStateResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ListDeviceStateResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ListDeviceStateResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ListDeviceStateResponseOwnedView(
+    ::buffa::OwnedView<ListDeviceStateResponseView<'static>>,
+);
+impl ListDeviceStateResponseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateResponseOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ListDeviceStateResponse,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ListDeviceStateResponseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ListDeviceStateResponseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ListDeviceStateResponse {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `epoch`
+    #[must_use]
+    pub fn epoch(&self) -> &'_ str {
+        self.0.reborrow().epoch
+    }
+    /// Resync anchor: the first page's revision, echoed on every page.
+    /// After the last page, use it as `since_revision`.
+    ///
+    /// Field 2: `revision`
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.0.reborrow().revision
+    }
+    /// Field 3: `devices`
+    #[must_use]
+    pub fn devices(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        super::super::__buffa::view::DeviceStateSnapshotView<'_>,
+    > {
+        &self.0.reborrow().devices
+    }
+    /// Empty on the last page.
+    ///
+    /// Field 4: `next_cursor`
+    #[must_use]
+    pub fn next_cursor(&self) -> &'_ str {
+        self.0.reborrow().next_cursor
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<ListDeviceStateResponseView<'static>>>
+for ListDeviceStateResponseOwnedView {
+    fn from(inner: ::buffa::OwnedView<ListDeviceStateResponseView<'static>>) -> Self {
+        ListDeviceStateResponseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ListDeviceStateResponseOwnedView>
+for ::buffa::OwnedView<ListDeviceStateResponseView<'static>> {
+    fn from(wrapper: ListDeviceStateResponseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<ListDeviceStateResponseView<'static>>>
+for ListDeviceStateResponseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ListDeviceStateResponseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ListDeviceStateResponse {
+    type View<'a> = ListDeviceStateResponseView<'a>;
+    type ViewHandle = ListDeviceStateResponseOwnedView;
+}
+impl ::serde::Serialize for ListDeviceStateResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct ListDeviceStateChangesRequestView<'a> {
+    /// Return entries with `global_revision > since_revision`.
+    ///
+    /// Field 1: `since_revision`
+    pub since_revision: u64,
+    /// 0 means the default (256), capped at 1024.
+    ///
+    /// Field 2: `limit`
+    pub limit: u32,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for ListDeviceStateChangesRequestView<'a> {
+    type Owned = super::super::ListDeviceStateChangesRequest;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.since_revision = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.limit = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::ListDeviceStateChangesRequest,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::ListDeviceStateChangesRequest,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::ListDeviceStateChangesRequest {
+            since_revision: self.since_revision,
+            limit: self.limit,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for ListDeviceStateChangesRequestView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.since_revision != 0u64 {
+            size
+                += 1u64 + ::buffa::types::uint64_encoded_len(self.since_revision) as u64;
+        }
+        if self.limit != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.limit) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.since_revision != 0u64 {
+            ::buffa::types::put_uint64_field(1u32, self.since_revision, buf);
+        }
+        if self.limit != 0u32 {
+            ::buffa::types::put_uint32_field(2u32, self.limit, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ListDeviceStateChangesRequestView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.since_revision) {
+            __map
+                .serialize_entry(
+                    "sinceRevision",
+                    &::buffa::json_helpers::ProtoJson(&self.since_revision),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.limit) {
+            __map
+                .serialize_entry(
+                    "limit",
+                    &::buffa::json_helpers::ProtoJson(&self.limit),
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ListDeviceStateChangesRequestView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ListDeviceStateChangesRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.ListDeviceStateChangesRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateChangesRequest";
+}
+::buffa::impl_default_view_instance!(ListDeviceStateChangesRequestView);
+::buffa::impl_view_reborrow!(ListDeviceStateChangesRequestView);
+/** Self-contained, `'static` owned view of a `ListDeviceStateChangesRequest` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ListDeviceStateChangesRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ListDeviceStateChangesRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ListDeviceStateChangesRequestOwnedView(
+    ::buffa::OwnedView<ListDeviceStateChangesRequestView<'static>>,
+);
+impl ListDeviceStateChangesRequestOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateChangesRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateChangesRequestOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ListDeviceStateChangesRequest,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateChangesRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ListDeviceStateChangesRequestView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ListDeviceStateChangesRequestView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ListDeviceStateChangesRequest {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Return entries with `global_revision > since_revision`.
+    ///
+    /// Field 1: `since_revision`
+    #[must_use]
+    pub fn since_revision(&self) -> u64 {
+        self.0.reborrow().since_revision
+    }
+    /// 0 means the default (256), capped at 1024.
+    ///
+    /// Field 2: `limit`
+    #[must_use]
+    pub fn limit(&self) -> u32 {
+        self.0.reborrow().limit
+    }
+}
+impl ::core::convert::From<
+    ::buffa::OwnedView<ListDeviceStateChangesRequestView<'static>>,
+> for ListDeviceStateChangesRequestOwnedView {
+    fn from(
+        inner: ::buffa::OwnedView<ListDeviceStateChangesRequestView<'static>>,
+    ) -> Self {
+        ListDeviceStateChangesRequestOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ListDeviceStateChangesRequestOwnedView>
+for ::buffa::OwnedView<ListDeviceStateChangesRequestView<'static>> {
+    fn from(wrapper: ListDeviceStateChangesRequestOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<
+    ::buffa::OwnedView<ListDeviceStateChangesRequestView<'static>>,
+> for ListDeviceStateChangesRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<ListDeviceStateChangesRequestView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ListDeviceStateChangesRequest {
+    type View<'a> = ListDeviceStateChangesRequestView<'a>;
+    type ViewHandle = ListDeviceStateChangesRequestOwnedView;
+}
+impl ::serde::Serialize for ListDeviceStateChangesRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct ListDeviceStateChangesResponseView<'a> {
+    /// Field 1: `epoch`
+    pub epoch: &'a str,
+    /// Field 2: `current_revision`
+    pub current_revision: u64,
+    /// Latest value of each changed slot, ascending by revision.
+    ///
+    /// Field 3: `changes`
+    pub changes: ::buffa::RepeatedView<
+        'a,
+        super::super::__buffa::view::DeviceStateEntryView<'a>,
+    >,
+    /// The cursor is invalid (above the current revision, below the
+    /// eviction watermark, or inside a revision range skipped at boot):
+    /// resync with `ListDeviceState`.
+    ///
+    /// Field 4: `reset_required`
+    pub reset_required: bool,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for ListDeviceStateChangesResponseView<'a> {
+    type Owned = super::super::ListDeviceStateChangesResponse;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.epoch = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.current_revision = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.reset_required = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<
+                        super::super::__buffa::view::DeviceStateEntryView,
+                    >(),
+                )?;
+                view.changes
+                    .push(
+                        <super::super::__buffa::view::DeviceStateEntryView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<
+        super::super::ListDeviceStateChangesResponse,
+        ::buffa::DecodeError,
+    > {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<
+        super::super::ListDeviceStateChangesResponse,
+        ::buffa::DecodeError,
+    > {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::ListDeviceStateChangesResponse {
+            epoch: self.epoch.to_string(),
+            current_revision: self.current_revision,
+            changes: self
+                .changes
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            reset_required: self.reset_required,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for ListDeviceStateChangesResponseView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.epoch.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.epoch) as u64;
+        }
+        if self.current_revision != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.current_revision) as u64;
+        }
+        for v in &self.changes {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.reset_required {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.epoch.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.epoch, buf);
+        }
+        if self.current_revision != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.current_revision, buf);
+        }
+        for v in &self.changes {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if self.reset_required {
+            ::buffa::types::put_bool_field(4u32, self.reset_required, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for ListDeviceStateChangesResponseView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.epoch) {
+            __map.serialize_entry("epoch", self.epoch)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.current_revision) {
+            __map
+                .serialize_entry(
+                    "currentRevision",
+                    &::buffa::json_helpers::ProtoJson(&self.current_revision),
+                )?;
+        }
+        if !self.changes.is_empty() {
+            __map.serialize_entry("changes", &*self.changes)?;
+        }
+        if self.reset_required {
+            __map.serialize_entry("resetRequired", &self.reset_required)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for ListDeviceStateChangesResponseView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ListDeviceStateChangesResponse";
+    const FULL_NAME: &'static str = "oxidhome.v1.ListDeviceStateChangesResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ListDeviceStateChangesResponse";
+}
+::buffa::impl_default_view_instance!(ListDeviceStateChangesResponseView);
+::buffa::impl_view_reborrow!(ListDeviceStateChangesResponseView);
+/** Self-contained, `'static` owned view of a `ListDeviceStateChangesResponse` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`ListDeviceStateChangesResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`ListDeviceStateChangesResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct ListDeviceStateChangesResponseOwnedView(
+    ::buffa::OwnedView<ListDeviceStateChangesResponseView<'static>>,
+);
+impl ListDeviceStateChangesResponseOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateChangesResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateChangesResponseOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::ListDeviceStateChangesResponse,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            ListDeviceStateChangesResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`ListDeviceStateChangesResponseView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &ListDeviceStateChangesResponseView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::ListDeviceStateChangesResponse {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `epoch`
+    #[must_use]
+    pub fn epoch(&self) -> &'_ str {
+        self.0.reborrow().epoch
+    }
+    /// Field 2: `current_revision`
+    #[must_use]
+    pub fn current_revision(&self) -> u64 {
+        self.0.reborrow().current_revision
+    }
+    /// Latest value of each changed slot, ascending by revision.
+    ///
+    /// Field 3: `changes`
+    #[must_use]
+    pub fn changes(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        super::super::__buffa::view::DeviceStateEntryView<'_>,
+    > {
+        &self.0.reborrow().changes
+    }
+    /// The cursor is invalid (above the current revision, below the
+    /// eviction watermark, or inside a revision range skipped at boot):
+    /// resync with `ListDeviceState`.
+    ///
+    /// Field 4: `reset_required`
+    #[must_use]
+    pub fn reset_required(&self) -> bool {
+        self.0.reborrow().reset_required
+    }
+}
+impl ::core::convert::From<
+    ::buffa::OwnedView<ListDeviceStateChangesResponseView<'static>>,
+> for ListDeviceStateChangesResponseOwnedView {
+    fn from(
+        inner: ::buffa::OwnedView<ListDeviceStateChangesResponseView<'static>>,
+    ) -> Self {
+        ListDeviceStateChangesResponseOwnedView(inner)
+    }
+}
+impl ::core::convert::From<ListDeviceStateChangesResponseOwnedView>
+for ::buffa::OwnedView<ListDeviceStateChangesResponseView<'static>> {
+    fn from(wrapper: ListDeviceStateChangesResponseOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<
+    ::buffa::OwnedView<ListDeviceStateChangesResponseView<'static>>,
+> for ListDeviceStateChangesResponseOwnedView {
+    fn as_ref(
+        &self,
+    ) -> &::buffa::OwnedView<ListDeviceStateChangesResponseView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::ListDeviceStateChangesResponse {
+    type View<'a> = ListDeviceStateChangesResponseView<'a>;
+    type ViewHandle = ListDeviceStateChangesResponseOwnedView;
+}
+impl ::serde::Serialize for ListDeviceStateChangesResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}

@@ -817,6 +817,38 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE audit_event ADD COLUMN command_id TEXT;
     ALTER TABLE audit_event ADD COLUMN command_outcome TEXT;
     ",
+    // 19 — architecture-review H2: durable device-state projection.
+    // One row per `(device_id, capability)` slot of the in-memory
+    // `DeviceStateStore`, written off the publish path by its
+    // coalescing flusher. `device_state_meta` is a single row: the
+    // store epoch, the revision the rows were flushed at, the stale
+    // eviction watermark and the JSON list of revision ranges that
+    // earlier boots skipped (cursors inside one must resync).
+    "
+    CREATE TABLE device_state (
+        device_id         TEXT NOT NULL,
+        capability        TEXT NOT NULL,
+        owner_instance    TEXT NOT NULL,
+        owner_plugin      TEXT NOT NULL,
+        owner_install     TEXT NOT NULL,
+        fields_blob       BLOB NOT NULL,
+        global_revision   INTEGER NOT NULL,
+        received_ms       INTEGER NOT NULL,
+        observed_ms       INTEGER NOT NULL,
+        source_generation INTEGER NOT NULL,
+        quality           TEXT NOT NULL,
+        PRIMARY KEY (device_id, capability)
+    ) WITHOUT ROWID;
+
+    CREATE TABLE device_state_meta (
+        id                INTEGER PRIMARY KEY CHECK (id = 1),
+        epoch             TEXT NOT NULL,
+        revision          INTEGER NOT NULL,
+        evicted_through   INTEGER NOT NULL,
+        holes_json        TEXT NOT NULL,
+        writer            TEXT NOT NULL
+    );
+    ",
 ];
 
 /// File name of the host database inside the state dir.
@@ -1839,6 +1871,9 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 19 (H2): device-state tables.
+                    DROP TABLE device_state;
+                    DROP TABLE device_state_meta;
                     -- 18 (H5): audit_event command columns.
                     ALTER TABLE audit_event DROP COLUMN command_outcome;
                     ALTER TABLE audit_event DROP COLUMN command_id;

@@ -27,6 +27,23 @@ service DevicesService {
   // with a host-minted `command_id` and an explicit
   // `command_outcome` (H5, ADR-0003).
   rpc ExecuteCommand(ExecuteCommandRequest) returns (ExecuteCommandResponse);
+
+  // H2: current state of one device from the host-owned projection.
+  // Mirrors `GET /api/v1/devices/{id}/state`; `devices:read`. An
+  // unknown device returns an empty `capabilities` list, not an
+  // error. `bytes_val` fields are withheld without `blobs:read` (M7).
+  rpc GetDeviceState(GetDeviceStateRequest) returns (GetDeviceStateResponse);
+
+  // H2: one page of the full-store snapshot, the resync primitive.
+  // Mirrors `GET /api/v1/devices/state`; `devices:read`. A malformed
+  // `cursor` is `invalid_argument`; a cursor from an earlier daemon
+  // process or another store epoch is `aborted` (restart the resync
+  // without a cursor).
+  rpc ListDeviceState(ListDeviceStateRequest) returns (ListDeviceStateResponse);
+
+  // H2: cursor catch-up over the projection. Mirrors
+  // `GET /api/v1/devices/state/changes`; `devices:read`.
+  rpc ListDeviceStateChanges(ListDeviceStateChangesRequest) returns (ListDeviceStateChangesResponse);
 }
 
 message ListDevicesRequest {}
@@ -157,4 +174,85 @@ message ExecuteCommandError {
     string unavailable = 4;
     string internal = 5;
   }
+}
+
+// H2: freshness of a projected state entry.
+enum StateQuality {
+  STATE_QUALITY_UNSPECIFIED = 0;
+  // The owning instance is live and reported this value.
+  STATE_QUALITY_FRESH = 1;
+  // The owner stopped, the device or capability was removed, or the
+  // value was restored at boot and not yet republished.
+  STATE_QUALITY_STALE = 2;
+}
+
+// H2: the current value of one capability on one device.
+message DeviceStateEntry {
+  string device_id = 1;
+  string capability = 2;
+  // Merged current fields.
+  repeated KeyValue fields = 3;
+  // Store-wide revision at write time; the only ordering axis.
+  uint64 global_revision = 4;
+  // Host wall clock (ms) when the value was applied.
+  int64 received_ms = 5;
+  // Plugin-supplied observation time (ms); informational.
+  uint64 observed_ms = 6;
+  // Supervisor generation of the owner at write time.
+  uint64 source_generation = 7;
+  StateQuality quality = 8;
+}
+
+// H2: every projected capability of one device, read atomically.
+message DeviceStateSnapshot {
+  string device_id = 1;
+  // Opaque store epoch; changes only when the projection is discarded.
+  string epoch = 2;
+  // Store revision of the read (or the pinned resync revision).
+  uint64 revision = 3;
+  repeated DeviceStateEntry capabilities = 4;
+}
+
+message GetDeviceStateRequest {
+  string device_id = 1;
+}
+
+message GetDeviceStateResponse {
+  DeviceStateSnapshot state = 1;
+}
+
+message ListDeviceStateRequest {
+  // Opaque continuation cursor from `next_cursor`; empty for the
+  // first page.
+  string cursor = 1;
+  // Devices per page; 0 means the default (64), capped at 256.
+  uint32 limit = 2;
+}
+
+message ListDeviceStateResponse {
+  string epoch = 1;
+  // Resync anchor: the first page's revision, echoed on every page.
+  // After the last page, use it as `since_revision`.
+  uint64 revision = 2;
+  repeated DeviceStateSnapshot devices = 3;
+  // Empty on the last page.
+  string next_cursor = 4;
+}
+
+message ListDeviceStateChangesRequest {
+  // Return entries with `global_revision > since_revision`.
+  uint64 since_revision = 1;
+  // 0 means the default (256), capped at 1024.
+  uint32 limit = 2;
+}
+
+message ListDeviceStateChangesResponse {
+  string epoch = 1;
+  uint64 current_revision = 2;
+  // Latest value of each changed slot, ascending by revision.
+  repeated DeviceStateEntry changes = 3;
+  // The cursor is invalid (above the current revision, below the
+  // eviction watermark, or inside a revision range skipped at boot):
+  // resync with `ListDeviceState`.
+  bool reset_required = 4;
 }

@@ -11,7 +11,7 @@ use oxidhome_test_host::wit::devices::{Command, CommandResult};
 use oxidhome_test_host::wit::events::EventPayload;
 use oxidhome_test_host::wit::types::Value;
 use oxidhome_test_host::{CapabilitiesSection, InitError, LoadOptions, TestHost, TestHostError};
-use support::{HELLO_WORLD, KV_COUNTER, SIMULATED_SWITCH, stage, stage_unchanged};
+use support::{EVENT_RECORDER, HELLO_WORLD, KV_COUNTER, SIMULATED_SWITCH, stage, stage_unchanged};
 
 fn toggle() -> Command {
     Command {
@@ -306,4 +306,152 @@ async fn cancelled_load_releases_its_id() {
         .expect("id is free after the cancelled load");
     switch.init().await.unwrap();
     assert_eq!(switch.devices().len(), 1);
+}
+
+fn read_state(device: &str) -> Command {
+    Command {
+        id: "cmd-read".into(),
+        capability: "recorder".into(),
+        action: "read-state".into(),
+        args: vec![oxidhome_test_host::wit::types::KeyValue {
+            key: "device".into(),
+            value: Value::StringVal(device.into()),
+        }],
+    }
+}
+
+/// H2: a plugin reads another plugin's device state through
+/// `host-state` only with a matching `reads_state` grant; a refused
+/// read is the same `not-found` as for an unknown device (plus an
+/// operator-side audit `deny` row), and `list-state` leaves the
+/// device out.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn plugin_reads_device_state_only_with_a_grant() {
+    use oxidhome_core::state::AuditQuery;
+    use oxidhome_test_host::wit::types::Error as WitError;
+
+    let host = TestHost::new().unwrap();
+    let switch_dir = stage_unchanged(SIMULATED_SWITCH);
+    let mut switch = host.load(switch_dir.path()).await.unwrap();
+    switch.init().await.unwrap();
+    let device = switch.devices()[0].id.clone();
+    let list = || Command {
+        id: "cmd-list".into(),
+        capability: "recorder".into(),
+        action: "list-state".into(),
+        args: Vec::new(),
+    };
+    let int_field = |result: CommandResult, key: &str| match result {
+        CommandResult::OkWithState(fields) => fields
+            .into_iter()
+            .find(|kv| kv.key == key)
+            .map(|kv| kv.value),
+        other => panic!("expected ok-with-state, got {other:?}"),
+    };
+
+    let plain = stage_unchanged(EVENT_RECORDER);
+    let mut denied = host
+        .load_with(plain.path(), LoadOptions::new().instance_id("denied"))
+        .await
+        .unwrap();
+    denied.init().await.unwrap();
+    // An invisible device and an unknown one get the same answer, so
+    // the plugin can't probe which ids exist.
+    let hidden = match denied.send_command("", read_state(&device)).await.unwrap() {
+        CommandResult::Err(WitError::NotFound(msg)) => msg,
+        other => panic!("expected not-found, got {other:?}"),
+    };
+    let unknown_id = "dev-00000000000000000000";
+    let unknown = match denied
+        .send_command("", read_state(unknown_id))
+        .await
+        .unwrap()
+    {
+        CommandResult::Err(WitError::NotFound(msg)) => msg,
+        other => panic!("expected not-found, got {other:?}"),
+    };
+    assert_eq!(
+        hidden.replace(device.as_str(), "<id>"),
+        unknown.replace(unknown_id, "<id>"),
+        "the two refusals must be indistinguishable",
+    );
+    assert!(hidden.contains("reads_state"), "{hidden}");
+    assert!(matches!(
+        int_field(denied.send_command("", list()).await.unwrap(), "entries"),
+        Some(Value::IntVal(0))
+    ));
+    // The operator still gets a deny row for the hidden device (written
+    // in the background), and none for the unknown one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let rows = loop {
+        let rows = host
+            .engine()
+            .audit_log()
+            .query(&AuditQuery::default(), 64)
+            .unwrap();
+        let found = rows.iter().any(|r| {
+            r.method == "STATE"
+                && r.decision == "deny"
+                && r.required_scope.as_deref() == Some("reads_state")
+                && r.path.ends_with(&device)
+        });
+        if found || std::time::Instant::now() > deadline {
+            break rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(
+        rows.iter()
+            .any(|r| r.method == "STATE" && r.path.ends_with(&device)),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.path.ends_with(unknown_id)),
+        "{rows:?}"
+    );
+
+    let granted = stage(EVENT_RECORDER, |caps| {
+        let grant: toml::Table =
+            toml::from_str("plugin = \"example.simulated-switch\"\ncapabilities = [\"switch\"]")
+                .unwrap();
+        caps.insert(
+            "reads_state".into(),
+            toml::Value::Array(vec![toml::Value::Table(grant)]),
+        );
+    });
+    let mut reader = host
+        .load_with(granted.path(), LoadOptions::new().instance_id("reader"))
+        .await
+        .unwrap();
+    reader.init().await.unwrap();
+    let fields = match reader.send_command("", read_state(&device)).await.unwrap() {
+        CommandResult::OkWithState(fields) => fields,
+        other => panic!("expected the switch state, got {other:?}"),
+    };
+    assert!(
+        fields.iter().any(|kv| kv.key == "switch.quality"
+            && matches!(&kv.value, Value::StringVal(q) if q == "fresh")),
+        "{fields:?}"
+    );
+    assert!(
+        fields
+            .iter()
+            .any(|kv| kv.key.starts_with("switch.") && kv.key != "switch.quality")
+    );
+    assert!(matches!(
+        int_field(reader.send_command("", list()).await.unwrap(), "entries"),
+        Some(Value::IntVal(1))
+    ));
+
+    // Once the owner is gone the value is still readable, as stale.
+    drop(switch);
+    let fields = match reader.send_command("", read_state(&device)).await.unwrap() {
+        CommandResult::OkWithState(fields) => fields,
+        other => panic!("expected the stale switch state, got {other:?}"),
+    };
+    assert!(
+        fields.iter().any(|kv| kv.key == "switch.quality"
+            && matches!(&kv.value, Value::StringVal(q) if q == "stale"))
+    );
 }
