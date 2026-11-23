@@ -37,9 +37,14 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use crate::Engine;
 use crate::auth::invocation::{self, InvocationContext};
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
-use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
+use crate::host_impl::plugin::oxidhome::plugin::types::{
+    DeviceId, Error as WitError, KeyValue, ServiceId,
+};
 use crate::state::CallGuard;
 
+use super::command::{
+    AbandonOnDrop, CommandOutcome, CommandReport, DispatchTicket, mint_command_id,
+};
 use super::instance::{InitError, PluginInstance};
 
 /// Tunable supervisor timing — restart backoff plus the consecutive-
@@ -162,11 +167,16 @@ enum ControlCommand {
     /// supervisor scopes it on its task while the wasm runs and
     /// refuses the command if its deadline has passed by the time it
     /// is dequeued.
+    ///
+    /// H5: `ticket` is shared with the waiting caller; the supervisor
+    /// runs the command only if it wins `queued → started` (see
+    /// [`super::command`]). The reply is the explicit outcome.
     Execute {
         ctx: InvocationContext,
         device: DeviceId,
         cmd: Command,
-        reply: oneshot::Sender<anyhow::Result<CommandResult>>,
+        ticket: DispatchTicket,
+        reply: oneshot::Sender<CommandOutcome>,
     },
     /// Run the plugin's `execute-service-command` on a service it owns
     /// — the dispatcher hops to this on the owner's supervisor task so
@@ -374,17 +384,7 @@ impl InstanceHandle {
     /// Run the plugin's `execute-command` for `device` as a
     /// host-origin invocation (no external principal, no deadline).
     /// External entry points use [`Self::execute_command_in`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the supervisor is gone, or if the call traps —
-    /// a trap also crashes the instance (`Failed`). A plugin returning
-    /// a normal error result surfaces as `Ok(CommandResult::Err(..))`.
-    pub async fn execute_command(
-        &self,
-        device: DeviceId,
-        cmd: Command,
-    ) -> anyhow::Result<CommandResult> {
+    pub async fn execute_command(&self, device: DeviceId, cmd: Command) -> CommandReport {
         let ctx = InvocationContext::host_origin(&self.instance_id);
         self.execute_command_in(ctx, device, cmd).await
     }
@@ -394,38 +394,107 @@ impl InstanceHandle {
     /// so a `call-service` the plugin makes is attributed to `ctx`'s
     /// root principal and bounded by its deadline.
     ///
-    /// # Errors
-    ///
-    /// As [`Self::execute_command`]; additionally `Err` when `ctx`'s
-    /// deadline passed before the supervisor dequeued the command (the
-    /// plugin is not invoked).
+    /// H5: mints the command id (overwriting `cmd.id`) and always
+    /// returns an explicit outcome — this never fails. `timed_out` is
+    /// reported only for a command the plugin will never see; once the
+    /// supervisor has entered the plugin, a missed deadline, a trap or
+    /// a lost supervisor is `outcome_unknown`. Dropping the returned
+    /// future withdraws a still-queued command.
     pub async fn execute_command_in(
         &self,
         ctx: InvocationContext,
         device: DeviceId,
+        mut cmd: Command,
+    ) -> CommandReport {
+        let command_id = mint_command_id();
+        cmd.id.clone_from(&command_id);
+        let outcome = self.dispatch_command(ctx, device, cmd).await;
+        CommandReport {
+            command_id,
+            outcome,
+        }
+    }
+
+    async fn dispatch_command(
+        &self,
+        ctx: InvocationContext,
+        device: DeviceId,
         cmd: Command,
-    ) -> anyhow::Result<CommandResult> {
-        let (reply, rx) = oneshot::channel();
-        self.control
-            .send(ControlCommand::Execute {
-                ctx,
-                device,
-                cmd,
-                reply,
-            })
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "instance `{}` supervisor is no longer running",
-                    self.instance_id,
-                )
-            })?;
-        rx.await.map_err(|_| {
-            anyhow!(
-                "instance `{}` supervisor dropped the command reply",
+    ) -> CommandOutcome {
+        let ticket = DispatchTicket::default();
+        let _withdraw = AbandonOnDrop(ticket.clone());
+        let deadline = ctx.deadline();
+        let call_id = ctx.call_id().to_owned();
+        let timed_out = || CommandOutcome::TimedOut {
+            message: format!(
+                "invocation `{call_id}` deadline passed before instance `{}` started the \
+                 command; it did not run",
                 self.instance_id,
-            )
-        })?
+            ),
+        };
+        let (reply, mut rx) = oneshot::channel();
+        let enqueue = self.control.send(ControlCommand::Execute {
+            ctx,
+            device,
+            cmd,
+            ticket: ticket.clone(),
+            reply,
+        });
+        let enqueued = match deadline {
+            Some(d) => match tokio::time::timeout_at(d, enqueue).await {
+                Ok(enqueued) => enqueued,
+                // Never enqueued.
+                Err(_) => return timed_out(),
+            },
+            None => enqueue.await,
+        };
+        if enqueued.is_err() {
+            return CommandOutcome::Rejected {
+                error: WitError::Unavailable(format!(
+                    "instance `{}` is not running",
+                    self.instance_id
+                )),
+            };
+        }
+        let received = if let Some(d) = deadline {
+            let Ok(received) = tokio::time::timeout_at(d, &mut rx).await else {
+                if ticket.try_withdraw() {
+                    return timed_out();
+                }
+                // Entered before the deadline; the reply may have
+                // landed in the same instant. Closing first makes the
+                // race binary: a reply sent after this point fails, and
+                // the supervisor audits it as a late result.
+                rx.close();
+                return rx.try_recv().unwrap_or_else(|_| CommandOutcome::Unknown {
+                    message: format!(
+                        "invocation `{call_id}` deadline passed while instance `{}` was \
+                         executing the command; it may have taken effect",
+                        self.instance_id,
+                    ),
+                });
+            };
+            received
+        } else {
+            rx.await
+        };
+        received.unwrap_or_else(|_| {
+            if ticket.started() {
+                CommandOutcome::Unknown {
+                    message: format!(
+                        "instance `{}` supervisor went away while executing the command",
+                        self.instance_id,
+                    ),
+                }
+            } else {
+                CommandOutcome::Rejected {
+                    error: WitError::Unavailable(format!(
+                        "instance `{}` stopped before running the command",
+                        self.instance_id,
+                    )),
+                }
+            }
+        })
     }
 
     /// Run the plugin's `execute-service-command` on `service`. Used
@@ -990,6 +1059,11 @@ async fn run_one_lifecycle(
     // loops. Idempotent + cheap (one HashMap retain each).
     engine.devices().remove_by_owner(instance_id);
     engine.services().remove_by_owner(instance_id);
+    // H5: a fresh store can't complete commands the previous life
+    // accepted.
+    engine
+        .pending_commands()
+        .expire_owner(instance_id, "the plugin instance restarted");
     // H9: mark any device-state entries this instance previously
     // published as `Stale` and bump the supervisor generation so
     // fresh entries applied under this life are distinguishable
@@ -1203,10 +1277,13 @@ async fn backoff_wait(
                 // returning a typed `CommandResult::Err` for service
                 // calls); keep them separate now rather than merging.
                 #[allow(clippy::match_same_arms)]
+                // H5: refused before acting — retry-safe.
                 Some(ControlCommand::Execute { reply, .. }) => {
-                    let _ = reply.send(Err(anyhow!(
-                        "instance `{instance_id}` is restarting after a crash",
-                    )));
+                    let _ = reply.send(CommandOutcome::Rejected {
+                        error: WitError::Unavailable(format!(
+                            "instance `{instance_id}` is restarting after a crash",
+                        )),
+                    });
                 }
                 #[allow(clippy::match_same_arms)]
                 Some(ControlCommand::ExecuteService { reply, .. }) => {
@@ -1216,6 +1293,105 @@ async fn backoff_wait(
                 }
             }
         }
+    }
+}
+
+/// `ControlCommand::Execute`: run one device command and reply with
+/// its H5 outcome. A trap is still a crash (propagated after replying).
+async fn run_execute(
+    instance: &mut PluginInstance,
+    instance_id: &str,
+    ctx: InvocationContext,
+    device: DeviceId,
+    cmd: Command,
+    ticket: &DispatchTicket,
+    reply: oneshot::Sender<CommandOutcome>,
+) -> anyhow::Result<LoopAction> {
+    // H6: the root gave up (or its budget ran out while the
+    // command sat in this queue). Running it now would actuate
+    // a device nobody is waiting on any more. H5: the ticket
+    // makes "did not run" race-free against the caller's own
+    // deadline (and its disconnect).
+    // The deadline check and the claim are one ticket decision, so a
+    // caller withdrawing at its deadline sees either "started" or
+    // "never ran", never a refused command marked started.
+    if !ticket.try_start_unless(|| ctx.is_expired()) {
+        let _ = ticket.try_abandon();
+        let refused = CommandOutcome::TimedOut {
+            message: format!(
+                "instance `{instance_id}` refused execute-command: invocation `{}` \
+                 deadline exceeded before dispatch",
+                ctx.call_id(),
+            ),
+        };
+        if let Err(outcome) = reply.send(refused)
+            && !ticket.withdrawn_by_caller()
+        {
+            // The caller went away (disconnect, not its deadline:
+            // that path reports `timed_out` itself) while the command
+            // was queued; its request row has no outcome, so record
+            // that it never ran.
+            super::command::record_resolution(
+                instance.audit_log().as_ref(),
+                &ctx,
+                &cmd.id,
+                &device,
+                &outcome,
+            );
+        }
+        return Ok(LoopAction::Continue);
+    }
+    let command_id = cmd.id.clone();
+    let device_id = device.clone();
+    let ctx = ctx.entering(instance_id);
+    // For a late-result audit row: keeps the executing instance.
+    let entered_ctx = ctx.clone();
+    let result = invocation::CURRENT
+        .scope(ctx, instance.execute_command(device, cmd))
+        .await;
+    let (outcome, trap) = match result {
+        Ok(result) => (CommandOutcome::from_plugin(result), None),
+        // An `execute-command` trap is a crash. The plugin was
+        // entered, so whatever it did to the device may stand.
+        // The caller gets a short message; the trap detail (wasm
+        // backtrace) stays in the instance's failure reason and logs.
+        Err(trap) => {
+            tracing::warn!(
+                instance_id = %instance_id,
+                command_id = %command_id,
+                error = %format!("{trap:#}"),
+                "execute-command trapped; command outcome unknown",
+            );
+            (
+                CommandOutcome::Unknown {
+                    message: format!(
+                        "instance `{instance_id}` crashed during execute-command; the \
+                         command may have taken effect",
+                    ),
+                },
+                Some(trap),
+            )
+        }
+    };
+    if let Err(outcome) = reply.send(outcome)
+        && !matches!(outcome, CommandOutcome::Accepted)
+    {
+        // The caller stopped waiting (deadline or disconnect)
+        // after the plugin was entered and reported
+        // `outcome_unknown`; record how the command really
+        // ended. A late `accepted` is skipped: the pending entry
+        // records the terminal outcome.
+        super::command::record_resolution(
+            instance.audit_log().as_ref(),
+            &entered_ctx,
+            &command_id,
+            &device_id,
+            &outcome,
+        );
+    }
+    match trap {
+        None => Ok(LoopAction::Continue),
+        Some(trap) => Err(trap),
     }
 }
 
@@ -1260,38 +1436,9 @@ async fn handle_control(
             ctx,
             device,
             cmd,
+            ticket,
             reply,
-        }) => {
-            // H6: the root gave up (or its budget ran out while the
-            // command sat in this queue). Running it now would actuate
-            // a device nobody is waiting on any more.
-            if ctx.is_expired() {
-                let _ = reply.send(Err(anyhow!(
-                    "instance `{instance_id}` refused execute-command: invocation `{}` \
-                     deadline exceeded before dispatch",
-                    ctx.call_id(),
-                )));
-                return Ok(LoopAction::Continue);
-            }
-            let ctx = ctx.entering(instance_id);
-            let outcome = invocation::CURRENT
-                .scope(ctx, instance.execute_command(device, cmd))
-                .await;
-            match outcome {
-                Ok(result) => {
-                    let _ = reply.send(Ok(result));
-                    Ok(LoopAction::Continue)
-                }
-                Err(trap) => {
-                    // Surface the trap to the caller, then crash the
-                    // instance — an `execute-command` trap is a crash.
-                    let _ = reply.send(Err(anyhow!(
-                        "instance `{instance_id}` crashed during execute-command: {trap:#}",
-                    )));
-                    Err(trap)
-                }
-            }
-        }
+        }) => run_execute(instance, instance_id, ctx, device, cmd, &ticket, reply).await,
         Some(ControlCommand::ExecuteService {
             ctx,
             guard,

@@ -17,8 +17,12 @@ wasm = "target/wasm32-wasip2/debug/hang.wasm"
 tick_interval_ms = 10
 restart = "never"
 
+[capabilities]
+# Only the "command" phase registers a device.
+declares_devices = ["switch"]
+
 [config.phase]
 type = "enum"
-values = ["init", "tick"]
+values = ["init", "tick", "command"]
 default = "tick"
 description = "Which lifecycle hook spins forever."

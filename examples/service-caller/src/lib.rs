@@ -34,6 +34,10 @@ fn extract_value(result: &CommandResult) -> Result<i64, String> {
         }
         CommandResult::Ok => Err("counter returned Ok without state".into()),
         CommandResult::Err(e) => Err(format!("counter returned err: {e:?}")),
+        // The callee may have counted; don't assume either way.
+        CommandResult::Unknown(why) => Err(format!("counter outcome unknown: {why}")),
+        // `call-service` never returns `accepted` (H5).
+        CommandResult::Accepted => Err("counter returned accepted".into()),
     }
 }
 

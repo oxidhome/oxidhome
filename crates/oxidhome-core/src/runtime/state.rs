@@ -428,6 +428,10 @@ pub struct PluginState {
     /// externally-rooted invocations (H6). `None` for low-level
     /// test states; the loader sets it via [`Self::with_audit_log`].
     pub audit_log: Option<Arc<crate::state::AuditLog>>,
+    /// H5: the engine's table of `accepted` device commands, consulted
+    /// by `host-devices::complete-command`. `None` for low-level test
+    /// states; the loader sets it via [`Self::with_pending_commands`].
+    pub pending_commands: Option<Arc<super::PendingCommands>>,
     /// Per-instance wake `Notify` — C2d wake-isolation. Signaled by
     /// the [`EventBus`] every time a published event matches one
     /// of this plugin's active subscription filters. The
@@ -533,6 +537,7 @@ impl PluginState {
             services,
             instances,
             audit_log: None,
+            pending_commands: None,
             subscriptions: Vec::new(),
             manifest,
             actor,
@@ -564,6 +569,13 @@ impl PluginState {
     #[must_use]
     pub fn with_audit_log(mut self, audit_log: Arc<crate::state::AuditLog>) -> Self {
         self.audit_log = Some(audit_log);
+        self
+    }
+
+    /// Attach the engine's pending-command table (H5).
+    #[must_use]
+    pub fn with_pending_commands(mut self, pending: Arc<super::PendingCommands>) -> Self {
+        self.pending_commands = Some(pending);
         self
     }
 }
@@ -1036,6 +1048,14 @@ impl host_devices::Host for PluginState {
         self.devices
             .get(&self.instance_id, &id)
             .map(|meta| meta.info.clone())
+    }
+
+    async fn complete_command(
+        &mut self,
+        id: types::CommandId,
+        reply: CommandResult,
+    ) -> Result<(), WitError> {
+        super::command::complete_command(self, &id, reply)
     }
 }
 

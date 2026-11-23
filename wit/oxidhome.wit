@@ -55,6 +55,13 @@ interface types {
 
   type subscription-id = u64;
 
+  /// Host-minted identifier for one device command dispatch (H5),
+  /// `cmd-<32 hex>`. Unique per dispatch: a retry of the same request
+  /// is a new command with a new id. Quoted by the plugin in
+  /// `host-devices::complete-command` and recorded in the host's
+  /// audit trail.
+  type command-id = string;
+
   variant value {
     bool-val(bool),
     int-val(s64),
@@ -257,7 +264,7 @@ interface capabilities {
 // ─────────────────────────────────────────────────────────────────────────
 
 interface devices {
-  use types.{device-id, local-id, key-value, error};
+  use types.{device-id, local-id, key-value, error, command-id};
   use capabilities.{capability-spec, capability-state};
 
   record device-info {
@@ -283,6 +290,10 @@ interface devices {
   /// device). Capability name + arguments. The plugin matches on
   /// capability + action.
   record command {
+    /// Host-minted id of this dispatch (H5). A plugin that answers
+    /// `command-result::accepted` keeps it and later reports the
+    /// final result with `host-devices::complete-command`.
+    id: command-id,
     /// Capability name: `"switch"`, `"dimmer"`, `"color-light"`, etc.
     capability: string,
     /// Action verb: `"set"`, `"toggle"`, `"increment"`, etc.
@@ -290,11 +301,34 @@ interface devices {
     args: list<key-value>,
   }
 
+  /// What a plugin reports for a command (H5). The host maps each case
+  /// onto the explicit outcome the caller sees: `ok` / `ok-with-state`
+  /// → `completed`, `err` → `rejected`, `unknown` → `outcome-unknown`,
+  /// `accepted` → `accepted`.
   variant command-result {
+    /// The command took effect.
     ok,
     /// Device returned new state inline alongside the OK.
     ok-with-state(list<key-value>),
+    /// The plugin refused the command **without acting** (unknown
+    /// action, bad arguments, device unreachable before anything was
+    /// sent). Callers may safely retry after fixing the cause. A
+    /// plugin that may already have acted returns `unknown` instead.
     err(error),
+    /// The plugin may have acted but cannot confirm it (for example a
+    /// radio frame was sent and no acknowledgement came back). The
+    /// string says why. Callers must read the device state before
+    /// retrying.
+    unknown(string),
+    /// `execute-command` only: the plugin took the command and will
+    /// report the final result later with
+    /// `host-devices::complete-command`, quoting `command.id`. The host
+    /// records `outcome-unknown` if no result arrives before the
+    /// pending command expires. Not valid from
+    /// `execute-service-command` (service commands complete
+    /// synchronously; the host turns it into `unknown`) or as the
+    /// argument of `complete-command`.
+    accepted,
   }
 }
 
@@ -1028,8 +1062,8 @@ interface inference {
 
 /// Device lifecycle: announce devices the plugin manages, look them up.
 interface host-devices {
-  use types.{device-id, error};
-  use devices.{device-info};
+  use types.{device-id, error, command-id};
+  use devices.{device-info, command-result};
 
   register-device: func(info: device-info) -> result<device-id, error>;
   update-device:   func(id: device-id, info: device-info) -> result<_, error>;
@@ -1037,6 +1071,16 @@ interface host-devices {
   /// Look up a device the plugin previously registered. Returns
   /// `error::not-found(...)` if the id is unknown to this plugin.
   get-device:      func(id: device-id) -> result<device-info, error>;
+  /// Report the final result of a command this instance answered with
+  /// `command-result::accepted` (H5). Each accepted command completes
+  /// at most once. `ok-with-state` is projected into the device state
+  /// exactly as a synchronous reply would be.
+  ///
+  /// Errors: `invalid-argument` if `reply` is `accepted`; `not-found`
+  /// if `id` is not a pending command of this instance (never
+  /// accepted, already completed, or expired, in which case the host
+  /// already recorded `outcome-unknown`).
+  complete-command: func(id: command-id, reply: command-result) -> result<_, error>;
 }
 
 /// Service lifecycle + synchronous cross-plugin dispatch (Phase 7).
@@ -1104,7 +1148,9 @@ interface host-services {
   /// Synchronously call another plugin's service command. The host
   /// routes `target` → owning instance, races its
   /// `execute-service-command` export against a timeout, and
-  /// returns the result.
+  /// returns the result. The callee's `command-result::unknown` is
+  /// passed through; `accepted` is never returned (a callee that
+  /// answers `accepted` is reported as `unknown`).
   ///
   /// **Caller-side capability gate (H10).** The dispatcher
   /// authorizes the call against the caller's structured
@@ -1223,7 +1269,9 @@ world plugin {
   // Event delivery from the host's bus to the plugin
   export on-event: func(ev: event);
 
-  // Commands targeting devices the plugin owns
+  // Commands targeting devices the plugin owns. `cmd.id` is the
+  // host-minted command id (H5); see `command-result` for how each
+  // reply maps onto the caller-visible outcome.
   export execute-command: func(
     device: device-id,
     cmd: command,
@@ -1233,6 +1281,8 @@ world plugin {
   // the host dispatcher when another plugin (or this one) calls
   // `host-services::call-service` against one of this plugin's services.
   // Plugins that expose no services return `command-result::err(...)`.
+  // Service commands complete synchronously: `accepted` is not valid
+  // here and the host reports it to the caller as `unknown`.
   export execute-service-command: func(
     service: service-id,
     command: string,

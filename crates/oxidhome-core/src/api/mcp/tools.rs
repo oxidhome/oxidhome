@@ -66,17 +66,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::Engine;
-use crate::api::auth::wit_error_kind;
 use crate::api::scopes::{
     DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START,
     PLUGINS_STOP, PLUGINS_UNINSTALL, can_read_blobs, require_scope,
 };
-use crate::api::server::{WireCommandResult, command_result_to_wire};
+use crate::api::server::WireCommandReport;
 use crate::auth::Actor;
-use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::EventFilter as BusEventFilter;
 use crate::host_impl::plugin::oxidhome::plugin::types::KeyValue;
 use crate::host_impl::plugin::oxidhome::plugin::types::Value;
+use crate::runtime::CommandOutcome;
 use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
@@ -101,9 +101,13 @@ pub(super) fn list_tools() -> Vec<Tool> {
             "device.send_command",
             "Dispatch a capability command to a device (e.g. switch/toggle, dimmer/set). \
              The owning plugin's `execute-command` handles the request; the response \
-             carries the WIT `command-result` (Ok / OkWithState with a state map / Err with \
-             a typed WIT error). SENSITIVE: gated on the `devices:command` scope — \
-             physical actuation (locks, garage doors, alarms) rides this same path.",
+             carries the host-minted `command_id` and an explicit `outcome`: `completed` \
+             (optional `state` map), `accepted` (finishes asynchronously), `rejected` \
+             (typed `error`; nothing happened), `timed_out` (did not run) or \
+             `outcome_unknown` (may have run: read the device state before retrying). \
+             `retry_safe` is true only for `rejected` and `timed_out`. SENSITIVE: gated on \
+             the `devices:command` scope — physical actuation (locks, garage doors, \
+             alarms) rides this same path.",
             Arc::new(device_send_command_schema()),
         )
         .with_title("Send device command"),
@@ -724,13 +728,17 @@ pub(super) async fn call(
     let audit_log_for_finalize = engine.audit_log();
     let audit_finalize = tokio::task::spawn_blocking(move || {
         let _guard = audit_permit;
-        audit_log_for_finalize.finalize(
+        audit_log_for_finalize.finalize_with_command(
             intent_id,
             finalize_input.status,
             &finalize_input.decision,
             finalize_input.required_scope.as_deref(),
             finalize_input.execution_outcome.as_deref(),
             finalize_input.domain_error.as_deref(),
+            finalize_input
+                .command
+                .as_ref()
+                .map(|(id, outcome)| (id.as_str(), *outcome)),
         )
     })
     .await;
@@ -876,6 +884,9 @@ struct FinalizeInput {
     required_scope: Option<String>,
     execution_outcome: Option<String>,
     domain_error: Option<String>,
+    /// H5: `(command_id, command_outcome)` of a dispatched device
+    /// command.
+    command: Option<(String, &'static str)>,
 }
 
 impl FinalizeInput {
@@ -930,6 +941,11 @@ impl FinalizeInput {
                     domain_kind: Some(kind),
                     ..
                 } => (Some("failed"), Some((*kind).to_string())),
+                // H5: a dispatched device command.
+                ToolOutcome::Command { audit, .. } => (
+                    audit.execution_outcome,
+                    audit.domain_error.map(str::to_string),
+                ),
                 _ => (None, None),
             };
         FinalizeInput {
@@ -938,6 +954,12 @@ impl FinalizeInput {
             required_scope: outcome.required_scope().map(str::to_string),
             execution_outcome: execution_outcome.map(str::to_string),
             domain_error,
+            command: match outcome {
+                ToolOutcome::Command { audit, .. } => {
+                    Some((audit.command_id.clone(), audit.outcome))
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -977,6 +999,17 @@ enum ToolOutcome {
         message: String,
         structured: Option<JsonValue>,
         domain_kind: Option<&'static str>,
+    },
+    /// H5: a device command the host dispatched. `value` is the
+    /// [`WireCommandReport`] (`structuredContent` on both paths);
+    /// `is_error` is set for every outcome except `completed` and
+    /// `accepted`, so an agent never mistakes `outcome_unknown` for
+    /// success. Audited as `200` / `allow` with the command id and
+    /// outcome in their own columns.
+    Command {
+        value: JsonValue,
+        is_error: bool,
+        audit: crate::api::auth::DomainOutcome,
     },
     /// Client sent bad arguments. Maps to `-32602`.
     InvalidParams(String),
@@ -1043,6 +1076,19 @@ impl ToolOutcome {
                     crate::redact::scrub_text(&message).into_owned(),
                 )]),
             }),
+            Self::Command {
+                mut value,
+                is_error,
+                ..
+            } => {
+                // M7: same credential masking as `Ok` / `ExecErr`.
+                crate::redact::redact_json(&mut value);
+                Ok(if is_error {
+                    CallToolResult::structured_error(value)
+                } else {
+                    CallToolResult::structured(value)
+                })
+            }
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
             Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
@@ -1069,7 +1115,7 @@ impl ToolOutcome {
             // the tool WAS invoked. Matches the REST
             // send-command path (`200` with a
             // `CommandResult::Err` in the body).
-            Self::Ok { .. } | Self::ExecErr { .. } => 200,
+            Self::Ok { .. } | Self::ExecErr { .. } | Self::Command { .. } => 200,
             Self::UnknownTool(_) => 404,
             Self::InvalidParams(_) => 400,
             Self::TooLarge(_) => 413,
@@ -1081,7 +1127,7 @@ impl ToolOutcome {
 
     fn decision(&self) -> &'static str {
         match self {
-            Self::Ok { .. } | Self::ExecErr { .. } => "allow",
+            Self::Ok { .. } | Self::ExecErr { .. } | Self::Command { .. } => "allow",
             Self::UnknownTool(_)
             | Self::Denied { .. }
             | Self::InvalidParams(_)
@@ -1124,18 +1170,6 @@ pub(super) const CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS: &str =
     "constraint:plugins.uninstall:plugins";
 pub(super) const CONSTRAINT_PLUGINS_START_PLUGINS: &str = "constraint:plugins.start:plugins";
 pub(super) const CONSTRAINT_PLUGINS_INSTALL_PLUGINS: &str = "constraint:plugins.install:plugins";
-
-/// Cap on the plugin-supplied error message before we let it
-/// enter any JSON serialisation. The WIT contract lets a
-/// plugin's `command-result::err` payload carry an
-/// unconstrained string — a misbehaving guest could push
-/// close to its 128 MiB memory ceiling of text and drive the
-/// host into two full copies (once through
-/// `serde_json::to_value`, once through
-/// `CallToolResult::structured_error`) before any downstream
-/// bound sees it. 4 KiB is generous for a real error message
-/// while capping the runaway path (round-1 F2 on PR #123).
-const MAX_PLUGIN_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
 
 async fn device_send_command_call(
     engine: Engine,
@@ -1199,7 +1233,9 @@ async fn device_send_command_call(
         };
     };
 
+    // The supervisor handle mints `id` (H5).
     let cmd = Command {
+        id: String::new(),
         capability: args.capability,
         action: args.action,
         args: args
@@ -1212,126 +1248,30 @@ async fn device_send_command_call(
             .collect(),
     };
 
-    let result = match handle
+    let report = handle
         .execute_command_in(invocation, args.device_id, cmd)
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::error!(target: "mcp.tool.device.send_command", %err, "dispatch failed");
-            return ToolOutcome::Internal("device command dispatch failed".into());
-        }
-    };
+        .await;
 
-    // Round-1 F2 on PR #123: truncate the plugin-supplied
-    // error message BEFORE conversion to `WireCommandResult`
-    // + `serde_json::Value`. Both those steps make a full
-    // copy of the string, and a misbehaving plugin can push
-    // arbitrarily many bytes into the WIT error variant.
-    let result = truncate_plugin_error(result);
-
-    // Match REST's shape: the plugin-visible response carries
-    // the `CommandResult` verbatim; a `CommandResult::Err`
-    // rides on the `is_error: true` branch so clients see the
-    // domain-error, and the wire body's `error.kind` is the
-    // same tagged shape REST already returns.
-    let wire = command_result_to_wire(result, can_read_blobs(actor));
-    let structured = match serde_json::to_value(&wire) {
-        Ok(v) => v,
+    // Round-1 F2 on PR #123: plugin-supplied text is already capped
+    // (`runtime::command::cap_plugin_text`) before any wire copy.
+    let audit = crate::api::auth::DomainOutcome::from_report(&report);
+    let is_error = !matches!(
+        report.outcome,
+        CommandOutcome::Completed { .. } | CommandOutcome::Accepted
+    );
+    match serde_json::to_value(WireCommandReport::from_report(
+        report,
+        can_read_blobs(actor),
+    )) {
+        Ok(value) => ToolOutcome::Command {
+            value,
+            is_error,
+            audit,
+        },
         Err(err) => {
             tracing::error!(target: "mcp.tool.device.send_command", %err, "wire serialisation failed");
-            return ToolOutcome::Internal("failed to serialise command result".into());
+            ToolOutcome::Internal("failed to serialise command result".into())
         }
-    };
-    match &wire {
-        WireCommandResult::Ok | WireCommandResult::OkWithState { .. } => ToolOutcome::Ok {
-            value: structured,
-            // Plugin was reached and returned Ok — audits
-            // as `execution_outcome = "success"`.
-            plugin_reached: true,
-        },
-        WireCommandResult::Err { error } => {
-            let domain_kind = wit_error_kind_of_wire(error);
-            ToolOutcome::ExecErr {
-                message: format!(
-                    "device.send_command failed: {} — {}",
-                    domain_kind,
-                    message_of_wire_error(error),
-                ),
-                structured: Some(structured),
-                domain_kind: Some(domain_kind),
-            }
-        }
-    }
-}
-
-/// Truncate a plugin-supplied WIT `error` message to
-/// [`MAX_PLUGIN_ERROR_MESSAGE_BYTES`] BEFORE it reaches the
-/// wire-conversion helpers. `truncate` operates on UTF-8
-/// char boundaries, so we back the cap off to the largest
-/// char boundary that's ≤ the cap — avoids splitting a
-/// multi-byte character. Only touches `CommandResult::Err`;
-/// other variants pass through.
-fn truncate_plugin_error(result: CommandResult) -> CommandResult {
-    use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
-    let CommandResult::Err(err) = result else {
-        return result;
-    };
-    let truncated = match err {
-        WitError::NotFound(m) => WitError::NotFound(cap_message(m)),
-        WitError::InvalidArgument(m) => WitError::InvalidArgument(cap_message(m)),
-        WitError::PermissionDenied(m) => WitError::PermissionDenied(cap_message(m)),
-        WitError::Unavailable(m) => WitError::Unavailable(cap_message(m)),
-        WitError::Internal(m) => WitError::Internal(cap_message(m)),
-    };
-    CommandResult::Err(truncated)
-}
-
-fn cap_message(mut m: String) -> String {
-    if m.len() > MAX_PLUGIN_ERROR_MESSAGE_BYTES {
-        // Walk back to the largest char boundary ≤ cap so
-        // `truncate` doesn't panic on multi-byte characters.
-        let mut cap = MAX_PLUGIN_ERROR_MESSAGE_BYTES;
-        while !m.is_char_boundary(cap) {
-            cap -= 1;
-        }
-        let original_len = m.len();
-        m.truncate(cap);
-        tracing::warn!(
-            target: "mcp.tool.device.send_command",
-            original_len,
-            cap = MAX_PLUGIN_ERROR_MESSAGE_BYTES,
-            "plugin error message exceeded cap — truncated",
-        );
-        m.push_str("… [truncated by host]");
-    }
-    m
-}
-
-fn wit_error_kind_of_wire(err: &crate::api::server::WireWitError) -> &'static str {
-    use crate::api::server::WireWitError as W;
-    use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
-    // Reconstruct just enough of the WIT error to reuse the
-    // shared classifier. Cheap — the constructor doesn't
-    // allocate beyond one `String::new()`.
-    let placeholder = match err {
-        W::NotFound { .. } => WitError::NotFound(String::new()),
-        W::InvalidArgument { .. } => WitError::InvalidArgument(String::new()),
-        W::PermissionDenied { .. } => WitError::PermissionDenied(String::new()),
-        W::Unavailable { .. } => WitError::Unavailable(String::new()),
-        W::Internal { .. } => WitError::Internal(String::new()),
-    };
-    wit_error_kind(&placeholder)
-}
-
-fn message_of_wire_error(err: &crate::api::server::WireWitError) -> &str {
-    use crate::api::server::WireWitError as W;
-    match err {
-        W::NotFound { message }
-        | W::InvalidArgument { message }
-        | W::PermissionDenied { message }
-        | W::Unavailable { message }
-        | W::Internal { message } => message,
     }
 }
 
@@ -3171,6 +3111,8 @@ fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
         credential_fp: None,
         call_id: None,
         invocation: None,
+        command_id: None,
+        command_outcome: None,
     }
 }
 
@@ -3196,45 +3138,8 @@ fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome
         credential_fp: None,
         call_id: None,
         invocation: None,
-    }
-}
-
-#[cfg(test)]
-mod message_cap_tests {
-    use super::{MAX_PLUGIN_ERROR_MESSAGE_BYTES, cap_message};
-
-    #[test]
-    fn passes_through_short_messages_unchanged() {
-        let short = "brief plugin error".to_string();
-        assert_eq!(cap_message(short.clone()), short);
-    }
-
-    #[test]
-    fn truncates_over_cap_ascii_message() {
-        let big = "x".repeat(MAX_PLUGIN_ERROR_MESSAGE_BYTES + 100);
-        let out = cap_message(big);
-        assert!(
-            out.len() <= MAX_PLUGIN_ERROR_MESSAGE_BYTES + 32,
-            "capped output {} B must fit within cap + suffix; got {}",
-            MAX_PLUGIN_ERROR_MESSAGE_BYTES,
-            out.len(),
-        );
-        assert!(out.ends_with("[truncated by host]"));
-    }
-
-    #[test]
-    fn truncation_respects_utf8_char_boundaries() {
-        // Fill the message with 4-byte emojis so a naïve
-        // byte truncation at exactly the cap would split a
-        // scalar. `cap_message` walks back to the largest
-        // safe boundary — the output is always valid UTF-8.
-        let emoji = "😀";
-        assert_eq!(emoji.len(), 4);
-        let big: String = emoji.repeat((MAX_PLUGIN_ERROR_MESSAGE_BYTES / 4) + 100);
-        assert!(big.len() > MAX_PLUGIN_ERROR_MESSAGE_BYTES);
-        let out = cap_message(big);
-        assert!(out.is_char_boundary(out.len() - "… [truncated by host]".len()));
-        assert!(out.ends_with("[truncated by host]"));
+        command_id: None,
+        command_outcome: None,
     }
 }
 

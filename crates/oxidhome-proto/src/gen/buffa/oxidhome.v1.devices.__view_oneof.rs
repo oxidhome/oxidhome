@@ -38,6 +38,27 @@ pub mod execute_command_response {
                 super::super::super::super::__buffa::view::ExecuteCommandErrorView<'a>,
             >,
         ),
+        Accepted(
+            ::buffa::alloc::boxed::Box<
+                super::super::super::super::__buffa::view::execute_command_response::AcceptedView<
+                    'a,
+                >,
+            >,
+        ),
+        TimedOut(
+            ::buffa::alloc::boxed::Box<
+                super::super::super::super::__buffa::view::execute_command_response::TimedOutView<
+                    'a,
+                >,
+            >,
+        ),
+        OutcomeUnknown(
+            ::buffa::alloc::boxed::Box<
+                super::super::super::super::__buffa::view::execute_command_response::OutcomeUnknownView<
+                    'a,
+                >,
+            >,
+        ),
     }
 }
 pub mod execute_command_error {

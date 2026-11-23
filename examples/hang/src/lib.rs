@@ -4,14 +4,20 @@
 //!
 //! - `"tick"` (default) — `init` succeeds, then the lifecycle
 //!   `tick()` enters an infinite loop;
-//! - `"init"` — `init` itself never returns.
+//! - `"init"` — `init` itself never returns;
+//! - `"command"` — `init` registers a switch device, then
+//!   `execute_command` never returns. The H5 fixture for a deadline
+//!   that passes while the plugin is running a command
+//!   (`outcome_unknown`), and for a command that expires in the queue
+//!   behind it (`timed_out`).
 //!
 //! It's the fixture for the liveness-watchdog tests: the host must be
 //! able to interrupt the wedged call (`Trap::Interrupt`) so the
 //! supervisor can reclaim the instance instead of hanging forever.
 
-use oxidhome_sdk::Plugin;
-use oxidhome_sdk::host;
+use oxidhome_sdk::bindings::oxidhome::plugin::capabilities::CapabilitySpec;
+use oxidhome_sdk::bindings::oxidhome::plugin::devices::{Command, CommandResult};
+use oxidhome_sdk::{Device, Plugin, host};
 
 #[derive(Default)]
 struct Hang;
@@ -36,8 +42,15 @@ fn spin() -> ! {
 impl Plugin for Hang {
     fn init(&mut self) -> Result<(), String> {
         let _ = oxidhome_sdk::logging::init();
-        if cfg_phase() == "init" {
-            spin();
+        match cfg_phase().as_str() {
+            "init" => spin(),
+            "command" => {
+                host::register_device(
+                    Device::new("switch-1", "Hanging Switch").capability(CapabilitySpec::Switch),
+                )
+                .map_err(|e| format!("register-device failed: {e:?}"))?;
+            }
+            _ => {}
         }
         oxidhome_sdk::tracing::info!("hang ready — will spin on first tick");
         Ok(())
@@ -47,6 +60,10 @@ impl Plugin for Hang {
         if cfg_phase() == "tick" {
             spin();
         }
+    }
+
+    fn execute_command(&mut self, _device: String, _cmd: Command) -> CommandResult {
+        spin();
     }
 
     fn shutdown(&mut self) {}

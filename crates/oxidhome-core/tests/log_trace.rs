@@ -75,6 +75,7 @@ async fn plugin_logs_survive_host_restart() {
             .execute_command(
                 device_id.clone(),
                 Command {
+                    id: String::new(),
                     capability: "switch".into(),
                     action: "toggle".into(),
                     args: Vec::new(),
@@ -237,18 +238,19 @@ async fn supervised_invocation_keeps_plugin_span_path_prefix() {
     let actor = oxidhome_core::Actor::api("tok-log", vec!["*".into()]);
     let ctx =
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
-    handle
+    let report = handle
         .execute_command_in(
             ctx,
             device_id,
             Command {
+                id: String::new(),
                 capability: "switch".into(),
                 action: "toggle".into(),
                 args: Vec::new(),
             },
         )
-        .await
-        .expect("toggle");
+        .await;
+    assert_eq!(report.outcome.as_str(), "completed", "{report:?}");
     handle.stop().await.expect("stop");
     engine.log_store().wait_drained_for_test();
 

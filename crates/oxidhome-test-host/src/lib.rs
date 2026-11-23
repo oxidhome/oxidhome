@@ -51,6 +51,7 @@
 //!     .send_command(
 //!         device,
 //!         Command {
+//!             id: "cmd-test".into(),
 //!             capability: "switch".into(),
 //!             action: "toggle".into(),
 //!             args: Vec::new(),
@@ -130,7 +131,10 @@ pub use view::StorageView;
 /// Host-side types the harness hands back, re-exported so tests don't
 /// need a direct `oxidhome-core` dependency for the common cases.
 pub use oxidhome_core::state::{BlobInfo, DeviceMeta, HistoricalEvent, ServiceMeta};
-pub use oxidhome_core::{Engine, InitError, InstanceHandle, InstanceState, SupervisorTuning};
+pub use oxidhome_core::{
+    CommandOutcome, CommandReport, Engine, InitError, InstanceHandle, InstanceState,
+    SupervisorTuning,
+};
 pub use oxidhome_manifest::{CapabilitiesSection, ServiceGrant};
 
 /// WIT types of the `plugin` world, as the host sees them: the

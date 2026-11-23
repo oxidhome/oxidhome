@@ -24,9 +24,10 @@ use tokio::net::TcpListener;
 use crate::Engine;
 use crate::auth::{Actor, InvocationContext};
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
-use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
+use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
+use crate::runtime::{CommandOutcome, CommandReport};
 use crate::state::{
     AuditQuery, EventLog, EventLogError, EventQuery, HistoricalEvent, HistoricalLogEvent,
     InstallError, LogLevel, LogQuery, LogStore, LogValue, TopicMatch, UninstallError,
@@ -1096,21 +1097,84 @@ impl From<Value> for WireValue {
     }
 }
 
-/// Wire mirror of the WIT `command-result` variant. `ok` carries
-/// no body; `ok_with_state` carries a `{key: WireValue}` map — a
-/// keyed dict reads better in JSON than the WIT `Vec<KeyValue>`,
-/// and using [`WireValue`] (tagged) instead of a flat
-/// `serde_json::Value` keeps the round-trip lossless: a client
-/// that sent `{"t":"int","v":5}` and reads `{"t":"int","v":5}`
-/// back can distinguish int from float, json-payload from string,
-/// etc. `err` carries the host's [`WitError`] mapped to a tagged
-/// `{kind, message}` shape.
+/// Wire shape of a device-command result (H5): the host-minted
+/// `command_id` plus the explicit `outcome`. Shared by REST and MCP.
+///
+/// - `completed` carries `state` (a `{key: WireValue}` map) when the
+///   plugin returned its post-command state. [`WireValue`] is tagged,
+///   so the round-trip stays lossless (int vs float, JSON vs string).
+/// - `rejected` carries the [`WitError`] as a tagged `{kind, message}`.
+/// - `timed_out` and `outcome_unknown` carry a human-readable
+///   `message`.
+/// - `retry_safe` is `true` only when the host knows the command had
+///   no effect (`rejected`, `timed_out`).
 #[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum WireCommandResult {
-    Ok,
-    OkWithState { state: HashMap<String, WireValue> },
-    Err { error: WireWitError },
+pub(crate) struct WireCommandReport {
+    pub(crate) command_id: String,
+    pub(crate) outcome: &'static str,
+    pub(crate) retry_safe: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) state: Option<HashMap<String, WireValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<WireWitError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<String>,
+}
+
+impl WireCommandReport {
+    /// Without `blobs` (the caller's [`can_read_blobs`]), returned
+    /// `bytes-val` state is withheld (M7).
+    pub(crate) fn from_report(mut report: CommandReport, blobs: bool) -> Self {
+        if !blobs {
+            report.withhold_bytes();
+        }
+        let outcome = report.outcome.as_str();
+        let retry_safe = report.outcome.is_retry_safe();
+        let (state, error, message) = match report.outcome {
+            CommandOutcome::Accepted => (None, None, None),
+            CommandOutcome::Completed { state } => (
+                state.map(|kvs| {
+                    kvs.into_iter()
+                        .map(|kv| (kv.key, kv.value.into()))
+                        .collect()
+                }),
+                None,
+                None,
+            ),
+            CommandOutcome::Rejected { error } => (None, Some(error.into()), None),
+            CommandOutcome::TimedOut { message } | CommandOutcome::Unknown { message } => {
+                (None, None, Some(message))
+            }
+        };
+        Self {
+            command_id: report.command_id,
+            outcome,
+            retry_safe,
+            state,
+            error,
+            message,
+        }
+    }
+}
+
+/// H5 REST status for a device-command outcome. Every outcome carries
+/// the same JSON body; the status lets a generic HTTP client tell them
+/// apart without reading it:
+///
+/// - `completed` → `200 OK`
+/// - `accepted` → `202 Accepted`
+/// - `rejected` → `422 Unprocessable Content` (nothing happened; fix and retry)
+/// - `timed_out` → `504 Gateway Timeout` (nothing happened; retry is safe)
+/// - `outcome_unknown` → `502 Bad Gateway` (may have happened; read the
+///   device state before retrying)
+pub(crate) fn command_outcome_status(outcome: &CommandOutcome) -> StatusCode {
+    match outcome {
+        CommandOutcome::Completed { .. } => StatusCode::OK,
+        CommandOutcome::Accepted => StatusCode::ACCEPTED,
+        CommandOutcome::Rejected { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        CommandOutcome::TimedOut { .. } => StatusCode::GATEWAY_TIMEOUT,
+        CommandOutcome::Unknown { .. } => StatusCode::BAD_GATEWAY,
+    }
 }
 
 /// Wire mirror of the WIT `error` variant. Same shape clients can
@@ -1137,25 +1201,6 @@ impl From<WitError> for WireWitError {
     }
 }
 
-/// Project a plugin's command result onto the wire. Without `blobs`
-/// (the caller's [`can_read_blobs`]), returned `bytes-val` state is
-/// withheld (M7).
-pub(crate) fn command_result_to_wire(mut r: CommandResult, blobs: bool) -> WireCommandResult {
-    if !blobs {
-        crate::redact::withhold_bytes_in_command_result(&mut r);
-    }
-    match r {
-        CommandResult::Ok => WireCommandResult::Ok,
-        CommandResult::OkWithState(kvs) => WireCommandResult::OkWithState {
-            state: kvs
-                .into_iter()
-                .map(|kv| (kv.key, kv.value.into()))
-                .collect(),
-        },
-        CommandResult::Err(e) => WireCommandResult::Err { error: e.into() },
-    }
-}
-
 /// `POST /api/v1/devices/{device_id}/command` — route a command
 /// through the owning plugin instance's `execute-command` export
 /// and return the result.
@@ -1167,24 +1212,23 @@ pub(crate) fn command_result_to_wire(mut r: CommandResult, blobs: bool) -> WireC
 /// (scoped on `audit:read`) surfaces the trail — filter by
 /// `path=/api/v1/devices/.../command` for command-dispatch rows.
 ///
-/// **Error shape** (5xx are reserved for *host* failures; 4xx mean
-/// the request was structurally rejected; 2xx with a `kind: "err"`
-/// in the body means the plugin returned a structured error):
+/// **Response shape (H5).** Every command the host routed to the
+/// owning instance gets a host-minted `command_id` and an explicit
+/// `outcome` in a [`WireCommandReport`] body; the HTTP status follows
+/// the outcome (see [`command_outcome_status`]): `200` completed, `202`
+/// accepted, `422` rejected, `504` timed out, `502` outcome unknown.
+/// Requests that never reach dispatch keep their usual statuses:
 /// - `404 not_found` — no device with that id, or its owning
 ///   instance isn't currently running. Indistinguishable from
 ///   "wrong id" so a probing caller can't enumerate device ids.
 /// - `403` — scope check failed, or the token's `device.send_command`
 ///   allowlist does not cover `device_id` (audited with
 ///   `required_scope = "constraint:device.send_command:devices"`).
-/// - `500` — supervisor channel error / plugin trap (the dispatch
-///   path crashed the owning instance), or the request's invocation
-///   deadline passed before the owning supervisor dequeued it.
 ///
 /// The plugin runs under the request's [`InvocationContext`] (H6), so
-/// any `call-service` it makes is audited against this token.
-/// - `200` — plugin processed the command; the body's
-///   `WireCommandResult` says whether the plugin returned `Ok`,
-///   `OkWithState`, or `Err`.
+/// any `call-service` it makes is audited against this token. The
+/// audit row records `command_id` and `command_outcome`, with
+/// `decision = "allow"` whatever the outcome status.
 async fn send_command(
     Extension(actor): Extension<Actor>,
     Extension(invocation): Extension<InvocationContext>,
@@ -1215,8 +1259,10 @@ async fn send_command(
         .ok_or(CommandError::NotFound)?;
 
     // Build the WIT command. JSON `value` shapes map to typed
-    // `Value` variants via the `From<WireValue>` impl.
+    // `Value` variants via the `From<WireValue>` impl. The supervisor
+    // handle mints `id` (H5).
     let cmd = Command {
+        id: String::new(),
         capability: body.capability,
         action: body.action,
         args: body
@@ -1229,37 +1275,28 @@ async fn send_command(
             .collect(),
     };
 
-    let result = handle
-        .execute_command_in(invocation, device_id, cmd)
-        .await
-        .map_err(CommandError::Dispatch)?;
+    let report = handle.execute_command_in(invocation, device_id, cmd).await;
 
-    // F4: the wire response stays HTTP 200 (the RPC itself
-    // succeeded and the authorization check passed), but a
-    // `CommandResult::Err` is a domain-level failure. Smuggle the
-    // WIT error kind onto the response extensions so the auth
-    // middleware populates the ledger's `execution_outcome` +
-    // `domain_error` columns *without* touching the transport
-    // status or the authorization `decision`. See
-    // `super::auth::DomainOutcome` for why authorization and
-    // execution outcomes are kept independent.
-    let domain_outcome = match &result {
-        CommandResult::Ok | CommandResult::OkWithState(_) => None,
-        CommandResult::Err(err) => Some(crate::api::auth::DomainOutcome {
-            domain_error: crate::api::auth::wit_error_kind(err),
-        }),
-    };
-    let mut response = Json(command_result_to_wire(result, can_read_blobs(&actor))).into_response();
-    if let Some(outcome) = domain_outcome {
-        response.extensions_mut().insert(outcome);
-    }
+    // F4 + H5: the authorization decision stays `allow` whatever the
+    // command outcome; the outcome and command id ride to the audit
+    // middleware on a response extension.
+    let status = command_outcome_status(&report.outcome);
+    let domain_outcome = crate::api::auth::DomainOutcome::from_report(&report);
+    let mut response = (
+        status,
+        Json(WireCommandReport::from_report(
+            report,
+            can_read_blobs(&actor),
+        )),
+    )
+        .into_response();
+    response.extensions_mut().insert(domain_outcome);
     Ok(response)
 }
 
 enum CommandError {
     Scope(ScopeDenied),
     NotFound,
-    Dispatch(anyhow::Error),
 }
 
 impl IntoResponse for CommandError {
@@ -1267,10 +1304,6 @@ impl IntoResponse for CommandError {
         match self {
             CommandError::Scope(s) => s.into_response(),
             CommandError::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
-            CommandError::Dispatch(err) => {
-                tracing::error!(target: "api.devices", error = %err, "device command dispatch failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            }
         }
     }
 }
@@ -3186,6 +3219,13 @@ struct WireAuditEntry {
     /// decoded from the ledger's JSON column.
     #[serde(skip_serializing_if = "Option::is_none")]
     invocation: Option<serde_json::Value>,
+    /// H5 device-command id, on command-dispatch rows and their
+    /// `COMMAND` resolution rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_id: Option<String>,
+    /// H5 explicit command outcome for `command_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_outcome: Option<String>,
 }
 
 impl WireAuditEntry {
@@ -3209,6 +3249,8 @@ impl WireAuditEntry {
                 .invocation
                 .as_deref()
                 .and_then(|j| serde_json::from_str(j).ok()),
+            command_id: row.command_id,
+            command_outcome: row.command_outcome,
         }
     }
 }
@@ -3544,6 +3586,32 @@ impl IntoResponse for DashboardsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M7 + H5: a `completed` report's `bytes-val` state is withheld
+    /// from a caller without `blobs:read` (REST and MCP share this
+    /// encoder) and passed through for one with it.
+    #[test]
+    fn command_report_withholds_bytes_without_blobs_read() {
+        let report = || CommandReport {
+            command_id: "cmd-00000000000000000000000000000001".into(),
+            outcome: CommandOutcome::Completed {
+                state: Some(vec![KeyValue {
+                    key: "frame".into(),
+                    value: Value::BytesVal(vec![1, 2, 3]),
+                }]),
+            },
+        };
+        let narrow = serde_json::to_value(WireCommandReport::from_report(report(), false)).unwrap();
+        let full = serde_json::to_value(WireCommandReport::from_report(report(), true)).unwrap();
+        assert_ne!(narrow["state"]["frame"], full["state"]["frame"], "{narrow}");
+        let mut withheld = Value::BytesVal(vec![1, 2, 3]);
+        crate::redact::withhold_bytes(&mut withheld);
+        let expected: WireValue = withheld.into();
+        assert_eq!(
+            narrow["state"]["frame"],
+            serde_json::to_value(expected).unwrap()
+        );
+    }
     use crate::host_impl::plugin::oxidhome::plugin::events::{
         ButtonEvent as WitButtonEvent, Event,
     };

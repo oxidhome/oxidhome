@@ -60,6 +60,7 @@ async fn counter_persists_across_host_restart() {
                     // existence for unregistered devices yet).
                     "no-device".into(),
                     Command {
+                        id: String::new(),
                         capability: "counter".into(),
                         action: "tick".into(),
                         args: Vec::new(),
@@ -88,6 +89,7 @@ async fn counter_persists_across_host_restart() {
         .execute_command(
             "no-device".into(),
             Command {
+                id: String::new(),
                 capability: "counter".into(),
                 action: "read".into(),
                 args: Vec::new(),

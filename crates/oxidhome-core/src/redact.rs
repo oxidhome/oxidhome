@@ -547,7 +547,8 @@ pub fn scrub_secret_values<'a>(text: &'a str, secrets: &[&str]) -> Cow<'a, str> 
 }
 
 /// [`scrub_secret_values`] over the message of a command result's
-/// error, for plugin-authored text that leaves the sandbox.
+/// error (or H5 `unknown` text), for plugin-authored text that leaves
+/// the sandbox.
 pub fn scrub_command_error(result: &mut CommandResult, secrets: &[&str]) {
     use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
     if let CommandResult::Err(
@@ -556,7 +557,8 @@ pub fn scrub_command_error(result: &mut CommandResult, secrets: &[&str]) {
         | WitError::PermissionDenied(m)
         | WitError::Unavailable(m)
         | WitError::Internal(m),
-    ) = result
+    )
+    | CommandResult::Unknown(m) = result
         && let Cow::Owned(scrubbed) = scrub_secret_values(m, secrets)
     {
         *m = scrubbed;

@@ -404,9 +404,16 @@ async fn device_send_command_end_to_end_toggles_a_switch() {
         "toggle must succeed; got {response}",
     );
     let structured = &result["structuredContent"];
+    // H5: the host-minted command id and the explicit outcome.
     assert_eq!(
-        structured["kind"], "ok_with_state",
-        "simulated-switch's toggle returns ok_with_state; got {structured}",
+        structured["outcome"], "completed",
+        "simulated-switch's toggle completes; got {structured}",
+    );
+    assert!(
+        structured["command_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("cmd-")),
+        "{structured}",
     );
     let state = structured["state"].as_object().expect("state is an object");
     // simulated-switch reports `state: bool` after toggle
@@ -441,6 +448,12 @@ async fn device_send_command_end_to_end_toggles_a_switch() {
         "success has no domain_error; got {:?}",
         toggle_row.domain_error,
     );
+    // H5: the row carries the command id the caller saw.
+    assert_eq!(
+        toggle_row.command_id.as_deref(),
+        structured["command_id"].as_str(),
+    );
+    assert_eq!(toggle_row.command_outcome.as_deref(), Some("completed"));
 
     handle.stop().await.expect("stop");
     // Prove PluginInstance::load isn't accidentally
@@ -966,7 +979,7 @@ async fn device_send_command_success_keeps_text_mirror() {
     );
     let text = content[0]["text"].as_str().expect("text content");
     let parsed: Value = serde_json::from_str(text).expect("text mirror is JSON");
-    assert_eq!(parsed["kind"], "ok_with_state");
+    assert_eq!(parsed["outcome"], "completed");
 
     handle.stop().await.expect("stop");
 }

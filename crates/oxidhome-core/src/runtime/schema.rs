@@ -621,15 +621,17 @@ pub(crate) fn check_args(
 }
 
 /// Gate the callee's reply on the command's `returns` schema. An
-/// `err` passes through untouched; a reply that breaks the schema
-/// becomes `internal` (the callee broke its own contract).
+/// `err` / `unknown` / `accepted` pass through untouched (no state to
+/// check; the instance already turned a service `accepted` into
+/// `unknown`); a reply that breaks the schema becomes `internal` (the
+/// callee broke its own contract).
 pub(crate) fn check_result(
     service: &str,
     spec: &CommandSpec,
     result: CommandResult,
 ) -> Result<CommandResult, WitError> {
     let violation = match &result {
-        CommandResult::Err(_) => None,
+        CommandResult::Err(_) | CommandResult::Unknown(_) | CommandResult::Accepted => None,
         CommandResult::Ok => spec
             .returns
             .iter()

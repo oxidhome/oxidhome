@@ -55,6 +55,11 @@ pub mod __buffa {
         reg.register_json_any(super::__EXECUTE_COMMAND_RESPONSE_JSON_ANY);
         reg.register_json_any(super::execute_command_response::__OK_JSON_ANY);
         reg.register_json_any(super::execute_command_response::__OK_WITH_STATE_JSON_ANY);
+        reg.register_json_any(super::execute_command_response::__ACCEPTED_JSON_ANY);
+        reg.register_json_any(super::execute_command_response::__TIMED_OUT_JSON_ANY);
+        reg.register_json_any(
+            super::execute_command_response::__OUTCOME_UNKNOWN_JSON_ANY,
+        );
         reg.register_json_any(super::__EXECUTE_COMMAND_ERROR_JSON_ANY);
         reg.register_json_any(super::__TAIL_EVENTS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__TAIL_EVENTS_RESPONSE_JSON_ANY);

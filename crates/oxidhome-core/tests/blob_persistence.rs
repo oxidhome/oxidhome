@@ -62,6 +62,7 @@ async fn blobs_survive_host_restart() {
             .execute_command(
                 "no-device".into(),
                 Command {
+                    id: String::new(),
                     capability: "snapshot".into(),
                     action: "write".into(),
                     args: vec![

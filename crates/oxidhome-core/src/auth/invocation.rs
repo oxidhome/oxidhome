@@ -416,13 +416,19 @@ pub fn audit_cap(s: &str) -> &str {
 /// `call-<32 lowercase hex>` — 128 random bits, same shape as the
 /// installation UUIDs.
 fn mint_call_id() -> String {
+    mint_prefixed_id("call-")
+}
+
+/// `<prefix><32 lowercase hex>` — 128 random bits. Shared by the
+/// invocation `call_id` and the H5 device-command id (`cmd-`).
+pub(crate) fn mint_prefixed_id(prefix: &str) -> String {
     use std::fmt::Write as _;
     let mut bytes = [0u8; 16];
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("system RNG must be available");
-    let mut id = String::with_capacity(5 + 32);
-    id.push_str("call-");
+    let mut id = String::with_capacity(prefix.len() + 32);
+    id.push_str(prefix);
     for b in bytes {
         let _ = write!(id, "{b:02x}");
     }

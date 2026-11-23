@@ -250,6 +250,7 @@ mod tests {
 
     fn command() -> Command {
         Command {
+            id: "cmd-test".into(),
             capability: "switch".into(),
             action: "toggle".into(),
             args: Vec::new(),

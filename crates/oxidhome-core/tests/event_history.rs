@@ -79,6 +79,7 @@ async fn state_changed_event_survives_host_restart() {
             .execute_command(
                 device_id.clone(),
                 Command {
+                    id: String::new(),
                     capability: "switch".into(),
                     action: "toggle".into(),
                     args: Vec::new(),

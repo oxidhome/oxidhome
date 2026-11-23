@@ -13,6 +13,7 @@
 // `#[doc(hidden)]` `call_service_from_host` helper; the regular
 // surface is everything else accessed via `pub(crate)` inside the
 // module.
+pub mod command;
 pub mod contract;
 pub mod dispatcher;
 mod instance;
@@ -23,6 +24,7 @@ mod schema;
 mod state;
 pub(crate) mod watchdog;
 
+pub use command::{CommandOutcome, CommandReport, PendingCommands};
 pub use instance::{InitError, LoadMode, PluginInstance, read_manifest_with_bytes};
 pub use lifecycle::{
     InstanceHandle, InstanceState, SupervisorTuning, supervise, supervise_with_tuning,
@@ -83,6 +85,8 @@ pub struct Engine {
     blobs: Arc<BlobStore>,
     services: Arc<ServiceRegistry>,
     instances: Arc<InstanceRegistry>,
+    /// H5: accepted-but-unfinished device commands.
+    pending_commands: Arc<PendingCommands>,
     auth_tokens: Arc<crate::state::TokenStore>,
     installed_plugins: Arc<InstalledPluginRegistry>,
     /// H2 round-2 F1: per-`plugin_id` async mutex used by both API
@@ -364,15 +368,17 @@ impl Engine {
                 .context("constructing wasmtime engine")?,
         );
         watchdog::EpochTicker::spawn(&inner);
+        let audit_log = Arc::new(AuditLog::new(Arc::clone(&db)));
         Ok(Self {
             inner,
+            pending_commands: Arc::new(PendingCommands::new(Some(Arc::clone(&audit_log)))),
             devices: Arc::new(DeviceRegistry::new()),
             device_state: Arc::new(DeviceStateStore::new()),
             events: Arc::new(EventBus::new()),
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
             event_log: Arc::new(EventLog::new(Arc::clone(&db))),
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
-            audit_log: Arc::new(AuditLog::new(Arc::clone(&db))),
+            audit_log,
             dashboards: Arc::new(crate::state::DashboardStore::new(Arc::clone(&db))),
             auth_tokens: Arc::new(crate::state::TokenStore::new(Arc::clone(&db))),
             blobs: Arc::new(BlobStore::new(Arc::clone(&db), blobs_root)),
@@ -519,6 +525,13 @@ impl Engine {
     #[must_use]
     pub fn services(&self) -> Arc<ServiceRegistry> {
         Arc::clone(&self.services)
+    }
+
+    /// H5: the table of `accepted` device commands awaiting
+    /// `complete-command`. Shared with every plugin instance.
+    #[must_use]
+    pub fn pending_commands(&self) -> Arc<PendingCommands> {
+        Arc::clone(&self.pending_commands)
     }
 
     /// Per-engine registry of supervised plugin instances — Phase 6d.
@@ -1202,6 +1215,9 @@ impl Engine {
     pub fn release_instance_state(&self, instance_id: &str) {
         self.devices().remove_by_owner(instance_id);
         self.services().remove_by_owner(instance_id);
+        // H5: no completion can be matched once the instance is gone.
+        self.pending_commands
+            .expire_owner(instance_id, "the plugin instance stopped");
         // H9: device-state entries survive the terminal (unlike
         // `DeviceRegistry` entries, which are reaped) so consumers
         // can still read the last observed values with

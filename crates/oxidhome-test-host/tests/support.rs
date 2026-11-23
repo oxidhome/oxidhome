@@ -32,6 +32,7 @@ pub const SERVICE_BOUNCER: (&str, &str) = ("service-bouncer", "service_bouncer.w
 pub const SNAPSHOT_SAVER: (&str, &str) = ("snapshot-saver", "snapshot_saver.wasm");
 pub const CRASHER: (&str, &str) = ("crasher", "crasher.wasm");
 pub const HANG: (&str, &str) = ("hang", "hang.wasm");
+pub const DEFERRED_SWITCH: (&str, &str) = ("deferred-switch", "deferred_switch.wasm");
 
 /// Build `examples/<dir>` for `wasm32-wasip2` (once per test binary)
 /// and return the artifact path.
@@ -72,8 +73,10 @@ pub fn build_example((dir, artifact): (&str, &str)) -> PathBuf {
     ] {
         cmd.env_remove(var);
     }
-    let status = cmd.status().expect("invoking cargo build");
-    assert!(status.success(), "{dir} build failed: {status}");
+    build_once_per_run(&example_dir, || {
+        let status = cmd.status().expect("invoking cargo build");
+        assert!(status.success(), "{dir} build failed: {status}");
+    });
     let path = example_dir
         .join("target")
         .join("wasm32-wasip2")
@@ -156,4 +159,45 @@ pub fn stage(example: (&str, &str), edit_caps: impl FnOnce(&mut toml::Table)) ->
 #[must_use]
 pub fn stage_unchanged(example: (&str, &str)) -> TempDir {
     stage(example, |_| {})
+}
+
+/// Run `build` for `example_dir` at most once per test run, across
+/// processes and test crates.
+///
+/// cargo replaces an example's uplifted `.wasm` (unlink + relink) on
+/// every `cargo build`, even a no-op one. nextest runs each test in
+/// its own process, so one test rebuilding an example could briefly
+/// remove the artifact another test was loading. An exclusive lock
+/// on `<example>/target/.oxidhome-test-build.lock` serializes builds,
+/// and a stamp keyed on `NEXTEST_RUN_ID` skips cargo after the run's
+/// first build. Without nextest (plain `cargo test`, one process per
+/// test binary) the caller's in-process memo covers the same case.
+fn build_once_per_run(example_dir: &Path, build: impl FnOnce()) {
+    let target = example_dir.join("target");
+    std::fs::create_dir_all(&target).expect("create example target dir");
+    let lock = std::fs::File::create(target.join(".oxidhome-test-build.lock"))
+        .expect("open example build lock");
+    lock.lock().expect("lock example build");
+    let stamp = std::env::var("NEXTEST_RUN_ID")
+        .ok()
+        .map(|run| target.join(format!(".oxidhome-test-built-{run}")));
+    if stamp.as_ref().is_some_and(|s| s.exists()) {
+        return;
+    }
+    build();
+    if let Some(stamp) = stamp {
+        // Drop stamps of earlier runs, then mark this one.
+        if let Ok(entries) = std::fs::read_dir(&target) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".oxidhome-test-built-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        std::fs::write(&stamp, b"").expect("write build stamp");
+    }
 }
