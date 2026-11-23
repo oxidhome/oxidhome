@@ -237,27 +237,25 @@ fn effective_log_filter() -> Setting<String> {
 /// M7 rules don't see inside a directive string. Targets and levels
 /// stay readable.
 fn mask_span_fields(filter: &str) -> String {
+    // `EnvFilter`'s grammar: `{` opens a span's field list and the
+    // first `}` closes it, with no nesting, quoting or escapes.
     let mut out = String::with_capacity(filter.len());
-    let mut depth = 0usize;
+    let mut in_fields = false;
     for c in filter.chars() {
-        match c {
-            '{' => {
-                if depth == 0 {
-                    out.push_str("{***");
-                }
-                depth += 1;
+        match (in_fields, c) {
+            (false, '{') => {
+                out.push_str("{***");
+                in_fields = true;
             }
-            '}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    out.push('}');
-                }
+            (true, '}') => {
+                out.push('}');
+                in_fields = false;
             }
-            _ if depth > 0 => {}
-            _ => out.push(c),
+            (true, _) => {}
+            (false, c) => out.push(c),
         }
     }
-    if depth > 0 {
+    if in_fields {
         out.push('}');
     }
     out
@@ -449,8 +447,15 @@ mod tests {
             mask_span_fields("warn,[request{url=https://alice:pw@hub/}]=debug"),
             "warn,[request{***}]=debug",
         );
-        assert_eq!(mask_span_fields("x[s{a={b}}]=trace"), "x[s{***}]=trace");
         assert_eq!(mask_span_fields("x[s{unterminated"), "x[s{***}");
+        // `\{` is a literal brace inside a field value, not a nesting
+        // level; the directives after it stay visible.
+        let filter = r"app[request{message=\{}]=debug,other=trace";
+        assert!(tracing_subscriber::EnvFilter::try_new(filter).is_ok());
+        assert_eq!(
+            mask_span_fields(filter),
+            "app[request{***}]=debug,other=trace"
+        );
     }
 
     #[cfg(unix)]

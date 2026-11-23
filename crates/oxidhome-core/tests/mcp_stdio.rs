@@ -187,6 +187,17 @@ async fn stdio_ambient_actor_has_wildcard_scope() {
     joined.expect("serve_stdio_over returned Err");
 }
 
+/// Kills the child and removes its state dir even when an
+/// assertion or timeout panics first.
+struct Cleanup(std::process::Child, std::path::PathBuf);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        let _ = std::fs::remove_dir_all(&self.1);
+    }
+}
+
 /// The real `mcp-stdio` binary publishes its resolved settings, so
 /// `oxidhome://config` reports this run (mode, env-sourced state dir)
 /// instead of `"daemon": null`.
@@ -203,7 +214,7 @@ fn stdio_binary_serves_its_config_snapshot() {
             .expect("clock")
             .as_nanos()
     ));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_oxidhome-core"))
+    let child = Command::new(env!("CARGO_BIN_EXE_oxidhome-core"))
         .arg("mcp-stdio")
         .env("OXIDHOME_STATE_DIR", &state_dir)
         .env_remove("OXIDHOME_EVENT_LOG_MAX_ROWS")
@@ -213,8 +224,9 @@ fn stdio_binary_serves_its_config_snapshot() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn oxidhome mcp-stdio");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = Cleanup(child, state_dir.clone());
+    let mut stdin = guard.0.stdin.take().expect("stdin");
+    let stdout = guard.0.stdout.take().expect("stdout");
 
     // Read lines on a thread so a hung child fails the test on a
     // deadline instead of blocking it.
@@ -255,10 +267,6 @@ fn stdio_binary_serves_its_config_snapshot() {
         "params": {"uri": "oxidhome://config"},
     }));
     let response = recv_id(2);
-    drop(send);
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&state_dir);
 
     let text = response["result"]["contents"][0]["text"]
         .as_str()
