@@ -55,17 +55,21 @@ use oxidhome_proto::connect::oxidhome::v1::{
 use oxidhome_proto::proto::oxidhome::v1::{
     Button as ProtoButton, ButtonKind as ProtoButtonKind, CheckRequest, CheckResponse,
     CommandOutcome as ProtoCommandOutcome, CursorExpired as ProtoCursorExpired,
-    CustomEvent as ProtoCustomEvent, Device, Event as ProtoEvent,
+    CustomEvent as ProtoCustomEvent, Device, DeviceStateEntry as ProtoDeviceStateEntry,
+    DeviceStateSnapshot as ProtoDeviceStateSnapshot, Event as ProtoEvent,
     ExecuteCommandError as ProtoCmdError, ExecuteCommandRequest, ExecuteCommandResponse,
-    Inference as ProtoInference, InstallPluginRequest, InstallPluginResponse, Instance,
-    KeyValue as ProtoKeyValue, Lagged as ProtoLagged, ListDevicesRequest, ListDevicesResponse,
+    GetDeviceStateRequest, GetDeviceStateResponse, Inference as ProtoInference,
+    InstallPluginRequest, InstallPluginResponse, Instance, KeyValue as ProtoKeyValue,
+    Lagged as ProtoLagged, ListDeviceStateChangesRequest, ListDeviceStateChangesResponse,
+    ListDeviceStateRequest, ListDeviceStateResponse, ListDevicesRequest, ListDevicesResponse,
     ListInstancesRequest, ListInstancesResponse, ListPluginsRequest, ListPluginsResponse,
     LogEvent as ProtoLogEvent, LogField as ProtoLogField, LogLevel as ProtoLogLevel,
     LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest, QueryLogsResponse,
-    StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged, StopPluginRequest,
-    StopPluginResponse, TailEventsRequest, TailEventsResponse, UninstallPluginRequest,
-    UninstallPluginResponse, Value as ProtoValue, event as proto_event, execute_command_error,
-    execute_command_response, log_value, tail_events_response, value,
+    StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged,
+    StateQuality as ProtoStateQuality, StopPluginRequest, StopPluginResponse, TailEventsRequest,
+    TailEventsResponse, UninstallPluginRequest, UninstallPluginResponse, Value as ProtoValue,
+    event as proto_event, execute_command_error, execute_command_response, log_value,
+    tail_events_response, value,
 };
 
 use crate::Engine;
@@ -83,9 +87,9 @@ use super::auth::{
     AuthState, actor_from_record, extract_bearer, finalize_audit, record_anonymous_probe,
 };
 use super::scopes::{
-    DEVICES_COMMAND, DEVICES_LIST, EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
-    PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope,
-    ScopeDenied, can_read_blobs, require_scope,
+    DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ, EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST,
+    LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL,
+    Scope, ScopeDenied, can_read_blobs, require_scope,
 };
 
 /// `HealthService` implementation. Anonymous; reads only the
@@ -413,6 +417,129 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         record_domain_outcome(&ctx, &report);
         Response::ok(command_report_to_proto(report, ctx_can_read_blobs(&ctx)))
     }
+
+    async fn get_device_state<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetDeviceStateRequest>,
+    ) -> ServiceResult<impl Encodable<GetDeviceStateResponse> + Send + use<'a>> {
+        require_scope_connect(&ctx, DEVICES_READ)?;
+        let blobs = ctx_can_read_blobs(&ctx);
+        let device_id = request.to_owned_message().device_id;
+        let (epoch, revision, mut entries) = self
+            .engine
+            .device_state()
+            .snapshot_device_with_revision(&device_id);
+        entries.sort_by(|a, b| a.capability.cmp(&b.capability));
+        Response::ok(GetDeviceStateResponse {
+            state: device_snapshot_to_proto(device_id, &entries, &epoch, revision, blobs).into(),
+            ..Default::default()
+        })
+    }
+
+    async fn list_device_state<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListDeviceStateRequest>,
+    ) -> ServiceResult<impl Encodable<ListDeviceStateResponse> + Send + use<'a>> {
+        use super::server::{
+            DEFAULT_ALL_DEVICES_STATE_LIMIT, MAX_ALL_DEVICES_STATE_LIMIT,
+            MAX_ALL_DEVICES_STATE_PAGE_BYTES,
+        };
+        require_scope_connect(&ctx, DEVICES_READ)?;
+        let blobs = ctx_can_read_blobs(&ctx);
+        let req = request.to_owned_message();
+        let limit = match usize::try_from(req.limit).unwrap_or(usize::MAX) {
+            0 => DEFAULT_ALL_DEVICES_STATE_LIMIT,
+            n => n.min(MAX_ALL_DEVICES_STATE_LIMIT),
+        };
+        let store = self.engine.device_state();
+        // Same pin protocol as REST: the cursor is verified before any
+        // of its fields are trusted.
+        let pinned = if req.cursor.is_empty() {
+            None
+        } else {
+            match store.verify_cursor(&req.cursor) {
+                Ok((_, revision, after)) => Some((revision, after)),
+                Err(crate::state::CursorError::Bad) => {
+                    return Err(rpc_err(
+                        &ctx,
+                        ConnectError::invalid_argument(
+                            "invalid `cursor`: pass the previous page's `next_cursor` verbatim",
+                        ),
+                    ));
+                }
+                Err(crate::state::CursorError::EpochChanged) => {
+                    return Err(rpc_err(
+                        &ctx,
+                        ConnectError::aborted(
+                            "the cursor is from an earlier daemon process or store epoch; \
+                             restart the resync without a cursor",
+                        ),
+                    ));
+                }
+            }
+        };
+        let page = store.snapshot_page_capped(
+            pinned.as_ref().map(|(_, after)| after.as_str()),
+            limit,
+            MAX_ALL_DEVICES_STATE_PAGE_BYTES,
+            |_| true,
+        );
+        let revision = pinned.as_ref().map_or(page.revision, |(r, _)| *r);
+        let devices: Vec<ProtoDeviceStateSnapshot> = page
+            .devices
+            .iter()
+            .map(|caps| {
+                let id = caps
+                    .first()
+                    .map(|c| c.device_id.clone())
+                    .unwrap_or_default();
+                device_snapshot_to_proto(id, caps, &page.epoch, revision, blobs)
+            })
+            .collect();
+        let next_cursor = match devices.last() {
+            Some(last) if page.more => store.issue_cursor(revision, &last.device_id),
+            _ => String::new(),
+        };
+        Response::ok(ListDeviceStateResponse {
+            epoch: page.epoch,
+            revision,
+            devices,
+            next_cursor,
+            ..Default::default()
+        })
+    }
+
+    async fn list_device_state_changes<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListDeviceStateChangesRequest>,
+    ) -> ServiceResult<impl Encodable<ListDeviceStateChangesResponse> + Send + use<'a>> {
+        use super::server::{DEFAULT_STATE_CHANGES_LIMIT, MAX_STATE_CHANGES_LIMIT};
+        require_scope_connect(&ctx, DEVICES_READ)?;
+        let blobs = ctx_can_read_blobs(&ctx);
+        let req = request.to_owned_message();
+        let limit = match usize::try_from(req.limit).unwrap_or(usize::MAX) {
+            0 => DEFAULT_STATE_CHANGES_LIMIT,
+            n => n.min(MAX_STATE_CHANGES_LIMIT),
+        };
+        let page = self
+            .engine
+            .device_state()
+            .deltas_since_with_revision(req.since_revision, limit);
+        Response::ok(ListDeviceStateChangesResponse {
+            epoch: page.epoch,
+            current_revision: page.current_revision,
+            changes: page
+                .entries
+                .iter()
+                .map(|e| device_state_to_proto(e, blobs))
+                .collect(),
+            reset_required: page.reset_required,
+            ..Default::default()
+        })
+    }
 }
 
 /// F4 + H5 helper — stamps the [`HandlerOutcomeSlot`] with the
@@ -448,6 +575,57 @@ fn proto_key_value_to_wit(kv: ProtoKeyValue) -> KeyValue {
         None => Value::JsonVal(String::new()),
     };
     KeyValue { key: kv.key, value }
+}
+
+/// H2: one projected entry on the wire. `blobs` is the caller's
+/// `blobs:read`; without it `bytes_val` fields are withheld (M7).
+fn device_state_to_proto(state: &crate::state::DeviceState, blobs: bool) -> ProtoDeviceStateEntry {
+    let mut fields = state.fields.clone();
+    if !blobs {
+        crate::redact::withhold_bytes_in_kvs(&mut fields);
+    }
+    ProtoDeviceStateEntry {
+        device_id: state.device_id.clone(),
+        capability: state.capability.clone(),
+        fields: fields
+            .into_iter()
+            .map(|kv| ProtoKeyValue {
+                key: kv.key,
+                value: wit_value_to_proto(kv.value).into(),
+                ..Default::default()
+            })
+            .collect(),
+        global_revision: state.global_revision,
+        received_ms: state.received_ms,
+        observed_ms: state.observed_ms,
+        source_generation: state.source_generation,
+        quality: match state.quality {
+            crate::state::StateQuality::Fresh => ProtoStateQuality::Fresh,
+            crate::state::StateQuality::Stale => ProtoStateQuality::Stale,
+        }
+        .into(),
+        ..Default::default()
+    }
+}
+
+/// H2: one device's entries (sorted by capability) as a snapshot.
+fn device_snapshot_to_proto(
+    device_id: String,
+    entries: &[std::sync::Arc<crate::state::DeviceState>],
+    epoch: &str,
+    revision: u64,
+    blobs: bool,
+) -> ProtoDeviceStateSnapshot {
+    ProtoDeviceStateSnapshot {
+        device_id,
+        epoch: epoch.to_owned(),
+        revision,
+        capabilities: entries
+            .iter()
+            .map(|e| device_state_to_proto(e, blobs))
+            .collect(),
+        ..Default::default()
+    }
 }
 
 fn wit_value_to_proto(value: Value) -> ProtoValue {

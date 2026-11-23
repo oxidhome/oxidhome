@@ -14,6 +14,32 @@ pub type OwnedExecuteCommandRequestView = ::buffa::view::OwnedView<
 pub type OwnedExecuteCommandResponseView = ::buffa::view::OwnedView<
     crate::proto::oxidhome::v1::__buffa::view::ExecuteCommandResponseView<'static>,
 >;
+///Shorthand for `OwnedView<GetDeviceStateRequestView<'static>>`.
+pub type OwnedGetDeviceStateRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::GetDeviceStateRequestView<'static>,
+>;
+///Shorthand for `OwnedView<GetDeviceStateResponseView<'static>>`.
+pub type OwnedGetDeviceStateResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::GetDeviceStateResponseView<'static>,
+>;
+///Shorthand for `OwnedView<ListDeviceStateRequestView<'static>>`.
+pub type OwnedListDeviceStateRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateRequestView<'static>,
+>;
+///Shorthand for `OwnedView<ListDeviceStateResponseView<'static>>`.
+pub type OwnedListDeviceStateResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateResponseView<'static>,
+>;
+///Shorthand for `OwnedView<ListDeviceStateChangesRequestView<'static>>`.
+pub type OwnedListDeviceStateChangesRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateChangesRequestView<'static>,
+>;
+///Shorthand for `OwnedView<ListDeviceStateChangesResponseView<'static>>`.
+pub type OwnedListDeviceStateChangesResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateChangesResponseView<
+        'static,
+    >,
+>;
 impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListDevicesResponse>
 for crate::proto::oxidhome::v1::__buffa::view::ListDevicesResponseView<'_> {
     fn encode(
@@ -82,6 +108,110 @@ for ::buffa::view::OwnedView<
         )
     }
 }
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::GetDeviceStateResponse>
+for crate::proto::oxidhome::v1::__buffa::view::GetDeviceStateResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::GetDeviceStateResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::GetDeviceStateResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListDeviceStateResponse>
+for crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListDeviceStateResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListDeviceStateChangesResponse>
+for crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateChangesResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListDeviceStateChangesResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateChangesResponseView<
+        'static,
+    >,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
 /// Full service name for this service.
 pub const DEVICES_SERVICE_SERVICE_NAME: &str = "oxidhome.v1.DevicesService";
 /// Static [`Spec`](::connectrpc::Spec) for the `ListDevices` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
@@ -93,6 +223,24 @@ pub const DEVICES_SERVICE_LIST_DEVICES_SPEC: ::connectrpc::Spec = ::connectrpc::
 /// Static [`Spec`](::connectrpc::Spec) for the `ExecuteCommand` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const DEVICES_SERVICE_EXECUTE_COMMAND_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/oxidhome.v1.DevicesService/ExecuteCommand",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the `GetDeviceState` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const DEVICES_SERVICE_GET_DEVICE_STATE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.DevicesService/GetDeviceState",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the `ListDeviceState` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const DEVICES_SERVICE_LIST_DEVICE_STATE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.DevicesService/ListDeviceState",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the `ListDeviceStateChanges` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const DEVICES_SERVICE_LIST_DEVICE_STATE_CHANGES_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.DevicesService/ListDeviceStateChanges",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
@@ -205,6 +353,83 @@ pub trait DevicesService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
+    /// H2: current state of one device from the host-owned projection.
+    /// Mirrors `GET /api/v1/devices/{id}/state`; `devices:read`. An
+    /// unknown device returns an empty `capabilities` list, not an
+    /// error. `bytes_val` fields are withheld without `blobs:read` (M7).
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn get_device_state<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::GetDeviceStateRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::GetDeviceStateResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// H2: one page of the full-store snapshot, the resync primitive.
+    /// Mirrors `GET /api/v1/devices/state`; `devices:read`. A malformed
+    /// `cursor` is `invalid_argument`; a cursor from an earlier daemon
+    /// process or another store epoch is `aborted` (restart the resync
+    /// without a cursor).
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn list_device_state<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::ListDeviceStateRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::ListDeviceStateResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// H2: cursor catch-up over the projection. Mirrors
+    /// `GET /api/v1/devices/state/changes`; `devices:read`.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn list_device_state_changes<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::ListDeviceStateChangesRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::ListDeviceStateChangesResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -295,6 +520,93 @@ impl<S: DevicesService> DevicesServiceExt for S {
                 },
             )
             .with_spec(DEVICES_SERVICE_EXECUTE_COMMAND_SPEC)
+            .route_view(
+                DEVICES_SERVICE_SERVICE_NAME,
+                "GetDeviceState",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::GetDeviceStateRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::GetDeviceStateRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.get_device_state(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::GetDeviceStateResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(DEVICES_SERVICE_GET_DEVICE_STATE_SPEC)
+            .route_view(
+                DEVICES_SERVICE_SERVICE_NAME,
+                "ListDeviceState",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::ListDeviceStateRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.list_device_state(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::ListDeviceStateResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(DEVICES_SERVICE_LIST_DEVICE_STATE_SPEC)
+            .route_view(
+                DEVICES_SERVICE_SERVICE_NAME,
+                "ListDeviceStateChanges",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateChangesRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::ListDeviceStateChangesRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.list_device_state_changes(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::ListDeviceStateChangesResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(DEVICES_SERVICE_LIST_DEVICE_STATE_CHANGES_SPEC)
     }
 }
 /// Type-inference marker used by [`Router::add_service`](::connectrpc::Router::add_service).
@@ -361,6 +673,24 @@ impl<T: DevicesService> ::connectrpc::Dispatcher for DevicesServiceServer<T> {
                         .with_spec(DEVICES_SERVICE_EXECUTE_COMMAND_SPEC),
                 )
             }
+            "GetDeviceState" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(DEVICES_SERVICE_GET_DEVICE_STATE_SPEC),
+                )
+            }
+            "ListDeviceState" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(DEVICES_SERVICE_LIST_DEVICE_STATE_SPEC),
+                )
+            }
+            "ListDeviceStateChanges" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(DEVICES_SERVICE_LIST_DEVICE_STATE_CHANGES_SPEC),
+                )
+            }
             _ => None,
         }
     }
@@ -417,6 +747,72 @@ impl<T: DevicesService> ::connectrpc::Dispatcher for DevicesServiceServer<T> {
                         .await?
                         .encode::<
                             crate::proto::oxidhome::v1::ExecuteCommandResponse,
+                        >(format)
+                })
+            }
+            "GetDeviceState" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::GetDeviceStateRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::GetDeviceStateRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::GetDeviceStateRequest,
+                    >::from_parts(&req, &body);
+                    svc.get_device_state(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::GetDeviceStateResponse,
+                        >(format)
+                })
+            }
+            "ListDeviceState" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::ListDeviceStateRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::ListDeviceStateRequest,
+                    >::from_parts(&req, &body);
+                    svc.list_device_state(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::ListDeviceStateResponse,
+                        >(format)
+                })
+            }
+            "ListDeviceStateChanges" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::ListDeviceStateChangesRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateChangesRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::ListDeviceStateChangesRequest,
+                    >::from_parts(&req, &body);
+                    svc.list_device_state_changes(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::ListDeviceStateChangesResponse,
                         >(format)
                 })
             }
@@ -632,6 +1028,141 @@ where
                 &self.transport,
                 &self.config,
                 DEVICES_SERVICE_EXECUTE_COMMAND_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the GetDeviceState RPC. Sends a request to /oxidhome.v1.DevicesService/GetDeviceState.
+    pub async fn get_device_state(
+        &self,
+        request: crate::proto::oxidhome::v1::GetDeviceStateRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::GetDeviceStateResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.get_device_state_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the GetDeviceState RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn get_device_state_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::GetDeviceStateRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::GetDeviceStateResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                DEVICES_SERVICE_GET_DEVICE_STATE_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the ListDeviceState RPC. Sends a request to /oxidhome.v1.DevicesService/ListDeviceState.
+    pub async fn list_device_state(
+        &self,
+        request: crate::proto::oxidhome::v1::ListDeviceStateRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.list_device_state_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the ListDeviceState RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn list_device_state_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::ListDeviceStateRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                DEVICES_SERVICE_LIST_DEVICE_STATE_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the ListDeviceStateChanges RPC. Sends a request to /oxidhome.v1.DevicesService/ListDeviceStateChanges.
+    pub async fn list_device_state_changes(
+        &self,
+        request: crate::proto::oxidhome::v1::ListDeviceStateChangesRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateChangesResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.list_device_state_changes_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the ListDeviceStateChanges RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn list_device_state_changes_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::ListDeviceStateChangesRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::ListDeviceStateChangesResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                DEVICES_SERVICE_LIST_DEVICE_STATE_CHANGES_SPEC
                     .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,

@@ -61,6 +61,14 @@ pub mod __buffa {
             super::execute_command_response::__OUTCOME_UNKNOWN_JSON_ANY,
         );
         reg.register_json_any(super::__EXECUTE_COMMAND_ERROR_JSON_ANY);
+        reg.register_json_any(super::__DEVICE_STATE_ENTRY_JSON_ANY);
+        reg.register_json_any(super::__DEVICE_STATE_SNAPSHOT_JSON_ANY);
+        reg.register_json_any(super::__GET_DEVICE_STATE_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__GET_DEVICE_STATE_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__LIST_DEVICE_STATE_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__LIST_DEVICE_STATE_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__LIST_DEVICE_STATE_CHANGES_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__LIST_DEVICE_STATE_CHANGES_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__TAIL_EVENTS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__TAIL_EVENTS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__EVENT_JSON_ANY);
@@ -125,6 +133,38 @@ pub use self::__buffa::view::ExecuteCommandResponseOwnedView;
 pub use self::__buffa::view::ExecuteCommandErrorView;
 #[doc(inline)]
 pub use self::__buffa::view::ExecuteCommandErrorOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::DeviceStateEntryView;
+#[doc(inline)]
+pub use self::__buffa::view::DeviceStateEntryOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::DeviceStateSnapshotView;
+#[doc(inline)]
+pub use self::__buffa::view::DeviceStateSnapshotOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::GetDeviceStateRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::GetDeviceStateRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::GetDeviceStateResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::GetDeviceStateResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListDeviceStateRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ListDeviceStateRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListDeviceStateResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ListDeviceStateResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListDeviceStateChangesRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ListDeviceStateChangesRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListDeviceStateChangesResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ListDeviceStateChangesResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::TailEventsRequestView;
 #[doc(inline)]

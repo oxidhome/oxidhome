@@ -4603,7 +4603,7 @@ async fn devices_state_full_snapshot_rejects_forged_and_stale_cursors() {
         }
     };
 
-    // Malformed cursor (not `<epoch>.<rev>.<device>.<hmac>`)
+    // Malformed cursor (not `<epoch>.<boot>.<rev>.<device>.<hmac>`)
     // → 400.
     assert_eq!(
         fetch_status("/api/v1/devices/state?cursor=garbage").await,
@@ -4616,15 +4616,18 @@ async fn devices_state_full_snapshot_rejects_forged_and_stale_cursors() {
     // so a legitimate pre-restart cursor lands here too.
     assert_eq!(
         fetch_status(
-            "/api/v1/devices/state?cursor=epoch-deadbeef.1.dev-x.00000000000000000000000000000000",
+            "/api/v1/devices/state?cursor=epoch-deadbeef.0011223344556677.1.dev-x.00000000000000000000000000000000",
         )
         .await,
         StatusCode::CONFLICT,
     );
-    // Fabricated cursor carrying *this* store's epoch but
-    // a garbage MAC still returns 400 (MAC failure).
-    let live_epoch = engine.device_state().epoch();
-    let forged = format!("{live_epoch}.1.dev-x.00000000000000000000000000000000");
+    // Fabricated cursor carrying *this* store's epoch and process
+    // nonce (copied from a real cursor) but a garbage MAC still
+    // returns 400 (MAC failure).
+    let real = engine.device_state().issue_cursor(1, "dev-x");
+    let mut parts = real.splitn(3, '.');
+    let (live_epoch, live_boot) = (parts.next().unwrap(), parts.next().unwrap());
+    let forged = format!("{live_epoch}.{live_boot}.1.dev-x.00000000000000000000000000000000");
     assert_eq!(
         fetch_status(&format!("/api/v1/devices/state?cursor={forged}")).await,
         StatusCode::BAD_REQUEST,
@@ -6341,4 +6344,140 @@ async fn expired_invocation_is_refused_before_plugin_runs() {
     assert_eq!(report.outcome.as_str(), "completed", "{report:?}");
 
     handle.stop().await.expect("stop");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_device_state_scope_deny_returns_permission_denied() {
+    for path in [
+        "/oxidhome.v1.DevicesService/GetDeviceState",
+        "/oxidhome.v1.DevicesService/ListDeviceState",
+        "/oxidhome.v1.DevicesService/ListDeviceStateChanges",
+    ] {
+        assert_connect_scope_denied(path, b"[\"devices:list\"]").await;
+    }
+}
+
+/// H2: the Connect state RPCs mirror the REST state endpoints,
+/// including M7 bytes withholding without `blobs:read`.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_device_state_rpcs_mirror_rest() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+
+    let engine = Engine::new().expect("engine");
+    let store = engine.device_state();
+    store.apply_delta(
+        "dev-1".into(),
+        "alpha".into(),
+        "camera".into(),
+        vec![
+            KeyValue {
+                key: "frame".into(),
+                value: Value::BytesVal(vec![1, 2, 3]),
+            },
+            KeyValue {
+                key: "on".into(),
+                value: Value::BoolVal(true),
+            },
+        ],
+        5,
+        6,
+    );
+    store.apply_delta(
+        "dev-2".into(),
+        "alpha".into(),
+        "switch".into(),
+        vec![KeyValue {
+            key: "on".into(),
+            value: Value::BoolVal(false),
+        }],
+        5,
+        6,
+    );
+    let reader = engine
+        .auth_tokens()
+        .create("reader", b"[\"devices:read\"]")
+        .unwrap();
+    let call = |path: &'static str, body: String| {
+        let engine = engine.clone();
+        let bearer = reader.plaintext.clone();
+        async move {
+            let resp = build_router(engine)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+
+    let one = call(
+        "/oxidhome.v1.DevicesService/GetDeviceState",
+        r#"{"deviceId":"dev-1"}"#.into(),
+    )
+    .await;
+    let state = &one["state"];
+    assert_eq!(state["deviceId"], "dev-1");
+    assert_eq!(state["epoch"], engine.device_state().epoch());
+    let fields = &state["capabilities"][0]["fields"];
+    let frame = fields
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["key"] == "frame")
+        .unwrap();
+    let marker: serde_json::Value =
+        serde_json::from_str(frame["value"]["jsonVal"].as_str().expect("withheld marker")).unwrap();
+    assert_eq!(marker["withheld"], "bytes");
+    assert_eq!(state["capabilities"][0]["quality"], "STATE_QUALITY_FRESH");
+
+    // Page through the full snapshot one device at a time.
+    let first = call(
+        "/oxidhome.v1.DevicesService/ListDeviceState",
+        r#"{"limit":1}"#.into(),
+    )
+    .await;
+    assert_eq!(first["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(first["devices"][0]["deviceId"], "dev-1");
+    let cursor = first["nextCursor"].as_str().expect("more pages").to_owned();
+    let second = call(
+        "/oxidhome.v1.DevicesService/ListDeviceState",
+        serde_json::json!({ "cursor": cursor, "limit": 1 }).to_string(),
+    )
+    .await;
+    assert_eq!(second["devices"][0]["deviceId"], "dev-2");
+    assert_eq!(second["revision"], first["revision"]);
+    assert!(second.get("nextCursor").is_none_or(|c| c == ""));
+
+    let changes = call(
+        "/oxidhome.v1.DevicesService/ListDeviceStateChanges",
+        r#"{"sinceRevision":"1"}"#.into(),
+    )
+    .await;
+    assert_eq!(changes["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(changes["changes"][0]["deviceId"], "dev-2");
+    assert!(changes.get("resetRequired").is_none_or(|r| r == false));
+
+    let reset = call(
+        "/oxidhome.v1.DevicesService/ListDeviceStateChanges",
+        r#"{"sinceRevision":"999"}"#.into(),
+    )
+    .await;
+    assert_eq!(reset["resetRequired"], true);
 }

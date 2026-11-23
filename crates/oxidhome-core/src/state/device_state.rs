@@ -735,6 +735,79 @@ impl DeviceStateStore {
         (inner.epoch.clone(), inner.global_revision, entries)
     }
 
+    /// H2: one page of the full-store snapshot, grouped by device and
+    /// capped by both a device count and a byte budget, read under one
+    /// lock. Shared by REST `GET /api/v1/devices/state`, Connect
+    /// `ListDeviceState` and the plugin `host-state::list-state`
+    /// import.
+    ///
+    /// Devices sort by id after `after_device_id`; `keep` drops
+    /// entries the caller may not see (a device with no kept entry is
+    /// skipped). A device is committed whole: the page stops before a
+    /// device that would exceed `device_limit` or push the page past
+    /// `byte_cap` (the first device is always kept, so paging makes
+    /// progress). Bytes are estimated as capability name plus field
+    /// bytes. `more` says whether a kept device follows the page.
+    #[must_use]
+    pub fn snapshot_page_capped(
+        &self,
+        after_device_id: Option<&str>,
+        device_limit: usize,
+        byte_cap: usize,
+        keep: impl Fn(&DeviceState) -> bool,
+    ) -> CappedPage {
+        let inner = self.inner_read();
+        let start = match after_device_id {
+            Some(cursor) => Bound::Excluded((cursor.to_string(), MAX_CAP_SENTINEL.to_string())),
+            None => Bound::Unbounded,
+        };
+        let mut devices: Vec<Vec<Arc<DeviceState>>> = Vec::new();
+        let mut page_bytes: usize = 0;
+        let mut pending: Vec<Arc<DeviceState>> = Vec::new();
+        let mut pending_bytes: usize = 0;
+        let mut pending_device: Option<&DeviceId> = None;
+        let mut more = false;
+        // Commit `pending` if it fits; `false` means the page is full
+        // and `pending` is the first device of the next page.
+        let mut commit = |pending: &mut Vec<Arc<DeviceState>>, pending_bytes: &mut usize| {
+            if pending.is_empty() {
+                return true;
+            }
+            let total = page_bytes.saturating_add(*pending_bytes);
+            if devices.len() >= device_limit || (!devices.is_empty() && total > byte_cap) {
+                return false;
+            }
+            page_bytes = total;
+            devices.push(std::mem::take(pending));
+            *pending_bytes = 0;
+            true
+        };
+        for ((did, _cap), entry) in inner.entries.range((start, Bound::Unbounded)) {
+            if pending_device != Some(did) {
+                if !commit(&mut pending, &mut pending_bytes) {
+                    more = true;
+                    break;
+                }
+                pending_device = Some(did);
+            }
+            if keep(entry) {
+                pending_bytes = pending_bytes
+                    .saturating_add(entry.capability.len())
+                    .saturating_add(entry.field_byte_estimate());
+                pending.push(Arc::clone(entry));
+            }
+        }
+        if !more && !commit(&mut pending, &mut pending_bytes) {
+            more = true;
+        }
+        CappedPage {
+            epoch: inner.epoch.clone(),
+            revision: inner.global_revision,
+            devices,
+            more,
+        }
+    }
+
     /// Snapshot a single `(device, capability)` slot.
     #[must_use]
     pub fn snapshot_capability(
@@ -1753,6 +1826,20 @@ pub struct DeltaPage {
     pub current_revision: u64,
     pub entries: Vec<Arc<DeviceState>>,
     pub reset_required: bool,
+}
+
+/// H2: return of [`DeviceStateStore::snapshot_page_capped`].
+#[derive(Debug)]
+pub struct CappedPage {
+    /// Store epoch at read time.
+    pub epoch: String,
+    /// Store revision at read time.
+    pub revision: u64,
+    /// Kept entries, one inner vec per device, sorted by device id
+    /// then capability.
+    pub devices: Vec<Vec<Arc<DeviceState>>>,
+    /// Another kept device follows the last one in `devices`.
+    pub more: bool,
 }
 
 /// H9 round-12 finding 2: sentinel string that sorts strictly
