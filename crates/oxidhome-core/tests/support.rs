@@ -6,8 +6,10 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 /// Workspace root — derives from the test crate's
 /// `CARGO_MANIFEST_DIR` (`<root>/crates/oxidhome-core`).
@@ -121,17 +123,70 @@ pub fn stage_plugin(prefix: &str, wasm_src: &Path, wasm_name: &str, manifest: &s
 /// succeeded.
 #[must_use]
 pub fn build_example(dir: &str, artifact: &str) -> PathBuf {
+    static BUILT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let example_dir = workspace_root().join("examples").join(dir);
-    let status = spawn_clean_cargo(
-        &example_dir,
-        &["build", "--target", "wasm32-wasip2", "--locked"],
-    )
-    .status()
-    .expect("invoking cargo build");
-    assert!(status.success(), "{dir} build failed: {status}");
+    // Held across the build: concurrent tests in one binary wait for
+    // the first build instead of relinking under each other.
+    let mut built = BUILT
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !built.contains(dir) {
+        build_once_per_run(&example_dir, || {
+            let status = spawn_clean_cargo(
+                &example_dir,
+                &["build", "--target", "wasm32-wasip2", "--locked"],
+            )
+            .status()
+            .expect("invoking cargo build");
+            assert!(status.success(), "{dir} build failed: {status}");
+        });
+        built.insert(dir.to_owned());
+    }
     example_dir
         .join("target")
         .join("wasm32-wasip2")
         .join("debug")
         .join(artifact)
+}
+
+/// Run `build` for `example_dir` at most once per test run, across
+/// processes and test crates.
+///
+/// cargo replaces an example's uplifted `.wasm` (unlink + relink) on
+/// every `cargo build`, even a no-op one. nextest runs each test in
+/// its own process, so one test rebuilding an example could briefly
+/// remove the artifact another test was loading. An exclusive lock
+/// on `<example>/target/.oxidhome-test-build.lock` serializes builds,
+/// and a stamp keyed on `NEXTEST_RUN_ID` skips cargo after the run's
+/// first build. Without nextest (plain `cargo test`, one process per
+/// test binary) the caller's in-process memo covers the same case.
+fn build_once_per_run(example_dir: &Path, build: impl FnOnce()) {
+    let target = example_dir.join("target");
+    std::fs::create_dir_all(&target).expect("create example target dir");
+    let lock = std::fs::File::create(target.join(".oxidhome-test-build.lock"))
+        .expect("open example build lock");
+    lock.lock().expect("lock example build");
+    let stamp = std::env::var("NEXTEST_RUN_ID")
+        .ok()
+        .map(|run| target.join(format!(".oxidhome-test-built-{run}")));
+    if stamp.as_ref().is_some_and(|s| s.exists()) {
+        return;
+    }
+    build();
+    if let Some(stamp) = stamp {
+        // Drop stamps of earlier runs, then mark this one.
+        if let Ok(entries) = std::fs::read_dir(&target) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".oxidhome-test-built-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        std::fs::write(&stamp, b"").expect("write build stamp");
+    }
 }
