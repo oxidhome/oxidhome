@@ -40,4 +40,13 @@ message CheckResponse {
   // `oxidhome://status` resource. Empty from a daemon that predates
   // the field.
   string event_log = 3;
+
+  // State of the durable device-state projection (H2): "ok", or
+  // "degraded" while flushes to the database are failing (live state
+  // and control still work; changes since the last flush would be
+  // lost on a crash). Same value as `device_state` on
+  // `GET /api/v1/readyz`; details are on the authenticated MCP
+  // `oxidhome://status` resource. Empty from a daemon that predates
+  // the field.
+  string device_state = 4;
 }

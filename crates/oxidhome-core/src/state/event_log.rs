@@ -50,7 +50,7 @@ pub use mirror::{
 pub use retention::{
     DEFAULT_EVENT_LOG_MAX_AGE, DEFAULT_EVENT_LOG_MAX_ROWS, DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY,
     DEFAULT_EVENT_LOG_RETENTION_INTERVAL, ENV_EVENT_LOG_MAX_ROWS, ENV_EVENT_LOG_RETENTION_DAYS,
-    EventLogRetention, RetentionTask,
+    EventLogRetention,
 };
 pub use scan::{ScanPage, ScanStep};
 

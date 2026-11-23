@@ -46,6 +46,14 @@
 //!   since no earlier cursor describes what was dropped. A backup
 //!   restore does the same ([`invalidate_cursors_after_restore`]): the
 //!   restored database is an older history.
+//! - **Consistency marker.** Each flush stores, next to the hole list
+//!   in `holes_json`, the table's row count and a checksum over the
+//!   meta row (epoch, revision, watermark, holes, writer, row count).
+//!   A boot whose meta row or row count doesn't match its marker
+//!   treats the meta as damage and starts a new history, so a
+//!   revision inflated by damage can't keep cursors valid that the
+//!   lost writes made invalid. A meta row from before the marker has
+//!   none and is accepted once; the boot flush adds it.
 //! - **Encoding.** Fields use their own tagged JSON shape: floats by
 //!   bit pattern (NaN and infinities round-trip), bytes as hex, and
 //!   `u64` timestamps by bit pattern in `SQLite`'s signed integers.
@@ -192,6 +200,42 @@ pub(super) struct Backing {
     /// they were taken.
     flush_lock: Mutex<()>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Outcome of the flushes so far, for [`DeviceStateHealth`].
+    health: Mutex<FlushStatus>,
+}
+
+#[derive(Debug, Default)]
+struct FlushStatus {
+    /// The current run of failed flushes started here.
+    failing_since_ms: Option<i64>,
+    last_error: Option<String>,
+    last_flush_ms: Option<i64>,
+    failed_total: u64,
+}
+
+/// H2: flush health of the durable device-state projection, reported
+/// by `GET /api/v1/readyz` and Connect `HealthService.Check`
+/// (`device_state: ok | degraded`) and in full on the MCP
+/// `oxidhome://status` resource.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DeviceStateHealth {
+    /// The store flushes to a database (`false` for an in-memory
+    /// store, which is never degraded).
+    pub persistent: bool,
+    /// The last flush failed: changes are queued in memory and
+    /// retried, and a crash now would lose them. Live state and
+    /// control are unaffected.
+    pub degraded: bool,
+    /// Host time of the first failed flush in the current run.
+    pub degraded_since_ms: Option<i64>,
+    /// Error of the last failed flush, while degraded.
+    pub last_error: Option<String>,
+    /// Host time of the last successful flush.
+    pub last_flush_ms: Option<i64>,
+    /// Failed flushes since the daemon started.
+    pub failed_flushes_total: u64,
+    /// Slots waiting for the next flush.
+    pub pending_keys: usize,
 }
 
 /// A flush failed; the batch was re-queued.
@@ -214,16 +258,79 @@ struct FlushBatch {
     upserts: Vec<Arc<DeviceState>>,
     deletes: Vec<Key>,
     rewrite_all: bool,
+    /// Rows in the table once this batch commits: the store's entry
+    /// count at the batch's revision (every flush writes every key
+    /// changed since the last one, so the table mirrors the store).
+    rows: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredHole(u64, u64);
+
+/// `holes_json` as stored: the hole list with its consistency marker,
+/// or the bare list written before the marker existed.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum StoredRanges {
+    Marked {
+        holes: Vec<StoredHole>,
+        rows: u64,
+        check: String,
+    },
+    Legacy(Vec<StoredHole>),
+}
 
 struct Meta {
     epoch: String,
     revision: u64,
     evicted_through: u64,
     holes: Vec<(u64, u64)>,
+    /// The stored marker matched (or there was none).
+    consistent: bool,
+}
+
+/// Checksum over everything one flush writes to the meta row, plus the
+/// table's row count. Not a MAC: it detects damage, not tampering.
+fn meta_check(
+    epoch: &str,
+    revision: u64,
+    evicted_through: u64,
+    holes: &[(u64, u64)],
+    writer: &str,
+    rows: u64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"oxidhome.device_state_meta.v1\0");
+    h.update(epoch.as_bytes());
+    h.update([0]);
+    h.update(revision.to_be_bytes());
+    h.update(evicted_through.to_be_bytes());
+    h.update(u64::try_from(holes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for &(lo, hi) in holes {
+        h.update(lo.to_be_bytes());
+        h.update(hi.to_be_bytes());
+    }
+    h.update(writer.as_bytes());
+    h.update([0]);
+    h.update(rows.to_be_bytes());
+    super::hex_lower(&h.finalize()[..16])
+}
+
+/// `holes_json` for a meta row: the holes with their marker.
+fn encode_ranges(
+    epoch: &str,
+    revision: u64,
+    evicted_through: u64,
+    holes: &[(u64, u64)],
+    writer: &str,
+    rows: u64,
+) -> serde_json::Result<String> {
+    serde_json::to_string(&StoredRanges::Marked {
+        holes: holes.iter().map(|&(lo, hi)| StoredHole(lo, hi)).collect(),
+        rows,
+        check: meta_check(epoch, revision, evicted_through, holes, writer, rows),
+    })
 }
 
 impl DeviceStateStore {
@@ -324,6 +431,7 @@ impl DeviceStateStore {
                 signal: Arc::clone(&signal),
                 flush_lock: Mutex::new(()),
                 thread: Mutex::new(None),
+                health: Mutex::new(FlushStatus::default()),
             }),
         });
         // Persist the base revision and hole before serving anything,
@@ -358,6 +466,53 @@ impl DeviceStateStore {
     /// The write failed; the changes stay queued for the next flush.
     pub fn flush(&self) -> Result<bool, FlushError> {
         self.flush_inner(false, false)
+    }
+
+    /// H2: current flush health (see [`DeviceStateHealth`]).
+    #[must_use]
+    pub fn flush_health(&self) -> DeviceStateHealth {
+        let Some(backing) = &self.backing else {
+            return DeviceStateHealth::default();
+        };
+        let pending_keys = {
+            let inner = self.inner_read();
+            inner.dirty.as_ref().map_or(0, |d| {
+                if d.rewrite_all {
+                    inner.entries.len()
+                } else {
+                    d.keys.len()
+                }
+            })
+        };
+        let st = backing
+            .health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        DeviceStateHealth {
+            // An in-memory database is not persistence.
+            persistent: backing.db.path().is_some(),
+            degraded: st.failing_since_ms.is_some(),
+            degraded_since_ms: st.failing_since_ms,
+            last_error: st.failing_since_ms.and(st.last_error.clone()),
+            last_flush_ms: st.last_flush_ms,
+            failed_flushes_total: st.failed_total,
+            pending_keys,
+        }
+    }
+
+    /// Test hook: report a failed flush, so API tests can observe the
+    /// degraded signal.
+    #[cfg(test)]
+    pub(crate) fn degrade_for_test(&self, reason: &str) {
+        if let Some(backing) = &self.backing {
+            let mut st = backing
+                .health
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            st.failing_since_ms.get_or_insert(0);
+            st.last_error = Some(reason.to_owned());
+            st.failed_total += 1;
+        }
     }
 
     /// H2: final flush at shutdown, then stop the flusher thread.
@@ -416,9 +571,23 @@ impl DeviceStateStore {
             }
             result
         });
+        let now = crate::state::event_log::now_unix_ms();
+        let mut st = backing
+            .health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         match result {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                st.failing_since_ms = None;
+                st.last_error = None;
+                st.last_flush_ms = Some(now);
+                Ok(true)
+            }
             Err(err) => {
+                st.failing_since_ms.get_or_insert(now);
+                st.last_error = Some(err.to_string());
+                st.failed_total += 1;
+                drop(st);
                 self.requeue(&batch);
                 Err(FlushError(err.to_string()))
             }
@@ -456,6 +625,7 @@ impl DeviceStateStore {
             upserts,
             deletes,
             rewrite_all,
+            rows: u64::try_from(inner.entries.len()).unwrap_or(u64::MAX),
         })
     }
 
@@ -513,7 +683,8 @@ fn restore_revisions(
     // cursor format can't carry would break pagination: damage too.
     let usable = flushed <= MAX_RESTORABLE_REVISION
         && meta.as_ref().is_none_or(|m| {
-            m.revision >= max_row_revision
+            m.consistent
+                && m.revision >= max_row_revision
                 && super::is_valid_epoch(&m.epoch)
                 && m.evicted_through <= flushed.saturating_add(REVISION_GAP)
                 // Every boot records exactly `(R, R + GAP)`, in order.
@@ -564,8 +735,18 @@ fn restore_revisions(
             "persisted device-state metadata unusable; starting a new revision history",
         );
         inner.epoch = super::mint_epoch();
-        inner.global_revision = 0;
-        inner.evicted_through_revision = 0;
+        // Above every revision the damaged history claims, with the
+        // watermark there, so a cursor from it resets even for a
+        // client that doesn't compare epochs. A revision with no room
+        // left starts over from zero; the new epoch is then the only
+        // signal.
+        let base = if flushed <= MAX_RESTORABLE_REVISION {
+            flushed + REVISION_GAP
+        } else {
+            0
+        };
+        inner.global_revision = base;
+        inner.evicted_through_revision = base;
         inner.holes.clear();
         if let Some(dirty) = inner.dirty.as_mut() {
             dirty.rewrite_all = true;
@@ -688,13 +869,15 @@ fn write_batch(conn: &mut rusqlite::Connection, batch: &FlushBatch) -> rusqlite:
             delete.execute(params![device, capability])?;
         }
     }
-    let holes: Vec<StoredHole> = batch
-        .holes
-        .iter()
-        .map(|&(lo, hi)| StoredHole(lo, hi))
-        .collect();
-    let holes_json = serde_json::to_string(&holes)
-        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    let holes_json = encode_ranges(
+        &batch.epoch,
+        batch.revision,
+        batch.evicted_through,
+        &batch.holes,
+        &batch.writer,
+        batch.rows,
+    )
+    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
     tx.execute(
         "INSERT INTO device_state_meta(id, epoch, revision, evicted_through, holes_json, writer) \
          VALUES (1, ?1, ?2, ?3, ?4, ?5) \
@@ -793,12 +976,66 @@ pub fn invalidate_cursors_after_restore(conn: &rusqlite::Connection) -> rusqlite
     if !has_meta {
         return Ok(());
     }
+    // One row even when the meta row is missing (the rows' watermark
+    // must still move past the backup's history).
+    let (revision, row_max, rows, writer) = conn.query_row(
+        "SELECT m.revision, \
+             COALESCE((SELECT MAX(global_revision) FROM device_state), 0), \
+             (SELECT COUNT(*) FROM device_state), m.holes_json, m.writer \
+             FROM (SELECT 1) LEFT JOIN device_state_meta AS m ON m.id = 1",
+        [],
+        // Damaged columns (a BLOB hole list, a TEXT revision) pass
+        // the integrity check and the boot recovers from them, so
+        // the restore must not fail on them either.
+        |row| {
+            use rusqlite::types::ValueRef;
+            let int = |i: usize| -> rusqlite::Result<Option<i64>> {
+                Ok(match row.get_ref(i)? {
+                    ValueRef::Integer(n) => Some(n),
+                    _ => None,
+                })
+            };
+            // Invalid UTF-8 counts as undecodable, not as an error.
+            let text = |i: usize| -> rusqlite::Result<Option<String>> {
+                Ok(match row.get_ref(i)? {
+                    ValueRef::Text(t) => std::str::from_utf8(t).ok().map(str::to_owned),
+                    _ => None,
+                })
+            };
+            Ok((
+                int(0)?,
+                int(1)?.unwrap_or(0),
+                int(2)?.unwrap_or(0),
+                text(4)?,
+            ))
+        },
+    )?;
+    let epoch = super::mint_epoch();
+    // A damaged revision falls back to the rows' highest.
+    let revision = revision.unwrap_or(row_max).max(0);
+    // Past everything the restored database issued, including the
+    // skipped range its next boot records.
+    let evicted = revision.max(row_max).saturating_add(to_i64(REVISION_GAP));
+    // Rewrite the whole meta row with a fresh marker, so the next boot
+    // accepts the new epoch and watermark even if the backup's row was
+    // damaged. Holes are dropped: every revision they cover is below
+    // the new watermark, where every cursor resets anyway.
+    let writer = writer.unwrap_or_default();
+    let holes_json = encode_ranges(
+        &epoch,
+        to_u64(revision),
+        to_u64(evicted),
+        &[],
+        &writer,
+        u64::try_from(rows).unwrap_or(0),
+    )
+    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
     conn.execute(
-        "UPDATE device_state_meta SET epoch = ?1, \
-         evicted_through = MAX(revision, \
-             COALESCE((SELECT MAX(global_revision) FROM device_state), 0)) + ?2 \
-         WHERE id = 1",
-        params![super::mint_epoch(), to_i64(REVISION_GAP)],
+        "INSERT INTO device_state_meta(id, epoch, revision, evicted_through, holes_json, writer) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch, \
+         revision = excluded.revision, evicted_through = excluded.evicted_through, \
+         holes_json = excluded.holes_json, writer = excluded.writer",
+        params![epoch, revision, evicted, holes_json, writer],
     )?;
     Ok(())
 }
@@ -816,10 +1053,11 @@ type Loaded = (Option<Meta>, Vec<DeviceState>, bool);
 fn load(db: &Db) -> anyhow::Result<Loaded> {
     db.read(|conn| -> anyhow::Result<_> {
         let mut damaged = false;
-        let meta = conn
+        let mut marker: Option<(u64, String, String)> = None;
+        let mut meta = conn
             .query_row(
-                "SELECT epoch, revision, evicted_through, holes_json FROM device_state_meta \
-                 WHERE id = 1",
+                "SELECT epoch, revision, evicted_through, holes_json, writer \
+                 FROM device_state_meta WHERE id = 1",
                 [],
                 // Conversion failures are damage, not a failed boot.
                 |row| {
@@ -829,6 +1067,7 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
                             row.get::<_, i64>(1)?,
                             row.get::<_, i64>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     })()
                     .ok())
@@ -842,9 +1081,14 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
                 }
                 decoded
             })
-            .map(|(epoch, revision, evicted, holes_json)| {
-                let holes = serde_json::from_str::<Vec<StoredHole>>(&holes_json)
-                    .unwrap_or_else(|err| {
+            .map(|(epoch, revision, evicted, holes_json, writer)| {
+                let holes = match serde_json::from_str::<StoredRanges>(&holes_json) {
+                    Ok(StoredRanges::Legacy(holes)) => holes,
+                    Ok(StoredRanges::Marked { holes, rows, check }) => {
+                        marker = Some((rows, check, writer));
+                        holes
+                    }
+                    Err(err) => {
                         tracing::warn!(
                             target: "device_state.persist",
                             error = %err,
@@ -852,15 +1096,17 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
                         );
                         damaged = true;
                         Vec::new()
-                    })
-                    .into_iter()
-                    .map(|StoredHole(lo, hi)| (lo, hi))
-                    .collect();
+                    }
+                }
+                .into_iter()
+                .map(|StoredHole(lo, hi)| (lo, hi))
+                .collect();
                 Meta {
                     epoch,
                     revision: to_u64(revision),
                     evicted_through: to_u64(evicted),
                     holes,
+                    consistent: true,
                 }
             });
         let mut stmt = conn.prepare(
@@ -888,8 +1134,48 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
                 "skipped undecodable device-state rows",
             );
         }
+        if meta.is_none() && out.len() + skipped > 0 {
+            // Rows without their meta row: the revision and watermark
+            // are lost, so recover as from damage (gap + watermark)
+            // instead of taking the first-boot path.
+            damaged = true;
+            tracing::warn!(
+                target: "device_state.persist",
+                rows = out.len() + skipped,
+                "device-state rows without a meta row",
+            );
+        }
+        if let (Some(m), Some(marker)) = (meta.as_mut(), marker) {
+            let total = u64::try_from(out.len() + skipped).unwrap_or(u64::MAX);
+            m.consistent = marker_matches(m, &marker, total);
+        }
         Ok((meta, out, damaged))
     })
+}
+
+/// Whether `meta` and the `total` rows found match the marker stored
+/// with them (`rows`, `check`, `writer`). The marker covers every row
+/// in the table, decodable or not: undecodable rows take the damage
+/// path, a missing or extra row or a changed meta field fails here.
+fn marker_matches(meta: &Meta, (rows, check, writer): &(u64, String, String), total: u64) -> bool {
+    let expected = meta_check(
+        &meta.epoch,
+        meta.revision,
+        meta.evicted_through,
+        &meta.holes,
+        writer,
+        *rows,
+    );
+    if *rows == total && *check == expected {
+        return true;
+    }
+    tracing::warn!(
+        target: "device_state.persist",
+        rows_marked = rows,
+        rows_found = total,
+        "device-state metadata fails its consistency marker",
+    );
+    false
 }
 
 fn decode_row(row: &rusqlite::Row<'_>) -> Option<DeviceState> {
@@ -1250,6 +1536,65 @@ mod tests {
         assert!(store.close_persistence());
     }
 
+    /// Rows without a meta row are recovered like damage: an old
+    /// cursor resets instead of matching a renumbered slot.
+    #[test]
+    fn rows_without_a_meta_row_reset_old_cursors() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        assert!(store.close_persistence());
+        let cursor = store.current_revision() + 1;
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| c.execute("DELETE FROM device_state_meta", []))
+            .expect("drop meta");
+        drop(db);
+        let store = open(&dir);
+        assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
+        assert!(store.close_persistence());
+    }
+
+    /// A backup whose meta row is damaged in ways the integrity check
+    /// accepts (invalid UTF-8 text, a BLOB hole list) still restores,
+    /// and every earlier cursor resets after the next boot.
+    #[test]
+    fn restore_invalidation_rewrites_a_damaged_meta_row() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        let cursor = store.current_revision();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| {
+            c.execute(
+                "UPDATE device_state_meta SET writer = CAST(x'ff' AS TEXT), holes_json = x'00'",
+                [],
+            )?;
+            invalidate_cursors_after_restore(c)
+        })
+        .expect("invalidate");
+        drop(db);
+        let store = open(&dir);
+        assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
+        assert!(store.current_revision() > REVISION_GAP);
+        // A missing meta row is rewritten too.
+        let cursor = store.current_revision();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| {
+            c.execute("DELETE FROM device_state_meta", [])?;
+            invalidate_cursors_after_restore(c)
+        })
+        .expect("invalidate");
+        drop(db);
+        let store = open(&dir);
+        assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
+        assert!(store.close_persistence());
+    }
+
     #[test]
     fn restore_invalidation_expires_every_cursor() {
         let dir = tempdir();
@@ -1271,7 +1616,128 @@ mod tests {
                 .deltas_since_with_revision(store.current_revision(), 10)
                 .reset_required
         );
+        // The re-marked meta row passed its consistency check: the
+        // revisions continue past the restored history instead of
+        // starting over.
+        assert!(store.current_revision() > REVISION_GAP);
         assert!(store.close_persistence());
+    }
+
+    /// Follow-up to H2 round 4: a meta row or row set that changed
+    /// after its flush (an inflated revision, a lost or added row)
+    /// fails the consistency marker and starts a new history, so no
+    /// earlier cursor survives.
+    #[test]
+    fn damage_that_still_decodes_fails_the_consistency_marker() {
+        for corrupt in [
+            "UPDATE device_state_meta SET revision = revision + 5",
+            "UPDATE device_state_meta SET evicted_through = evicted_through + 1",
+            "DELETE FROM device_state WHERE device_id = 'dev-b'",
+            "INSERT INTO device_state SELECT 'dev-c', capability, owner_instance, \
+             owner_plugin, owner_install, fields_blob, global_revision, received_ms, \
+             observed_ms, source_generation, quality FROM device_state \
+             WHERE device_id = 'dev-a'",
+        ] {
+            let dir = tempdir();
+            let store = open(&dir);
+            put(&store, "dev-a", true);
+            put(&store, "dev-b", true);
+            let epoch = store.epoch();
+            let cursor = store.current_revision();
+            assert!(store.close_persistence());
+            let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+            drop(store);
+            db.write(|c| c.execute(corrupt, [])).expect("corrupt");
+            drop(db);
+            let store = open(&dir);
+            assert_ne!(store.epoch(), epoch, "{corrupt}");
+            assert!(
+                store.deltas_since_with_revision(cursor, 10).reset_required,
+                "{corrupt}"
+            );
+            let (epoch, cursor) = (store.epoch(), store.current_revision());
+            assert!(store.close_persistence());
+            drop(store);
+            // The boot flush re-marked the table: the next boot keeps
+            // the new history.
+            let store = open(&dir);
+            assert_eq!(store.epoch(), epoch, "{corrupt}");
+            assert!(
+                !store.deltas_since_with_revision(cursor, 10).reset_required,
+                "{corrupt}"
+            );
+            assert!(store.close_persistence());
+        }
+    }
+
+    /// A meta row written before the marker existed (a bare hole list)
+    /// is accepted once, and the boot flush adds the marker.
+    #[test]
+    fn a_meta_row_without_a_marker_is_accepted() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        let epoch = store.epoch();
+        let cursor = store.current_revision();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| {
+            c.execute(
+                "UPDATE device_state_meta SET holes_json = json_extract(holes_json, '$.holes')",
+                [],
+            )
+        })
+        .expect("strip the marker");
+        let stripped: String = db
+            .read(|c| c.query_row("SELECT holes_json FROM device_state_meta", [], |r| r.get(0)))
+            .expect("read");
+        assert!(stripped.starts_with('['), "{stripped}");
+        drop(db);
+        let store = open(&dir);
+        assert_eq!(store.epoch(), epoch);
+        assert!(!store.deltas_since_with_revision(cursor, 10).reset_required);
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        let marked: String = db
+            .read(|c| c.query_row("SELECT holes_json FROM device_state_meta", [], |r| r.get(0)))
+            .expect("read");
+        assert!(marked.contains("\"check\""), "{marked}");
+        assert!(store.close_persistence());
+    }
+
+    /// Follow-up to H2: a failing flush reports the store degraded with
+    /// its error, keeps the changes queued, and a later success clears
+    /// it.
+    #[test]
+    fn failing_flushes_report_degraded_until_one_succeeds() {
+        let dir = tempdir();
+        let store = open(&dir);
+        stop_flusher(&store);
+        assert!(!store.flush_health().degraded);
+        assert!(store.flush_health().last_flush_ms.is_some());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        db.write(|c| c.execute("ALTER TABLE device_state RENAME TO device_state_away", []))
+            .expect("hide the table");
+        put(&store, "dev-a", true);
+        assert!(store.flush().is_err());
+        let health = store.flush_health();
+        assert!(health.degraded);
+        assert!(health.degraded_since_ms.is_some());
+        assert!(health.last_error.is_some());
+        assert_eq!(health.failed_flushes_total, 1);
+        assert_eq!(health.pending_keys, 1);
+        db.write(|c| c.execute("ALTER TABLE device_state_away RENAME TO device_state", []))
+            .expect("restore the table");
+        assert!(store.flush().expect("flush"));
+        let health = store.flush_health();
+        assert!(!health.degraded);
+        assert_eq!(health.last_error, None);
+        assert_eq!(health.failed_flushes_total, 1);
+        assert_eq!(health.pending_keys, 0);
+        assert_eq!(
+            DeviceStateStore::new().flush_health(),
+            DeviceStateHealth::default()
+        );
     }
 
     #[test]
@@ -1385,6 +1851,7 @@ mod tests {
             let store = open(&dir);
             put(&store, "dev-a", true);
             let epoch = store.epoch();
+            let cursor = store.current_revision();
             assert!(store.close_persistence());
             let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
             drop(store);
@@ -1392,7 +1859,13 @@ mod tests {
             drop(db);
             let store = open(&dir);
             assert_ne!(store.epoch(), epoch, "{corrupt}");
-            assert!(store.current_revision() < REVISION_GAP, "{corrupt}");
+            // Expired by the watermark too, unless the revision had no
+            // room left (`-1`) and the history restarted from zero.
+            assert!(
+                store.deltas_since_with_revision(cursor, 10).reset_required
+                    || store.current_revision() < REVISION_GAP,
+                "{corrupt}"
+            );
             assert!(store.snapshot_capability("dev-a", "switch").is_some());
             assert!(store.close_persistence());
         }
@@ -1438,7 +1911,14 @@ mod tests {
         let store = open(&dir);
         assert_eq!(
             store
-                .snapshot_page_capped(None, usize::MAX, usize::MAX, usize::MAX, |_| true)
+                .snapshot_page_capped(
+                    None,
+                    usize::MAX,
+                    usize::MAX,
+                    crate::state::PageSizing::Estimate,
+                    usize::MAX,
+                    |_| true,
+                )
                 .devices
                 .len(),
             n
@@ -1451,7 +1931,14 @@ mod tests {
         let _ = store.restart_generation("other-inst");
         assert_eq!(
             store
-                .snapshot_page_capped(None, usize::MAX, usize::MAX, usize::MAX, |_| true)
+                .snapshot_page_capped(
+                    None,
+                    usize::MAX,
+                    usize::MAX,
+                    crate::state::PageSizing::Estimate,
+                    usize::MAX,
+                    |_| true,
+                )
                 .devices
                 .len(),
             n
@@ -1476,9 +1963,11 @@ mod tests {
         drop(store);
         let (lo, hi): (i64, i64) = db
             .read(|c| {
-                c.query_row("SELECT holes_json FROM device_state_meta", [], |r| {
-                    r.get::<_, String>(0)
-                })
+                c.query_row(
+                    "SELECT json_extract(holes_json, '$.holes') FROM device_state_meta",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
             })
             .map(|j| {
                 let v: Vec<(i64, i64)> = serde_json::from_str(&j).expect("holes");
@@ -1488,7 +1977,8 @@ mod tests {
         let row_rev: i64 = db
             .read(|c| c.query_row("SELECT global_revision FROM device_state", [], |r| r.get(0)))
             .expect("row");
-        // Shift the range up so it ends on the surviving row.
+        // Shift the range up so it ends on the surviving row (written
+        // as a bare list, which has no marker to fail).
         let shift = row_rev - hi;
         db.write(|c| {
             c.execute(

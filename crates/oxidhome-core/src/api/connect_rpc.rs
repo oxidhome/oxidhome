@@ -93,7 +93,8 @@ use super::scopes::{
 };
 
 /// `HealthService` implementation. Anonymous; reads only the
-/// in-memory event-log mirror health (H3), never the database.
+/// in-memory event-log mirror health (H3) and device-state flush
+/// health (H2), never the database.
 struct OxidHomeHealth {
     engine: Engine,
 }
@@ -120,10 +121,17 @@ impl oxidhome_proto::connect::oxidhome::v1::HealthService for OxidHomeHealth {
         } else {
             "ok"
         };
+        // H2: the device-state projection's flush health, the same way.
+        let device_state = if self.engine.device_state().flush_health().degraded {
+            "degraded"
+        } else {
+            "ok"
+        };
         Response::ok(CheckResponse {
             status: "ok".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             event_log: event_log.into(),
+            device_state: device_state.into(),
             ..Default::default()
         })
     }
@@ -454,7 +462,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
     ) -> ServiceResult<impl Encodable<ListDeviceStateResponse> + Send + use<'a>> {
         use super::server::{
             DEFAULT_ALL_DEVICES_STATE_LIMIT, MAX_ALL_DEVICES_STATE_LIMIT,
-            MAX_ALL_DEVICES_STATE_PAGE_BYTES, MAX_ALL_DEVICES_STATE_SCAN,
+            MAX_ALL_DEVICES_STATE_SCAN, MAX_STATE_PAGE_WIRE_BYTES,
         };
         require_scope_connect(&ctx, DEVICES_READ)?;
         let blobs = ctx_can_read_blobs(&ctx);
@@ -493,7 +501,8 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         let page = store.snapshot_page_capped(
             pinned.as_ref().map(|(_, after)| after.as_str()),
             limit,
-            MAX_ALL_DEVICES_STATE_PAGE_BYTES,
+            MAX_STATE_PAGE_WIRE_BYTES,
+            crate::state::PageSizing::Wire { blobs },
             MAX_ALL_DEVICES_STATE_SCAN,
             // Same as REST: a continuation page leaves out entries
             // newer than the pinned revision.
@@ -518,6 +527,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             revision,
             devices,
             next_cursor,
+            truncated: page.truncated,
             ..Default::default()
         })
     }
@@ -527,7 +537,9 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, ListDeviceStateChangesRequest>,
     ) -> ServiceResult<impl Encodable<ListDeviceStateChangesResponse> + Send + use<'a>> {
-        use super::server::{DEFAULT_STATE_CHANGES_LIMIT, MAX_STATE_CHANGES_LIMIT};
+        use super::server::{
+            DEFAULT_STATE_CHANGES_LIMIT, MAX_STATE_CHANGES_LIMIT, MAX_STATE_PAGE_WIRE_BYTES,
+        };
         require_scope_connect(&ctx, DEVICES_READ)?;
         let blobs = ctx_can_read_blobs(&ctx);
         let req = request.to_owned_message();
@@ -535,10 +547,12 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             0 => DEFAULT_STATE_CHANGES_LIMIT,
             n => n.min(MAX_STATE_CHANGES_LIMIT),
         };
-        let page = self
-            .engine
-            .device_state()
-            .deltas_since_with_revision(req.since_revision, limit);
+        let page = self.engine.device_state().deltas_since_capped(
+            req.since_revision,
+            limit,
+            MAX_STATE_PAGE_WIRE_BYTES,
+            crate::state::PageSizing::Wire { blobs },
+        );
         Response::ok(ListDeviceStateChangesResponse {
             epoch: page.epoch,
             current_revision: page.current_revision,
@@ -548,6 +562,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
                 .map(|e| device_state_to_proto(e, blobs))
                 .collect(),
             reset_required: page.reset_required,
+            truncated: page.truncated,
             ..Default::default()
         })
     }

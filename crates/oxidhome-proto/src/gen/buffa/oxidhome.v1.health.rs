@@ -144,6 +144,22 @@ pub struct CheckResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub event_log: ::buffa::alloc::string::String,
+    /// State of the durable device-state projection (H2): "ok", or
+    /// "degraded" while flushes to the database are failing (live state
+    /// and control still work; changes since the last flush would be
+    /// lost on a crash). Same value as `device_state` on
+    /// `GET /api/v1/readyz`; details are on the authenticated MCP
+    /// `oxidhome://status` resource. Empty from a daemon that predates
+    /// the field.
+    ///
+    /// Field 4: `device_state`
+    #[serde(
+        rename = "deviceState",
+        alias = "device_state",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub device_state: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -154,6 +170,7 @@ impl ::core::fmt::Debug for CheckResponse {
             .field("status", &self.status)
             .field("version", &self.version)
             .field("event_log", &self.event_log)
+            .field("device_state", &self.device_state)
             .finish()
     }
 }
@@ -193,6 +210,9 @@ impl ::buffa::Message for CheckResponse {
         if !self.event_log.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.event_log) as u64;
         }
+        if !self.device_state.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.device_state) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -211,6 +231,9 @@ impl ::buffa::Message for CheckResponse {
         }
         if !self.event_log.is_empty() {
             ::buffa::types::put_string_field(3u32, &self.event_log, buf);
+        }
+        if !self.device_state.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.device_state, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -246,6 +269,13 @@ impl ::buffa::Message for CheckResponse {
                 )?;
                 ::buffa::types::merge_string(&mut self.event_log, buf)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.device_state, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -257,6 +287,7 @@ impl ::buffa::Message for CheckResponse {
         self.status.clear();
         self.version.clear();
         self.event_log.clear();
+        self.device_state.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

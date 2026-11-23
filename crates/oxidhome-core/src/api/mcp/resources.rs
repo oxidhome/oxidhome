@@ -176,8 +176,9 @@ pub(super) fn list_resources() -> Vec<Resource> {
             .with_title("Host configuration")
             .with_description(
                 "JSON snapshot of the daemon's effective configuration: run mode, state \
-                 directory, listen address, event-log retention, stdout log filter (span field \
-                 values masked) and the MCP mount's limits. Each setting is \
+                 directory, listen address, retention (`event_log_retention`, \
+                 `log_retention`, `audit_retention`), stdout log filter (span field values \
+                 masked) and the MCP mount's limits. Each setting is \
                  `{value, source, env?}` where `source` is `default`, `env` or `flag` and \
                  `env` names the overriding variable; `daemon.mode` and \
                  `daemon.listen_addr` (the bound address) are plain values, and `daemon` \
@@ -1262,6 +1263,9 @@ struct StatusBody {
     /// H3: durable event-mirror health — whether live events are
     /// currently delivered without history rows, and how many were.
     event_log: crate::state::EventLogHealth,
+    /// H2: durable device-state projection flush health — whether
+    /// changes are queued in memory because flushes fail, and why.
+    device_state: crate::state::DeviceStateHealth,
 }
 
 async fn status_read(engine: Engine) -> ReadOutcome {
@@ -1291,6 +1295,7 @@ async fn status_read(engine: Engine) -> ReadOutcome {
         running_instances: engine.instances().list().len(),
         devices: engine.devices().list().len(),
         event_log: engine.event_log().health(),
+        device_state: engine.device_state().flush_health(),
     };
     encode(&body, "status")
 }

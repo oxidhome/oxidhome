@@ -637,8 +637,12 @@ impl LogStore {
                 .db
                 .write_low_priority(|conn| -> Result<_, LogStoreError> {
                     Ok(conn.execute(
+                        // The newest row stays, so the table is never
+                        // emptied and ids are never handed out again
+                        // (a concurrent retention pass plans by id).
                         "DELETE FROM log_event WHERE id IN \
-                         (SELECT id FROM log_event WHERE ts_unix_ms < ?1 LIMIT ?2)",
+                         (SELECT id FROM log_event WHERE ts_unix_ms < ?1 \
+                          AND id < (SELECT MAX(id) FROM log_event) LIMIT ?2)",
                         params![cutoff_ms, chunk],
                     )?)
                 })?;
@@ -647,6 +651,18 @@ impl LogStore {
                 return Ok(total);
             }
         }
+    }
+
+    /// Spawn the periodic diagnostic-log retention task on the current
+    /// tokio runtime (see [`crate::state::retention`]): rows older
+    /// than `policy.max_age` or beyond the newest `policy.max_rows`
+    /// are deleted in low-priority chunks. `None` with no limits.
+    #[must_use]
+    pub fn spawn_retention(
+        self: &Arc<Self>,
+        policy: crate::state::RetentionPolicy,
+    ) -> Option<crate::state::RetentionTask> {
+        crate::state::retention::spawn(Arc::clone(self), policy)
     }
 
     /// Total row count.
@@ -1120,6 +1136,47 @@ fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Diagnostic logs have no ordering contract: any row older than the
+/// cutoff, or below the newest `max_rows`, may go.
+impl crate::state::retention::RetentionTarget for LogStore {
+    type Plan = crate::state::retention::IdWindowPlan;
+
+    const TABLE: &'static str = "log_event";
+
+    fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
+    fn plan(
+        &self,
+        cutoff_ms: Option<i64>,
+        max_rows: Option<u64>,
+    ) -> anyhow::Result<Option<Self::Plan>> {
+        Ok(crate::state::retention::plan_id_window(
+            &self.db,
+            "log_event",
+            "ts_unix_ms",
+            cutoff_ms,
+            max_rows,
+        )?)
+    }
+
+    fn step(
+        &self,
+        plan: &mut Self::Plan,
+        stopped: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Option<usize>> {
+        Ok(crate::state::retention::step_id_window(
+            &self.db,
+            "log_event",
+            "(?1 IS NOT NULL AND ts_unix_ms < ?1) OR (?2 IS NOT NULL AND id <= ?2)",
+            &[],
+            plan,
+            stopped,
+        )?)
+    }
 }
 
 #[cfg(test)]

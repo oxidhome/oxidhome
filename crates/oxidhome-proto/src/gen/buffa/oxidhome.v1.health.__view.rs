@@ -242,6 +242,16 @@ pub struct CheckResponseView<'a> {
     ///
     /// Field 3: `event_log`
     pub event_log: &'a str,
+    /// State of the durable device-state projection (H2): "ok", or
+    /// "degraded" while flushes to the database are failing (live state
+    /// and control still work; changes since the last flush would be
+    /// lost on a crash). Same value as `device_state` on
+    /// `GET /api/v1/readyz`; details are on the authenticated MCP
+    /// `oxidhome://status` resource. Empty from a daemon that predates
+    /// the field.
+    ///
+    /// Field 4: `device_state`
+    pub device_state: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for CheckResponseView<'a> {
@@ -293,6 +303,13 @@ impl<'a> ::buffa::MessageView<'a> for CheckResponseView<'a> {
                 )?;
                 view.event_log = ::buffa::types::borrow_str(&mut cur)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.device_state = ::buffa::types::borrow_str(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -318,6 +335,7 @@ impl<'a> ::buffa::MessageView<'a> for CheckResponseView<'a> {
             status: self.status.to_string(),
             version: self.version.to_string(),
             event_log: self.event_log.to_string(),
+            device_state: self.device_state.to_string(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -338,6 +356,9 @@ impl<'a> ::buffa::ViewEncode<'a> for CheckResponseView<'a> {
         if !self.event_log.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.event_log) as u64;
         }
+        if !self.device_state.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.device_state) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -357,6 +378,9 @@ impl<'a> ::buffa::ViewEncode<'a> for CheckResponseView<'a> {
         }
         if !self.event_log.is_empty() {
             ::buffa::types::put_string_field(3u32, &self.event_log, buf);
+        }
+        if !self.device_state.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.device_state, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -387,6 +411,9 @@ impl<'__a> ::serde::Serialize for CheckResponseView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.event_log) {
             __map.serialize_entry("eventLog", self.event_log)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.device_state) {
+            __map.serialize_entry("deviceState", self.device_state)?;
         }
         __map.end()
     }
@@ -507,6 +534,19 @@ impl CheckResponseOwnedView {
     #[must_use]
     pub fn event_log(&self) -> &'_ str {
         self.0.reborrow().event_log
+    }
+    /// State of the durable device-state projection (H2): "ok", or
+    /// "degraded" while flushes to the database are failing (live state
+    /// and control still work; changes since the last flush would be
+    /// lost on a crash). Same value as `device_state` on
+    /// `GET /api/v1/readyz`; details are on the authenticated MCP
+    /// `oxidhome://status` resource. Empty from a daemon that predates
+    /// the field.
+    ///
+    /// Field 4: `device_state`
+    #[must_use]
+    pub fn device_state(&self) -> &'_ str {
+        self.0.reborrow().device_state
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<CheckResponseView<'static>>>

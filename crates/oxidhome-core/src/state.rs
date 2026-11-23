@@ -28,6 +28,7 @@ pub mod events;
 pub mod installed_plugins;
 pub mod kv;
 pub mod log_store;
+pub mod retention;
 pub mod services;
 
 pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery, credential_fingerprint};
@@ -38,9 +39,9 @@ pub use dashboards::{
 };
 pub use db::Db;
 pub use device_state::{
-    CappedPage, CursorError, DeltaPage, DeviceState, DeviceStateStore, MAX_BYTES_PER_SLOT,
-    MAX_FIELDS_PER_SLOT, MAX_PROJECTED_BYTES_PER_INSTANCE, MAX_STALE_ENTRIES,
-    SharedDeviceStateStore, SlotCapExceeded, StateQuality,
+    CappedPage, CursorError, DeltaPage, DeviceState, DeviceStateHealth, DeviceStateStore,
+    MAX_BYTES_PER_SLOT, MAX_FIELDS_PER_SLOT, MAX_PROJECTED_BYTES_PER_INSTANCE, MAX_STALE_ENTRIES,
+    PageSizing, SharedDeviceStateStore, SlotCapExceeded, StateQuality, json_escaped_len,
 };
 pub use devices::{
     DeviceMeta, DeviceRegistry, MAX_CAPABILITIES_PER_DEVICE, MAX_DEVICES_PER_INSTANCE,
@@ -50,7 +51,7 @@ pub use event_log::{
     DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY, DEFAULT_EVENT_LOG_RETENTION_INTERVAL,
     ENV_EVENT_LOG_MAX_ROWS, ENV_EVENT_LOG_RETENTION_DAYS, EventLog, EventLogError, EventLogHealth,
     EventLogRetention, EventOrder, EventQuery, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker,
-    HistoricalEvent, MirrorPolicy, RetentionTask, TopicMatch,
+    HistoricalEvent, MirrorPolicy, TopicMatch,
 };
 pub use event_tail::{EventTail, TailError, TailItem};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
@@ -66,5 +67,9 @@ pub(crate) use kv::stored_value_size;
 pub use kv::{KvError, KvStore};
 pub use log_store::{
     HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogStoreError, LogValue, SqliteLayer,
+};
+pub use retention::{
+    AUDIT_RETENTION_ENV, EVENT_LOG_RETENTION_ENV, LOG_RETENTION_ENV, RetentionConfig, RetentionEnv,
+    RetentionPolicy, RetentionTask, RetentionTasks,
 };
 pub use services::{CallGuard, ServiceMeta, ServiceRegistry};

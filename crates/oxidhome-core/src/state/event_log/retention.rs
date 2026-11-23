@@ -1,15 +1,15 @@
 //! Event-log retention (H4 / M6 follow-up).
 //!
-//! A periodic task trims `event_log` by age and by row count. Every
-//! trim removes an **id prefix** (H4): the pass picks one boundary id
-//! and deletes the rows below it, oldest first, in chunks of
-//! [`TRIM_CHUNK_ROWS`]. Each chunk is one low-priority transaction
-//! (M6) that deletes the lowest remaining ids, so every committed
-//! state — and every reader snapshot — still has pruned exactly
-//! `1..=k`, and `cursor_expired` (checking the row right after a
-//! cursor) stays exact. New rows only get higher ids, so a boundary
-//! computed at the start of a pass stays a valid prefix bound for
-//! the whole pass.
+//! The periodic task ([`super::super::retention`]) trims `event_log`
+//! by age and by row count. Every trim removes an **id prefix** (H4):
+//! the pass picks one boundary id and deletes the rows below it,
+//! oldest first, in chunks of [`RETENTION_CHUNK_ROWS`]. Each chunk is
+//! one low-priority transaction (M6) that deletes the lowest remaining
+//! ids, so every committed state — and every reader snapshot — still
+//! has pruned exactly `1..=k`, and `cursor_expired` (checking the row
+//! right after a cursor) stays exact. New rows only get higher ids, so
+//! a boundary computed at the start of a pass stays a valid prefix
+//! bound for the whole pass.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,11 +17,10 @@ use std::time::Duration;
 use rusqlite::{OptionalExtension, params};
 
 use super::{EventLog, EventLogError};
-
-/// Rows per retention `DELETE` transaction. Same as the diagnostic
-/// log's chunk, so a normal-priority write waits for at most one
-/// bounded chunk.
-pub(super) const TRIM_CHUNK_ROWS: i64 = 2048;
+use crate::state::Db;
+use crate::state::retention::{
+    EVENT_LOG_RETENTION_ENV, RETENTION_CHUNK_ROWS, RetentionPolicy, RetentionTarget, RetentionTask,
+};
 
 /// Default maximum event age: 30 days.
 pub const DEFAULT_EVENT_LOG_MAX_AGE: Duration = Duration::from_hours(30 * 24);
@@ -30,96 +29,27 @@ pub const DEFAULT_EVENT_LOG_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 pub const DEFAULT_EVENT_LOG_MAX_ROWS: u64 = 1_000_000;
 
 /// How often the retention task runs.
-pub const DEFAULT_EVENT_LOG_RETENTION_INTERVAL: Duration = Duration::from_hours(1);
+pub const DEFAULT_EVENT_LOG_RETENTION_INTERVAL: Duration =
+    crate::state::retention::DEFAULT_RETENTION_INTERVAL;
 
 /// Delay before the first pass, so retention doesn't compete with
 /// boot (migrations, plugin starts).
-pub const DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY: Duration = Duration::from_secs(60);
+pub const DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY: Duration =
+    crate::state::retention::DEFAULT_RETENTION_FIRST_DELAY;
 
 /// Environment variable for the maximum age, in days (`0` disables
 /// the age limit).
-pub const ENV_EVENT_LOG_RETENTION_DAYS: &str = "OXIDHOME_EVENT_LOG_RETENTION_DAYS";
+pub const ENV_EVENT_LOG_RETENTION_DAYS: &str = EVENT_LOG_RETENTION_ENV.days_var;
 
 /// Environment variable for the maximum row count (`0` disables the
 /// row limit).
-pub const ENV_EVENT_LOG_MAX_ROWS: &str = "OXIDHOME_EVENT_LOG_MAX_ROWS";
+pub const ENV_EVENT_LOG_MAX_ROWS: &str = EVENT_LOG_RETENTION_ENV.rows_var;
 
-/// What the retention task keeps. `None` disables a limit; with both
-/// disabled the task never deletes anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EventLogRetention {
-    /// Rows received longer ago than this are deleted (subject to
-    /// the id-prefix rule).
-    pub max_age: Option<Duration>,
-    /// At most this many newest rows are kept.
-    pub max_rows: Option<u64>,
-    /// Time between passes.
-    pub interval: Duration,
-    /// Time before the first pass.
-    pub first_delay: Duration,
-}
-
-impl Default for EventLogRetention {
-    fn default() -> Self {
-        Self {
-            max_age: Some(DEFAULT_EVENT_LOG_MAX_AGE),
-            max_rows: Some(DEFAULT_EVENT_LOG_MAX_ROWS),
-            interval: DEFAULT_EVENT_LOG_RETENTION_INTERVAL,
-            first_delay: DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY,
-        }
-    }
-}
-
-impl EventLogRetention {
-    /// Defaults overridden by [`ENV_EVENT_LOG_RETENTION_DAYS`] and
-    /// [`ENV_EVENT_LOG_MAX_ROWS`].
-    ///
-    /// # Errors
-    ///
-    /// A variable that is set but isn't a non-negative integer.
-    pub fn from_env() -> anyhow::Result<Self> {
-        // `var_os` + lossy: a non-Unicode value fails the parse below
-        // instead of reading as unset and silently applying a default.
-        Self::from_lookup(|name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()))
-    }
-
-    /// [`Self::from_env`] with an injectable lookup, for tests.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::from_env`].
-    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
-        let parse = |name: &str| -> anyhow::Result<Option<u64>> {
-            lookup(name)
-                .map(|raw| {
-                    raw.trim().parse::<u64>().map_err(|e| {
-                        anyhow::anyhow!("parsing ${name} ({raw:?}) as a non-negative integer: {e}")
-                    })
-                })
-                .transpose()
-        };
-        let mut policy = Self::default();
-        if let Some(days) = parse(ENV_EVENT_LOG_RETENTION_DAYS)? {
-            policy.max_age = match days {
-                0 => None,
-                d => Some(Duration::from_secs(d.saturating_mul(24 * 60 * 60))),
-            };
-        }
-        if let Some(rows) = parse(ENV_EVENT_LOG_MAX_ROWS)? {
-            policy.max_rows = (rows > 0).then_some(rows);
-        }
-        Ok(policy)
-    }
-
-    /// Cutoff for `received_ms`, or `None` with no age limit.
-    fn cutoff_ms(&self, now_ms: i64) -> Option<i64> {
-        self.max_age
-            .map(|age| now_ms.saturating_sub(i64::try_from(age.as_millis()).unwrap_or(i64::MAX)))
-    }
-}
+/// What the event-log retention task keeps (see [`RetentionPolicy`]).
+pub type EventLogRetention = RetentionPolicy;
 
 impl EventLog {
-    /// The last id (inclusive) `policy` would delete, or `None` when
+    /// The last id (inclusive) a pass would delete, or `None` when
     /// nothing is due. Runs on a pooled reader: retention only
     /// deletes id prefixes and new rows only get higher ids, so a
     /// bound computed from any recent snapshot is still a prefix
@@ -177,28 +107,24 @@ impl EventLog {
     }
 
     /// Delete one chunk of the id prefix up to `last` (inclusive):
-    /// the [`TRIM_CHUNK_ROWS`] lowest ids at most. One low-priority
-    /// transaction (M6). `proceed` is checked once the writer is
-    /// held, so a stop requested while this waited for the writer
-    /// skips the delete. Returns the rows removed; `0` means the
-    /// prefix is gone (or the chunk was skipped).
+    /// the [`RETENTION_CHUNK_ROWS`] lowest ids at most. One low-priority
+    /// transaction (M6), skipped (`None`) if `stopped` turns true
+    /// before the writer is granted. `Some(0)` means the prefix is
+    /// gone.
     fn trim_chunk_through(
         &self,
         last: i64,
-        proceed: impl FnOnce() -> bool,
-    ) -> Result<usize, EventLogError> {
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Option<usize>, EventLogError> {
         self.db
-            .write_low_priority(|conn| -> Result<_, EventLogError> {
-                if !proceed() {
-                    return Ok(0);
-                }
+            .write_low_priority_unless(stopped, |conn| -> Result<_, EventLogError> {
                 // `MIN(id) + chunk - 1` may exceed `i64::MAX`; SQLite
                 // then compares against a REAL, which is still exact
                 // enough to bound the chunk.
                 Ok(conn.execute(
                     "DELETE FROM event_log WHERE id <= \
                      MIN(?1, (SELECT MIN(id) FROM event_log) + (?2 - 1))",
-                    params![last, TRIM_CHUNK_ROWS],
+                    params![last, RETENTION_CHUNK_ROWS],
                 )?)
             })
     }
@@ -206,12 +132,10 @@ impl EventLog {
     /// Delete the whole id prefix up to `last`, chunk by chunk.
     pub(super) fn trim_through(&self, last: i64) -> Result<usize, EventLogError> {
         let mut total = 0;
-        loop {
-            match self.trim_chunk_through(last, || true)? {
-                0 => return Ok(total),
-                n => total += n,
-            }
+        while let Some(n @ 1..) = self.trim_chunk_through(last, &|| false)? {
+            total += n;
         }
+        Ok(total)
     }
 
     /// Run one retention pass synchronously: compute the boundary,
@@ -234,121 +158,33 @@ impl EventLog {
     }
 
     /// Spawn the periodic retention task on the current tokio
-    /// runtime. Each chunk runs on the blocking pool, one at a time.
-    /// [`RetentionTask::shutdown`] stops the task between chunks and
-    /// waits for an in-flight chunk, so the caller can release the
-    /// state-dir lock knowing no retention write is still running.
-    /// A failed pass logs a warning and the next one runs on
-    /// schedule. With no limits configured the task isn't spawned
-    /// and `None` is returned. A zero `interval` is treated as 1 s.
+    /// runtime (see [`crate::state::retention`]).
+    /// [`RetentionTask::shutdown`] stops it between chunks, cancels a
+    /// chunk still waiting for the writer and waits for one already
+    /// running. With no limits configured the task isn't spawned and
+    /// `None` is returned.
     #[must_use]
     pub fn spawn_retention(self: &Arc<Self>, policy: EventLogRetention) -> Option<RetentionTask> {
-        if policy.max_age.is_none() && policy.max_rows.is_none() {
-            return None;
-        }
-        let log = Arc::clone(self);
-        let (stop_tx, mut stop) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(async move {
-            let stopped = |stop: &tokio::sync::watch::Receiver<bool>| *stop.borrow();
-            tokio::select! {
-                () = tokio::time::sleep(policy.first_delay) => {}
-                _ = stop.changed() => return,
-            }
-            let interval = if policy.interval.is_zero() {
-                Duration::from_secs(1)
-            } else {
-                policy.interval
-            };
-            let mut ticks = tokio::time::interval(interval);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = ticks.tick() => {}
-                    _ = stop.changed() => return,
-                }
-                if stopped(&stop) {
-                    return;
-                }
-                match run_pass(&log, policy, &stop).await {
-                    Ok(0) => {}
-                    Ok(removed) => {
-                        tracing::info!(target: "event_log.retention", removed, "event log trimmed");
-                    }
-                    Err(error) => {
-                        tracing::warn!(target: "event_log.retention", %error, "event log retention pass failed");
-                    }
-                }
-            }
-        });
-        Some(RetentionTask {
-            stop: stop_tx,
-            handle,
-        })
+        crate::state::retention::spawn(Arc::clone(self), policy)
     }
 }
 
-/// Handle to the task started by [`EventLog::spawn_retention`].
-/// Dropping it without [`Self::shutdown`] stops the task after its
-/// current pass, without waiting for it.
-#[derive(Debug)]
-pub struct RetentionTask {
-    stop: tokio::sync::watch::Sender<bool>,
-    handle: tokio::task::JoinHandle<()>,
-}
+impl RetentionTarget for EventLog {
+    /// The last id of the prefix to delete.
+    type Plan = i64;
 
-impl RetentionTask {
-    /// Stop the task and wait for it: a pass in progress ends after
-    /// its current chunk commits (each chunk is one bounded
-    /// transaction).
-    pub async fn shutdown(self) {
-        let _ = self.stop.send(true);
-        if let Err(join) = self.handle.await
-            && join.is_panic()
-        {
-            std::panic::resume_unwind(join.into_panic());
-        }
+    const TABLE: &'static str = "event_log";
+
+    fn db(&self) -> &Arc<Db> {
+        &self.db
     }
-}
 
-/// One pass of the background task, chunk by chunk on the blocking
-/// pool. Checks `stop` before each chunk.
-async fn run_pass(
-    log: &Arc<EventLog>,
-    policy: EventLogRetention,
-    stop: &tokio::sync::watch::Receiver<bool>,
-) -> Result<usize, EventLogError> {
-    let now_ms = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis()),
-    )
-    .unwrap_or(i64::MAX);
-    let bound = {
-        let log = Arc::clone(log);
-        blocking(move || log.retention_bound(policy.cutoff_ms(now_ms), policy.max_rows)).await?
-    };
-    let Some(last) = bound else {
-        return Ok(0);
-    };
-    let mut total = 0;
-    while !*stop.borrow() {
-        let log = Arc::clone(log);
-        let stop = stop.clone();
-        match blocking(move || log.trim_chunk_through(last, || !*stop.borrow())).await? {
-            0 => break,
-            n => total += n,
-        }
+    fn plan(&self, cutoff_ms: Option<i64>, max_rows: Option<u64>) -> anyhow::Result<Option<i64>> {
+        Ok(self.retention_bound(cutoff_ms, max_rows)?)
     }
-    Ok(total)
-}
 
-/// Run `f` on the blocking pool and wait for it; a panic propagates.
-async fn blocking<R: Send + 'static>(
-    f: impl FnOnce() -> Result<R, EventLogError> + Send + 'static,
-) -> Result<R, EventLogError> {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(result) => result,
-        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    fn step(&self, last: &mut i64, stopped: &dyn Fn() -> bool) -> anyhow::Result<Option<usize>> {
+        Ok(self.trim_chunk_through(*last, stopped)?.filter(|n| *n > 0))
     }
 }
 
@@ -388,32 +224,46 @@ mod tests {
         EventLogRetention {
             max_age: max_age_ms.map(Duration::from_millis),
             max_rows,
-            ..EventLogRetention::default()
+            ..RetentionPolicy::defaults(&EVENT_LOG_RETENTION_ENV)
         }
     }
 
-    /// Each chunk deletes at most `TRIM_CHUNK_ROWS` of the lowest ids,
+    /// Each chunk deletes at most `RETENTION_CHUNK_ROWS` of the lowest ids,
     /// so after every committed chunk the pruned range is `1..=k`.
     #[test]
     fn chunks_delete_the_lowest_ids_first() {
         let log = log();
-        let rows = TRIM_CHUNK_ROWS * 2 + 10;
+        let rows = RETENTION_CHUNK_ROWS * 2 + 10;
         for t in 0..rows {
             record(&log, t);
         }
         let last = rows;
         assert_eq!(
-            log.trim_chunk_through(last, || true).expect("chunk"),
-            usize::try_from(TRIM_CHUNK_ROWS).expect("fits")
+            log.trim_chunk_through(last, &|| false)
+                .expect("chunk")
+                .expect("ran"),
+            usize::try_from(RETENTION_CHUNK_ROWS).expect("fits")
         );
-        assert_eq!(oldest(&log), Some(TRIM_CHUNK_ROWS + 1));
+        assert_eq!(oldest(&log), Some(RETENTION_CHUNK_ROWS + 1));
         assert_eq!(
-            log.trim_chunk_through(last, || true).expect("chunk"),
-            usize::try_from(TRIM_CHUNK_ROWS).expect("fits")
+            log.trim_chunk_through(last, &|| false)
+                .expect("chunk")
+                .expect("ran"),
+            usize::try_from(RETENTION_CHUNK_ROWS).expect("fits")
         );
-        assert_eq!(oldest(&log), Some(TRIM_CHUNK_ROWS * 2 + 1));
-        assert_eq!(log.trim_chunk_through(last, || true).expect("chunk"), 10);
-        assert_eq!(log.trim_chunk_through(last, || true).expect("chunk"), 0);
+        assert_eq!(oldest(&log), Some(RETENTION_CHUNK_ROWS * 2 + 1));
+        assert_eq!(
+            log.trim_chunk_through(last, &|| false)
+                .expect("chunk")
+                .expect("ran"),
+            10
+        );
+        assert_eq!(
+            log.trim_chunk_through(last, &|| false)
+                .expect("chunk")
+                .expect("ran"),
+            0
+        );
         assert_eq!(log.count().expect("count"), 0);
     }
 
@@ -425,7 +275,7 @@ mod tests {
         for t in 0..5 {
             record(&log, t);
         }
-        assert_eq!(log.trim_chunk_through(5, || false).expect("chunk"), 0);
+        assert_eq!(log.trim_chunk_through(5, &|| true).expect("chunk"), None);
         assert_eq!(log.count().expect("count"), 5);
     }
 
@@ -474,7 +324,7 @@ mod tests {
     #[test]
     fn age_limit_trims_an_id_prefix_across_chunks() {
         let log = log();
-        let old = TRIM_CHUNK_ROWS + 5;
+        let old = RETENTION_CHUNK_ROWS + 5;
         for _ in 0..old {
             record(&log, 1_000);
         }
@@ -562,23 +412,39 @@ mod tests {
             }
         };
         assert_eq!(
-            EventLogRetention::from_lookup(env(&[])).expect("defaults"),
-            EventLogRetention::default()
+            EventLogRetention::from_lookup(&EVENT_LOG_RETENTION_ENV, env(&[])).expect("defaults"),
+            RetentionPolicy::defaults(&EVENT_LOG_RETENTION_ENV)
         );
-        let p = EventLogRetention::from_lookup(env(&[
-            (ENV_EVENT_LOG_RETENTION_DAYS, "7"),
-            (ENV_EVENT_LOG_MAX_ROWS, " 0 "),
-        ]))
+        let p = EventLogRetention::from_lookup(
+            &EVENT_LOG_RETENTION_ENV,
+            env(&[
+                (ENV_EVENT_LOG_RETENTION_DAYS, "7"),
+                (ENV_EVENT_LOG_MAX_ROWS, " 0 "),
+            ]),
+        )
         .expect("parse");
         assert_eq!(p.max_age, Some(Duration::from_hours(7 * 24)));
         assert_eq!(p.max_rows, None);
-        let p = EventLogRetention::from_lookup(env(&[(ENV_EVENT_LOG_RETENTION_DAYS, "0")]))
-            .expect("parse");
+        let p = EventLogRetention::from_lookup(
+            &EVENT_LOG_RETENTION_ENV,
+            env(&[(ENV_EVENT_LOG_RETENTION_DAYS, "0")]),
+        )
+        .expect("parse");
         assert_eq!(p.max_age, None);
         assert_eq!(p.max_rows, Some(DEFAULT_EVENT_LOG_MAX_ROWS));
-        assert!(EventLogRetention::from_lookup(env(&[(ENV_EVENT_LOG_MAX_ROWS, "-1")])).is_err());
         assert!(
-            EventLogRetention::from_lookup(env(&[(ENV_EVENT_LOG_RETENTION_DAYS, "week")])).is_err()
+            EventLogRetention::from_lookup(
+                &EVENT_LOG_RETENTION_ENV,
+                env(&[(ENV_EVENT_LOG_MAX_ROWS, "-1")])
+            )
+            .is_err()
+        );
+        assert!(
+            EventLogRetention::from_lookup(
+                &EVENT_LOG_RETENTION_ENV,
+                env(&[(ENV_EVENT_LOG_RETENTION_DAYS, "week")])
+            )
+            .is_err()
         );
     }
 

@@ -4187,6 +4187,18 @@ pub struct ListDeviceStateResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub next_cursor: ::buffa::alloc::string::String,
+    /// The page holds fewer than `limit` devices because it reached the
+    /// server's byte budget (an upper bound on the encoded size, kept
+    /// well under a 4 MiB receive limit) or its scan budget;
+    /// `next_cursor` is set. The first device is always sent whole.
+    ///
+    /// Field 5: `truncated`
+    #[serde(
+        rename = "truncated",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub truncated: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -4198,6 +4210,7 @@ impl ::core::fmt::Debug for ListDeviceStateResponse {
             .field("revision", &self.revision)
             .field("devices", &self.devices)
             .field("next_cursor", &self.next_cursor)
+            .field("truncated", &self.truncated)
             .finish()
     }
 }
@@ -4245,6 +4258,9 @@ impl ::buffa::Message for ListDeviceStateResponse {
         if !self.next_cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.next_cursor) as u64;
         }
+        if self.truncated {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4271,6 +4287,9 @@ impl ::buffa::Message for ListDeviceStateResponse {
         }
         if !self.next_cursor.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.next_cursor, buf);
+        }
+        if self.truncated {
+            ::buffa::types::put_bool_field(5u32, self.truncated, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4318,6 +4337,13 @@ impl ::buffa::Message for ListDeviceStateResponse {
                 )?;
                 ::buffa::types::merge_string(&mut self.next_cursor, buf)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.truncated = ::buffa::types::decode_bool(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -4330,6 +4356,7 @@ impl ::buffa::Message for ListDeviceStateResponse {
         self.revision = 0u64;
         self.devices.clear();
         self.next_cursor.clear();
+        self.truncated = false;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -4556,6 +4583,17 @@ pub struct ListDeviceStateChangesResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
     )]
     pub reset_required: bool,
+    /// The server's byte budget cut the page short: more changes follow
+    /// even though `changes` holds fewer than `limit` entries. Advance
+    /// the cursor to the highest returned revision and poll again.
+    ///
+    /// Field 5: `truncated`
+    #[serde(
+        rename = "truncated",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub truncated: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -4567,6 +4605,7 @@ impl ::core::fmt::Debug for ListDeviceStateChangesResponse {
             .field("current_revision", &self.current_revision)
             .field("changes", &self.changes)
             .field("reset_required", &self.reset_required)
+            .field("truncated", &self.truncated)
             .finish()
     }
 }
@@ -4616,6 +4655,9 @@ impl ::buffa::Message for ListDeviceStateChangesResponse {
         if self.reset_required {
             size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
+        if self.truncated {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4642,6 +4684,9 @@ impl ::buffa::Message for ListDeviceStateChangesResponse {
         }
         if self.reset_required {
             ::buffa::types::put_bool_field(4u32, self.reset_required, buf);
+        }
+        if self.truncated {
+            ::buffa::types::put_bool_field(5u32, self.truncated, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4689,6 +4734,13 @@ impl ::buffa::Message for ListDeviceStateChangesResponse {
                 )?;
                 self.reset_required = ::buffa::types::decode_bool(buf)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.truncated = ::buffa::types::decode_bool(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -4701,6 +4753,7 @@ impl ::buffa::Message for ListDeviceStateChangesResponse {
         self.current_revision = 0u64;
         self.changes.clear();
         self.reset_required = false;
+        self.truncated = false;
         self.__buffa_unknown_fields.clear();
     }
 }

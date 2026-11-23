@@ -232,7 +232,16 @@ async fn get_config(
 /// missing rows — so an orchestrator doesn't restart a daemon whose
 /// disk is full. Details are on the authenticated MCP
 /// `oxidhome://status` resource.
+///
+/// H2: `device_state` reports the durable device-state projection the
+/// same way: `"degraded"` while its flushes fail (live state is
+/// unaffected; a crash would lose the unflushed changes), still 200.
 async fn readyz(State(state): State<ApiState>) -> Response {
+    let device_state = if state.engine.device_state().flush_health().degraded {
+        "degraded"
+    } else {
+        "ok"
+    };
     let event_log = if state.engine.event_log().health().degraded {
         "degraded"
     } else {
@@ -274,6 +283,7 @@ async fn readyz(State(state): State<ApiState>) -> Response {
                 status: "ok",
                 version: env!("CARGO_PKG_VERSION"),
                 event_log,
+                device_state,
             }),
         )
             .into_response(),
@@ -285,6 +295,7 @@ async fn readyz(State(state): State<ApiState>) -> Response {
                     status: "not_ready",
                     version: env!("CARGO_PKG_VERSION"),
                     event_log,
+                    device_state,
                 }),
             )
                 .into_response()
@@ -303,6 +314,7 @@ struct ReadyzBody {
     status: &'static str,
     version: &'static str,
     event_log: &'static str,
+    device_state: &'static str,
 }
 
 /// Bind a TCP listener at the configured address.
@@ -664,18 +676,19 @@ pub(crate) const DEFAULT_ALL_DEVICES_STATE_LIMIT: usize = 64;
 /// the page past this even if they explicitly ask.
 /// H9 round-16 finding 2: reduced from 512 to 256.
 pub(crate) const MAX_ALL_DEVICES_STATE_LIMIT: usize = 256;
-/// H9 round-16 finding 2: hard cap on the cumulative
-/// serialized *bytes* of one snapshot page. The `limit`
-/// (device count) cap alone can't bound the response body
-/// when devices carry many capabilities each at the per-
-/// slot byte cap; the page truncates at a device boundary
-/// once cumulative bytes reach this ceiling. Chosen at
-/// 1 MiB — 2× the per-device × capability × slot bytes
-/// worst case of `MAX_CAPABILITIES_PER_DEVICE (32) *
-/// MAX_BYTES_PER_SLOT (16 KiB) = 512 KiB`, so a well-
-/// behaved plugin's single device never triggers the byte
-/// cap before the count cap does.
-pub(crate) const MAX_ALL_DEVICES_STATE_PAGE_BYTES: usize = 1024 * 1024;
+/// Byte budget of one device-state snapshot or changes page (REST
+/// and Connect), measured as an upper bound on the encoded size
+/// ([`crate::state::PageSizing::Wire`]: JSON escaping and the REST
+/// byte-array encoding included). The entry-count caps alone can't
+/// bound the body: a 16 KiB slot of control characters encodes to
+/// about 96 KiB of JSON. Half of Connect's default 4 MiB receive
+/// limit, so the page envelope and a client's own framing still fit.
+/// A page stops before the device (snapshot) or entry (changes) that
+/// would cross it and says so with `truncated`; the first one is
+/// always sent, and a device within the per-device caps
+/// (`MAX_CAPABILITIES_PER_DEVICE` slots of `MAX_BYTES_PER_SLOT`)
+/// encodes to under 4 MiB even at the escaping worst case.
+pub(crate) const MAX_STATE_PAGE_WIRE_BYTES: usize = 2 * 1024 * 1024;
 
 /// H2: entries one snapshot page looks at. A continuation page skips
 /// entries newer than its pin, so without a budget a page could walk
@@ -711,6 +724,10 @@ struct AllDevicesStateSnapshot {
     /// device id; server-verified on the way back in, so a
     /// client can't omit the pin or forge a stale one.
     next_cursor: Option<String>,
+    /// The page holds fewer than `limit` devices because it hit the
+    /// byte budget ([`MAX_STATE_PAGE_WIRE_BYTES`]) or the scan
+    /// budget; `next_cursor` is set. Always present.
+    truncated: bool,
 }
 
 /// Handler-local error type covering scope denial, malformed
@@ -810,7 +827,8 @@ async fn get_all_device_state(
     let page = state.engine.device_state().snapshot_page_capped(
         cursor_fields.as_ref().map(|(_, _, did)| did.as_str()),
         limit,
-        MAX_ALL_DEVICES_STATE_PAGE_BYTES,
+        MAX_STATE_PAGE_WIRE_BYTES,
+        crate::state::PageSizing::Wire { blobs },
         MAX_ALL_DEVICES_STATE_SCAN,
         |e| pinned.is_none_or(|r| e.global_revision <= r),
     );
@@ -836,6 +854,7 @@ async fn get_all_device_state(
         revision,
         devices,
         next_cursor,
+        truncated: page.truncated,
     }))
 }
 
@@ -905,6 +924,11 @@ struct StateChangesBody {
     /// `if body.reset_required { ... }` without checking for
     /// absence.
     reset_required: bool,
+    /// The byte budget ([`MAX_STATE_PAGE_WIRE_BYTES`]) cut the page
+    /// short: more changes follow even though `changes` holds fewer
+    /// than `limit` entries. Advance the cursor as usual and poll
+    /// again. Always present.
+    truncated: bool,
 }
 
 /// Default page size for `state/changes`. Chosen to comfortably
@@ -941,10 +965,12 @@ async fn query_device_state_changes(
     // H9 round-6 finding 1: the store now returns a `DeltaPage`
     // carrying `epoch` + `reset_required` so the client can
     // detect a daemon restart and resync.
-    let page = state
-        .engine
-        .device_state()
-        .deltas_since_with_revision(since, limit);
+    let page = state.engine.device_state().deltas_since_capped(
+        since,
+        limit,
+        MAX_STATE_PAGE_WIRE_BYTES,
+        crate::state::PageSizing::Wire { blobs },
+    );
     let changes: Vec<DeviceStateEntry> = page
         .entries
         .iter()
@@ -955,6 +981,7 @@ async fn query_device_state_changes(
         current_revision: page.current_revision,
         changes,
         reset_required: page.reset_required,
+        truncated: page.truncated,
     }))
 }
 
@@ -3674,6 +3701,20 @@ mod tests {
         let (code, body) = probe(&router, "GET", "/api/v1/readyz").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["event_log"], "degraded", "{body}");
+        assert_eq!(body["device_state"], "ok", "{body}");
+        assert_eq!(body["status"], "ok", "{body}");
+
+        // H2: failing device-state flushes show the same way.
+        engine
+            .device_state()
+            .degrade_for_test("injected: disk I/O error");
+        let (code, body) = probe(&router, "POST", check).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["deviceState"], "degraded", "{body}");
+        let (code, body) = probe(&router, "GET", "/api/v1/readyz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["device_state"], "degraded", "{body}");
     }
 
     /// M7 + H5: a `completed` report's `bytes-val` state is withheld

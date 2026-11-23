@@ -72,7 +72,7 @@ use oxidhome_core::api::{
     recover_admin_token_offline, serve,
 };
 use oxidhome_core::exclusive_lock::acquire_state_dir_lock;
-use oxidhome_core::state::{EventLogRetention, RetentionTask};
+use oxidhome_core::state::{RetentionConfig, RetentionTasks};
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -121,8 +121,24 @@ const SHUTDOWN_REAPER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 /// `SocketAddr` (so `0.0.0.0:7780` and `[::1]:7780` both work).
 const DEFAULT_BIND: &str = "127.0.0.1:7780";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Bound on the runtime shutdown after the mode returns: blocking-pool
+/// work still running (a lifecycle operation, an audit row, a
+/// retention chunk) gets this long to finish before the process exits.
+const SHUTDOWN_RUNTIME_BUDGET: Duration = Duration::from_secs(10);
+
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_mode());
+    // Bounded, unlike dropping the runtime: a blocking task hung on the
+    // disk can't keep the process alive. The state-dir lock, if taken,
+    // is held past this (see `STATE_DIR_LOCK`).
+    runtime.shutdown_timeout(SHUTDOWN_RUNTIME_BUDGET);
+    result
+}
+
+async fn run_mode() -> anyhow::Result<()> {
     // 14.5: `oxidhome mcp-stdio` runs the MCP server over the
     // process's stdin/stdout instead of the HTTP listener.
     // Intended for MCP clients that spawn subprocesses (Claude
@@ -150,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state_dir = resolve_state_dir()?;
-    let retention = EventLogRetention::from_env()?;
+    let retention = RetentionConfig::from_env()?;
     // Round-1 P1 on PR #143: enforce single-process ownership of
     // the state dir. `Engine`'s in-memory registries (device,
     // instance, event, service, per-plugin lifecycle locks) are
@@ -158,10 +174,9 @@ async fn main() -> anyhow::Result<()> {
     // would race on plugin start/uninstall + serve stale reads
     // (SQLite WAL only protects the tables themselves, not the
     // supervisor bookkeeping). The lock is held for the process
-    // lifetime; leaked here on purpose (a `let _` binding would
-    // drop at end of scope, releasing the lock while the daemon
-    // is still running).
-    let _state_dir_lock = acquire_state_dir_lock(&state_dir)?;
+    // lifetime and released only by the OS when the process
+    // ends (see `STATE_DIR_LOCK`).
+    hold_state_dir_lock(&state_dir)?;
     // Engine first — its `log_store` provides the SQLite tracing
     // layer that the global subscriber composes below.
     //
@@ -244,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
     let actual = listener.local_addr()?;
     tracing::info!(addr = %actual, "oxidhome API listening");
     publish_http_config(&state_dir, &retention, bind_addr, actual);
-    let event_log_retention = spawn_event_log_retention(&engine, retention);
+    let retention = spawn_retention(&engine, retention);
 
     // Serve until a shutdown signal arrives. `serve` returning
     // Err here means the accept loop itself died (rare); we
@@ -316,7 +331,8 @@ async fn main() -> anyhow::Result<()> {
     let _ = engine
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
-    stop_event_log_retention(event_log_retention).await;
+    drain_state_read_audit(&engine).await;
+    stop_retention(retention).await;
     close_state_writers(&engine).await;
 
     // Drain the log writer before process exit so the tail of the
@@ -337,10 +353,7 @@ async fn main() -> anyhow::Result<()> {
     // running the full shutdown-cleanup sequence, so
     // systemd / runit still see a non-zero exit and can
     // restart.
-    if let Some(err) = serve_error {
-        return Err(err);
-    }
-    Ok(())
+    serve_error.map_or(Ok(()), Err)
 }
 
 /// `oxidhome://config` / `GET /api/v1/config`: publish what the HTTP
@@ -348,7 +361,7 @@ async fn main() -> anyhow::Result<()> {
 /// plugin directory is argv\[1\], the value `main` starts.
 fn publish_http_config(
     state_dir: &std::path::Path,
-    retention: &EventLogRetention,
+    retention: &RetentionConfig,
     configured: SocketAddr,
     bound: SocketAddr,
 ) {
@@ -360,36 +373,79 @@ fn publish_http_config(
     install_daemon_config(config);
 }
 
-/// H4 / M6 follow-up: periodic event-log retention (age and row
-/// limits from `$OXIDHOME_EVENT_LOG_RETENTION_DAYS` /
-/// `$OXIDHOME_EVENT_LOG_MAX_ROWS`). Low-priority, chunked, id prefix
-/// only. Used by both long-running modes (HTTP daemon and
-/// `mcp-stdio`); the caller shuts it down before releasing the
-/// state-dir lock.
-fn spawn_event_log_retention(
-    engine: &Engine,
-    retention: EventLogRetention,
-) -> Option<RetentionTask> {
+/// Periodic retention for the event log, the diagnostic log and the
+/// audit ledger (limits from `$OXIDHOME_{EVENT_LOG,LOG,AUDIT}_*`; see
+/// `oxidhome_core::state::retention`). Low-priority and chunked. Used
+/// by both long-running modes (HTTP daemon and `mcp-stdio`); the
+/// caller shuts the tasks down before it exits.
+fn spawn_retention(engine: &Engine, config: RetentionConfig) -> RetentionTasks {
+    let days = |p: &oxidhome_core::state::RetentionPolicy| p.max_age.map(|a| a.as_secs() / 86_400);
     tracing::info!(
-        max_age_days = retention.max_age.map(|a| a.as_secs() / 86_400),
-        max_rows = retention.max_rows,
-        "event log retention",
+        event_log_max_age_days = days(&config.event_log),
+        event_log_max_rows = config.event_log.max_rows,
+        log_max_age_days = days(&config.logs),
+        log_max_rows = config.logs.max_rows,
+        audit_max_age_days = days(&config.audit),
+        audit_max_rows = config.audit.max_rows,
+        "retention",
     );
-    engine.event_log().spawn_retention(retention)
+    engine.spawn_retention(config)
 }
 
-/// Stop retention and wait out an in-flight chunk, so no retention
-/// write outlives the state-dir lock released when the caller
-/// returns. Bounded by [`SHUTDOWN_FLUSH_BUDGET`] so a hung disk can't
-/// wedge shutdown.
-async fn stop_event_log_retention(task: Option<RetentionTask>) {
-    if let Some(task) = task
-        && tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, task.shutdown())
-            .await
-            .is_err()
+/// Stop retention: a chunk still waiting for the writer is cancelled,
+/// one already running is waited out. Bounded by
+/// [`SHUTDOWN_FLUSH_BUDGET`] so a chunk hung on the disk can't wedge
+/// shutdown; [`STATE_DIR_LOCK`] covers that chunk.
+async fn stop_retention(tasks: RetentionTasks) {
+    if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, tasks.shutdown())
+        .await
+        .is_err()
     {
-        tracing::warn!("event log retention: a chunk was still running at the shutdown deadline");
+        tracing::warn!("retention: a chunk was still running at the shutdown deadline");
     }
+}
+
+/// Bound on the H2 deny-audit drain at shutdown.
+const SHUTDOWN_AUDIT_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Write the `deny` audit rows the stopped plugins queued (H2
+/// `get-state`, `read-events`) within [`SHUTDOWN_AUDIT_DRAIN_DEADLINE`].
+/// `COMMAND` resolutions are flushed by the command journal's own close
+/// (`close_state_writers`).
+async fn drain_state_read_audit(engine: &Engine) {
+    let engine = engine.clone();
+    // One deadline for both the drain and the wait for it, so a
+    // blocking pool too busy to start the drain can't stretch it.
+    let deadline = std::time::Instant::now() + SHUTDOWN_AUDIT_DRAIN_DEADLINE;
+    let drain = tokio::task::spawn_blocking(move || {
+        engine.drain_state_read_audit(deadline.saturating_duration_since(std::time::Instant::now()))
+    });
+    let drained = tokio::time::timeout_at(deadline.into(), drain)
+        .await
+        .is_ok_and(|joined| joined.unwrap_or(false));
+    if !drained {
+        tracing::warn!("deny-audit drain timed out; queued rows may be lost at exit");
+    }
+}
+
+/// The exclusive state-dir lock of a long-running mode. A static is
+/// never dropped: the lock stays held until the operating system closes
+/// it with the process, after [`main`] shut the runtime down and every
+/// thread is gone. Releasing it earlier would let a write still running
+/// on another thread (a retention chunk or an orphaned H3 mirror write
+/// stuck on a hung disk, an audit row, a lifecycle operation, the
+/// checkpointer) touch the database after another process (a restarted
+/// daemon, `oxidhome restore`) took the lock.
+static STATE_DIR_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Take the state-dir lock and hold it for the rest of the process
+/// (see [`STATE_DIR_LOCK`]).
+fn hold_state_dir_lock(state_dir: &std::path::Path) -> anyhow::Result<()> {
+    let lock = acquire_state_dir_lock(state_dir)?;
+    if STATE_DIR_LOCK.set(lock).is_err() {
+        anyhow::bail!("state-dir lock taken twice");
+    }
+    Ok(())
 }
 
 /// M4: `oxidhome recover-admin-token [--revoke-all]`. Offline only —
@@ -703,10 +759,10 @@ async fn run_stdio() -> anyhow::Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
     let state_dir = resolve_state_dir()?;
-    let retention = EventLogRetention::from_env()?;
+    let retention = RetentionConfig::from_env()?;
     // Round-1 P1 on PR #143: exclusive lock, held for the
-    // process lifetime.
-    let _state_dir_lock = acquire_state_dir_lock(&state_dir)?;
+    // process lifetime (see `STATE_DIR_LOCK`).
+    hold_state_dir_lock(&state_dir)?;
     let engine = Engine::with_state_dir(&state_dir).with_context(|| {
         format!(
             "opening engine state at {} — set $OXIDHOME_STATE_DIR to override",
@@ -737,7 +793,7 @@ async fn run_stdio() -> anyhow::Result<()> {
         &state_dir,
         &retention,
     ));
-    let event_log_retention = spawn_event_log_retention(&engine, retention);
+    let retention = spawn_retention(&engine, retention);
     tracing::info!(
         state_dir = %state_dir.display(),
         "oxidhome mcp-stdio ready — awaiting client on stdin",
@@ -770,9 +826,11 @@ async fn run_stdio() -> anyhow::Result<()> {
     let _ = engine
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
-    stop_event_log_retention(event_log_retention).await;
+    drain_state_read_audit(&engine).await;
+    stop_retention(retention).await;
     close_state_writers(&engine).await;
 
+    tracing::info!("oxidhome mcp-stdio session closed");
     // Flush the log writer before returning so the tail of the
     // session lands in `<state_dir>/oxidhome.db`. Matches the
     // daemon's happy-path drain (round-2 P2 on PR #143).
@@ -785,11 +843,9 @@ async fn run_stdio() -> anyhow::Result<()> {
         );
     }
 
-    tracing::info!("oxidhome mcp-stdio session closed");
     // Propagate the serve error AFTER cleanup so cleanup still
     // runs on a mid-session transport failure.
-    serve_result.context("MCP stdio session failed")?;
-    Ok(())
+    serve_result.context("MCP stdio session failed")
 }
 
 fn init_tracing(engine: &Engine) {

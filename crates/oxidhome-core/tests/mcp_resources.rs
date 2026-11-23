@@ -1098,14 +1098,14 @@ async fn status_resource_requires_status_read_scope() {
 /// installs the same value, so test order doesn't matter.
 fn install_test_daemon_config() {
     use oxidhome_core::api::mcp::{DaemonConfig, DaemonMode, install_daemon_config};
-    use oxidhome_core::state::EventLogRetention;
+    use oxidhome_core::state::RetentionConfig;
 
     let addr = "127.0.0.1:7780".parse().expect("addr");
     let _ = install_daemon_config(
         DaemonConfig::resolve(
             DaemonMode::Http,
             std::path::Path::new("/srv/password=hunter2/state"),
-            &EventLogRetention::default(),
+            &RetentionConfig::default(),
         )
         .with_listener(addr, addr),
     );

@@ -6000,6 +6000,13 @@ pub struct ListDeviceStateResponseView<'a> {
     ///
     /// Field 4: `next_cursor`
     pub next_cursor: &'a str,
+    /// The page holds fewer than `limit` devices because it reached the
+    /// server's byte budget (an upper bound on the encoded size, kept
+    /// well under a 4 MiB receive limit) or its scan budget;
+    /// `next_cursor` is set. The first device is always sent whole.
+    ///
+    /// Field 5: `truncated`
+    pub truncated: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ListDeviceStateResponseView<'a> {
@@ -6050,6 +6057,13 @@ impl<'a> ::buffa::MessageView<'a> for ListDeviceStateResponseView<'a> {
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
                 view.next_cursor = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.truncated = ::buffa::types::decode_bool(&mut cur)?;
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -6107,6 +6121,7 @@ impl<'a> ::buffa::MessageView<'a> for ListDeviceStateResponseView<'a> {
                 .map(|v| v.to_owned_from_source(__buffa_src))
                 .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
             next_cursor: self.next_cursor.to_string(),
+            truncated: self.truncated,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -6135,6 +6150,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ListDeviceStateResponseView<'a> {
         if !self.next_cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.next_cursor) as u64;
         }
+        if self.truncated {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -6162,6 +6180,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ListDeviceStateResponseView<'a> {
         }
         if !self.next_cursor.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.next_cursor, buf);
+        }
+        if self.truncated {
+            ::buffa::types::put_bool_field(5u32, self.truncated, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -6199,6 +6220,9 @@ impl<'__a> ::serde::Serialize for ListDeviceStateResponseView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.next_cursor) {
             __map.serialize_entry("nextCursor", self.next_cursor)?;
+        }
+        if self.truncated {
+            __map.serialize_entry("truncated", &self.truncated)?;
         }
         __map.end()
     }
@@ -6324,6 +6348,16 @@ impl ListDeviceStateResponseOwnedView {
     #[must_use]
     pub fn next_cursor(&self) -> &'_ str {
         self.0.reborrow().next_cursor
+    }
+    /// The page holds fewer than `limit` devices because it reached the
+    /// server's byte budget (an upper bound on the encoded size, kept
+    /// well under a 4 MiB receive limit) or its scan budget;
+    /// `next_cursor` is set. The first device is always sent whole.
+    ///
+    /// Field 5: `truncated`
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.0.reborrow().truncated
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ListDeviceStateResponseView<'static>>>
@@ -6673,6 +6707,12 @@ pub struct ListDeviceStateChangesResponseView<'a> {
     ///
     /// Field 4: `reset_required`
     pub reset_required: bool,
+    /// The server's byte budget cut the page short: more changes follow
+    /// even though `changes` holds fewer than `limit` entries. Advance
+    /// the cursor to the highest returned revision and poll again.
+    ///
+    /// Field 5: `truncated`
+    pub truncated: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ListDeviceStateChangesResponseView<'a> {
@@ -6723,6 +6763,13 @@ impl<'a> ::buffa::MessageView<'a> for ListDeviceStateChangesResponseView<'a> {
                     ::buffa::encoding::WireType::Varint,
                 )?;
                 view.reset_required = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.truncated = ::buffa::types::decode_bool(&mut cur)?;
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -6780,6 +6827,7 @@ impl<'a> ::buffa::MessageView<'a> for ListDeviceStateChangesResponseView<'a> {
                 .map(|v| v.to_owned_from_source(__buffa_src))
                 .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
             reset_required: self.reset_required,
+            truncated: self.truncated,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -6810,6 +6858,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ListDeviceStateChangesResponseView<'a> {
         if self.reset_required {
             size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
+        if self.truncated {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -6837,6 +6888,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ListDeviceStateChangesResponseView<'a> {
         }
         if self.reset_required {
             ::buffa::types::put_bool_field(4u32, self.reset_required, buf);
+        }
+        if self.truncated {
+            ::buffa::types::put_bool_field(5u32, self.truncated, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -6874,6 +6928,9 @@ impl<'__a> ::serde::Serialize for ListDeviceStateChangesResponseView<'__a> {
         }
         if self.reset_required {
             __map.serialize_entry("resetRequired", &self.reset_required)?;
+        }
+        if self.truncated {
+            __map.serialize_entry("truncated", &self.truncated)?;
         }
         __map.end()
     }
@@ -7000,6 +7057,15 @@ impl ListDeviceStateChangesResponseOwnedView {
     #[must_use]
     pub fn reset_required(&self) -> bool {
         self.0.reborrow().reset_required
+    }
+    /// The server's byte budget cut the page short: more changes follow
+    /// even though `changes` holds fewer than `limit` entries. Advance
+    /// the cursor to the highest returned revision and poll again.
+    ///
+    /// Field 5: `truncated`
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.0.reborrow().truncated
     }
 }
 impl ::core::convert::From<
