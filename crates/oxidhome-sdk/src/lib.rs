@@ -36,8 +36,12 @@
 //!   `logging` bridge so [`tracing`] macros from plugin code reach
 //!   the host's log store.
 //!
-//! Streaming / AI worlds land in later phases; everything above is
-//! the standard `plugin` world.
+//! - **Network** (`streaming-plugin` feature) — `StreamingPlugin`
+//!   and `streaming_plugin!` for the `streaming-plugin` world, whose
+//!   instances get WASI sockets and outgoing HTTP. See the `streaming`
+//!   module (built with that feature).
+//!
+//! AI worlds land in later phases.
 //!
 //! # Hello world
 //!
@@ -70,11 +74,27 @@
 /// [`logging::init`] forwards events to the host.
 pub use tracing;
 
-/// Generated guest bindings for the standard `plugin` world. Re-exported
-/// so the [`plugin!`] macro and plugin code can reach generated types
+/// Generated guest bindings for the world this SDK build targets: the
+/// standard `plugin` world, or `streaming-plugin` with the
+/// `streaming-plugin` feature. Re-exported so the [`plugin!`] /
+/// `streaming_plugin!` macros and plugin code can reach generated types
 /// (`Event`, `Command`, `CommandResult`, …) without a direct dep on
-/// `oxidhome-wit`.
+/// `oxidhome-wit`. The streaming world includes every `plugin` import
+/// and export, so code written against these paths works in both.
+#[cfg(not(feature = "streaming-plugin"))]
 pub use oxidhome_wit::plugin as bindings;
+/// Generated guest bindings for the world this SDK build targets: the
+/// standard `plugin` world, or `streaming-plugin` with the
+/// `streaming-plugin` feature. Re-exported so the `plugin!` /
+/// [`streaming_plugin!`] macros and plugin code can reach generated types
+/// (`Event`, `Command`, `CommandResult`, …) without a direct dep on
+/// `oxidhome-wit`. The streaming world includes every `plugin` import
+/// and export, so code written against these paths works in both.
+#[cfg(feature = "streaming-plugin")]
+pub use oxidhome_wit::streaming_plugin as bindings;
+
+#[cfg(not(any(feature = "plugin", feature = "streaming-plugin")))]
+compile_error!("oxidhome-sdk needs a world feature: `plugin` (default) or `streaming-plugin`");
 
 mod device;
 pub use device::Device;
@@ -94,6 +114,11 @@ pub mod host;
 
 mod plugin;
 pub use plugin::Plugin;
+
+#[cfg(feature = "streaming-plugin")]
+pub mod streaming;
+#[cfg(feature = "streaming-plugin")]
+pub use streaming::StreamingPlugin;
 
 pub mod logging;
 

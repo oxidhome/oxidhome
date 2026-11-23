@@ -102,6 +102,63 @@ pub fn run_tick<P: crate::Plugin>(cell: &'static std::thread::LocalKey<RefCell<O
     });
 }
 
+#[cfg(feature = "streaming-plugin")]
+pub fn run_setup_pipeline<P: crate::StreamingPlugin>(
+    cell: &'static std::thread::LocalKey<RefCell<Option<P>>>,
+    device: String,
+) -> Result<crate::streaming::media::MediaPipeline, String> {
+    cell.with(|cell| match cell.borrow_mut().as_mut() {
+        Option::Some(p) => crate::StreamingPlugin::setup_pipeline(p, device),
+        Option::None => Result::Err(String::from("plugin not initialized")),
+    })
+}
+
+/// The world-level `Guest` impl shared by every world: the lifecycle,
+/// event, command, and tick exports, delegating to the dispatch helpers
+/// above through the thread-local `$cell`.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __plugin_guest {
+    ($ty:ident, $cell:ident) => {
+        impl $crate::__private::bindings::Guest for $ty {
+            fn init() -> $crate::__private::Result<(), $crate::__private::String> {
+                $crate::__private::run_init::<$ty>(&$cell)
+            }
+
+            fn on_shutdown() {
+                $crate::__private::run_shutdown::<$ty>(&$cell);
+            }
+
+            fn on_event(ev: $crate::__private::bindings::oxidhome::plugin::events::Event) {
+                $crate::__private::run_on_event::<$ty>(&$cell, ev);
+            }
+
+            fn execute_command(
+                device: $crate::__private::String,
+                cmd: $crate::__private::bindings::oxidhome::plugin::devices::Command,
+            ) -> $crate::__private::bindings::oxidhome::plugin::devices::CommandResult {
+                $crate::__private::run_execute_command::<$ty>(&$cell, device, cmd)
+            }
+
+            fn execute_service_command(
+                service: $crate::__private::String,
+                command: $crate::__private::String,
+                args: $crate::__private::Vec<
+                    $crate::__private::bindings::oxidhome::plugin::types::KeyValue,
+                >,
+            ) -> $crate::__private::bindings::oxidhome::plugin::devices::CommandResult {
+                $crate::__private::run_execute_service_command::<$ty>(
+                    &$cell, service, command, args,
+                )
+            }
+
+            fn tick() {
+                $crate::__private::run_tick::<$ty>(&$cell);
+            }
+        }
+    };
+}
+
 /// Wires a plugin type into the wit-bindgen-generated `plugin` world
 /// exports. Generated [`Plugin`](crate::Plugin)-trait dispatch lives
 /// here so the macro body stays small.
@@ -129,45 +186,7 @@ macro_rules! __plugin_impl {
                 };
             }
 
-            impl $crate::__private::bindings::Guest for $ty {
-                fn init() -> $crate::__private::Result<(), $crate::__private::String> {
-                    $crate::__private::run_init::<$ty>(&__OXIDHOME_PLUGIN)
-                }
-
-                fn on_shutdown() {
-                    $crate::__private::run_shutdown::<$ty>(&__OXIDHOME_PLUGIN);
-                }
-
-                fn on_event(ev: $crate::__private::bindings::oxidhome::plugin::events::Event) {
-                    $crate::__private::run_on_event::<$ty>(&__OXIDHOME_PLUGIN, ev);
-                }
-
-                fn execute_command(
-                    device: $crate::__private::String,
-                    cmd: $crate::__private::bindings::oxidhome::plugin::devices::Command,
-                ) -> $crate::__private::bindings::oxidhome::plugin::devices::CommandResult {
-                    $crate::__private::run_execute_command::<$ty>(&__OXIDHOME_PLUGIN, device, cmd)
-                }
-
-                fn execute_service_command(
-                    service: $crate::__private::String,
-                    command: $crate::__private::String,
-                    args: $crate::__private::Vec<
-                        $crate::__private::bindings::oxidhome::plugin::types::KeyValue,
-                    >,
-                ) -> $crate::__private::bindings::oxidhome::plugin::devices::CommandResult {
-                    $crate::__private::run_execute_service_command::<$ty>(
-                        &__OXIDHOME_PLUGIN,
-                        service,
-                        command,
-                        args,
-                    )
-                }
-
-                fn tick() {
-                    $crate::__private::run_tick::<$ty>(&__OXIDHOME_PLUGIN);
-                }
-            }
+            $crate::__plugin_guest!($ty, __OXIDHOME_PLUGIN);
 
             $crate::__private::bindings::export!(
                 $ty with_types_in $crate::__private::bindings
@@ -176,13 +195,91 @@ macro_rules! __plugin_impl {
     };
 }
 
-/// Public face of the [`__plugin_impl!`] machinery. Plugin authors use
-/// this name; the macro itself is just a thin re-export so docs stay
-/// readable.
+/// Exports a [`Plugin`](crate::Plugin) type as the component's
+/// standard-world implementation: lifecycle, events, commands, services
+/// and tick.
+///
+/// ```ignore
+/// #[derive(Default)]
+/// struct Hello;
+/// impl oxidhome_sdk::Plugin for Hello {
+///     fn init(&mut self) -> Result<(), String> { Ok(()) }
+///     fn shutdown(&mut self) {}
+/// }
+/// oxidhome_sdk::plugin!(Hello);
+/// ```
+///
+/// With the `streaming-plugin` feature use
+/// `streaming_plugin!` instead.
+#[cfg(not(feature = "streaming-plugin"))]
 #[macro_export]
 macro_rules! plugin {
     ($ty:ident) => {
         $crate::__plugin_impl!($ty);
+    };
+}
+
+/// With the `streaming-plugin` feature the component must also export the
+/// streaming world's `setup-pipeline`: use
+/// [`streaming_plugin!`](crate::streaming_plugin).
+#[cfg(feature = "streaming-plugin")]
+#[macro_export]
+macro_rules! plugin {
+    ($ty:ident) => {
+        ::core::compile_error!(
+            "oxidhome-sdk is built for the streaming-plugin world: implement \
+             `oxidhome_sdk::StreamingPlugin` and use `oxidhome_sdk::streaming_plugin!`"
+        );
+    };
+}
+
+/// Exports a [`StreamingPlugin`](crate::StreamingPlugin) type as the
+/// component's `streaming-plugin` world implementation: everything
+/// [`plugin!`](crate::plugin) exports, plus `setup-pipeline`.
+///
+/// Needs the SDK's `streaming-plugin` feature and
+/// `world = "streaming-plugin"` in the manifest.
+///
+/// ```ignore
+/// #[derive(Default)]
+/// struct Probe;
+/// impl oxidhome_sdk::Plugin for Probe {
+///     fn init(&mut self) -> Result<(), String> { Ok(()) }
+///     fn shutdown(&mut self) {}
+/// }
+/// impl oxidhome_sdk::StreamingPlugin for Probe {}
+/// oxidhome_sdk::streaming_plugin!(Probe);
+/// ```
+#[cfg(feature = "streaming-plugin")]
+#[macro_export]
+macro_rules! streaming_plugin {
+    ($ty:ident) => {
+        const _: () = {
+            $crate::__private::thread_local! {
+                static __OXIDHOME_PLUGIN: $crate::__private::RefCell<
+                    $crate::__private::Option<$ty>,
+                > = const {
+                    $crate::__private::RefCell::new($crate::__private::Option::None)
+                };
+            }
+
+            $crate::__plugin_guest!($ty, __OXIDHOME_PLUGIN);
+
+            impl $crate::__private::bindings::exports::oxidhome::plugin::streaming::Guest for $ty {
+                fn setup_pipeline(
+                    device: $crate::__private::String,
+                ) -> $crate::__private::Result<
+                    $crate::streaming::media::MediaPipeline,
+                    $crate::__private::String,
+                > {
+                    $crate::__private::run_setup_pipeline::<$ty>(&__OXIDHOME_PLUGIN, device)
+                }
+            }
+
+            $crate::__private::bindings::export!(
+                $ty with_types_in $crate::__private::bindings
+            );
+        };
     };
 }
 

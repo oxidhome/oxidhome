@@ -1510,13 +1510,29 @@ interface streaming {
 
 /// Streaming plugin world — extends the standard world with WASI
 /// sockets/HTTP and host-media for cameras, voice assistants, network
-/// bridges. Capability is still gated by the manifest; importing these
-/// interfaces doesn't grant them.
+/// bridges. Only instances whose manifest selects a streaming world get
+/// these imports linked.
+///
+/// Importing them doesn't grant network access. The host checks every
+/// TCP connect, UDP send, name lookup and outgoing HTTP request against
+/// the instance's granted `[capabilities] network` rules, on the resolved
+/// IP address; with no matching rule the call fails with `access-denied`
+/// (sockets, name lookup) or `HTTP-request-denied` (HTTP). Names are
+/// resolved by the host, and a name rule only covers the public addresses
+/// the name resolved to: loopback, link-local and private addresses need
+/// an IP or CIDR rule inside that range. Binds are allowed only to the
+/// unspecified address; `listen` is refused. `wasi:http` does not follow
+/// redirects, so each hop is a new, separately checked request.
 world streaming-plugin {
   include plugin;
   import host-media;
+  import wasi:sockets/instance-network@0.2.0;
+  import wasi:sockets/network@0.2.0;
+  import wasi:sockets/tcp-create-socket@0.2.0;
   import wasi:sockets/tcp@0.2.0;
+  import wasi:sockets/udp-create-socket@0.2.0;
   import wasi:sockets/udp@0.2.0;
+  import wasi:sockets/ip-name-lookup@0.2.0;
   import wasi:http/outgoing-handler@0.2.0;
   import wasi:clocks/monotonic-clock@0.2.0;
   export streaming;

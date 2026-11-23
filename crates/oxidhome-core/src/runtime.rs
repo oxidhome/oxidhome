@@ -20,6 +20,8 @@ pub mod dispatcher;
 mod event_read;
 mod instance;
 mod lifecycle;
+mod media_placeholder;
+mod network;
 mod plugin_stdio;
 mod registry;
 pub mod sandbox;
@@ -54,7 +56,7 @@ use crate::state::{
 /// and instantiated cheaply across many [`PluginInstance`]s — wrap this
 /// in an [`Arc`] and share. The engine is configured for the component
 /// model with async host functions so calls into wasm can suspend
-/// (Phase 8+ will use this for sockets/HTTP).
+/// (streaming instances' sockets and HTTP rely on it).
 ///
 /// Beyond the Wasmtime engine, [`Engine`] carries the singletons every
 /// plugin instance shares: the [`DeviceRegistry`] (Phase 3), the

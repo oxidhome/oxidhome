@@ -17,6 +17,17 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# The plugin world the SDK binds to. Enable exactly one for a wasm build:
+# each world embeds its own component-type section, and a component may
+# carry only one. `streaming-plugin` plugins depend on the SDK with
+# `default-features = false, features = ["streaming-plugin"]`. On native
+# targets (tests, docs) both may be on; the SDK then binds to the
+# streaming world, which includes everything in `plugin`.
+default = ["plugin"]
+plugin = ["oxidhome-wit/plugin"]
+streaming-plugin = ["oxidhome-wit/streaming-plugin"]
+
 [dependencies]
 oxidhome-wit.workspace = true
 # Re-exported so plugin authors can use `oxidhome_sdk::tracing::info!` etc.

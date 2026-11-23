@@ -34,6 +34,8 @@ pub const CRASHER: (&str, &str) = ("crasher", "crasher.wasm");
 pub const HANG: (&str, &str) = ("hang", "hang.wasm");
 pub const DEFERRED_SWITCH: (&str, &str) = ("deferred-switch", "deferred_switch.wasm");
 pub const SCRIPT_HOST: (&str, &str) = ("script-host", "script_host.wasm");
+pub const NET_PROBE: (&str, &str) = ("net-probe", "net_probe.wasm");
+pub const NETWORK_DISCOVERY: (&str, &str) = ("network-discovery", "network_discovery.wasm");
 
 /// Build `examples/<dir>` for `wasm32-wasip2` (once per test binary)
 /// and return the artifact path.
@@ -128,6 +130,20 @@ impl Drop for TempDir {
 /// the production backend can install it as-is.
 #[must_use]
 pub fn stage(example: (&str, &str), edit_caps: impl FnOnce(&mut toml::Table)) -> TempDir {
+    stage_with(example, |manifest| {
+        let caps = manifest
+            .entry("capabilities")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .expect("[capabilities] table");
+        edit_caps(caps);
+    })
+}
+
+/// [`stage`] with `edit` applied to the whole manifest (after
+/// `[runtime] wasm` is rewritten), e.g. to change `[plugin] world`.
+#[must_use]
+pub fn stage_with(example: (&str, &str), edit: impl FnOnce(&mut toml::Table)) -> TempDir {
     let wasm = build_example(example);
     let dir = TempDir::new(example.0);
     std::fs::copy(&wasm, dir.path().join("plugin.wasm")).expect("copy wasm");
@@ -142,12 +158,7 @@ pub fn stage(example: (&str, &str), edit_caps: impl FnOnce(&mut toml::Table)) ->
         .and_then(toml::Value::as_table_mut)
         .expect("[runtime] table")
         .insert("wasm".into(), toml::Value::String("plugin.wasm".into()));
-    let caps = manifest
-        .entry("capabilities")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .expect("[capabilities] table");
-    edit_caps(caps);
+    edit(&mut manifest);
     std::fs::write(
         dir.path().join("manifest.toml"),
         toml::to_string(&manifest).expect("serialize manifest"),

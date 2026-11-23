@@ -106,12 +106,19 @@ pub mod plugin {
 }
 
 /// Streaming plugin world: adds host-media + WASI sockets/HTTP.
+///
+/// Like `plugin`, its export macro (`__export_streaming_plugin_impl`) is
+/// lifted to the crate root so `oxidhome-sdk`'s `streaming_plugin!` can
+/// invoke it. Only this streaming world does so: `streaming-ai-plugin`
+/// exports the same `streaming` interface, and two `#[macro_export]`ed
+/// copies of its cabi helper would collide.
 #[cfg(feature = "streaming-plugin")]
 pub mod streaming_plugin {
     wit_bindgen::generate!({
         path: "../../wit",
         world: "streaming-plugin",
         generate_all,
+        pub_export_macro: true,
     });
 }
 

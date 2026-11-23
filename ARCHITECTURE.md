@@ -65,6 +65,8 @@ The WIT defines multiple worlds, each adding capabilities on top of the previous
 
 Importing a WASI interface does **not** grant access to it. Capabilities are gated by the plugin manifest the user approves at install time. The host enforces network allowlists, filesystem scopes, model access, etc. per instance.
 
+The world an instance runs is the one its manifest's `[plugin] world` names, and it decides what the instance's linker gets. `plugin` and `ai-plugin` instances get only the WASI that libstd needs (`wasi:cli`, `wasi:clocks`, `wasi:io`, `wasi:random`, `wasi:filesystem` with no preopens); a component of theirs that imports `wasi:sockets` or `wasi:http` fails to load. Streaming instances also get `wasi:sockets` and outgoing `wasi:http` (Phase 8; see [Network access](#network-access-phase-8)). `host-media` is linked for them too, but answers `unavailable` until media pipelines land.
+
 ## The device model
 
 ### Capabilities, not device types
@@ -233,6 +235,7 @@ Loading a model is asking the host to execute computation on the GPU using arbit
 - **Storage** — `get`, `set`, `delete`, `list-keys` (small KV, per instance); blob bytes via the `blob-store` interface
 - **Configuration** — `get-config`, `list-config`
 - **Device state** (H2) — `host-state::get-state`, `list-state` read the host's state projection; own devices always, others with `[[capabilities.reads_state]]` (see *Device state (H2)*)
+- **Network** (streaming worlds only, Phase 8) — WASI 0.2 `wasi:sockets` and outgoing `wasi:http`, checked against the instance's `[capabilities] network` rules (see *Network access (Phase 8)*)
 - **Inference** (AI plugins only) — `load-model`, model handles with `infer()`
 - **Logging** — at standard levels
 
@@ -414,6 +417,18 @@ Load-bearing invariants the codebase depends on today. Each corresponds to a shi
 - **Authorization outcome and execution outcome are separate audit fields.** `decision` carries the auth outcome (`allow` / `deny` / `error` / `pending`), `status` carries the wire HTTP status, `execution_outcome` + `domain_error` carry the plugin's `CommandResult::Err` kind, and `command_id` + `command_outcome` (migration 18) the H5 command id and outcome. A plugin returning an error on an authorized request no longer shows up in `WHERE decision = 'deny'` searches. **C3 review F4.**
 - **Tokens are hashed at rest.** 256-bit CSPRNG bearer tokens, SHA-256 at rest — plain SHA is correct for a uniformly-random 256-bit secret; a slow KDF only pays off against low-entropy passwords. `revoked_ms` is a tombstone; rows aren't deleted so audit lineage stays intact. **12-API tokens.**
 - **Admin bootstrap is crash-safe and recoverable offline.** The first-run admin secret is fsynced to `<state_dir>/admin-token.pending-<id>` before its row commits, then renamed to `admin-token`; a failed delivery rolls the row back, and startup reconciliation promotes an interrupted delivery and removes `admin-token` once its token has been used. A lost admin secret is recovered with `oxidhome recover-admin-token [--revoke-all]`, which only runs under the exclusive state-dir lock (daemon stopped) and is never exposed over the network. Bootstrap, recovery, revocations and file removals land in `audit_event` (`method = LOCAL`, `path = host.auth.*` / `cli.auth.*`). **M4.**
+
+### Network access (Phase 8)
+
+Streaming-world instances reach the network only as far as their **effective** `[capabilities] network` rules (requested ∩ granted) allow. One per-instance policy decides every socket connect, UDP send, received datagram, bind, name lookup and HTTP request (`runtime::network`):
+
+- **Decided on the resolved IP.** Addresses are canonicalized (IPv4-mapped IPv6 → IPv4) and classified as in the media policy. Unspecified, broadcast, multicast, documentation and reserved addresses are always refused — so broadcast / multicast discovery isn't possible yet.
+- **IP and CIDR rules** cover the addresses they contain. A literal grants its own address whatever its class; a CIDR grants loopback, link-local or private addresses only when the whole range lies inside that class's blocks, so `0.0.0.0/0` covers public space only.
+- **Name rules** (`host.example.com`, `*.example.com`) cover only the *public* addresses the host itself resolved a matching name to. `wasi:sockets/ip-name-lookup` is host-implemented: names no rule mentions aren't looked up, and answers no rule allows are dropped before the plugin sees them, so DNS rebinding can't reach loopback or the LAN. Resolved addresses are remembered for 10 minutes (at most 1024 per instance).
+- **Binds** only to the unspecified address (any port); `listen` is refused.
+- **`wasi:http`** is sent by the host: it resolves and checks the request's host (`tcp` / `any` rules for `http://`, `https` / `any` for `https://`) and connects to exactly the address it checked. Redirects are never followed, so every hop the plugin follows is a new, checked request. `https://` requests are refused until TLS ships.
+- **Ceilings** per instance: 64 live sockets, 4 concurrent lookups (5 s timeout), 16 concurrent HTTP requests, and at most 128 network rules per manifest.
+- **Refusals are audited** in `audit_event` (`method = NET`, `decision = deny`, `required_scope = network`, `path = net.<op>/<instance>/<target>`, the reason in `domain_error`), rate-limited per instance (burst 16, then 1/s). Dropped datagrams are not audited.
 
 ### Data classification and redaction (M7)
 

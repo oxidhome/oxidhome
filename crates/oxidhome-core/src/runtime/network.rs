@@ -1,0 +1,66 @@
+//! Network access for `streaming-plugin` instances (Phase 8).
+//!
+//! Which WASI interfaces an instance's linker gets depends on the world
+//! its manifest selects:
+//!
+//! - `plugin` / `ai-plugin`: what libstd needs (`wasi:cli`, `wasi:clocks`,
+//!   `wasi:io`, `wasi:random`, `wasi:filesystem`) and nothing that touches
+//!   the network. A component that imports `wasi:sockets` or `wasi:http`
+//!   fails to instantiate.
+//! - `streaming-plugin` / `streaming-ai-plugin`: the above plus
+//!   `wasi:sockets/*`, `wasi:http/{types,outgoing-handler}`, and the
+//!   `host-media` / `media` imports (placeholders until media pipelines
+//!   exist).
+//!
+//! Every network operation of a streaming instance is decided by its
+//! [`NetworkPolicy`] (see [`policy`] for the rules):
+//!
+//! - TCP connect, UDP send / connect, binds and listens go through the
+//!   `wasmtime-wasi` socket-address check ([`sockets::address_check`]);
+//!   incoming datagrams the policy wouldn't allow are dropped.
+//! - `wasi:sockets/ip-name-lookup` is implemented here, not by
+//!   `wasmtime-wasi`, so the host only resolves names a rule mentions and
+//!   remembers which public addresses each name resolved to.
+//! - Socket creation is capped per instance.
+//! - `wasi:http` requests are sent by [`http::HttpHooks`]: the host
+//!   resolves the request's host, checks each address, and connects to
+//!   exactly the address it checked.
+//!
+//! Refusals are audited (`method = NET`) through the shared deny-audit
+//! worker, rate-limited per instance.
+
+mod http;
+mod policy;
+mod sockets;
+
+pub(crate) use http::HttpHooks;
+pub(crate) use policy::NetworkPolicy;
+pub(crate) use sockets::address_check;
+
+use oxidhome_manifest::World;
+use wasmtime::component::Linker;
+
+use super::state::PluginState;
+
+/// Whether `world` gets WASI sockets and HTTP.
+pub(crate) const fn is_streaming(world: World) -> bool {
+    matches!(world, World::StreamingPlugin | World::StreamingAiPlugin)
+}
+
+/// Add the WASI imports for an instance of `world` to `linker`.
+///
+/// # Errors
+///
+/// When a definition clashes with one already in the linker.
+pub(crate) fn add_wasi_to_linker(
+    linker: &mut Linker<PluginState>,
+    world: World,
+) -> anyhow::Result<()> {
+    sockets::add_base_wasi(linker)?;
+    if is_streaming(world) {
+        sockets::add_sockets(linker)?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(linker)?;
+        super::media_placeholder::add_to_linker(linker)?;
+    }
+    Ok(())
+}

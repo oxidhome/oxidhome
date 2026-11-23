@@ -101,12 +101,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
       - run: cargo build --package oxidhome-sdk --target wasm32-wasip2 --all-targets --verbose
+      # The SDK's world features are mutually exclusive on wasm; build
+      # each world on its own.
+      - run: cargo build --package oxidhome-sdk --target wasm32-wasip2 --no-default-features --features streaming-plugin --all-targets --verbose
   ExamplesBuildJob:
     name: Build examples for wasm32-wasip2
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        example: [hello-world, simulated-switch, event-recorder, deferred-switch, script-host]
+        example: [hello-world, simulated-switch, event-recorder, deferred-switch, script-host, network-discovery]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
@@ -129,7 +132,10 @@ jobs:
           toolchain: ${{ needs.RustMeta.outputs.rust-version }}
           target: wasm32-wasip2
       - run: cargo check --workspace --all-features --all-targets --verbose
-      - run: cargo check --package oxidhome-sdk --target wasm32-wasip2 --all-features --all-targets --verbose
+      # One SDK world at a time: the world features are mutually
+      # exclusive on wasm.
+      - run: cargo check --package oxidhome-sdk --target wasm32-wasip2 --all-targets --verbose
+      - run: cargo check --package oxidhome-sdk --target wasm32-wasip2 --no-default-features --features streaming-plugin --all-targets --verbose
   Build:
     name: Build
     needs:
@@ -220,8 +226,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
       - run: cargo install-tools
-      - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --all-features --all-targets --verbose -- --deny warnings
-      - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --all-features --all-targets --quiet --message-format=json | cargo-action-fmt
+      # One SDK world at a time: the world features are mutually
+      # exclusive on wasm.
+      - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --all-targets --verbose -- --deny warnings
+      - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --no-default-features --features streaming-plugin --all-targets --verbose -- --deny warnings
+      - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --all-targets --quiet --message-format=json | cargo-action-fmt
+        if: failure()
+      - run: cargo clippy --package oxidhome-sdk --target wasm32-wasip2 --no-default-features --features streaming-plugin --all-targets --quiet --message-format=json | cargo-action-fmt
         if: failure()
   Docs:
     name: Check rustdoc
@@ -237,7 +248,9 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps --verbose
       # Same target-specific pass as `WasmClippy`: the SDK's docs are
       # what plugin authors read, and they build for wasm32-wasip2.
-      - run: cargo doc --package oxidhome-sdk --target wasm32-wasip2 --all-features --no-deps --verbose
+      # One world at a time (mutually exclusive on wasm).
+      - run: cargo doc --package oxidhome-sdk --target wasm32-wasip2 --no-deps --verbose
+      - run: cargo doc --package oxidhome-sdk --target wasm32-wasip2 --no-default-features --features streaming-plugin --no-deps --verbose
   DocLinks:
     name: Check markdown links
     runs-on: ubuntu-latest

@@ -466,6 +466,15 @@ pub struct PluginState {
     /// is one. Set by the supervisor after load; `None` for instances
     /// driven without a supervisor.
     pub(crate) sandbox: Option<super::sandbox::SandboxRole>,
+    /// Phase 8: the instance's network policy, built from its effective
+    /// `[capabilities] network` rules. Consulted only when the
+    /// instance's world links WASI sockets / HTTP; empty (deny-all)
+    /// otherwise.
+    pub(crate) network: Arc<super::network::NetworkPolicy>,
+    /// `wasi:http` context and the hooks that send through
+    /// [`Self::network`] (streaming worlds only).
+    http_ctx: wasmtime_wasi_http::WasiHttpCtx,
+    http_hooks: super::network::HttpHooks,
 }
 
 impl PluginState {
@@ -490,18 +499,8 @@ impl PluginState {
         instances: Arc<InstanceRegistry>,
     ) -> Self {
         let instance_id: InstanceId = instance_id.into();
-        // M7: WASI stdout / stderr feed the host log pipeline with the
-        // instance's own secrets scrubbed, rather than the host's
-        // console; stdin stays empty.
         let log_rate = Arc::new(std::sync::Mutex::new(LogRateBucket::new()));
-        let (stdout, stderr) = super::plugin_stdio::PluginOutput::pair(
-            instance_id.as_str(),
-            manifest.plugin.id.as_str(),
-            &crate::redact::config_secrets(&config),
-            &log_rate,
-        );
-        let mut wasi = WasiCtxBuilder::new();
-        wasi.stdout(stdout).stderr(stderr);
+        let wasi = build_wasi(&instance_id, &manifest, &config, &log_rate, None);
         // C5: `PluginState::new` doesn't know about
         // `InstalledPluginRegistry` (it's the low-level
         // constructor used by tests + the loader). Default the
@@ -531,13 +530,18 @@ impl PluginState {
         device_state.bind_owner_plugin(&instance_id, &manifest.plugin.id, &installation_uuid);
         // Start the `host-state` deny-audit worker off the read path.
         let _ = super::state_read::deny_audit_queue();
+        let network = Arc::new(super::network::NetworkPolicy::new(
+            instance_id.as_str(),
+            &[],
+            None,
+        ));
         Self {
             instance_id,
             installation_uuid,
             granted_capabilities,
             consumes_services_requested,
             table: ResourceTable::new(),
-            wasi: wasi.build(),
+            wasi,
             devices,
             device_state,
             events,
@@ -556,7 +560,34 @@ impl PluginState {
             limits,
             log_rate,
             sandbox: None,
+            http_hooks: super::network::HttpHooks::new(Arc::clone(&network)),
+            network,
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
         }
+    }
+
+    /// Phase 8: give a streaming-world instance its network policy,
+    /// built from the effective (granted) `network` rules. Rebuilds the
+    /// WASI context with TCP / UDP enabled and every socket address
+    /// checked by the policy. Call before instantiation, after
+    /// [`Self::with_granted_capabilities`] and [`Self::with_audit_log`].
+    #[must_use]
+    pub(crate) fn with_network_access(mut self) -> Self {
+        let policy = Arc::new(super::network::NetworkPolicy::new(
+            self.instance_id.as_str(),
+            &self.granted_capabilities.network,
+            self.audit_log.clone(),
+        ));
+        self.wasi = build_wasi(
+            &self.instance_id,
+            &self.manifest,
+            &self.config,
+            &self.log_rate,
+            Some(&policy),
+        );
+        self.http_hooks = super::network::HttpHooks::new(Arc::clone(&policy));
+        self.network = policy;
+        self
     }
 
     /// C5: override the granted capabilities set by
@@ -597,6 +628,46 @@ impl Drop for PluginState {
         // don't outlive their instances.
         self.device_state
             .unbind_owner_plugin(&self.instance_id, &self.installation_uuid);
+    }
+}
+
+/// The instance's WASI context. M7: stdout / stderr feed the host log
+/// pipeline with the instance's own secrets scrubbed, rather than the
+/// host's console; stdin stays empty. With a network policy (streaming
+/// worlds), TCP and UDP are enabled and every socket address goes
+/// through it; name lookups are served by `runtime::network`, never by
+/// `wasmtime-wasi`'s resolver.
+fn build_wasi(
+    instance_id: &InstanceId,
+    manifest: &PluginManifest,
+    config: &InstanceConfig,
+    log_rate: &Arc<std::sync::Mutex<LogRateBucket>>,
+    network: Option<&Arc<super::network::NetworkPolicy>>,
+) -> WasiCtx {
+    let (stdout, stderr) = super::plugin_stdio::PluginOutput::pair(
+        instance_id.as_str(),
+        manifest.plugin.id.as_str(),
+        &crate::redact::config_secrets(config),
+        log_rate,
+    );
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.stdout(stdout).stderr(stderr);
+    if let Some(policy) = network {
+        wasi.allow_tcp(true)
+            .allow_udp(true)
+            .allow_ip_name_lookup(false)
+            .socket_addr_check(super::network::address_check(Arc::clone(policy)));
+    }
+    wasi.build()
+}
+
+impl wasmtime_wasi_http::WasiHttpView for PluginState {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
     }
 }
 

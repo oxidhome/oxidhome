@@ -143,6 +143,13 @@ path = "tests/data_classification.rs"
 # Exact pins (see the root Cargo.toml).
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
+# Phase 8: outgoing `wasi:http` for `streaming-plugin` instances, sent
+# through the host's own checked client (`runtime::network::http`).
+wasmtime-wasi-http.workspace = true
+http.workspace = true
+hyper.workspace = true
+# Phase 8: CIDR containment for network rules (`runtime::network`).
+ipnet.workspace = true
 # Decodes each plugin component's embedded WIT types for the load-time
 # contract check (`runtime::contract`).
 wit-parser.workspace = true

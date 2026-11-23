@@ -112,6 +112,13 @@ pub enum ValidationError {
     )]
     TooManyDeclaresDevices { count: usize, max: usize },
 
+    #[error(
+        "capabilities.network has {count} rules; the cap is {max}. The host checks \
+         every connect, send, lookup and HTTP request against the list — use CIDR \
+         ranges, port ranges and `*.suffix` names instead of one rule per address."
+    )]
+    TooManyNetworkRules { count: usize, max: usize },
+
     #[error("plugin.keywords[{index}] `{got}` is invalid: {reason}")]
     InvalidKeyword {
         index: usize,
@@ -375,6 +382,11 @@ pub const MAX_SCRIPT_SANDBOXES: u32 = 64;
 /// picks a handful).
 pub const MAX_DECLARES_DEVICES: usize = 64;
 
+/// Phase 8: hard cap on `[capabilities] network` rules. Every connect,
+/// UDP send, name lookup and HTTP request of a `streaming-plugin`
+/// instance is checked against the list, so the cap bounds that work.
+pub const MAX_NETWORK_RULES: usize = 128;
+
 /// H2: hard cap on `[[capabilities.reads_state]]` entries, and on
 /// each entry's `capabilities` / `devices` lists. Every state read
 /// checks the grants once per entry, so the caps bound that work.
@@ -460,6 +472,12 @@ pub fn check_capability_limits(
         errors.push(ValidationError::TooManyConsumesServicesGrants {
             count: caps.consumes_services.len(),
             max: MAX_CONSUMES_SERVICES_GRANTS,
+        });
+    }
+    if caps.network.len() > MAX_NETWORK_RULES {
+        errors.push(ValidationError::TooManyNetworkRules {
+            count: caps.network.len(),
+            max: MAX_NETWORK_RULES,
         });
     }
     if caps.script_sandboxes > MAX_SCRIPT_SANDBOXES {
@@ -1365,6 +1383,24 @@ mod tests {
             e,
             ValidationError::TooManyConsumesServicesGrants { count, max }
                 if *max == MAX_CONSUMES_SERVICES_GRANTS && *count == MAX_CONSUMES_SERVICES_GRANTS + 1
+        )));
+    }
+
+    /// Phase 8: `network` is capped; the cap itself passes.
+    #[test]
+    fn network_rules_reject_over_cap() {
+        let mut m = ok_manifest();
+        let rule: crate::NetworkRule = "tcp://192.168.1.2:1883".parse().unwrap();
+        m.capabilities.network = vec![rule; MAX_NETWORK_RULES];
+        assert!(validate(&m).is_ok());
+        m.capabilities
+            .network
+            .push("udp://10.0.0.1:53".parse().unwrap());
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::TooManyNetworkRules { count, max }
+                if *max == MAX_NETWORK_RULES && *count == MAX_NETWORK_RULES + 1
         )));
     }
 

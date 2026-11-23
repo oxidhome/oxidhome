@@ -1,0 +1,36 @@
+manifest_version = 1
+
+[plugin]
+id = "example.net-probe"
+name = "Net Probe"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Runs scripted network operations — streaming-plugin network-policy test fixture."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/net-probe"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "test-fixture", "network"]
+world = "streaming-plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/net_probe.wasm"
+
+[capabilities]
+# Tests replace these with rules for the ports their local servers use.
+network = []
+# One small result per operation.
+storage_quota_kb = 16
+
+[config.ops]
+# `;`-separated operations, run in order by `init`; the result of
+# operation N is stored under the KV key `op/N` as `ok:<detail>` or
+# `err:<detail>`. Operations:
+#   tcp <host:port>    connect, send "ping\n", read one reply line
+#   udp <host:port>    send "ping" from an unbound socket, wait 2 s for a reply
+#   dns <host>         resolve the name, list the addresses
+#   http <url>         GET over wasi:http, following up to 3 redirects
+#   bind <addr:port>   bind a UDP socket
+#   listen <addr:port> bind + listen a TCP socket
+type = "string"
+default = ""
+description = "Network operations to run on init."
