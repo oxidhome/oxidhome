@@ -252,18 +252,18 @@ impl<'a> CommandSlot<'a> {
         capability: String,
         action: String,
     ) -> Self {
-        let slot = {
-            let mut list = commands.lock().unwrap_or_else(PoisonError::into_inner);
-            list.push(CommandRecord {
-                device,
-                capability,
-                action,
-                command_id: String::new(),
-                outcome: None,
-                dropped: false,
-            });
-            list.len() - 1
-        };
+        // Both slots under the instance's lock (taken first, then the
+        // host's), so the two histories agree on send order.
+        let mut list = commands.lock().unwrap_or_else(PoisonError::into_inner);
+        list.push(CommandRecord {
+            device,
+            capability,
+            action,
+            command_id: String::new(),
+            outcome: None,
+            dropped: false,
+        });
+        let slot = list.len() - 1;
         let host_slot = {
             let mut ids = host
                 .command_ids
@@ -272,6 +272,7 @@ impl<'a> CommandSlot<'a> {
             ids.push(String::new());
             ids.len() - 1
         };
+        drop(list);
         Self {
             commands,
             host,
@@ -583,7 +584,13 @@ fn render_device_state(instance: &InstanceRef<'_>, stamp: &Stamp) -> Vec<String>
         .snapshot_page_with_revision(None, usize::MAX);
     let mut entries: Vec<_> = all
         .into_iter()
-        .filter(|e| e.owner_instance == instance.instance_id)
+        // Both owner fields, as the core state read checks them: a
+        // stale row a dropped instance left under the same id belongs
+        // to another installation.
+        .filter(|e| {
+            e.owner_instance == instance.instance_id
+                && *e.owner_install == *instance.installation_uuid
+        })
         .collect();
     entries.sort_by(|a, b| {
         (a.device_id.as_str(), a.capability.as_str())
@@ -654,7 +661,7 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
                 }
                 CommandOutcome::Rejected { error } => format!(" {}", render_error(error)),
                 CommandOutcome::TimedOut { message } | CommandOutcome::Unknown { message } => {
-                    format!(" {}", esc(message))
+                    format!(" {}", esc(&oxidhome_core::redact::redact_text(message)))
                 }
             };
             format!("{head} {}{detail}", outcome.as_str())
@@ -728,7 +735,10 @@ fn render_error(error: &WitError) -> String {
         WitError::Unavailable(m) => ("unavailable", m),
         WitError::Internal(m) => ("internal", m),
     };
-    format!("{kind}({message:?})")
+    format!(
+        "{kind}({:?})",
+        oxidhome_core::redact::redact_text(message).as_ref()
+    )
 }
 
 /// The redaction pass over a rendered snapshot (see [`Snapshot`],
@@ -813,6 +823,9 @@ impl<'a> Redactor<'a> {
         for (from, to) in self.replacements {
             text = text.replace(from.as_str(), to);
         }
+        // Ids first: a secret that overlaps one must not break it up
+        // and leave its random part behind.
+        let mut text = self.minted_ids(&text);
         // A string value equal to a secret, however short.
         for quoted in &self.quoted {
             let masked = if quoted.starts_with('\\') {
@@ -824,8 +837,7 @@ impl<'a> Redactor<'a> {
         }
         let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
         let text = oxidhome_core::redact::scrub_secret_values(&text, &secrets).into_owned();
-        let text = oxidhome_core::redact::scrub_text(&text).into_owned();
-        self.minted_ids(&text)
+        oxidhome_core::redact::scrub_text(&text).into_owned()
     }
 
     /// Replace host-minted ids with `<cmd-1>`-style placeholders.
@@ -1331,6 +1343,22 @@ mod tests {
                 )
             )
         );
+    }
+
+    #[test]
+    fn ids_and_errors_survive_secret_overlap() {
+        // A secret overlapping a minted id leaves no part of the id.
+        let mut snap = sample();
+        let call = format!("call-{}", "9f".repeat(16));
+        snap.storage = vec![format!("k = {call:?}")];
+        Redactor::new(&[], &["call".to_owned()]).apply(&mut snap);
+        // (The placeholder's name may be masked; the random part is gone.)
+        assert_eq!(snap.storage, ["k = \"<***-1>\""]);
+        // Structured credentials in a refusal's message are masked.
+        let text = render_error(&WitError::InvalidArgument(
+            r#"{"key":"password","value":"fixture-password"}"#.into(),
+        ));
+        assert!(!text.contains("fixture-password"), "{text}");
     }
 
     #[test]

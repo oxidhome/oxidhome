@@ -644,7 +644,13 @@ async fn hang_tick_is_interrupted_by_the_watchdog() {
             break;
         }
     }
-    let state = terminal.expect("the watchdog to interrupt the tick within 120 s");
+    let Some(state) = terminal else {
+        // Free the spinning worker before failing, or the runtime's
+        // teardown would wait for it forever.
+        clock.advance(Duration::from_hours(1));
+        let _ = tokio::time::timeout(Duration::from_secs(10), hang.wait_terminal()).await;
+        panic!("the watchdog didn't interrupt the tick within 120 s ({clock:?})");
+    };
     assert!(clock.elapsed() >= Duration::from_secs(30), "{clock:?}");
     let error = failed_error(state);
     assert!(error.contains("unresponsive"), "{error}");
