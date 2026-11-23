@@ -529,6 +529,8 @@ impl PluginState {
         // the `reads_state` grant's `plugin` selector matches on.
         let installation_uuid: Arc<str> = installation_uuid.into();
         device_state.bind_owner_plugin(&instance_id, &manifest.plugin.id, &installation_uuid);
+        // Start the `host-state` deny-audit worker off the read path.
+        let _ = super::state_read::deny_audit_queue();
         Self {
             instance_id,
             installation_uuid,

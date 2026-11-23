@@ -107,9 +107,11 @@ fn to_wit(entry: &DeviceState, vis: Visibility) -> WitDeviceState {
 }
 
 /// One refused read, recorded by [`deny_audit_worker`].
-struct DenyAudit {
+pub(crate) struct DenyAudit {
     log: Arc<crate::state::AuditLog>,
-    ctx: invocation::InvocationContext,
+    /// The caller's context; `None` (host-origin) is minted by the
+    /// worker, off the guest's path.
+    ctx: Option<invocation::InvocationContext>,
     instance_id: String,
     device: String,
 }
@@ -121,37 +123,44 @@ struct DenyAudit {
 /// neither the error nor its latency tells the plugin the device
 /// exists. The operator still sees the row.
 fn audit_state_denied(log: Option<Arc<crate::state::AuditLog>>, instance_id: &str, device: &str) {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::mpsc::{SyncSender, sync_channel};
-    static QUEUE: OnceLock<Option<SyncSender<DenyAudit>>> = OnceLock::new();
-    static DROPPED: AtomicU64 = AtomicU64::new(0);
     let Some(log) = log else {
         return;
     };
-    let queue = QUEUE.get_or_init(|| {
+    let job = DenyAudit {
+        log,
+        ctx: invocation::current(),
+        instance_id: instance_id.to_owned(),
+        device: device.to_owned(),
+    };
+    if deny_audit_queue().is_none_or(|q| q.try_send(job).is_err()) {
+        DENY_AUDIT_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+static DENY_AUDIT_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The audit worker's queue, starting the worker on first use. Called
+/// from `PluginState::new` so the first refused read doesn't pay for
+/// the thread start.
+pub(crate) fn deny_audit_queue() -> Option<&'static std::sync::mpsc::SyncSender<DenyAudit>> {
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{SyncSender, sync_channel};
+    static QUEUE: OnceLock<Option<SyncSender<DenyAudit>>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
         let (tx, rx) = sync_channel::<DenyAudit>(DENY_AUDIT_QUEUE);
         // A detached std thread: Tokio waits for blocking tasks at
         // runtime teardown, so a write stuck on the disk must not be
         // one. It exits when the process does.
         std::thread::Builder::new()
             .name("state-deny-audit".into())
-            .spawn(move || deny_audit_worker(&rx, &DROPPED))
+            .spawn(move || deny_audit_worker(&rx, &DENY_AUDIT_DROPPED))
             .map_err(|err| {
                 tracing::error!(target: "host.audit", error = %err, "state-read audit worker not started");
             })
             .ok()
             .map(|_| tx)
-    });
-    let job = DenyAudit {
-        log,
-        ctx: invocation::current_or_host(instance_id),
-        instance_id: instance_id.to_owned(),
-        device: device.to_owned(),
-    };
-    if queue.as_ref().is_none_or(|q| q.try_send(job).is_err()) {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-    }
+    })
+    .as_ref()
 }
 
 fn deny_audit_worker(
@@ -169,7 +178,10 @@ fn deny_audit_worker(
             device = %job.device,
             "get-state denied — no matching capabilities.reads_state grant",
         );
-        let root = job.ctx.root();
+        let ctx = job
+            .ctx
+            .unwrap_or_else(|| invocation::InvocationContext::host_origin(&job.instance_id));
+        let root = ctx.root();
         let entry = AuditEntry {
             id: 0,
             intent_ms: 0,
@@ -188,8 +200,8 @@ fn deny_audit_worker(
             execution_outcome: None,
             domain_error: None,
             credential_fp: None,
-            call_id: Some(job.ctx.call_id().to_owned()),
-            invocation: Some(job.ctx.audit_json()),
+            call_id: Some(ctx.call_id().to_owned()),
+            invocation: Some(ctx.audit_json()),
             command_id: None,
             command_outcome: None,
         };

@@ -498,7 +498,9 @@ fn restore_revisions(
             m.revision >= max_row_revision
                 && super::is_valid_epoch(&m.epoch)
                 && m.evicted_through <= flushed.saturating_add(REVISION_GAP)
-                && m.holes.iter().all(|&(lo, hi)| lo < hi && hi <= flushed)
+                // Every boot records exactly `(R, R + GAP)`, in order.
+                && m.holes.iter().all(|&(lo, hi)| lo.checked_add(REVISION_GAP) == Some(hi) && hi <= flushed)
+                && m.holes.windows(2).all(|w| w[0].1 <= w[1].0)
         });
     if let Some(meta) = meta.filter(|_| usable) {
         let base = flushed + REVISION_GAP;
@@ -870,9 +872,14 @@ fn decode_row(row: &rusqlite::Row<'_>) -> Option<DeviceState> {
     let blob: Vec<u8> = row.get(4).ok()?;
     let fields = decode_fields(&blob).ok()?;
     let quality: String = row.get(9).ok()?;
+    let device_id: String = row.get(0).ok()?;
+    let capability: String = row.get(1).ok()?;
+    if device_id.is_empty() || capability.is_empty() {
+        return None;
+    }
     Some(DeviceState {
-        device_id: row.get(0).ok()?,
-        capability: row.get(1).ok()?,
+        device_id,
+        capability,
         owner_instance: row.get(2).ok()?,
         owner_plugin: row.get(3).ok()?,
         owner_install: row.get(10).ok()?,
@@ -1332,6 +1339,7 @@ mod tests {
             "UPDATE device_state_meta SET evicted_through = -1",
             "UPDATE device_state_meta SET epoch = ''",
             "UPDATE device_state_meta SET revision = 0",
+            "UPDATE device_state_meta SET holes_json = '[[1,2]]'",
         ] {
             let dir = tempdir();
             let store = open(&dir);
@@ -1398,6 +1406,9 @@ mod tests {
         assert!(store.close_persistence());
         drop(store);
         let store = open(&dir);
+        // A supervisor starting (a no-op stale sweep) must not evict.
+        let _ = store.restart_generation("inst");
+        let _ = store.restart_generation("other-inst");
         assert_eq!(
             store
                 .snapshot_page_capped(None, usize::MAX, usize::MAX, usize::MAX, |_| true)

@@ -1518,7 +1518,13 @@ impl DeviceStateStore {
             inner.touch(key);
             inner.entries.insert(key.clone(), updated);
         }
-        Self::enforce_stale_cap_locked(inner);
+        // Only a sweep that made something stale can push the count
+        // past the cap. A no-op sweep must not evict: right after a
+        // restore the store may hold more stale slots than the cap
+        // (persisted state kept until owners return, H2).
+        if !keys_to_stale.is_empty() {
+            Self::enforce_stale_cap_locked(inner);
+        }
         keys_to_stale.len()
     }
 
