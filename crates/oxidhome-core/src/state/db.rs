@@ -949,7 +949,7 @@ impl Db {
     /// Forwards any rusqlite open / migration error verbatim.
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory `SQLite` database")?;
-        Self::initialize(None, conn, ConnectionPolicy::default())
+        Self::initialize(None, None, conn, ConnectionPolicy::default())
     }
 
     /// Open the persistent database at `<state_dir>/oxidhome.db`.
@@ -983,9 +983,14 @@ impl Db {
         // opens, so readers and the checkpointer, which open later,
         // reach the same file even after a working-directory change
         // or a symlinked state dir being retargeted.
-        let path = std::fs::canonicalize(state_dir)
-            .with_context(|| format!("resolving state dir {}", state_dir.display()))?
-            .join(DB_FILE_NAME);
+        let state_dir = std::fs::canonicalize(state_dir)
+            .with_context(|| format!("resolving state dir {}", state_dir.display()))?;
+        let mut path = state_dir.join(DB_FILE_NAME);
+        if path.exists() {
+            // A symlinked database file: pin its target too.
+            path = std::fs::canonicalize(&path)
+                .with_context(|| format!("resolving {}", path.display()))?;
+        }
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database at {}", path.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
@@ -1011,7 +1016,7 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enabling foreign_keys")?;
         apply_checkpoint_pragmas(&conn)?;
-        let mut db = Self::initialize(Some(path.clone()), conn, policy)?;
+        let mut db = Self::initialize(Some(path.clone()), Some(&state_dir), conn, policy)?;
         // Readers and the checkpointer start only after migrations,
         // so none of them ever caches a pre-migration schema.
         db.checkpointer = Some(Checkpointer::start(&path, policy.checkpoint_interval)?);
@@ -1021,6 +1026,7 @@ impl Db {
 
     fn initialize(
         path: Option<PathBuf>,
+        state_dir: Option<&Path>,
         conn: Connection,
         policy: ConnectionPolicy,
     ) -> anyhow::Result<Self> {
@@ -1045,7 +1051,7 @@ impl Db {
         // M3 migration preflight: an existing file-backed database
         // with pending migrations gets an integrity check + snapshot
         // first. A fresh database (v0) has nothing to protect.
-        if let Some(state_dir) = path.as_deref().and_then(Path::parent)
+        if let Some(state_dir) = state_dir
             && pre_open_user_version > 0
             && pre_open_user_version < target
         {
@@ -1640,8 +1646,10 @@ fn checkpoint_loop(conn: &Connection, shared: &CheckpointShared, interval: Durat
         match conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", (), |row| {
             row.get::<_, i64>(0)
         }) {
-            Ok(_) => {
-                shared.runs.fetch_add(1, Ordering::Relaxed);
+            Ok(busy) => {
+                if busy == 0 {
+                    shared.runs.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Err(err) => {
                 tracing::warn!(
@@ -2486,7 +2494,25 @@ mod tests {
         };
         let db = Db::open_file_with_policy(dir.path(), policy).expect("open");
         db.write(|c| insert_log_rows(c, 100)).expect("insert");
-        wait_until("a passive checkpoint", || db.checkpoints_run() >= 1);
+        // The rows reach the main database file (not just the WAL)
+        // while the `Db` is alive and idle: a copy of the main file
+        // alone, opened without its WAL, already holds them.
+        let main_file = dir.path().join(DB_FILE_NAME);
+        let snap_dir = tempdir_for_test();
+        let snap = snap_dir.path().join("snap.db");
+        wait_until("a checkpoint of the seeded rows", || {
+            if std::fs::copy(&main_file, &snap).is_err() {
+                return false;
+            }
+            let count = Connection::open(&snap).and_then(|c| {
+                c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get::<_, i64>(0))
+            });
+            for suffix in ["-wal", "-shm"] {
+                let _ = std::fs::remove_file(snap_dir.path().join(format!("snap.db{suffix}")));
+            }
+            matches!(count, Ok(100))
+        });
+        assert!(db.checkpoints_run() >= 1);
         let worker = Arc::downgrade(
             &db.checkpointer
                 .as_ref()

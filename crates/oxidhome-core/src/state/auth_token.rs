@@ -260,13 +260,14 @@ impl TokenStore {
     }
 
     /// [`Self::touch_last_used`] for a caller that already holds the
-    /// row from [`Self::verify_read_only`]: coalesces on the newer of
-    /// the row's `last_used_ms` and this process's last write, so
-    /// eviction from the in-process map never forces a write.
+    /// row from [`Self::verify_read_only`] (`recorded` is its
+    /// `last_used_ms`): coalesces on the newer of that and this
+    /// process's last write, so eviction from the in-process map
+    /// never forces a write.
     #[must_use]
-    pub fn touch_last_used_from(&self, rec: &TokenRecord) -> i64 {
-        let recorded = rec.last_used_ms.max(self.cached_last_used(&rec.id));
-        self.bump_last_used(&rec.id, recorded)
+    pub fn touch_last_used_from(&self, token_id: &str, recorded: Option<i64>) -> i64 {
+        let recorded = recorded.max(self.cached_last_used(token_id));
+        self.bump_last_used(token_id, recorded)
     }
 
     /// Whether a `last_used_ms` value is recent enough that a bump
@@ -1094,7 +1095,10 @@ mod tests {
         let rec = store.verify_read_only(&issued.plaintext).unwrap();
         // Stale the row behind the record's back: the record wins.
         set_last_used(&db, &issued.id, 1);
-        assert_eq!(store.touch_last_used_from(&rec), recent);
+        assert_eq!(
+            store.touch_last_used_from(&rec.id, rec.last_used_ms),
+            recent
+        );
         assert_eq!(
             store.get(&issued.id).unwrap().unwrap().last_used_ms,
             Some(1)

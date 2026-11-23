@@ -712,18 +712,18 @@ async fn try_best_effort_touch(
             return;
         };
         let tokens = Arc::clone(tokens);
-        let rec = rec.clone();
+        let (id, recorded) = (token_id.to_string(), rec.last_used_ms);
         let _ = tokio::task::spawn_blocking(move || {
             let _guard = permit;
-            let _ = tokens.touch_last_used_from(&rec);
+            let _ = tokens.touch_last_used_from(&id, recorded);
         })
         .await;
         return;
     }
     let tokens = Arc::clone(tokens);
-    let rec = rec.clone();
+    let (id, recorded) = (token_id.to_string(), rec.last_used_ms);
     let _ = tokio::task::spawn_blocking(move || {
-        let _ = tokens.touch_last_used_from(&rec);
+        let _ = tokens.touch_last_used_from(&id, recorded);
     })
     .await;
 }
