@@ -4570,7 +4570,11 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
         .iter()
         .map(|d| d["device_id"].as_str().unwrap())
         .collect();
-    assert_eq!(page2_ids, ["dev-2"], "entries newer than the pin are left out");
+    assert_eq!(
+        page2_ids,
+        ["dev-2"],
+        "entries newer than the pin are left out"
+    );
 
     // A follow-up `/state/changes?since_revision=<pinned>`
     // now picks up dev-0's update (it has global_revision > pinned).
@@ -4589,7 +4593,10 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
         "the update that landed during pagination must surface via /state/changes; got {changed_ids:?}",
     );
     for id in ["dev-3", "dev-9"] {
-        assert!(changed_ids.contains(&id), "{id} missing from {changed_ids:?}");
+        assert!(
+            changed_ids.contains(&id),
+            "{id} missing from {changed_ids:?}"
+        );
     }
 }
 
