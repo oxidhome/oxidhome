@@ -92,18 +92,19 @@ have no audit row to complete.
 - **Boot.** Before any plugin runs, every surviving row is resolved to `outcome_unknown` with a `COMMAND` row whose
   `domain_error` is `daemon_restart`, or `expired` if its expiry had already passed, and deleted in the same
   transaction. Other expiry rows carry `expired`, `instance_restarted` or `instance_stopped` in the same column. A
-  clean shutdown expires pending commands as `instance_stopped` when their instances stop, so only a crash or a
-  supervisor that misses the shutdown deadline leaves rows for the next boot. A failed reconciliation stops the boot, as a failed
+  supervisor expires its pending commands as `instance_stopped` before it publishes its terminal state, so only a
+  crash or a supervisor that misses the shutdown deadline leaves rows for the next boot. A failed reconciliation stops the boot, as a failed
   device-state restore does. A resolution whose persisted row is already gone (another boot reconciled it) writes no
   second row. Persisted rows are redacted like audit rows (M7).
 - **Queued commands that are dropped.** A command refused during a restart backoff, or still queued when its
-  supervisor goes terminal (the supervisor now drains and refuses its queue before it publishes the terminal state),
-  is `rejected`. If its caller
-  disconnected, that outcome is recorded as a `COMMAND` row.
+  supervisor goes terminal (the supervisor drains and refuses its queue before it publishes the terminal state), is
+  `rejected` when the refusal wins while its caller still waits within its deadline, and `timed_out` when the caller
+  had already gone or its deadline had passed. Neither ran. If its caller disconnected, that outcome is recorded as a
+  `COMMAND` row.
 - **Service calls.** `ExecuteService` carries the same dispatch ticket. When the caller's wait ends while the call is
   queued, it never runs, and `call-service` answers `unavailable` with "it did not run" (safe to retry). Once the
   callee started, a missed deadline or a lost supervisor answers `ok(unknown(..))`, as a trap already did. The WIT
   contract is unchanged; the H6 hop row is finalized `allow` with no execution outcome for `unknown`, and `error` /
   503 for a call that did not run. A caller cancelled mid-call (its future dropped) gets the same split from the
-  ticket, so its hop row never stays `pending`, and a withdrawn queued call releases its in-flight refcount at once.
+  ticket, so its hop row doesn't stay `pending` (short of a runtime torn down before the finalize is written), and a withdrawn queued call releases its in-flight refcount at once.
 

@@ -206,6 +206,31 @@ async fn clean_stop_leaves_nothing_to_reconcile() {
     );
 }
 
+/// The stop expiry is queued before the terminal state is published:
+/// a journal closed as soon as the instance is terminal, without
+/// waiting for the reaper, already holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_expiry_is_queued_before_the_terminal_state() {
+    let state_dir = support::tempdir("h5-stop-order");
+    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
+    let (handle, device) = start_deferred(&engine).await;
+    let report = handle
+        .execute_command_in(api_root(), device, toggle(true))
+        .await;
+    assert!(matches!(report.outcome, CommandOutcome::Accepted));
+    handle.stop().await.expect("stop");
+    assert!(matches!(
+        handle.wait_terminal().await,
+        InstanceState::Stopped
+    ));
+    assert!(engine.close_command_journal(Duration::from_secs(5)));
+    let stopped = command_rows(&engine, |r| {
+        r.command_id.as_deref() == Some(report.command_id.as_str())
+    });
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(stopped[0].domain_error.as_deref(), Some("instance_stopped"));
+}
+
 /// Enqueue `cmd` for `handle` under `root` and drop the caller right
 /// after: the client disconnected while the command was queued.
 async fn enqueue_and_disconnect(handle: &InstanceHandle, root: InvocationContext, device: String) {
@@ -540,7 +565,18 @@ async fn cancelled_service_caller_finalizes_its_hop_row() {
     let (running_id, running) = call();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (queued_id, queued) = call();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Both calls hold their refcount, so both are past their hop's
+    // intent write and dispatched.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.services().active_call_count(&service) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "calls never dispatched"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Give the supervisor time to enter the first call.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     queued.abort();
     running.abort();
 

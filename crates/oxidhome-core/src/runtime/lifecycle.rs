@@ -245,6 +245,16 @@ impl SharedCallGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
+
+    /// Drop the guard (if still held) under the lock, so whoever finds
+    /// it gone knows the refcount was already decremented.
+    fn release(&self) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(slot.take());
+    }
 }
 
 /// Releases the [`SharedCallGuard`] of a service call that never
@@ -258,7 +268,7 @@ struct ReleaseUnlessStarted {
 impl Drop for ReleaseUnlessStarted {
     fn drop(&mut self) {
         if !self.ticket.started() {
-            drop(self.guard.take());
+            self.guard.release();
         }
     }
 }
@@ -1465,6 +1475,11 @@ async fn run_supervisor(
     while let Some(ctrl) = control_rx.recv().await {
         refuse_unserved(ctrl, &instance_id, "stopped before running it", &pending);
     }
+    // Its accepted commands can't complete any more. Queued before the
+    // terminal state, so a journal closed right after `stop` (or a
+    // `supervise` caller with no reaper) still records them as
+    // stopped rather than leaving them to the next boot.
+    pending.expire_owner(&instance_id, super::ExpiryReason::InstanceStopped);
     transition(&state_tx, &instance_id, terminal);
 }
 
@@ -1893,7 +1908,7 @@ fn refuse_unserved(ctrl: ControlCommand, instance_id: &str, why: &str, pending: 
             let _ = ticket.try_refuse();
             // Released before the reply, as on the dequeue refusal, so
             // the caller never sees the refused call still active.
-            drop(guard.take());
+            guard.release();
             let _ = reply.send(Err(anyhow!("instance `{instance_id}` {why}")));
         }
         ControlCommand::Shutdown { reply } => {
@@ -2081,7 +2096,7 @@ async fn handle_control(
             // call was queued knows it never ran.
             if !ticket.try_start_unless(|| ctx.is_expired()) {
                 let _ = ticket.try_abandon();
-                drop(guard.take());
+                guard.release();
                 let _ = reply.send(Err(anyhow!(
                     "instance `{instance_id}` refused execute-service-command: invocation \
                      `{}` deadline exceeded before dispatch",

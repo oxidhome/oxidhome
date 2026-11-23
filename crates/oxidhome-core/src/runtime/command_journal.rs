@@ -295,7 +295,7 @@ fn run(shared: &Shared, db: &Db) {
                     jobs = batch.len(),
                     "command journal batch failed; retrying",
                 );
-                std::thread::sleep(RETRY_DELAY);
+                wait_retry_unless_closed(shared);
                 continue;
             }
             // Closing: retry within the close budget, then give up.
@@ -320,6 +320,23 @@ fn run(shared: &Shared, db: &Db) {
         if q.jobs.is_empty() {
             shared.idle.notify_all();
         }
+    }
+}
+
+/// Wait [`RETRY_DELAY`] before retrying a failed batch, cut short by
+/// a close so the retry moves onto the close budget at once.
+fn wait_retry_unless_closed(shared: &Shared) {
+    let until = Instant::now() + RETRY_DELAY;
+    let mut q = shared.lock();
+    while !q.closed {
+        let Some(left) = until.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        q = shared
+            .work
+            .wait_timeout(q, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
     }
 }
 
@@ -688,6 +705,34 @@ mod tests {
         assert!(journal.close(Duration::from_secs(5)), "the retry wrote it");
         restore.join().unwrap();
         assert_eq!(resolution_rows(&db).len(), 1);
+    }
+
+    #[test]
+    fn a_close_cuts_short_the_retry_wait_of_a_batch_failing_before_it() {
+        let db = db();
+        let journal = CommandJournal::start(Arc::clone(&db)).expect("journal");
+        db.write(|c| c.execute_batch("ALTER TABLE pending_command RENAME TO pc_away"))
+            .unwrap();
+        assert!(journal.persist(row("cmd-a", i64::MAX)));
+        // The first attempt fails; the worker is now in its 1 s retry
+        // wait.
+        std::thread::sleep(Duration::from_millis(100));
+        let restore = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                db.write(|c| c.execute_batch("ALTER TABLE pc_away RENAME TO pending_command"))
+                    .unwrap();
+            })
+        };
+        // Well under the 1 s wait: only a close that wakes the worker
+        // gets the retry in.
+        assert!(
+            journal.close(Duration::from_millis(500)),
+            "the retry wrote it"
+        );
+        restore.join().unwrap();
+        assert_eq!(load_rows(&db).unwrap().len(), 1);
     }
 
     #[test]
