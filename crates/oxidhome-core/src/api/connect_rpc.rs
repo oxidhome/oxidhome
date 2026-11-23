@@ -360,26 +360,21 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .devices()
             .list()
             .into_iter()
-            .map(|meta| Device {
-                device_id: meta.id.clone(),
-                owner_instance: meta.owner_instance.clone(),
-                name: meta.info.name.clone(),
-                category: self
-                    .engine
-                    .devices()
-                    .class_of(&meta.id)
-                    .category()
-                    .as_str()
-                    .to_owned(),
-                sensitive: self
-                    .engine
-                    .devices()
-                    .class_of(&meta.id)
-                    .sensitive()
-                    .iter()
-                    .map(|c| c.as_str().to_owned())
-                    .collect(),
-                ..Default::default()
+            .map(|meta| {
+                // One read, so `category` and `sensitive` agree.
+                let class = self.engine.devices().class_of(&meta.id);
+                Device {
+                    device_id: meta.id.clone(),
+                    owner_instance: meta.owner_instance.clone(),
+                    name: meta.info.name.clone(),
+                    category: class.category().as_str().to_owned(),
+                    sensitive: class
+                        .sensitive()
+                        .iter()
+                        .map(|c| c.as_str().to_owned())
+                        .collect(),
+                    ..Default::default()
+                }
             })
             .collect();
         Response::ok(ListDevicesResponse {

@@ -83,6 +83,14 @@ pub enum DeviceMetaError {
     /// The id isn't a host device id (`dev-` + 16 lowercase hex).
     #[error("`{0}` is not a device id (dev-<16 hex>)")]
     BadDeviceId(String),
+    /// A raise to `camera` for a device whose owning instance the host
+    /// can't find: the raise would protect the device but not the
+    /// instance's other bytes, so it is refused.
+    #[error(
+        "`{0}` has no known owning instance (not registered, no stored state or events); \
+         start its plugin and set the category again"
+    )]
+    UnknownOwner(String),
 }
 
 /// The `device_meta` table plus its in-memory copy. One per
@@ -280,14 +288,19 @@ impl DeviceMetaStore {
         let mut owner = owner_instance
             .map(str::to_owned)
             .or_else(|| rows.get(device_id).and_then(|r| r.owner_instance.clone()));
+        if let Some(db) = &self.db
+            && owner.is_none()
+        {
+            // Not registered right now (an offline CLI run, a stopped
+            // plugin): the owner from what the host kept of the
+            // device, so a raise to `camera` still classes its
+            // instance's other data.
+            owner = db.read(|conn| known_owner(conn, device_id))?;
+        }
+        if category == Some(DeviceCategory::Camera) && owner.is_none() {
+            return Err(DeviceMetaError::UnknownOwner(device_id.to_owned()));
+        }
         if let Some(db) = &self.db {
-            if owner.is_none() {
-                // Not registered right now (an offline CLI run, a
-                // stopped plugin): the owner from what the host kept
-                // of the device, so a raise to `camera` still classes
-                // its instance's other data.
-                owner = db.read(|conn| known_owner(conn, device_id))?;
-            }
             durable_write(db, |conn| {
                 conn.execute(
                     "INSERT INTO device_meta \
@@ -476,6 +489,25 @@ mod tests {
         // A known device and another instance are unaffected.
         store.observe("dev-0000000000000000", "p", lock).unwrap();
         store.observe("dev-ffffffffffffffff", "q", lock).unwrap();
+    }
+
+    /// A raise to `camera` needs the owning instance, so the whole
+    /// instance is classed; other raises don't.
+    #[test]
+    fn camera_raise_needs_a_known_owner() {
+        let store = DeviceMetaStore::open(Arc::new(Db::open_in_memory().unwrap())).unwrap();
+        assert!(matches!(
+            store.set_override(DEV, Some(DeviceCategory::Camera), None),
+            Err(DeviceMetaError::UnknownOwner(_))
+        ));
+        store
+            .set_override(DEV, Some(DeviceCategory::Lock), None)
+            .expect("lock needs no owner");
+        let row = store
+            .set_override(DEV, Some(DeviceCategory::Camera), Some("inst"))
+            .expect("owner given");
+        assert_eq!(row.owner_instance.as_deref(), Some("inst"));
+        assert!(store.instance_is_camera("inst"));
     }
 
     #[test]

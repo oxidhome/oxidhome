@@ -286,10 +286,13 @@ impl DeviceRegistry {
         info: DeviceInfo,
     ) -> DeviceId {
         let id = stable_device_id(installation_uuid, &owner_instance, &info.local_id);
-        // Unchecked path (tests and dev loads): a refused floor write
-        // is logged, the in-memory registration still happens.
+        // Unchecked path (tests and embedders; plugins go through
+        // `try_register`). A refused floor write fails closed: the
+        // device is not registered (and so can't be commanded or
+        // read), the error is logged, and the id is still returned.
         if let Err(err) = self.observe(&id, &owner_instance, &info) {
-            tracing::error!(target: "auth.device_meta", device_id = %id, ?err, "floor not recorded");
+            tracing::error!(target: "auth.device_meta", device_id = %id, ?err, "floor not recorded; device not registered");
+            return id;
         }
         let meta = Arc::new(DeviceMeta {
             id: id.clone(),

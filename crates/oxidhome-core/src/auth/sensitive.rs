@@ -102,7 +102,7 @@ impl SensitiveGuard {
             let key = (principal.to_owned(), category);
             if !buckets.contains_key(&key)
                 && buckets.len() >= MAX_BUCKETS
-                && !evict_refilled(&mut buckets, now)
+                && !evict_refilled(&mut buckets, principal, now)
             {
                 // Every tracked bucket is still mid-window: dropping
                 // one would hand its principal a fresh allowance, so
@@ -125,9 +125,10 @@ impl SensitiveGuard {
             }
         }
         for category in categories.iter() {
-            if let Some(b) = buckets.get_mut(&(principal.to_owned(), category)) {
-                b.tokens -= 1.0;
-            }
+            let b = buckets
+                .get_mut(&(principal.to_owned(), category))
+                .expect("checked above; eviction spares the charging principal");
+            b.tokens -= 1.0;
         }
         Ok(())
     }
@@ -255,15 +256,19 @@ fn rate(limit: RateLimit) -> (f64, f64) {
     (capacity, capacity / limit.per.as_secs_f64())
 }
 
-/// Drop the least recently used bucket that has refilled completely
-/// (indistinguishable from a fresh one, so forgetting it resets
-/// nothing). `false` when every bucket is still below capacity.
+/// Drop the least recently used bucket, of another principal, that has
+/// refilled completely (indistinguishable from a fresh one, so
+/// forgetting it resets nothing). `false` when there is none.
 fn evict_refilled(
     buckets: &mut HashMap<(String, SensitiveCategory), Bucket>,
+    principal: &str,
     now: Instant,
 ) -> bool {
     let key = buckets
         .iter()
+        // Never the charging principal's own buckets: a multi-category
+        // charge must not evict the bucket it just checked.
+        .filter(|((owner, _), _)| owner != principal)
         .filter(|((_, category), b)| {
             let (capacity, refill) = rate(RateLimit::for_category(*category));
             let mut b = **b;
@@ -297,6 +302,24 @@ mod tests {
         ));
         // Known principals keep their own buckets.
         g.charge("p0", lock).expect("p0 still has allowance");
+    }
+
+    /// With one free slot, a two-category charge can't evict the
+    /// bucket it just made for its first category.
+    #[test]
+    fn a_multi_category_charge_keeps_its_own_buckets() {
+        let (g, _) = guard();
+        let lock: SensitiveSet = [SensitiveCategory::Lock].into_iter().collect();
+        for i in 0..MAX_BUCKETS - 1 {
+            g.charge(&format!("p{i}"), lock).expect("room");
+        }
+        let both: SensitiveSet = [SensitiveCategory::Lock, SensitiveCategory::Opener]
+            .into_iter()
+            .collect();
+        assert!(matches!(
+            g.charge("newcomer", both),
+            Err(ObligationError::RateLimited { .. })
+        ));
     }
 
     fn guard() -> (SensitiveGuard, Arc<AuditLog>) {

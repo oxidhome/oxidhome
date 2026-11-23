@@ -567,9 +567,14 @@ async fn set_device_category(
     let stored = tokio::task::spawn_blocking(move || devices.set_category(&id, category))
         .await
         .map_err(|_| CategoryError::Internal)?
-        .map_err(|err| {
-            tracing::error!(target: "api.devices", error = %err, "storing a category override failed");
-            CategoryError::Internal
+        .map_err(|err| match err {
+            crate::state::DeviceMetaError::UnknownOwner(_) => {
+                CategoryError::BadRequest(err.to_string())
+            }
+            err => {
+                tracing::error!(target: "api.devices", error = %err, "storing a category override failed");
+                CategoryError::Internal
+            }
         })?;
     tracing::warn!(
         target: "auth.sensitive",

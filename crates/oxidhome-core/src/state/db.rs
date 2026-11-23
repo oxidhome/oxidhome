@@ -890,7 +890,8 @@ const MIGRATIONS: &[&str] = &[
     //   category raise, and the registering instance. See
     //   `state::device_meta`. Backfilled with a `camera` floor for
     //   every device whose `video-stream` state or state-change
-    //   events (`topic = 'video-stream'`) are persisted, so the
+    //   events (a `StateChanged` payload, not a custom event that
+    //   happens to share the topic) are persisted, so the
     //   state restored before plugins load (and the instance's blobs)
     //   is camera data from the first read after upgrade. The other
     //   sensitive capabilities are new in this version.
@@ -916,7 +917,11 @@ const MIGRATIONS: &[&str] = &[
       FROM device_state WHERE capability = 'video-stream';
     INSERT OR IGNORE INTO device_meta(device_id, owner_instance, sensitive_floor, category_override, updated_ms)
     SELECT device_id, MIN(instance_id), 'camera', NULL, 0
-      FROM event_log WHERE topic = 'video-stream' AND device_id IS NOT NULL
+      FROM event_log
+     WHERE topic = 'video-stream' AND device_id IS NOT NULL
+       AND json_valid(payload_blob)
+       AND json_extract(payload_blob, '$.t') = 'StateChanged'
+       AND json_extract(payload_blob, '$.v.capability') = 'video-stream'
      GROUP BY device_id;
     ",
 ];
@@ -2045,9 +2050,14 @@ mod tests {
                            ('dev-00000000000000bb', 'on-off', 'cam', 'p', 'u', X'00', 2, 1, 1, 1, 'ok');
                     -- State evicted, history kept.
                     INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
-                    VALUES (1, 1, 'dev-00000000000000cc', 'cam2', 'p', 'video-stream', X'00'),
-                           (2, 2, 'dev-00000000000000aa', 'cam', 'p', 'video-stream', X'00'),
-                           (3, 3, 'dev-00000000000000dd', 'lamp', 'p', 'on-off', X'00');
+                    VALUES (1, 1, 'dev-00000000000000cc', 'cam2', 'p', 'video-stream',
+                            CAST('{\"t\":\"StateChanged\",\"v\":{\"capability\":\"video-stream\",\"fields\":[]}}' AS BLOB)),
+                           (2, 2, 'dev-00000000000000aa', 'cam', 'p', 'video-stream',
+                            CAST('{\"t\":\"StateChanged\",\"v\":{\"capability\":\"video-stream\",\"fields\":[]}}' AS BLOB)),
+                           (3, 3, 'dev-00000000000000dd', 'lamp', 'p', 'on-off', X'00'),
+                           -- A custom event sharing the topic is not a camera.
+                           (4, 4, 'dev-00000000000000ee', 'lamp', 'p', 'video-stream',
+                            CAST('{\"t\":\"Custom\",\"v\":{\"topic\":\"video-stream\"}}' AS BLOB));
                     PRAGMA user_version = 20;
                     ",
                 )
