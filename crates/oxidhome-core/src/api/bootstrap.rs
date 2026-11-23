@@ -166,7 +166,7 @@ pub fn ensure_admin_token(
         }
     };
 
-    match tokens.insert_if_empty(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON) {
+    match tokens.insert_owner_if_empty(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON) {
         Ok(true) => {}
         Ok(false) => {
             remove_quietly(&pending);
@@ -326,8 +326,8 @@ fn stale_subject(secret: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RevokeScope {
     /// Revoke every active token labelled `ADMIN_TOKEN_LABEL` —
-    /// the previous bootstrap / recovery tokens. Other tokens keep
-    /// working.
+    /// the previous bootstrap / recovery tokens — and the owner
+    /// token. Other tokens keep working.
     #[default]
     AdminTokens,
     /// Revoke every active token (credential-compromise response).
@@ -401,7 +401,9 @@ pub fn recover_admin_token(
         .context("listing tokens")?
         .into_iter()
         .filter(|t| t.revoked_ms.is_none())
-        .filter(|t| scope == RevokeScope::All || t.label == ADMIN_TOKEN_LABEL)
+        // H6 slice 2: the previous owner too, whatever its label, so
+        // recovery leaves exactly one owner.
+        .filter(|t| scope == RevokeScope::All || t.label == ADMIN_TOKEN_LABEL || t.owner)
         .map(|t| t.id)
         .collect();
 
@@ -930,7 +932,7 @@ mod tests {
         write_new_secret(&pending_path(fx.dir.path(), &live.id), &live.plaintext).unwrap();
         assert!(
             fx.tokens
-                .insert_if_empty(&live, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
+                .insert_owner_if_empty(&live, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
                 .unwrap()
         );
         // Crash before the insert: never committed.

@@ -223,6 +223,12 @@ async fn lock_commands_need_an_explicit_grant() {
         .count();
     assert_eq!(granted_rows, 10, "one warn row per allowed command");
 
+    // An empty body doesn't clear it: the field is required.
+    let (status, _) = send(&router, "PUT", &category_uri, &owner.plaintext, "{}").await;
+    assert!(status.is_client_error(), "{status}");
+    let (status, _) = send(&router, "POST", &command_uri, &wildcard.plaintext, TOGGLE).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
     // Clearing the raise puts the switch back in reach.
     let (status, _) = send(
         &router,
@@ -259,7 +265,8 @@ fn category_override_persists_and_only_raises() {
     {
         let engine = Engine::with_state_dir(state.path()).expect("engine");
         oxidhome_core::api::sensitive_admin::set_device_category(
-            &engine,
+            &engine.audit_log(),
+            engine.devices().meta(),
             id,
             Some(DeviceCategory::Opener),
         )
@@ -283,7 +290,8 @@ fn category_override_persists_and_only_raises() {
 
 fn set_bad_id(engine: &Engine) -> anyhow::Result<()> {
     oxidhome_core::api::sensitive_admin::set_device_category(
-        engine,
+        &engine.audit_log(),
+        engine.devices().meta(),
         "not-a-device",
         Some(DeviceCategory::Lock),
     )

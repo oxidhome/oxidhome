@@ -79,7 +79,7 @@ use oxidhome_core::api::mcp::{
 };
 use oxidhome_core::api::sensitive_admin::{
     grant_sensitive, revoke_sensitive, sensitive_access_report, set_device_category,
-    with_offline_engine,
+    with_offline_stores,
 };
 use oxidhome_core::api::{
     ApiConfig, RevokeScope, bind, ensure_admin_token, reconcile_admin_token_files,
@@ -566,8 +566,8 @@ fn run_token() -> anyhow::Result<()> {
         Some("list") if args.len() == 1 => {
             init_cli_tracing();
             let state_dir = resolve_state_dir()?;
-            with_offline_engine(&state_dir, |engine| {
-                for t in engine.auth_tokens().list()? {
+            with_offline_stores(&state_dir, |stores| {
+                for t in stores.tokens.list()? {
                     let policy = oxidhome_core::auth::parse_policy(&t.scope_json);
                     let sensitive = policy.as_ref().map_or_else(
                         || "(unparseable policy: deny-all)".to_owned(),
@@ -622,12 +622,11 @@ fn run_token() -> anyhow::Result<()> {
             }
             init_cli_tracing();
             let state_dir = resolve_state_dir()?;
-            let policy = with_offline_engine(&state_dir, |engine| {
-                let (tokens, audit) = (engine.auth_tokens(), engine.audit_log());
+            let policy = with_offline_stores(&state_dir, |stores| {
                 if cmd == "grant-sensitive" {
-                    grant_sensitive(&tokens, &audit, token_id, category, &devices)
+                    grant_sensitive(&stores.tokens, &stores.audit, token_id, category, &devices)
                 } else {
-                    revoke_sensitive(&tokens, &audit, token_id, category)
+                    revoke_sensitive(&stores.tokens, &stores.audit, token_id, category)
                 }
             })?;
             println!(
@@ -672,8 +671,8 @@ fn run_device() -> anyhow::Result<()> {
             };
             init_cli_tracing();
             let state_dir = resolve_state_dir()?;
-            let row = with_offline_engine(&state_dir, |engine| {
-                set_device_category(engine, device_id, category)
+            let row = with_offline_stores(&state_dir, |stores| {
+                set_device_category(&stores.audit, &stores.devices, device_id, category)
             })?;
             println!(
                 "device {device_id} category override: {}",

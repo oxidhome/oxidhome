@@ -45,6 +45,9 @@ pub const AUDIT_METHOD_AUTHZ: &str = "AUTHZ";
 /// hasn't touched for longest.
 const MAX_BUCKETS: usize = 4096;
 
+/// `Retry-After` when the bucket table is full of mid-window buckets.
+const TABLE_FULL_RETRY_SECS: u64 = 60;
+
 /// Why the obligations of an allowed sensitive action weren't met.
 #[derive(Debug, thiserror::Error)]
 pub enum ObligationError {
@@ -97,8 +100,17 @@ impl SensitiveGuard {
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         for category in categories.iter() {
             let key = (principal.to_owned(), category);
-            if !buckets.contains_key(&key) && buckets.len() >= MAX_BUCKETS {
-                evict_lru(&mut buckets);
+            if !buckets.contains_key(&key)
+                && buckets.len() >= MAX_BUCKETS
+                && !evict_refilled(&mut buckets, now)
+            {
+                // Every tracked bucket is still mid-window: dropping
+                // one would hand its principal a fresh allowance, so
+                // refuse the newcomer instead.
+                return Err(ObligationError::RateLimited {
+                    category,
+                    retry_after_secs: TABLE_FULL_RETRY_SECS,
+                });
             }
             let (capacity, refill) = rate(RateLimit::for_category(category));
             let bucket = buckets
@@ -243,14 +255,24 @@ fn rate(limit: RateLimit) -> (f64, f64) {
     (capacity, capacity / limit.per.as_secs_f64())
 }
 
-fn evict_lru(buckets: &mut HashMap<(String, SensitiveCategory), Bucket>) {
-    if let Some(key) = buckets
+/// Drop the least recently used bucket that has refilled completely
+/// (indistinguishable from a fresh one, so forgetting it resets
+/// nothing). `false` when every bucket is still below capacity.
+fn evict_refilled(
+    buckets: &mut HashMap<(String, SensitiveCategory), Bucket>,
+    now: Instant,
+) -> bool {
+    let key = buckets
         .iter()
+        .filter(|((_, category), b)| {
+            let (capacity, refill) = rate(RateLimit::for_category(*category));
+            let mut b = **b;
+            b.refill(now, capacity, refill);
+            b.tokens >= capacity
+        })
         .min_by_key(|(_, b)| b.last_observed)
-        .map(|(k, _)| k.clone())
-    {
-        buckets.remove(&key);
-    }
+        .map(|(k, _)| k.clone());
+    key.is_some_and(|k| buckets.remove(&k).is_some())
 }
 
 #[cfg(test)]
@@ -259,6 +281,23 @@ mod tests {
     use crate::auth::{Actor, ActorKind, DeviceClass, Principal, Resource, Transport, authorize};
     use crate::auth::{DeviceCategory, SensitiveGrant, TokenPolicy};
     use crate::state::{AuditQuery, Db};
+
+    /// A full table of mid-window buckets refuses a newcomer rather
+    /// than forgetting (and so refilling) someone's spent allowance.
+    #[test]
+    fn a_full_table_never_resets_a_spent_bucket() {
+        let (g, _) = guard();
+        let lock: SensitiveSet = [SensitiveCategory::Lock].into_iter().collect();
+        for i in 0..MAX_BUCKETS {
+            g.charge(&format!("p{i}"), lock).expect("room");
+        }
+        assert!(matches!(
+            g.charge("newcomer", lock),
+            Err(ObligationError::RateLimited { .. })
+        ));
+        // Known principals keep their own buckets.
+        g.charge("p0", lock).expect("p0 still has allowance");
+    }
 
     fn guard() -> (SensitiveGuard, Arc<AuditLog>) {
         let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));

@@ -889,7 +889,8 @@ const MIGRATIONS: &[&str] = &[
     //   has ever derived (a floor a plugin can't lower), the operator's
     //   category raise, and the registering instance. See
     //   `state::device_meta`. Backfilled with a `camera` floor for
-    //   every device whose `video-stream` state is persisted, so the
+    //   every device whose `video-stream` state or state-change
+    //   events (`topic = 'video-stream'`) are persisted, so the
     //   state restored before plugins load (and the instance's blobs)
     //   is camera data from the first read after upgrade. The other
     //   sensitive capabilities are new in this version.
@@ -913,6 +914,10 @@ const MIGRATIONS: &[&str] = &[
     INSERT INTO device_meta(device_id, owner_instance, sensitive_floor, category_override, updated_ms)
     SELECT device_id, owner_instance, 'camera', NULL, 0
       FROM device_state WHERE capability = 'video-stream';
+    INSERT OR IGNORE INTO device_meta(device_id, owner_instance, sensitive_floor, category_override, updated_ms)
+    SELECT device_id, MIN(instance_id), 'camera', NULL, 0
+      FROM event_log WHERE topic = 'video-stream' AND device_id IS NOT NULL
+     GROUP BY device_id;
     ",
 ];
 
@@ -2038,6 +2043,11 @@ mod tests {
                         source_generation, quality)
                     VALUES ('dev-00000000000000aa', 'video-stream', 'cam', 'p', 'u', X'00', 1, 1, 1, 1, 'ok'),
                            ('dev-00000000000000bb', 'on-off', 'cam', 'p', 'u', X'00', 2, 1, 1, 1, 'ok');
+                    -- State evicted, history kept.
+                    INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
+                    VALUES (1, 1, 'dev-00000000000000cc', 'cam2', 'p', 'video-stream', X'00'),
+                           (2, 2, 'dev-00000000000000aa', 'cam', 'p', 'video-stream', X'00'),
+                           (3, 3, 'dev-00000000000000dd', 'lamp', 'p', 'on-off', X'00');
                     PRAGMA user_version = 20;
                     ",
                 )
@@ -2056,7 +2066,8 @@ mod tests {
         let floors: Vec<(String, String, String)> = db
             .read(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT device_id, owner_instance, sensitive_floor FROM device_meta",
+                    "SELECT device_id, owner_instance, sensitive_floor FROM device_meta \
+                     ORDER BY device_id",
                 )?;
                 stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                     .collect()
@@ -2064,11 +2075,18 @@ mod tests {
             .expect("floors");
         assert_eq!(
             floors,
-            vec![(
-                "dev-00000000000000aa".to_string(),
-                "cam".to_string(),
-                "camera".to_string()
-            )]
+            vec![
+                (
+                    "dev-00000000000000aa".to_string(),
+                    "cam".to_string(),
+                    "camera".to_string()
+                ),
+                (
+                    "dev-00000000000000cc".to_string(),
+                    "cam2".to_string(),
+                    "camera".to_string()
+                ),
+            ]
         );
     }
 

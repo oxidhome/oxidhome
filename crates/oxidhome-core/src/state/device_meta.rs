@@ -236,7 +236,7 @@ impl DeviceMetaStore {
         let new_floor = floor.union(derived.sensitive());
         if let Some(db) = &self.db {
             let csv = new_floor.to_csv();
-            db.write(|conn| -> Result<usize, rusqlite::Error> {
+            durable_write(db, |conn| {
                 conn.execute(
                     "INSERT INTO device_meta \
                        (device_id, owner_instance, sensitive_floor, category_override, updated_ms) \
@@ -277,11 +277,18 @@ impl DeviceMetaStore {
         }
         let name = category.map(DeviceCategory::as_str);
         let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
-        let owner = owner_instance
+        let mut owner = owner_instance
             .map(str::to_owned)
             .or_else(|| rows.get(device_id).and_then(|r| r.owner_instance.clone()));
         if let Some(db) = &self.db {
-            db.write(|conn| -> Result<(), rusqlite::Error> {
+            if owner.is_none() {
+                // Not registered right now (an offline CLI run, a
+                // stopped plugin): the owner from what the host kept
+                // of the device, so a raise to `camera` still classes
+                // its instance's other data.
+                owner = db.read(|conn| known_owner(conn, device_id))?;
+            }
+            durable_write(db, |conn| {
                 conn.execute(
                     "INSERT INTO device_meta \
                        (device_id, owner_instance, sensitive_floor, category_override, updated_ms) \
@@ -302,6 +309,45 @@ impl DeviceMetaStore {
         }
         Ok(row.clone())
     }
+}
+
+/// The instance that owns `device_id` according to its persisted state
+/// or event history, if any.
+fn known_owner(
+    conn: &rusqlite::Connection,
+    device_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    use rusqlite::OptionalExtension as _;
+    conn.query_row(
+        "SELECT owner_instance FROM device_state WHERE device_id = ?1 \
+         UNION ALL \
+         SELECT instance_id FROM event_log WHERE device_id = ?1 \
+         LIMIT 1",
+        params![device_id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// One write at `synchronous = FULL`: a protection change the caller
+/// acts on (a registration accepted, an override acknowledged) must
+/// survive power loss. The token store's policy writes do the same.
+fn durable_write<R: Send>(
+    db: &Db,
+    f: impl FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error>,
+) -> Result<R, rusqlite::Error> {
+    db.write(move |conn| -> Result<R, rusqlite::Error> {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let result = f(conn);
+        if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+            tracing::warn!(
+                target: "auth.device_meta",
+                error = %err,
+                "failed to restore synchronous = NORMAL; connection stays at FULL",
+            );
+        }
+        result
+    })
 }
 
 fn decode_row(id: &str, owner: Option<String>, floor: &str, over: Option<&str>) -> DeviceMetaRow {

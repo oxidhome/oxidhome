@@ -265,17 +265,31 @@ fn store(tokens: &TokenStore, token_id: &str, policy: &TokenPolicy) -> anyhow::R
     }
 }
 
-/// Run `op` against an engine opened on `state_dir` under the exclusive
-/// state-dir lock (the daemon must be stopped).
+/// The stores the offline `token` / `device` commands touch, opened
+/// straight on the database: no engine, so listing tokens or raising
+/// a category doesn't run engine startup (device-state revision bump,
+/// pending-command resolution) while the daemon is stopped.
+pub struct OfflineStores {
+    /// The token table.
+    pub tokens: TokenStore,
+    /// The audit ledger.
+    pub audit: crate::state::AuditLog,
+    /// The `device_meta` table.
+    pub devices: crate::state::DeviceMetaStore,
+}
+
+/// Run `op` against the stores of the database under `state_dir`,
+/// holding the exclusive state-dir lock (the daemon must be stopped).
 ///
 /// # Errors
 ///
-/// No database, the lock is held, or `op` failed.
-pub fn with_offline_engine<T>(
+/// No database, the lock is held, the database won't open, or `op`
+/// failed.
+pub fn with_offline_stores<T>(
     state_dir: &Path,
-    op: impl FnOnce(&crate::Engine) -> anyhow::Result<T>,
+    op: impl FnOnce(&OfflineStores) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    if !state_dir.join("oxidhome.db").exists() {
+    if !state_dir.join(crate::state::db::DB_FILE_NAME).exists() {
         anyhow::bail!(
             "no oxidhome database under {} (set $OXIDHOME_STATE_DIR to the daemon's state dir)",
             state_dir.display(),
@@ -283,21 +297,29 @@ pub fn with_offline_engine<T>(
     }
     let _lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
         .context("this command needs exclusive access — stop the daemon first")?;
-    let engine = crate::Engine::with_state_dir(state_dir)
-        .with_context(|| format!("opening engine state at {}", state_dir.display()))?;
-    let result = op(&engine);
-    let _ = engine.log_store().flush(std::time::Duration::from_secs(5));
-    result
+    let db = std::sync::Arc::new(
+        crate::state::Db::open_file(state_dir)
+            .with_context(|| format!("opening the database under {}", state_dir.display()))?,
+    );
+    let stores = OfflineStores {
+        tokens: TokenStore::new(std::sync::Arc::clone(&db)),
+        audit: crate::state::AuditLog::new(std::sync::Arc::clone(&db)),
+        devices: crate::state::DeviceMetaStore::open(db).context("reading device_meta")?,
+    };
+    op(&stores)
 }
 
 /// Set (or with `None` clear) the operator's category raise for
-/// `device_id`, audited. Returns the stored row.
+/// `device_id` in `devices`, audited in `audit`. The owner recorded
+/// with it comes from the device's persisted state or events. Returns
+/// the stored row.
 ///
 /// # Errors
 ///
 /// A malformed device id, or a storage / audit failure.
 pub fn set_device_category(
-    engine: &crate::Engine,
+    audit: &crate::state::AuditLog,
+    devices: &crate::state::DeviceMetaStore,
     device_id: &str,
     category: Option<DeviceCategory>,
 ) -> anyhow::Result<DeviceMetaRow> {
@@ -308,10 +330,9 @@ pub fn set_device_category(
         "{AUDIT_PATH_DEVICE_CATEGORY}:{}",
         category.map_or("clear", DeviceCategory::as_str)
     );
-    let devices = engine.devices();
-    audited(&engine.audit_log(), "cli", device_id, &path, || {
+    audited(audit, "cli", device_id, &path, || {
         devices
-            .set_category(device_id, category)
+            .set_override(device_id, category, None)
             .context("storing the category override")
     })
 }

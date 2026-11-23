@@ -488,8 +488,16 @@ async fn list_devices(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CategoryBody {
-    /// A category name, or `null` to clear the override.
+    /// A category name, or `null` to clear the override. Required:
+    /// `{}` is a 400/422, not a silent clear.
+    #[serde(deserialize_with = "nullable")]
     category: Option<String>,
+}
+
+/// `Option` without serde's "missing means `None`": with a
+/// `deserialize_with`, an absent field is an error.
+fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    <Option<String> as Deserialize>::deserialize(d)
 }
 
 /// Response of `PUT /api/v1/devices/{device_id}/category`.
