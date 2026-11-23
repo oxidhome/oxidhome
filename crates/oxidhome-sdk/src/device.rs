@@ -115,14 +115,23 @@ impl Device {
     }
 
     /// A garage door, gate or other `opener` (sensitive, like
-    /// [`Self::lock`]). `position` (0.0 closed to 1.0 open) only when
-    /// the device reports one. Commands by convention: `open`, `close`,
-    /// `stop`, and `set` with a `position` arg when `supports_position`.
+    /// [`Self::lock`]). `supports_position` says whether the device
+    /// reports a position at all; `position` (0.0 closed to 1.0 open)
+    /// is the current one, `None` while unknown (and always `None`
+    /// without position support; the host refuses one). Commands by
+    /// convention: `open`, `close`, `stop`, and `set` with a `position`
+    /// arg when `supports_position`.
     #[must_use]
-    pub fn opener(self, kind: OpenerKind, state: OpenerState, position: Option<f64>) -> Self {
+    pub fn opener(
+        self,
+        kind: OpenerKind,
+        supports_position: bool,
+        state: OpenerState,
+        position: Option<f64>,
+    ) -> Self {
         self.capability(CapabilitySpec::Opener(OpenerSpec {
             kind,
-            supports_position: position.is_some(),
+            supports_position,
         }))
         .initial_state(CapabilityState::Opener(OpenerStatus { state, position }))
     }
@@ -345,7 +354,7 @@ mod tests {
         ));
 
         let info = Device::new("gate", "Gate")
-            .opener(OpenerKind::Gate, OpenerState::Closed, Some(0.0))
+            .opener(OpenerKind::Gate, true, OpenerState::Closed, None)
             .build();
         assert!(matches!(
             info.capabilities[0],

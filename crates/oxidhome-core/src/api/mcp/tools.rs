@@ -702,7 +702,7 @@ pub(super) async fn call(
             events_history_call(
                 engine.clone(),
                 request.arguments,
-                BytesGate::new(&invocation, &engine),
+                BytesGate::deferred(&invocation, &engine),
             )
             .await
         }
@@ -711,7 +711,7 @@ pub(super) async fn call(
                 engine.clone(),
                 request.arguments,
                 cancelled,
-                BytesGate::new(&invocation, &engine),
+                BytesGate::deferred(&invocation, &engine),
             )
             .await
         }
@@ -1765,7 +1765,11 @@ async fn events_history_call(
         .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
     let body = super::resources::EventsBody { events };
-    match super::resources::encode_body_capped(&body, "events.history", MAX_TOOL_BODY_BYTES) {
+    let encoded =
+        super::resources::encode_body_capped(&body, "events.history", MAX_TOOL_BODY_BYTES);
+    // A camera release counts only if the page goes out.
+    gate.settle(matches!(encoded, EncodedBody::Value(_)));
+    match encoded {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
             // Pure host-state read — plugin was never reached,
@@ -2230,7 +2234,10 @@ async fn events_subscribe_call(
         .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
     let body = super::resources::EventsBody { events };
-    match super::resources::encode_body_capped(&body, "events.subscribe", MAX_TOOL_BODY_BYTES) {
+    let encoded =
+        super::resources::encode_body_capped(&body, "events.subscribe", MAX_TOOL_BODY_BYTES);
+    gate.settle(matches!(encoded, EncodedBody::Value(_)));
+    match encoded {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
             plugin_reached: false,

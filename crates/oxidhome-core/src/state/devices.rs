@@ -212,21 +212,11 @@ impl DeviceRegistry {
     /// device. Its blobs are then camera blobs.
     #[must_use]
     pub fn instance_is_camera(&self, instance_id: &str) -> bool {
-        // Derive from a snapshot: `class_of` takes the read lock
-        // itself, and a nested read can deadlock behind a writer.
-        let owned: Vec<Arc<DeviceMeta>> = self
-            .read()
-            .values()
-            .filter(|m| m.owner_instance == instance_id)
-            .map(Arc::clone)
-            .collect();
-        owned.iter().any(|m| {
-            let derived = DeviceClass::derive(&m.info.capabilities);
-            self.meta
-                .get(&m.id)
-                .map_or(derived, |row| row.apply(derived))
-                .is_camera()
-        }) || self.meta.instance_is_camera(instance_id)
+        // One lookup: every registered camera has a `device_meta` row
+        // naming its owner (`observe` records it before the device is
+        // registered, and a registration whose row can't be stored is
+        // refused), as does every `camera` raise.
+        self.meta.instance_is_camera(instance_id)
     }
 
     /// Set (or clear) the operator's category override for `id`,
@@ -424,7 +414,13 @@ impl DeviceRegistry {
                 // releasing it would let a concurrent `remove` + register
                 // interleave. Floor writes are rare (only on a new
                 // sensitive category) and bounded.
-                self.observe(id, owner_instance, &new.info)?;
+                if let Err(err) = self.observe(id, owner_instance, &new.info) {
+                    // Fail closed, as `try_register`: an update whose
+                    // floor can't be recorded drops the device rather
+                    // than leave it commandable under its old class.
+                    guard.remove(id);
+                    return Err(err);
+                }
                 guard.insert(id.clone(), new);
                 Ok(())
             }
@@ -780,7 +776,19 @@ mod tests {
                 .expect("room");
         }
         lamp.capabilities = vec![CapabilitySpec::Lock];
-        assert_eq!(reg.register("u", "inst".into(), lamp), id);
+        assert_eq!(reg.register("u", "inst".into(), lamp.clone()), id);
         assert!(reg.get_any(&id).is_none(), "old switch entry dropped");
+
+        // The plugin paths fail closed the same way.
+        let mut plain = lamp.clone();
+        plain.capabilities = Vec::new();
+        reg.try_register("u", "inst".into(), plain.clone())
+            .expect("a non-sensitive registration needs no floor row");
+        assert!(reg.try_register("u", "inst".into(), lamp.clone()).is_err());
+        assert!(reg.get_any(&id).is_none(), "try_register dropped it");
+        reg.try_register("u", "inst".into(), plain)
+            .expect("re-register");
+        assert!(reg.update("inst", &id, lamp).is_err());
+        assert!(reg.get_any(&id).is_none(), "update dropped it");
     }
 }

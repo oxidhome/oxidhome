@@ -45,12 +45,17 @@ pub(crate) struct BytesGate {
     guard: Arc<SensitiveGuard>,
     /// The root holds `blob.read` at all (the pre-check).
     general: bool,
+    /// Hold the camera release's `warn` row until [`Self::settle`]
+    /// (a response that may still be refused, e.g. for size).
+    deferred: bool,
     state: Mutex<GateState>,
 }
 
 #[derive(Default)]
 struct GateState {
     camera: CameraRelease,
+    /// A deferred gate's charged-but-unrecorded release.
+    pending: Option<(crate::auth::Decision, String)>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +78,42 @@ impl BytesGate {
             devices: engine.devices(),
             guard: engine.sensitive(),
             general: authorize(ctx, Action::BlobRead, &Resource::blobs()).allow,
+            deferred: false,
             state: Mutex::new(GateState::default()),
+        }
+    }
+
+    /// A gate for a single response that can still be refused after
+    /// its values are released (MCP event reads, refused when the
+    /// encoded body is too large). A camera release is charged when
+    /// it happens but recorded only by [`Self::settle`]`(true)`;
+    /// settled `false` (or dropped unsettled) it is refunded.
+    pub(crate) fn deferred(ctx: &InvocationContext, engine: &Engine) -> Self {
+        let mut gate = Self::new(ctx, engine);
+        gate.deferred = true;
+        gate
+    }
+
+    /// Finish a [`Self::deferred`] gate: `delivered` records the
+    /// camera release's `warn` row, otherwise its charge is refunded.
+    /// A no-op for other gates or when nothing was released.
+    pub(crate) fn settle(&self, delivered: bool) {
+        let pending = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .take();
+        let Some((decision, target)) = pending else {
+            return;
+        };
+        if delivered {
+            self.record_release(decision, target);
+        } else if decision.obligations.rate_limit.is_some() {
+            self.guard.refund(
+                self.ctx.root().audit_token_id(),
+                decision.obligations.sensitive,
+            );
         }
     }
 
@@ -84,10 +124,9 @@ impl BytesGate {
             &crate::auth::Actor::api("", Vec::new()),
             crate::auth::Transport::Rest,
         ));
-        Self {
-            general: false,
-            ..Self::new(&ctx, engine)
-        }
+        let mut gate = Self::new(&ctx, engine);
+        gate.general = false;
+        gate
     }
 
     /// `true` when the root holds `blob.read` at all. Only for sizing
@@ -202,11 +241,19 @@ impl BytesGate {
             }
         }
         st.camera = CameraRelease::Released;
+        if self.deferred {
+            st.pending = Some((decision.clone(), target.to_owned()));
+            return true;
+        }
         drop(st);
+        self.record_release(decision.clone(), target.to_owned());
+        true
+    }
+
+    /// Write the `warn` row for a camera release, off the request path.
+    fn record_release(&self, decision: crate::auth::Decision, target: String) {
         let guard = Arc::clone(&self.guard);
         let ctx = self.ctx.clone();
-        let target = target.to_owned();
-        let decision = decision.clone();
         let write = move || {
             if let Err(err) = guard.record(&ctx, Action::BlobRead, &target, &decision) {
                 tracing::error!(
@@ -223,7 +270,13 @@ impl BytesGate {
             }
             Err(_) => write(),
         }
-        true
+    }
+}
+
+impl Drop for BytesGate {
+    /// An unsettled deferred release was never delivered: refund it.
+    fn drop(&mut self) {
+        self.settle(false);
     }
 }
 
@@ -258,6 +311,48 @@ mod tests {
             false,
         );
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
+    }
+
+    /// A deferred gate records a camera release only once settled as
+    /// delivered; an undelivered one is refunded.
+    #[test]
+    fn a_deferred_release_counts_only_when_delivered() {
+        use crate::state::AuditQuery;
+        let engine = Engine::new().expect("engine");
+        let cam = engine.devices().register(
+            "u",
+            "cam-inst".into(),
+            info("c", vec![CapabilitySpec::VideoStream]),
+        );
+        let viewer = ctx(
+            &["blobs:read"],
+            vec![SensitiveGrant::all(SensitiveCategory::Camera)],
+        );
+        let warn = || {
+            engine
+                .audit_log()
+                .query(
+                    &AuditQuery {
+                        level: Some("warn".into()),
+                        ..AuditQuery::default()
+                    },
+                    10,
+                )
+                .unwrap()
+                .len()
+        };
+        // Far more refused pages than the camera allowance: each is
+        // refunded, so the allowance is intact afterwards.
+        for _ in 0..300 {
+            let gate = BytesGate::deferred(&viewer, &engine);
+            assert!(gate.allows(Some(&cam), None));
+            gate.settle(false);
+        }
+        assert_eq!(warn(), 0);
+        let gate = BytesGate::deferred(&viewer, &engine);
+        assert!(gate.allows(Some(&cam), None));
+        gate.settle(true);
+        assert_eq!(warn(), 1);
     }
 
     /// An open gate (a tail) sees an instance become a camera source:

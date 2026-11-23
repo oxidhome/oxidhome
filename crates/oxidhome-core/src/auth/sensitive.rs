@@ -133,6 +133,18 @@ impl SensitiveGuard {
         Ok(())
     }
 
+    /// Give back one charge per category in `categories` (capped at
+    /// capacity): a read that charged and then wasn't delivered.
+    pub(crate) fn refund(&self, principal: &str, categories: SensitiveSet) {
+        let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        for category in categories.iter() {
+            let (capacity, _) = rate(RateLimit::for_category(category));
+            if let Some(b) = buckets.get_mut(&(principal.to_owned(), category)) {
+                b.tokens = (b.tokens + 1.0).min(capacity);
+            }
+        }
+    }
+
     /// Meet `decision`'s obligations for `action` on `target` (a
     /// device id, or `<instance>/<name>` for a blob): rate limit, then
     /// the `warn` row. A no-op for a decision without sensitive

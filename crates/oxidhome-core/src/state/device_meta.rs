@@ -25,14 +25,14 @@
 //! A failed write is logged and the in-memory floor still applies for
 //! the life of the process: the floor only ever protects more.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rusqlite::params;
 
 use super::db::Db;
 use super::event_log::now_unix_ms;
-use crate::auth::{DeviceCategory, DeviceClass, SensitiveSet};
+use crate::auth::{DeviceCategory, DeviceClass, SensitiveCategory, SensitiveSet};
 
 /// One remembered device.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -99,6 +99,9 @@ pub enum DeviceMetaError {
 pub struct DeviceMetaStore {
     db: Option<Arc<Db>>,
     rows: RwLock<HashMap<String, DeviceMetaRow>>,
+    /// Instances some row classes as a camera source, kept in step
+    /// with `rows` so the per-value byte check is one lookup.
+    cameras: RwLock<HashSet<String>>,
     /// Serializes writers through read → commit → publish, so the
     /// `rows` lock is held only to read and to publish, never across a
     /// `SQLite` commit: readers (every authorization) don't wait on an
@@ -131,6 +134,7 @@ impl DeviceMetaStore {
         Self {
             db: None,
             rows: RwLock::new(HashMap::new()),
+            cameras: RwLock::new(HashSet::new()),
             writer: Mutex::new(()),
         }
     }
@@ -163,6 +167,7 @@ impl DeviceMetaStore {
         })?;
         Ok(Self {
             db: Some(db),
+            cameras: RwLock::new(camera_instances(&rows)),
             rows: RwLock::new(rows),
             writer: Mutex::new(()),
         })
@@ -196,14 +201,16 @@ impl DeviceMetaStore {
     /// camera, by its floor or the operator's override.
     #[must_use]
     pub fn instance_is_camera(&self, instance_id: &str) -> bool {
-        self.rows
+        self.cameras
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .any(|row| {
-                row.owner_instance.as_deref() == Some(instance_id)
-                    && row.apply(DeviceClass::other()).is_camera()
-            })
+            .contains(instance_id)
+    }
+
+    /// Recompute [`Self::cameras`] from `rows` (writers only, holding
+    /// the `rows` write lock; writes are rare).
+    fn refresh_cameras(&self, rows: &HashMap<String, DeviceMetaRow>) {
+        *self.cameras.write().unwrap_or_else(PoisonError::into_inner) = camera_instances(rows);
     }
 
     /// Record that `device_id`, registered by `owner_instance`, was
@@ -272,6 +279,7 @@ impl DeviceMetaStore {
         let row = rows.entry(device_id.to_owned()).or_default();
         row.sensitive_floor = new_floor;
         row.owner_instance = Some(owner_instance.to_owned());
+        self.refresh_cameras(&rows);
         Ok(())
     }
 
@@ -298,6 +306,28 @@ impl DeviceMetaStore {
         }
         let name = category.map(DeviceCategory::as_str);
         let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if category.is_none() {
+            // Clearing never leaves an empty row behind: an empty row
+            // would count against the instance's floor-row cap.
+            match self.get(device_id) {
+                None => return Ok(DeviceMetaRow::default()),
+                Some(row) if row.sensitive_floor.is_empty() => {
+                    if let Some(db) = &self.db {
+                        durable_write(db, |conn| {
+                            conn.execute(
+                                "DELETE FROM device_meta WHERE device_id = ?1",
+                                params![device_id],
+                            )
+                        })?;
+                    }
+                    let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
+                    rows.remove(device_id);
+                    self.refresh_cameras(&rows);
+                    return Ok(DeviceMetaRow::default());
+                }
+                Some(_) => {}
+            }
+        }
         let mut owner = owner_instance
             .map(str::to_owned)
             .or_else(|| self.get(device_id).and_then(|r| r.owner_instance));
@@ -334,7 +364,9 @@ impl DeviceMetaStore {
         if owner.is_some() {
             row.owner_instance = owner;
         }
-        Ok(row.clone())
+        let row = row.clone();
+        self.refresh_cameras(&rows);
+        Ok(row)
     }
 }
 
@@ -377,18 +409,28 @@ fn durable_write<R: Send>(
     })
 }
 
+/// Instances that own a row classed as a camera.
+fn camera_instances(rows: &HashMap<String, DeviceMetaRow>) -> HashSet<String> {
+    rows.values()
+        .filter(|r| r.apply(DeviceClass::other()).is_camera())
+        .filter_map(|r| r.owner_instance.clone())
+        .collect()
+}
+
 fn decode_row(id: &str, owner: Option<String>, floor: &str, over: Option<&str>) -> DeviceMetaRow {
     // Rows are written only by this module, so a name it can't parse
-    // comes from a newer binary. Keep what parses and say so; the
-    // floor can only lose protection by being unreadable, which is
-    // why it is logged at error.
-    let sensitive_floor = floor
+    // comes from a newer binary (or a hand-edited file). Fail closed:
+    // the device is then treated as every sensitive category until the
+    // row is repaired, and the problem is logged at error.
+    let mut unreadable = false;
+    let mut sensitive_floor: SensitiveSet = floor
         .split(',')
         .filter(|n| !n.is_empty())
         .filter_map(|n| match n.parse() {
             Ok(c) => Some(c),
             Err(err) => {
                 tracing::error!(target: "auth.device_meta", device_id = id, %err, "unreadable floor entry");
+                unreadable = true;
                 None
             }
         })
@@ -397,9 +439,13 @@ fn decode_row(id: &str, owner: Option<String>, floor: &str, over: Option<&str>) 
         Ok(c) => Some(c),
         Err(err) => {
             tracing::error!(target: "auth.device_meta", device_id = id, %err, "unreadable category override");
+            unreadable = true;
             None
         }
     });
+    if unreadable {
+        sensitive_floor = SensitiveCategory::ALL.into_iter().collect();
+    }
     DeviceMetaRow {
         owner_instance: owner,
         sensitive_floor,
@@ -505,6 +551,24 @@ mod tests {
         store.observe("dev-ffffffffffffffff", "q", lock).unwrap();
     }
 
+    /// Clearing an override leaves no empty row (it would count
+    /// against the per-instance floor-row cap).
+    #[test]
+    fn clearing_removes_an_empty_row() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let store = DeviceMetaStore::open(Arc::clone(&db)).unwrap();
+        store
+            .set_override(DEV, None, Some("inst"))
+            .expect("no-op clear");
+        assert_eq!(store.get(DEV), None);
+        store
+            .set_override(DEV, Some(DeviceCategory::Lock), Some("inst"))
+            .expect("raise");
+        store.set_override(DEV, None, None).expect("clear");
+        assert_eq!(store.get(DEV), None);
+        assert_eq!(DeviceMetaStore::open(db).unwrap().get(DEV), None);
+    }
+
     /// A raise to `camera` needs the owning instance, so the whole
     /// instance is classed; other raises don't.
     #[test]
@@ -522,6 +586,24 @@ mod tests {
             .expect("owner given");
         assert_eq!(row.owner_instance.as_deref(), Some("inst"));
         assert!(store.instance_is_camera("inst"));
+    }
+
+    /// A row this binary can't read is treated as every sensitive
+    /// category, not as none.
+    #[test]
+    fn an_unreadable_row_fails_closed() {
+        let row = decode_row(DEV, Some("i".into()), "lock,teleporter", None);
+        assert_eq!(
+            row.sensitive_floor,
+            SensitiveCategory::ALL.into_iter().collect()
+        );
+        let row = decode_row(DEV, Some("i".into()), "", Some("toaster"));
+        assert!(row.sensitive_floor.contains(SensitiveCategory::Camera));
+        let row = decode_row(DEV, None, "lock", Some("opener"));
+        assert_eq!(
+            row.sensitive_floor,
+            [SensitiveCategory::Lock].into_iter().collect()
+        );
     }
 
     #[test]

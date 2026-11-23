@@ -778,7 +778,7 @@ async fn read_inner(
         // Events + logs hit `SQLite`, so parse the query
         // and run the read under `spawn_blocking`.
         Kind::Events => {
-            let gate = BytesGate::new(ctx, &engine);
+            let gate = BytesGate::deferred(ctx, &engine);
             events_read(engine, query_str, gate).await
         }
         Kind::Logs => logs_read(engine, query_str).await,
@@ -1252,7 +1252,10 @@ async fn events_read(engine: Engine, raw_query: &str, gate: BytesGate) -> ReadOu
         .into_iter()
         .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
-    encode(&EventsBody { events }, "events")
+    let outcome = encode(&EventsBody { events }, "events");
+    // A camera release counts only if the page goes out.
+    gate.settle(matches!(outcome, ReadOutcome::OkText { .. }));
+    outcome
 }
 
 // ── Logs ──────────────────────────────────────────────────────────

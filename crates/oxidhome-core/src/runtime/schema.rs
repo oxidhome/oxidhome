@@ -217,8 +217,14 @@ pub(crate) fn check_state_fields(
     fields: &[KeyValue],
 ) -> Result<(), String> {
     if capability == "opener" {
+        let supports_position = opener_supports_position(info);
         for kv in fields.iter().filter(|kv| kv.key == "position") {
             match kv.value {
+                _ if !supports_position => {
+                    return Err(
+                        "opener reports a `position` but its spec doesn't support one".into(),
+                    );
+                }
                 Value::FloatVal(p) if p.is_finite() && (0.0..=1.0).contains(&p) => {}
                 _ => return Err("opener `position` must be a number from 0.0 to 1.0".into()),
             }
@@ -261,6 +267,13 @@ pub(crate) fn check_state_fields(
         )),
         None => Ok(()),
     }
+}
+
+/// `supports-position` of `info`'s opener spec (`false` without one).
+fn opener_supports_position(info: &DeviceInfo) -> bool {
+    info.capabilities
+        .iter()
+        .any(|c| matches!(c, CapabilitySpec::Opener(o) if o.supports_position))
 }
 
 fn check_unit(unit: &Unit) -> Result<(), String> {
@@ -388,11 +401,17 @@ pub(crate) fn check_device_info(info: &DeviceInfo) -> Result<(), WitError> {
     for state in &info.initial_state {
         if let CapabilityState::Opener(o) = state
             && let Some(position) = o.position
-            && !(position.is_finite() && (0.0..=1.0).contains(&position))
         {
-            return Err(invalid(format!(
-                "opener position {position} is outside 0.0 to 1.0"
-            )));
+            if !opener_supports_position(info) {
+                return Err(invalid(
+                    "opener initial state has a position but its spec doesn't support one".into(),
+                ));
+            }
+            if !(position.is_finite() && (0.0..=1.0).contains(&position)) {
+                return Err(invalid(format!(
+                    "opener position {position} is outside 0.0 to 1.0"
+                )));
+            }
         }
         if let CapabilityState::Sensor(m) = state {
             check_unit(&m.unit).map_err(invalid)?;
@@ -919,13 +938,20 @@ mod tests {
 
     #[test]
     fn opener_position_is_checked_on_every_update() {
-        let info = DeviceInfo {
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::{OpenerKind, OpenerSpec};
+        let opener = |supports_position| {
+            CapabilitySpec::Opener(OpenerSpec {
+                kind: OpenerKind::Gate,
+                supports_position,
+            })
+        };
+        let mut info = DeviceInfo {
             local_id: "o".into(),
             name: String::new(),
             manufacturer: None,
             model: None,
             firmware: None,
-            capabilities: Vec::new(),
+            capabilities: vec![opener(true)],
             initial_state: Vec::new(),
             metadata: Vec::new(),
         };
@@ -940,6 +966,9 @@ mod tests {
         assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(f64::NAN))).is_err());
         assert!(check_state_fields(&info, "opener", &pos(Value::StringVal("x".into()))).is_err());
         assert!(check_state_fields(&info, "switch", &pos(Value::FloatVal(9.0))).is_ok());
+        // No position support: no position at all.
+        info.capabilities = vec![opener(false)];
+        assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(0.5))).is_err());
     }
 
     #[test]

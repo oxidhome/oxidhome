@@ -81,14 +81,32 @@ pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
         .filter(|r| r.revoked_ms.is_none() && !r.owner)
         .filter_map(|r| {
             let policy = parse_policy(&r.scope_json)?;
-            let granted: SensitiveSet = policy
-                .sensitive
-                .iter()
-                .filter(|g| g.devices.is_none())
-                .map(|g| g.category)
-                .collect();
+            // The devices a command could reach before: the token's
+            // `device.send_command` allowlist, if it has one.
+            let command_devices = policy
+                .constraints
+                .get("device.send_command")
+                .and_then(|c| c.devices.as_deref());
+            let covered = |c: SensitiveCategory| {
+                policy.sensitive.iter().any(|g| {
+                    g.category == c
+                        && match (&g.devices, command_devices) {
+                            (None, _) => true,
+                            // A command grant naming at least the
+                            // allowlist restores all it reached.
+                            (Some(granted), Some(allowed)) if c.guards_commands() => {
+                                allowed.iter().all(|d| granted.contains(d))
+                            }
+                            (Some(_), _) => false,
+                        }
+                })
+            };
             let reached = reached_by(&policy.scopes);
-            let missing: SensitiveSet = reached.iter().filter(|c| !granted.contains(*c)).collect();
+            let missing: SensitiveSet = reached
+                .iter()
+                .filter(|c| !(c.guards_commands() && command_devices.is_some_and(<[_]>::is_empty)))
+                .filter(|c| !covered(*c))
+                .collect();
             (!missing.is_empty()).then(|| SensitiveGap {
                 token_id: r.id.clone(),
                 label: r.label.clone(),
@@ -504,5 +522,44 @@ mod tests {
         .unwrap();
         let gaps = sensitive_access_report(&tokens);
         assert!(gaps[0].missing.contains(SensitiveCategory::Lock));
+    }
+
+    /// A token that could only command some devices is fully restored
+    /// by a grant naming those devices.
+    #[test]
+    fn a_grant_matching_the_command_allowlist_closes_the_gap() {
+        let (tokens, audit) = stores();
+        let t = tokens
+            .create(
+                "door",
+                br#"{"scopes":["devices:command"],"constraints":{"device.send_command":{"devices":["dev-00000000000000aa"]}}}"#,
+            )
+            .unwrap();
+        let gaps = sensitive_access_report(&tokens);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        grant_sensitive(
+            &tokens,
+            &audit,
+            &t.id,
+            SensitiveCategory::Lock,
+            &["dev-00000000000000aa".into()],
+        )
+        .unwrap();
+        let gaps = sensitive_access_report(&tokens);
+        assert!(
+            !gaps[0].missing.contains(SensitiveCategory::Lock),
+            "{gaps:?}"
+        );
+        assert!(gaps[0].missing.contains(SensitiveCategory::Opener));
+
+        // An empty allowlist reached no device at all.
+        let none = tokens
+            .create(
+                "none",
+                br#"{"scopes":["devices:command"],"constraints":{"device.send_command":{"devices":[]}}}"#,
+            )
+            .unwrap();
+        let gaps = sensitive_access_report(&tokens);
+        assert!(gaps.iter().all(|g| g.token_id != none.id), "{gaps:?}");
     }
 }

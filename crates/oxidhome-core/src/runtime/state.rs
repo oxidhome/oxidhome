@@ -1073,6 +1073,10 @@ impl host_devices::Host for PluginState {
         if outcome.is_ok() {
             self.device_state
                 .reconcile_capabilities(&id, &live_capabilities);
+        } else if self.devices.get_any(&id).is_none() {
+            // A refused floor write dropped the device (fail closed);
+            // its state goes stale like a `remove-device`.
+            self.device_state.mark_device_stale(&id);
         }
         outcome
     }
