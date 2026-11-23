@@ -466,14 +466,36 @@ async fn sandbox_limit_counts_stopping_sandboxes() {
         )
     };
 
-    load(&engine, "a", "pong ok\n").await;
+    let svc_a = load(&engine, "a", "hold sleep 3000\n").await;
     match load_b().await {
         Ok(CommandResult::Err(Error::Unavailable(msg))) => assert!(msg.contains("limit"), "{msg}"),
         other => panic!("expected the limit, got {other:?}"),
     }
 
+    // Keep `a` busy, so it is still stopping after `unload`: hidden
+    // from the list, still registered, and still counted.
+    let held = tokio::spawn({
+        let engine = engine.clone();
+        let svc_a = svc_a.clone();
+        async move { call(&engine, svc_a, "hold", Vec::new()).await }
+    });
+    while engine.services().active_call_count(&svc_a) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Let the call reach `a`'s supervisor ahead of the stop.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let outcome = call(&engine, scripts.clone(), "unload", vec![string("id", "a")]).await;
     assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    assert_eq!(
+        engine.sandboxes().list(MANAGER),
+        Vec::<(String, String)>::new()
+    );
+    assert!(engine.instance("main~a").is_some());
+    match load_b().await {
+        Ok(CommandResult::Err(Error::Unavailable(msg))) => assert!(msg.contains("limit"), "{msg}"),
+        other => panic!("a stopping sandbox must still count, got {other:?}"),
+    }
+    let _ = held.await;
     // Once `a` is gone, `b` fits.
     let deadline = Instant::now() + Duration::from_mins(1);
     loop {
@@ -487,6 +509,50 @@ async fn sandbox_limit_counts_stopping_sandboxes() {
     }
     // `a`'s slot goes only after its instance-registry entry.
     assert!(engine.instance("main~a").is_none());
+
+    manager.stop().await.expect("stop manager");
+}
+
+/// Scripts outlive a manager crash: the manager's next life re-adopts
+/// the same sandbox (same instance, same service) instead of starting
+/// a new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn manager_crash_keeps_and_readopts_its_scripts() {
+    let state = support::tempdir("sandbox-readopt");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let manager = start_manager(&engine, LoadMode::Dev).await;
+    let svc_a = load(&engine, "a", "pong ok\n").await;
+    let scripts = service_of(&engine, MANAGER, "scripts").await;
+
+    let outcome = call(&engine, scripts.clone(), "crash", Vec::new()).await;
+    assert!(
+        matches!(outcome, Ok(CommandResult::Unknown(_))),
+        "a trap mid-call is unknown: {outcome:?}"
+    );
+    // The manager's next life registers `scripts` afresh.
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let fresh = loop {
+        match engine
+            .services()
+            .resolve_by_local_id(PLUGIN, MANAGER, "scripts")
+        {
+            Some(id) if id != scripts && manager.state() == InstanceState::Running => break id,
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "manager never came back");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_ne!(fresh, scripts);
+
+    // `a` kept running through it and is still the same sandbox.
+    assert_eq!(
+        engine.sandboxes().list(MANAGER),
+        vec![("a".to_owned(), "main~a".to_owned())]
+    );
+    assert_eq!(service_of(&engine, "main~a", "script").await, svc_a);
+    let outcome = call(&engine, svc_a.clone(), "pong", Vec::new()).await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    assert_eq!(load(&engine, "a", "pong ok\n").await, svc_a);
 
     manager.stop().await.expect("stop manager");
 }

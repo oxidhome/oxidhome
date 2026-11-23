@@ -4,7 +4,8 @@
 //! The same component plays two roles:
 //!
 //! - **Manager** — the instance the operator starts. It registers the
-//!   `scripts` service with `load {id, source}` and `unload {id}`,
+//!   `scripts` service with `load {id, source}`, `unload {id}` and
+//!   `crash` (trap the manager; its scripts keep running),
 //!   starts one sandbox per loaded script, and keeps the sources in KV
 //!   so its next life (or the next daemon start) re-creates them,
 //!   retrying on `tick` while a previous sandbox is still stopping.
@@ -162,6 +163,11 @@ impl ScriptHost {
                     CommandSpec::new("unload")
                         .description("Stop a script")
                         .param(Field::string("id")),
+                )
+                .command(
+                    CommandSpec::new("crash").description(
+                        "Trap the manager; its scripts keep running and are re-adopted",
+                    ),
                 ),
         )
         .map_err(|e| format!("register-service failed: {e:?}"))?;
@@ -193,6 +199,9 @@ impl ScriptHost {
         command: &str,
         args: &[KeyValue],
     ) -> CommandResult {
+        if command == "crash" {
+            panic!("manager asked to crash");
+        }
         let Some(id) = string_arg(args, "id") else {
             return CommandResult::Err(Error::InvalidArgument("missing `id`".into()));
         };
@@ -202,6 +211,10 @@ impl ScriptHost {
             // next life restores; undo the save if the start is refused.
             "load" => {
                 let source = string_arg(args, "source").unwrap_or_default();
+                // Never save a script its sandbox would refuse to run.
+                if let Err(e) = parse(source) {
+                    return CommandResult::Err(Error::InvalidArgument(e));
+                }
                 let previous = match host::storage::get(&key) {
                     Ok(previous) => previous,
                     Err(e) => return CommandResult::Err(e),
@@ -253,9 +266,10 @@ impl ScriptHost {
                 pending.remove(id);
                 match host::sandboxes::stop(id) {
                     Ok(()) => CommandResult::Ok,
-                    // Not running (pending, failed, or stopped by the
-                    // operator): forgetting the saved script was enough.
-                    Err(Error::NotFound(_)) if saved => CommandResult::Ok,
+                    // Not running (pending, failed, stopped by the
+                    // operator, or this manager isn't supervised):
+                    // forgetting the saved script was enough.
+                    Err(Error::NotFound(_) | Error::Unavailable(_)) if saved => CommandResult::Ok,
                     Err(e) => CommandResult::Err(e),
                 }
             }
