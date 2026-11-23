@@ -99,8 +99,9 @@ impl Transport {
 /// It also carries the principal's resolved [`Authority`] (scopes and
 /// 14.4 constraints) that [`crate::auth::authorize()`] decides on. The
 /// authority is host-only: [`InvocationContext::audit_json`] does not
-/// include it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// include it, and equality ignores it: two principals are equal when
+/// they name the same caller, as before the authority was added.
+#[derive(Debug, Clone)]
 pub struct Principal {
     kind: ActorKind,
     subject: String,
@@ -108,6 +109,17 @@ pub struct Principal {
     transport: Transport,
     authority: Authority,
 }
+
+impl PartialEq for Principal {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.subject == other.subject
+            && self.credential_id == other.credential_id
+            && self.transport == other.transport
+    }
+}
+
+impl Eq for Principal {}
 
 impl Principal {
     /// Principal for a caller that authenticated with a bearer token.
@@ -472,6 +484,20 @@ mod tests {
             target_instance: target.into(),
             target_service: "svc".into(),
         }
+    }
+
+    #[test]
+    fn principal_equality_ignores_authority() {
+        let a = Actor::api("tok-1", vec!["devices:list".into(), "logs:read".into()]);
+        let b = Actor::api("tok-1", vec!["logs:read".into(), "devices:list".into()]);
+        assert_eq!(
+            Principal::token(ActorKind::Api, &a, Transport::Rest),
+            Principal::token(ActorKind::Api, &b, Transport::Rest),
+        );
+        assert_ne!(
+            Principal::token(ActorKind::Api, &a, Transport::Rest),
+            Principal::token(ActorKind::Api, &a, Transport::Connect),
+        );
     }
 
     #[test]

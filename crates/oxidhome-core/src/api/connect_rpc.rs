@@ -432,20 +432,21 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
     ) -> ServiceResult<impl Encodable<GetDeviceStateResponse> + Send + use<'a>> {
         require_connect(&ctx, Action::DeviceRead, &Resource::devices())?;
         let device_id = request.to_owned_message().device_id;
-        require_connect(
-            &ctx,
-            Action::DeviceRead,
-            &Resource::device(device_id.as_str()),
-        )?;
-        let blobs = ctx_can_read_blobs(&ctx);
         // Host-minted ids are short; don't copy a huge one under the
-        // projection lock.
+        // projection lock. (No constraint narrows `device.read`, so the
+        // target check below can't deny once the collection passed.)
         if device_id.len() > MAX_DEVICE_ID_LEN {
             return Err(rpc_err(
                 &ctx,
                 ConnectError::invalid_argument("`device_id` is too long"),
             ));
         }
+        require_connect(
+            &ctx,
+            Action::DeviceRead,
+            &Resource::device(device_id.as_str()),
+        )?;
+        let blobs = ctx_can_read_blobs(&ctx);
         let (epoch, revision, mut entries) = self
             .engine
             .device_state()

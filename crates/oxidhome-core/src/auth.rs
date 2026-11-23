@@ -187,16 +187,16 @@ impl Actor {
     /// **unrestricted** for this actor (subject to the flat
     /// scope check upstream).
     ///
-    /// Dispatch sites don't consult this directly: the constraint
-    /// map is copied into the invocation's root
-    /// [`authorize::Authority`] and applied by [`authorize()`].
+    /// Dispatch sites don't consult this directly: the invocation's
+    /// root [`authorize::Authority`] shares this actor's `Arc`, and
+    /// [`authorize()`] applies the constraint.
     #[must_use]
     pub fn constraint(&self, tool_name: &str) -> Option<&policy::ToolConstraint> {
         self.inner.constraints.get(tool_name)
     }
 
-    /// The full per-tool constraint map, keyed by tool name. Copied
-    /// into the root [`Authority`] when an invocation is minted.
+    /// The full per-tool constraint map, keyed by tool name. The root
+    /// [`Authority`] of an invocation reads this same map.
     #[must_use]
     pub fn constraints(&self) -> &HashMap<String, policy::ToolConstraint> {
         &self.inner.constraints
