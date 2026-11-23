@@ -70,6 +70,9 @@ pub const PENDING_COMMAND_TTL: Duration = Duration::from_mins(5);
 /// for a plugin that accepts whatever capability a caller sends.
 pub const MAX_PENDING_CAPABILITY_BYTES: usize = 256;
 
+/// Length of a host-minted command id: `cmd-` plus 32 hex digits.
+const COMMAND_ID_LEN: usize = COMMAND_ID_PREFIX.len() + 32;
+
 /// Mint a fresh `cmd-<32 hex>` command id (128 random bits).
 #[must_use]
 pub fn mint_command_id() -> String {
@@ -373,7 +376,7 @@ impl PendingCommands {
                 "capability name is longer than {MAX_PENDING_CAPABILITY_BYTES} bytes"
             ));
         }
-        if !command_id.starts_with(COMMAND_ID_PREFIX) {
+        if !command_id.starts_with(COMMAND_ID_PREFIX) || command_id.len() != COMMAND_ID_LEN {
             return Err(format!(
                 "command id `{}` was not minted by the host; it cannot be completed later",
                 audit_cap(command_id),
@@ -441,6 +444,14 @@ impl PendingCommands {
         owner_instance: &str,
         command_id: &str,
     ) -> Result<PendingCommand, WitError> {
+        // Host ids have a fixed length; don't hash an oversized
+        // plugin-supplied string under the host-wide lock.
+        if command_id.len() != COMMAND_ID_LEN {
+            return Err(WitError::NotFound(format!(
+                "command `{}` is not a host command id",
+                audit_cap(command_id),
+            )));
+        }
         let mut entries = self.lock();
         match entries.get(command_id) {
             Some(p) if p.owner_instance == owner_instance => {}

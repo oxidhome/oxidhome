@@ -9,7 +9,7 @@ A simulated switch whose commands finish asynchronously, showing the `accepted` 
     host-minted `cmd.id`. The caller sees outcome `accepted` (REST `202`).
   - The same with `lost: true` is accepted but never completed, so the host expires it as `outcome_unknown`.
   - Any other capability or action returns `err`, which the host reports as `rejected`.
-- On each `tick` (every 50 ms): applies every accepted command, publishes `state-changed`, and calls
+- On each `tick` (every 50 ms): applies every accepted command and calls
   `host::complete_command(id, OkWithState)`. The host projects the state and records the final outcome in the
   audit trail.
 

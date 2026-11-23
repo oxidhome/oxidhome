@@ -825,13 +825,9 @@ async fn command_accepted_then_completed() {
     );
     let pending = switch.pending_commands();
     eventually("the tick to complete the command", || pending.is_empty()).await;
-    let events = switch.events().unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| e.device_id.as_deref() == Some(device.as_str())),
-        "the completion published the new state: {events:?}"
-    );
+    // The fixture publishes no event: the projection changed because
+    // the host projected the completion's `ok-with-state`.
+    assert_eq!(projected_switch(&host, &device), Some(true));
     switch.stop().await.unwrap();
 }
 
@@ -880,12 +876,26 @@ async fn command_accepted_completes_on_a_direct_tick() {
 
     let mut command = switch_command("set", vec![arg("state", Value::BoolVal(true))]);
     command.id = "cmd-00000000000000000000000000000001".into();
-    let reply = switch.send_command(device, command).await.unwrap();
+    let reply = switch.send_command(device.clone(), command).await.unwrap();
     assert!(matches!(reply, CommandResult::Accepted), "{reply:?}");
     assert_eq!(pending.len(), 1);
     assert_eq!(switch.advance(Duration::from_millis(50)).await.unwrap(), 1);
     assert!(pending.is_empty(), "the tick completed the command");
-    assert_eq!(switch.events().unwrap().len(), 1);
+    assert_eq!(projected_switch(&host, &device), Some(true));
+}
+
+/// The projected `switch.state` of `device`.
+fn projected_switch(host: &TestHost, device: &str) -> Option<bool> {
+    host.engine()
+        .device_state()
+        .snapshot_device(device)
+        .iter()
+        .filter(|s| s.capability == "switch")
+        .flat_map(|s| s.fields.iter())
+        .find_map(|kv| match (kv.key.as_str(), &kv.value) {
+            ("state", Value::BoolVal(b)) => Some(*b),
+            _ => None,
+        })
 }
 
 // ── snapshots ──────────────────────────────────────────────────────

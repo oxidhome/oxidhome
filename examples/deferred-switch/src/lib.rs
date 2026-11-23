@@ -5,10 +5,11 @@
 //! sent it — a radio round trip, a cloud API with a job id. This plugin
 //! models that: `switch::set { state }` and `switch::toggle` answer
 //! [`CommandResult::Accepted`] and remember the host-minted
-//! [`Command::id`]. On the next `tick` the "device" acknowledges, the
-//! plugin publishes the new state and reports the final result with
-//! [`host::complete_command`]. The caller sees `accepted` right away;
-//! the final outcome lands in the host's audit trail.
+//! [`Command::id`]. On the next `tick` the "device" acknowledges and the
+//! plugin reports the final result, with the new state, through
+//! [`host::complete_command`]; the host projects that state exactly as
+//! it would a synchronous `ok-with-state`. The caller sees `accepted`
+//! right away; the final outcome lands in the host's audit trail.
 //!
 //! A `lost: true` argument simulates a device that never acknowledges:
 //! the command stays pending until the host expires it and records
@@ -92,18 +93,15 @@ impl Plugin for DeferredSwitch {
     }
 
     fn tick(&mut self) {
-        let Some(device) = self.device_id.clone() else {
+        if self.device_id.is_none() {
             return;
-        };
+        }
         for (command_id, target) in std::mem::take(&mut self.in_flight) {
             self.state = target;
             let fields = vec![KeyValue {
                 key: "state".to_string(),
                 value: Value::BoolVal(target),
             }];
-            if let Err(e) = host::publish_state_change(device.clone(), "switch", fields.clone()) {
-                oxidhome_sdk::tracing::warn!("publish_state_change failed: {e:?}");
-            }
             if let Err(e) = host::complete_command(&command_id, &CommandResult::OkWithState(fields)) {
                 // `not-found`: the host already expired the command.
                 oxidhome_sdk::tracing::warn!("complete_command {command_id} failed: {e:?}");
