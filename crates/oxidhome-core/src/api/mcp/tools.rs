@@ -2374,6 +2374,16 @@ struct PluginsStopBody {
     stopped: Vec<String>,
 }
 
+/// `plugins.stop` past [`crate::STOP_WAIT_LIMIT`]: an error result that
+/// still says which instances stopped.
+#[derive(Serialize)]
+struct PluginsStopTimedOutBody {
+    error: &'static str,
+    message: String,
+    stopped: Vec<String>,
+    stopping: Vec<String>,
+}
+
 async fn plugins_stop_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
@@ -2429,17 +2439,28 @@ async fn plugins_stop_call(
         .collect();
     let report = crate::runtime::stop_and_wait_reaped(handles, crate::STOP_WAIT_LIMIT).await;
     if !report.still_stopping.is_empty() {
-        return ToolOutcome::ExecErr {
-            message: format!(
-                "instances still stopping after {} s; they finish in the background: {}",
-                crate::STOP_WAIT_LIMIT.as_secs(),
-                report.still_stopping.join(", "),
-            ),
-            structured: Some(json!({
-                "stopped": report.stopped,
-                "stopping": report.still_stopping,
-            })),
-            domain_kind: None,
+        let message = format!(
+            "instances still stopping after {} s; they finish in the background",
+            crate::STOP_WAIT_LIMIT.as_secs(),
+        );
+        let body = PluginsStopTimedOutBody {
+            error: "stop_timed_out",
+            message: message.clone(),
+            stopped: report.stopped,
+            stopping: report.still_stopping,
+        };
+        return match super::resources::encode_body_capped(
+            &body,
+            "plugins.stop",
+            MAX_TOOL_BODY_BYTES,
+        ) {
+            EncodedBody::Value(v) => ToolOutcome::ExecErr {
+                message,
+                structured: Some(v),
+                domain_kind: None,
+            },
+            EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+            EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
         };
     }
     let stopped = report.stopped;

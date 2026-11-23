@@ -998,6 +998,12 @@ struct Channels {
     stop: watch::Receiver<bool>,
 }
 
+/// Whether a stop was requested, or every handle is gone: the check
+/// between plugin calls, matching [`stop_requested`].
+fn stop_is_requested(stop: &watch::Receiver<bool>) -> bool {
+    *stop.borrow() || stop.has_changed().is_err()
+}
+
 /// Resolves once a stop is requested, or every handle is gone (also a
 /// stop request, and the only one a guest blocked in a host import
 /// can hear).
@@ -1061,15 +1067,14 @@ impl Drop for ControlQueue {
                     ticket,
                     reply,
                 } => {
-                    // A caller that went away while queued already made
-                    // it `timed_out` (H5); the stop refuses the rest.
-                    let caller_gone = ticket.abandoned();
-                    // `false` only if the plugin was entered, which a
-                    // command still in the channel never was.
-                    if !ticket.try_abandon() {
+                    // A caller that went away (or whose deadline passed)
+                    // while queued gets `timed_out` (H5); the stop
+                    // refuses the rest. `None`: the plugin was entered,
+                    // which a command still in the channel never was.
+                    let Some(caller_gone) = ticket.try_refuse() else {
                         continue;
-                    }
-                    let refused = if caller_gone {
+                    };
+                    let refused = if caller_gone || ctx.is_expired() {
                         CommandOutcome::TimedOut {
                             message: format!(
                                 "instance `{instance_id}` stopped; the command did not run",
@@ -1373,7 +1378,7 @@ async fn run_supervisor(
                 // A stop requested while the instance was crashing
                 // (say, the watchdog interrupting a call a stop was
                 // waiting on) wins over the restart policy.
-                if *stop_rx.borrow() {
+                if stop_is_requested(&stop_rx) {
                     transition(&state_tx, &instance_id, InstanceState::Stopped);
                     return;
                 }
@@ -1525,7 +1530,7 @@ async fn run_one_lifecycle(
     let policy = instance.manifest().runtime.restart;
 
     // Stopped while loading: don't enter the plugin at all.
-    if *stop.borrow() {
+    if stop_is_requested(stop) {
         return stop_after_cancel(instance, state_tx, instance_id);
     }
     match guest_call(stop, instance.init()).await {
@@ -1545,7 +1550,7 @@ async fn run_one_lifecycle(
         }
     }
     transition(state_tx, instance_id, InstanceState::Inited);
-    if *stop.borrow() {
+    if stop_is_requested(stop) {
         // Stopped while `init` ran: no event handlers.
         return shutdown_before_serving(instance, state_tx, instance_id).await;
     }
@@ -1720,7 +1725,7 @@ async fn serve_loop(
         match outcome {
             // A stop requested meanwhile goes straight to shutdown,
             // without entering new event handlers.
-            Ok(LoopAction::Continue) if *stop.borrow() => {}
+            Ok(LoopAction::Continue) if stop_is_requested(stop) => {}
             Ok(LoopAction::Continue) => match guest_call(stop, instance.drain_events()).await {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),

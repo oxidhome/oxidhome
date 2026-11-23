@@ -664,8 +664,9 @@ async fn stop_waits_for_slow_sandboxes_and_reports_the_relation() {
         let engine = engine.clone();
         async move { call(&engine, svc_a, "slow", Vec::new()).await }
     });
-    // Let the call reach the sandbox's `sleep`.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Let the call reach the sandbox's `sleep` (an idle sandbox enters
+    // it within milliseconds; the margin is for loaded CI runners).
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let started = Instant::now();
     let report = oxidhome_core::stop_and_wait_reaped(vec![manager], Duration::from_mins(1)).await;

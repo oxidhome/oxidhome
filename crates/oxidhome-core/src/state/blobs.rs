@@ -1096,6 +1096,12 @@ impl BlobStore {
             // A file already gone is fine; one this instance doesn't
             // index keeps the directory.
             for id in &ids {
+                // Ids are host-minted file names; never follow one
+                // that isn't (a corrupt row) out of the directory.
+                if id.is_empty() || id.starts_with('.') || id.contains(['/', '\\', '\0']) {
+                    tracing::warn!(blob_id = %id, "purge skipped a blob id that isn't a file name");
+                    continue;
+                }
                 let path = instance_dir.join(id);
                 if let Err(err) = std::fs::remove_file(&path)
                     && err.kind() != std::io::ErrorKind::NotFound
