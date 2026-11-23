@@ -558,10 +558,23 @@ const SHUTDOWN_DEVICE_STATE_DEADLINE: Duration = Duration::from_secs(5);
 /// the persisted projection carries their stale flips. Bounded: a hung
 /// disk costs the unflushed changes, which the next boot treats like a
 /// crash (their cursors resync).
+///
+/// Runs on a detached std thread rather than `spawn_blocking`: the
+/// Tokio runtime waits for its blocking tasks on teardown, so a flush
+/// stuck on the disk would hold the process past the deadline.
 async fn close_device_state(engine: &oxidhome_core::Engine) {
     let engine = engine.clone();
-    let flush = tokio::task::spawn_blocking(move || engine.close_device_state());
-    match tokio::time::timeout(SHUTDOWN_DEVICE_STATE_DEADLINE, flush).await {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("device-state-close".into())
+        .spawn(move || {
+            let _ = tx.send(engine.close_device_state());
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(error = %err, "device-state projection: final flush not started");
+        return;
+    }
+    match tokio::time::timeout(SHUTDOWN_DEVICE_STATE_DEADLINE, rx).await {
         Ok(Ok(true)) => {}
         Ok(Ok(false) | Err(_)) => {
             tracing::warn!("device-state projection: final flush failed");

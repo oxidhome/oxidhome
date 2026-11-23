@@ -28,16 +28,27 @@
 //!   snapshot point, but the previous process may have issued
 //!   revisions above `R` that were never flushed (a crash, a disk
 //!   error). The restored store therefore continues from
-//!   `R + REVISION_GAP` and records the skipped range `(R, R + GAP]` as
+//!   `R + REVISION_GAP` and records the skipped range `(R, R + GAP)` as
 //!   a *hole*: a `/state/changes` cursor at or below `R` stays valid,
-//!   a cursor inside a hole gets `reset_required`. The hole and the
-//!   new base revision are written before the store serves anything,
-//!   so a crash later in this life can't reuse those revisions. The
+//!   a cursor inside a hole gets `reset_required`. The base `R + GAP`
+//!   itself is a valid cursor (a snapshot taken before the first new
+//!   write reports it). The hole and the new base revision are written
+//!   at `synchronous = FULL` before the store serves anything, so
+//!   neither a crash nor a power loss later in this life can reuse
+//!   those revisions. The
 //!   newest [`MAX_HOLES`] holes are kept; older ones fold into the
 //!   eviction watermark (cursors below it also reset).
 //! - **What is lost.** Changes made after the last successful flush
 //!   (at most [`COALESCE`] in steady state, longer while the disk is
 //!   failing). Their cursors land in the hole and resync.
+//! - **Damage and restores.** A row or hole list that can't be decoded
+//!   is dropped and the epoch is rotated with every cursor expired,
+//!   since no earlier cursor describes what was dropped. A backup
+//!   restore does the same ([`invalidate_cursors_after_restore`]): the
+//!   restored database is an older history.
+//! - **Encoding.** Fields use their own tagged JSON shape: floats by
+//!   bit pattern (NaN and infinities round-trip), bytes as hex, and
+//!   `u64` timestamps by bit pattern in `SQLite`'s signed integers.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
@@ -47,7 +58,7 @@ use std::time::Duration;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::{DeviceState, DeviceStateStore, StateQuality, StoreInner};
-use crate::host_impl::plugin::oxidhome::plugin::types::DeviceId;
+use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, Value};
 use crate::state::Db;
 
 type Key = (DeviceId, String);
@@ -202,7 +213,7 @@ impl DeviceStateStore {
     ///
     /// Reading the table, or writing the restored base, failed.
     pub fn open_persistent(db: Arc<Db>) -> anyhow::Result<Arc<Self>> {
-        let (meta, rows) = load(&db)?;
+        let (meta, rows, damaged) = load(&db)?;
         let signal = Arc::new(FlushSignal::default());
         let mut inner = StoreInner {
             dirty: Some(Dirty {
@@ -221,9 +232,13 @@ impl DeviceStateStore {
                 .or_insert(0);
             *generation = (*generation).max(row.source_generation);
             if !row.owner_plugin.is_empty() {
-                inner
-                    .owner_plugins
-                    .insert(row.owner_instance.clone(), row.owner_plugin.clone());
+                inner.owner_plugins.insert(
+                    row.owner_instance.clone(),
+                    super::OwnerIdentity {
+                        plugin: row.owner_plugin.clone(),
+                        install: row.owner_install.clone(),
+                    },
+                );
             }
             inner.entries.insert(
                 (row.device_id.clone(), row.capability.clone()),
@@ -244,6 +259,17 @@ impl DeviceStateStore {
                 }
             }
             inner.global_revision = base;
+            if damaged {
+                // Part of the persisted state couldn't be read back: no
+                // earlier cursor can be trusted to describe what was
+                // dropped. Rotate the epoch and expire every cursor.
+                tracing::warn!(
+                    target: "device_state.persist",
+                    "persisted device state was partly unreadable; every client cursor resyncs",
+                );
+                inner.epoch = super::mint_epoch();
+                inner.evicted_through_revision = base;
+            }
         } else {
             inner.global_revision = max_row_revision;
         }
@@ -263,8 +289,12 @@ impl DeviceStateStore {
                 thread: Mutex::new(None),
             }),
         });
-        // Persist the base revision and hole before serving anything.
-        store.flush_inner(true).map_err(|e| anyhow::anyhow!(e))?;
+        // Persist the base revision and hole before serving anything,
+        // at `synchronous = FULL`: a power loss must not roll the
+        // reservation back after clients saw revisions above it.
+        store
+            .flush_inner(true, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
         tracing::info!(
             target: "device_state.persist",
             restored,
@@ -290,7 +320,7 @@ impl DeviceStateStore {
     ///
     /// The write failed; the changes stay queued for the next flush.
     pub fn flush(&self) -> Result<bool, FlushError> {
-        self.flush_inner(false)
+        self.flush_inner(false, false)
     }
 
     /// H2: final flush at shutdown, then stop the flusher thread.
@@ -324,7 +354,7 @@ impl DeviceStateStore {
         ok
     }
 
-    fn flush_inner(&self, force_meta: bool) -> Result<bool, FlushError> {
+    fn flush_inner(&self, force_meta: bool, durable: bool) -> Result<bool, FlushError> {
         let Some(backing) = &self.backing else {
             return Ok(false);
         };
@@ -335,7 +365,20 @@ impl DeviceStateStore {
         let Some(batch) = self.take_batch(force_meta) else {
             return Ok(true);
         };
-        let result = backing.db.write(|conn| write_batch(conn, &batch));
+        let result = backing.db.write(|conn| {
+            if durable {
+                conn.pragma_update(None, "synchronous", "FULL")?;
+            }
+            let result = write_batch(conn, &batch);
+            if durable && let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                tracing::warn!(
+                    target: "device_state.persist",
+                    error = %err,
+                    "failed to restore synchronous = NORMAL after the boot flush",
+                );
+            }
+            result
+        });
         match result {
             Ok(()) => Ok(true),
             Err(err) => {
@@ -457,12 +500,14 @@ fn spawn_flusher(
     Ok(handle)
 }
 
+/// `SQLite` integers are signed; store `u64` by bit pattern so values
+/// above `i64::MAX` (a plugin's `observed-ms`) round-trip.
 fn to_i64(v: u64) -> i64 {
-    i64::try_from(v).unwrap_or(i64::MAX)
+    v.cast_signed()
 }
 
 fn to_u64(v: i64) -> u64 {
-    u64::try_from(v).unwrap_or(0)
+    v.cast_unsigned()
 }
 
 fn write_batch(conn: &mut rusqlite::Connection, batch: &FlushBatch) -> rusqlite::Result<()> {
@@ -473,16 +518,18 @@ fn write_batch(conn: &mut rusqlite::Connection, batch: &FlushBatch) -> rusqlite:
     {
         let mut upsert = tx.prepare(
             "INSERT INTO device_state(device_id, capability, owner_instance, owner_plugin, \
-             fields_blob, global_revision, received_ms, observed_ms, source_generation, quality) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             fields_blob, global_revision, received_ms, observed_ms, source_generation, quality, \
+             owner_install) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(device_id, capability) DO UPDATE SET \
              owner_instance = excluded.owner_instance, owner_plugin = excluded.owner_plugin, \
+             owner_install = excluded.owner_install, \
              fields_blob = excluded.fields_blob, global_revision = excluded.global_revision, \
              received_ms = excluded.received_ms, observed_ms = excluded.observed_ms, \
              source_generation = excluded.source_generation, quality = excluded.quality",
         )?;
         for e in &batch.upserts {
-            let blob = crate::state::event_log::encode_fields(&e.fields)
+            let blob = encode_fields(&e.fields)
                 .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
             upsert.execute(params![
                 e.device_id,
@@ -495,6 +542,7 @@ fn write_batch(conn: &mut rusqlite::Connection, batch: &FlushBatch) -> rusqlite:
                 to_i64(e.observed_ms),
                 to_i64(e.source_generation),
                 quality_str(e.quality),
+                e.owner_install,
             ])?;
         }
         let mut delete =
@@ -525,6 +573,97 @@ fn write_batch(conn: &mut rusqlite::Connection, batch: &FlushBatch) -> rusqlite:
     tx.commit()
 }
 
+/// On-disk shape of one field value. Floats are stored by bit pattern
+/// (JSON has no NaN or infinity) and bytes as hex.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "t", content = "v")]
+enum PersistedValue {
+    Bool(bool),
+    Int(i64),
+    FloatBits(u64),
+    String(String),
+    BytesHex(String),
+    Json(String),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedField {
+    k: String,
+    v: PersistedValue,
+}
+
+fn encode_fields(fields: &[KeyValue]) -> Result<Vec<u8>, serde_json::Error> {
+    let out: Vec<PersistedField> = fields
+        .iter()
+        .map(|kv| PersistedField {
+            k: kv.key.clone(),
+            v: match &kv.value {
+                Value::BoolVal(b) => PersistedValue::Bool(*b),
+                Value::IntVal(i) => PersistedValue::Int(*i),
+                Value::FloatVal(f) => PersistedValue::FloatBits(f.to_bits()),
+                Value::StringVal(s) => PersistedValue::String(s.clone()),
+                Value::BytesVal(b) => PersistedValue::BytesHex(super::hex_lower(b)),
+                Value::JsonVal(j) => PersistedValue::Json(j.clone()),
+            },
+        })
+        .collect();
+    serde_json::to_vec(&out)
+}
+
+fn decode_fields(blob: &[u8]) -> Result<Vec<KeyValue>, String> {
+    let stored: Vec<PersistedField> = serde_json::from_slice(blob).map_err(|e| e.to_string())?;
+    stored
+        .into_iter()
+        .map(|f| {
+            let value = match f.v {
+                PersistedValue::Bool(b) => Value::BoolVal(b),
+                PersistedValue::Int(i) => Value::IntVal(i),
+                PersistedValue::FloatBits(bits) => Value::FloatVal(f64::from_bits(bits)),
+                PersistedValue::String(s) => Value::StringVal(s),
+                PersistedValue::BytesHex(h) => {
+                    Value::BytesVal(super::hex_bytes(&h).ok_or("invalid hex")?)
+                }
+                PersistedValue::Json(j) => Value::JsonVal(j),
+            };
+            Ok(KeyValue { key: f.k, value })
+        })
+        .collect()
+}
+
+/// H2: make every `/state/changes` cursor and the epoch from before a
+/// backup restore invalid. A restored database is an older history:
+/// a client of the live daemon may hold a revision the restored store
+/// will reissue for different state, and the skipped range at the
+/// next boot only covers what the backup itself issued. Rotating the
+/// epoch tells epoch-checking clients; raising the eviction watermark
+/// past the next boot's base makes every older cursor reset.
+///
+/// Runs on the restored database before migrations; a database older
+/// than the device-state tables has no cursors to invalidate.
+///
+/// # Errors
+///
+/// The update failed.
+pub fn invalidate_cursors_after_restore(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_meta: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
+         AND name = 'device_state_meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_meta {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE device_state_meta SET epoch = ?1, \
+         evicted_through = MAX(revision, \
+             COALESCE((SELECT MAX(global_revision) FROM device_state), 0)) + ?2 \
+         WHERE id = 1",
+        params![super::mint_epoch(), to_i64(REVISION_GAP)],
+    )?;
+    Ok(())
+}
+
 fn quality_str(q: StateQuality) -> &'static str {
     match q {
         StateQuality::Fresh => "fresh",
@@ -532,8 +671,12 @@ fn quality_str(q: StateQuality) -> &'static str {
     }
 }
 
-fn load(db: &Db) -> anyhow::Result<(Option<Meta>, Vec<DeviceState>)> {
+/// Persisted rows plus whether anything had to be dropped.
+type Loaded = (Option<Meta>, Vec<DeviceState>, bool);
+
+fn load(db: &Db) -> anyhow::Result<Loaded> {
     db.read(|conn| -> anyhow::Result<_> {
+        let mut damaged = false;
         let meta = conn
             .query_row(
                 "SELECT epoch, revision, evicted_through, holes_json FROM device_state_meta \
@@ -555,9 +698,9 @@ fn load(db: &Db) -> anyhow::Result<(Option<Meta>, Vec<DeviceState>)> {
                         tracing::warn!(
                             target: "device_state.persist",
                             error = %err,
-                            "unreadable device-state hole list; cursors below the restored \
-                             revision will resync",
+                            "unreadable device-state hole list",
                         );
+                        damaged = true;
                         Vec::new()
                     })
                     .into_iter()
@@ -572,15 +715,15 @@ fn load(db: &Db) -> anyhow::Result<(Option<Meta>, Vec<DeviceState>)> {
             });
         let mut stmt = conn.prepare(
             "SELECT device_id, capability, owner_instance, owner_plugin, fields_blob, \
-             global_revision, received_ms, observed_ms, source_generation, quality \
-             FROM device_state",
+             global_revision, received_ms, observed_ms, source_generation, quality, \
+             owner_install FROM device_state",
         )?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         let mut skipped = 0usize;
         while let Some(row) = rows.next()? {
             let blob: Vec<u8> = row.get(4)?;
-            let Ok(fields) = crate::state::event_log::decode_fields(&blob) else {
+            let Ok(fields) = decode_fields(&blob) else {
                 skipped += 1;
                 continue;
             };
@@ -590,6 +733,7 @@ fn load(db: &Db) -> anyhow::Result<(Option<Meta>, Vec<DeviceState>)> {
                 capability: row.get(1)?,
                 owner_instance: row.get(2)?,
                 owner_plugin: row.get(3)?,
+                owner_install: row.get(10)?,
                 fields,
                 global_revision: to_u64(row.get(5)?),
                 received_ms: row.get(6)?,
@@ -603,13 +747,14 @@ fn load(db: &Db) -> anyhow::Result<(Option<Meta>, Vec<DeviceState>)> {
             });
         }
         if skipped > 0 {
+            damaged = true;
             tracing::warn!(
                 target: "device_state.persist",
                 skipped,
                 "skipped undecodable device-state rows",
             );
         }
-        Ok((meta, out))
+        Ok((meta, out, damaged))
     })
 }
 
@@ -664,7 +809,7 @@ mod tests {
     fn restart_restores_values_as_stale_and_keeps_epoch_and_old_cursors() {
         let dir = tempdir();
         let store = open(&dir);
-        store.bind_owner_plugin("inst", "example.switch");
+        store.bind_owner_plugin("inst", "example.switch", "inst-uuid");
         store.bump_generation("inst");
         put(&store, "dev-a", true);
         put(&store, "dev-b", false);
@@ -683,6 +828,7 @@ mod tests {
         assert_eq!(a.quality, StateQuality::Stale);
         assert_eq!(fmt(&a.fields), fmt(&on(true)));
         assert_eq!(a.owner_plugin, "example.switch");
+        assert_eq!(a.owner_install, "inst-uuid");
         // A cursor at the flushed revision is still valid and sees
         // the stale flips.
         let page = store.deltas_since_with_revision(flushed, 100);
@@ -695,6 +841,26 @@ mod tests {
         let a = store.snapshot_capability("dev-a", "switch").expect("slot");
         assert_eq!(a.quality, StateQuality::Fresh);
         assert_eq!(fmt(&a.fields), fmt(&on(false)));
+        assert!(store.close_persistence());
+    }
+
+    #[test]
+    fn restored_base_revision_is_a_valid_cursor() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        store.mark_device_stale("dev-a");
+        assert!(store.close_persistence());
+        drop(store);
+        // Nothing fresh to flip at boot: the store sits at its base.
+        let store = open(&dir);
+        let base = store.current_revision();
+        let page = store.deltas_since_with_revision(base, 10);
+        assert!(
+            !page.reset_required,
+            "a snapshot's revision must be pollable"
+        );
+        assert!(page.entries.is_empty());
         assert!(store.close_persistence());
     }
 
@@ -804,5 +970,107 @@ mod tests {
         let store = open(&dir);
         assert_eq!(store.verify_cursor(&cursor), Err(CursorError::EpochChanged));
         assert!(store.close_persistence());
+    }
+
+    #[test]
+    fn non_finite_floats_bytes_and_large_timestamps_round_trip() {
+        let dir = tempdir();
+        let store = open(&dir);
+        let fields = vec![
+            KeyValue {
+                key: "nan".into(),
+                value: Value::FloatVal(f64::NAN),
+            },
+            KeyValue {
+                key: "inf".into(),
+                value: Value::FloatVal(f64::NEG_INFINITY),
+            },
+            KeyValue {
+                key: "raw".into(),
+                value: Value::BytesVal(vec![0, 0xff, 0x10]),
+            },
+            KeyValue {
+                key: "on".into(),
+                value: Value::BoolVal(true),
+            },
+        ];
+        store.replace_snapshot(
+            "dev-a".into(),
+            "inst".into(),
+            "s".into(),
+            fields,
+            u64::MAX,
+            3,
+        );
+        assert!(store.close_persistence());
+        drop(store);
+        let store = open(&dir);
+        let e = store.snapshot_capability("dev-a", "s").expect("restored");
+        assert_eq!(e.observed_ms, u64::MAX);
+        let by_key = |k: &str| &e.fields.iter().find(|f| f.key == k).expect(k).value;
+        assert!(matches!(by_key("nan"), Value::FloatVal(f) if f.is_nan()));
+        assert!(matches!(by_key("inf"), Value::FloatVal(f) if *f == f64::NEG_INFINITY));
+        assert!(matches!(by_key("raw"), Value::BytesVal(b) if b == &[0, 0xff, 0x10]));
+        assert!(matches!(by_key("on"), Value::BoolVal(true)));
+        assert!(store.close_persistence());
+    }
+
+    #[test]
+    fn unreadable_persisted_state_expires_every_cursor() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        put(&store, "dev-b", true);
+        let cursor = store.current_revision();
+        let epoch = store.epoch();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| {
+            c.execute(
+                "UPDATE device_state SET fields_blob = x'00' WHERE device_id = 'dev-b'",
+                [],
+            )
+        })
+        .expect("corrupt a row");
+        drop(db);
+        let store = open(&dir);
+        assert_ne!(store.epoch(), epoch);
+        assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
+        assert!(store.snapshot_capability("dev-a", "switch").is_some());
+        assert!(store.close_persistence());
+    }
+
+    #[test]
+    fn restore_invalidation_expires_every_cursor() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        let cursor = store.current_revision();
+        let epoch = store.epoch();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| invalidate_cursors_after_restore(c))
+            .expect("invalidate");
+        drop(db);
+        let store = open(&dir);
+        assert_ne!(store.epoch(), epoch);
+        assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
+        assert!(
+            !store
+                .deltas_since_with_revision(store.current_revision(), 10)
+                .reset_required
+        );
+        assert!(store.close_persistence());
+    }
+
+    #[test]
+    fn legacy_pagination_cursor_is_a_restart() {
+        let store = DeviceStateStore::new();
+        assert_eq!(
+            store.verify_cursor("epoch-00.12.dev-x.00000000000000000000000000000000"),
+            Err(CursorError::EpochChanged)
+        );
     }
 }

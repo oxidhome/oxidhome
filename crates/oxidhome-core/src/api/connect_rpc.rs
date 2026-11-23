@@ -484,6 +484,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             pinned.as_ref().map(|(_, after)| after.as_str()),
             limit,
             MAX_ALL_DEVICES_STATE_PAGE_BYTES,
+            usize::MAX,
             |_| true,
         );
         let revision = pinned.as_ref().map_or(page.revision, |(r, _)| *r);
@@ -497,10 +498,9 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
                 device_snapshot_to_proto(id, caps, &page.epoch, revision, blobs)
             })
             .collect();
-        let next_cursor = match devices.last() {
-            Some(last) if page.more => store.issue_cursor(revision, &last.device_id),
-            _ => String::new(),
-        };
+        let next_cursor = page
+            .resume_after
+            .map_or_else(String::new, |after| store.issue_cursor(revision, &after));
         Response::ok(ListDeviceStateResponse {
             epoch: page.epoch,
             revision,

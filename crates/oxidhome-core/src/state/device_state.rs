@@ -79,7 +79,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rand::TryRng;
 
 mod persist;
-pub use persist::FlushError;
+pub use persist::{FlushError, REVISION_GAP, invalidate_cursors_after_restore};
 
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue};
 
@@ -145,6 +145,11 @@ pub struct DeviceState {
     /// [`DeviceStateStore::bind_owner_plugin`]). Matched by the H2
     /// `reads_state` grant's `plugin` selector.
     pub owner_plugin: String,
+    /// Installation UUID of the owning plugin at write time (empty
+    /// when unknown). A reinstall under the same plugin and instance
+    /// id is a different owner: it doesn't get the predecessor's
+    /// entries as its own (H2).
+    pub owner_install: String,
     pub quality: StateQuality,
 }
 
@@ -253,8 +258,9 @@ struct StoreInner {
     /// H2: `plugin.id` per owning `instance_id`, stamped onto every
     /// entry the instance writes. See
     /// [`DeviceStateStore::bind_owner_plugin`].
-    owner_plugins: HashMap<String, String>,
-    /// H2: revision ranges `(lo, hi]` that a boot skipped over. A
+    owner_plugins: HashMap<String, OwnerIdentity>,
+    /// H2: revision ranges `(lo, hi)` that a boot skipped over (`hi` is
+    /// the restored store's base revision, a valid cursor itself). A
     /// cursor inside one may come from writes that were lost before
     /// they were flushed, so it must resync. See [`persist`].
     holes: Vec<(u64, u64)>,
@@ -278,6 +284,13 @@ impl Default for StoreInner {
             dirty: None,
         }
     }
+}
+
+/// H2: the plugin and installation an owning instance runs as.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OwnerIdentity {
+    plugin: String,
+    install: String,
 }
 
 /// H2: 64-bit OS-random per-process nonce, hex. See
@@ -346,7 +359,7 @@ impl StoreInner {
         }
     }
 
-    fn owner_plugin(&self, owner_instance: &str) -> String {
+    fn owner_identity(&self, owner_instance: &str) -> OwnerIdentity {
         self.owner_plugins
             .get(owner_instance)
             .cloned()
@@ -375,12 +388,21 @@ impl DeviceStateStore {
     /// H2: remember which plugin `owner_instance` belongs to, so the
     /// entries it writes carry `owner_plugin`. Called when an instance
     /// is loaded.
-    pub fn bind_owner_plugin(&self, owner_instance: &str, plugin_id: &str) {
+    pub fn bind_owner_plugin(
+        &self,
+        owner_instance: &str,
+        plugin_id: &str,
+        installation_uuid: &str,
+    ) {
+        let identity = OwnerIdentity {
+            plugin: plugin_id.to_owned(),
+            install: installation_uuid.to_owned(),
+        };
         let mut inner = self.inner_write();
-        if inner.owner_plugins.get(owner_instance).map(String::as_str) != Some(plugin_id) {
+        if inner.owner_plugins.get(owner_instance) != Some(&identity) {
             inner
                 .owner_plugins
-                .insert(owner_instance.to_owned(), plugin_id.to_owned());
+                .insert(owner_instance.to_owned(), identity);
         }
     }
 
@@ -623,7 +645,10 @@ impl DeviceStateStore {
         // fits `MAX_BYTES_PER_SLOT`, matching the
         // field-count backstop pattern above.
         let final_fields = truncate_to_byte_cap(final_fields, &device_id, &capability);
-        let owner_plugin = inner.owner_plugin(&owner_instance);
+        let OwnerIdentity {
+            plugin: owner_plugin,
+            install: owner_install,
+        } = inner.owner_identity(&owner_instance);
         let entry = Arc::new(DeviceState {
             device_id,
             capability,
@@ -634,6 +659,7 @@ impl DeviceStateStore {
             source_generation: generation,
             owner_instance,
             owner_plugin,
+            owner_install,
             quality: StateQuality::Fresh,
         });
         inner.touch(&key);
@@ -670,10 +696,12 @@ impl DeviceStateStore {
         device_id: &str,
     ) -> (String, u64, Vec<Arc<DeviceState>>) {
         let inner = self.inner_read();
+        // H2: range scan over the device's keys instead of the whole map.
+        let lo = (device_id.to_string(), String::new());
+        let hi = (device_id.to_string(), MAX_CAP_SENTINEL.to_string());
         let entries: Vec<Arc<DeviceState>> = inner
             .entries
-            .iter()
-            .filter(|((did, _), _)| did == device_id)
+            .range(lo..=hi)
             .map(|(_, meta)| Arc::clone(meta))
             .collect();
         (inner.epoch.clone(), inner.global_revision, entries)
@@ -748,13 +776,18 @@ impl DeviceStateStore {
     /// device that would exceed `device_limit` or push the page past
     /// `byte_cap` (the first device is always kept, so paging makes
     /// progress). Bytes are estimated as capability name plus field
-    /// bytes. `more` says whether a kept device follows the page.
+    /// bytes. The scan also stops at a device boundary once it has
+    /// looked at `scan_budget` entries, which bounds the lock hold for
+    /// a sparse `keep`. `resume_after` is set when the caller should
+    /// read on: the last device committed (page full) or scanned
+    /// (budget spent).
     #[must_use]
     pub fn snapshot_page_capped(
         &self,
         after_device_id: Option<&str>,
         device_limit: usize,
         byte_cap: usize,
+        scan_budget: usize,
         keep: impl Fn(&DeviceState) -> bool,
     ) -> CappedPage {
         let inner = self.inner_read();
@@ -767,7 +800,8 @@ impl DeviceStateStore {
         let mut pending: Vec<Arc<DeviceState>> = Vec::new();
         let mut pending_bytes: usize = 0;
         let mut pending_device: Option<&DeviceId> = None;
-        let mut more = false;
+        let mut resume_after: Option<DeviceId> = None;
+        let mut full = false;
         // Commit `pending` if it fits; `false` means the page is full
         // and `pending` is the first device of the next page.
         let mut commit = |pending: &mut Vec<Arc<DeviceState>>, pending_bytes: &mut usize| {
@@ -783,10 +817,18 @@ impl DeviceStateStore {
             *pending_bytes = 0;
             true
         };
-        for ((did, _cap), entry) in inner.entries.range((start, Bound::Unbounded)) {
+        for (scanned, ((did, _cap), entry)) in
+            inner.entries.range((start, Bound::Unbounded)).enumerate()
+        {
             if pending_device != Some(did) {
                 if !commit(&mut pending, &mut pending_bytes) {
-                    more = true;
+                    full = true;
+                    break;
+                }
+                if scanned >= scan_budget {
+                    // Resume after the last device looked at, whether
+                    // or not it had a kept entry.
+                    resume_after = pending_device.cloned();
                     break;
                 }
                 pending_device = Some(did);
@@ -798,14 +840,21 @@ impl DeviceStateStore {
                 pending.push(Arc::clone(entry));
             }
         }
-        if !more && !commit(&mut pending, &mut pending_bytes) {
-            more = true;
+        if !full && resume_after.is_none() && !commit(&mut pending, &mut pending_bytes) {
+            full = true;
+        }
+        // Page full: resume after the last committed device.
+        if full {
+            resume_after = devices
+                .last()
+                .and_then(|d| d.first())
+                .map(|e| e.device_id.clone());
         }
         CappedPage {
             epoch: inner.epoch.clone(),
             revision: inner.global_revision,
             devices,
-            more,
+            resume_after,
         }
     }
 
@@ -1054,6 +1103,49 @@ impl DeviceStateStore {
         format!("{payload}.{hex}")
     }
 
+    /// H2: seal a scan position for the plugin `list-state` cursor.
+    /// The plugin must not learn the id of a device it can't see (the
+    /// scan may stop on one), so the id is encrypted with an
+    /// HMAC-derived keystream under this process's cursor secret and
+    /// authenticated. Format: `<nonce hex><ciphertext hex>.<mac hex>`.
+    #[must_use]
+    pub fn seal_scan_position(&self, device_id: &str) -> String {
+        let mut nonce = [0u8; 16];
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut nonce)
+            .expect("system RNG must be available");
+        let secret = self.inner_read().cursor_secret;
+        let ct = position_keystream_xor(&secret, &nonce, device_id.as_bytes());
+        let mac = position_mac(&secret, &nonce, &ct);
+        format!(
+            "{}{}.{}",
+            hex_lower(&nonce),
+            hex_lower(&ct),
+            hex_lower(&mac)
+        )
+    }
+
+    /// Inverse of [`Self::seal_scan_position`]. `None` for a token
+    /// that is malformed, forged, or from another process.
+    #[must_use]
+    pub fn open_scan_position(&self, token: &str) -> Option<String> {
+        if token.len() > MAX_SCAN_TOKEN_LEN {
+            return None;
+        }
+        let (body, mac_hex) = token.split_once('.')?;
+        let body = hex_bytes(body)?;
+        let mac = hex_bytes(mac_hex)?;
+        if body.len() < 16 || mac.len() != 16 {
+            return None;
+        }
+        let (nonce, ct) = body.split_at(16);
+        let secret = self.inner_read().cursor_secret;
+        if !constant_time_eq(&position_mac(&secret, nonce, ct), &mac) {
+            return None;
+        }
+        String::from_utf8(position_keystream_xor(&secret, nonce, ct)).ok()
+    }
+
     /// H9 round-14 finding 3: verify + decode a paginated
     /// cursor issued by [`Self::issue_cursor`]. Returns
     /// `(epoch, pinned_revision, after_device_id)` on
@@ -1086,7 +1178,15 @@ impl DeviceStateStore {
         let epoch = parts.next().ok_or(CursorError::Bad)?;
         let boot = parts.next().ok_or(CursorError::Bad)?;
         let rev = parts.next().ok_or(CursorError::Bad)?;
-        let device = parts.next().ok_or(CursorError::Bad)?;
+        let Some(device) = parts.next() else {
+            // H2: a pre-H2 cursor (`<epoch>.<revision>.<device>.<mac>`)
+            // comes from an earlier daemon process: restart the resync
+            // (409) rather than report a client bug (400).
+            if !epoch.is_empty() && boot.parse::<u64>().is_ok() && !rev.is_empty() {
+                return Err(CursorError::EpochChanged);
+            }
+            return Err(CursorError::Bad);
+        };
         if epoch.is_empty() || device.is_empty() || mac_hex.len() != 32 {
             return Err(CursorError::Bad);
         }
@@ -1175,7 +1275,7 @@ impl DeviceStateStore {
             || inner
                 .holes
                 .iter()
-                .any(|&(lo, hi)| since_revision > lo && since_revision <= hi)
+                .any(|&(lo, hi)| since_revision > lo && since_revision < hi)
         {
             return DeltaPage {
                 epoch: inner.epoch.clone(),
@@ -1283,7 +1383,7 @@ impl DeviceStateStore {
         // as `write_entry` so post-restart writes stamp the right
         // generation onto the reseeded slots.
         let generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
-        let owner_plugin = inner.owner_plugin(owner_instance);
+        let owner = inner.owner_identity(owner_instance);
         for (capability, fields) in initial_state {
             // H9 round-16 finding 1: canonicalize the input
             // by folding duplicate keys last-wins BEFORE
@@ -1314,7 +1414,8 @@ impl DeviceStateStore {
                 observed_ms,
                 source_generation: generation,
                 owner_instance: owner_instance.to_string(),
-                owner_plugin: owner_plugin.clone(),
+                owner_plugin: owner.plugin.clone(),
+                owner_install: owner.install.clone(),
                 quality: StateQuality::Fresh,
             });
             inner.touch(&key);
@@ -1429,6 +1530,51 @@ impl DeviceStateStore {
             }
         }
     }
+}
+
+/// Longest `list-state` cursor accepted (a sealed device id is about
+/// 2 × (16 + id length) + 33 characters).
+const MAX_SCAN_TOKEN_LEN: usize = 1024;
+
+fn position_keystream_xor(secret: &[u8; 32], nonce: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for (i, chunk) in data.chunks(32).enumerate() {
+        let mut msg = b"oxidhome-scan-ks".to_vec();
+        msg.extend_from_slice(nonce);
+        msg.extend_from_slice(&u64::try_from(i).unwrap_or(u64::MAX).to_be_bytes());
+        let ks = hmac_sha256(secret, &msg);
+        out.extend(chunk.iter().zip(ks).map(|(a, b)| a ^ b));
+    }
+    out
+}
+
+fn position_mac(secret: &[u8; 32], nonce: &[u8], ct: &[u8]) -> [u8; 16] {
+    let mut msg = b"oxidhome-scan-mac".to_vec();
+    msg.extend_from_slice(nonce);
+    msg.extend_from_slice(ct);
+    let full = hmac_sha256(secret, &msg);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// H9 round-13 finding 2: per-slot cap on distinct field
@@ -1839,8 +1985,9 @@ pub struct CappedPage {
     /// Kept entries, one inner vec per device, sorted by device id
     /// then capability.
     pub devices: Vec<Vec<Arc<DeviceState>>>,
-    /// Another kept device follows the last one in `devices`.
-    pub more: bool,
+    /// Set when more entries may follow: pass it as the next page's
+    /// `after_device_id`. See [`DeviceStateStore::snapshot_page_capped`].
+    pub resume_after: Option<DeviceId>,
 }
 
 /// H9 round-12 finding 2: sentinel string that sorts strictly
@@ -3380,5 +3527,72 @@ mod tests {
         assert!(matches!(before.fields[0].value, Value::BoolVal(true)));
         let after = store.snapshot_capability("dev-1", "switch").unwrap();
         assert!(matches!(after.fields[0].value, Value::BoolVal(false)));
+    }
+
+    /// H2: `snapshot_page_capped` honours the device limit, skips
+    /// devices without kept entries, and stops at a device boundary
+    /// once the scan budget is spent, with a resume point.
+    #[test]
+    fn capped_page_limits_filters_and_scan_budget() {
+        let store = DeviceStateStore::new();
+        for d in 0..6 {
+            for cap in ["a", "b"] {
+                store.apply_delta(
+                    format!("dev-{d}"),
+                    "inst".into(),
+                    cap.into(),
+                    vec![kv("x", Value::IntVal(d))],
+                    0,
+                    0,
+                );
+            }
+        }
+        let ids = |p: &CappedPage| {
+            p.devices
+                .iter()
+                .map(|d| d[0].device_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let page = store.snapshot_page_capped(None, 2, usize::MAX, usize::MAX, |_| true);
+        assert_eq!(ids(&page), ["dev-0", "dev-1"]);
+        assert_eq!(page.devices[0].len(), 2, "a device is committed whole");
+        assert_eq!(page.resume_after.as_deref(), Some("dev-1"));
+        let last = store.snapshot_page_capped(Some("dev-3"), 10, usize::MAX, usize::MAX, |_| true);
+        assert_eq!(ids(&last), ["dev-4", "dev-5"]);
+        assert_eq!(last.resume_after, None);
+        // Only odd devices kept, capability `b` only.
+        let odd = store.snapshot_page_capped(None, 10, usize::MAX, usize::MAX, |e| {
+            e.device_id.ends_with(['1', '3', '5']) && e.capability == "b"
+        });
+        assert_eq!(ids(&odd), ["dev-1", "dev-3", "dev-5"]);
+        assert!(odd.devices.iter().all(|d| d.len() == 1));
+        // Budget of 3 entries: stops after the second device's entries,
+        // at a device boundary, and resumes after the last one scanned.
+        let none = store.snapshot_page_capped(None, 10, usize::MAX, 3, |_| false);
+        assert!(none.devices.is_empty());
+        assert_eq!(none.resume_after.as_deref(), Some("dev-1"));
+        // Byte cap: the first device always fits, the second doesn't.
+        let tiny = store.snapshot_page_capped(None, 10, 1, usize::MAX, |_| true);
+        assert_eq!(ids(&tiny), ["dev-0"]);
+        assert_eq!(tiny.resume_after.as_deref(), Some("dev-0"));
+    }
+
+    /// H2: a sealed `list-state` position hides the device id, round-
+    /// trips in this process, and is refused by another one or when
+    /// tampered with.
+    #[test]
+    fn scan_position_is_sealed() {
+        let store = DeviceStateStore::new();
+        let id = "hidden-device-with-a-long-id-over-32-bytes";
+        let token = store.seal_scan_position(id);
+        assert!(!token.contains("hidden"));
+        assert_eq!(store.open_scan_position(&token).as_deref(), Some(id));
+        assert_eq!(DeviceStateStore::new().open_scan_position(&token), None);
+        let mut tampered = token.clone().into_bytes();
+        tampered[40] = if tampered[40] == b'0' { b'1' } else { b'0' };
+        let tampered = String::from_utf8(tampered).expect("ascii");
+        assert_eq!(store.open_scan_position(&tampered), None);
+        assert_eq!(store.open_scan_position("zz.zz"), None);
+        assert_eq!(store.open_scan_position(""), None);
     }
 }

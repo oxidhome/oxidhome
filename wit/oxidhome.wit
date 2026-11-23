@@ -1339,8 +1339,9 @@ interface host-state {
     /// Visible entries, grouped by device (sorted by device id, then
     /// capability).
     entries: list<device-state>,
-    /// Pass as `after` to read the next page; `none` on the last one.
-    next-after: option<device-id>,
+    /// Opaque cursor for the next page; `none` once the scan reached
+    /// the end. Valid only in this host process.
+    next-cursor: option<string>,
   }
 
   /// Every visible capability entry of `device`. `not-found` when the
@@ -1348,12 +1349,16 @@ interface host-state {
   /// but none of it is visible to this plugin.
   get-state: func(device: device-id) -> result<list<device-state>, error>;
 
-  /// Visible entries matching `filter`, for devices sorting after
-  /// `after`, at most `limit` devices per page (0 means 64; capped at
-  /// 256) and about 1 MiB.
+  /// Visible entries matching `filter`, from the start (`cursor` is
+  /// `none`) or from a previous page's `next-cursor`, at most `limit`
+  /// devices per page (0 means 64; capped at 256) and about 1 MiB.
+  /// One call looks at a bounded number of entries, so a page can
+  /// hold fewer devices than `limit`, or none, while `next-cursor` is
+  /// still set: keep reading until it is `none`. A cursor from an
+  /// earlier host process is `invalid-argument`; start over.
   list-state: func(
     filter: state-filter,
-    after: option<device-id>,
+    cursor: option<string>,
     limit: u32,
   ) -> result<state-page, error>;
 }

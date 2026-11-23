@@ -1131,6 +1131,14 @@ fn complete_restore_audit(
 /// Boot an engine on the restored state (proves it opens, applies
 /// pending migrations) and record the restore in its audit ledger.
 fn record_restore(state_dir: &Path, archive_created_ms: u64) -> anyhow::Result<()> {
+    // H2: the restored projection is an older history; cursors held by
+    // clients of the replaced database must resync.
+    {
+        let conn = rusqlite::Connection::open(state_dir.join(crate::state::db::DB_FILE_NAME))
+            .with_context(|| format!("opening restored database at {}", state_dir.display()))?;
+        crate::state::device_state::invalidate_cursors_after_restore(&conn)
+            .context("invalidating device-state cursors after restore")?;
+    }
     let engine = crate::Engine::with_state_dir(state_dir)
         .with_context(|| format!("opening engine state at {}", state_dir.display()))?;
     let entry = crate::state::AuditEntry {

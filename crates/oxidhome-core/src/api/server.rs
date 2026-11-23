@@ -779,6 +779,7 @@ async fn get_all_device_state(
         cursor_fields.as_ref().map(|(_, _, did)| did.as_str()),
         limit,
         MAX_ALL_DEVICES_STATE_PAGE_BYTES,
+        usize::MAX,
         |_| true,
     );
     let epoch = page.epoch;
@@ -795,16 +796,9 @@ async fn get_all_device_state(
         .into_iter()
         .map(|caps| DeviceStateSnapshot::from_entries(&caps, &epoch, revision, blobs))
         .collect();
-    let next_cursor = if page.more {
-        devices.last().map(|d| {
-            state
-                .engine
-                .device_state()
-                .issue_cursor(revision, &d.device_id)
-        })
-    } else {
-        None
-    };
+    let next_cursor = page
+        .resume_after
+        .map(|after| state.engine.device_state().issue_cursor(revision, &after));
     Ok(Json(AllDevicesStateSnapshot {
         epoch,
         revision,

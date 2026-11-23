@@ -52,19 +52,22 @@ pub fn get(device: &str) -> Result<Vec<DeviceState>, Error> {
     host_state::get_state(device)
 }
 
-/// One page of visible entries matching `filter`, for devices sorting
-/// after `after`. `limit` is in devices (0 means the host default).
-/// Pass the page's `next_after` back as `after` for the next page.
+/// One page of visible entries matching `filter`. Pass `None` for the
+/// first page and the previous page's `next_cursor` after that.
+/// `limit` is in devices (0 means the host default). A page can be
+/// short, or empty, while `next_cursor` is set.
 ///
 /// # Errors
 ///
-/// Forwards any host [`Error`].
-pub fn list(filter: &StateFilter, after: Option<&str>, limit: u32) -> Result<StatePage, Error> {
-    host_state::list_state(filter, after, limit)
+/// Forwards any host [`Error`]; [`Error::InvalidArgument`] for a cursor
+/// from an earlier host process.
+pub fn list(filter: &StateFilter, cursor: Option<&str>, limit: u32) -> Result<StatePage, Error> {
+    host_state::list_state(filter, cursor, limit)
 }
 
 /// Every visible entry matching `filter`, reading at most
-/// [`MAX_LIST_ALL_PAGES`] pages. Pages are separate reads, so entries
+/// [`MAX_LIST_ALL_PAGES`] pages (a result cut off there is partial;
+/// use [`list`] to page further). Pages are separate reads, so entries
 /// from different pages may come from different revisions; compare
 /// [`DeviceState::revision`] when that matters.
 ///
@@ -73,12 +76,12 @@ pub fn list(filter: &StateFilter, after: Option<&str>, limit: u32) -> Result<Sta
 /// Forwards any host [`Error`].
 pub fn list_all(filter: &StateFilter) -> Result<Vec<DeviceState>, Error> {
     let mut out = Vec::new();
-    let mut after: Option<String> = None;
+    let mut cursor: Option<String> = None;
     for _ in 0..MAX_LIST_ALL_PAGES {
-        let page = list(filter, after.as_deref(), 0)?;
+        let page = list(filter, cursor.as_deref(), 0)?;
         out.extend(page.entries);
-        match page.next_after {
-            Some(next) => after = Some(next),
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
             None => break,
         }
     }

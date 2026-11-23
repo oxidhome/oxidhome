@@ -527,10 +527,11 @@ impl PluginState {
         let limits = PluginResourceLimits::new();
         // H2: entries this instance writes carry its plugin id, which
         // the `reads_state` grant's `plugin` selector matches on.
-        device_state.bind_owner_plugin(&instance_id, &manifest.plugin.id);
+        let installation_uuid: Arc<str> = installation_uuid.into();
+        device_state.bind_owner_plugin(&instance_id, &manifest.plugin.id, &installation_uuid);
         Self {
             instance_id,
-            installation_uuid: installation_uuid.into(),
+            installation_uuid,
             granted_capabilities,
             consumes_services_requested,
             table: ResourceTable::new(),

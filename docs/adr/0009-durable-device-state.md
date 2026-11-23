@@ -25,11 +25,12 @@ rule that a disk problem never stops live control, and it must not add disk work
   failed flush is retried with backoff and never affects publishing.
 - Restored values are `stale` until the owner republishes them. The host does not claim a value it has not seen in
   the owner's current life.
-- The epoch is persisted. A restored store continues from the flushed revision `R` plus 2^32 and records `(R, R + 2^32]`
-  as a skipped range before serving anything. Cursors at or below `R` stay valid, and cursors inside a skipped range get
-  `reset_required`.
+- The epoch is persisted. A restored store continues from the flushed revision `R` plus 2^32 and records `(R, R + 2^32)`
+  as a skipped range before serving anything, written at `synchronous = FULL`. Cursors at or below `R` stay valid, and
+  cursors inside a skipped range get `reset_required`. Undecodable persisted data and a backup restore rotate the epoch
+  and expire every cursor.
 - Plugins read state through a new `host-state` WIT import (`get-state`, `list-state`). An instance always reads what
-  it wrote. Other entries need a `[[capabilities.reads_state]]` grant selecting owner plugin, capability and device,
+  it wrote as the same installation. Other entries need a `[[capabilities.reads_state]]` grant selecting owner plugin, capability and device,
   with `bytes = true` required to see `bytes-val` fields. Requested and granted lists are intersected by equality, and
   refused `get-state` calls are audited.
 - Connect gains `GetDeviceState`, `ListDeviceState` and `ListDeviceStateChanges`, with parity to the REST endpoints.

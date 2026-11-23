@@ -830,6 +830,7 @@ const MIGRATIONS: &[&str] = &[
         capability        TEXT NOT NULL,
         owner_instance    TEXT NOT NULL,
         owner_plugin      TEXT NOT NULL,
+        owner_install     TEXT NOT NULL,
         fields_blob       BLOB NOT NULL,
         global_revision   INTEGER NOT NULL,
         received_ms       INTEGER NOT NULL,

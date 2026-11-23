@@ -645,12 +645,12 @@ interface host-state {
   record state-page {
     revision: u64,
     entries: list<device-state>,
-    next-after: option<device-id>,
+    next-cursor: option<string>,
   }
 
   get-state: func(device: device-id) -> result<list<device-state>, error>;
 
-  list-state: func(filter: state-filter, after: option<device-id>, limit: u32) -> result<state-page, error>;
+  list-state: func(filter: state-filter, cursor: option<string>, limit: u32) -> result<state-page, error>;
 }
 
 interface host-media {

@@ -32,8 +32,19 @@ const DEFAULT_LIST_LIMIT: usize = 64;
 const MAX_LIST_LIMIT: usize = 256;
 /// Byte budget per `list-state` page (same as the REST snapshot).
 const MAX_LIST_PAGE_BYTES: usize = 1024 * 1024;
+/// Entries one `list-state` call looks at before it returns a partial
+/// page, bounding how long it holds the store lock under a sparse
+/// filter or grant.
+const LIST_SCAN_BUDGET: usize = 4096;
 /// How long a refused read waits for its audit row.
 const DENY_AUDIT_WAIT: Duration = Duration::from_secs(2);
+/// Deny-row writes in flight at once, process-wide. A write that
+/// outlives [`DENY_AUDIT_WAIT`] keeps its permit until it completes,
+/// so a stalled writer can't pile up blocking tasks; past the limit a
+/// refusal is traced but not audited.
+const MAX_PENDING_DENY_AUDITS: usize = 32;
+static DENY_AUDIT_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_PENDING_DENY_AUDITS);
 /// Audit `method` for state reads.
 pub(crate) const STATE_READ_AUDIT_METHOD: &str = "STATE";
 
@@ -46,8 +57,17 @@ enum Visibility {
     Full,
 }
 
-fn visibility(instance_id: &str, grants: &[StateGrant], entry: &DeviceState) -> Visibility {
-    if entry.owner_instance == instance_id {
+/// Own entries are the ones this instance wrote *as this
+/// installation*: an instance id reused by another plugin, or by a
+/// reinstall of the same plugin, doesn't inherit the stale entries its
+/// predecessor left behind.
+fn visibility(
+    instance_id: &str,
+    installation_uuid: &str,
+    grants: &[StateGrant],
+    entry: &DeviceState,
+) -> Visibility {
+    if entry.owner_instance == instance_id && entry.owner_install == installation_uuid {
         return Visibility::Full;
     }
     let mut seen = Visibility::Hidden;
@@ -125,7 +145,17 @@ async fn audit_state_denied(
             command_id: None,
             command_outcome: None,
         };
-        let write = tokio::task::spawn_blocking(move || log.record_completed(&entry));
+        let Ok(permit) = DENY_AUDIT_PERMITS.try_acquire() else {
+            tracing::warn!(
+                target: "host.audit",
+                "state-read deny row dropped: too many audit writes pending",
+            );
+            return;
+        };
+        let write = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.record_completed(&entry)
+        });
         match tokio::time::timeout(DENY_AUDIT_WAIT, write).await {
             Ok(Ok(Ok(_))) => {}
             Ok(Ok(Err(err))) => {
@@ -148,10 +178,11 @@ impl host_state::Host for PluginState {
             return Err(WitError::NotFound(format!("no state for device {device}")));
         }
         let grants = Arc::clone(&self.granted_capabilities);
+        let install = self.installation_uuid.to_string();
         let mut out: Vec<WitDeviceState> = entries
             .iter()
             .filter_map(|e| {
-                let vis = visibility(&self.instance_id, &grants.reads_state, e);
+                let vis = visibility(&self.instance_id, &install, &grants.reads_state, e);
                 (vis != Visibility::Hidden).then(|| to_wit(e, vis))
             })
             .collect();
@@ -181,46 +212,59 @@ impl host_state::Host for PluginState {
     async fn list_state(
         &mut self,
         filter: StateFilter,
-        after: Option<DeviceId>,
+        cursor: Option<String>,
         limit: u32,
     ) -> Result<StatePage, WitError> {
+        // The cursor is sealed: the scan may stop on a device this
+        // plugin can't see, and its id must not leak.
+        let after = match cursor.as_deref() {
+            None => None,
+            Some(token) => Some(self.device_state.open_scan_position(token).ok_or_else(|| {
+                WitError::InvalidArgument(
+                    "invalid or expired list-state cursor; start over without one".into(),
+                )
+            })?),
+        };
         let limit = match usize::try_from(limit).unwrap_or(usize::MAX) {
             0 => DEFAULT_LIST_LIMIT,
             n => n.min(MAX_LIST_LIMIT),
         };
         let grants = Arc::clone(&self.granted_capabilities);
         let instance_id = self.instance_id.clone();
+        let install = self.installation_uuid.to_string();
         let page = self.device_state.snapshot_page_capped(
             after.as_deref(),
             limit,
             MAX_LIST_PAGE_BYTES,
+            LIST_SCAN_BUDGET,
             |e| {
                 filter.device.as_ref().is_none_or(|d| *d == e.device_id)
                     && filter
                         .capability
                         .as_ref()
                         .is_none_or(|c| *c == e.capability)
-                    && visibility(&instance_id, &grants.reads_state, e) != Visibility::Hidden
+                    && visibility(&instance_id, &install, &grants.reads_state, e)
+                        != Visibility::Hidden
             },
         );
-        let next_after = if page.more {
-            page.devices
-                .last()
-                .and_then(|d| d.first())
-                .map(|e| e.device_id.clone())
-        } else {
-            None
-        };
+        let next_cursor = page
+            .resume_after
+            .map(|after| self.device_state.seal_scan_position(&after));
         let entries = page
             .devices
             .iter()
             .flatten()
-            .map(|e| to_wit(e, visibility(&instance_id, &grants.reads_state, e)))
+            .map(|e| {
+                to_wit(
+                    e,
+                    visibility(&instance_id, &install, &grants.reads_state, e),
+                )
+            })
             .collect();
         Ok(StatePage {
             revision: page.revision,
             entries,
-            next_after,
+            next_cursor,
         })
     }
 }
@@ -244,6 +288,7 @@ mod tests {
             source_generation: 1,
             owner_instance: owner_instance.into(),
             owner_plugin: owner_plugin.into(),
+            owner_install: format!("inst-{owner_plugin}"),
             quality: StateQuality::Fresh,
         }
     }
@@ -260,27 +305,33 @@ mod tests {
     #[test]
     fn own_entries_are_always_fully_visible() {
         let e = entry("me", "p.me", "dev-1", "camera");
-        assert_eq!(visibility("me", &[], &e), Visibility::Full);
+        assert_eq!(visibility("me", "inst-p.me", &[], &e), Visibility::Full);
+        // Same instance id, another installation (reinstall or another
+        // plugin): not its own.
+        assert_eq!(visibility("me", "inst-p.new", &[], &e), Visibility::Hidden);
     }
 
     #[test]
     fn foreign_entries_need_a_matching_grant() {
         let e = entry("other", "p.other", "dev-1", "camera");
-        assert_eq!(visibility("me", &[], &e), Visibility::Hidden);
+        assert_eq!(visibility("me", "inst-p.me", &[], &e), Visibility::Hidden);
         let wrong_plugin = grant("p.else", &["*"], &["*"], true);
         let wrong_cap = grant("p.other", &["switch"], &["*"], true);
         let wrong_dev = grant("*", &["*"], &["dev-2"], true);
         let empty_caps = grant("*", &[], &["*"], true);
         for g in [wrong_plugin, wrong_cap, wrong_dev, empty_caps] {
-            assert_eq!(visibility("me", &[g], &e), Visibility::Hidden);
+            assert_eq!(visibility("me", "inst-p.me", &[g], &e), Visibility::Hidden);
         }
         let no_bytes = grant("p.other", &["camera"], &["dev-1"], false);
         assert_eq!(
-            visibility("me", std::slice::from_ref(&no_bytes), &e),
+            visibility("me", "inst-p.me", std::slice::from_ref(&no_bytes), &e),
             Visibility::Withheld
         );
         let bytes = grant("*", &["*"], &["*"], true);
-        assert_eq!(visibility("me", &[no_bytes, bytes], &e), Visibility::Full);
+        assert_eq!(
+            visibility("me", "inst-p.me", &[no_bytes, bytes], &e),
+            Visibility::Full
+        );
     }
 
     #[test]
