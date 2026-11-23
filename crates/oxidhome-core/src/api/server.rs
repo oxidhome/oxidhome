@@ -3690,6 +3690,56 @@ impl IntoResponse for DashboardsError {
 mod tests {
     use super::*;
 
+    /// H3 follow-up: a degraded event-log mirror shows on both
+    /// anonymous probes, REST `/readyz` and Connect `Health.Check`,
+    /// while both keep reporting the daemon itself as up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn degraded_event_log_shows_on_readyz_and_connect_health() {
+        use tower::ServiceExt as _;
+        async fn probe(
+            router: &Router,
+            method: &str,
+            uri: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let mut req = axum::http::Request::builder().method(method).uri(uri);
+            let body = if method == "POST" {
+                req = req.header(axum::http::header::CONTENT_TYPE, "application/json");
+                axum::body::Body::from("{}")
+            } else {
+                axum::body::Body::empty()
+            };
+            let resp = router
+                .clone()
+                .oneshot(req.body(body).expect("request"))
+                .await
+                .expect("response");
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            (status, serde_json::from_slice(&bytes).expect("json"))
+        }
+        let engine = Engine::new().expect("engine");
+        let router = build_router(engine.clone());
+        let check = "/oxidhome.v1.HealthService/Check";
+
+        let (code, body) = probe(&router, "POST", check).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["eventLog"], "ok", "{body}");
+
+        engine
+            .event_log()
+            .degrade_for_test("injected: database or disk is full");
+        let (code, body) = probe(&router, "POST", check).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "ok", "degraded history keeps the daemon up");
+        assert_eq!(body["eventLog"], "degraded", "{body}");
+        let (code, body) = probe(&router, "GET", "/api/v1/readyz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["event_log"], "degraded", "{body}");
+    }
+
     /// M7 + H5: a `completed` report's `bytes-val` state is withheld
     /// from a caller without `blobs:read` (REST and MCP share this
     /// encoder) and passed through for one with it.

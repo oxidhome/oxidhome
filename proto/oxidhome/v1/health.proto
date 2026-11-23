@@ -11,8 +11,8 @@ syntax = "proto3";
 package oxidhome.v1;
 
 // HealthService — anonymous liveness probe for the daemon. No
-// authentication required; the only signal it carries is "the
-// daemon is up and the API surface is wired."
+// authentication required; it carries "the daemon is up and the API
+// surface is wired" plus the durable event-log mirror's state.
 service HealthService {
   // Check returns the daemon's identity + version. Always returns
   // OK on a reachable daemon. The future plugin-health rollup (which
@@ -24,11 +24,20 @@ service HealthService {
 message CheckRequest {}
 
 message CheckResponse {
-  // Always "ok" for now. Reserves the field for a future
-  // degraded-mode signal without breaking the wire shape.
+  // Always "ok" on a reachable daemon. A degraded event-log mirror
+  // does not change it (live control and delivery still work); see
+  // `event_log`.
   string status = 1;
 
   // `cargo`-resolved version of `oxidhome-core` — same value the
   // JSON `/api/v1/health` endpoint reports.
   string version = 2;
+
+  // State of the durable event-log mirror (H3): "ok", or "degraded"
+  // while event_log writes are failing and live events are delivered
+  // without a row id. Same value as `event_log` on
+  // `GET /api/v1/readyz`; details are on the authenticated MCP
+  // `oxidhome://status` resource. Empty from a daemon that predates
+  // the field.
+  string event_log = 3;
 }

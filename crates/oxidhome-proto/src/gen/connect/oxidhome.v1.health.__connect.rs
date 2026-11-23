@@ -49,8 +49,8 @@ pub const HEALTH_SERVICE_CHECK_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::se
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
 /// HealthService — anonymous liveness probe for the daemon. No
-/// authentication required; the only signal it carries is "the
-/// daemon is up and the API surface is wired."
+/// authentication required; it carries "the daemon is up and the API
+/// surface is wired" plus the durable event-log mirror's state.
 ///
 /// # Implementing handlers
 ///

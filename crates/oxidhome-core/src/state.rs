@@ -46,8 +46,11 @@ pub use devices::{
     DeviceMeta, DeviceRegistry, MAX_CAPABILITIES_PER_DEVICE, MAX_DEVICES_PER_INSTANCE,
 };
 pub use event_log::{
-    CursorExpired, EventLog, EventLogError, EventLogHealth, EventOrder, EventQuery,
-    GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, HistoricalEvent, MirrorPolicy, TopicMatch,
+    CursorExpired, DEFAULT_EVENT_LOG_MAX_AGE, DEFAULT_EVENT_LOG_MAX_ROWS,
+    DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY, DEFAULT_EVENT_LOG_RETENTION_INTERVAL,
+    ENV_EVENT_LOG_MAX_ROWS, ENV_EVENT_LOG_RETENTION_DAYS, EventLog, EventLogError, EventLogHealth,
+    EventLogRetention, EventOrder, EventQuery, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker,
+    HistoricalEvent, MirrorPolicy, RetentionTask, TopicMatch,
 };
 pub use event_tail::{EventTail, TailError, TailItem};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};

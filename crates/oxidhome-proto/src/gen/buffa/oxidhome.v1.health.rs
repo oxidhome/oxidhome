@@ -108,8 +108,9 @@ pub const __CHECK_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buf
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct CheckResponse {
-    /// Always "ok" for now. Reserves the field for a future
-    /// degraded-mode signal without breaking the wire shape.
+    /// Always "ok" on a reachable daemon. A degraded event-log mirror
+    /// does not change it (live control and delivery still work); see
+    /// `event_log`.
     ///
     /// Field 1: `status`
     #[serde(
@@ -128,6 +129,21 @@ pub struct CheckResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub version: ::buffa::alloc::string::String,
+    /// State of the durable event-log mirror (H3): "ok", or "degraded"
+    /// while event_log writes are failing and live events are delivered
+    /// without a row id. Same value as `event_log` on
+    /// `GET /api/v1/readyz`; details are on the authenticated MCP
+    /// `oxidhome://status` resource. Empty from a daemon that predates
+    /// the field.
+    ///
+    /// Field 3: `event_log`
+    #[serde(
+        rename = "eventLog",
+        alias = "event_log",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub event_log: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -137,6 +153,7 @@ impl ::core::fmt::Debug for CheckResponse {
         f.debug_struct("CheckResponse")
             .field("status", &self.status)
             .field("version", &self.version)
+            .field("event_log", &self.event_log)
             .finish()
     }
 }
@@ -173,6 +190,9 @@ impl ::buffa::Message for CheckResponse {
         if !self.version.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.version) as u64;
         }
+        if !self.event_log.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.event_log) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -188,6 +208,9 @@ impl ::buffa::Message for CheckResponse {
         }
         if !self.version.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.version, buf);
+        }
+        if !self.event_log.is_empty() {
+            ::buffa::types::put_string_field(3u32, &self.event_log, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -216,6 +239,13 @@ impl ::buffa::Message for CheckResponse {
                 )?;
                 ::buffa::types::merge_string(&mut self.version, buf)?;
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.event_log, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -226,6 +256,7 @@ impl ::buffa::Message for CheckResponse {
     fn clear(&mut self) {
         self.status.clear();
         self.version.clear();
+        self.event_log.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

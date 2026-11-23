@@ -39,10 +39,16 @@ use super::db::Db;
 
 mod cursor;
 mod mirror;
+mod retention;
 
 pub use cursor::CursorExpired;
 pub use mirror::{
     EventLogHealth, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, MirrorPolicy, is_gap_marker,
+};
+pub use retention::{
+    DEFAULT_EVENT_LOG_MAX_AGE, DEFAULT_EVENT_LOG_MAX_ROWS, DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY,
+    DEFAULT_EVENT_LOG_RETENTION_INTERVAL, ENV_EVENT_LOG_MAX_ROWS, ENV_EVENT_LOG_RETENTION_DAYS,
+    EventLogRetention, RetentionTask,
 };
 
 /// Errors returned by [`EventLog`]. Maps onto the WIT `error` variant
@@ -499,18 +505,11 @@ fn run_query(
 }
 
 impl EventLog {
-    /// Delete every event with `received_ms < cutoff_ms`. Returns the
-    /// number of rows removed. The retention scheduler (Phase 12) will
-    /// call this periodically; for now it's just a knob for tests.
-    ///
-    /// # Errors
-    ///
-    /// Forwards any SQL error.
-    /// H5-adjacent: cheap accessor for the fully-serialized shape a
-    /// caller can hand to `Self::record_prepared`. Kept off
-    /// [`EventPayload`]'s public surface so the storage-encoding
-    /// choice (JSON today, `postcard` tomorrow) doesn't leak past
-    /// the `state` module.
+    /// Delete every event with `received_ms < cutoff_ms`, subject to
+    /// the id-prefix rule below. Returns the number of rows removed.
+    /// The periodic retention task
+    /// ([`Self::spawn_retention`] / [`Self::apply_retention`]) uses
+    /// the same boundary for its age limit.
     ///
     /// H4: deletes only a **prefix of row ids** — every row below the
     /// first row (by id) received at or after `cutoff_ms`. Under a
@@ -522,19 +521,18 @@ impl EventLog {
     ///
     /// M6: retention is maintenance nobody waits on, so it runs at low
     /// priority and yields to queued event appends, audit and KV
-    /// writes. It stays one statement: a single prefix `DELETE` keeps
-    /// the H4 invariant trivially (no reader snapshot sees a partly
-    /// applied trim).
+    /// writes. It deletes in bounded chunks of the lowest remaining
+    /// ids, so every committed chunk (and every reader snapshot) has
+    /// still pruned an id prefix.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any SQL error.
     pub fn trim_older_than(&self, cutoff_ms: i64) -> Result<usize, EventLogError> {
-        self.db
-            .write_low_priority(|conn| -> Result<_, EventLogError> {
-                Ok(conn.execute(
-                    "DELETE FROM event_log WHERE id < COALESCE( \
-                     (SELECT MIN(id) FROM event_log WHERE received_ms >= ?1), \
-                     (SELECT MAX(id) + 1 FROM event_log))",
-                    params![cutoff_ms],
-                )?)
-            })
+        match self.retention_bound(Some(cutoff_ms), None)? {
+            Some(last) => self.trim_through(last),
+            None => Ok(0),
+        }
     }
 
     /// Total row count. Mostly for tests + future status endpoints.
