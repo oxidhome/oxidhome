@@ -598,13 +598,13 @@ pub(crate) fn cap_plugin_text(m: String) -> String {
 }
 
 /// M7 + H5: bound a plugin reply's `err` / `unknown` text, then scrub
-/// the instance's secret values from it. Capping first (with room for
-/// the longest secret, so one straddling the final cut is still whole
-/// and gets scrubbed) keeps the scrubber from copying a guest-sized
-/// message.
+/// the instance's secret values from it. Bounding first keeps the
+/// scrubber from copying a guest-sized message. The cut is chosen on
+/// the original text and moved past any secret occurrence that
+/// straddles it, so every secret byte kept is part of a whole match the
+/// scrubber then replaces; a later shorter cap can only trim scrubbed
+/// text.
 pub(crate) fn scrub_and_cap_reply(result: &mut CommandResult, secrets: &[&str]) {
-    let window = secrets.iter().map(|s| s.len()).max().unwrap_or(0);
-    let limit = MAX_PLUGIN_MESSAGE_BYTES.saturating_add(window);
     match result {
         CommandResult::Err(
             WitError::NotFound(m)
@@ -613,12 +613,43 @@ pub(crate) fn scrub_and_cap_reply(result: &mut CommandResult, secrets: &[&str]) 
             | WitError::Unavailable(m)
             | WitError::Internal(m),
         )
-        | CommandResult::Unknown(m) => {
-            *m = cap_text_at(std::mem::take(m), limit);
+        | CommandResult::Unknown(m)
+            if m.len() > MAX_PLUGIN_MESSAGE_BYTES =>
+        {
+            let cut = secret_safe_cut(m, MAX_PLUGIN_MESSAGE_BYTES, secrets);
+            *m = cap_text_at(std::mem::take(m), cut);
         }
         _ => {}
     }
     crate::redact::scrub_command_error(result, secrets);
+}
+
+/// The largest char boundary `<= limit`, moved forward past every
+/// secret occurrence that starts before it and ends after it.
+fn secret_safe_cut(text: &str, limit: usize, secrets: &[&str]) -> usize {
+    let bytes = text.as_bytes();
+    let mut cut = limit.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    loop {
+        // Occurrences crossing `cut` start in `(cut - len, cut)`.
+        let crossing_end = secrets
+            .iter()
+            .map(|s| s.as_bytes())
+            .filter(|s| !s.is_empty())
+            .flat_map(|secret| {
+                (cut.saturating_sub(secret.len() - 1)..cut).filter_map(move |start| {
+                    let end = start + secret.len();
+                    (end > cut && bytes.get(start..end) == Some(secret)).then_some(end)
+                })
+            })
+            .max();
+        match crossing_end {
+            Some(end) => cut = end,
+            None => return cut,
+        }
+    }
 }
 
 fn cap_text_at(m: String, limit: usize) -> String {
@@ -912,6 +943,24 @@ mod message_cap_tests {
         assert!(out.len() < MAX_PLUGIN_MESSAGE_BYTES + 128, "{}", out.len());
         let out = cap_plugin_text(out);
         assert!(!out.contains("hunter2"));
+    }
+
+    #[test]
+    fn earlier_secret_masking_cannot_pull_a_partial_secret_into_the_cap() {
+        let secret = "s3cr3t-value-that-is-long";
+        // One whole secret early (its mask is shorter), then one
+        // straddling well past the cap.
+        let mut text = String::from(secret);
+        text.push_str(&"x".repeat(MAX_PLUGIN_MESSAGE_BYTES + 10 - secret.len()));
+        text.push_str(secret);
+        text.push_str(&"y".repeat(100));
+        let mut reply = CommandResult::Unknown(text);
+        scrub_and_cap_reply(&mut reply, &[secret]);
+        let CommandResult::Unknown(out) = reply else {
+            panic!("variant kept")
+        };
+        let out = cap_plugin_text(out);
+        assert!(!out.contains("s3cr3t"), "partial secret leaked");
     }
 
     #[test]
