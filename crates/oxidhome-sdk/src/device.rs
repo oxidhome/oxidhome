@@ -145,7 +145,8 @@ impl Device {
     }
 
     /// A `siren`, sounding or not (sensitive: the `alarm` category).
-    /// Commands by convention: `on`, `off`, `toggle`.
+    /// Commands: `set` with a bool `state`, `toggle` (as the WIT
+    /// documents).
     #[must_use]
     pub fn siren(self, sounding: bool) -> Self {
         self.capability(CapabilitySpec::Siren)

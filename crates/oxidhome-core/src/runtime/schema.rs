@@ -17,7 +17,7 @@
 //!   host keeps apart (`unit = "other"`, `unit_label = <label>`) and
 //!   refuses when the label spells a named code. Every sensor
 //!   `state-changed` delta and `ok-with-state` reply must carry the
-//!   spec's unit ([`check_sensor_fields`]).
+//!   spec's unit ([`check_state_fields`]).
 //! - **Service commands** carry `params` / `returns` field schemas.
 //!   [`check_service_info`] validates them at `register-service` /
 //!   `update-service`; [`check_args`] gates every `call-service`
@@ -209,12 +209,22 @@ pub(crate) fn sensor_unit_changed(old: &DeviceInfo, new: &DeviceInfo) -> bool {
 /// `other` fallback, `unit_label`, both exactly as the spec declares
 /// them. A reading can't then reach the projection without its unit
 /// (a delta into an empty or `Stale` slot replaces it) or with a
-/// free-form one. No-op for other capabilities.
-pub(crate) fn check_sensor_fields(
+/// free-form one. An opener's `position` must be a number in 0.0 to
+/// 1.0, as at registration. No-op for other capabilities.
+pub(crate) fn check_state_fields(
     info: &DeviceInfo,
     capability: &str,
     fields: &[KeyValue],
 ) -> Result<(), String> {
+    if capability == "opener" {
+        for kv in fields.iter().filter(|kv| kv.key == "position") {
+            match kv.value {
+                Value::FloatVal(p) if p.is_finite() && (0.0..=1.0).contains(&p) => {}
+                _ => return Err("opener `position` must be a number from 0.0 to 1.0".into()),
+            }
+        }
+        return Ok(());
+    }
     if capability != "sensor" {
         return Ok(());
     }
@@ -870,7 +880,7 @@ mod tests {
             key: "value".into(),
             value: Value::FloatVal(1.0),
         };
-        check_sensor_fields(&info, "sensor", &[value.clone(), unit("celsius")]).unwrap();
+        check_state_fields(&info, "sensor", &[value.clone(), unit("celsius")]).unwrap();
         for bad in [
             vec![value.clone()],
             vec![value.clone(), unit("fahrenheit")],
@@ -884,12 +894,12 @@ mod tests {
             ],
         ] {
             assert!(
-                check_sensor_fields(&info, "sensor", &bad).is_err(),
+                check_state_fields(&info, "sensor", &bad).is_err(),
                 "{bad:?} should be refused"
             );
         }
         // Other capabilities are not the sensor's business.
-        check_sensor_fields(&info, "switch", &[unit("anything")]).unwrap();
+        check_state_fields(&info, "switch", &[unit("anything")]).unwrap();
 
         let other = device(
             vec![sensor(Unit::Other("steps".into()), None, None)],
@@ -899,12 +909,37 @@ mod tests {
             key: "unit_label".into(),
             value: Value::StringVal(v.into()),
         };
-        check_sensor_fields(&other, "sensor", &[value, unit("other"), label("steps")]).unwrap();
+        check_state_fields(&other, "sensor", &[value, unit("other"), label("steps")]).unwrap();
         assert!(
-            check_sensor_fields(&other, "sensor", &[unit("other")]).is_err(),
+            check_state_fields(&other, "sensor", &[unit("other")]).is_err(),
             "an `other` reading must carry its label"
         );
-        assert!(check_sensor_fields(&other, "sensor", &[unit("other"), label("paces")]).is_err());
+        assert!(check_state_fields(&other, "sensor", &[unit("other"), label("paces")]).is_err());
+    }
+
+    #[test]
+    fn opener_position_is_checked_on_every_update() {
+        let info = DeviceInfo {
+            local_id: "o".into(),
+            name: String::new(),
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            capabilities: Vec::new(),
+            initial_state: Vec::new(),
+            metadata: Vec::new(),
+        };
+        let pos = |v: Value| {
+            vec![KeyValue {
+                key: "position".into(),
+                value: v,
+            }]
+        };
+        assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(0.5))).is_ok());
+        assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(1.5))).is_err());
+        assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(f64::NAN))).is_err());
+        assert!(check_state_fields(&info, "opener", &pos(Value::StringVal("x".into()))).is_err());
+        assert!(check_state_fields(&info, "switch", &pos(Value::FloatVal(9.0))).is_ok());
     }
 
     #[test]

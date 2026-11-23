@@ -223,6 +223,12 @@ pub fn grant_sensitive(
 ) -> anyhow::Result<TokenPolicy> {
     check_devices(devices)?;
     let policy = with_grant(live_policy(tokens, token_id)?, category, devices);
+    // The merged list, not just this call's patterns, stays in bounds.
+    for grant in &policy.sensitive {
+        if let Some(list) = &grant.devices {
+            check_devices(list)?;
+        }
+    }
     let path = format!("{AUDIT_PATH_GRANT_SENSITIVE}:{}", category.as_str());
     audited(audit, "cli", token_id, &path, || {
         store(tokens, token_id, &policy)?;
@@ -394,6 +400,19 @@ mod tests {
             rows.iter()
                 .any(|r| r.path == "cli.auth.grant_sensitive:lock")
         );
+    }
+
+    /// Repeated grants can't grow a device list past the cap.
+    #[test]
+    fn merged_device_lists_stay_capped() {
+        let (tokens, audit) = stores();
+        let t = tokens.create("ha", br#"["*"]"#).unwrap();
+        let first: Vec<String> = (0..MAX_DEVICE_PATTERNS)
+            .map(|i| format!("dev-{i:016x}"))
+            .collect();
+        grant_sensitive(&tokens, &audit, &t.id, SensitiveCategory::Lock, &first).unwrap();
+        let more = vec!["dev-ffffffffffffffff".to_owned()];
+        assert!(grant_sensitive(&tokens, &audit, &t.id, SensitiveCategory::Lock, &more).is_err());
     }
 
     /// The owner's grants aren't editable: it holds every category.

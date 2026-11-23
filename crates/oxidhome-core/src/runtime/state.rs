@@ -990,8 +990,14 @@ impl host_devices::Host for PluginState {
                     tracing::warn!(
                         instance_id = %self.instance_id,
                         error = %err,
-                        "register-device denied (per-instance device cap)",
+                        "register-device denied",
                     );
+                    // A refused re-registration dropped the earlier
+                    // entry (fail closed); its state goes stale like
+                    // a `remove-device`.
+                    if self.devices.get_any(&would_be_id).is_none() {
+                        self.device_state.mark_device_stale(&would_be_id);
+                    }
                     return Err(err);
                 }
             };
@@ -1355,12 +1361,13 @@ fn require_publish_authorized(
                 )));
             }
             if let EventPayload::StateChanged(sc) = payload {
-                super::schema::check_sensor_fields(&meta.info, &sc.capability, &sc.fields)
-                    .map_err(|e| {
+                super::schema::check_state_fields(&meta.info, &sc.capability, &sc.fields).map_err(
+                    |e| {
                         WitError::InvalidArgument(format!(
                             "publish-event: device `{device_id}`: {e}"
                         ))
-                    })?;
+                    },
+                )?;
             }
             Ok(())
         }

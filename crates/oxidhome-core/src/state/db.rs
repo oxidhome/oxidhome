@@ -881,7 +881,9 @@ const MIGRATIONS: &[&str] = &[
     //   host's own audit rows for those two actions (`method = LOCAL`,
     //   which no API, Connect or MCP request can produce) on tokens
     //   that still hold exactly the minted `["*"]` scope, and set at
-    //   insert by those two code paths from now on. It is a column
+    //   insert by those two code paths from now on. Only the newest
+    //   live candidate becomes the owner, and a partial unique index
+    //   keeps it to one live owner. It is a column
     //   rather than a lookup because audit retention prunes the rows.
     // - `audit_event.level`: `warn` on the extra row every allowed
     //   sensitive action writes; NULL (info) otherwise.
@@ -898,12 +900,19 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE auth_token ADD COLUMN owner INTEGER NOT NULL DEFAULT 0;
     UPDATE auth_token SET owner = 1
-     WHERE CAST(scope_json AS TEXT) = '[\"*\"]'
-       AND id IN (
-         SELECT token_id FROM audit_event
-          WHERE method = 'LOCAL'
-            AND ((actor_kind = 'host' AND path = 'host.auth.bootstrap')
-              OR (actor_kind = 'cli' AND path = 'cli.auth.recover')));
+     WHERE id = (
+       SELECT id FROM auth_token
+        WHERE CAST(scope_json AS TEXT) = '[\"*\"]'
+          AND revoked_ms IS NULL
+          AND id IN (
+            SELECT token_id FROM audit_event
+             WHERE method = 'LOCAL'
+               AND ((actor_kind = 'host' AND path = 'host.auth.bootstrap')
+                 OR (actor_kind = 'cli' AND path = 'cli.auth.recover')))
+        ORDER BY created_ms DESC, id DESC
+        LIMIT 1);
+    CREATE UNIQUE INDEX auth_token_one_owner ON auth_token(owner)
+     WHERE owner = 1 AND revoked_ms IS NULL;
     ALTER TABLE audit_event ADD COLUMN level TEXT;
     CREATE TABLE device_meta (
         device_id          TEXT PRIMARY KEY NOT NULL,
@@ -2028,6 +2037,7 @@ mod tests {
                     "
                     DROP TABLE device_meta;
                     ALTER TABLE audit_event DROP COLUMN level;
+                    DROP INDEX auth_token_one_owner;
                     ALTER TABLE auth_token DROP COLUMN owner;
                     INSERT INTO auth_token(id, label, hash, scope_json, created_ms)
                     VALUES ('boot', 'admin', X'01', CAST('[\"*\"]' AS BLOB), 1),
@@ -2072,7 +2082,8 @@ mod tests {
                 stmt.query_map([], |r| r.get(0))?.collect()
             })
             .expect("owners");
-        assert_eq!(owners, vec!["boot".to_string(), "recovered".to_string()]);
+        // One live owner: the newest candidate.
+        assert_eq!(owners, vec!["recovered".to_string()]);
         let floors: Vec<(String, String, String)> = db
             .read(|c| {
                 let mut stmt = c.prepare(
@@ -2119,6 +2130,7 @@ mod tests {
                     -- device categories.
                     DROP TABLE device_meta;
                     ALTER TABLE audit_event DROP COLUMN level;
+                    DROP INDEX auth_token_one_owner;
                     ALTER TABLE auth_token DROP COLUMN owner;
                     -- 20 (H5): pending commands.
                     DROP TABLE pending_command;

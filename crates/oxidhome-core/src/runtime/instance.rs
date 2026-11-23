@@ -1168,10 +1168,15 @@ impl PluginInstance {
     /// this method on the matching [`PluginInstance`].
     ///
     /// The authorization resource for `device`, classed as the host
-    /// registry sees it right now (H6 slice 2).
+    /// registry sees it right now (H6 slice 2); `None` when this
+    /// instance doesn't have it registered.
     #[must_use]
-    pub fn device_resource(&self, device: &str) -> crate::auth::Resource {
-        self.store.data().devices.resource(device)
+    pub fn device_resource(&self, device: &str) -> Option<crate::auth::Resource> {
+        let data = self.store.data();
+        data.devices
+            .get(&data.instance_id, &device.to_owned())
+            .ok()
+            .map(|_| data.devices.resource(device))
     }
 
     /// H5: `cmd.id` is the host-minted command id. An `accepted` reply
@@ -1635,7 +1640,7 @@ pub(crate) fn project_command_state(
             );
         }
         // M2: a sensor reading must carry the spec's unit.
-        if let Err(e) = super::schema::check_sensor_fields(&meta.info, capability, &fields) {
+        if let Err(e) = super::schema::check_state_fields(&meta.info, capability, &fields) {
             // The detail quotes plugin-registered labels (Debug-escaped,
             // so exact-value secret scrubbing can miss them): log it,
             // keep it out of the caller's message.

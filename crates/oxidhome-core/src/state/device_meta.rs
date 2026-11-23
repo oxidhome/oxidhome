@@ -26,7 +26,7 @@
 //! the life of the process: the floor only ever protects more.
 
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rusqlite::params;
 
@@ -99,6 +99,11 @@ pub enum DeviceMetaError {
 pub struct DeviceMetaStore {
     db: Option<Arc<Db>>,
     rows: RwLock<HashMap<String, DeviceMetaRow>>,
+    /// Serializes writers through read → commit → publish, so the
+    /// `rows` lock is held only to read and to publish, never across a
+    /// `SQLite` commit: readers (every authorization) don't wait on an
+    /// fsync.
+    writer: Mutex<()>,
 }
 
 impl Default for DeviceMetaStore {
@@ -126,6 +131,7 @@ impl DeviceMetaStore {
         Self {
             db: None,
             rows: RwLock::new(HashMap::new()),
+            writer: Mutex::new(()),
         }
     }
 
@@ -158,6 +164,7 @@ impl DeviceMetaStore {
         Ok(Self {
             db: Some(db),
             rows: RwLock::new(rows),
+            writer: Mutex::new(()),
         })
     }
 
@@ -204,8 +211,8 @@ impl DeviceMetaStore {
     /// has a sensitive category the floor lacks, and records the owner
     /// of a remembered device; otherwise does nothing (no write for
     /// non-sensitive devices). The `SQLite` write commits before the
-    /// in-memory row changes, both under the store's lock, so memory
-    /// never runs ahead of (or behind) the table.
+    /// in-memory row changes; writers are serialized, so memory never
+    /// runs ahead of (or behind) the table.
     ///
     /// # Errors
     ///
@@ -223,24 +230,28 @@ impl DeviceMetaStore {
         owner_instance: &str,
         derived: DeviceClass,
     ) -> Result<(), ObserveError> {
-        let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
-        let current = rows.get(device_id);
-        let floor = current.map_or_else(SensitiveSet::empty, |r| r.sensitive_floor);
-        let owner_known = current
-            .and_then(|r| r.owner_instance.as_deref())
-            .is_some_and(|o| o == owner_instance);
-        if derived.sensitive().is_subset(floor) && (owner_known || current.is_none()) {
-            return Ok(());
-        }
-        if current.is_none() {
-            let owned = rows
-                .values()
-                .filter(|r| r.owner_instance.as_deref() == Some(owner_instance))
-                .count();
-            if owned >= MAX_FLOOR_ROWS_PER_INSTANCE {
-                return Err(ObserveError::CapExceeded);
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let floor = {
+            let rows = self.rows.read().unwrap_or_else(PoisonError::into_inner);
+            let current = rows.get(device_id);
+            let floor = current.map_or_else(SensitiveSet::empty, |r| r.sensitive_floor);
+            let owner_known = current
+                .and_then(|r| r.owner_instance.as_deref())
+                .is_some_and(|o| o == owner_instance);
+            if derived.sensitive().is_subset(floor) && (owner_known || current.is_none()) {
+                return Ok(());
             }
-        }
+            if current.is_none() {
+                let owned = rows
+                    .values()
+                    .filter(|r| r.owner_instance.as_deref() == Some(owner_instance))
+                    .count();
+                if owned >= MAX_FLOOR_ROWS_PER_INSTANCE {
+                    return Err(ObserveError::CapExceeded);
+                }
+            }
+            floor
+        };
         let new_floor = floor.union(derived.sensitive());
         if let Some(db) = &self.db {
             let csv = new_floor.to_csv();
@@ -257,6 +268,7 @@ impl DeviceMetaStore {
                 )
             })?;
         }
+        let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
         let row = rows.entry(device_id.to_owned()).or_default();
         row.sensitive_floor = new_floor;
         row.owner_instance = Some(owner_instance.to_owned());
@@ -267,8 +279,9 @@ impl DeviceMetaStore {
     /// `device_id`. The device need not be registered right now;
     /// `owner_instance` is its owner when the host knows it, recorded so
     /// a raise to `camera` classes the instance's blobs too. Returns the
-    /// row as stored. Commit and publication happen under one lock, so
-    /// concurrent overrides land in memory in the order they committed.
+    /// row as stored. Writers are serialized through commit and
+    /// publication, so concurrent overrides land in memory in the order
+    /// they committed.
     ///
     /// # Errors
     ///
@@ -284,10 +297,10 @@ impl DeviceMetaStore {
             return Err(DeviceMetaError::BadDeviceId(device_id.to_owned()));
         }
         let name = category.map(DeviceCategory::as_str);
-        let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut owner = owner_instance
             .map(str::to_owned)
-            .or_else(|| rows.get(device_id).and_then(|r| r.owner_instance.clone()));
+            .or_else(|| self.get(device_id).and_then(|r| r.owner_instance));
         if let Some(db) = &self.db
             && owner.is_none()
         {
@@ -315,6 +328,7 @@ impl DeviceMetaStore {
                 Ok(())
             })?;
         }
+        let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
         let row = rows.entry(device_id.to_owned()).or_default();
         row.category_override = category;
         if owner.is_some() {

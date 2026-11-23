@@ -430,8 +430,9 @@ impl TokenStore {
     /// Insert a token produced by [`Self::generate`] **as the owner**
     /// and revoke every still-active id in `revoke_ids`, all in one
     /// transaction — the offline recovery command's rotation step.
-    /// The row is marked owner only when `scope_json` is the minted
-    /// `["*"]`; this and [`Self::insert_owner_if_empty`] are the only
+    /// Any other live owner is revoked in the same transaction and
+    /// listed in the result. The row is marked owner only when
+    /// `scope_json` is the minted `["*"]`; this and [`Self::insert_owner_if_empty`] are the only
     /// owner-minting inserts (H6 slice 2): every other insert
     /// ([`Self::create`], [`Self::create_if_empty`]) is a plain token.
     /// Either the new token exists *and* the old ones are revoked,
@@ -462,6 +463,25 @@ impl TokenStore {
                     params![now, id],
                 )?;
                 if n > 0 {
+                    revoked.push(id);
+                }
+            }
+            // One owner at a time: a still-live previous owner is
+            // revoked with the rotation even when the caller didn't
+            // name it (H6 slice 2; a unique index enforces it too).
+            if row.is_owner() {
+                let previous: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id FROM auth_token WHERE owner = 1 AND revoked_ms IS NULL",
+                    )?;
+                    stmt.query_map([], |r| r.get(0))?
+                        .collect::<Result<_, _>>()?
+                };
+                for id in previous {
+                    tx.execute(
+                        "UPDATE auth_token SET revoked_ms = ?1 WHERE id = ?2",
+                        params![now, id],
+                    )?;
                     revoked.push(id);
                 }
             }
@@ -592,11 +612,16 @@ impl PendingRow {
         })
     }
 
+    /// Whether the row is inserted as the owner.
+    fn is_owner(&self) -> bool {
+        self.owner && self.scope_json.as_slice() == br#"["*"]"#
+    }
+
     /// Insert the row, as the owner token when it was built for one
     /// (bootstrap or recovery, H6 slice 2) and its scope is the minted
     /// `["*"]`.
     fn insert(&self, conn: &rusqlite::Connection) -> Result<(), TokenError> {
-        let owner = self.owner && self.scope_json.as_slice() == br#"["*"]"#;
+        let owner = self.is_owner();
         conn.execute(
             "INSERT INTO auth_token \
                (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms, owner) \

@@ -2025,7 +2025,16 @@ async fn run_execute(
     // command was queued (a plugin's `update-device`, an operator's
     // category raise). Re-authorize against the class it has now; a
     // command admitted for a switch must not actuate a lock.
-    if let Some(why) = dispatch_refusal(&ctx, &instance.device_resource(&device), admitted)
+    let refusal = match instance.device_resource(&device) {
+        Some(resource) => dispatch_refusal(&ctx, &resource, admitted),
+        // Removed (or dropped by a refused re-registration) while the
+        // command was queued: nothing classes it any more.
+        None if ctx.root().is_external() => {
+            Some("the device is no longer registered; the command did not run".to_owned())
+        }
+        None => None,
+    };
+    if let Some(why) = refusal
         && let Some(caller_gone) = ticket.try_refuse()
     {
         let refused = if caller_gone {

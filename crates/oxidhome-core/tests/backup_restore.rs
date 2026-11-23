@@ -537,6 +537,7 @@ fn restore_migrates_an_archive_at_the_schema_floor() {
         conn.execute_batch(
             "DROP TABLE device_meta;
              ALTER TABLE audit_event DROP COLUMN level;
+             DROP INDEX auth_token_one_owner;
              ALTER TABLE auth_token DROP COLUMN owner;
              DROP TABLE pending_command;
              DROP TABLE device_state;

@@ -360,7 +360,13 @@ impl DeviceRegistry {
         // new registration says, even for a moment. A single instance
         // registers serially (see above), so releasing the lock for
         // the floor write doesn't race the quota check.
-        self.observe(&id, &owner_instance, &info)?;
+        if let Err(err) = self.observe(&id, &owner_instance, &info) {
+            // Fail closed: a re-registration that can't record its
+            // floor drops the earlier entry rather than leave it
+            // commandable under its old class.
+            self.write().remove(&id);
+            return Err(err);
+        }
         let meta = Arc::new(DeviceMeta {
             id: id.clone(),
             owner_instance,
