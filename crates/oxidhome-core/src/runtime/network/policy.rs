@@ -48,6 +48,8 @@ pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const RESOLVED_TTL: Duration = Duration::from_mins(10);
 /// Most resolved addresses remembered per instance.
 pub(crate) const MAX_RESOLVED: usize = 1024;
+/// Longest DNS name, without the root dot.
+const MAX_NAME_LEN: usize = 253;
 /// Audited denials allowed in a burst, per instance.
 const AUDIT_BURST: f64 = 16.0;
 /// Audited denials refilled per second, per instance.
@@ -207,7 +209,7 @@ impl CompiledRule {
 }
 
 /// Lowercase, without a trailing dot.
-fn normalize_name(name: &str) -> String {
+pub(crate) fn normalize_name(name: &str) -> String {
     name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
 
@@ -245,50 +247,60 @@ struct Resolved {
     entries: HashMap<IpAddr, ResolvedEntry>,
 }
 
+/// One address: each matching rule (index into `NetworkPolicy::rules`)
+/// with its own expiry, so resolving one name never extends the grant
+/// another name's rule gave the same address.
 struct ResolvedEntry {
-    /// Indices into `NetworkPolicy::rules`.
-    rules: Vec<usize>,
-    expires: Instant,
+    rules: Vec<(usize, Instant)>,
+}
+
+impl ResolvedEntry {
+    /// When the last of its rules expires.
+    fn expires(&self) -> Option<Instant> {
+        self.rules.iter().map(|(_, e)| *e).max()
+    }
 }
 
 impl Resolved {
     fn insert(&mut self, ip: IpAddr, rules: &[usize], now: Instant) {
         let expires = now + RESOLVED_TTL;
-        if let Some(entry) = self.entries.get_mut(&ip) {
-            entry.expires = expires;
-            for r in rules {
-                if !entry.rules.contains(r) {
-                    entry.rules.push(*r);
-                }
+        if !self.entries.contains_key(&ip) && self.entries.len() >= MAX_RESOLVED {
+            for entry in self.entries.values_mut() {
+                entry.rules.retain(|(_, e)| *e > now);
             }
-            return;
+            self.entries.retain(|_, e| !e.rules.is_empty());
+            if self.entries.len() >= MAX_RESOLVED
+                && let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.expires())
+                    .map(|(ip, _)| *ip)
+            {
+                self.entries.remove(&oldest);
+            }
         }
-        if self.entries.len() >= MAX_RESOLVED {
-            self.entries.retain(|_, e| e.expires > now);
+        let entry = self
+            .entries
+            .entry(ip)
+            .or_insert_with(|| ResolvedEntry { rules: Vec::new() });
+        for rule in rules {
+            match entry.rules.iter_mut().find(|(r, _)| r == rule) {
+                Some((_, e)) => *e = expires,
+                None => entry.rules.push((*rule, expires)),
+            }
         }
-        if self.entries.len() >= MAX_RESOLVED
-            && let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.expires)
-                .map(|(ip, _)| *ip)
-        {
-            self.entries.remove(&oldest);
-        }
-        self.entries.insert(
-            ip,
-            ResolvedEntry {
-                rules: rules.to_vec(),
-                expires,
-            },
-        );
     }
 
-    fn rules_for(&self, ip: IpAddr, now: Instant) -> &[usize] {
-        match self.entries.get(&ip) {
-            Some(entry) if entry.expires > now => &entry.rules,
-            _ => &[],
-        }
+    /// The rules whose resolution of `ip` hasn't expired.
+    fn rules_for(&self, ip: IpAddr, now: Instant) -> Vec<usize> {
+        self.entries.get(&ip).map_or_else(Vec::new, |entry| {
+            entry
+                .rules
+                .iter()
+                .filter(|(_, e)| *e > now)
+                .map(|(r, _)| *r)
+                .collect()
+        })
     }
 }
 
@@ -403,6 +415,13 @@ impl NetworkPolicy {
     /// The name rules matching `name` for any of `uses`, after checking
     /// it is a host name. Empty means the name may not be resolved.
     pub(crate) fn name_rules(&self, name: &str, uses: &[Use]) -> Result<Vec<usize>, Denial> {
+        // A DNS name is at most 253 bytes (254 with the root dot); refuse
+        // longer guest input before copying it.
+        if name.len() > MAX_NAME_LEN + 1 {
+            return Err(Denial::InvalidName(
+                crate::auth::invocation::audit_cap(name).to_owned(),
+            ));
+        }
         let normalized = normalize_name(name);
         if crate::native_policy::endpoint::validate_endpoint(&normalized, None, "/").is_err()
             || normalized.parse::<IpAddr>().is_ok()
@@ -458,6 +477,8 @@ impl NetworkPolicy {
 
     /// Record a refusal: a `tracing` warning and an audit `deny` row,
     /// both rate-limited per instance.
+    /// `target` and the reason may carry guest-chosen strings (a lookup
+    /// name), so both are capped before they reach the log or the row.
     pub(crate) fn audit_denial(&self, op: &'static str, target: &str, denial: &Denial) {
         let Some(suppressed) = self
             .audit
@@ -467,13 +488,16 @@ impl NetworkPolicy {
         else {
             return;
         };
+        let target = crate::auth::invocation::audit_cap(target);
+        let reason = denial.to_string();
+        let reason = crate::auth::invocation::audit_cap(&reason);
         tracing::warn!(
             target: "host.network",
             instance_id = %self.instance_id,
             op,
             target_addr = %target,
             suppressed,
-            "network access denied: {denial}",
+            "network access denied: {reason}",
         );
         crate::runtime::state_read::queue_deny_audit(
             self.audit_log.clone(),
@@ -481,7 +505,7 @@ impl NetworkPolicy {
             crate::runtime::state_read::DeniedRead::Network {
                 op,
                 target: target.to_owned(),
-                reason: denial.to_string(),
+                reason: reason.to_owned(),
             },
         );
     }
@@ -757,24 +781,49 @@ mod tests {
     fn resolved_table_is_bounded_and_expires() {
         let mut table = Resolved::default();
         let now = Instant::now();
-        for i in 0..(MAX_RESOLVED + 10) {
-            let ip = IpAddr::from(std::net::Ipv4Addr::from(
+        let nth = |i: usize| {
+            IpAddr::from(std::net::Ipv4Addr::from(
                 0x0808_0000 + u32::try_from(i).unwrap(),
-            ));
+            ))
+        };
+        for i in 0..(MAX_RESOLVED + 10) {
             table.insert(
-                ip,
+                nth(i),
                 &[0],
                 now + Duration::from_millis(u64::try_from(i).unwrap()),
             );
         }
         assert_eq!(table.entries.len(), MAX_RESOLVED);
         // The oldest entries were evicted first.
-        assert_eq!(table.rules_for(ip("8.8.0.0"), now), &[] as &[usize]);
-        let newest = IpAddr::from(std::net::Ipv4Addr::from(
-            0x0808_0000 + u32::try_from(MAX_RESOLVED + 9).unwrap(),
+        assert_eq!(table.rules_for(nth(0), now), Vec::<usize>::new());
+        let newest = nth(MAX_RESOLVED + 9);
+        assert_eq!(table.rules_for(newest, now), vec![0]);
+        assert_eq!(
+            table.rules_for(newest, now + RESOLVED_TTL * 2),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn resolving_one_name_does_not_renew_another_names_grant() {
+        let mut table = Resolved::default();
+        let now = Instant::now();
+        let shared = ip("93.184.216.34");
+        table.insert(shared, &[0], now);
+        let later = now + RESOLVED_TTL.saturating_sub(Duration::from_secs(1));
+        table.insert(shared, &[1], later);
+        let after_first_expired = now + RESOLVED_TTL + Duration::from_secs(1);
+        assert_eq!(table.rules_for(shared, after_first_expired), vec![1]);
+    }
+
+    #[test]
+    fn overlong_names_are_refused_before_matching() {
+        let p = policy(&["tcp://*.example.com:*"]);
+        let long = format!("{}.example.com", "a.".repeat(200));
+        assert!(matches!(
+            p.name_rules(&long, &[Use::Tcp]),
+            Err(Denial::InvalidName(n)) if n.len() <= 128
         ));
-        assert_eq!(table.rules_for(newest, now), &[0]);
-        assert_eq!(table.rules_for(newest, now + RESOLVED_TTL * 2), &[] as &[usize]);
     }
 
     #[test]

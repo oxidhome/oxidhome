@@ -587,6 +587,10 @@ impl PluginState {
         );
         self.http_hooks = super::network::HttpHooks::new(Arc::clone(&policy));
         self.network = policy;
+        // Sockets, lookups and `wasi:http` resources hold host memory
+        // outside the guest's memory ceiling; bound how many there are.
+        self.table
+            .set_max_capacity(super::network::MAX_TABLE_ENTRIES);
         self
     }
 

@@ -42,6 +42,24 @@ use wasmtime::component::Linker;
 
 use super::state::PluginState;
 
+/// Most resource-table entries a streaming instance may hold. Sockets,
+/// lookups and `wasi:http` resources (each outgoing body buffering up
+/// to one chunk on the host) live there, outside the guest's memory
+/// ceiling; this bounds them.
+pub(crate) const MAX_TABLE_ENTRIES: usize = 4096;
+
+/// Run `fut` inside the invocation `ctx` (when there is one), so audit
+/// rows written from spawned work name the call that caused them.
+pub(crate) async fn in_invocation<F: std::future::Future>(
+    ctx: Option<crate::auth::invocation::InvocationContext>,
+    fut: F,
+) -> F::Output {
+    match ctx {
+        Some(ctx) => crate::auth::invocation::CURRENT.scope(ctx, fut).await,
+        None => fut.await,
+    }
+}
+
 /// Whether `world` gets WASI sockets and HTTP.
 pub(crate) const fn is_streaming(world: World) -> bool {
     matches!(world, World::StreamingPlugin | World::StreamingAiPlugin)
@@ -59,7 +77,7 @@ pub(crate) fn add_wasi_to_linker(
     sockets::add_base_wasi(linker)?;
     if is_streaming(world) {
         sockets::add_sockets(linker)?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(linker)?;
+        http::add_to_linker(linker)?;
         super::media_placeholder::add_to_linker(linker)?;
     }
     Ok(())

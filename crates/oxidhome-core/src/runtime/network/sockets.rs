@@ -250,7 +250,9 @@ pub(super) async fn resolve(
     let Ok(permit) = Arc::clone(&policy.lookups).try_acquire_owned() else {
         return Err(ErrorCode::TemporaryResolverFailure);
     };
-    let host = name.to_owned();
+    // Resolved as an absolute name, so a resolver search list can't
+    // turn it into a different name than the one the rules matched.
+    let host = format!("{}.", super::policy::normalize_name(name));
     let blocking = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         (host.as_str(), 0)
@@ -265,8 +267,10 @@ pub(super) async fn resolve(
     };
     let admitted = policy.admit_resolved(addrs, rules);
     if admitted.is_empty() {
+        // Resolved, but only to addresses the rules refuse: a policy
+        // refusal, not a DNS failure.
         policy.audit_denial(op, name, &Denial::ResolvedRefused(name.to_owned()));
-        return Err(ErrorCode::NameUnresolvable);
+        return Err(ErrorCode::AccessDenied);
     }
     Ok(admitted)
 }
@@ -281,7 +285,7 @@ impl ip_name_lookup::Host for NetView<'_> {
         self.sockets.table.get(&network)?;
         let state = if let Some(ip) = ip_literal(&name) {
             // No DNS; the address is checked when it is used.
-            LookupState::Done(vec![ip].into_iter())
+            LookupState::Done(vec![ip.to_canonical()].into_iter())
         } else {
             let rules = match self.policy.name_rules(&name, &[Use::Tcp, Use::Udp]) {
                 Ok(rules) => rules,
@@ -295,9 +299,12 @@ impl ip_name_lookup::Host for NetView<'_> {
                 }
             };
             let policy = Arc::clone(&self.policy);
-            LookupState::Pending(tokio::spawn(async move {
+            // The task-local invocation doesn't cross `spawn`; carry it so
+            // a refusal is audited against the call that caused it.
+            let ctx = crate::auth::invocation::current();
+            LookupState::Pending(tokio::spawn(super::in_invocation(ctx, async move {
                 resolve(&policy, &name, &rules, "lookup").await
-            }))
+            })))
         };
         let lookup = self.sockets.table.push(Lookup { state })?;
         // The guest's handle is typed `resolve-address-stream`; the table

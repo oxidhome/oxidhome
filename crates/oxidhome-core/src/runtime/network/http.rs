@@ -25,8 +25,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::uri::Scheme;
 use http_body_util::BodyExt;
+use wasmtime::component::Resource;
 use wasmtime_wasi::p2::bindings::sockets::network::ErrorCode as SocketErrorCode;
+use wasmtime_wasi_http::RequestOptions as RequestOptionsResource;
 use wasmtime_wasi_http::io::TokioIo;
+use wasmtime_wasi_http::p2::bindings::http::outgoing_handler;
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode as HttpErrorCode;
+use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, HostOutgoingRequest};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
 use super::policy::{Denial, NetworkPolicy, Use};
@@ -37,6 +42,53 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest gap between response body frames when the plugin sets none.
 const BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest single write to an outgoing body; each body buffers at most
+/// one such chunk on the host.
+const BODY_CHUNK_SIZE: usize = 16 * 1024;
+
+/// `wasi:http` from `wasmtime-wasi-http`, with `outgoing-handler#handle`
+/// replaced by one that also frees the `request-options` it was given:
+/// `wasmtime-wasi-http` 50 reads the owned handle and leaves it in the
+/// table, so every request with options would leak an entry.
+pub(super) fn add_to_linker(
+    linker: &mut wasmtime::component::Linker<crate::runtime::state::PluginState>,
+) -> anyhow::Result<()> {
+    use wasmtime_wasi_http::WasiHttpView as _;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(linker)?;
+    linker.allow_shadowing(true);
+    let shadowed = linker.instance(OUTGOING_HANDLER).and_then(|mut instance| {
+        instance.func_wrap(
+            "handle",
+            |mut store: wasmtime::StoreContextMut<'_, crate::runtime::state::PluginState>,
+             (request, options): (
+                Resource<HostOutgoingRequest>,
+                Option<Resource<RequestOptionsResource>>,
+            )| {
+                let mut view = store.data_mut().http();
+                let options_rep = options.as_ref().map(Resource::rep);
+                let result = outgoing_handler::Host::handle(&mut view, request, options);
+                if let Some(rep) = options_rep {
+                    // Already gone if upstream ever deletes it itself.
+                    let _ = view
+                        .table
+                        .delete(Resource::<RequestOptionsResource>::new_own(rep));
+                }
+                let result: Result<Resource<HostFutureIncomingResponse>, HttpErrorCode> =
+                    match result {
+                        Ok(response) => Ok(response),
+                        Err(err) => Err(err.downcast()?),
+                    };
+                Ok((result,))
+            },
+        )
+    });
+    linker.allow_shadowing(false);
+    shadowed?;
+    Ok(())
+}
+
+/// The `outgoing-handler` interface `wasmtime-wasi-http` links.
+const OUTGOING_HANDLER: &str = "wasi:http/outgoing-handler@0.2.12";
 
 /// The future `send_request` returns: the response plus a future that
 /// drives the connection until the response body is done.
@@ -74,12 +126,26 @@ impl WasiHttpHooks for HttpHooks {
         // nothing here needs them.
         drop(fut);
         let policy = Arc::clone(&self.policy);
-        Box::new(async move { send(policy, request, options).await })
+        // Sent on a spawned task: carry the invocation for audit rows.
+        let ctx = crate::auth::invocation::current();
+        Box::new(super::in_invocation(ctx, async move {
+            send(policy, request, options).await
+        }))
+    }
+
+    fn p2_outgoing_body_chunk_size(&mut self) -> usize {
+        BODY_CHUNK_SIZE
+    }
+
+    fn p2_outgoing_body_buffer_chunks(&mut self) -> usize {
+        1
     }
 }
 
 fn dns_error(code: SocketErrorCode) -> Error {
     match code {
+        // Resolved only to addresses the rules refuse (already audited).
+        SocketErrorCode::AccessDenied => Error::HttpRequestDenied,
         SocketErrorCode::TemporaryResolverFailure => Error::DnsTimeout,
         _ => Error::DnsError {
             rcode: Some(format!("{code:?}")),
@@ -134,6 +200,11 @@ async fn send(
 > {
     let uri = request.uri().clone();
     let authority = uri.authority().ok_or(Error::HttpRequestUriInvalid)?;
+    // Userinfo would reach the `Host` header and the audit row; the
+    // checked host and port are all a request may carry.
+    if authority.as_str().contains('@') {
+        return Err(Error::HttpRequestUriInvalid);
+    }
     let tls = uri.scheme() == Some(&Scheme::HTTPS);
     let (using, default_port, scheme) = if tls {
         (Use::Https, 443, "https")

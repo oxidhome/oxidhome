@@ -290,30 +290,42 @@ async fn disallowed_host_port_and_proto_are_refused_and_audited() {
 async fn a_name_resolving_to_a_forbidden_address_is_refused() {
     let host = TestHost::new().unwrap();
     let tcp = TcpServer::line();
+    let web = TcpServer::http(|_| http_ok("secret"));
     // `localhost` resolves to loopback: a name rule never reaches it
     // (rebinding protection), and a name without a rule isn't looked up.
     let results = probe(
         &host,
         "rebind",
-        &[format!("tcp://localhost:{}", tcp.port())],
+        &[
+            format!("tcp://localhost:{}", tcp.port()),
+            format!("tcp://localhost:{}", web.port()),
+        ],
         &[
             format!("tcp localhost:{}", tcp.port()),
             "dns localhost".to_owned(),
             "dns unlisted.example.com".to_owned(),
+            format!("http http://localhost:{}/", web.port()),
         ],
     )
     .await;
-    assert!(results[0].starts_with("err:"), "{results:?}");
-    assert!(results[1].starts_with("err:"), "{results:?}");
-    assert!(results[2].starts_with("err:"), "{results:?}");
+    for result in &results {
+        assert!(result.starts_with("err:"), "{results:?}");
+    }
     assert_eq!(tcp.accepted(), 0);
-    let row = wait_for_deny(&host, "lookup", "rebind", "localhost").await;
-    assert!(
-        row.domain_error
-            .is_some_and(|e| e.contains("no network rule allows")),
-        "rebinding refusal"
-    );
+    assert_eq!(web.accepted(), 0);
     wait_for_deny(&host, "lookup", "rebind", "unlisted.example.com").await;
+    // Where the platform resolver answers `localhost.` (the host looks
+    // names up as absolute names), the refusal is a policy one: audited,
+    // and HTTP reports it as denied rather than as a DNS failure.
+    if !results[3].contains("DnsError") {
+        let row = wait_for_deny(&host, "lookup", "rebind", "localhost").await;
+        assert!(
+            row.domain_error
+                .is_some_and(|e| e.contains("no network rule allows")),
+            "rebinding refusal"
+        );
+        assert_eq!(results[3], "err:ErrorCode::HttpRequestDenied");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -358,6 +370,8 @@ async fn http_requests_are_checked_on_every_hop() {
             format!("http http://127.0.0.1:{}/", forbidden.port()),
             // HTTPS needs an `https` rule (and isn't sent yet anyway).
             format!("http https://127.0.0.1:{}/", allowed.port()),
+            // Userinfo never reaches the wire.
+            format!("http http://user:pw@127.0.0.1:{}/ok", allowed.port()),
         ],
     )
     .await;
@@ -365,6 +379,9 @@ async fn http_requests_are_checked_on_every_hop() {
     assert_eq!(results[1], "err:ErrorCode::HttpRequestDenied");
     assert_eq!(results[2], "err:ErrorCode::HttpRequestDenied");
     assert_eq!(results[3], "err:ErrorCode::HttpRequestDenied");
+    assert!(results[4].starts_with("err:"), "{results:?}");
+    // Only the `/ok` request and the redirecting hop reached the server.
+    assert_eq!(allowed.accepted(), 2);
     assert_eq!(
         forbidden.accepted(),
         0,

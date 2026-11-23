@@ -11,10 +11,11 @@
 //!
 //! Use [`std::net`] as on any other target: `TcpStream`, `UdpSocket`,
 //! and name resolution through `ToSocketAddrs` all run over the WASI
-//! sockets the world imports. Non-blocking mode works; set it when a
-//! socket is drained from [`Plugin::tick`](crate::Plugin::tick), since a
-//! blocking read holds the instance until the host's liveness watchdog
-//! (30 s) ends it.
+//! sockets the world imports. Use non-blocking mode (or a read timeout)
+//! for sockets drained from [`Plugin::tick`](crate::Plugin::tick): a
+//! blocking read waits inside the host, where the liveness watchdog
+//! doesn't reach, so the instance is stuck until data arrives or it is
+//! stopped.
 //!
 //! # HTTP
 //!

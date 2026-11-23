@@ -13,7 +13,7 @@ use oxidhome_sdk::bindings::oxidhome::plugin::types::Value;
 use oxidhome_sdk::host::{config, storage};
 use oxidhome_sdk::streaming::wasi::http::outgoing_handler;
 use oxidhome_sdk::streaming::wasi::http::types::{
-    Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, Scheme,
+    Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
 };
 use oxidhome_sdk::streaming::wasi::io::streams::StreamError;
 use oxidhome_sdk::{Plugin, StreamingPlugin};
@@ -155,7 +155,13 @@ fn http_get(url: &str) -> Result<(u16, Option<String>, Vec<u8>), String> {
     let body = request.body().map_err(|()| "body")?;
     OutgoingBody::finish(body, None).map_err(|e| format!("{e:?}"))?;
 
-    let pending = outgoing_handler::handle(request, None).map_err(|e| format!("{e:?}"))?;
+    // Always with options, so the host's handling of the owned
+    // `request-options` handle is exercised on every request.
+    let options = RequestOptions::new();
+    options
+        .set_connect_timeout(Some(10_000_000_000))
+        .map_err(|()| "connect timeout")?;
+    let pending = outgoing_handler::handle(request, Some(options)).map_err(|e| format!("{e:?}"))?;
     pending.subscribe().block();
     let response = pending
         .get()
