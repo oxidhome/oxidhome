@@ -874,10 +874,12 @@ const SHOWN_BYTES: usize = 32;
 /// text: masking part of a secret here would stop it matching whole.
 fn mask_json_doc(text: &str) -> std::borrow::Cow<'_, str> {
     let changed = match serde_json::from_str::<serde_json::Value>(text) {
-        // A JSON string scalar: its decoded text, masked as plain text.
-        Ok(serde_json::Value::String(inner)) => {
-            mask_plain(&inner).map(|m| serde_json::Value::String(m).to_string())
-        }
+        // A JSON string scalar: its decoded text, masked as text (which
+        // may itself be a JSON document).
+        Ok(serde_json::Value::String(inner)) => match mask_text(&inner) {
+            std::borrow::Cow::Owned(m) => Some(serde_json::Value::String(m).to_string()),
+            std::borrow::Cow::Borrowed(_) => None,
+        },
         Ok(mut doc) if doc.is_object() || doc.is_array() => {
             // Credential-keyed values first (a declared secret may
             // match a key's name), then declared secrets, whole, before
@@ -897,8 +899,8 @@ fn mask_json_doc(text: &str) -> std::borrow::Cow<'_, str> {
     changed.map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
 }
 
-/// Rename object keys that are ids in `ids` to their placeholders.
-/// `true` if any was renamed.
+/// Replace the ids in `ids` wherever they appear in object keys with
+/// their placeholders. `true` if any key changed.
 fn rename_id_keys(doc: &mut serde_json::Value, ids: &HashMap<String, String>) -> bool {
     match doc {
         serde_json::Value::Object(map) => {
@@ -906,14 +908,18 @@ fn rename_id_keys(doc: &mut serde_json::Value, ids: &HashMap<String, String>) ->
             for value in map.values_mut() {
                 changed |= rename_id_keys(value, ids);
             }
-            let known: Vec<String> = map
+            let renamed: Vec<(String, String)> = map
                 .keys()
-                .filter(|k| ids.contains_key(*k))
-                .cloned()
+                .filter_map(|key| {
+                    let new = ids.iter().fold(key.clone(), |k, (id, placeholder)| {
+                        k.replace(id.as_str(), placeholder)
+                    });
+                    (new != *key).then(|| (key.clone(), new))
+                })
                 .collect();
-            for key in known {
-                if let Some(value) = map.remove(&key) {
-                    map.insert(ids[&key].clone(), value);
+            for (old, new) in renamed {
+                if let Some(value) = map.remove(&old) {
+                    map.insert(new, value);
                     changed = true;
                 }
             }
@@ -1558,6 +1564,15 @@ mod tests {
         let _scope = SecretsInScope::new(&[], ids);
         let doc = render_value(&Value::JsonVal(format!(r#"{{"{b}":2,"{a}":1}}"#)));
         assert_eq!(doc, r#"json:"{\"<cmd-1>\":1,\"<cmd-2>\":2}""#);
+        let doc = render_value(&Value::JsonVal(format!(
+            r#"{{"result/{b}":2,"result/{a}":1}}"#
+        )));
+        assert_eq!(doc, r#"json:"{\"result/<cmd-1>\":1,\"result/<cmd-2>\":2}""#);
+        // A typed string holding a JSON document.
+        let typed = render_value(&Value::JsonVal(
+            serde_json::Value::String(r#"{"key":"password","value":"hunter2"}"#.into()).to_string(),
+        ));
+        assert!(!typed.contains("hunter2"), "{typed}");
     }
 
     #[test]
