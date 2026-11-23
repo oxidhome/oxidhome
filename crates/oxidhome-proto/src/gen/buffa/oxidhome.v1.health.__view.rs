@@ -222,8 +222,9 @@ impl ::serde::Serialize for CheckRequestOwnedView {
 }
 #[derive(Clone, Debug, Default)]
 pub struct CheckResponseView<'a> {
-    /// Always "ok" for now. Reserves the field for a future
-    /// degraded-mode signal without breaking the wire shape.
+    /// Always "ok" on a reachable daemon. A degraded event-log mirror
+    /// does not change it (live control and delivery still work); see
+    /// `event_log`.
     ///
     /// Field 1: `status`
     pub status: &'a str,
@@ -232,6 +233,15 @@ pub struct CheckResponseView<'a> {
     ///
     /// Field 2: `version`
     pub version: &'a str,
+    /// State of the durable event-log mirror (H3): "ok", or "degraded"
+    /// while event_log writes are failing and live events are delivered
+    /// without a row id. Same value as `event_log` on
+    /// `GET /api/v1/readyz`; details are on the authenticated MCP
+    /// `oxidhome://status` resource. Empty from a daemon that predates
+    /// the field.
+    ///
+    /// Field 3: `event_log`
+    pub event_log: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for CheckResponseView<'a> {
@@ -276,6 +286,13 @@ impl<'a> ::buffa::MessageView<'a> for CheckResponseView<'a> {
                 )?;
                 view.version = ::buffa::types::borrow_str(&mut cur)?;
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.event_log = ::buffa::types::borrow_str(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -300,6 +317,7 @@ impl<'a> ::buffa::MessageView<'a> for CheckResponseView<'a> {
         ::core::result::Result::Ok(super::super::CheckResponse {
             status: self.status.to_string(),
             version: self.version.to_string(),
+            event_log: self.event_log.to_string(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -317,6 +335,9 @@ impl<'a> ::buffa::ViewEncode<'a> for CheckResponseView<'a> {
         if !self.version.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.version) as u64;
         }
+        if !self.event_log.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.event_log) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -333,6 +354,9 @@ impl<'a> ::buffa::ViewEncode<'a> for CheckResponseView<'a> {
         }
         if !self.version.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.version, buf);
+        }
+        if !self.event_log.is_empty() {
+            ::buffa::types::put_string_field(3u32, &self.event_log, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -360,6 +384,9 @@ impl<'__a> ::serde::Serialize for CheckResponseView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.version) {
             __map.serialize_entry("version", self.version)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.event_log) {
+            __map.serialize_entry("eventLog", self.event_log)?;
         }
         __map.end()
     }
@@ -452,8 +479,9 @@ impl CheckResponseOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// Always "ok" for now. Reserves the field for a future
-    /// degraded-mode signal without breaking the wire shape.
+    /// Always "ok" on a reachable daemon. A degraded event-log mirror
+    /// does not change it (live control and delivery still work); see
+    /// `event_log`.
     ///
     /// Field 1: `status`
     #[must_use]
@@ -467,6 +495,18 @@ impl CheckResponseOwnedView {
     #[must_use]
     pub fn version(&self) -> &'_ str {
         self.0.reborrow().version
+    }
+    /// State of the durable event-log mirror (H3): "ok", or "degraded"
+    /// while event_log writes are failing and live events are delivered
+    /// without a row id. Same value as `event_log` on
+    /// `GET /api/v1/readyz`; details are on the authenticated MCP
+    /// `oxidhome://status` resource. Empty from a daemon that predates
+    /// the field.
+    ///
+    /// Field 3: `event_log`
+    #[must_use]
+    pub fn event_log(&self) -> &'_ str {
+        self.0.reborrow().event_log
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<CheckResponseView<'static>>>

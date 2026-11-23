@@ -88,10 +88,11 @@ use super::scopes::{
     ScopeDenied, can_read_blobs, require_scope,
 };
 
-/// `HealthService` implementation. Anonymous — no engine state is
-/// needed today; carries no fields. A future `Health.PluginRollup`
-/// RPC would take an `Engine` here.
-struct OxidHomeHealth;
+/// `HealthService` implementation. Anonymous; reads only the
+/// in-memory event-log mirror health (H3), never the database.
+struct OxidHomeHealth {
+    engine: Engine,
+}
 
 impl oxidhome_proto::connect::oxidhome::v1::HealthService for OxidHomeHealth {
     async fn check<'a>(
@@ -106,9 +107,19 @@ impl oxidhome_proto::connect::oxidhome::v1::HealthService for OxidHomeHealth {
         // marker (its forward-compat slot for round-tripping unknown
         // proto fields). Setting the schema's named fields covers
         // the contract.
+        //
+        // H3 follow-up: mirror `/readyz`'s `event_log` signal. The
+        // status stays "ok" while degraded, same as `/readyz` stays
+        // 200: control still works, only history is missing rows.
+        let event_log = if self.engine.event_log().health().degraded {
+            "degraded"
+        } else {
+            "ok"
+        };
         Response::ok(CheckResponse {
             status: "ok".into(),
             version: env!("CARGO_PKG_VERSION").into(),
+            event_log: event_log.into(),
             ..Default::default()
         })
     }
@@ -1186,7 +1197,10 @@ fn wit_key_value_to_proto(kv: KeyValue) -> ProtoKeyValue {
 #[must_use]
 pub fn router(engine: Engine) -> ConnectRouter {
     let router = ConnectRouter::new();
-    let router = Arc::new(OxidHomeHealth).register(router);
+    let router = Arc::new(OxidHomeHealth {
+        engine: engine.clone(),
+    })
+    .register(router);
     let router = Arc::new(OxidHomeInstances {
         engine: engine.clone(),
     })

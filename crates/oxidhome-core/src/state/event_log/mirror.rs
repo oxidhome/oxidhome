@@ -464,6 +464,13 @@ impl EventLog {
         Plan::Skip
     }
 
+    /// Test hook: enter degraded mode as if a mirror write had
+    /// failed, so API tests can observe the degraded signal.
+    #[cfg(test)]
+    pub(crate) fn degrade_for_test(&self, reason: &str) {
+        self.note_unrecorded(0, reason, false);
+    }
+
     fn note_unrecorded(&self, received_ms: i64, reason: &str, probing: bool) {
         let next_probe = Instant::now() + self.mirror.policy.probe_interval;
         let mut st = self.mirror.lock();
