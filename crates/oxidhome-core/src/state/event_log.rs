@@ -302,8 +302,8 @@ fn query_on(
         // learn that history is missing rows — while the time and
         // cursor bounds apply to every row. Two separately ordered,
         // limited scans (each index-friendly; an `OR` across them
-        // forces a full sort before `LIMIT`) merged by id, both under
-        // one connection lock so no write lands between them.
+        // forces a full sort before `LIMIT`) merged by id, both in
+        // one `Db::read` snapshot so no write lands between them.
         let markers = has_selectors.then(|| build_query(filter, limit, Rows::GapMarkers));
         let mut out = run_query(conn, &selected)?;
         if let Some(markers) = &markers {

@@ -8,27 +8,33 @@
 //! commit must be transactional with the KV usage counter, per
 //! `03_core.md` §5).
 //!
-//! [`Db`] holds a [`rusqlite::Connection`] behind a mutex and exposes
-//! synchronous `read` / `write` helpers. Callers from the async host
-//! side wrap them in [`tokio::task::spawn_blocking`] — the `SQLite` call
-//! itself stays sync, which keeps the rusqlite API straightforward and
-//! avoids the cost of an async wrapper crate for a workload measured
-//! in single-thousand inserts per day.
+//! [`Db`] owns one writer connection behind a mutex, a small pool of
+//! read-only connections, and a passive-checkpoint thread (M6; see
+//! the type docs for the model and the busy / checkpoint policy). It
+//! exposes synchronous `read` / `write` helpers. Callers from the
+//! async host side wrap them in [`tokio::task::spawn_blocking`] — the
+//! `SQLite` call itself stays sync, which keeps the rusqlite API
+//! straightforward and avoids the cost of an async wrapper crate.
 //!
 //! Two construction paths:
 //!
 //! - [`Db::open_in_memory`] — `":memory:"`. Used by every existing
 //!   integration test and the no-arg [`Engine::new`](crate::Engine::new) entry point so
-//!   the "engine without a state dir" shape still works.
+//!   the "engine without a state dir" shape still works. A private
+//!   in-memory database has exactly one connection, so reads share
+//!   the writer.
 //! - [`Db::open_file`] — `<state_dir>/oxidhome.db` with WAL mode +
 //!   `synchronous = NORMAL`. The combination chosen by Phase 5's
 //!   storage-backend decision (Appendix A in `00_OVERVIEW.md`).
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::Context;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 /// Schema migrations applied at open time. Append-only; `user_version`
 /// in the database file picks up where the last run left off.
@@ -823,19 +829,102 @@ pub fn schema_version() -> i64 {
     i64::try_from(MIGRATIONS.len()).expect("migration count fits in i64")
 }
 
-/// Wrapper around the host's `rusqlite::Connection`.
+/// How long any connection waits on a `SQLite` lock before it
+/// reports `SQLITE_BUSY`. Inside one process the writer mutex
+/// already serializes writes, so this mostly covers other
+/// processes on the same file (an online `oxidhome backup`, an
+/// operator's `sqlite3` shell) and WAL-index recovery. Kept below
+/// any request deadline so a stuck lock surfaces as an error
+/// instead of a hang.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on read-only connections a file-backed [`Db`]
+/// opens. Connections open lazily on first contended use, so an
+/// idle host holds one or two.
+pub const READ_POOL_SIZE: usize = 4;
+
+/// Backstop `wal_autocheckpoint` on the writer, in pages
+/// (64 MiB at the default 4 KiB page). The routine checkpoint runs
+/// off the commit path on the checkpointer thread
+/// ([`CHECKPOINT_INTERVAL`]); this only fires if that thread falls
+/// far behind, so a committing writer (an event publish holding
+/// the bus gate) almost never pays for a checkpoint.
+pub const WAL_AUTOCHECKPOINT_PAGES: i64 = 16_384;
+
+/// Size the WAL file is truncated back to after a checkpoint lets
+/// it reset, so a burst doesn't leave a large `-wal` on disk.
+pub const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+/// How often the checkpointer thread runs
+/// `PRAGMA wal_checkpoint(PASSIVE)`. Passive checkpoints never take
+/// the writer lock and never wait on readers; they copy whatever
+/// frames no open read snapshot still needs.
+pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Longest a [`Db::write_low_priority`] caller defers to waiting
+/// normal-priority writers before it takes its turn anyway. Bounds
+/// diagnostic-log latency under a sustained control-write storm
+/// (the log channel absorbs the backlog and drops past capacity).
+pub const LOW_PRIORITY_MAX_DEFER: Duration = Duration::from_millis(250);
+
+/// Connection-model knobs. [`Db::open_file`] uses the defaults
+/// above; tests shrink the intervals to observe the policy without
+/// waiting on wall-clock time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConnectionPolicy {
+    pub(crate) read_pool_size: usize,
+    pub(crate) checkpoint_interval: Duration,
+    pub(crate) low_priority_max_defer: Duration,
+}
+
+impl Default for ConnectionPolicy {
+    fn default() -> Self {
+        Self {
+            read_pool_size: READ_POOL_SIZE,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
+            low_priority_max_defer: LOW_PRIORITY_MAX_DEFER,
+        }
+    }
+}
+
+/// The host's `SQLite` handle: one writer, a small read pool, and a
+/// checkpointer (M6).
 ///
-/// The connection is mutex-guarded — `SQLite` in WAL mode supports many
-/// concurrent readers and one writer, but `rusqlite::Connection` itself
-/// is `!Sync`, so a single host-side connection routes every operation
-/// through one mutex. For Phase-5 workloads (per-instance KV, low
-/// thousands of log events / day) that's plenty; a real `r2d2`-style
-/// pool can drop in when contention shows up in profiling.
+/// - **Writer.** One `rusqlite::Connection` behind a mutex. Every
+///   write goes through it, so `BEGIN IMMEDIATE` never races
+///   another in-process writer and commit order is mutex order.
+///   [`Self::write`] is normal priority (events, KV, audit, tokens,
+///   registry, dashboards); [`Self::write_low_priority`] (diagnostic
+///   log batches, log retention) yields to any normal-priority
+///   writer already waiting, for at most
+///   [`LOW_PRIORITY_MAX_DEFER`].
+/// - **Readers.** File-backed databases open up to
+///   [`READ_POOL_SIZE`] extra connections with `query_only = ON`.
+///   [`Self::read`] runs its closure on one of them inside a
+///   deferred read transaction, so a query sees one consistent
+///   snapshot (the same isolation the old single mutex gave) and
+///   never waits on the writer: WAL lets readers proceed while a
+///   write transaction is open. `:memory:` databases are private
+///   to one connection, so they have no pool and `read` uses the
+///   writer.
+/// - **Checkpointer.** A background thread with its own connection
+///   runs a passive WAL checkpoint every [`CHECKPOINT_INTERVAL`].
+///
+/// `rusqlite::Connection` is `!Sync`, which is why every
+/// connection sits behind a mutex or a pool lease.
 pub struct Db {
     /// `None` for `:memory:` databases (the "file path" we report in
     /// error messages); `Some(path)` for file-backed instances.
     path: Option<PathBuf>,
     conn: Mutex<Connection>,
+    /// Normal-priority writers currently waiting for `conn`.
+    write_gate: WriteGate,
+    /// `None` for `:memory:`.
+    readers: Option<ReadPool>,
+    /// `None` for `:memory:`. Dropped (stopped + joined) with the
+    /// `Db`, so no connection outlives it.
+    checkpointer: Option<Checkpointer>,
+    policy: ConnectionPolicy,
     /// `user_version` observed *before* this process open ran any
     /// migrations. Callers use this to detect "did migration N just
     /// run this boot" — the H2 round-2 F3 one-shot blob-root sweep
@@ -856,13 +945,15 @@ impl Db {
     /// Forwards any rusqlite open / migration error verbatim.
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory `SQLite` database")?;
-        Self::initialize(None, conn)
+        Self::initialize(None, conn, ConnectionPolicy::default())
     }
 
     /// Open the persistent database at `<state_dir>/oxidhome.db`.
     /// Creates `state_dir` if it doesn't already exist; enables WAL
     /// mode and `synchronous = NORMAL` (the durability sweet spot per
-    /// Phase 5's appendix-A choice).
+    /// Phase 5's appendix-A choice), sets [`BUSY_TIMEOUT`] and the
+    /// checkpoint policy, and starts the read pool and checkpointer
+    /// once migrations have applied.
     ///
     /// M3: refuses a state dir with an interrupted restore, and runs
     /// the migration preflight
@@ -874,12 +965,21 @@ impl Db {
     /// Returns the first failure across directory creation, file
     /// open, pragma application, preflight, or migration.
     pub fn open_file(state_dir: &Path) -> anyhow::Result<Self> {
+        Self::open_file_with_policy(state_dir, ConnectionPolicy::default())
+    }
+
+    pub(crate) fn open_file_with_policy(
+        state_dir: &Path,
+        policy: ConnectionPolicy,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("creating state dir {}", state_dir.display()))?;
         crate::backup::ensure_no_interrupted_restore(state_dir)?;
         let path = state_dir.join(DB_FILE_NAME);
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database at {}", path.display()))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .context("setting busy_timeout")?;
         // WAL: many concurrent readers + one writer, plus crash safety
         // without the cost of full `synchronous = FULL`. `query_row`
         // because PRAGMA journal_mode returns the new mode.
@@ -890,6 +990,9 @@ impl Db {
             mode.eq_ignore_ascii_case("wal"),
             "expected WAL journal mode, `SQLite` reported `{mode}`",
         );
+        // NORMAL is the baseline; the durable paths (M4 token writes,
+        // `AuditLog::record_intent_durable`) raise it to FULL on this
+        // connection for one write and restore it afterwards.
         conn.pragma_update(None, "synchronous", "NORMAL")
             .context("setting synchronous = NORMAL")?;
         // `foreign_keys = ON` is off by default per `SQLite` docs — turn
@@ -897,10 +1000,20 @@ impl Db {
         // future Phase-5b additions) are enforced.
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enabling foreign_keys")?;
-        Self::initialize(Some(path), conn)
+        apply_checkpoint_pragmas(&conn)?;
+        let mut db = Self::initialize(Some(path.clone()), conn, policy)?;
+        // Readers and the checkpointer start only after migrations,
+        // so none of them ever caches a pre-migration schema.
+        db.checkpointer = Some(Checkpointer::start(&path, policy.checkpoint_interval)?);
+        db.readers = Some(ReadPool::new(path, policy.read_pool_size));
+        Ok(db)
     }
 
-    fn initialize(path: Option<PathBuf>, conn: Connection) -> anyhow::Result<Self> {
+    fn initialize(
+        path: Option<PathBuf>,
+        conn: Connection,
+        policy: ConnectionPolicy,
+    ) -> anyhow::Result<Self> {
         // Read the on-file `user_version` before touching the
         // schema, so callers can distinguish "we just applied
         // migration N this open" from "N had already been applied
@@ -942,6 +1055,10 @@ impl Db {
         let db = Self {
             path,
             conn: Mutex::new(conn),
+            write_gate: WriteGate::default(),
+            readers: None,
+            checkpointer: None,
+            policy,
             pre_open_user_version,
         };
         db.apply_migrations()?;
@@ -985,11 +1102,14 @@ impl Db {
         Ok(())
     }
 
-    /// Run a closure with a `&Connection`. Cheap read-only operations
-    /// (queries that don't write) go through here; the closure borrows
-    /// the connection, runs synchronously, and the mutex releases as
-    /// soon as it returns. Caller is responsible for hopping out to
-    /// `spawn_blocking` if it's calling from an async context.
+    /// Run a read-only closure against the database.
+    ///
+    /// On a file-backed database the closure runs on a pooled
+    /// `query_only` connection inside one deferred read transaction:
+    /// it sees a single committed snapshot, never waits on the
+    /// writer, and fails with `SQLITE_READONLY` if it tries to write.
+    /// On `:memory:` it runs on the writer connection. Either way the
+    /// call is synchronous; async callers hop to `spawn_blocking`.
     ///
     /// Error-generic so a caller's domain error (e.g.
     /// `state::kv::KvError`) can be returned directly via `?` from
@@ -998,26 +1118,33 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// Whatever `f` returns.
+    /// Whatever `f` returns, or a `rusqlite` error opening a pooled
+    /// connection or its read transaction.
     ///
     /// # Panics
     ///
-    /// Panics only if another thread holding the connection mutex
-    /// panicked while it was locked. Recoverable poisoning isn't a
-    /// useful state for a database handle, so the panic is the
-    /// intentional shape.
+    /// Panics only if another thread panicked while holding the
+    /// writer or pool mutex. Recoverable poisoning isn't a useful
+    /// state for a database handle, so the panic is the intentional
+    /// shape.
     pub fn read<R, E>(&self, f: impl FnOnce(&Connection) -> Result<R, E>) -> Result<R, E>
     where
         R: Send,
+        E: From<rusqlite::Error>,
     {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        f(&conn)
+        let Some(pool) = &self.readers else {
+            let conn = self.lock_writer();
+            return f(&conn);
+        };
+        let mut lease = pool.checkout()?;
+        lease.run(f)
     }
 
-    /// Same shape as [`Self::read`], but takes a `&mut Connection` so
-    /// the closure can start a transaction. `BEGIN IMMEDIATE` /
-    /// `COMMIT` lives inside `f` — this method just unlocks the mutex
-    /// and hands the connection over.
+    /// Run a closure with the writer connection at normal priority.
+    /// `BEGIN IMMEDIATE` / `COMMIT` lives inside `f` — this method
+    /// just takes the writer mutex and hands the connection over. A
+    /// normal-priority caller waiting here makes
+    /// [`Self::write_low_priority`] callers stand aside.
     ///
     /// # Errors
     ///
@@ -1025,14 +1152,62 @@ impl Db {
     ///
     /// # Panics
     ///
-    /// Same as [`Self::read`] — only on poisoning of the connection
+    /// Same as [`Self::read`] — only on poisoning of the writer
     /// mutex.
     pub fn write<R, E>(&self, f: impl FnOnce(&mut Connection) -> Result<R, E>) -> Result<R, E>
     where
         R: Send,
     {
+        let mut conn = self.lock_writer();
+        f(&mut conn)
+    }
+
+    /// [`Self::write`] for work nobody waits on (diagnostic log
+    /// batches, log retention). Before taking the writer mutex it
+    /// waits until no normal-priority writer is queued, for at most
+    /// [`LOW_PRIORITY_MAX_DEFER`]. A normal-priority writer that
+    /// arrives after this call has taken the mutex waits for `f` to
+    /// finish, so `f` should be one bounded transaction.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` returns.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`Self::write`].
+    pub fn write_low_priority<R, E>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        R: Send,
+    {
+        self.write_gate
+            .defer_to_waiters(self.policy.low_priority_max_defer);
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         f(&mut conn)
+    }
+
+    /// Writer mutex at normal priority: uncontended takes it
+    /// directly; contended registers as a waiter first so
+    /// low-priority writers defer.
+    fn lock_writer(&self) -> MutexGuard<'_, Connection> {
+        match self.conn.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(_)) => panic!("db mutex poisoned"),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        let waiter = self.write_gate.enter();
+        let guard = self.conn.lock().expect("db mutex poisoned");
+        drop(waiter);
+        guard
+    }
+
+    /// Normal-priority writers currently queued on the writer mutex.
+    #[cfg(test)]
+    fn waiting_writers(&self) -> usize {
+        *self.write_gate.waiting.lock().expect("write gate poisoned")
     }
 
     /// Path the database is backed by, or `None` for `:memory:`. Used
@@ -1043,23 +1218,30 @@ impl Db {
         self.path.as_deref()
     }
 
-    /// Cheap connectivity check. Grabs the connection mutex and
-    /// runs `SELECT 1` — sub-millisecond on a healthy `SQLite`
-    /// handle, and any of the failure modes worth surfacing to an
-    /// orchestrator (mutex poisoned, connection closed, disk I/O
-    /// error) show up as an error here.
+    /// Cheap connectivity check. Takes the writer mutex and runs
+    /// `SELECT 1` — sub-millisecond on a healthy `SQLite` handle, and
+    /// any of the failure modes worth surfacing to an orchestrator
+    /// (mutex poisoned, connection closed, disk I/O error, a writer
+    /// stuck in a transaction) show up as an error or a wait here.
     ///
-    /// Used by the JSON `GET /api/v1/readyz` readiness probe. The
-    /// audit ledger, token store, KV store, blob index, event log,
-    /// and log store all live on this same connection, so a
-    /// working ping stands in for all of them.
+    /// Used by the JSON `GET /api/v1/readyz` readiness probe. Every
+    /// persistent store writes through this connection, so a working
+    /// ping stands in for all of them.
     ///
     /// # Errors
     ///
     /// Forwards any `rusqlite` failure verbatim.
     pub fn ping(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_writer();
         conn.query_row("SELECT 1", [], |_| Ok(()))
+    }
+
+    /// Passive WAL checkpoints the checkpointer thread has completed.
+    #[cfg(test)]
+    fn checkpoints_run(&self) -> u64 {
+        self.checkpointer
+            .as_ref()
+            .map_or(0, |c| c.shared.runs.load(Ordering::Relaxed))
     }
 }
 
@@ -1068,8 +1250,304 @@ impl std::fmt::Debug for Db {
         f.debug_struct("Db")
             .field("path", &self.path)
             .field("conn", &"<rusqlite::Connection>")
+            .field("read_pool", &self.readers.as_ref().map(|p| p.max))
+            .field("policy", &self.policy)
             .field("pre_open_user_version", &self.pre_open_user_version)
-            .finish()
+            .finish_non_exhaustive()
+    }
+}
+
+/// Checkpoint pragmas shared by the writer and the checkpointer.
+fn apply_checkpoint_pragmas(conn: &Connection) -> anyhow::Result<()> {
+    conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)
+        .context("setting wal_autocheckpoint")?;
+    // `journal_size_limit` returns the new value, so read it back
+    // through `query_row` rather than `pragma_update`.
+    let _: i64 = conn
+        .query_row(
+            &format!("PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES}"),
+            (),
+            |row| row.get(0),
+        )
+        .context("setting journal_size_limit")?;
+    Ok(())
+}
+
+/// Counts normal-priority writers waiting on the writer mutex, so
+/// low-priority writers can stand aside.
+#[derive(Default)]
+struct WriteGate {
+    waiting: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl WriteGate {
+    fn enter(&self) -> WaiterGuard<'_> {
+        *self.waiting.lock().expect("write gate poisoned") += 1;
+        WaiterGuard { gate: self }
+    }
+
+    fn defer_to_waiters(&self, max: Duration) {
+        let waiting = self.waiting.lock().expect("write gate poisoned");
+        if *waiting == 0 {
+            return;
+        }
+        let _unused = self
+            .idle
+            .wait_timeout_while(waiting, max, |n| *n > 0)
+            .expect("write gate poisoned");
+    }
+}
+
+/// Decrements the waiter count on drop, including on unwind.
+struct WaiterGuard<'a> {
+    gate: &'a WriteGate,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        // Never panic in drop: a poisoned gate only means another
+        // waiter panicked; the count is still meaningful.
+        let mut n = self
+            .gate
+            .waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *n -= 1;
+        if *n == 0 {
+            self.gate.idle.notify_all();
+        }
+    }
+}
+
+/// Lazily-filled pool of `query_only` connections to one file.
+struct ReadPool {
+    path: PathBuf,
+    max: usize,
+    state: Mutex<PoolState>,
+    returned: Condvar,
+}
+
+struct PoolState {
+    idle: Vec<Connection>,
+    /// Connections that exist right now (idle + leased).
+    open: usize,
+}
+
+impl ReadPool {
+    fn new(path: PathBuf, max: usize) -> Self {
+        Self {
+            path,
+            max: max.max(1),
+            state: Mutex::new(PoolState {
+                idle: Vec::new(),
+                open: 0,
+            }),
+            returned: Condvar::new(),
+        }
+    }
+
+    fn checkout(&self) -> Result<ReadLease<'_>, rusqlite::Error> {
+        let mut state = self.state.lock().expect("read pool poisoned");
+        loop {
+            if let Some(conn) = state.idle.pop() {
+                return Ok(ReadLease {
+                    pool: self,
+                    conn: Some(conn),
+                });
+            }
+            if state.open < self.max {
+                state.open += 1;
+                drop(state);
+                return match open_reader(&self.path) {
+                    Ok(conn) => Ok(ReadLease {
+                        pool: self,
+                        conn: Some(conn),
+                    }),
+                    Err(err) => {
+                        self.forget_one();
+                        Err(err)
+                    }
+                };
+            }
+            state = self.returned.wait(state).expect("read pool poisoned");
+        }
+    }
+
+    /// A slot was given up (open failed, or a connection was
+    /// discarded): let a waiter open a fresh one.
+    fn forget_one(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.open -= 1;
+        drop(state);
+        self.returned.notify_one();
+    }
+}
+
+fn open_reader(path: &Path) -> Result<Connection, rusqlite::Error> {
+    // No `SQLITE_OPEN_CREATE`: the writer created the file and set
+    // WAL (a persistent property of the file) before any reader opens.
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // Read-write open + `query_only` rather than a read-only open: a
+    // read-only WAL connection needs the `-shm` to already exist and
+    // be writable, which is not guaranteed across a writer restart.
+    conn.pragma_update(None, "query_only", true)?;
+    Ok(conn)
+}
+
+/// A pooled reader on loan. Returns the connection on drop, or
+/// discards it if its transaction state is unknown.
+struct ReadLease<'a> {
+    pool: &'a ReadPool,
+    conn: Option<Connection>,
+}
+
+impl ReadLease<'_> {
+    fn run<R, E>(&mut self, f: impl FnOnce(&Connection) -> Result<R, E>) -> Result<R, E>
+    where
+        E: From<rusqlite::Error>,
+    {
+        let conn = self.conn.as_mut().expect("lease holds a connection");
+        // Deferred: the snapshot starts at the first read, and a
+        // read-only transaction never takes a write lock.
+        let tx = conn.transaction()?;
+        let out = f(&tx);
+        if tx.rollback().is_err() {
+            // Unknown transaction state: don't hand this connection
+            // to the next caller. The read result is still valid.
+            self.discard();
+        }
+        out
+    }
+
+    fn discard(&mut self) {
+        if self.conn.take().is_some() {
+            self.pool.forget_one();
+        }
+    }
+}
+
+impl Drop for ReadLease<'_> {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        if std::thread::panicking() || !conn.is_autocommit() {
+            // A panic mid-closure or a transaction left open: close
+            // the connection instead of recycling it.
+            drop(conn);
+            self.pool.forget_one();
+            return;
+        }
+        let mut state = self
+            .pool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.idle.push(conn);
+        drop(state);
+        self.pool.returned.notify_one();
+    }
+}
+
+/// Background passive-checkpoint thread. Stopped and joined on drop.
+struct Checkpointer {
+    shared: Arc<CheckpointShared>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct CheckpointShared {
+    stop: Mutex<bool>,
+    wake: Condvar,
+    runs: AtomicU64,
+}
+
+impl Checkpointer {
+    fn start(path: &Path, interval: Duration) -> anyhow::Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening checkpoint connection to {}", path.display()))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .context("setting checkpointer busy_timeout")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .context("setting checkpointer synchronous")?;
+        apply_checkpoint_pragmas(&conn)?;
+        let shared = Arc::new(CheckpointShared::default());
+        let thread_shared = Arc::clone(&shared);
+        let handle = std::thread::Builder::new()
+            .name("oxidhome-db-checkpoint".into())
+            .spawn(move || checkpoint_loop(&conn, &thread_shared, interval))
+            .context("spawning checkpointer thread")?;
+        Ok(Self {
+            shared,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        *self
+            .shared
+            .stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.shared.wake.notify_all();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn checkpoint_loop(conn: &Connection, shared: &CheckpointShared, interval: Duration) {
+    let mut stop = shared
+        .stop
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        stop = shared
+            .wake
+            .wait_timeout_while(stop, interval, |stopped| !*stopped)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+        if *stop {
+            return;
+        }
+        drop(stop);
+        // (busy, wal frames, frames checkpointed). PASSIVE returns
+        // busy = 1 only if another checkpoint was running.
+        match conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", (), |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(_) => {
+                shared.runs.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "state.db",
+                    error = %err,
+                    "passive WAL checkpoint failed; the writer's autocheckpoint backstop still applies",
+                );
+            }
+        }
+        stop = shared
+            .stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
@@ -1565,6 +2043,294 @@ mod tests {
             pre_migration_snapshots(dir.path()).len(),
             crate::backup::PRE_MIGRATION_KEEP
         );
+    }
+
+    // ── M6: connection model ───────────────────────────────────────
+
+    /// Generous bound for "this must happen eventually" waits. The
+    /// tests below assert ordering and progress, never latency, so
+    /// the bound only turns a deadlock into a failure.
+    const PROGRESS_BOUND: Duration = Duration::from_secs(60);
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < PROGRESS_BOUND,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn test_policy() -> ConnectionPolicy {
+        ConnectionPolicy {
+            // Long enough that a loaded machine can't turn the
+            // priority-ordering test into a timeout race.
+            low_priority_max_defer: PROGRESS_BOUND,
+            ..ConnectionPolicy::default()
+        }
+    }
+
+    fn custom_event(topic: &str) -> crate::host_impl::plugin::oxidhome::plugin::events::Event {
+        use crate::host_impl::plugin::oxidhome::plugin::events::{
+            CustomEvent, Event, EventPayload,
+        };
+        Event {
+            device: None,
+            timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
+            row_id: None,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: topic.into(),
+                payload: "{}".into(),
+            }),
+        }
+    }
+
+    fn insert_log_rows(conn: &Connection, n: usize) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare(
+            "INSERT INTO log_event(ts_unix_ms, level, target, message) VALUES (?1, 2, 't', 'burst')",
+        )?;
+        for i in 0..n {
+            stmt.execute([i64::try_from(i).unwrap_or(i64::MAX)])?;
+        }
+        Ok(())
+    }
+
+    /// Every connection of a file-backed `Db` carries the busy and
+    /// checkpoint policy; durable paths still start from NORMAL.
+    #[test]
+    fn file_db_applies_busy_and_checkpoint_policy() {
+        let dir = tempdir_for_test();
+        let db = Db::open_file(dir.path()).expect("open");
+        let (busy, autockpt, limit, sync, query_only): (i64, i64, i64, i64, i64) = db
+            .write(|c| -> rusqlite::Result<_> {
+                Ok((
+                    c.pragma_query_value(None, "busy_timeout", |r| r.get(0))?,
+                    c.pragma_query_value(None, "wal_autocheckpoint", |r| r.get(0))?,
+                    c.pragma_query_value(None, "journal_size_limit", |r| r.get(0))?,
+                    c.pragma_query_value(None, "synchronous", |r| r.get(0))?,
+                    c.pragma_query_value(None, "query_only", |r| r.get(0))?,
+                ))
+            })
+            .expect("writer pragmas");
+        let expected_busy = i64::try_from(BUSY_TIMEOUT.as_millis()).expect("fits");
+        assert_eq!(busy, expected_busy);
+        assert_eq!(autockpt, WAL_AUTOCHECKPOINT_PAGES);
+        assert_eq!(limit, JOURNAL_SIZE_LIMIT_BYTES);
+        assert_eq!(sync, 1, "writer baseline is synchronous = NORMAL");
+        assert_eq!(query_only, 0);
+
+        let (reader_busy, reader_query_only): (i64, i64) = db
+            .read(|c| -> rusqlite::Result<_> {
+                Ok((
+                    c.pragma_query_value(None, "busy_timeout", |r| r.get(0))?,
+                    c.pragma_query_value(None, "query_only", |r| r.get(0))?,
+                ))
+            })
+            .expect("reader pragmas");
+        assert_eq!(reader_busy, expected_busy);
+        assert_eq!(reader_query_only, 1);
+    }
+
+    /// `read` really is read-only on a file-backed `Db`: a write
+    /// attempted through it fails instead of bypassing the writer.
+    #[test]
+    fn pooled_reads_refuse_writes() {
+        let dir = tempdir_for_test();
+        let db = Db::open_file(dir.path()).expect("open");
+        let err = db
+            .read(|c| insert_log_rows(c, 1))
+            .expect_err("query_only reader must refuse INSERT");
+        assert!(
+            err.to_string().contains("readonly") || err.to_string().contains("read-only"),
+            "unexpected error: {err}",
+        );
+        let n: i64 = db
+            .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(n, 0);
+        // The failed lease was recycled or replaced; reads keep working.
+        for _ in 0..(READ_POOL_SIZE * 2) {
+            db.ping().expect("ping");
+            let _: i64 = db
+                .read(|c| c.query_row("SELECT 1", [], |r| r.get(0)))
+                .expect("read after refused write");
+        }
+    }
+
+    /// M6 evidence: while a large diagnostic-log batch holds the
+    /// writer mid-transaction, (1) a KV read and an event-history
+    /// query complete, seeing the pre-batch snapshot, and (2) an
+    /// event-log append that queues behind the batch commits before
+    /// the next log batch. Before M6 both reads waited for the
+    /// batch, and the next batch could win the mutex.
+    ///
+    /// No timing assertions: the batch is held open until the
+    /// reads report back, and ordering is read from a sequence
+    /// counter.
+    #[test]
+    fn log_batch_blocks_neither_reads_nor_event_append() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+
+        use crate::host_impl::plugin::oxidhome::plugin::types::Value as WitValue;
+        use crate::state::{EventLog, EventQuery, KvStore};
+
+        let dir = tempdir_for_test();
+        let db = Arc::new(Db::open_file_with_policy(dir.path(), test_policy()).expect("open"));
+        let kv = Arc::new(KvStore::new(Arc::clone(&db)));
+        let events = Arc::new(EventLog::new(Arc::clone(&db)));
+        kv.register_instance("inst-1", "alpha", 1024)
+            .expect("register");
+        kv.set(
+            "inst-1",
+            "alpha",
+            "mode",
+            WitValue::StringVal("away".into()),
+        )
+        .expect("kv set");
+        events
+            .record(1, &custom_event("before"), "alpha", "acme.test")
+            .expect("seed event");
+
+        // (1) A low-priority "log batch" takes the writer, inserts a
+        // large batch, and holds the transaction open until told.
+        let (holding_tx, holding_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let batch = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.write_low_priority(|c| -> rusqlite::Result<()> {
+                    let tx =
+                        c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    insert_log_rows(&tx, 5_000)?;
+                    holding_tx.send(()).expect("signal holding");
+                    release_rx.recv().expect("release");
+                    tx.commit()
+                })
+            })
+        };
+        holding_rx
+            .recv_timeout(PROGRESS_BOUND)
+            .expect("batch holds the writer");
+
+        let (read_tx, read_rx) = mpsc::channel();
+        {
+            let kv = Arc::clone(&kv);
+            let events = Arc::clone(&events);
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                let value = kv.get("inst-1", "alpha", "mode").expect("kv get");
+                let history = events.query(&EventQuery::default(), 10).expect("history");
+                let logs: i64 = db
+                    .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
+                    .expect("log count");
+                read_tx.send((value, history.len(), logs)).expect("report");
+            });
+        }
+        let (value, history, logs) = read_rx
+            .recv_timeout(PROGRESS_BOUND)
+            .expect("reads must complete while the log batch holds the writer");
+        assert!(matches!(value, Some(WitValue::StringVal(ref s)) if s == "away"));
+        assert_eq!(history, 1);
+        assert_eq!(logs, 0, "the uncommitted batch is invisible to readers");
+
+        // (2) Priority: an event append queues first, then the next
+        // log batch. The append must commit first.
+        let order = Arc::new(AtomicUsize::new(0));
+        let append = {
+            let events = Arc::clone(&events);
+            let order = Arc::clone(&order);
+            std::thread::spawn(move || {
+                let id = events
+                    .record(2, &custom_event("control"), "alpha", "acme.test")
+                    .expect("append");
+                (id, order.fetch_add(1, Ordering::SeqCst))
+            })
+        };
+        wait_until("the event append to queue on the writer", || {
+            db.waiting_writers() == 1
+        });
+        let next_batch = {
+            let db = Arc::clone(&db);
+            let order = Arc::clone(&order);
+            std::thread::spawn(move || {
+                db.write_low_priority(|c| insert_log_rows(c, 1))
+                    .expect("next batch");
+                order.fetch_add(1, Ordering::SeqCst)
+            })
+        };
+        release_tx.send(()).expect("release batch");
+        batch.join().expect("batch thread").expect("batch commit");
+        let (append_id, append_seq) = append.join().expect("append thread");
+        let batch_seq = next_batch.join().expect("next batch thread");
+        assert!(append_id > 0);
+        assert!(
+            append_seq < batch_seq,
+            "event append (seq {append_seq}) must commit before the next log batch (seq {batch_seq})",
+        );
+        let logs: i64 = db
+            .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
+            .expect("log count");
+        assert_eq!(logs, 5_001);
+    }
+
+    /// A read closure sees one snapshot even if a write commits
+    /// between its statements (the isolation the single mutex used
+    /// to give).
+    #[test]
+    fn pooled_read_sees_one_snapshot() {
+        use std::sync::mpsc;
+        let dir = tempdir_for_test();
+        let db = Arc::new(Db::open_file(dir.path()).expect("open"));
+        let (first_tx, first_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let reader = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.read(|c| -> rusqlite::Result<(i64, i64)> {
+                    let a: i64 = c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0))?;
+                    first_tx.send(()).expect("signal");
+                    go_rx.recv().expect("go");
+                    let b: i64 = c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0))?;
+                    Ok((a, b))
+                })
+            })
+        };
+        first_rx.recv_timeout(PROGRESS_BOUND).expect("first read");
+        db.write(|c| insert_log_rows(c, 3))
+            .expect("commit between reads");
+        go_tx.send(()).expect("go");
+        let (a, b) = reader.join().expect("reader").expect("read");
+        assert_eq!((a, b), (0, 0));
+        let now: i64 = db
+            .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(now, 3);
+    }
+
+    /// The checkpointer thread runs passive checkpoints on its own
+    /// connection and stops when the `Db` drops.
+    #[test]
+    fn checkpointer_runs_and_stops_with_db() {
+        let dir = tempdir_for_test();
+        let policy = ConnectionPolicy {
+            checkpoint_interval: Duration::from_millis(5),
+            ..ConnectionPolicy::default()
+        };
+        let db = Db::open_file_with_policy(dir.path(), policy).expect("open");
+        db.write(|c| insert_log_rows(c, 100)).expect("insert");
+        wait_until("a passive checkpoint", || db.checkpoints_run() >= 1);
+        drop(db);
+        // Reopen proves no connection or lock leaked from the drop.
+        let db = Db::open_file(dir.path()).expect("reopen");
+        let n: i64 = db
+            .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(n, 100);
     }
 
     /// Tiny tempdir helper — same shape as the one in the

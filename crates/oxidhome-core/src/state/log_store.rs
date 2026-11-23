@@ -25,10 +25,16 @@
 //! possibly off a tokio worker, possibly off a plain
 //! `std::thread::spawn`'d background task. We can't assume a tokio
 //! runtime is in scope, so the writer is a plain `std::thread` and
-//! the channel is `std::sync::mpsc::sync_channel`. Same `SQLite` handle
-//! the Phase-5a KV and Phase-5d event log share — the rusqlite
-//! `Connection` is mutex-guarded inside `Db`, so concurrent use from
-//! tokio + this thread is safe.
+//! the channel is `std::sync::mpsc::sync_channel`. It writes through
+//! the same `Db` writer the KV store and event log use.
+//!
+//! ## Batching and priority (M6)
+//!
+//! The writer drains everything queued (up to `MAX_BATCH_ROWS`) and
+//! commits it as one transaction through [`Db::write_low_priority`],
+//! so a burst costs one commit per batch instead of one per row, and
+//! a waiting event publish, audit write, or KV write goes first.
+//! Queries go through the `Db` read pool and don't wait on either.
 //!
 //! ## Span-carried context
 //!
@@ -65,6 +71,16 @@ use super::db::Db;
 /// blocking the writer; sustained overflow trips the drop counter
 /// instead of back-pressuring tracing.
 const DEFAULT_CAPACITY: usize = 1024;
+
+/// Most rows the writer commits in one transaction (M6). Bounds how
+/// long a log batch holds the writer once it has it, so a
+/// normal-priority write (event publish, audit, KV) arriving just
+/// after waits for at most one batch.
+const MAX_BATCH_ROWS: usize = 256;
+
+/// Rows per retention `DELETE` transaction in
+/// [`LogStore::trim_older_than`].
+const TRIM_CHUNK_ROWS: usize = 2048;
 
 /// Errors returned by [`LogStore`]. Layer-side `try_send` never
 /// returns these (it can only fail by dropping into the counter);
@@ -252,6 +268,9 @@ struct Counters {
     dropped: AtomicU64,
     written: AtomicU64,
     write_errors: AtomicU64,
+    /// Committed writer transactions; `written / batches` is the
+    /// mean batch size.
+    batches: AtomicU64,
     /// `true` iff the most recent `flush()` call hit its budget
     /// without draining. Used by `LogStore::drop` to avoid a
     /// second 5-second wait when an explicit shutdown flush has
@@ -607,12 +626,26 @@ impl LogStore {
                  retention may miss in-flight rows on this pass",
             );
         }
-        self.db.write(|conn| -> Result<_, LogStoreError> {
-            Ok(conn.execute(
-                "DELETE FROM log_event WHERE ts_unix_ms < ?1",
-                params![cutoff_ms],
-            )?)
-        })
+        // M6: low priority and chunked, so a large retention pass
+        // never holds the writer for more than one chunk ahead of
+        // an event publish or an audit write.
+        let chunk = i64::try_from(TRIM_CHUNK_ROWS).unwrap_or(i64::MAX);
+        let mut total = 0;
+        loop {
+            let n = self
+                .db
+                .write_low_priority(|conn| -> Result<_, LogStoreError> {
+                    Ok(conn.execute(
+                        "DELETE FROM log_event WHERE id IN \
+                         (SELECT id FROM log_event WHERE ts_unix_ms < ?1 LIMIT ?2)",
+                        params![cutoff_ms, chunk],
+                    )?)
+                })?;
+            total += n;
+            if n < TRIM_CHUNK_ROWS {
+                return Ok(total);
+            }
+        }
     }
 
     /// Total row count.
@@ -1020,45 +1053,65 @@ impl Visit for EventFields {
 // The owning-by-value version is right.
 #[allow(clippy::needless_pass_by_value)]
 fn writer_loop(db: Arc<Db>, rx: Receiver<LogRecord>, counters: Arc<Counters>) {
-    while let Ok(record) = rx.recv() {
-        let written = match db.write(|conn| -> rusqlite::Result<()> {
-            conn.execute(
-                "INSERT INTO log_event(ts_unix_ms, level, instance_id, plugin_id, device_id, target, span_path, message, fields_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    record.ts_unix_ms,
-                    record.level,
-                    record.instance_id,
-                    record.plugin_id,
-                    record.device_id,
-                    record.target,
-                    record.span_path,
-                    record.message,
-                    if record.fields_blob.is_empty() {
-                        None
-                    } else {
-                        Some(record.fields_blob.as_slice())
-                    },
-                ],
-            )?;
-            Ok(())
-        }) {
-            Ok(()) => true,
+    let mut batch = Vec::with_capacity(MAX_BATCH_ROWS);
+    while let Ok(first) = rx.recv() {
+        // M6: drain whatever queued up while the previous batch was
+        // committing (no artificial linger, so an idle store still
+        // writes each row promptly) and commit it as one transaction.
+        batch.push(first);
+        while batch.len() < MAX_BATCH_ROWS {
+            match rx.try_recv() {
+                Ok(record) => batch.push(record),
+                Err(_) => break,
+            }
+        }
+        let rows = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        match db.write_low_priority(|conn| insert_batch(conn, &batch)) {
+            Ok(()) => {
+                counters.written.fetch_add(rows, Ordering::Relaxed);
+                counters.batches.fetch_add(1, Ordering::Relaxed);
+            }
             Err(e) => {
                 // No `tracing::error!` here — would loop. Stderr is
                 // fine for a host-side smoke channel; Phase 12's
-                // status endpoint reads `write_errors`.
-                eprintln!("oxidhome log_store: write failed: {e}");
-                false
+                // status endpoint reads `write_errors`. The batch is
+                // one transaction, so every row in it failed.
+                eprintln!("oxidhome log_store: write of {rows} rows failed: {e}");
+                counters.write_errors.fetch_add(rows, Ordering::Relaxed);
             }
-        };
-        if written {
-            counters.written.fetch_add(1, Ordering::Relaxed);
-        } else {
-            counters.write_errors.fetch_add(1, Ordering::Relaxed);
         }
+        batch.clear();
     }
     // Sender side fully dropped — exit cleanly.
+}
+
+/// Insert `batch` in one `BEGIN IMMEDIATE` transaction.
+fn insert_batch(conn: &mut rusqlite::Connection, batch: &[LogRecord]) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO log_event(ts_unix_ms, level, instance_id, plugin_id, device_id, target, span_path, message, fields_blob) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for record in batch {
+            stmt.execute(params![
+                record.ts_unix_ms,
+                record.level,
+                record.instance_id,
+                record.plugin_id,
+                record.device_id,
+                record.target,
+                record.span_path,
+                record.message,
+                if record.fields_blob.is_empty() {
+                    None
+                } else {
+                    Some(record.fields_blob.as_slice())
+                },
+            ])?;
+        }
+    }
+    tx.commit()
 }
 
 fn now_unix_ms() -> i64 {
@@ -1602,6 +1655,60 @@ mod tests {
         );
         // Drain so the writer thread exits cleanly on test teardown.
         store.wait_drained_for_test();
+    }
+
+    /// M6: a burst that queues while the writer is busy commits in
+    /// a few bounded batches, not one transaction per row.
+    #[test]
+    fn burst_commits_in_bounded_batches() {
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        let store = LogStore::new(Arc::clone(&db));
+        // Hold the writer while the burst queues, so the writer
+        // thread finds a backlog once it gets the connection.
+        db.write(|_| -> rusqlite::Result<()> {
+            with_log_subscriber(&store, || {
+                for i in 0..600 {
+                    tracing::info!(target: "test", i, "burst");
+                }
+            });
+            Ok(())
+        })
+        .expect("hold writer");
+        store.wait_drained_for_test();
+        assert_eq!(store.dropped(), 0);
+        assert_eq!(store.written(), 600);
+        // At most one batch started before the writer blocked, then
+        // the backlog drains in ceil(600 / MAX_BATCH_ROWS) batches.
+        let batches = store.counters.batches.load(Ordering::Relaxed);
+        assert!(
+            batches <= 1 + 600_u64.div_ceil(MAX_BATCH_ROWS as u64),
+            "expected batched commits, got {batches} transactions for 600 rows",
+        );
+        assert_eq!(store.count().expect("count"), 600);
+    }
+
+    /// M6: retention deletes in chunks and still removes every
+    /// matching row.
+    #[test]
+    fn trim_older_than_deletes_across_chunks() {
+        let store = store();
+        let rows = TRIM_CHUNK_ROWS * 2 + 5;
+        store
+            .db
+            .write(|c| -> rusqlite::Result<()> {
+                let tx = c.transaction()?;
+                for i in 0..rows {
+                    tx.execute(
+                        "INSERT INTO log_event(ts_unix_ms, level, target, message) VALUES (?1, 2, 't', 'm')",
+                        params![i64::try_from(i).unwrap()],
+                    )?;
+                }
+                tx.commit()
+            })
+            .expect("seed");
+        let cutoff = i64::try_from(rows - 1).unwrap();
+        assert_eq!(store.trim_older_than(cutoff).expect("trim"), rows - 1);
+        assert_eq!(store.count().expect("count"), 1);
     }
 
     /// Restart-survival: write some events, drop the store, reopen

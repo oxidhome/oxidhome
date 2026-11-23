@@ -20,7 +20,8 @@
 //! the hash are derived from the secret itself, so the same secret
 //! never produces two different rows.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::TryRng;
@@ -84,16 +85,35 @@ pub struct IssuedToken {
     pub plaintext: String,
 }
 
+/// Resolution of `auth_token.last_used_ms` (M6). A verify within
+/// this window of the token's last recorded use skips the UPDATE,
+/// so a busy client costs one write per minute instead of one per
+/// request. A token's first use is always written (the bootstrap's
+/// "has the admin token been used" check and
+/// `TokenStore::delete_undelivered` key on NULL vs. set).
+pub const LAST_USED_RESOLUTION_MS: i64 = 60_000;
+
+/// Bound on the in-process "last written" map; cleared when full.
+/// Only tokens that verified successfully ever enter it.
+const LAST_USED_CACHE_MAX: usize = 1024;
+
 /// In-memory + SQLite-backed token registry. One per [`Engine`](crate::Engine).
 #[derive(Debug)]
 pub struct TokenStore {
     db: Arc<Db>,
+    /// `token_id -> last_used_ms` this process wrote, for callers
+    /// that bump without a fresh row in hand
+    /// ([`Self::touch_last_used`]).
+    last_written: Mutex<HashMap<String, i64>>,
 }
 
 impl TokenStore {
     #[must_use]
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        Self {
+            db,
+            last_written: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Mint a fresh token with `label` and the given `scope_json`
@@ -168,16 +188,15 @@ impl TokenStore {
     }
 
     /// Verify a plaintext bearer secret and return the matching
-    /// record. On success, bumps `last_used_ms`. The error variants
+    /// record. On success, bumps `last_used_ms` unless it was
+    /// recorded within [`LAST_USED_RESOLUTION_MS`]. The error variants
     /// the API rejects with are intentionally indistinguishable from
     /// the outside (all map to 401) so an attacker can't probe id
     /// shape, validity, or revocation state.
     ///
-    /// **Locking.** The lookup runs under `db.read()` and only the
-    /// `last_used_ms` bump takes the write lock — so on the
-    /// happy-path the auth check competes for the shared `SQLite`
-    /// connection mutex only briefly for the timestamp update,
-    /// instead of holding the write lock across the SELECT. The
+    /// **Locking.** The lookup runs on a pooled reader (`db.read()`)
+    /// and only the `last_used_ms` bump takes the writer, at most
+    /// once per [`LAST_USED_RESOLUTION_MS`] per token (M6). The
     /// gap between read and write is benign: at worst two concurrent
     /// verifies of the same token write `last_used_ms` to nearly
     /// identical values, and a `revoke` interleaved between the
@@ -189,9 +208,9 @@ impl TokenStore {
         // are deliberately swallowed inside `touch_last_used`: the
         // token is already verified, and missing a timestamp update
         // is strictly less bad than rejecting the request.
-        let now = touch_last_used(&self.db, &rec.id);
+        let last_used = self.bump_last_used(&rec.id, rec.last_used_ms);
         Ok(TokenRecord {
-            last_used_ms: Some(now),
+            last_used_ms: Some(last_used),
             ..rec
         })
     }
@@ -232,10 +251,44 @@ impl TokenStore {
     /// [`Self::verify_read_only`] before the audit path, then
     /// `require_token` calls this to complete the write half
     /// without redoing the SELECT (round-3 P1 on PR #140).
-    /// Returns the timestamp written.
+    /// Coalesced like [`Self::verify`]: skipped if this process
+    /// wrote the token's `last_used_ms` within
+    /// [`LAST_USED_RESOLUTION_MS`]. Returns the recorded timestamp.
     #[must_use]
     pub fn touch_last_used(&self, token_id: &str) -> i64 {
-        touch_last_used(&self.db, token_id)
+        let recorded = self
+            .last_written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(token_id)
+            .copied();
+        self.bump_last_used(token_id, recorded)
+    }
+
+    /// Write `last_used_ms = now` unless `recorded` (the row's value
+    /// from [`Self::verify`], or this process's last write from
+    /// [`Self::touch_last_used`]) is less than
+    /// [`LAST_USED_RESOLUTION_MS`] old. `None` (never used) always
+    /// writes. Returns the timestamp now on record (best effort: a
+    /// failed write is logged and `now` returned, as before M6).
+    fn bump_last_used(&self, token_id: &str, recorded: Option<i64>) -> i64 {
+        let now = now_ms();
+        if let Some(t) = recorded
+            && (0..LAST_USED_RESOLUTION_MS).contains(&(now - t))
+        {
+            return t;
+        }
+        if touch_last_used(&self.db, token_id, now) {
+            let mut map = self
+                .last_written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if map.len() >= LAST_USED_CACHE_MAX && !map.contains_key(token_id) {
+                map.clear();
+            }
+            map.insert(token_id.to_string(), now);
+        }
+        now
     }
 
     /// Mark a token revoked. Idempotent — calling on an already-
@@ -537,30 +590,30 @@ fn derive_id(hash: &[u8; 32]) -> String {
     base64url_no_pad(&hash[..12])
 }
 
-/// Best-effort `last_used_ms` bump. Extracted from
-/// [`TokenStore::verify`] so the MCP rate-limit path can call
-/// it separately after a successful read-only verify. Failures
-/// are logged and swallowed; the caller has already
-/// authenticated. Returns the timestamp that was written.
-fn touch_last_used(db: &Db, token_id: &str) -> i64 {
-    let now = now_ms();
+/// Best-effort `last_used_ms = now` write. Failures are logged and
+/// swallowed; the caller has already authenticated. Returns whether
+/// the write succeeded.
+fn touch_last_used(db: &Db, token_id: &str, now: i64) -> bool {
     let id_for_db = token_id.to_string();
     let logged_id = token_id.to_string();
-    if let Err(err) = db.write(move |conn| -> Result<(), TokenError> {
+    match db.write(move |conn| -> Result<(), TokenError> {
         conn.execute(
             "UPDATE auth_token SET last_used_ms = ?1 WHERE id = ?2",
             params![now, id_for_db],
         )?;
         Ok(())
     }) {
-        tracing::warn!(
-            target: "auth.token",
-            token_id = %logged_id,
-            error = %err,
-            "failed to bump last_used_ms; verify itself succeeded",
-        );
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                target: "auth.token",
+                token_id = %logged_id,
+                error = %err,
+                "failed to bump last_used_ms; verify itself succeeded",
+            );
+            false
+        }
     }
-    now
 }
 
 fn now_ms() -> i64 {
@@ -892,9 +945,8 @@ mod tests {
     }
 
     /// Verify still bumps `last_used_ms` after the split into
-    /// `db.read` + `db.write`. Pins the contract so future
-    /// optimizations (e.g. coalescing the write to a 30-60s
-    /// window) can't drop the bump entirely.
+    /// `db.read` + `db.write`, and a token's first use is always
+    /// written even with M6 coalescing.
     #[test]
     fn verify_bumps_last_used_ms_via_separate_write() {
         let store = TokenStore::new(fresh());
@@ -906,5 +958,60 @@ mod tests {
         let post = store.get(&issued.id).unwrap().unwrap();
         assert!(post.last_used_ms.is_some());
         assert_eq!(rec.last_used_ms, post.last_used_ms);
+    }
+
+    fn set_last_used(db: &Db, id: &str, ms: i64) {
+        db.write(|c| {
+            c.execute(
+                "UPDATE auth_token SET last_used_ms = ?1 WHERE id = ?2",
+                params![ms, id],
+            )
+        })
+        .unwrap();
+    }
+
+    /// M6: verifies inside the resolution window coalesce into the
+    /// recorded value; once it is older than the window, the next
+    /// verify writes again.
+    #[test]
+    fn verify_coalesces_last_used_within_resolution() {
+        let db = fresh();
+        let store = TokenStore::new(Arc::clone(&db));
+        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let recent = now_ms() - 1_000;
+        set_last_used(&db, &issued.id, recent);
+        let rec = store.verify(&issued.plaintext).unwrap();
+        assert_eq!(rec.last_used_ms, Some(recent));
+        let row = store.get(&issued.id).unwrap().unwrap();
+        assert_eq!(row.last_used_ms, Some(recent), "no write inside the window");
+
+        let stale = now_ms() - 2 * LAST_USED_RESOLUTION_MS;
+        set_last_used(&db, &issued.id, stale);
+        let rec = store.verify(&issued.plaintext).unwrap();
+        let row = store.get(&issued.id).unwrap().unwrap();
+        assert!(
+            row.last_used_ms.unwrap() > stale,
+            "stale value is refreshed"
+        );
+        assert_eq!(rec.last_used_ms, row.last_used_ms);
+    }
+
+    /// M6: `touch_last_used` (no row in hand) coalesces on this
+    /// process's own last write.
+    #[test]
+    fn touch_last_used_coalesces_on_process_writes() {
+        let db = fresh();
+        let store = TokenStore::new(Arc::clone(&db));
+        let issued = store.create("mcp", b"[\"*\"]").unwrap();
+        let first = store.touch_last_used(&issued.id);
+        let row = store.get(&issued.id).unwrap().unwrap();
+        assert_eq!(row.last_used_ms, Some(first), "first touch writes");
+        // Make the row stale behind the cache's back: a second touch
+        // inside the window must not write.
+        set_last_used(&db, &issued.id, 1);
+        let second = store.touch_last_used(&issued.id);
+        assert_eq!(second, first);
+        let row = store.get(&issued.id).unwrap().unwrap();
+        assert_eq!(row.last_used_ms, Some(1));
     }
 }
