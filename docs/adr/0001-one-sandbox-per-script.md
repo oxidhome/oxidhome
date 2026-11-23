@@ -47,7 +47,11 @@ the decision.
 ### Sandbox model
 
 - A **script sandbox** is a child instance of a scripting-plugin instance (the *parent*): the same component and the
-  same pinned manifest, loaded into its own Wasmtime `Store` under its own supervisor task. The parent starts one with
+  same pinned manifest, loaded into its own Wasmtime `Store` under its own supervisor task. The parent's supervisor
+  compiles the component once, on its first load, and keeps the bytes and the compiled form for its lifetime; its
+  restarts, its sandboxes and their restarts instantiate that, so a sandbox runs exactly the parent's code (a rebuilt
+  dev `.wasm` is picked up only by a fresh start). A reinstall or upgrade needs a stop and start, so a new supervisor
+  and a new compile; a load that resolves a different installation than the cached one is refused. The parent starts one with
   `host-sandboxes::start-sandbox(local-id, source)` and stops it with `stop-sandbox(local-id)`; `list-sandboxes`
   shows the live ones. Inside a sandbox, `current-sandbox()` returns the script's `local-id`, its instance id, the
   parent's instance id and the source, so the component's `init` knows which script to run. In a parent it returns
@@ -63,17 +67,28 @@ the decision.
   outlive a crash of their parent: they are still listed when the parent's next life runs `init`. They stop when the
   parent reaches a terminal state (stopped by the operator, or `Failed`), when the parent stops them, or on daemon
   shutdown. A terminal parent leaves the instance registry only after all its sandboxes have, so stopping it and
-  then uninstalling never races a child that is still running.
+  then uninstalling never races a child that is still running. The API stop handlers wait for that release (bounded
+  by `STOP_WAIT_LIMIT`, 75 s; past it they answer with the instances still stopping).
+- **Stopping.** A stop gives a plugin call in flight a 2 s grace, then cancels it, so a script blocked in a host
+  import (a WASI `sleep`, a slow `call-service`) can't hold its stop up; the epoch watchdog only interrupts guest
+  code. A cancelled call's caller hears `unknown` (it may have acted), and `on-shutdown` is skipped. `on-shutdown`
+  itself is bounded by the watchdog deadline in wall-clock time. `Stopped` is published only after the `Store` is
+  dropped.
 - Sandboxes don't nest: `start-sandbox` from inside a sandbox is `permission-denied`. Only instances the engine
   starts and reaps can start sandboxes; one driven without that (the test host's unsupervised `load`, the
-  `supervise*` helpers) gets `unavailable`.
+  `supervise*` helpers) gets `unavailable`. An instance's sandbox role is set before its component is
+  instantiated.
 - A singleton plugin can't run sandboxes: every sandbox is another copy of the component, which would break the
   exclusivity `singleton` promises. Manifest validation refuses `singleton = true` with `script_sandboxes > 0`.
 - A sandbox's KV, blob and device-state rows key on its own instance id, so each script has its own storage that
-  survives its restarts. Nothing purges them when the script is removed; they go with the installation on
-  uninstall, like any instance's. The live-sandbox limit therefore doesn't bound a plugin's stored data: a plugin
-  that keeps starting scripts under new `local-id`s gets a fresh quota for each. Purging a removed script's storage
-  is deferred (below).
+  survives its restarts, its parent's restarts and its parent stopping (the parent re-creates it later).
+  `stop-sandbox` means the script is removed: once the sandbox is gone, the host purges its KV and blob storage and
+  drops its device-state generation and publish rate limiter, before the `local-id` can be started again. A plugin
+  that changes a script's source (stop, then start) starts the new version with empty storage; state that must
+  outlive the script belongs in the parent's storage. Purging on removal was chosen over a per-plugin budget across
+  sandbox namespaces: it needs no new accounting, and with it the live-sandbox limit bounds a plugin's stored data
+  (at most `script_sandboxes` live namespaces, plus those its parent stopped without removing). Its device-state
+  entries stay, `stale`, under the projection's stale cap.
 
 ### Identity
 
@@ -85,7 +100,10 @@ the decision.
 - The sandbox runs under the parent's installation identity (`plugin_id`, `installation_uuid`, load mode) and the
   same effective capabilities. The instance id is what distinguishes it everywhere else: service ownership, the
   `caller_instance` and `instance` axes of `consumes_services` grants, the delegation chain, audit rows, logs and
-  the instance list in the API.
+  the instance list in the API, which shows a sandbox's `parent_instance_id` and `sandbox_local_id` (REST, Connect,
+  MCP).
+- The embedder entry points that bypass the instance registry (`PluginInstance::load*`, `supervise*`) refuse an id
+  containing `~` and the id of a registered instance.
 
 ### Resource ceilings
 
@@ -123,11 +141,6 @@ its own policy. A call that never reached B (B restarting, not running, deadline
 ### Deferred
 
 - Per-script tuning of the ceilings, and a per-plugin aggregate memory budget across sandboxes.
-- Bounding the storage of removed scripts (purge on `stop-sandbox`, or a per-plugin budget across sandbox
-  namespaces), and dropping the per-instance bookkeeping (device-state generation, publish rate limiter) a removed
-  script's instance id leaves behind.
-- Compiling the component once per parent: today every sandbox load (and restart) compiles it again from the
-  plugin directory, which is slow and, for dev loads, picks up a rebuilt `.wasm`.
-- Showing the parent/child relation in the REST, Connect, MCP and UI instance views (a sandbox shows up there as an
-  ordinary instance today).
-- Persisting sandboxes across daemon restarts: the parent re-creates them from its own storage in `init`.
+- Persisting sandboxes across daemon restarts on the host side: the parent re-creates them from its own storage in
+  `init`.
+- Saying in the WIT's `stop-sandbox` docs that the sandbox's storage goes with it.

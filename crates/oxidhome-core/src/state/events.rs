@@ -672,6 +672,17 @@ impl EventBus {
         Ok(())
     }
 
+    /// Drop the publish rate limiter of an instance id that won't be
+    /// used again (a removed script sandbox, ADR-0001), so retired ids
+    /// don't accumulate buckets. A later publisher under the same id
+    /// starts with a full bucket.
+    pub fn forget_instance(&self, instance_id: &str) {
+        self.rate_limiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(instance_id);
+    }
+
     fn limiter_for(&self, instance_id: &str) -> Arc<RateLimiter> {
         let mut map = self
             .rate_limiters
@@ -1091,6 +1102,27 @@ mod tests {
             matches!(err, PublishDenied::RateLimited { .. }),
             "got {err:?}",
         );
+    }
+
+    /// ADR-0001: a retired instance id's bucket is dropped; the id
+    /// starts over with a full one.
+    #[test]
+    fn forget_instance_drops_its_rate_limiter() {
+        let bus = EventBus::new();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        for _ in 0..DEFAULT_PUBLISH_BURST as u32 {
+            bus.admit_publish("main~a").unwrap();
+        }
+        assert!(bus.admit_publish("main~a").is_err());
+        bus.forget_instance("main~a");
+        assert!(
+            !bus.rate_limiters
+                .lock()
+                .expect("lock")
+                .contains_key("main~a")
+        );
+        bus.admit_publish("main~a")
+            .expect("a forgotten id starts with a full bucket");
     }
 
     #[test]

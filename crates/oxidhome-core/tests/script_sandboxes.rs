@@ -581,3 +581,205 @@ async fn manager_crash_keeps_and_readopts_its_scripts() {
 
     manager.stop().await.expect("stop manager");
 }
+
+/// Wait until `instance` has left the instance registry.
+async fn wait_gone(engine: &Engine, instance: &str) {
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while engine.instance(instance).is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "`{instance}` never left the registry"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// ADR-0001 follow-up: a supervisor compiles its component once. Its
+/// restarts, the sandboxes it starts and their restarts all reuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn restarts_and_sandboxes_reuse_the_compiled_component() {
+    let state = support::tempdir("sandbox-compile-once");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let manager = start_manager(&engine, LoadMode::Dev).await;
+    assert_eq!(engine.component_compile_count(), 1);
+
+    let svc_a = load(&engine, "a", "boom trap\npong ok\n").await;
+    load(&engine, "b", "pong ok\n").await;
+    assert_eq!(
+        engine.component_compile_count(),
+        1,
+        "sandboxes compiled again"
+    );
+
+    // A sandbox restart reuses it.
+    let outcome = call(&engine, svc_a.clone(), "boom", Vec::new()).await;
+    assert!(
+        matches!(outcome, Ok(CommandResult::Unknown(_))),
+        "got {outcome:?}"
+    );
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while service_of(&engine, "main~a", "script").await == svc_a {
+        assert!(Instant::now() < deadline, "a did not restart");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // So does a restart of the manager itself.
+    let scripts = service_of(&engine, MANAGER, "scripts").await;
+    let outcome = call(&engine, scripts.clone(), "crash", Vec::new()).await;
+    assert!(
+        matches!(outcome, Ok(CommandResult::Unknown(_))),
+        "got {outcome:?}"
+    );
+    while service_of(&engine, MANAGER, "scripts").await == scripts {
+        assert!(Instant::now() < deadline, "manager did not restart");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    manager.wait_for_running().await.expect("manager Running");
+    assert_eq!(
+        engine.component_compile_count(),
+        1,
+        "a restart compiled again"
+    );
+
+    manager.stop().await.expect("stop manager");
+}
+
+/// The parent/child relation is on every sandbox's handle, and the
+/// API stop wait covers a parent's sandboxes: once it returns, none of
+/// them is left, even one stuck in a slow call (cancelled, so its
+/// caller hears `unknown`).
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_waits_for_slow_sandboxes_and_reports_the_relation() {
+    let state = support::tempdir("sandbox-stop-wait");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let manager = start_manager(&engine, LoadMode::Dev).await;
+    let svc_a = load(&engine, "a", "slow sleep 10000\n").await;
+
+    let child = engine.instance("main~a").expect("sandbox registered");
+    assert_eq!(child.parent_instance_id(), Some(MANAGER));
+    assert_eq!(child.sandbox_local_id(), Some("a"));
+    assert_eq!(manager.parent_instance_id(), None);
+    assert_eq!(manager.sandbox_local_id(), None);
+
+    let slow = tokio::spawn({
+        let engine = engine.clone();
+        async move { call(&engine, svc_a, "slow", Vec::new()).await }
+    });
+    // Let the call reach the sandbox's `sleep` (an idle sandbox enters
+    // it within milliseconds; the margin is for loaded CI runners).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let started = Instant::now();
+    let report = oxidhome_core::stop_and_wait_reaped(vec![manager], Duration::from_mins(1)).await;
+    assert_eq!(report.stopped, vec![MANAGER.to_owned()]);
+    assert_eq!(report.still_stopping, Vec::<String>::new());
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the sandbox's 10 s sleep held the stop up: {:?}",
+        started.elapsed()
+    );
+    assert!(engine.instance(MANAGER).is_none());
+    assert!(engine.instance("main~a").is_none());
+    assert!(matches!(child.state(), InstanceState::Stopped));
+
+    match slow.await.expect("join") {
+        Ok(CommandResult::Unknown(msg)) => assert!(msg.contains("stopped"), "{msg}"),
+        other => panic!("expected unknown, got {other:?}"),
+    }
+}
+
+/// A sandbox's storage goes with its script: `stop-sandbox` (the
+/// manager's `unload`) purges it once the sandbox is gone, while a
+/// sandbox that stops with its parent keeps it for the next life.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_script_storage_is_purged() {
+    let state = support::tempdir("sandbox-purge");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let manager = start_manager(&engine, LoadMode::Dev).await;
+    let svc_a = load(&engine, "a", "save store\n").await;
+    let svc_b = load(&engine, "b", "save store\n").await;
+    for svc in [svc_a, svc_b] {
+        let outcome = call(&engine, svc, "save", Vec::new()).await;
+        assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    }
+    let uuid = manager.installation_uuid().expect("loaded").to_owned();
+    let kv = engine.kv();
+    for id in ["main~a", "main~b"] {
+        let (used, _) = kv.usage(&uuid, id).expect("usage").expect("row");
+        assert!(used > 0, "{id} stored nothing");
+    }
+
+    let scripts = service_of(&engine, MANAGER, "scripts").await;
+    let outcome = call(&engine, scripts, "unload", vec![string("id", "a")]).await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    wait_gone(&engine, "main~a").await;
+    assert_eq!(kv.usage(&uuid, "main~a").expect("usage"), None);
+    assert_eq!(
+        kv.list_keys(&uuid, "main~a", "").expect("keys"),
+        Vec::<String>::new()
+    );
+
+    // Stopping the manager isn't a removal: `b` keeps its storage.
+    manager.stop().await.expect("stop manager");
+    wait_gone(&engine, MANAGER).await;
+    assert!(kv.usage(&uuid, "main~b").expect("usage").is_some());
+    assert_eq!(
+        kv.list_keys(&uuid, "main~b", "").expect("keys"),
+        vec!["note".to_owned()]
+    );
+}
+
+/// Sandboxes don't nest: `start-sandbox` from inside one is
+/// `permission-denied`.
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_cannot_start_a_sandbox() {
+    let state = support::tempdir("sandbox-nest");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let manager = start_manager(&engine, LoadMode::Dev).await;
+    let svc_a = load(&engine, "a", "deeper nest\n").await;
+    let outcome = call(&engine, svc_a, "deeper", Vec::new()).await;
+    assert!(
+        matches!(outcome, Ok(CommandResult::Err(Error::PermissionDenied(_)))),
+        "got {outcome:?}"
+    );
+    assert!(engine.instance("main~a~nested").is_none());
+    assert_eq!(
+        engine.sandboxes().list(MANAGER),
+        vec![("a".to_owned(), "main~a".to_owned())]
+    );
+    manager.stop().await.expect("stop manager");
+}
+
+/// The embedder entry points that bypass the instance registry refuse
+/// a sandbox-shaped id and the id of a registered instance.
+#[tokio::test(flavor = "multi_thread")]
+async fn embedder_helpers_refuse_reserved_and_registered_ids() {
+    let state = support::tempdir("sandbox-embedder-ids");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let manager = start_manager(&engine, LoadMode::Dev).await;
+    load(&engine, "a", "pong ok\n").await;
+
+    for id in ["main~b", MANAGER, "main~a"] {
+        let err = match oxidhome_core::PluginInstance::load(&engine, &plugin_dir(), id).await {
+            Ok(_) => panic!("load accepted `{id}`"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(
+            err.contains("reserved") || err.contains("running supervised instance"),
+            "{id}: {err}"
+        );
+        let handle = oxidhome_core::supervise(engine.clone(), plugin_dir(), id, PLUGIN, None);
+        let err = handle
+            .wait_for_running()
+            .await
+            .expect_err("supervise accepted the id")
+            .to_string();
+        assert!(
+            err.contains("reserved") || err.contains("running supervised instance"),
+            "{id}: {err}"
+        );
+    }
+    // The refusals touched nothing.
+    assert_eq!(manager.state(), InstanceState::Running);
+    assert!(engine.instance("main~b").is_none());
+    manager.stop().await.expect("stop manager");
+}

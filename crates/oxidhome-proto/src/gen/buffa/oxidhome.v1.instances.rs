@@ -299,6 +299,27 @@ pub struct Instance {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub config_json: ::buffa::alloc::string::String,
+    /// ADR-0001: for a script sandbox, the instance that started it
+    /// (the sandbox's id is `<parent_instance_id>~<sandbox_local_id>`).
+    /// Unset for any other instance.
+    ///
+    /// Field 5: `parent_instance_id`
+    #[serde(
+        rename = "parentInstanceId",
+        alias = "parent_instance_id",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub parent_instance_id: ::core::option::Option<::buffa::alloc::string::String>,
+    /// ADR-0001: for a script sandbox, its `local-id` within the parent.
+    /// Unset for any other instance.
+    ///
+    /// Field 6: `sandbox_local_id`
+    #[serde(
+        rename = "sandboxLocalId",
+        alias = "sandbox_local_id",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub sandbox_local_id: ::core::option::Option<::buffa::alloc::string::String>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -310,6 +331,8 @@ impl ::core::fmt::Debug for Instance {
             .field("plugin_id", &self.plugin_id)
             .field("state", &self.state)
             .field("config_json", &self.config_json)
+            .field("parent_instance_id", &self.parent_instance_id)
+            .field("sandbox_local_id", &self.sandbox_local_id)
             .finish()
     }
 }
@@ -319,6 +342,28 @@ impl Instance {
     ///
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Instance";
+}
+impl Instance {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::parent_instance_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_parent_instance_id(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.parent_instance_id = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::sandbox_local_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_sandbox_local_id(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.sandbox_local_id = Some(value.into());
+        self
+    }
 }
 ::buffa::impl_default_instance!(Instance);
 impl ::buffa::MessageName for Instance {
@@ -352,6 +397,12 @@ impl ::buffa::Message for Instance {
         if !self.config_json.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.config_json) as u64;
         }
+        if let Some(ref v) = self.parent_instance_id {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
+        if let Some(ref v) = self.sandbox_local_id {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -373,6 +424,12 @@ impl ::buffa::Message for Instance {
         }
         if !self.config_json.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.config_json, buf);
+        }
+        if let Some(ref v) = self.parent_instance_id {
+            ::buffa::types::put_string_field(5u32, v, buf);
+        }
+        if let Some(ref v) = self.sandbox_local_id {
+            ::buffa::types::put_string_field(6u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -415,6 +472,30 @@ impl ::buffa::Message for Instance {
                 )?;
                 ::buffa::types::merge_string(&mut self.config_json, buf)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(
+                    self
+                        .parent_instance_id
+                        .get_or_insert_with(::buffa::alloc::string::String::new),
+                    buf,
+                )?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(
+                    self
+                        .sandbox_local_id
+                        .get_or_insert_with(::buffa::alloc::string::String::new),
+                    buf,
+                )?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -427,6 +508,8 @@ impl ::buffa::Message for Instance {
         self.plugin_id.clear();
         self.state.clear();
         self.config_json.clear();
+        self.parent_instance_id = ::core::option::Option::None;
+        self.sandbox_local_id = ::core::option::Option::None;
         self.__buffa_unknown_fields.clear();
     }
 }

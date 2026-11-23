@@ -19,7 +19,11 @@
 //! - `call <script> <command>` — call `<command>` on the sibling script
 //!   `<script>` through `host::call_service` and reply with its result;
 //! - `sleep <ms>` — sleep (at most 10 s), then reply `ok`;
-//! - `trap` — panic (the sandbox crashes and restarts on its own).
+//! - `trap` — panic (the sandbox crashes and restarts on its own);
+//! - `store` — write the key `note` to the script's own storage, then
+//!   reply `ok`;
+//! - `nest` — try to start a sandbox from inside this one and reply
+//!   with the host's answer (sandboxes don't nest, so an error).
 //!
 //! Blank lines and lines starting with `#` are ignored.
 
@@ -40,6 +44,8 @@ enum Action {
     Call { script: String, command: String },
     Sleep(u64),
     Trap,
+    Store,
+    Nest,
 }
 
 enum Role {
@@ -94,6 +100,8 @@ fn parse(source: &str) -> Result<BTreeMap<String, Action>, String> {
         let action = match words.as_slice() {
             [_, "ok"] => Action::Ok,
             [_, "trap"] => Action::Trap,
+            [_, "store"] => Action::Store,
+            [_, "nest"] => Action::Nest,
             [_, "sleep", ms] => Action::Sleep(
                 ms.parse()
                     .map_err(|e| format!("line {}: bad sleep: {e}", n + 1))?,
@@ -320,6 +328,19 @@ impl ScriptHost {
                 CommandResult::Ok
             }
             Action::Trap => panic!("script asked to trap"),
+            Action::Store => {
+                match host::storage::set("note", &Value::StringVal("stored".into())) {
+                    Ok(()) => CommandResult::Ok,
+                    Err(e) => CommandResult::Err(e),
+                }
+            }
+            Action::Nest => match host::sandboxes::start("nested", "") {
+                Ok(instance) => CommandResult::OkWithState(vec![KeyValue {
+                    key: "instance_id".into(),
+                    value: Value::StringVal(instance),
+                }]),
+                Err(e) => CommandResult::Err(e),
+            },
             Action::Call { script, command } => {
                 let instance = host::sandboxes::instance_id(parent, script);
                 let target = match host::resolve_service(PLUGIN_ID, &instance, SCRIPT_SERVICE) {

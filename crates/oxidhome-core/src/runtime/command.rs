@@ -285,6 +285,25 @@ impl DispatchTicket {
         self.0.load(Ordering::Acquire) == WITHDRAWN
     }
 
+    /// Supervisor teardown: refuse a still-queued command. `None` if
+    /// the plugin was entered; `Some(true)` if the caller had already
+    /// gone (disconnect or deadline) before the refusal, `Some(false)`
+    /// if this refusal won.
+    pub(crate) fn try_refuse(&self) -> Option<bool> {
+        let mut observed =
+            self.0
+                .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire);
+        while observed == Err(CLAIMING) {
+            std::thread::yield_now();
+            observed = Err(self.0.load(Ordering::Acquire));
+        }
+        match observed {
+            Ok(_) => Some(false),
+            Err(STARTED) => None,
+            Err(_) => Some(true),
+        }
+    }
+
     /// Whether the supervisor entered the plugin.
     pub(crate) fn started(&self) -> bool {
         self.0.load(Ordering::Acquire) == STARTED

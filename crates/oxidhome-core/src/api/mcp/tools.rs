@@ -2374,6 +2374,16 @@ struct PluginsStopBody {
     stopped: Vec<String>,
 }
 
+/// `plugins.stop` past [`crate::STOP_WAIT_LIMIT`]: an error result that
+/// still says which instances stopped.
+#[derive(Serialize)]
+struct PluginsStopTimedOutBody {
+    error: &'static str,
+    message: String,
+    stopped: Vec<String>,
+    stopping: Vec<String>,
+}
+
 async fn plugins_stop_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
@@ -2410,37 +2420,50 @@ async fn plugins_stop_call(
         };
     }
 
-    // Mirror the REST handler: iterate the registry, filter to
-    // matching plugin_id (+ optional instance_id), stop each
-    // and wait for the reaper to clear the entry so a follow-up
-    // caller sees consistent post-stop state. Idempotent — an
-    // empty `stopped` list is a valid success (nothing was
-    // running that matched).
-    let registry = engine.instances();
-    let mut stopped = Vec::new();
-    for handle in registry.list() {
-        if handle.plugin_id() != args.plugin_id {
-            continue;
-        }
-        if let Some(want) = &args.instance_id
-            && handle.instance_id() != want
-        {
-            continue;
-        }
-        let id = handle.instance_id().to_string();
-        if let Err(err) = handle.stop().await {
-            tracing::warn!(
-                target: "mcp.tool.plugins.stop",
-                instance_id = %id,
-                error = %err,
-                "stop instance failed; continuing with siblings",
-            );
-            continue;
-        }
-        let _ = handle.wait_terminal().await;
-        wait_for_registry_clear(&registry, &id).await;
-        stopped.push(id);
+    // Mirror the REST handler: stop every matching instance at once
+    // and wait (bounded) until each has been reaped, sandboxes
+    // included, so a follow-up caller sees consistent post-stop
+    // state. Idempotent — an empty `stopped` list is a valid success
+    // (nothing was running that matched).
+    let handles = engine
+        .instances()
+        .list()
+        .into_iter()
+        .filter(|handle| {
+            handle.plugin_id() == args.plugin_id
+                && args
+                    .instance_id
+                    .as_ref()
+                    .is_none_or(|want| handle.instance_id() == want)
+        })
+        .collect();
+    let report = crate::runtime::stop_and_wait_reaped(handles, crate::STOP_WAIT_LIMIT).await;
+    if !report.still_stopping.is_empty() {
+        let message = format!(
+            "instances still stopping after {} s; they finish in the background",
+            crate::STOP_WAIT_LIMIT.as_secs(),
+        );
+        let body = PluginsStopTimedOutBody {
+            error: "stop_timed_out",
+            message: message.clone(),
+            stopped: report.stopped,
+            stopping: report.still_stopping,
+        };
+        return match super::resources::encode_body_capped(
+            &body,
+            "plugins.stop",
+            MAX_TOOL_BODY_BYTES,
+        ) {
+            EncodedBody::Value(v) => ToolOutcome::ExecErr {
+                message,
+                structured: Some(v),
+                domain_kind: None,
+            },
+            EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+            EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+        };
     }
+    let stopped = report.stopped;
 
     let body = PluginsStopBody { stopped };
     match super::resources::encode_body_capped(&body, "plugins.stop", MAX_TOOL_BODY_BYTES) {
@@ -2459,28 +2482,6 @@ async fn plugins_stop_call(
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
         EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
-    }
-}
-
-/// Bounded poll for the instance to leave the registry after
-/// its supervisor reached a terminal state. Same rationale as
-/// the REST-side [`crate::api::server::wait_for_registry_clear`]:
-/// the reaper runs on a separately-spawned tokio task, so
-/// there's a brief window where the terminal state is
-/// observable but the registry entry is still present. 5 s is
-/// comfortably above any plausible reaper-scheduling latency.
-async fn wait_for_registry_clear(registry: &crate::InstanceRegistry, instance_id: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while registry.get(instance_id).is_some() {
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                target: "mcp.tool.plugins.stop",
-                instance_id = %instance_id,
-                "instance registry didn't clear after 5s — reaper task lagging?",
-            );
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 

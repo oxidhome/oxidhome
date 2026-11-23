@@ -25,8 +25,8 @@ pub mod state;
 pub use auth::{Actor, ActorKind};
 pub use runtime::{
     CommandOutcome, CommandReport, Engine, EngineShuttingDown, InitError, InstanceHandle,
-    InstanceRegistry, InstanceState, PluginInstance, RegistryError, StopAllReport,
-    SupervisorTuning, supervise, supervise_with_tuning,
+    InstanceRegistry, InstanceState, PluginInstance, RegistryError, STOP_WAIT_LIMIT, StopAllReport,
+    StopWaitReport, SupervisorTuning, stop_and_wait_reaped, supervise, supervise_with_tuning,
 };
 pub use state::{DeviceMeta, DeviceRegistry, EventBus, EventSubscription};
 

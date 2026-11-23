@@ -29,7 +29,8 @@ pub(crate) mod watchdog;
 pub use command::{CommandOutcome, CommandReport, PendingCommands};
 pub use instance::{InitError, LoadMode, PluginInstance, read_manifest_with_bytes};
 pub use lifecycle::{
-    InstanceHandle, InstanceState, SupervisorTuning, supervise, supervise_with_tuning,
+    InstanceHandle, InstanceState, STOP_GRACE, STOP_WAIT_LIMIT, StopWaitReport, SupervisorTuning,
+    stop_and_wait_reaped, supervise, supervise_with_tuning,
 };
 pub use registry::{InstanceRegistry, RegistryError};
 pub use sandbox::{SANDBOX_SEPARATOR, SandboxRegistry, sandbox_instance_id};
@@ -165,6 +166,9 @@ pub struct Engine {
     /// restart the engine's plugin activity build a fresh
     /// `Engine`.
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Components compiled so far. A test hook: a restart or a sandbox
+    /// reuses its supervisor's compiled component and doesn't count.
+    component_compiles: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Round-7 F1: error returned by
@@ -420,7 +424,23 @@ impl Engine {
             reaper_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             started_at: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            component_compiles: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// How many times this engine has compiled a plugin component.
+    /// A supervisor compiles once; its restarts and its script
+    /// sandboxes reuse that (ADR-0001). For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn component_compile_count(&self) -> u64 {
+        self.component_compiles
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_component_compile(&self) {
+        self.component_compiles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// C6: HMAC secret for `plugins:ui` tickets. See
@@ -1234,6 +1254,28 @@ impl Engine {
             while engine.sandboxes.has_children(&instance_id) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
+            // A sandbox its parent removed takes its storage and
+            // bookkeeping with it. Its `Store` is gone (terminal), and
+            // its id can't be started again until the entry below is
+            // removed, so nothing writes under it meanwhile.
+            if let Some(slot) = &slot
+                && engine.sandboxes.is_retired(slot)
+            {
+                // A sandbox removed before it finished loading has no
+                // installation of its own yet; it runs its parent's.
+                let installation = reaper_handle
+                    .installation_uuid()
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        engine
+                            .instances
+                            .get(&slot.parent)
+                            .and_then(|parent| parent.installation_uuid().map(str::to_owned))
+                    });
+                engine
+                    .retire_sandbox_instance(&instance_id, installation.as_deref())
+                    .await;
+            }
             engine.instances.unregister(&instance_id, &plugin_id);
             // A sandbox leaves its parent's registry last: until then
             // (it's terminal, so not live) a same-`local-id` start
@@ -1244,6 +1286,7 @@ impl Engine {
                     .sandboxes
                     .remove_if_current(&slot.parent, &slot.local_id, slot.generation);
             }
+            reaper_handle.mark_reaped();
             if let Ok(mut guard) = reapers.lock()
                 && let std::collections::hash_map::Entry::Occupied(entry) =
                     guard.entry(reaper_key_for_task)
@@ -1291,6 +1334,45 @@ impl Engine {
             self.spawn_tracked_reaper(&handle, instance_id, plugin_id.to_owned(), Some(slot));
             handle
         })
+    }
+
+    /// ADR-0001: release what a removed script sandbox leaves behind
+    /// under its instance id: its KV and blob storage (purged when the
+    /// parent stops it with `stop-sandbox`, rather than counted against
+    /// a per-plugin budget), its device-state generation and its
+    /// publish rate limiter. A failed purge is logged; the rows then
+    /// stay until the plugin is uninstalled.
+    async fn retire_sandbox_instance(&self, instance_id: &str, installation_uuid: Option<&str>) {
+        self.device_state.forget_instance(instance_id);
+        self.events.forget_instance(instance_id);
+        // No installation: neither the sandbox nor its parent ever
+        // loaded, so it stored nothing.
+        let Some(installation_uuid) = installation_uuid else {
+            return;
+        };
+        let kv = Arc::clone(&self.kv);
+        let blobs = Arc::clone(&self.blobs);
+        let uuid = installation_uuid.to_owned();
+        let id = instance_id.to_owned();
+        let purged = tokio::task::spawn_blocking(move || {
+            (
+                kv.purge_instance(&uuid, &id),
+                blobs.purge_instance(&uuid, &id),
+            )
+        })
+        .await;
+        match purged {
+            Ok((Ok(_), Ok(_))) => {
+                tracing::info!(instance_id, "removed script sandbox's storage purged");
+            }
+            Ok((kv, blobs)) => tracing::error!(
+                instance_id,
+                kv_error = ?kv.err(),
+                blob_error = ?blobs.err(),
+                "purging a removed script sandbox's storage failed; it stays until uninstall",
+            ),
+            Err(join) => tracing::error!(instance_id, error = %join, "storage purge task failed"),
+        }
     }
 
     /// ADR-0001: the live script sandboxes, per parent instance.

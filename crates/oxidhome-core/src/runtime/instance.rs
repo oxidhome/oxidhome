@@ -4,8 +4,8 @@
 //! carries its declared identity, capabilities, and resolved
 //! per-instance config.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
 use oxidhome_manifest::{InstanceConfig, PluginManifest, merge};
@@ -22,8 +22,102 @@ use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, Serv
 use crate::{MIN_SUPPORTED_SDK_VERSION, OXIDHOME_SDK_VERSION};
 
 use super::Engine;
+use super::sandbox::SandboxRole;
 use super::state::PluginState;
 use super::watchdog;
+
+/// A supervisor's compiled component, kept for its whole lifetime so a
+/// restart (and, for a scripting plugin, every sandbox it starts and
+/// their restarts) instantiates it again instead of compiling the
+/// `.wasm` again (ADR-0001).
+///
+/// Filled by the supervisor's first successful load. A supervisor's
+/// manifest is pinned for its lifetime, and so are the bytes this
+/// holds: a sandbox runs exactly the code its parent runs, even in a
+/// dev load whose `.wasm` was rebuilt since. A reinstall or upgrade
+/// means a new supervisor (stop, uninstall, install, start) and so a
+/// new cache; a load that resolves a different installation than the
+/// one the component was compiled under is refused rather than served
+/// from here.
+#[derive(Debug, Default)]
+pub(crate) struct ComponentCache {
+    slot: Mutex<Option<Arc<CachedComponent>>>,
+}
+
+/// The pinned bytes and compiled component in a [`ComponentCache`].
+pub(crate) struct CachedComponent {
+    wasm_path: PathBuf,
+    wasm_bytes: Arc<[u8]>,
+    component: Component,
+    /// The installation the component was first loaded under.
+    installation_uuid: Arc<str>,
+}
+
+impl std::fmt::Debug for CachedComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedComponent")
+            .field("wasm_path", &self.wasm_path)
+            .field("installation_uuid", &self.installation_uuid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ComponentCache {
+    fn get(&self) -> Option<Arc<CachedComponent>> {
+        self.slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Keep the first component; a later fill (two sandboxes of a
+    /// parent whose cache was still empty) is dropped.
+    fn fill(&self, cached: CachedComponent) {
+        self.slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| Arc::new(cached));
+    }
+}
+
+/// What a supervised load adds to a plain one.
+#[derive(Default)]
+pub(crate) struct SupervisedLoad<'a> {
+    /// The supervisor's component cache, if it keeps one.
+    pub(crate) cache: Option<&'a ComponentCache>,
+    /// ADR-0001: the instance's place in the sandbox model, set on its
+    /// state before the component is instantiated.
+    pub(crate) sandbox: Option<SandboxRole>,
+}
+
+/// The component cache handed to `instantiate`, and what it already
+/// holds.
+#[derive(Default, Clone, Copy)]
+struct Compiled<'a> {
+    cache: Option<&'a ComponentCache>,
+    cached: Option<&'a CachedComponent>,
+}
+
+/// Item 8 of the ADR-0001 follow-ups: the embedder entry points
+/// (`PluginInstance::load*`, `supervise*`) don't go through the
+/// instance registry, so they check here that `instance_id` is one an
+/// operator may use and that no registered instance runs under it.
+pub(crate) fn check_embedder_instance_id(engine: &Engine, instance_id: &str) -> anyhow::Result<()> {
+    if !super::is_operator_instance_id(instance_id) {
+        return Err(anyhow!(
+            "instance-id `{}` is not permitted (unsafe, or contains `{}`, which is reserved \
+             for script sandboxes)",
+            crate::auth::invocation::audit_cap(instance_id),
+            super::SANDBOX_SEPARATOR,
+        ));
+    }
+    if engine.instances().get(instance_id).is_some() {
+        return Err(anyhow!(
+            "instance-id `{instance_id}` belongs to a running supervised instance"
+        ));
+    }
+    Ok(())
+}
 
 /// C1b review F1: guard for the installation-UUID lookup in
 /// `PluginInstance::instantiate`. Returns `true` when the loaded
@@ -251,13 +345,16 @@ impl PluginInstance {
         overrides: Option<&toml::Value>,
         mode: LoadMode,
     ) -> anyhow::Result<Self> {
-        Self::load_with_optional_pinned_manifest(
+        let instance_id = instance_id.into();
+        check_embedder_instance_id(engine, &instance_id)?;
+        Self::load_supervised(
             engine,
             plugin_dir,
             instance_id,
             overrides,
             mode,
             None,
+            SupervisedLoad::default(),
         )
         .await
     }
@@ -285,27 +382,34 @@ impl PluginInstance {
         manifest_bytes: Vec<u8>,
         manifest: PluginManifest,
     ) -> anyhow::Result<Self> {
-        Self::load_with_optional_pinned_manifest(
+        let instance_id = instance_id.into();
+        check_embedder_instance_id(engine, &instance_id)?;
+        Self::load_supervised(
             engine,
             plugin_dir,
             instance_id,
             overrides,
             mode,
             Some((manifest_bytes, manifest)),
+            SupervisedLoad::default(),
         )
         .await
     }
 
-    async fn load_with_optional_pinned_manifest(
+    /// The load behind every entry point. The supervisor calls it
+    /// directly: its instance id is registered (so the embedder check
+    /// would refuse it), and it brings its component cache and sandbox
+    /// role.
+    pub(crate) async fn load_supervised(
         engine: &Engine,
         plugin_dir: &Path,
-        instance_id: impl Into<String>,
+        instance_id: String,
         overrides: Option<&toml::Value>,
         mode: LoadMode,
         pinned: Option<(Vec<u8>, PluginManifest)>,
+        supervised: SupervisedLoad<'_>,
     ) -> anyhow::Result<Self> {
         let plugin_dir = plugin_dir.to_path_buf();
-        let instance_id = instance_id.into();
         // `plugin_id = Empty` declares the field up-front so it
         // appears in the span's metadata; we fill it in below once
         // the manifest parses. The Phase-5c log layer's `on_record`
@@ -410,17 +514,25 @@ impl PluginInstance {
                 )
             })?;
 
-            let wasm_path = resolve_wasm_path(&plugin_dir, &manifest.runtime.wasm)?;
-            // C5 review F3 round-4 F2: read wasm bytes into
-            // memory once, then feed those same bytes to BOTH
-            // the digest verification and wasmtime's
-            // `Component::from_binary`. That closes the TOCTOU
-            // window where an on-disk rewrite between the
-            // digest walk and `Component::from_file` could sneak
-            // modified code past the check.
-            let wasm_bytes = tokio::fs::read(&wasm_path)
-                .await
-                .with_context(|| format!("reading wasm component from {}", wasm_path.display()))?;
+            // ADR-0001 follow-up: a supervisor that already compiled
+            // the component reuses its bytes and compiled form.
+            let cached = supervised.cache.and_then(ComponentCache::get);
+            let (wasm_path, wasm_bytes) = if let Some(cached) = &cached {
+                (cached.wasm_path.clone(), Arc::clone(&cached.wasm_bytes))
+            } else {
+                let wasm_path = resolve_wasm_path(&plugin_dir, &manifest.runtime.wasm)?;
+                // C5 review F3 round-4 F2: read wasm bytes into
+                // memory once, then feed those same bytes to BOTH
+                // the digest verification and wasmtime's
+                // `Component::from_binary`. That closes the TOCTOU
+                // window where an on-disk rewrite between the
+                // digest walk and `Component::from_file` could sneak
+                // modified code past the check.
+                let wasm_bytes = tokio::fs::read(&wasm_path).await.with_context(|| {
+                    format!("reading wasm component from {}", wasm_path.display())
+                })?;
+                (wasm_path, Arc::<[u8]>::from(wasm_bytes))
+            };
             let manifest = Arc::new(manifest);
             Self::instantiate(
                 engine,
@@ -432,6 +544,11 @@ impl PluginInstance {
                 manifest,
                 config,
                 mode,
+                Compiled {
+                    cache: supervised.cache,
+                    cached: cached.as_deref(),
+                },
+                supervised.sandbox,
             )
             .await
         }
@@ -456,6 +573,8 @@ impl PluginInstance {
         manifest: PluginManifest,
         overrides: Option<&toml::Value>,
     ) -> anyhow::Result<Self> {
+        let instance_id = instance_id.into();
+        check_embedder_instance_id(engine, &instance_id)?;
         let core_sdk = OXIDHOME_SDK_VERSION
             .parse::<Version>()
             .expect("OXIDHOME_SDK_VERSION is a valid semver string");
@@ -481,9 +600,10 @@ impl PluginInstance {
         // Test path: no registry entry, so no digest check runs;
         // pass empty manifest bytes so `instantiate` treats this
         // as a dev-time load.
-        let wasm_bytes = tokio::fs::read(wasm_path)
+        let wasm_bytes: Arc<[u8]> = tokio::fs::read(wasm_path)
             .await
-            .with_context(|| format!("reading wasm from {}", wasm_path.display()))?;
+            .with_context(|| format!("reading wasm from {}", wasm_path.display()))?
+            .into();
         let plugin_dir = wasm_path.parent().unwrap_or(wasm_path).to_path_buf();
         Self::instantiate(
             engine,
@@ -495,6 +615,8 @@ impl PluginInstance {
             Arc::new(manifest),
             config,
             LoadMode::Dev,
+            Compiled::default(),
+            None,
         )
         .await
     }
@@ -514,11 +636,13 @@ impl PluginInstance {
         plugin_dir: &Path,
         wasm_path: &Path,
         manifest_bytes: &[u8],
-        wasm_bytes: &[u8],
+        wasm_bytes: &Arc<[u8]>,
         instance_id: impl Into<String>,
         manifest: Arc<PluginManifest>,
         config: InstanceConfig,
         mode: LoadMode,
+        compiled: Compiled<'_>,
+        sandbox: Option<SandboxRole>,
     ) -> anyhow::Result<Self> {
         // C5 review F3 round-4 F2: instantiate from the same
         // in-memory wasm bytes the digest check will read, not
@@ -527,23 +651,30 @@ impl PluginInstance {
         // `plugin.wasm` between the digest walk and
         // `Component::from_file`.
         let instance_id = instance_id.into();
-        // M1: prove from the binary itself that the component was
-        // built against this host's `oxidhome:plugin` contract. The
-        // manifest's `sdk_version` (checked earlier) is only the
-        // author's claim; this is the authoritative check, and it
-        // runs on the same in-memory bytes that get compiled.
-        super::contract::verify_component(wasm_bytes).with_context(|| {
-            format!(
-                "rejecting plugin {} (instance {}): component {} is incompatible with this host's \
-                 WIT contract",
-                manifest.plugin.id,
-                instance_id,
-                wasm_path.display(),
-            )
-        })?;
-        let component = Component::from_binary(engine.raw(), wasm_bytes)
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("loading component from {}", wasm_path.display()))?;
+        let component = if let Some(cached) = compiled.cached {
+            // Verified and compiled from these same bytes by an
+            // earlier load of this supervisor.
+            cached.component.clone()
+        } else {
+            // M1: prove from the binary itself that the component was
+            // built against this host's `oxidhome:plugin` contract. The
+            // manifest's `sdk_version` (checked earlier) is only the
+            // author's claim; this is the authoritative check, and it
+            // runs on the same in-memory bytes that get compiled.
+            super::contract::verify_component(wasm_bytes).with_context(|| {
+                format!(
+                    "rejecting plugin {} (instance {}): component {} is incompatible with this \
+                     host's WIT contract",
+                    manifest.plugin.id,
+                    instance_id,
+                    wasm_path.display(),
+                )
+            })?;
+            engine.note_component_compile();
+            Component::from_binary(engine.raw(), wasm_bytes)
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("loading component from {}", wasm_path.display()))?
+        };
 
         let mut linker: Linker<PluginState> = Linker::new(engine.raw());
 
@@ -796,6 +927,19 @@ impl PluginInstance {
             }
         };
         let granted_capabilities = effective_grant;
+        // A cached component belongs to the installation it was
+        // compiled under; a different one (a reinstall racing a
+        // restart) gets a fresh supervisor, not these bytes.
+        if let Some(cached) = compiled.cached
+            && cached.installation_uuid != installation_uuid
+        {
+            return Err(anyhow!(
+                "plugin {} is now installation `{installation_uuid}`, but this supervisor \
+                 compiled installation `{}`; stop and start the instance to load it",
+                manifest.plugin.id,
+                cached.installation_uuid,
+            ));
+        }
 
         // Reserve a `kv_usage` row for this instance with the
         // **granted** quota (C5). `register_instance` is
@@ -848,6 +992,22 @@ impl PluginInstance {
         .with_granted_capabilities(granted_capabilities)
         .with_audit_log(engine.audit_log())
         .with_pending_commands(engine.pending_commands());
+        // ADR-0001: the role is in place before any guest code runs,
+        // component start functions included.
+        let mut state = state;
+        state.sandbox = sandbox;
+        // Publish the verified component before any guest code runs,
+        // so a sandbox started from it can't compile other bytes.
+        if compiled.cached.is_none()
+            && let Some(cache) = compiled.cache
+        {
+            cache.fill(CachedComponent {
+                wasm_path: wasm_path.to_path_buf(),
+                wasm_bytes: Arc::clone(wasm_bytes),
+                component: component.clone(),
+                installation_uuid: Arc::clone(&state.installation_uuid),
+            });
+        }
         let mut store = Store::new(engine.raw(), state);
         // C4: install the wasmtime resource limiter so linear-memory
         // grows / table extensions / additional instance/memory/table
@@ -887,12 +1047,6 @@ impl PluginInstance {
     /// in milliseconds instead of the 30 s default.
     pub(crate) fn set_watchdog(&mut self, timeout: std::time::Duration) {
         self.watchdog = timeout;
-    }
-
-    /// ADR-0001: attach this instance's place in the sandbox model.
-    /// The supervisor sets it after every load.
-    pub(crate) fn set_sandbox_role(&mut self, role: super::sandbox::SandboxRole) {
-        self.store.data_mut().sandbox = Some(role);
     }
 
     /// Arm the per-call epoch deadline before a host-driven entry
@@ -969,6 +1123,12 @@ impl PluginInstance {
 
     /// Call the plugin's exported `on-shutdown`. The plugin can't fail this
     /// call by contract; trapping bubbles up as an error.
+    ///
+    /// Bounded by the watchdog deadline in wall-clock time too: the
+    /// epoch watchdog only interrupts guest code, so a hook blocked in
+    /// a host import (a WASI `sleep`, say) is cancelled when the
+    /// deadline passes instead. Either way the call fails and the
+    /// instance must not be entered again.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         let data = self.store.data();
         let span = info_span!(
@@ -976,13 +1136,19 @@ impl PluginInstance {
             instance_id = %data.instance_id,
             plugin_id = %data.manifest.plugin.id,
         );
+        let deadline = self.watchdog;
         async {
             self.arm_watchdog();
-            self.bindings
-                .call_on_shutdown(&mut self.store)
+            match tokio::time::timeout(deadline, self.bindings.call_on_shutdown(&mut self.store))
                 .await
-                .map_err(anyhow::Error::from)
-                .context("invoking plugin shutdown")
+            {
+                Ok(result) => result
+                    .map_err(anyhow::Error::from)
+                    .context("invoking plugin shutdown"),
+                Err(_) => Err(anyhow!(
+                    "plugin shutdown did not return within {deadline:?}; cancelled"
+                )),
+            }
         }
         .instrument(span)
         .await

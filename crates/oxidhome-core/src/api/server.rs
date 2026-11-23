@@ -368,6 +368,12 @@ struct InstanceSummary {
     /// `{"secret": true, "set": …, "value": "***" | null}`, never in
     /// plaintext. `null` until the instance's first successful load.
     config: Option<serde_json::Value>,
+    /// ADR-0001: for a script sandbox, the instance that started it;
+    /// `null` otherwise.
+    parent_instance_id: Option<String>,
+    /// ADR-0001: for a script sandbox, its `local-id` within the
+    /// parent; `null` otherwise.
+    sandbox_local_id: Option<String>,
 }
 
 /// Authenticated `GET /api/v1/instances`. Returns every supervised
@@ -386,6 +392,8 @@ async fn list_instances(
             plugin_id: handle.plugin_id().to_string(),
             state: format!("{:?}", handle.state()),
             config: handle.config_view(),
+            parent_instance_id: handle.parent_instance_id().map(str::to_owned),
+            sandbox_local_id: handle.sandbox_local_id().map(str::to_owned),
         });
     }
     Ok(Json(InstancesBody { instances }))
@@ -1629,6 +1637,14 @@ struct StoppedRow {
 /// running instances of `plugin_id`. Gated on `plugins:stop`.
 /// Returns the list of `instance_id`s actually stopped (empty
 /// if none were running, which is success — idempotent).
+///
+/// Every matching instance is asked to stop at once, and the handler
+/// waits until each has been reaped: out of the instance registry,
+/// and for a scripting plugin's instance, its sandboxes too, so a
+/// follow-up uninstall doesn't see a leftover. The wait is bounded by
+/// [`crate::STOP_WAIT_LIMIT`]; past it the answer is `504` with
+/// `{"error": "stop_timed_out", "stopped": [...], "stopping": [...]}`,
+/// and the `stopping` instances finish stopping in the background.
 async fn stop_plugin_instances(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
@@ -1637,61 +1653,29 @@ async fn stop_plugin_instances(
 ) -> Result<Json<StoppedRow>, PluginLifecycleError> {
     require_scope(&actor, PLUGINS_STOP)?;
     let body = body.map_or_default(|Json(b)| b);
-    let mut stopped = Vec::new();
-    let registry = state.engine.instances();
-    for handle in registry.list() {
-        if handle.plugin_id() != plugin_id {
-            continue;
-        }
-        if let Some(want) = &body.instance_id
-            && handle.instance_id() != want
-        {
-            continue;
-        }
-        let id = handle.instance_id().to_string();
-        if let Err(err) = handle.stop().await {
-            tracing::warn!(
-                instance_id = %id,
-                error = %err,
-                "stop instance failed; continuing with siblings",
-            );
-            continue;
-        }
-        // `stop()` returns when the supervisor acks the shutdown
-        // command. `wait_terminal()` returns when the supervisor
-        // task ends. The InstanceRegistry's reaper task — which
-        // does the actual `unregister` — runs in a *separately*
-        // spawned tokio task that awaits the same `wait_terminal`
-        // we just awaited. So there's a brief window where we've
-        // observed the terminal state but the reaper hasn't run
-        // yet, and a follow-up `DELETE /api/v1/plugins/{id}`
-        // would see the entry and return 409. Poll the registry
-        // for clear — under realistic scheduling the reaper runs
-        // within a few ticks of the wait_terminal completion.
-        let _ = handle.wait_terminal().await;
-        wait_for_registry_clear(&registry, &id).await;
-        stopped.push(id);
+    let handles = state
+        .engine
+        .instances()
+        .list()
+        .into_iter()
+        .filter(|handle| {
+            handle.plugin_id() == plugin_id
+                && body
+                    .instance_id
+                    .as_ref()
+                    .is_none_or(|want| handle.instance_id() == want)
+        })
+        .collect();
+    let report = crate::runtime::stop_and_wait_reaped(handles, crate::STOP_WAIT_LIMIT).await;
+    if !report.still_stopping.is_empty() {
+        return Err(PluginLifecycleError::StopTimedOut {
+            stopped: report.stopped,
+            stopping: report.still_stopping,
+        });
     }
-    Ok(Json(StoppedRow { stopped }))
-}
-
-/// Bounded poll for the instance to leave the registry after its
-/// supervisor reached a terminal state. Under realistic scheduling
-/// the reaper runs within a few ticks; this just guarantees the
-/// API caller sees a consistent post-stop state. 5 s is comfortably
-/// above any plausible reaper-scheduling latency.
-async fn wait_for_registry_clear(registry: &crate::InstanceRegistry, instance_id: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while registry.get(instance_id).is_some() {
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                instance_id = %instance_id,
-                "instance registry didn't clear after 5s — reaper task lagging?",
-            );
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    Ok(Json(StoppedRow {
+        stopped: report.stopped,
+    }))
 }
 
 #[derive(Serialize)]
@@ -1784,6 +1768,12 @@ enum PluginLifecycleError {
     Start(anyhow::Error),
     /// In-memory engines have no plugins root. 503.
     NoPluginsRoot,
+    /// Stop: some instances weren't reaped within
+    /// [`crate::STOP_WAIT_LIMIT`]. 504; they keep stopping.
+    StopTimedOut {
+        stopped: Vec<String>,
+        stopping: Vec<String>,
+    },
 }
 
 impl From<ScopeDenied> for PluginLifecycleError {
@@ -1873,6 +1863,19 @@ impl IntoResponse for PluginLifecycleError {
             Self::NoPluginsRoot => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "no_plugins_root"})),
+            )
+                .into_response(),
+            Self::StopTimedOut { stopped, stopping } => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "stop_timed_out",
+                    "reason": format!(
+                        "instances still stopping after {} s; they finish in the background",
+                        crate::STOP_WAIT_LIMIT.as_secs(),
+                    ),
+                    "stopped": stopped,
+                    "stopping": stopping,
+                })),
             )
                 .into_response(),
         }

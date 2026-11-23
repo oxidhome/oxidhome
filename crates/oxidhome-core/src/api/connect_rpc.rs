@@ -295,6 +295,8 @@ impl oxidhome_proto::connect::oxidhome::v1::InstancesService for OxidHomeInstanc
                 config_json: handle
                     .config_view()
                     .map_or_else(String::new, |v| v.to_string()),
+                parent_instance_id: handle.parent_instance_id().map(str::to_owned),
+                sandbox_local_id: handle.sandbox_local_id().map(str::to_owned),
                 ..Default::default()
             })
             .collect();
@@ -892,32 +894,36 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
     ) -> ServiceResult<impl Encodable<StopPluginResponse> + Send + use<'a>> {
         require_scope_connect(&ctx, PLUGINS_STOP)?;
         let req = request.to_owned_message();
-        let mut stopped_ids = Vec::new();
-        let registry = self.engine.instances();
-        for handle in registry.list() {
-            if handle.plugin_id() != req.plugin_id {
-                continue;
-            }
-            if let Some(want) = &req.instance_id
-                && handle.instance_id() != want
-            {
-                continue;
-            }
-            let id = handle.instance_id().to_string();
-            if let Err(err) = handle.stop().await {
-                tracing::warn!(
-                    instance_id = %id,
-                    error = %err,
-                    "stop instance failed; continuing with siblings",
-                );
-                continue;
-            }
-            let _ = handle.wait_terminal().await;
-            wait_for_registry_clear(&registry, &id).await;
-            stopped_ids.push(id);
+        // Same shape as the JSON handler: stop every match at once and
+        // wait for each to be reaped (sandboxes included), bounded.
+        let handles = self
+            .engine
+            .instances()
+            .list()
+            .into_iter()
+            .filter(|handle| {
+                handle.plugin_id() == req.plugin_id
+                    && req
+                        .instance_id
+                        .as_ref()
+                        .is_none_or(|want| handle.instance_id() == want)
+            })
+            .collect();
+        let report = crate::runtime::stop_and_wait_reaped(handles, crate::STOP_WAIT_LIMIT).await;
+        if !report.still_stopping.is_empty() {
+            return Err(rpc_err(
+                &ctx,
+                ConnectError::deadline_exceeded(format!(
+                    "instances still stopping after {} s (they finish in the background): \
+                     {:?}; stopped: {:?}",
+                    crate::STOP_WAIT_LIMIT.as_secs(),
+                    report.still_stopping,
+                    report.stopped,
+                )),
+            ));
         }
         Response::ok(StopPluginResponse {
-            stopped_ids,
+            stopped_ids: report.stopped,
             ..Default::default()
         })
     }
@@ -1032,25 +1038,6 @@ fn uninstall_error_to_connect(err: UninstallError) -> ConnectError {
             tracing::error!(target: "api.plugins", error = %err, "uninstall persistence error");
             ConnectError::internal("uninstall persistence error")
         }
-    }
-}
-
-/// Bounded poll for the instance registry to clear after a
-/// supervisor reaches terminal — copied from the JSON side for the
-/// same reason (the reaper task lags `wait_terminal`; a follow-up
-/// uninstall would see the ghost). See the JSON `server.rs` for
-/// the full rationale.
-async fn wait_for_registry_clear(registry: &crate::InstanceRegistry, instance_id: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while registry.get(instance_id).is_some() {
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                instance_id = %instance_id,
-                "instance registry didn't clear after 5s — reaper task lagging?",
-            );
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
