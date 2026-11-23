@@ -121,8 +121,24 @@ const SHUTDOWN_REAPER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 /// `SocketAddr` (so `0.0.0.0:7780` and `[::1]:7780` both work).
 const DEFAULT_BIND: &str = "127.0.0.1:7780";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Bound on the runtime shutdown after the mode returns: blocking-pool
+/// work still running (a lifecycle operation, an audit row, a
+/// retention chunk) gets this long to finish before the process exits.
+const SHUTDOWN_RUNTIME_BUDGET: Duration = Duration::from_secs(10);
+
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_mode());
+    // Bounded, unlike dropping the runtime: a blocking task hung on the
+    // disk can't keep the process alive. The state-dir lock, if taken,
+    // is held past this (see `STATE_DIR_LOCK`).
+    runtime.shutdown_timeout(SHUTDOWN_RUNTIME_BUDGET);
+    result
+}
+
+async fn run_mode() -> anyhow::Result<()> {
     // 14.5: `oxidhome mcp-stdio` runs the MCP server over the
     // process's stdin/stdout instead of the HTTP listener.
     // Intended for MCP clients that spawn subprocesses (Claude
@@ -158,9 +174,9 @@ async fn main() -> anyhow::Result<()> {
     // would race on plugin start/uninstall + serve stale reads
     // (SQLite WAL only protects the tables themselves, not the
     // supervisor bookkeeping). The lock is held for the process
-    // lifetime: the normal exit goes through `exit_holding_lock`,
-    // so the OS releases it only with the process.
-    let state_dir_lock = acquire_state_dir_lock(&state_dir)?;
+    // lifetime and released only by the OS when the process
+    // ends (see `STATE_DIR_LOCK`).
+    hold_state_dir_lock(&state_dir)?;
     // Engine first — its `log_store` provides the SQLite tracing
     // layer that the global subscriber composes below.
     //
@@ -218,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
     // boundary; the loader will fail hard if the caller-supplied
     // dir happens to shadow an installed `plugin_id` at a
     // different path.
-    let plugin_handle = if let Some(plugin_dir) = std::env::args_os().nth(1) {
+    let _plugin_handle = if let Some(plugin_dir) = std::env::args_os().nth(1) {
         let plugin_dir = PathBuf::from(plugin_dir);
         let instance_id = plugin_dir
             .file_name()
@@ -337,8 +353,7 @@ async fn main() -> anyhow::Result<()> {
     // running the full shutdown-cleanup sequence, so
     // systemd / runit still see a non-zero exit and can
     // restart.
-    close_engine((engine, log_store, plugin_handle)).await;
-    exit_holding_lock(state_dir_lock, serve_error.map_or(Ok(()), Err))
+    serve_error.map_or(Ok(()), Err)
 }
 
 /// `oxidhome://config` / `GET /api/v1/config`: publish what the HTTP
@@ -380,7 +395,7 @@ fn spawn_retention(engine: &Engine, config: RetentionConfig) -> RetentionTasks {
 /// Stop retention: a chunk still waiting for the writer is cancelled,
 /// one already running is waited out. Bounded by
 /// [`SHUTDOWN_FLUSH_BUDGET`] so a chunk hung on the disk can't wedge
-/// shutdown; [`exit_holding_lock`] covers that chunk.
+/// shutdown; [`STATE_DIR_LOCK`] covers that chunk.
 async fn stop_retention(tasks: RetentionTasks) {
     if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, tasks.shutdown())
         .await
@@ -412,41 +427,24 @@ async fn drain_state_read_audit(engine: &Engine) {
     }
 }
 
-/// Drop the engine handles so the database closes normally (final WAL
-/// checkpoint) before [`exit_holding_lock`], on the blocking pool and
-/// within [`SHUTDOWN_FLUSH_BUDGET`]: a close stuck on the disk is left
-/// to the process exit instead of holding it.
-async fn close_engine(parts: impl Send + 'static) {
-    let close = tokio::task::spawn_blocking(move || drop(parts));
-    if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, close)
-        .await
-        .is_err()
-    {
-        tracing::warn!("closing the database did not finish within the shutdown budget");
-    }
-}
+/// The exclusive state-dir lock of a long-running mode. A static is
+/// never dropped: the lock stays held until the operating system closes
+/// it with the process, after [`main`] shut the runtime down and every
+/// thread is gone. Releasing it earlier would let a write still running
+/// on another thread (a retention chunk or an orphaned H3 mirror write
+/// stuck on a hung disk, an audit row, a lifecycle operation, the
+/// checkpointer) touch the database after another process (a restarted
+/// daemon, `oxidhome restore`) took the lock.
+static STATE_DIR_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
-/// End the process with the state-dir lock still held.
-///
-/// Returning from `main` would drop the lock first and only then tear
-/// the runtime down, so a write still running on another thread (a
-/// retention chunk or an orphaned H3 mirror write stuck on a hung
-/// disk, a deny-audit row, the checkpointer, the last connection's
-/// WAL checkpoint on close) could touch the database after another
-/// process (a restarted daemon, `oxidhome restore`) took the lock.
-/// `process::exit` runs no destructors: the lock file stays locked
-/// until the operating system closes it with the process, after every
-/// thread of it is gone.
-fn exit_holding_lock(lock: std::fs::File, result: anyhow::Result<()>) -> ! {
-    std::mem::forget(lock);
-    let code = match result {
-        Ok(()) => 0,
-        Err(err) => {
-            eprintln!("Error: {err:?}");
-            1
-        }
-    };
-    std::process::exit(code)
+/// Take the state-dir lock and hold it for the rest of the process
+/// (see [`STATE_DIR_LOCK`]).
+fn hold_state_dir_lock(state_dir: &std::path::Path) -> anyhow::Result<()> {
+    let lock = acquire_state_dir_lock(state_dir)?;
+    if STATE_DIR_LOCK.set(lock).is_err() {
+        anyhow::bail!("state-dir lock taken twice");
+    }
+    Ok(())
 }
 
 /// M4: `oxidhome recover-admin-token [--revoke-all]`. Offline only —
@@ -762,8 +760,8 @@ async fn run_stdio() -> anyhow::Result<()> {
     let state_dir = resolve_state_dir()?;
     let retention = RetentionConfig::from_env()?;
     // Round-1 P1 on PR #143: exclusive lock, held for the
-    // process lifetime (see `exit_holding_lock`).
-    let state_dir_lock = acquire_state_dir_lock(&state_dir)?;
+    // process lifetime (see `STATE_DIR_LOCK`).
+    hold_state_dir_lock(&state_dir)?;
     let engine = Engine::with_state_dir(&state_dir).with_context(|| {
         format!(
             "opening engine state at {} — set $OXIDHOME_STATE_DIR to override",
@@ -846,11 +844,7 @@ async fn run_stdio() -> anyhow::Result<()> {
 
     // Propagate the serve error AFTER cleanup so cleanup still
     // runs on a mid-session transport failure.
-    close_engine((engine, log_store)).await;
-    exit_holding_lock(
-        state_dir_lock,
-        serve_result.context("MCP stdio session failed"),
-    )
+    serve_result.context("MCP stdio session failed")
 }
 
 fn init_tracing(engine: &Engine) {

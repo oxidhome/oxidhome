@@ -294,7 +294,10 @@ impl AuditLog {
     ///   resolution row (same `call_id` and `command_id`) hasn't been
     ///   written yet, and a `COMMAND` row while its `accepted` row is
     ///   still there (so the pair goes accepted-first, even when a
-    ///   clock rollback made the resolution look older).
+    ///   clock rollback made the resolution look older), or while a
+    ///   pending row of this process shares its `call_id` (a command
+    ///   that resolved before its request was finalized as
+    ///   `accepted`).
     ///
     /// Kept rows still count toward `max_rows`: the limit picks the
     /// newest rows by id, and kept rows older than that are kept on
@@ -697,7 +700,8 @@ const AUDIT_RETENTION_DUE: &str = "\
         AND r.method = 'COMMAND' AND r.command_id = audit_event.command_id)) \
     AND NOT (method = 'COMMAND' AND EXISTS ( \
         SELECT 1 FROM audit_event AS a WHERE a.call_id = audit_event.call_id \
-        AND a.command_outcome = 'accepted' AND a.command_id = audit_event.command_id))";
+        AND ((a.command_outcome = 'accepted' AND a.command_id = audit_event.command_id) \
+        OR (a.finalized_ms IS NULL AND a.id > ?3))))";
 
 impl crate::state::retention::RetentionTarget for AuditLog {
     type Plan = crate::state::retention::IdWindowPlan;

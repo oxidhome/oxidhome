@@ -986,21 +986,26 @@ pub fn invalidate_cursors_after_restore(conn: &rusqlite::Connection) -> rusqlite
             // the integrity check and the boot recovers from them, so
             // the restore must not fail on them either.
             |row| {
-                use rusqlite::types::Value;
-                let int = |v: Value| match v {
-                    Value::Integer(n) => n,
-                    _ => 0,
+                use rusqlite::types::ValueRef;
+                let int = |i: usize| -> rusqlite::Result<i64> {
+                    Ok(match row.get_ref(i)? {
+                        ValueRef::Integer(n) => n,
+                        _ => 0,
+                    })
                 };
-                let text = |v: Value| match v {
-                    Value::Text(s) => Some(s),
-                    _ => None,
+                // Invalid UTF-8 counts as undecodable, not as an error.
+                let text = |i: usize| -> rusqlite::Result<Option<String>> {
+                    Ok(match row.get_ref(i)? {
+                        ValueRef::Text(t) => std::str::from_utf8(t).ok().map(str::to_owned),
+                        _ => None,
+                    })
                 };
                 Ok((
-                    int(row.get(0)?),
-                    int(row.get(1)?),
-                    int(row.get(2)?),
-                    text(row.get(3)?),
-                    text(row.get(4)?).unwrap_or_default(),
+                    int(0)?,
+                    int(1)?,
+                    int(2)?,
+                    text(3)?,
+                    text(4)?.unwrap_or_default(),
                 ))
             },
         )

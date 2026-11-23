@@ -682,6 +682,7 @@ mod tests {
     /// resolution row lands. Earlier processes' pending rows go by age
     /// only.
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one scenario, step by step")]
     fn audit_keeps_rows_unfinished_writes_need() {
         let dir = std::env::temp_dir().join(format!(
             "oxidhome-audit-retention-{}-{}",
@@ -780,6 +781,27 @@ mod tests {
         run_pass_blocking(&*log, &policy(Some(10_000), None), 100_000).expect("pass");
         let kept = ids(&db, "audit_event");
         assert!(kept.contains(&as_i64(early_resolution)), "{kept:?}");
+        // A command that resolved before its request was finalized:
+        // the resolution waits while the request is still pending.
+        log.record_intent(&row("POST", Some("call-d"), None))
+            .expect("intent");
+        let fast = log
+            .record_completed(&row(
+                "COMMAND",
+                Some("call-d"),
+                Some(("cmd-d", "completed")),
+            ))
+            .expect("row");
+        log.record_completed(&row("GET", None, None)).expect("row");
+        db.write(|c| {
+            c.execute(
+                "UPDATE audit_event SET intent_ms = 1000 WHERE id = ?1",
+                [as_i64(fast)],
+            )
+        })
+        .expect("age");
+        run_pass_blocking(&*log, &policy(Some(10_000), Some(1)), 100_000).expect("pass");
+        assert!(ids(&db, "audit_event").contains(&as_i64(fast)));
         // Once the accepted command is resolved, its row can go, and
         // then its resolution.
         log.record_completed(&row(
