@@ -593,16 +593,19 @@ pub const MAX_PLUGIN_MESSAGE_BYTES: usize = 4 * 1024;
 
 /// Cap plugin-supplied text at [`MAX_PLUGIN_MESSAGE_BYTES`] before any
 /// transport copies or encodes it.
-pub(crate) fn cap_plugin_text(mut m: String) -> String {
-    if m.len() > MAX_PLUGIN_MESSAGE_BYTES {
-        let mut cap = MAX_PLUGIN_MESSAGE_BYTES;
-        while !m.is_char_boundary(cap) {
-            cap -= 1;
-        }
-        m.truncate(cap);
-        m.push_str("… [truncated by host]");
+pub(crate) fn cap_plugin_text(m: String) -> String {
+    if m.len() <= MAX_PLUGIN_MESSAGE_BYTES {
+        return m;
     }
-    m
+    let mut cap = MAX_PLUGIN_MESSAGE_BYTES;
+    while !m.is_char_boundary(cap) {
+        cap -= 1;
+    }
+    // A fresh allocation, so the guest's oversized buffer is freed now.
+    let mut out = String::with_capacity(cap + 32);
+    out.push_str(&m[..cap]);
+    out.push_str("… [truncated by host]");
+    out
 }
 
 fn cap_wit_error(error: WitError) -> WitError {

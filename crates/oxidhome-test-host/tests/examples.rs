@@ -824,10 +824,12 @@ async fn command_accepted_then_completed() {
         "{report:?}"
     );
     let pending = switch.pending_commands();
-    eventually("the tick to complete the command", || pending.is_empty()).await;
-    // The fixture publishes no event: the projection changed because
-    // the host projected the completion's `ok-with-state`.
-    assert_eq!(projected_switch(&host, &device), Some(true));
+    // The fixture publishes no event: the projection changes because
+    // the host projects the completion's `ok-with-state`.
+    eventually("the tick to complete and project the command", || {
+        pending.is_empty() && projected_switch(&host, &device) == Some(true)
+    })
+    .await;
     switch.stop().await.unwrap();
 }
 

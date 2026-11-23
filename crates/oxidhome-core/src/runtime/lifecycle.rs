@@ -1340,8 +1340,9 @@ async fn run_execute(
     }
     let command_id = cmd.id.clone();
     let device_id = device.clone();
-    let root_ctx = ctx.clone();
     let ctx = ctx.entering(instance_id);
+    // For a late-result audit row: keeps the executing instance.
+    let entered_ctx = ctx.clone();
     let result = invocation::CURRENT
         .scope(ctx, instance.execute_command(device, cmd))
         .await;
@@ -1379,7 +1380,7 @@ async fn run_execute(
         // records the terminal outcome.
         super::command::record_resolution(
             instance.audit_log().as_ref(),
-            &root_ctx,
+            &entered_ctx,
             &command_id,
             &device_id,
             &outcome,
