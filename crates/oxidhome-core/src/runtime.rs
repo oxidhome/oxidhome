@@ -14,6 +14,7 @@
 // surface is everything else accessed via `pub(crate)` inside the
 // module.
 pub mod command;
+pub mod command_journal;
 pub mod contract;
 pub mod dispatcher;
 mod instance;
@@ -26,7 +27,7 @@ mod state;
 mod state_read;
 pub(crate) mod watchdog;
 
-pub use command::{CommandOutcome, CommandReport, PendingCommands};
+pub use command::{CommandOutcome, CommandReport, ExpiryReason, PendingCommands};
 pub use instance::{InitError, LoadMode, PluginInstance, read_manifest_with_bytes};
 pub use lifecycle::{
     InstanceHandle, InstanceState, STOP_GRACE, STOP_WAIT_LIMIT, StopWaitReport, SupervisorTuning,
@@ -398,9 +399,27 @@ impl Engine {
         // so reads are correct before owners republish.
         let device_state = DeviceStateStore::open_persistent(Arc::clone(&db))
             .context("restoring the device-state projection")?;
+        // H5: resolve the `accepted` commands a previous process left
+        // pending, before any plugin runs.
+        // Like the device-state restore, a failure stops the boot:
+        // the ledger must hold a final row for every command before
+        // new ones are accepted.
+        let resolved = command_journal::reconcile(&db)
+            .context("resolving the commands left pending by the previous run")?;
+        if resolved > 0 {
+            tracing::warn!(
+                target: "host.command",
+                resolved,
+                "resolved accepted commands left pending by the previous run as outcome_unknown",
+            );
+        }
+        let pending_commands = Arc::new(
+            PendingCommands::new(Some(Arc::clone(&audit_log)))
+                .context("starting the command journal")?,
+        );
         Ok(Self {
             inner,
-            pending_commands: Arc::new(PendingCommands::new(Some(Arc::clone(&audit_log)))),
+            pending_commands,
             devices: Arc::new(DeviceRegistry::new()),
             device_state,
             events,
@@ -1390,6 +1409,17 @@ impl Engine {
         self.device_state.close_persistence()
     }
 
+    /// H5: write the command journal's queued `COMMAND` resolution
+    /// rows and pending-command changes, waiting at most `timeout`, and
+    /// stop taking new ones. Called once at shutdown, after every
+    /// supervised instance has stopped (so the `outcome_unknown` rows
+    /// of the commands they still held are included). Blocking; returns
+    /// whether the journal drained.
+    #[must_use]
+    pub fn close_command_journal(&self, timeout: std::time::Duration) -> bool {
+        self.pending_commands.close_journal(timeout)
+    }
+
     /// Post-terminal cleanup for one instance: drop the device and
     /// service registry entries it owns and mark its device-state
     /// projection `Stale`. The supervisor's reaper runs this once an
@@ -1402,7 +1432,7 @@ impl Engine {
         self.services().remove_by_owner(instance_id);
         // H5: no completion can be matched once the instance is gone.
         self.pending_commands
-            .expire_owner(instance_id, "the plugin instance stopped");
+            .expire_owner(instance_id, ExpiryReason::InstanceStopped);
         // H9: device-state entries survive the terminal (unlike
         // `DeviceRegistry` entries, which are reaped) so consumers
         // can still read the last observed values with

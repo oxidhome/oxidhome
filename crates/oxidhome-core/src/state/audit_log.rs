@@ -449,35 +449,50 @@ impl AuditLog {
     /// Forwards any `rusqlite` error.
     pub fn record_completed(&self, entry: &AuditEntry) -> Result<u64, AuditLogError> {
         let now = now_unix_ms();
-        let id = self
-            .db
-            .write(|conn| -> Result<i64, AuditLogError> {
-                conn.execute(
-                    "INSERT INTO audit_event \
-                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome) \
-                     VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                    params![
-                        now,
-                        &entry.token_id,
-                        &entry.actor_kind,
-                        &entry.method,
-                        scrub(&entry.path),
-                        i64::from(entry.status),
-                        &entry.decision,
-                        &entry.required_scope,
-                        &entry.credential_fp,
-                        &entry.execution_outcome,
-                        scrub_opt(entry.domain_error.as_deref()),
-                        &entry.call_id,
-                        scrub_opt(entry.invocation.as_deref()),
-                        &entry.command_id,
-                        &entry.command_outcome,
-                    ],
-                )?;
-                Ok(conn.last_insert_rowid())
-            })?;
+        let id = self.db.write(|conn| -> Result<i64, AuditLogError> {
+            Self::insert_completed_row(conn, now, entry)
+        })?;
         #[allow(clippy::cast_sign_loss)]
         Ok(id as u64)
+    }
+
+    /// The INSERT behind [`Self::record_completed`], on a connection
+    /// (or transaction) the caller already holds, stamped `now`. The
+    /// H5 command journal uses it to commit a resolution row together
+    /// with the delete of its persisted pending command.
+    pub(crate) fn insert_completed_row(
+        conn: &rusqlite::Connection,
+        now: i64,
+        entry: &AuditEntry,
+    ) -> Result<i64, AuditLogError> {
+        conn.execute(
+            "INSERT INTO audit_event \
+             (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome) \
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                now,
+                &entry.token_id,
+                &entry.actor_kind,
+                &entry.method,
+                scrub(&entry.path),
+                i64::from(entry.status),
+                &entry.decision,
+                &entry.required_scope,
+                &entry.credential_fp,
+                &entry.execution_outcome,
+                scrub_opt(entry.domain_error.as_deref()),
+                &entry.call_id,
+                scrub_opt(entry.invocation.as_deref()),
+                &entry.command_id,
+                &entry.command_outcome,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// The shared database the ledger writes to.
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        &self.db
     }
 
     /// Read the ledger. Newest-first by `intent_ms`, capped at

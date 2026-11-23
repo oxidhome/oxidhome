@@ -252,7 +252,10 @@ pub fn resolve_service(
 /// A→…→A cycle, a command the target doesn't declare, or `args`
 /// that violate its `params` schema), [`Error::Internal`] (the
 /// target's reply violates its `returns` schema),
-/// [`Error::Unavailable`] (owner not running or dispatch timed out).
+/// [`Error::Unavailable`] (owner not running, or the call timed out
+/// before the target started it: it did not run and a retry is safe).
+/// A call that times out after the target started it returns
+/// `Ok(CommandResult::Unknown(..))` instead.
 pub fn call_service(
     target: &ServiceId,
     command: &str,

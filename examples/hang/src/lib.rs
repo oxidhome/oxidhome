@@ -10,6 +10,10 @@
 //!   that passes while the plugin is running a command
 //!   (`outcome_unknown`), and for a command that expires in the queue
 //!   behind it (`timed_out`);
+//! - `"service"` — `init` registers a `spinner` service whose `spin`
+//!   command never returns. The same H5 fixture for `call-service`: a
+//!   call whose deadline passes mid-call answers `unknown`, one that
+//!   expires in the queue behind it `unavailable` (it never ran);
 //! - `"sleep"` — `tick` blocks in a WASI `sleep` for an hour. The epoch
 //!   watchdog can't interrupt a guest parked in a host import; the
 //!   fixture for a stop cancelling the call instead;
@@ -22,7 +26,8 @@
 
 use oxidhome_sdk::bindings::oxidhome::plugin::capabilities::CapabilitySpec;
 use oxidhome_sdk::bindings::oxidhome::plugin::devices::{Command, CommandResult};
-use oxidhome_sdk::{Device, Plugin, host};
+use oxidhome_sdk::bindings::oxidhome::plugin::types::KeyValue;
+use oxidhome_sdk::{CommandSpec, Device, Plugin, Service, host};
 
 #[derive(Default)]
 struct Hang;
@@ -61,6 +66,12 @@ impl Plugin for Hang {
                 )
                 .map_err(|e| format!("register-device failed: {e:?}"))?;
             }
+            "service" => {
+                host::register_service(
+                    Service::new("spinner", "spinner").command(CommandSpec::new("spin")),
+                )
+                .map_err(|e| format!("register-service failed: {e:?}"))?;
+            }
             _ => {}
         }
         oxidhome_sdk::tracing::info!("hang ready — will spin on first tick");
@@ -76,6 +87,15 @@ impl Plugin for Hang {
     }
 
     fn execute_command(&mut self, _device: String, _cmd: Command) -> CommandResult {
+        spin();
+    }
+
+    fn execute_service_command(
+        &mut self,
+        _service: String,
+        _command: String,
+        _args: Vec<KeyValue>,
+    ) -> CommandResult {
         spin();
     }
 

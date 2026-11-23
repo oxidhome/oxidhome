@@ -849,6 +849,29 @@ const MIGRATIONS: &[&str] = &[
         writer            TEXT NOT NULL
     );
     ",
+    // 20 — architecture-review H5 / ADR-0003 follow-up: pending
+    // `accepted` device commands survive a daemon restart. One row per
+    // externally-rooted command a plugin answered with `accepted`,
+    // written behind the command path by the engine's command-journal
+    // writer and deleted in the same transaction as the command's
+    // `COMMAND` resolution row. Rows still present at boot are
+    // resolved to `outcome_unknown` (daemon restart, or expiry when
+    // `expires_ms` already passed). The audit linkage columns copy the
+    // request's `audit_event` attribution.
+    "
+    CREATE TABLE pending_command (
+        command_id       TEXT PRIMARY KEY NOT NULL,
+        call_id          TEXT NOT NULL,
+        owner_instance   TEXT NOT NULL,
+        device_id        TEXT NOT NULL,
+        capability       TEXT NOT NULL,
+        created_ms       INTEGER NOT NULL,
+        expires_ms       INTEGER NOT NULL,
+        token_id         TEXT NOT NULL,
+        actor_kind       TEXT NOT NULL,
+        invocation_json  TEXT NOT NULL
+    ) WITHOUT ROWID;
+    ",
 ];
 
 /// File name of the host database inside the state dir.
@@ -1871,6 +1894,8 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 20 (H5): pending commands.
+                    DROP TABLE pending_command;
                     -- 19 (H2): device-state tables.
                     DROP TABLE device_state;
                     DROP TABLE device_state_meta;

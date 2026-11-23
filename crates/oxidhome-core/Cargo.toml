@@ -96,6 +96,10 @@ name = "script_sandboxes"
 path = "tests/script_sandboxes.rs"
 
 [[test]]
+name = "command_outcomes"
+path = "tests/command_outcomes.rs"
+
+[[test]]
 name = "api_skeleton"
 path = "tests/api_skeleton.rs"
 

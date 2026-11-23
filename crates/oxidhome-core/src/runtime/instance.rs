@@ -1154,10 +1154,10 @@ impl PluginInstance {
         .await
     }
 
-    /// H6/H5: the audit ledger this instance records delegated hops
-    /// and command resolutions in, if attached.
-    pub(crate) fn audit_log(&self) -> Option<Arc<crate::state::AuditLog>> {
-        self.store.data().audit_log.clone()
+    /// H5: the engine's pending-command table, which also records the
+    /// `COMMAND` rows of results its callers no longer wait for.
+    pub(crate) fn pending_commands(&self) -> Option<Arc<super::PendingCommands>> {
+        self.store.data().pending_commands.clone()
     }
 
     /// Call the plugin's exported `execute-command` for a device this
