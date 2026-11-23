@@ -1238,8 +1238,8 @@ interface host-sandboxes {
   }
 
   /// Start a sandbox running `source` and return its instance id. The
-  /// call returns once the sandbox's supervisor is spawned; its `init`
-  /// runs afterwards. Starting a live `local-id` again with the same
+  /// call returns once the sandbox's supervisor is spawned and doesn't
+  /// wait for its `init`. Starting a live `local-id` again with the same
   /// source returns the existing instance id.
   ///
   /// Errors: `permission-denied` (`script_sandboxes` is 0 or the caller

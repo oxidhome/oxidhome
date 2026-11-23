@@ -52,8 +52,7 @@ the decision.
   shows the live ones. Inside a sandbox, `current-sandbox()` returns the script's `local-id`, its instance id, the
   parent's instance id and the source, so the component's `init` knows which script to run. In a parent it returns
   `none`.
-- `start-sandbox` returns as soon as the child supervisor is spawned (the child is `Loading`); it doesn't wait for
-  the child's `init`. Calling it again with the same `local-id` and the same source is a no-op that returns the
+- `start-sandbox` returns as soon as the child supervisor is spawned; it doesn't wait for the child's `init`. Calling it again with the same `local-id` and the same source is a no-op that returns the
   same instance id, so a restarted parent can re-adopt its scripts. A different source for a live `local-id` is
   refused (`invalid-argument`): stop the old one first.
 - `stop-sandbox` removes the sandbox from the parent's list at once and stops the child in the background. Until the

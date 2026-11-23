@@ -481,7 +481,9 @@ async fn sandbox_limit_counts_stopping_sandboxes() {
         )
     };
 
-    let svc_a = load(&engine, "a", "hold sleep 3000\n").await;
+    // The longest sleep the example allows, so `a` is still busy well
+    // after the assertions below.
+    let svc_a = load(&engine, "a", "hold sleep 10000\n").await;
     match load_b().await {
         Ok(CommandResult::Err(Error::Unavailable(msg))) => assert!(msg.contains("limit"), "{msg}"),
         other => panic!("expected the limit, got {other:?}"),

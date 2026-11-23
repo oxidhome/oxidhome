@@ -63,8 +63,10 @@ struct ScriptHost {
     role: Option<Role>,
 }
 
-/// The host's `start-sandbox` source limit.
-const MAX_SOURCE_BYTES: usize = 64 * 1024;
+/// The example's script size limit. The host takes up to 64 KiB, but
+/// the manager saves each source as one KV value, which is capped at
+/// 64 KiB after JSON encoding (escapes can double a source's size).
+const MAX_SOURCE_BYTES: usize = 16 * 1024;
 /// The host's limits on a service's commands (`register-service`).
 const MAX_COMMANDS: usize = 64;
 const MAX_COMMAND_NAME: usize = 64;
