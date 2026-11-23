@@ -104,6 +104,31 @@ pub enum TestHostError {
     /// failed.
     #[error("tracking a supervised instance")]
     Supervisor(#[source] Source),
+    /// Reading the audit ledger failed.
+    #[error("reading the audit ledger")]
+    Audit(#[from] oxidhome_core::state::AuditLogError),
+    /// A virtual-clock operation on a host built with
+    /// [`crate::TestHost::new`], which runs on the real clock.
+    #[error(
+        "this test host runs on the real clock; build it with \
+         `TestHost::with_virtual_clock` to move time"
+    )]
+    RealClock,
+    /// The virtual clock didn't settle: a task woken by a timer
+    /// didn't get back to waiting within the harness's real-time
+    /// bound — typically a plugin call that never returns. Move time
+    /// past its watchdog with [`crate::VirtualClock::advance`], which
+    /// doesn't wait.
+    #[error(
+        "the virtual clock did not settle at +{elapsed:?} within {limit:?} of real time \
+         (a task woken by a timer is still busy — a plugin call that never returns?)"
+    )]
+    ClockStalled {
+        /// Virtual time since the clock started.
+        elapsed: std::time::Duration,
+        /// The real-time bound that ran out.
+        limit: std::time::Duration,
+    },
 }
 
 impl TestHostError {

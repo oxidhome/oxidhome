@@ -54,7 +54,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use super::db::Db;
-use super::event_log::now_unix_ms;
+use crate::clock::Clock;
 
 /// One row in the `audit_event` table.
 ///
@@ -271,6 +271,8 @@ pub struct AuditLog {
     /// [`Db::audit_boot_floor`]: a pending row above it was written by
     /// this process and may still be finalized, so retention keeps it.
     boot_floor: i64,
+    /// Stamps `intent_ms` / `finalized_ms` (see [`crate::clock`]).
+    clock: Clock,
 }
 
 impl AuditLog {
@@ -285,7 +287,18 @@ impl AuditLog {
     #[must_use]
     pub fn new(db: Arc<Db>) -> Self {
         let boot_floor = db.audit_boot_floor();
-        Self { db, boot_floor }
+        Self {
+            db,
+            boot_floor,
+            clock: Clock::system(),
+        }
+    }
+
+    /// Stamp rows from `clock` instead of the system clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Spawn the periodic audit retention task on the current tokio
@@ -359,7 +372,7 @@ impl AuditLog {
     }
 
     fn insert_intent(&self, entry: &AuditEntry, durable: bool) -> Result<u64, AuditLogError> {
-        let intent_ms = now_unix_ms();
+        let intent_ms = self.clock.now_unix_ms();
         let id = self.db.write(|conn| -> Result<i64, AuditLogError> {
             if durable {
                 conn.pragma_update(None, "synchronous", "FULL")?;
@@ -458,7 +471,7 @@ impl AuditLog {
         command: Option<(&str, &str)>,
     ) -> Result<(), AuditLogError> {
         let (command_id, command_outcome) = command.unzip();
-        let finalized_ms = now_unix_ms();
+        let finalized_ms = self.clock.now_unix_ms();
         let rows = self.db.write(|conn| -> Result<usize, AuditLogError> {
             #[allow(clippy::cast_possible_wrap)]
             let id_i = id as i64;
@@ -517,7 +530,7 @@ impl AuditLog {
     }
 
     fn insert_completed(&self, entry: &AuditEntry, durable: bool) -> Result<u64, AuditLogError> {
-        let now = now_unix_ms();
+        let now = self.clock.now_unix_ms();
         let id = self.db.write(|conn| -> Result<i64, AuditLogError> {
             if durable {
                 conn.pragma_update(None, "synchronous", "FULL")?;

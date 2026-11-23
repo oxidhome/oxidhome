@@ -342,6 +342,18 @@ impl DeviceStateStore {
     ///
     /// Reading the table, or writing the restored base, failed.
     pub fn open_persistent(db: Arc<Db>) -> anyhow::Result<Arc<Self>> {
+        Self::open_persistent_with_clock(db, &crate::clock::Clock::system())
+    }
+
+    /// [`Self::open_persistent`], stamping times from `clock`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_persistent`].
+    pub fn open_persistent_with_clock(
+        db: Arc<Db>,
+        clock: &crate::clock::Clock,
+    ) -> anyhow::Result<Arc<Self>> {
         let (meta, rows, damaged) = load(&db)?;
         let signal = Arc::new(FlushSignal::default());
         let mut inner = StoreInner {
@@ -399,7 +411,7 @@ impl DeviceStateStore {
             inner.touch(key);
         }
         // Restored values are unconfirmed until the owner republishes.
-        let now = crate::state::event_log::now_unix_ms();
+        let now = clock.now_unix_ms();
         // Flipped here rather than through `stale_where_locked`: that
         // enforces the runtime stale cap, which would evict (and the
         // boot flush delete) persisted slots on a big install. The cap
@@ -433,6 +445,7 @@ impl DeviceStateStore {
                 thread: Mutex::new(None),
                 health: Mutex::new(FlushStatus::default()),
             }),
+            clock: clock.clone(),
         });
         // Persist the base revision and hole before serving anything,
         // at `synchronous = FULL`: a power loss must not roll the

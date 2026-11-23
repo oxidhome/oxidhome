@@ -32,11 +32,12 @@ use std::time::Duration;
 use anyhow::anyhow;
 use oxidhome_manifest::RestartPolicy;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{Instant, Interval, MissedTickBehavior};
+use tokio::time::Instant;
 
 use crate::Engine;
 use crate::auth::SensitiveSet;
 use crate::auth::invocation::{self, InvocationContext};
+use crate::clock::Interval;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::types::{
     DeviceId, Error as WitError, KeyValue, ServiceId,
@@ -1769,14 +1770,14 @@ fn stop_after_cancel(instance: PluginInstance, instance_id: &str) -> LifecycleOu
 fn build_tick_interval(instance: &PluginInstance) -> Option<Interval> {
     instance.manifest().runtime.tick_interval_ms.map(|ms| {
         let period = Duration::from_millis(ms);
-        // `interval_at(now + period, ..)` so the *first* tick lands one
+        let clock = instance.clock();
+        // Starts at `now + period` so the *first* tick lands one
         // cadence after Running, not immediately — `tick_interval_ms`
-        // is the gap between ticks, the first one included.
-        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
-        // A slow tick body must not make the loop "catch up" with a
-        // burst of back-to-back ticks; delay the schedule instead.
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        interval
+        // is the gap between ticks, the first one included. A slow
+        // tick body must not make the loop "catch up" with a burst of
+        // back-to-back ticks: the clock's interval delays the schedule
+        // instead (`MissedTickBehavior::Delay`).
+        clock.tick_interval(clock.instant() + period, period)
     })
 }
 

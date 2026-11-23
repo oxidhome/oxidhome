@@ -401,6 +401,9 @@ pub struct DeviceStateStore {
     /// H2: the database the store flushes to, and its flusher thread.
     /// `None` for [`Self::new`] (in-memory only).
     backing: Option<persist::Backing>,
+    /// Stamps `received_ms` on the store's own transitions (stale
+    /// flips); see [`crate::clock`].
+    clock: crate::clock::Clock,
 }
 
 impl DeviceStateStore {
@@ -409,6 +412,12 @@ impl DeviceStateStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The engine clock this store stamps with. Plugin states built
+    /// on the store read the same clock (see [`crate::clock`]).
+    pub(crate) fn clock(&self) -> &crate::clock::Clock {
+        &self.clock
     }
 
     /// H2: remember which plugin and installation `owner_instance`
@@ -533,7 +542,7 @@ impl DeviceStateStore {
     /// observability / tests.
     pub fn restart_generation(&self, owner_instance: &str) -> (usize, u64) {
         let mut inner = self.inner_write();
-        let received_ms = crate::state::event_log::now_unix_ms();
+        let received_ms = self.clock.now_unix_ms();
         let flipped = Self::stale_where_locked(&mut inner, received_ms, |_, entry| {
             entry.owner_instance == owner_instance && entry.quality == StateQuality::Fresh
         });
@@ -1631,7 +1640,7 @@ impl DeviceStateStore {
     /// the update was applied" contract.
     fn stale_where(&self, predicate: impl Fn(&(DeviceId, String), &DeviceState) -> bool) -> usize {
         let mut inner = self.inner_write();
-        let received_ms = crate::state::event_log::now_unix_ms();
+        let received_ms = self.clock.now_unix_ms();
         Self::stale_where_locked(&mut inner, received_ms, predicate)
     }
 

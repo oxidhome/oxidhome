@@ -18,3 +18,7 @@ does not cap a plugin's CPU
 
 # Plugins read event history through host-events::read-events.
 no history access
+
+# The engine clock seam (oxidhome_core::clock) gives the test host a
+# virtual clock.
+no clock injection

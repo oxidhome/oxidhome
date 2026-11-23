@@ -1,36 +1,62 @@
 //! [`Snapshot`] — a compact, deterministic text rendering of what one
 //! instance left in the host, for whole-state assertions.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::{Duration, UNIX_EPOCH};
+
+use oxidhome_core::state::{AuditEntry, AuditQuery, StateQuality};
+use oxidhome_core::{Clock, CommandOutcome};
 
 use crate::TestHostError;
 use crate::view::InstanceRef;
 use crate::wit::capabilities::{ButtonEvent, CapabilitySpec};
 use crate::wit::events::EventPayload;
 use crate::wit::services::{FieldSpec, ValueKind};
-use crate::wit::types::{KeyValue, Value};
+use crate::wit::types::{Error as WitError, KeyValue, Value};
 
 /// Environment variable that makes [`Snapshot::assert_matches_file`]
 /// (re)write the expected file instead of comparing against it.
 pub const UPDATE_SNAPSHOTS_ENV: &str = "OXIDHOME_UPDATE_SNAPSHOTS";
 
 /// What one instance has in the host — devices, services, events,
-/// storage, blobs — rendered one line per item.
+/// storage, blobs, and on request its device-state projection, the
+/// commands the test sent it, and its audit rows — rendered one line
+/// per item.
 ///
-/// Built by `snapshot()` on [`crate::TestPluginInstance`] or
-/// [`crate::SupervisedInstance`]. Every value the host or the guest
-/// stamps from a real clock (event timestamps, receive times, blob
-/// creation times) or from a process-wide counter (event-log row
-/// ids, `svc-N` service ids, blob ids) is left out, so two runs of
-/// the same test render the same text. Device ids stay in: they are
-/// a hash of the installation, instance id, and local id, so they
-/// are stable as long as the test picks its instance ids (or loads
-/// in the same order).
+/// Built by `snapshot()` / `snapshot_with()` on
+/// [`crate::TestPluginInstance`] or [`crate::SupervisedInstance`].
 ///
-/// The text form ([`fmt::Display`]) is what
-/// [`Self::assert_matches`] compares, e.g.
+/// # Stable and redacted
+///
+/// Two runs of the same test render the same text, and the text is
+/// safe to commit:
+///
+/// - Values stamped from a process-wide counter or a random source
+///   are left out (event-log row ids, `svc-N` service ids, blob ids,
+///   audit row ids) or replaced: a host-minted `cmd-<32 hex>` command
+///   id or `call-<32 hex>` invocation id becomes `<cmd-1>`,
+///   `<call-1>`, … numbered in order of first appearance.
+/// - Times are left out unless [`SnapshotOptions::times`] asks for
+///   them; then they render relative to the host's
+///   [`crate::VirtualClock`] start (`@+1.500s`), or as `@?` on a
+///   real-clock host.
+/// - The instance's secret config values (manifest `type = "secret"`)
+///   are masked as `***` wherever they appear — exact string values
+///   of any length, and inside free text from four characters on —
+///   as are values under credential-like keys (`password=…`,
+///   `api_key: …`), `Bearer` credentials, and `oxh_` API tokens, by
+///   the host's own redaction rules ([`oxidhome_core::redact`]).
+///   [`SnapshotOptions::redact`] adds test-specific replacements.
+///
+/// Device ids stay in: they are a hash of the installation, instance
+/// id, and local id, so they are stable as long as the test picks its
+/// instance ids (or loads in the same order).
+///
+/// The text form ([`fmt::Display`]) is what [`Self::assert_matches`]
+/// compares, e.g.
 ///
 /// ```text
 /// devices:
@@ -42,6 +68,10 @@ pub const UPDATE_SNAPSHOTS_ENV: &str = "OXIDHOME_UPDATE_SNAPSHOTS";
 ///   count = 3
 /// blobs:
 /// ```
+///
+/// The optional sections follow, in the order `device-state`,
+/// `commands`, `audit`, each only when requested. Any text-snapshot
+/// tool works too: compare `snapshot.to_string()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Snapshot {
@@ -56,10 +86,120 @@ pub struct Snapshot {
     pub storage: Vec<String>,
     /// `<name> <size>B <mime or ->`, sorted by name.
     pub blobs: Vec<String>,
+    /// With [`SnapshotOptions::device_state`]: the host's device-state
+    /// projection for this instance's devices, one line per
+    /// capability, `<device-id> <capability> {<field>=<value>, …}`,
+    /// plus ` stale` once the instance stopped (or before its first
+    /// report after a restart). Sorted by device id, then capability.
+    pub device_state: Option<Vec<String>>,
+    /// With [`SnapshotOptions::commands`]: every command the test sent
+    /// this instance through the harness, oldest first,
+    /// `<device-id> <capability>.<action> -> <outcome> <detail>`. The
+    /// outcome is the H5 name (`completed`, `rejected`, `accepted`,
+    /// `timed_out`, `outcome_unknown`); an `accepted` command shows
+    /// `(pending)` while the host still waits for its
+    /// `complete-command`, `(resolved)` after.
+    pub commands: Option<Vec<String>>,
+    /// With [`SnapshotOptions::audit`]: the audit-ledger rows rooted
+    /// at this instance (a refused `get-state` / `read-events`, …),
+    /// oldest first, `<decision> <status> <method> <path>` plus
+    /// `scope=`, `outcome=`, `command=` and `error=` when set.
+    pub audit: Option<Vec<String>>,
 }
 
+/// What [`Snapshot`] captures beyond the default sections, and how.
+/// `SnapshotOptions::default()` is the plain `snapshot()`.
+// Independent on/off switches set through the builder methods.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotOptions {
+    device_state: bool,
+    commands: bool,
+    audit: bool,
+    times: bool,
+    redactions: Vec<(String, String)>,
+}
+
+impl SnapshotOptions {
+    /// Same as [`SnapshotOptions::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every optional section, without times.
+    #[must_use]
+    pub fn all() -> Self {
+        Self::new().device_state().commands().audit()
+    }
+
+    /// Add the `device-state` section.
+    #[must_use]
+    pub fn device_state(mut self) -> Self {
+        self.device_state = true;
+        self
+    }
+
+    /// Add the `commands` section.
+    #[must_use]
+    pub fn commands(mut self) -> Self {
+        self.commands = true;
+        self
+    }
+
+    /// Add the `audit` section. Waits (up to 10 s of real time) for
+    /// audit rows the host writes in the background to land first.
+    #[must_use]
+    pub fn audit(mut self) -> Self {
+        self.audit = true;
+        self
+    }
+
+    /// Stamp events, device-state lines, and audit rows with the host
+    /// time they were recorded at, relative to the virtual clock's
+    /// start: `@+1.500s`. On a real-clock host every stamp is `@?`.
+    #[must_use]
+    pub fn times(mut self) -> Self {
+        self.times = true;
+        self
+    }
+
+    /// Replace every occurrence of `text` with `placeholder`, before
+    /// the built-in redaction runs — for values the test knows are
+    /// unstable or sensitive.
+    #[must_use]
+    pub fn redact(mut self, text: impl Into<String>, placeholder: impl Into<String>) -> Self {
+        let text = text.into();
+        if !text.is_empty() {
+            self.redactions.push((text, placeholder.into()));
+        }
+        self
+    }
+}
+
+/// One command a test sent through the harness, for the `commands`
+/// section.
+#[derive(Debug, Clone)]
+pub(crate) struct CommandRecord {
+    pub(crate) device: String,
+    pub(crate) capability: String,
+    pub(crate) action: String,
+    pub(crate) command_id: String,
+    pub(crate) outcome: CommandOutcome,
+}
+
+/// How long a snapshot waits for background audit writers.
+const AUDIT_FLUSH: Duration = Duration::from_secs(10);
+
+/// Upper bound on the audit rows one snapshot reads.
+const AUDIT_ROWS: usize = 100_000;
+
 impl Snapshot {
-    pub(crate) fn capture(instance: &InstanceRef<'_>) -> Result<Self, TestHostError> {
+    pub(crate) fn capture(
+        instance: &InstanceRef<'_>,
+        options: &SnapshotOptions,
+    ) -> Result<Self, TestHostError> {
+        let stamp = Stamp::new(instance.engine.clock(), options.times);
         let devices = instance
             .devices()
             .iter()
@@ -94,9 +234,10 @@ impl Snapshot {
             .iter()
             .map(|e| {
                 format!(
-                    "{} {}",
+                    "{} {}{}",
                     e.device_id.as_deref().map_or_else(|| "-".to_owned(), tok),
-                    render_payload(&e.payload)
+                    render_payload(&e.payload),
+                    stamp.at(e.received_ms),
                 )
             })
             .collect();
@@ -120,13 +261,64 @@ impl Snapshot {
                 )
             })
             .collect();
-        Ok(Self {
+        let device_state = options
+            .device_state
+            .then(|| render_device_state(instance, &stamp));
+        let commands = options.commands.then(|| render_commands(instance));
+        let audit = if options.audit {
+            Some(render_audit(instance, &stamp)?)
+        } else {
+            None
+        };
+        let mut snapshot = Self {
             devices,
             services,
             events,
             storage,
             blobs,
-        })
+            device_state,
+            commands,
+            audit,
+        };
+        Redactor::new(&options.redactions, instance.secrets).apply(&mut snapshot);
+        Ok(snapshot)
+    }
+
+    fn sections(&self) -> Vec<(&'static str, &Vec<String>)> {
+        let mut sections = vec![
+            ("devices", &self.devices),
+            ("services", &self.services),
+            ("events", &self.events),
+            ("storage", &self.storage),
+            ("blobs", &self.blobs),
+        ];
+        for (name, lines) in [
+            ("device-state", &self.device_state),
+            ("commands", &self.commands),
+            ("audit", &self.audit),
+        ] {
+            if let Some(lines) = lines {
+                sections.push((name, lines));
+            }
+        }
+        sections
+    }
+
+    fn lines_mut(&mut self) -> impl Iterator<Item = &mut String> {
+        [
+            &mut self.devices,
+            &mut self.services,
+            &mut self.events,
+            &mut self.storage,
+            &mut self.blobs,
+        ]
+        .into_iter()
+        .chain(
+            [&mut self.device_state, &mut self.commands, &mut self.audit]
+                .into_iter()
+                .flatten(),
+        )
+        .flat_map(|lines| lines.iter_mut())
     }
 
     /// Panic unless this snapshot renders as `expected`.
@@ -189,13 +381,7 @@ impl Snapshot {
 
 impl fmt::Display for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (name, lines) in [
-            ("devices", &self.devices),
-            ("services", &self.services),
-            ("events", &self.events),
-            ("storage", &self.storage),
-            ("blobs", &self.blobs),
-        ] {
+        for (name, lines) in self.sections() {
             writeln!(f, "{name}:")?;
             for line in lines {
                 writeln!(f, "  {line}")?;
@@ -203,6 +389,258 @@ impl fmt::Display for Snapshot {
         }
         Ok(())
     }
+}
+
+/// Renders host timestamps for [`SnapshotOptions::times`].
+enum Stamp {
+    Off,
+    RealClock,
+    /// The virtual clock's start, in Unix ms.
+    Since(i64),
+}
+
+impl Stamp {
+    fn new(clock: &Clock, on: bool) -> Self {
+        match (on, clock.as_virtual()) {
+            (false, _) => Self::Off,
+            (true, None) => Self::RealClock,
+            (true, Some(v)) => Self::Since(
+                v.start()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+            ),
+        }
+    }
+
+    /// ` @+S.mmms` for a stamp `ms` (Unix ms), or `""` when times are
+    /// off.
+    fn at(&self, ms: i64) -> String {
+        match *self {
+            Self::Off => String::new(),
+            Self::RealClock => " @?".to_owned(),
+            Self::Since(start) => {
+                let rel = ms.saturating_sub(start);
+                let sign = if rel < 0 { '-' } else { '+' };
+                let abs = rel.unsigned_abs();
+                format!(" @{sign}{}.{:03}s", abs / 1000, abs % 1000)
+            }
+        }
+    }
+}
+
+fn render_device_state(instance: &InstanceRef<'_>, stamp: &Stamp) -> Vec<String> {
+    let mut entries: Vec<_> = instance
+        .engine
+        .device_state()
+        .deltas_since(0, usize::MAX)
+        .into_iter()
+        .filter(|e| e.owner_instance == instance.instance_id)
+        .collect();
+    entries.sort_by(|a, b| {
+        (a.device_id.as_str(), a.capability.as_str())
+            .cmp(&(b.device_id.as_str(), b.capability.as_str()))
+    });
+    entries
+        .iter()
+        .map(|e| {
+            let stale = if e.quality == StateQuality::Stale {
+                " stale"
+            } else {
+                ""
+            };
+            format!(
+                "{} {} {}{stale}{}",
+                tok(&e.device_id),
+                tok(&e.capability),
+                render_fields(&e.fields),
+                stamp.at(e.received_ms),
+            )
+        })
+        .collect()
+}
+
+fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
+    let pending = instance.engine.pending_commands();
+    let records = instance
+        .commands
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    records
+        .iter()
+        .map(|r| {
+            let detail = match &r.outcome {
+                CommandOutcome::Accepted if pending.is_pending(&r.command_id) => {
+                    " (pending)".to_owned()
+                }
+                CommandOutcome::Accepted => " (resolved)".to_owned(),
+                CommandOutcome::Completed { state: None } => String::new(),
+                CommandOutcome::Completed { state: Some(state) } => {
+                    format!(" {}", render_fields(state))
+                }
+                CommandOutcome::Rejected { error } => format!(" {}", render_error(error)),
+                CommandOutcome::TimedOut { message } | CommandOutcome::Unknown { message } => {
+                    format!(" {}", esc(message))
+                }
+            };
+            format!(
+                "{} {}.{} -> {}{detail}",
+                tok(&r.device),
+                tok(&r.capability),
+                tok(&r.action),
+                r.outcome.as_str(),
+            )
+        })
+        .collect()
+}
+
+fn render_audit(instance: &InstanceRef<'_>, stamp: &Stamp) -> Result<Vec<String>, TestHostError> {
+    // Rows the host writes off the call path: refused reads (H2) and
+    // command resolutions (H5). Best effort — a row still queued after
+    // the wait shows up in a later snapshot.
+    let _ = instance.engine.drain_state_read_audit(AUDIT_FLUSH);
+    let _ = instance
+        .engine
+        .pending_commands()
+        .flush_journal(AUDIT_FLUSH);
+    let query = AuditQuery {
+        token_id: Some(instance.instance_id.to_owned()),
+        ..AuditQuery::default()
+    };
+    let mut rows = instance.engine.audit_log().query(&query, AUDIT_ROWS)?;
+    rows.sort_by_key(|r| r.id);
+    Ok(rows.iter().map(|r| render_audit_row(r, stamp)).collect())
+}
+
+fn render_audit_row(row: &AuditEntry, stamp: &Stamp) -> String {
+    let mut line = format!(
+        "{} {} {} {}",
+        tok(&row.decision),
+        row.status,
+        tok(&row.method),
+        path_tok(&row.path)
+    );
+    for (key, value) in [
+        ("scope", &row.required_scope),
+        ("outcome", &row.execution_outcome),
+        ("command", &row.command_outcome),
+    ] {
+        if let Some(value) = value {
+            let _ = write!(line, " {key}={}", tok(value));
+        }
+    }
+    if let Some(error) = &row.domain_error {
+        let _ = write!(line, " error={error:?}");
+    }
+    line.push_str(&stamp.at(row.intent_ms));
+    line
+}
+
+fn render_error(error: &WitError) -> String {
+    let (kind, message) = match error {
+        WitError::NotFound(m) => ("not-found", m),
+        WitError::InvalidArgument(m) => ("invalid-argument", m),
+        WitError::PermissionDenied(m) => ("permission-denied", m),
+        WitError::Unavailable(m) => ("unavailable", m),
+        WitError::Internal(m) => ("internal", m),
+    };
+    format!("{kind}({message:?})")
+}
+
+/// The redaction pass over a rendered snapshot (see [`Snapshot`],
+/// "Stable and redacted").
+struct Redactor<'a> {
+    replacements: &'a [(String, String)],
+    secrets: Vec<&'a str>,
+    /// Quoted renderings (`"…"`, as [`render_value`] prints a string)
+    /// of every secret, longest first.
+    quoted: Vec<String>,
+    ids: HashMap<String, String>,
+    counts: HashMap<&'static str, usize>,
+}
+
+/// Host-minted id prefixes replaced by numbered placeholders.
+const MINTED_PREFIXES: [&str; 2] = ["cmd-", "call-"];
+
+/// Hex digits after a minted id's prefix.
+const MINTED_HEX_LEN: usize = 32;
+
+impl<'a> Redactor<'a> {
+    fn new(replacements: &'a [(String, String)], secrets: &'a [String]) -> Self {
+        let mut secrets: Vec<&str> = secrets
+            .iter()
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .collect();
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        let quoted = secrets.iter().map(|s| format!("{s:?}")).collect();
+        Self {
+            replacements,
+            secrets,
+            quoted,
+            ids: HashMap::new(),
+            counts: HashMap::new(),
+        }
+    }
+
+    fn apply(mut self, snapshot: &mut Snapshot) {
+        for line in snapshot.lines_mut() {
+            *line = self.line(line);
+        }
+    }
+
+    fn line(&mut self, line: &str) -> String {
+        let mut text = line.to_owned();
+        for (from, to) in self.replacements {
+            text = text.replace(from.as_str(), to);
+        }
+        // A string value equal to a secret, however short.
+        for quoted in &self.quoted {
+            text = text.replace(quoted.as_str(), "\"***\"");
+        }
+        let text = oxidhome_core::redact::scrub_secret_values(&text, &self.secrets).into_owned();
+        let text = oxidhome_core::redact::scrub_text(&text).into_owned();
+        self.minted_ids(&text)
+    }
+
+    /// Replace host-minted ids with `<cmd-1>`-style placeholders.
+    fn minted_ids(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        'scan: while !rest.is_empty() {
+            for prefix in MINTED_PREFIXES {
+                if let Some(id) = minted_id_at(rest, prefix) {
+                    let next = self.counts.entry(prefix).or_default();
+                    let placeholder = self.ids.entry(id.to_owned()).or_insert_with(|| {
+                        *next += 1;
+                        format!("<{prefix}{next}>")
+                    });
+                    out.push_str(placeholder);
+                    rest = &rest[id.len()..];
+                    continue 'scan;
+                }
+            }
+            let ch = rest.chars().next().expect("non-empty");
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+        out
+    }
+}
+
+/// The minted id `prefix` + 32 lowercase hex digits at the start of
+/// `text`, unless more hex digits follow.
+fn minted_id_at<'t>(text: &'t str, prefix: &str) -> Option<&'t str> {
+    let hex = text.strip_prefix(prefix)?;
+    let is_hex = |b: &u8| b.is_ascii_digit() || (b'a'..=b'f').contains(b);
+    let bytes = hex.as_bytes();
+    if bytes.len() < MINTED_HEX_LEN || !bytes[..MINTED_HEX_LEN].iter().all(is_hex) {
+        return None;
+    }
+    if bytes.get(MINTED_HEX_LEN).is_some_and(is_hex) {
+        return None;
+    }
+    Some(&text[..prefix.len() + MINTED_HEX_LEN])
 }
 
 /// Whether [`UPDATE_SNAPSHOTS_ENV`] asks for snapshot files to be
@@ -241,10 +679,19 @@ pub fn render_value(value: &Value) -> String {
 /// escaped like a Rust string, so no name can imitate the separators
 /// around it and every item stays on one line.
 fn tok(text: &str) -> String {
+    tok_allowing(text, "")
+}
+
+/// [`tok`] for a `/`-separated path (an audit row's).
+fn path_tok(text: &str) -> String {
+    tok_allowing(text, "/")
+}
+
+fn tok_allowing(text: &str, extra: &str) -> String {
     let plain = !text.is_empty()
         && text
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c));
+            .all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c) || extra.contains(c));
     if plain {
         text.to_owned()
     } else {
@@ -435,6 +882,131 @@ mod tests {
             events: vec!["dev-1 state-changed switch {state=true}".into()],
             storage: vec!["count = 3".into()],
             blobs: Vec::new(),
+            device_state: None,
+            commands: None,
+            audit: None,
+        }
+    }
+
+    #[test]
+    fn optional_sections_render_after_the_default_ones() {
+        let mut snap = sample();
+        snap.commands = Some(vec!["dev-1 switch.toggle -> completed".into()]);
+        snap.audit = Some(Vec::new());
+        assert_eq!(
+            snap.to_string(),
+            "devices:\n  dev-1 \"Lamp\" [switch]\nservices:\nevents:\n  \
+             dev-1 state-changed switch {state=true}\nstorage:\n  count = 3\nblobs:\n\
+             commands:\n  dev-1 switch.toggle -> completed\naudit:\n"
+        );
+    }
+
+    #[test]
+    fn redaction_masks_secrets_and_numbers_minted_ids() {
+        let secrets = vec!["hunter2-long".to_owned(), "pw".to_owned()];
+        let extra = vec![("instance-7".to_owned(), "<inst>".to_owned())];
+        let mut snap = sample();
+        let cmd_a = format!("cmd-{}", "ab".repeat(16));
+        let cmd_b = format!("cmd-{}", "01".repeat(16));
+        let call = format!("call-{}", "9f".repeat(16));
+        snap.storage = vec![
+            "short = \"pw\"".into(),
+            "note = \"the key is hunter2-long!\"".into(),
+            "creds = \"password=abc\"".into(),
+            "who = \"instance-7\"".into(),
+        ];
+        snap.audit = Some(vec![
+            format!("allow 200 COMMAND {cmd_a} {call}"),
+            format!("allow 200 COMMAND {cmd_b} {cmd_a}"),
+            // Not a minted id: too short, or followed by more hex.
+            format!("cmd-test cmd-{}0", "ab".repeat(16)),
+        ]);
+        Redactor::new(&extra, &secrets).apply(&mut snap);
+        assert_eq!(
+            snap.storage,
+            [
+                "short = \"***\"",
+                "note = \"the key is ***!\"",
+                "creds = \"password=***\"",
+                "who = \"<inst>\"",
+            ]
+        );
+        assert_eq!(
+            snap.audit.unwrap(),
+            [
+                "allow 200 COMMAND <cmd-1> <call-1>",
+                "allow 200 COMMAND <cmd-2> <cmd-1>",
+                &format!("cmd-test cmd-{}0", "ab".repeat(16)),
+            ]
+        );
+        assert_eq!(minted_id_at("cmd-", "cmd-"), None);
+        assert_eq!(
+            minted_id_at(&format!("cmd-{}", "AB".repeat(16)), "cmd-"),
+            None
+        );
+    }
+
+    #[test]
+    fn options_and_stamps() {
+        let opts = SnapshotOptions::all()
+            .times()
+            .redact("", "x")
+            .redact("a", "b");
+        assert!(opts.device_state && opts.commands && opts.audit && opts.times);
+        assert_eq!(opts.redactions, [("a".to_owned(), "b".to_owned())]);
+        assert!(!SnapshotOptions::new().device_state);
+
+        assert_eq!(Stamp::new(&Clock::system(), false).at(5), "");
+        assert_eq!(Stamp::new(&Clock::system(), true).at(5), " @?");
+        let clock = Clock::from(oxidhome_core::VirtualClock::starting_at(
+            UNIX_EPOCH + Duration::from_secs(10),
+        ));
+        let stamp = Stamp::new(&clock, true);
+        assert_eq!(stamp.at(11_500), " @+1.500s");
+        assert_eq!(stamp.at(10_000), " @+0.000s");
+        assert_eq!(stamp.at(9_000), " @-1.000s");
+    }
+
+    #[test]
+    fn audit_rows_and_errors_render() {
+        let row = AuditEntry {
+            id: 4,
+            intent_ms: 0,
+            finalized_ms: None,
+            token_id: "inst".into(),
+            actor_kind: "plugin".into(),
+            method: "STATE".into(),
+            path: "device.state/inst/dev-1".into(),
+            status: 403,
+            decision: "deny".into(),
+            required_scope: Some("reads_state".into()),
+            execution_outcome: Some("failed".into()),
+            domain_error: Some("not found".into()),
+            credential_fp: None,
+            call_id: None,
+            invocation: None,
+            command_id: None,
+            command_outcome: Some("rejected".into()),
+        };
+        assert_eq!(
+            render_audit_row(&row, &Stamp::Off),
+            "deny 403 STATE device.state/inst/dev-1 scope=reads_state outcome=failed \
+             command=rejected error=\"not found\""
+        );
+        for (error, text) in [
+            (WitError::NotFound("a".into()), "not-found(\"a\")"),
+            (
+                WitError::InvalidArgument("b".into()),
+                "invalid-argument(\"b\")",
+            ),
+            (
+                WitError::PermissionDenied("c".into()),
+                "permission-denied(\"c\")",
+            ),
+            (WitError::Unavailable("d".into()), "unavailable(\"d\")"),
+            (WitError::Internal("e".into()), "internal(\"e\")"),
+        ] {
+            assert_eq!(render_error(&error), text);
         }
     }
 

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use oxidhome_core::runtime::dispatcher::call_service_from_host;
 use oxidhome_core::runtime::{LoadMode, SupervisorTuning, read_manifest_with_bytes};
-use oxidhome_core::{Engine, PluginInstance};
+use oxidhome_core::{Clock, Engine, PluginInstance, VirtualClock};
 use oxidhome_manifest::{CapabilitiesSection, PluginManifest, ServiceGrant};
 
 use crate::TestHostError;
@@ -32,11 +32,18 @@ use crate::wit::types::{Error as WitError, KeyValue};
 ///
 /// - [`Self::load`] — *driven directly*: the test calls each export
 ///   itself ([`TestPluginInstance`]), so nothing happens between calls
-///   and `tick` runs on a virtual clock.
+///   and [`TestPluginInstance::advance`] runs the scheduled ticks.
 /// - [`Self::start`] — *supervised*: the daemon's own supervisor task
-///   runs it ([`SupervisedInstance`]), with real-time ticks, event
+///   runs it ([`SupervisedInstance`]), with scheduled ticks, event
 ///   delivery, crash restarts, the liveness watchdog, and serving
 ///   `call-service` requests from other plugins.
+///
+/// [`Self::new`] runs the host on the real clock. On
+/// [`Self::with_virtual_clock`] time stands still until the test moves
+/// it ([`Self::advance`]): supervised ticks, `accepted`-command TTLs,
+/// the liveness watchdog, the guest's WASI clocks, and the host's
+/// event, device-state, and audit timestamps all follow the
+/// [`VirtualClock`]. See the crate docs, "Time".
 pub struct TestHost {
     // Field order matters: `engine` holds the database open, so it
     // drops before the directory it lives in is removed.
@@ -138,6 +145,8 @@ struct Prepared {
     config: Option<toml::Value>,
     mode: LoadMode,
     supervision: Option<SupervisorTuning>,
+    /// The merged config's secret values, for snapshot redaction.
+    secrets: Vec<String>,
 }
 
 impl TestHost {
@@ -149,9 +158,33 @@ impl TestHost {
     /// be created; [`TestHostError::Engine`] if the engine or its
     /// database can't be set up.
     pub fn new() -> Result<Self, TestHostError> {
+        Self::build(Clock::system())
+    }
+
+    /// Build a host on a fresh [`VirtualClock`], at
+    /// [`VirtualClock::new`]'s fixed start (2026-01-01T00:00:00Z).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn with_virtual_clock() -> Result<Self, TestHostError> {
+        Self::with_clock(VirtualClock::new())
+    }
+
+    /// Build a host on `clock` — e.g. one from
+    /// [`VirtualClock::starting_at`], or one shared with another host.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn with_clock(clock: VirtualClock) -> Result<Self, TestHostError> {
+        Self::build(Clock::from(clock))
+    }
+
+    fn build(clock: Clock) -> Result<Self, TestHostError> {
         let state_dir =
             TempDir::new().map_err(|(path, source)| TestHostError::StateDir { path, source })?;
-        let engine = Engine::with_state_dir(state_dir.path())
+        let engine = Engine::with_state_dir_and_clock(state_dir.path(), clock)
             .map_err(|e| TestHostError::Engine(e.into()))?;
         Ok(Self {
             engine,
@@ -173,6 +206,51 @@ impl TestHost {
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         self.state_dir.path()
+    }
+
+    /// The host's virtual clock; `None` on a [`Self::new`] host.
+    ///
+    /// Its own [`VirtualClock::advance`] moves time and fires what
+    /// falls due without waiting for anything — the way to move time
+    /// while a plugin call is stuck, e.g. past the liveness watchdog.
+    #[must_use]
+    pub fn virtual_clock(&self) -> Option<&VirtualClock> {
+        self.engine.clock().as_virtual()
+    }
+
+    /// Move the virtual clock forward by `by`, one timer at a time:
+    /// each timer that falls due in the span fires at its own
+    /// deadline, and the host waits for the work it triggers —
+    /// a supervised instance's tick, an `accepted` command's expiry —
+    /// before moving on. So with `tick_interval_ms = 1000`, advancing
+    /// 3.5 s runs exactly three supervised ticks.
+    ///
+    /// Directly driven instances aren't ticked here: their ticks run
+    /// when the test calls [`TestPluginInstance::advance`] (which also
+    /// moves this clock) or [`TestPluginInstance::tick`].
+    ///
+    /// # Errors
+    ///
+    /// [`TestHostError::RealClock`] on a [`Self::new`] host;
+    /// [`TestHostError::ClockStalled`] when woken work doesn't finish
+    /// (a hung plugin call: move past it with
+    /// [`VirtualClock::advance`] instead).
+    pub async fn advance(&self, by: Duration) -> Result<(), TestHostError> {
+        let clock = self.virtual_clock().ok_or(TestHostError::RealClock)?;
+        crate::clock::advance_to(clock, clock.elapsed().saturating_add(by)).await
+    }
+
+    /// Without moving time, wait until everything already due has
+    /// fired and the work it triggered has been picked up (every
+    /// supervised instance whose tick fired is waiting for its next
+    /// one again).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::advance`].
+    pub async fn run_until_idle(&self) -> Result<(), TestHostError> {
+        let clock = self.virtual_clock().ok_or(TestHostError::RealClock)?;
+        crate::clock::settle(clock).await
     }
 
     /// Load the plugin in `plugin_dir` with default [`LoadOptions`].
@@ -217,6 +295,7 @@ impl TestHost {
             config,
             mode,
             supervision: _,
+            secrets: _,
         } = self.prepare(plugin_dir, options).await?;
         let inner = PluginInstance::load_with_pinned_manifest(
             &self.engine,
@@ -291,6 +370,7 @@ impl TestHost {
             config,
             mode,
             supervision,
+            secrets,
         } = self.prepare(plugin_dir, options).await?;
         let handle = self
             .engine
@@ -311,6 +391,7 @@ impl TestHost {
             handle,
             reservation.keep(),
             Arc::clone(&self.state_dir),
+            secrets,
         ))
     }
 
@@ -410,6 +491,20 @@ impl TestHost {
                     source: e.into(),
                 })?;
         let plugin_id = manifest.plugin.id.clone();
+        // What the loader will merge; a config it refuses fails the
+        // load (or, supervised, the instance) on its own.
+        let secrets = oxidhome_manifest::merge(
+            &manifest,
+            config
+                .as_ref()
+                .unwrap_or(&toml::Value::Table(toml::Table::new())),
+        )
+        .map_or_default(|merged| {
+            oxidhome_core::redact::config_secrets(&merged)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        });
 
         let mode = match grant {
             None => LoadMode::Dev,
@@ -431,6 +526,7 @@ impl TestHost {
             config,
             mode,
             supervision,
+            secrets,
         })
     }
 }

@@ -475,6 +475,9 @@ pub struct PluginState {
     /// [`Self::network`] (streaming worlds only).
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
     http_hooks: super::network::HttpHooks,
+    /// The engine clock: event receive times and the projection's
+    /// `received_ms` (see [`crate::clock`]).
+    pub(crate) clock: crate::clock::Clock,
 }
 
 impl PluginState {
@@ -500,7 +503,11 @@ impl PluginState {
     ) -> Self {
         let instance_id: InstanceId = instance_id.into();
         let log_rate = Arc::new(std::sync::Mutex::new(LogRateBucket::new()));
-        let wasi = build_wasi(&instance_id, &manifest, &config, &log_rate, None);
+        // The guest's `wasi:clocks` read the engine clock, reached
+        // through the device-state store the engine built on it (a
+        // no-op on the system clock).
+        let clock = device_state.clock().clone();
+        let wasi = build_wasi(&instance_id, &manifest, &config, &log_rate, &clock, None);
         // C5: `PluginState::new` doesn't know about
         // `InstalledPluginRegistry` (it's the low-level
         // constructor used by tests + the loader). Default the
@@ -563,6 +570,7 @@ impl PluginState {
             http_hooks: super::network::HttpHooks::new(Arc::clone(&network)),
             network,
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            clock,
         }
     }
 
@@ -583,6 +591,7 @@ impl PluginState {
             &self.manifest,
             &self.config,
             &self.log_rate,
+            &self.clock,
             Some(&policy),
         );
         self.http_hooks = super::network::HttpHooks::new(Arc::clone(&policy));
@@ -648,6 +657,7 @@ fn build_wasi(
     manifest: &PluginManifest,
     config: &InstanceConfig,
     log_rate: &Arc<std::sync::Mutex<LogRateBucket>>,
+    clock: &crate::clock::Clock,
     network: Option<&Arc<super::network::NetworkPolicy>>,
 ) -> WasiCtx {
     let (stdout, stderr) = super::plugin_stdio::PluginOutput::pair(
@@ -658,6 +668,9 @@ fn build_wasi(
     );
     let mut wasi = WasiCtxBuilder::new();
     wasi.stdout(stdout).stderr(stderr);
+    // Virtual guest clocks apply to every world, the streaming one
+    // included (see `crate::clock`).
+    clock.configure_wasi(&mut wasi);
     if let Some(policy) = network {
         wasi.allow_tcp(true)
             .allow_udp(true)
@@ -1083,7 +1096,7 @@ impl host_devices::Host for PluginState {
             id, would_be_id,
             "stable_device_id must match try_register's derivation"
         );
-        let received_ms = crate::state::event_log::now_unix_ms();
+        let received_ms = self.clock.now_unix_ms();
         // H9 round-10 finding 1: atomically flip every pre-existing
         // `Fresh` entry for this stable device-id to `Stale`, then
         // seed the current registration's `initial_state`. Handles
@@ -1644,7 +1657,7 @@ impl host_events::Host for PluginState {
         let mirrored = self
             .event_log
             .mirror(
-                crate::state::event_log::now_unix_ms(),
+                self.clock.now_unix_ms(),
                 ev.clone(),
                 self.instance_id.clone(),
                 self.manifest.plugin.id.clone(),
@@ -1679,7 +1692,7 @@ impl host_events::Host for PluginState {
             crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
         ) = (ev.device.clone(), &ev.payload)
         {
-            let received = crate::state::event_log::now_unix_ms();
+            let received = self.clock.now_unix_ms();
             if super::schema::needs_snapshot_state(&sc.capability) {
                 // Rechecked under the store lock: the slot may have
                 // gone stale since the check above.

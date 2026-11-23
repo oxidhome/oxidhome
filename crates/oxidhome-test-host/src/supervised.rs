@@ -1,6 +1,6 @@
 //! [`SupervisedInstance`] — a plugin run by the production supervisor.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use oxidhome_core::runtime::PendingCommands;
@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::TestHostError;
 use crate::live::IdLease;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{CommandRecord, Snapshot, SnapshotOptions};
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::Command;
@@ -40,6 +40,8 @@ pub struct SupervisedInstance {
     watcher: Option<JoinHandle<InstanceState>>,
     runtime: tokio::runtime::Handle,
     state_dir: Arc<TempDir>,
+    secrets: Vec<String>,
+    commands: Mutex<Vec<CommandRecord>>,
 }
 
 impl SupervisedInstance {
@@ -48,6 +50,7 @@ impl SupervisedInstance {
         handle: InstanceHandle,
         lease: IdLease,
         state_dir: Arc<TempDir>,
+        secrets: Vec<String>,
     ) -> Self {
         let plugin_id: Arc<str> = handle.plugin_id().into();
         let watcher = {
@@ -78,6 +81,8 @@ impl SupervisedInstance {
             watcher: Some(watcher),
             runtime: tokio::runtime::Handle::current(),
             state_dir,
+            secrets,
+            commands: Mutex::default(),
         }
     }
 
@@ -148,12 +153,19 @@ impl SupervisedInstance {
     /// `outcome_unknown` (and crashes the instance), a refusal is
     /// `rejected`, an `accepted` reply stays pending until the plugin
     /// calls `complete-command`. The host overwrites `command.id`.
+    ///
+    /// Recorded for the snapshot's `commands` section
+    /// ([`crate::SnapshotOptions::commands`]).
     pub async fn send_command(
         &self,
         device: impl Into<DeviceId>,
         command: Command,
     ) -> CommandReport {
-        self.handle.execute_command(device.into(), command).await
+        let device = device.into();
+        let (capability, action) = (command.capability.clone(), command.action.clone());
+        let report = self.handle.execute_command(device.clone(), command).await;
+        self.record(device, capability, action, &report);
+        report
     }
 
     /// [`Self::send_command`] bounded by a deadline `budget` from now,
@@ -169,9 +181,27 @@ impl SupervisedInstance {
     ) -> CommandReport {
         let ctx = oxidhome_core::auth::InvocationContext::host_origin(self.handle.instance_id())
             .with_deadline(Some(tokio::time::Instant::now() + budget));
-        self.handle
-            .execute_command_in(ctx, device.into(), command)
-            .await
+        let device = device.into();
+        let (capability, action) = (command.capability.clone(), command.action.clone());
+        let report = self
+            .handle
+            .execute_command_in(ctx, device.clone(), command)
+            .await;
+        self.record(device, capability, action, &report);
+        report
+    }
+
+    fn record(&self, device: String, capability: String, action: String, report: &CommandReport) {
+        self.commands
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(CommandRecord {
+                device,
+                capability,
+                action,
+                command_id: report.command_id.clone(),
+                outcome: report.outcome.clone(),
+            });
     }
 
     /// The engine's table of accepted-but-unfinished commands (H5), for
@@ -258,13 +288,26 @@ impl SupervisedInstance {
         self.view().read_blob(name)
     }
 
-    /// A [`Snapshot`] of everything this instance has in the host.
+    /// A [`Snapshot`] of everything this instance has in the host:
+    /// the default sections ([`SnapshotOptions::default`]).
     ///
     /// # Errors
     ///
     /// When the event log, storage, or blob index can't be read.
     pub fn snapshot(&self) -> Result<Snapshot, TestHostError> {
-        self.view().snapshot()
+        self.snapshot_with(&SnapshotOptions::default())
+    }
+
+    /// A [`Snapshot`] with the sections and stamps `options` asks for.
+    /// On a virtual-clock host, call [`crate::TestHost::run_until_idle`]
+    /// first if the supervisor may still be working on a tick.
+    ///
+    /// # Errors
+    ///
+    /// When the event log, storage, blob index, or audit ledger can't
+    /// be read.
+    pub fn snapshot_with(&self, options: &SnapshotOptions) -> Result<Snapshot, TestHostError> {
+        self.view().snapshot(options)
     }
 
     fn view(&self) -> InstanceRef<'_> {
@@ -273,6 +316,8 @@ impl SupervisedInstance {
             state_dir: &self.state_dir,
             installation_uuid: self.installation_uuid(),
             instance_id: self.instance_id(),
+            secrets: &self.secrets,
+            commands: &self.commands,
         }
     }
 }

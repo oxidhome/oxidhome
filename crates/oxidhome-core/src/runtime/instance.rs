@@ -1562,6 +1562,12 @@ impl PluginInstance {
     pub fn wake(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.store.data().wake)
     }
+
+    /// The engine clock this instance runs on (see [`crate::clock`]).
+    #[must_use]
+    pub fn clock(&self) -> &crate::clock::Clock {
+        &self.store.data().clock
+    }
 }
 
 /// Join `plugin_dir + manifest.runtime.wasm`, canonicalize both, and
@@ -1703,7 +1709,7 @@ pub(crate) fn project_command_state(
     // reply see the same last-wins vec.
     let canonical = crate::state::DeviceStateStore::canonicalize_snapshot_fields(fields);
     if projection_ok {
-        let received_ms = crate::state::event_log::now_unix_ms();
+        let received_ms = device_state.clock().now_unix_ms();
         device_state.replace_snapshot(
             device.to_owned(),
             owner_instance.to_owned(),
