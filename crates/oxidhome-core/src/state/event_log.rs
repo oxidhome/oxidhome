@@ -48,7 +48,7 @@ pub use mirror::{
 pub use retention::{
     DEFAULT_EVENT_LOG_MAX_AGE, DEFAULT_EVENT_LOG_MAX_ROWS, DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY,
     DEFAULT_EVENT_LOG_RETENTION_INTERVAL, ENV_EVENT_LOG_MAX_ROWS, ENV_EVENT_LOG_RETENTION_DAYS,
-    EventLogRetention,
+    EventLogRetention, RetentionTask,
 };
 
 /// Errors returned by [`EventLog`]. Maps onto the WIT `error` variant

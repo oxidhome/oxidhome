@@ -50,7 +50,7 @@ pub use event_log::{
     DEFAULT_EVENT_LOG_RETENTION_FIRST_DELAY, DEFAULT_EVENT_LOG_RETENTION_INTERVAL,
     ENV_EVENT_LOG_MAX_ROWS, ENV_EVENT_LOG_RETENTION_DAYS, EventLog, EventLogError, EventLogHealth,
     EventLogRetention, EventOrder, EventQuery, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker,
-    HistoricalEvent, MirrorPolicy, TopicMatch,
+    HistoricalEvent, MirrorPolicy, RetentionTask, TopicMatch,
 };
 pub use event_tail::{EventTail, TailError, TailItem};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};

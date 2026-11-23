@@ -2612,25 +2612,36 @@ mod tests {
         assert!(opened_main_path(&mem).is_err(), "`:memory:` has no file");
     }
 
-    /// M6 follow-up: a non-UTF-8 state dir still pins readers to the
-    /// writer's file (the bytes come from `PRAGMA database_list`
-    /// instead of a re-resolve). Skipped where the filesystem refuses
+    /// M6 follow-up: when the file the writer resolves has a
+    /// non-UTF-8 path (`Connection::path()` is `None`), readers are
+    /// still pinned to it: the bytes come from `PRAGMA
+    /// database_list` instead of a re-resolve that a retargeted
+    /// symlink could redirect. Skipped where the filesystem refuses
     /// non-UTF-8 names (APFS).
     #[cfg(unix)]
     #[test]
-    fn readers_follow_the_writer_under_a_non_utf8_state_dir() {
+    fn readers_follow_a_non_utf8_writer_path() {
         use std::os::unix::ffi::OsStrExt as _;
         let base = tempdir_for_test();
-        let dir = base
+        let odd = base
             .path()
-            .join(std::ffi::OsStr::from_bytes(b"state-\xff\xfe"));
-        if std::fs::create_dir(&dir).is_err() {
+            .join(std::ffi::OsStr::from_bytes(b"target-\xff\xfe"));
+        if std::fs::create_dir(&odd).is_err() {
             return;
         }
+        let odd = std::fs::canonicalize(&odd).expect("canonical");
+        let dir = tempdir_for_test();
         let targets = tempdir_for_test();
-        let link = dir.join(DB_FILE_NAME);
-        std::os::unix::fs::symlink(targets.path().join("first.db"), &link).expect("dangling link");
-        let db = Db::open_file(&dir).expect("open");
+        let link = dir.path().join(DB_FILE_NAME);
+        let first = odd.join("first.db");
+        std::os::unix::fs::symlink(&first, &link).expect("dangling link");
+
+        let probe = Connection::open(&link).expect("probe open");
+        assert_eq!(probe.path(), None, "rusqlite can't report a non-UTF-8 path");
+        assert_eq!(opened_main_path(&probe).expect("raw path"), first);
+        drop(probe);
+
+        let db = Db::open_file(dir.path()).expect("open");
         db.write(|c| insert_log_rows(c, 3)).expect("insert");
         drop(Db::open_file(targets.path()).expect("other db"));
         std::fs::remove_file(&link).expect("unlink");

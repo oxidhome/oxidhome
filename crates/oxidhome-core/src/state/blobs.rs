@@ -807,23 +807,24 @@ impl BlobStore {
     /// consistent pair.
     ///
     /// Blob files are immutable once their row commits, and an
-    /// overwrite or delete unlinks the old file only after its
-    /// transaction commits. So once the file is open, the
-    /// descriptor pins exactly the bytes the row described (POSIX
-    /// unlink-while-open; on Windows the unlink fails while the
-    /// file is open and the old file is left for the orphan sweep).
-    /// The one race is between the lookup and the open: the row can
-    /// be read from a pooled snapshot that predates an overwrite
-    /// or delete whose unlink then runs before the open.
+    /// overwrite or delete unlinks the superseded file only after its
+    /// transaction commits (and after it releases the writer). So
+    /// once the file is open, the descriptor pins exactly the bytes
+    /// the row described. The one race is between the lookup and the
+    /// open: a pooled snapshot can predate an overwrite or delete
+    /// whose unlink then runs before the open.
     ///
-    /// The lookup runs on a pooled reader first. If the open finds
-    /// the file gone, the lookup and the open are repeated under
-    /// the writer, which serializes them against every commit +
-    /// unlink pair: the retry sees the newer row (or no row, and
-    /// returns `not_found`), and a file still missing there is a
-    /// real I/O error. A reader therefore gets the old version, the
-    /// new version, or `NotFound`, never a torn read or a spurious
-    /// `Io { NotFound }`.
+    /// The lookup runs on a pooled reader first. If the open fails,
+    /// the lookup and the open are repeated under the writer. While
+    /// the writer is held no transaction can supersede the row it
+    /// reads, so that row's file can only be unlinked after a later
+    /// commit, which can't happen before the open: the retry sees the
+    /// current row (or no row, and returns `not_found`), and an open
+    /// that still fails is a real I/O error. Any open error is
+    /// retried, not just `NotFound`, because on Windows opening a
+    /// file that is pending deletion fails with access denied. A
+    /// reader therefore gets the old version, the new version, or
+    /// `NotFound`, never a torn read or a spurious I/O error.
     fn open_current<T: Send>(
         &self,
         blobs_root: &Path,
@@ -849,15 +850,8 @@ impl BlobStore {
                 hook();
             }
         });
-        match open(&row)? {
-            Ok(file) => return Ok((row, file)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(BlobError::Io {
-                    path: instance_dir.join(id_of(&row)),
-                    source,
-                });
-            }
+        if let Ok(file) = open(&row)? {
+            return Ok((row, file));
         }
         self.db.write(|conn| -> Result<_, BlobError> {
             let row = lookup(conn)?.ok_or_else(&not_found)?;

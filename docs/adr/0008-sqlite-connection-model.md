@@ -50,4 +50,6 @@ While normal-priority callers are queued, consecutive low-priority transactions 
 between them. That is a per-class guarantee: admission within the normal class is not FIFO, so an individual
 normal-priority write has no fixed bound on the transactions that run ahead of it. A slow disk still slows every writer, and the H3 bus gate still serializes
 publishers behind one mirror write. Reads that need to be atomic with a later filesystem effect (the blob open) must
-stay on the writer. Each file-backed `Db` holds up to six connections and one extra thread.
+end on the writer: blob reads look up the row on a pooled reader and, only when the open fails because a newer
+commit unlinked the file, repeat the lookup and open under the writer (amended after M6; see ARCHITECTURE.md
+"Storage connections (M6)"). Each file-backed `Db` holds up to six connections and one extra thread.

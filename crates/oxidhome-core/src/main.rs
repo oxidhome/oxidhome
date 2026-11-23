@@ -70,7 +70,7 @@ use oxidhome_core::api::{
     recover_admin_token_offline, serve,
 };
 use oxidhome_core::exclusive_lock::acquire_state_dir_lock;
-use oxidhome_core::state::EventLogRetention;
+use oxidhome_core::state::{EventLogRetention, RetentionTask};
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -232,8 +232,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let _event_log_retention = spawn_event_log_retention(&engine, retention);
-
     // Bind the listener; log the actual bound address (matters
     // when `$OXIDHOME_BIND` ends in `:0` for ephemeral-port
     // testing) before moving into the accept loop.
@@ -243,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding the API listener at {bind_addr}"))?;
     let actual = listener.local_addr()?;
     tracing::info!(addr = %actual, "oxidhome API listening");
+    let event_log_retention = spawn_event_log_retention(&engine, retention);
 
     // Serve until a shutdown signal arrives. `serve` returning
     // Err here means the accept loop itself died (rare); we
@@ -314,6 +313,11 @@ async fn main() -> anyhow::Result<()> {
     let _ = engine
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
+    // Stop retention and wait out an in-flight chunk, so no retention
+    // write outlives the state-dir lock released when this returns.
+    if let Some(task) = event_log_retention {
+        task.shutdown().await;
+    }
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s
@@ -342,12 +346,13 @@ async fn main() -> anyhow::Result<()> {
 /// H4 / M6 follow-up: periodic event-log retention (age and row
 /// limits from `$OXIDHOME_EVENT_LOG_RETENTION_DAYS` /
 /// `$OXIDHOME_EVENT_LOG_MAX_ROWS`). Low-priority, chunked, id prefix
-/// only. The caller holds the handle for the daemon's lifetime;
-/// runtime teardown stops the task between chunks.
+/// only. Used by both long-running modes (HTTP daemon and
+/// `mcp-stdio`); the caller shuts it down before releasing the
+/// state-dir lock.
 fn spawn_event_log_retention(
     engine: &Engine,
     retention: EventLogRetention,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<RetentionTask> {
     tracing::info!(
         max_age_days = retention.max_age.map(|a| a.as_secs() / 86_400),
         max_rows = retention.max_rows,
@@ -597,6 +602,7 @@ async fn run_stdio() -> anyhow::Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
     let state_dir = resolve_state_dir()?;
+    let retention = EventLogRetention::from_env()?;
     // Round-1 P1 on PR #143: exclusive lock, held for the
     // process lifetime.
     let _state_dir_lock = acquire_state_dir_lock(&state_dir)?;
@@ -625,6 +631,7 @@ async fn run_stdio() -> anyhow::Result<()> {
         .with(engine.log_store().layer())
         .try_init();
 
+    let event_log_retention = spawn_event_log_retention(&engine, retention);
     tracing::info!(
         state_dir = %state_dir.display(),
         "oxidhome mcp-stdio ready — awaiting client on stdin",
@@ -657,6 +664,11 @@ async fn run_stdio() -> anyhow::Result<()> {
     let _ = engine
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
+    // Stop retention and wait out an in-flight chunk, so no retention
+    // write outlives the state-dir lock released when this returns.
+    if let Some(task) = event_log_retention {
+        task.shutdown().await;
+    }
 
     // Flush the log writer before returning so the tail of the
     // session lands in `<state_dir>/oxidhome.db`. Matches the

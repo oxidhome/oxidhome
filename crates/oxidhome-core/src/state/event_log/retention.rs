@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 
 use super::{EventLog, EventLogError};
 
@@ -78,7 +78,9 @@ impl EventLogRetention {
     ///
     /// A variable that is set but isn't a non-negative integer.
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        // `var_os` + lossy: a non-Unicode value fails the parse below
+        // instead of reading as unset and silently applying a default.
+        Self::from_lookup(|name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()))
     }
 
     /// [`Self::from_env`] with an injectable lookup, for tests.
@@ -141,16 +143,20 @@ impl EventLog {
                 )?,
                 None => None,
             };
-            // Rows: keep the `max_rows` highest ids.
+            // Rows: keep the `max_rows` highest ids. Retained ids are
+            // dense (H4: `AUTOINCREMENT`, one serialized writer, failed
+            // inserts roll back their id, retention deletes a prefix),
+            // so the bound is arithmetic on the head instead of an
+            // `OFFSET` scan over `max_rows` index entries.
             let by_rows: Option<i64> = match max_rows {
-                Some(keep) => conn
-                    .query_row(
-                        "SELECT id FROM event_log ORDER BY id DESC LIMIT 1 OFFSET ?1",
-                        params![i64::try_from(keep).unwrap_or(i64::MAX)],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                    .map(|id| id.saturating_add(1)),
+                Some(keep) => {
+                    let head: Option<i64> =
+                        conn.query_row("SELECT MAX(id) FROM event_log", (), |row| row.get(0))?;
+                    let keep = i64::try_from(keep).unwrap_or(i64::MAX);
+                    head.and_then(|head| head.checked_sub(keep))
+                        .filter(|last_dropped| *last_dropped > 0)
+                        .map(|last_dropped| last_dropped + 1)
+                }
                 None => None,
             };
             Ok(by_age.max(by_rows))
@@ -203,27 +209,37 @@ impl EventLog {
     }
 
     /// Spawn the periodic retention task on the current tokio
-    /// runtime. Each chunk runs on the blocking pool, one at a time,
-    /// so aborting the returned handle (or runtime shutdown) stops
-    /// the pass between chunks. A failed pass logs a warning and the
-    /// next one runs on schedule. With no limits configured the task
-    /// isn't spawned and `None` is returned.
+    /// runtime. Each chunk runs on the blocking pool, one at a time.
+    /// [`RetentionTask::shutdown`] stops the task between chunks and
+    /// waits for an in-flight chunk, so the caller can release the
+    /// state-dir lock knowing no retention write is still running.
+    /// A failed pass logs a warning and the next one runs on
+    /// schedule. With no limits configured the task isn't spawned
+    /// and `None` is returned. A zero `interval` is treated as 1 s.
     #[must_use]
-    pub fn spawn_retention(
-        self: &Arc<Self>,
-        policy: EventLogRetention,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    pub fn spawn_retention(self: &Arc<Self>, policy: EventLogRetention) -> Option<RetentionTask> {
         if policy.max_age.is_none() && policy.max_rows.is_none() {
             return None;
         }
         let log = Arc::clone(self);
-        Some(tokio::spawn(async move {
-            tokio::time::sleep(policy.first_delay).await;
-            let mut ticks = tokio::time::interval(policy.interval);
+        let (stop_tx, mut stop) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let stopped = |stop: &tokio::sync::watch::Receiver<bool>| *stop.borrow();
+            tokio::select! {
+                () = tokio::time::sleep(policy.first_delay) => {}
+                _ = stop.changed() => return,
+            }
+            let mut ticks = tokio::time::interval(policy.interval.max(Duration::from_secs(1)));
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticks.tick().await;
-                match run_pass(&log, policy).await {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    _ = stop.changed() => return,
+                }
+                if stopped(&stop) {
+                    return;
+                }
+                match run_pass(&log, policy, &stop).await {
                     Ok(0) => {}
                     Ok(removed) => {
                         tracing::info!(target: "event_log.retention", removed, "event log trimmed");
@@ -233,13 +249,44 @@ impl EventLog {
                     }
                 }
             }
-        }))
+        });
+        Some(RetentionTask {
+            stop: stop_tx,
+            handle,
+        })
+    }
+}
+
+/// Handle to the task started by [`EventLog::spawn_retention`].
+/// Dropping it without [`Self::shutdown`] stops the task after its
+/// current pass, without waiting for it.
+#[derive(Debug)]
+pub struct RetentionTask {
+    stop: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl RetentionTask {
+    /// Stop the task and wait for it: a pass in progress ends after
+    /// its current chunk commits (each chunk is one bounded
+    /// transaction).
+    pub async fn shutdown(self) {
+        let _ = self.stop.send(true);
+        if let Err(join) = self.handle.await
+            && join.is_panic()
+        {
+            std::panic::resume_unwind(join.into_panic());
+        }
     }
 }
 
 /// One pass of the background task, chunk by chunk on the blocking
-/// pool so the task can be cancelled between chunks.
-async fn run_pass(log: &Arc<EventLog>, policy: EventLogRetention) -> Result<usize, EventLogError> {
+/// pool. Checks `stop` before each chunk.
+async fn run_pass(
+    log: &Arc<EventLog>,
+    policy: EventLogRetention,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> Result<usize, EventLogError> {
     let now_ms = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -248,33 +295,29 @@ async fn run_pass(log: &Arc<EventLog>, policy: EventLogRetention) -> Result<usiz
     .unwrap_or(i64::MAX);
     let bound = {
         let log = Arc::clone(log);
-        blocking(move || log.retention_bound(policy.cutoff_ms(now_ms), policy.max_rows)).await
+        blocking(move || log.retention_bound(policy.cutoff_ms(now_ms), policy.max_rows)).await?
     };
-    let Some(bound) = bound.transpose()?.flatten() else {
+    let Some(bound) = bound else {
         return Ok(0);
     };
     let mut total = 0;
-    loop {
+    while !*stop.borrow() {
         let log = Arc::clone(log);
-        match blocking(move || log.trim_chunk_below(bound))
-            .await
-            .transpose()?
-        {
-            None | Some(0) => return Ok(total),
-            Some(n) => total += n,
+        match blocking(move || log.trim_chunk_below(bound)).await? {
+            0 => break,
+            n => total += n,
         }
     }
+    Ok(total)
 }
 
-/// Run `f` on the blocking pool. `None` when the runtime is shutting
-/// down and cancelled it before it started; a panic propagates.
+/// Run `f` on the blocking pool and wait for it; a panic propagates.
 async fn blocking<R: Send + 'static>(
     f: impl FnOnce() -> Result<R, EventLogError> + Send + 'static,
-) -> Option<Result<R, EventLogError>> {
+) -> Result<R, EventLogError> {
     match tokio::task::spawn_blocking(f).await {
-        Ok(result) => Some(result),
-        Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
-        Err(_) => None,
+        Ok(result) => result,
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
     }
 }
 
@@ -465,7 +508,7 @@ mod tests {
             .spawn_retention(EventLogRetention {
                 max_age: None,
                 max_rows: Some(4),
-                interval: Duration::from_millis(10),
+                interval: Duration::ZERO,
                 first_delay: Duration::ZERO,
             })
             .expect("spawned");
@@ -489,6 +532,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(oldest(&log), Some(10));
-        task.abort();
+        task.shutdown().await;
+        // Stopped: new rows are no longer trimmed.
+        for t in 13..20 {
+            record(&log, t);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(log.count().expect("count"), 11);
     }
 }
