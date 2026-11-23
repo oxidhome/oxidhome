@@ -569,6 +569,10 @@ impl InstanceHandle {
         cmd: Command,
     ) -> CommandOutcome {
         let ticket = DispatchTicket::default();
+        // Declared before `_withdraw` so a dropped caller withdraws the
+        // ticket before its reply channel closes: the supervisor can't
+        // claim the command for a receiver that is already gone.
+        let (reply, mut rx) = oneshot::channel();
         let _withdraw = AbandonOnDrop(ticket.clone());
         let deadline = ctx.deadline();
         let call_id = ctx.call_id().to_owned();
@@ -579,7 +583,6 @@ impl InstanceHandle {
                 self.instance_id,
             ),
         };
-        let (reply, mut rx) = oneshot::channel();
         let enqueue = self.control.send(ControlCommand::Execute {
             ctx,
             device,
@@ -623,7 +626,7 @@ impl InstanceHandle {
             };
             received
         } else {
-            rx.await
+            (&mut rx).await
         };
         received.unwrap_or_else(|_| {
             if ticket.started() {
@@ -681,13 +684,15 @@ impl InstanceHandle {
     ) -> ServiceCallOutcome {
         let guard = SharedCallGuard::new(guard);
         // Drop order: `_withdraw` settles the ticket, then `_release`
-        // frees the guard of a call that will never start.
+        // frees the guard of a call that will never start, then the
+        // reply channel closes (so the supervisor can't claim the call
+        // for a receiver that is already gone).
+        let (reply, mut rx) = oneshot::channel();
         let _release = ReleaseUnlessStarted {
             ticket: ticket.clone(),
             guard: guard.clone(),
         };
         let _withdraw = AbandonOnDrop(ticket.clone());
-        let (reply, mut rx) = oneshot::channel();
         // If the send fails (control channel closed), `_release` drops
         // the `CallGuard` → refcount decrements cleanly even on the
         // supervisor-gone path.

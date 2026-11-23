@@ -344,12 +344,16 @@ fn wait_retry_unless_closed(shared: &Shared) {
 /// sleeps briefly and answers `true` while the close budget lasts.
 fn retry_while_closing(shared: &Shared) -> bool {
     const CLOSING_RETRY_DELAY: Duration = Duration::from_millis(50);
-    match shared.lock().retry {
+    let delay = match shared.lock().retry {
         Retry::Never => return false,
-        Retry::Until(until) if Instant::now() + CLOSING_RETRY_DELAY >= until => return false,
-        Retry::Until(_) | Retry::Unbounded => {}
-    }
-    std::thread::sleep(CLOSING_RETRY_DELAY);
+        // A last attempt fits in whatever budget is left.
+        Retry::Until(until) => match until.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => left.min(CLOSING_RETRY_DELAY),
+            _ => return false,
+        },
+        Retry::Unbounded => CLOSING_RETRY_DELAY,
+    };
+    std::thread::sleep(delay);
     true
 }
 
@@ -733,6 +737,30 @@ mod tests {
         );
         restore.join().unwrap();
         assert_eq!(load_rows(&db).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_reconcile_rolls_back_every_delete() {
+        let db = db();
+        let journal = CommandJournal::start(Arc::clone(&db)).expect("journal");
+        assert!(journal.persist(row("cmd-a", i64::MAX)));
+        assert!(journal.persist(row("cmd-b", i64::MAX)));
+        assert!(journal.close(Duration::from_secs(5)));
+        // The second resolution row fails, after the first row's delete
+        // and audit insert went through.
+        db.write(|c| {
+            c.execute_batch(&format!(
+                "CREATE TRIGGER fail_second BEFORE INSERT ON audit_event
+                 WHEN NEW.method = '{COMMAND_RESOLUTION_AUDIT_METHOD}'
+                  AND (SELECT COUNT(*) FROM audit_event
+                       WHERE method = '{COMMAND_RESOLUTION_AUDIT_METHOD}') >= 1
+                 BEGIN SELECT RAISE(ABORT, 'second insert fails'); END",
+            ))
+        })
+        .unwrap();
+        assert!(reconcile(&db).is_err());
+        assert_eq!(load_rows(&db).unwrap().len(), 2, "both rows kept");
+        assert_eq!(resolution_rows(&db), Vec::<AuditEntry>::new());
     }
 
     #[test]

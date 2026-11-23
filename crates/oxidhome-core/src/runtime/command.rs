@@ -700,6 +700,13 @@ impl PendingCommands {
         for id in ids {
             if let Some(p) = entries.remove(&id) {
                 p.expiry.abort();
+                // A TTL that already ran out is an expiry, whatever
+                // ended the instance (as `take` judges a completion).
+                let reason = if tokio::time::Instant::now() >= p.expires_at {
+                    ExpiryReason::Expired
+                } else {
+                    reason
+                };
                 self.expired(&id, p, reason);
             }
         }
@@ -1152,6 +1159,31 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(table.take("inst-a", &id).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_elapsed_ttl_expires_as_expired_whatever_ends_the_instance() {
+        use crate::auth::{Actor, ActorKind, Principal, Transport};
+        use crate::state::{AuditQuery, Db};
+        let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
+        let table = Arc::new(PendingCommands::new(Some(Arc::clone(&audit))).unwrap());
+        table.set_ttl(Duration::ZERO);
+        let actor = Actor::api("tok-1", vec!["*".into()]);
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
+        let id = mint_command_id();
+        table
+            .register(&id, "inst-a", "dev-1", "switch", ctx)
+            .expect("register");
+        // No yield: the TTL timer hasn't run.
+        table.expire_owner("inst-a", ExpiryReason::InstanceStopped);
+        assert!(table.flush_journal(Duration::from_secs(5)));
+        let rows = audit.query(&AuditQuery::default(), 10).expect("query");
+        let row = rows
+            .iter()
+            .find(|r| r.command_id.as_deref() == Some(id.as_str()))
+            .expect("resolution row");
+        assert_eq!(row.domain_error.as_deref(), Some("expired"));
     }
 
     #[test]
