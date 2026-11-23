@@ -637,8 +637,12 @@ impl LogStore {
                 .db
                 .write_low_priority(|conn| -> Result<_, LogStoreError> {
                     Ok(conn.execute(
+                        // The newest row stays, so the table is never
+                        // emptied and ids are never handed out again
+                        // (a concurrent retention pass plans by id).
                         "DELETE FROM log_event WHERE id IN \
-                         (SELECT id FROM log_event WHERE ts_unix_ms < ?1 LIMIT ?2)",
+                         (SELECT id FROM log_event WHERE ts_unix_ms < ?1 \
+                          AND id < (SELECT MAX(id) FROM log_event) LIMIT ?2)",
                         params![cutoff_ms, chunk],
                     )?)
                 })?;

@@ -489,7 +489,8 @@ impl DeviceStateStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         DeviceStateHealth {
-            persistent: true,
+            // An in-memory database is not persistence.
+            persistent: backing.db.path().is_some(),
             degraded: st.failing_since_ms.is_some(),
             degraded_since_ms: st.failing_since_ms,
             last_error: st.failing_since_ms.and(st.last_error.clone()),

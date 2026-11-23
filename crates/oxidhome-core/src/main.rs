@@ -414,12 +414,13 @@ const SHUTDOWN_AUDIT_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 /// (`close_state_writers`).
 async fn drain_state_read_audit(engine: &Engine) {
     let engine = engine.clone();
+    // One deadline for both the drain and the wait for it, so a
+    // blocking pool too busy to start the drain can't stretch it.
+    let deadline = std::time::Instant::now() + SHUTDOWN_AUDIT_DRAIN_DEADLINE;
     let drain = tokio::task::spawn_blocking(move || {
-        engine.drain_state_read_audit(SHUTDOWN_AUDIT_DRAIN_DEADLINE)
+        engine.drain_state_read_audit(deadline.saturating_duration_since(std::time::Instant::now()))
     });
-    // The outer bound covers a blocking pool too busy to start the
-    // drain.
-    let drained = tokio::time::timeout(SHUTDOWN_AUDIT_DRAIN_DEADLINE * 2, drain)
+    let drained = tokio::time::timeout_at(deadline.into(), drain)
         .await
         .is_ok_and(|joined| joined.unwrap_or(false));
     if !drained {
