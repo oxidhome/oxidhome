@@ -25,7 +25,7 @@
 //! A failed write is logged and the in-memory floor still applies for
 //! the life of the process: the floor only ever protects more.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rusqlite::params;
@@ -111,9 +111,9 @@ pub enum DeviceMetaError {
 pub struct DeviceMetaStore {
     db: Option<Arc<Db>>,
     rows: RwLock<HashMap<String, DeviceMetaRow>>,
-    /// Instances some row classes as a camera source, kept in step
-    /// with `rows` so the per-value byte check is one lookup.
-    cameras: RwLock<HashSet<String>>,
+    /// Per-instance counts kept in step with `rows`, so the per-value
+    /// byte check and the per-instance quota are one lookup each.
+    index: RwLock<OwnerIndex>,
     /// Serializes writers through read → commit → publish, so the
     /// `rows` lock is held only to read and to publish, never across a
     /// `SQLite` commit: readers (every authorization) don't wait on an
@@ -146,7 +146,7 @@ impl DeviceMetaStore {
         Self {
             db: None,
             rows: RwLock::new(HashMap::new()),
-            cameras: RwLock::new(HashSet::new()),
+            index: RwLock::new(OwnerIndex::default()),
             writer: Mutex::new(()),
         }
     }
@@ -179,7 +179,7 @@ impl DeviceMetaStore {
         })?;
         Ok(Self {
             db: Some(db),
-            cameras: RwLock::new(camera_instances(&rows)),
+            index: RwLock::new(OwnerIndex::build(&rows)),
             rows: RwLock::new(rows),
             writer: Mutex::new(()),
         })
@@ -213,16 +213,24 @@ impl DeviceMetaStore {
     /// camera, by its floor or the operator's override.
     #[must_use]
     pub fn instance_is_camera(&self, instance_id: &str) -> bool {
-        self.cameras
+        self.index
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(instance_id)
+            .cameras
+            .get(instance_id)
+            .is_some_and(|n| *n > 0)
     }
 
-    /// Recompute [`Self::cameras`] from `rows` (writers only, holding
-    /// the `rows` write lock; writes are rare).
-    fn refresh_cameras(&self, rows: &HashMap<String, DeviceMetaRow>) {
-        *self.cameras.write().unwrap_or_else(PoisonError::into_inner) = camera_instances(rows);
+    /// Move [`Self::index`] from `before` to `after` for one changed
+    /// row (writers only, holding the `rows` write lock).
+    fn reindex(&self, before: Option<&DeviceMetaRow>, after: Option<&DeviceMetaRow>) {
+        let mut index = self.index.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(row) = before {
+            index.remove(row);
+        }
+        if let Some(row) = after {
+            index.add(row);
+        }
     }
 
     /// Record that `device_id`, registered by `owner_instance`, was
@@ -264,10 +272,14 @@ impl DeviceMetaStore {
                 return Err(ObserveError::TotalCapExceeded);
             }
             if current.is_none() {
-                let owned = rows
-                    .values()
-                    .filter(|r| r.owner_instance.as_deref() == Some(owner_instance))
-                    .count();
+                let owned = self
+                    .index
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .rows
+                    .get(owner_instance)
+                    .copied()
+                    .unwrap_or(0);
                 if owned >= MAX_FLOOR_ROWS_PER_INSTANCE {
                     return Err(ObserveError::CapExceeded);
                 }
@@ -292,9 +304,10 @@ impl DeviceMetaStore {
         }
         let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
         let row = rows.entry(device_id.to_owned()).or_default();
+        let before = row.clone();
         row.sensitive_floor = new_floor;
         row.owner_instance = Some(owner_instance.to_owned());
-        self.refresh_cameras(&rows);
+        self.reindex(Some(&before), Some(row));
         Ok(())
     }
 
@@ -336,8 +349,8 @@ impl DeviceMetaStore {
                         })?;
                     }
                     let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
-                    rows.remove(device_id);
-                    self.refresh_cameras(&rows);
+                    let before = rows.remove(device_id);
+                    self.reindex(before.as_ref(), None);
                     return Ok(DeviceMetaRow::default());
                 }
                 Some(_) => {}
@@ -381,12 +394,13 @@ impl DeviceMetaStore {
         }
         let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
         let row = rows.entry(device_id.to_owned()).or_default();
+        let before = row.clone();
         row.category_override = category;
         if owner.is_some() {
             row.owner_instance = owner;
         }
         let row = row.clone();
-        self.refresh_cameras(&rows);
+        self.reindex(Some(&before), Some(&row));
         Ok(row)
     }
 }
@@ -430,12 +444,50 @@ fn durable_write<R: Send>(
     })
 }
 
-/// Instances that own a row classed as a camera.
-fn camera_instances(rows: &HashMap<String, DeviceMetaRow>) -> HashSet<String> {
-    rows.values()
-        .filter(|r| r.apply(DeviceClass::other()).is_camera())
-        .filter_map(|r| r.owner_instance.clone())
-        .collect()
+/// Per-owner row counts and camera-row counts. An empty default row
+/// (the `before` of an insert) has no owner and counts nowhere.
+#[derive(Debug, Default)]
+struct OwnerIndex {
+    rows: HashMap<String, usize>,
+    cameras: HashMap<String, usize>,
+}
+
+impl OwnerIndex {
+    fn build(rows: &HashMap<String, DeviceMetaRow>) -> Self {
+        let mut index = Self::default();
+        for row in rows.values() {
+            index.add(row);
+        }
+        index
+    }
+
+    fn add(&mut self, row: &DeviceMetaRow) {
+        let Some(owner) = &row.owner_instance else {
+            return;
+        };
+        *self.rows.entry(owner.clone()).or_default() += 1;
+        if row.apply(DeviceClass::other()).is_camera() {
+            *self.cameras.entry(owner.clone()).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, row: &DeviceMetaRow) {
+        let Some(owner) = &row.owner_instance else {
+            return;
+        };
+        let dec = |map: &mut HashMap<String, usize>| {
+            if let Some(n) = map.get_mut(owner) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(owner);
+                }
+            }
+        };
+        dec(&mut self.rows);
+        if row.apply(DeviceClass::other()).is_camera() {
+            dec(&mut self.cameras);
+        }
+    }
 }
 
 fn decode_row(id: &str, owner: Option<String>, floor: &str, over: Option<&str>) -> DeviceMetaRow {
@@ -552,6 +604,28 @@ mod tests {
             .unwrap();
         assert!(store.instance_is_camera("cam"));
         assert!(!store.instance_is_camera("other"));
+    }
+
+    /// The per-instance camera index follows an override raised and
+    /// cleared, and a row moving to another owner.
+    #[test]
+    fn the_camera_index_follows_overrides() {
+        const LOCK_DEV: &str = "dev-00000000000000aa";
+        let store = DeviceMetaStore::detached();
+        store
+            .set_override(LOCK_DEV, Some(DeviceCategory::Camera), Some("a"))
+            .unwrap();
+        assert!(store.instance_is_camera("a"));
+        store.set_override(LOCK_DEV, None, None).unwrap();
+        assert!(!store.instance_is_camera("a"), "the empty row is gone");
+        store
+            .observe(DEV, "a", DeviceClass::of(DeviceCategory::Camera))
+            .unwrap();
+        store
+            .observe(DEV, "b", DeviceClass::of(DeviceCategory::Camera))
+            .unwrap();
+        assert!(!store.instance_is_camera("a"), "the row moved to b");
+        assert!(store.instance_is_camera("b"));
     }
 
     #[test]

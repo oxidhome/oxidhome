@@ -766,6 +766,23 @@ async fn read_inner(
         Route::Terminal { family, outcome } => return (family, outcome),
     };
 
+    // A blob instance segment that doesn't decode: the collection
+    // grant decides first, then the URI is malformed (not a camera
+    // grant the caller lacks).
+    if let Kind::Blob(instance, name) = &kind
+        && let Err(err) = percent_decode_segment(instance)
+    {
+        let collection = AuthResource::blob((*instance).to_owned(), *name, false);
+        if let Err(required) = authorize(ctx, action, &collection).into_result() {
+            return (family, ReadOutcome::Denied { required });
+        }
+        return (
+            family,
+            ReadOutcome::InvalidParams(format!(
+                "malformed `instance_id` segment `{instance}`: {err}"
+            )),
+        );
+    }
     let decision = authorize(ctx, action, &kind.resource(&engine));
     if let Err(required) = decision.clone().into_result() {
         return (family, ReadOutcome::Denied { required });

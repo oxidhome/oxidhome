@@ -75,7 +75,7 @@ use anyhow::Context;
 use oxidhome_core::Engine;
 use oxidhome_core::api::mcp::{
     DaemonConfig, DaemonMode, ENV_BIND, ENV_STATE_DIR, StdioOptions, install_daemon_config,
-    serve_stdio,
+    serve_stdio_with,
 };
 use oxidhome_core::api::sensitive_admin::{
     grant_sensitive, revoke_sensitive, sensitive_access_report, set_device_category,
@@ -1025,7 +1025,7 @@ async fn run_stdio(options: StdioOptions) -> anyhow::Result<()> {
     // awaited `serve_stdio` directly, so ctrl-c bypassed the
     // whole cleanup path.
     let serve_result = tokio::select! {
-        result = serve_stdio(engine.clone(), options) => result,
+        result = serve_stdio_with(engine.clone(), options) => result,
         signal = shutdown_signal() => {
             tracing::info!(signal = signal, "shutdown signal received; draining stdio session");
             Ok(())

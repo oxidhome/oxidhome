@@ -570,6 +570,13 @@ impl InstanceHandle {
     /// supervisor has entered the plugin, a missed deadline, a trap or
     /// a lost supervisor is `outcome_unknown`. Dropping the returned
     /// future withdraws a still-queued command.
+    ///
+    /// H6 slice 2: this entry point admits no sensitive category, so
+    /// an external caller's command to a lock, opener, alarm or
+    /// camera device is `rejected` at dispatch. Sensitive commands
+    /// go through the API surfaces, which discharge the obligations
+    /// (rate limit, warn audit row) and then call
+    /// [`Self::execute_command_admitted`].
     pub async fn execute_command_in(
         &self,
         ctx: InvocationContext,
@@ -1996,14 +2003,15 @@ fn dispatch_refusal(
     let decision = crate::auth::authorize(ctx, crate::auth::Action::DeviceCommand, resource);
     if !decision.allow {
         return Some(
-            "the device's category changed while the command was queued; the caller \
-                     may no longer command it"
+            "the caller may not command this device (its category may have changed \
+                     while the command was queued)"
                 .to_owned(),
         );
     }
     (!decision.obligations.sensitive.is_subset(admitted)).then(|| {
         format!(
-            "the device became sensitive ({}) while the command was queued; send it again",
+            "the device is sensitive ({}) and this command was not admitted for that; \
+             send it through an authorized API surface",
             decision.obligations.sensitive.to_csv()
         )
     })

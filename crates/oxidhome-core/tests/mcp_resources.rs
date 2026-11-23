@@ -1270,6 +1270,25 @@ async fn blobs_uri_without_name_returns_not_found() {
     );
 }
 
+/// A blob instance segment that doesn't percent-decode is a malformed
+/// URI for a caller holding `blobs:read`, not a missing camera grant.
+#[tokio::test(flavor = "current_thread")]
+async fn a_malformed_blob_instance_is_invalid_params() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "blobs-only", &["blobs:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://blobs/bad%FF/snap.jpg"}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+}
+
 /// A blobs URI for an instance that isn't running returns
 /// resource-not-found with a message naming the instance id.
 /// The scope check has already succeeded here (the token

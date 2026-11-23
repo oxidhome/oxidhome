@@ -54,5 +54,5 @@ pub use server::{
 };
 pub use stdio::{
     STDIO_TOKEN_ID, ServeStdioError, StdioOptions, serve_stdio, serve_stdio_over,
-    serve_stdio_over_with, stdio_actor,
+    serve_stdio_over_with, serve_stdio_with, stdio_actor,
 };

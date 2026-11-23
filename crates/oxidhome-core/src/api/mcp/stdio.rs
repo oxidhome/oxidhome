@@ -114,9 +114,17 @@ pub fn stdio_actor(options: &StdioOptions) -> Actor {
 }
 
 /// Convenience: serve MCP over the process's stdin / stdout
-/// until the client disconnects. Called by
+/// until the client disconnects, with default [`StdioOptions`].
+pub async fn serve_stdio(engine: Engine) -> Result<(), ServeStdioError> {
+    serve_stdio_with(engine, StdioOptions::default()).await
+}
+
+/// [`serve_stdio`] with explicit [`StdioOptions`]. Called by
 /// `oxidhome mcp-stdio`.
-pub async fn serve_stdio(engine: Engine, options: StdioOptions) -> Result<(), ServeStdioError> {
+pub async fn serve_stdio_with(
+    engine: Engine,
+    options: StdioOptions,
+) -> Result<(), ServeStdioError> {
     let (stdin, stdout) = rmcp::transport::stdio();
     serve_stdio_over_with(engine, &options, stdin, stdout).await
 }

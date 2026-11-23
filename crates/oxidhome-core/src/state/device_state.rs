@@ -574,6 +574,7 @@ impl DeviceStateStore {
             observed_ms,
             received_ms,
             /* merge = */ false,
+            None,
         );
     }
 
@@ -605,7 +606,60 @@ impl DeviceStateStore {
             observed_ms,
             received_ms,
             /* merge = */ true,
+            None,
         );
+    }
+
+    /// [`Self::apply_delta`] that refuses to start a slot without
+    /// `required` (H6 slice 2): when no Fresh entry of the owner's
+    /// live generation exists to merge into, a delta lacking that
+    /// key is dropped instead of becoming the whole snapshot.
+    /// Returns whether the delta was applied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_delta_requiring(
+        &self,
+        device_id: DeviceId,
+        owner_instance: String,
+        capability: String,
+        fields: Vec<KeyValue>,
+        observed_ms: u64,
+        received_ms: i64,
+        required: &str,
+    ) -> bool {
+        self.write_entry(
+            device_id,
+            owner_instance,
+            capability,
+            fields,
+            observed_ms,
+            received_ms,
+            /* merge = */ true,
+            Some(required),
+        )
+    }
+
+    /// `true` when a delta for `(device_id, capability)` would merge
+    /// into a Fresh entry of `owner_instance`'s live generation that
+    /// already carries `key` — the precondition
+    /// [`Self::apply_delta_requiring`] checks for a delta lacking it.
+    #[must_use]
+    pub fn has_live_field(
+        &self,
+        device_id: &str,
+        owner_instance: &str,
+        capability: &str,
+        key: &str,
+    ) -> bool {
+        let inner = self.inner_read();
+        let generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
+        inner
+            .entries
+            .get(&(device_id.to_owned(), capability.to_owned()))
+            .is_some_and(|prev| {
+                prev.quality == StateQuality::Fresh
+                    && prev.source_generation == generation
+                    && prev.fields.iter().any(|kv| kv.key == key)
+            })
     }
 
     #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
@@ -618,7 +672,8 @@ impl DeviceStateStore {
         observed_ms: u64,
         received_ms: i64,
         merge: bool,
-    ) {
+        required: Option<&str>,
+    ) -> bool {
         let mut inner = self.inner_write();
         // Round-4 review fix: read the generation under the same
         // lock as the entries write, so a concurrent
@@ -626,8 +681,22 @@ impl DeviceStateStore {
         // slip between the read and the insert and let a delayed
         // writer stamp the pre-sweep generation onto a fresh entry.
         let generation = inner.generations.get(&owner_instance).copied().unwrap_or(0);
-        let global_revision = inner.next_revision();
         let key = (device_id.clone(), capability.clone());
+        // H6 slice 2: a delta lacking `required` must merge into a
+        // Fresh slot of this generation that already has it;
+        // otherwise the slot would go Fresh without it.
+        if let Some(required) = required {
+            let has_it = merge
+                && inner.entries.get(&key).is_some_and(|prev| {
+                    prev.quality == StateQuality::Fresh
+                        && prev.source_generation == generation
+                        && prev.fields.iter().any(|kv| kv.key == required)
+                });
+            if !has_it && !fields.iter().any(|kv| kv.key == required) {
+                return false;
+            }
+        }
+        let global_revision = inner.next_revision();
         // Round-4 finding 1: **never merge into a Stale entry, or
         // into an entry from a prior generation**. A plugin
         // publishing a partial `state-change` after a restart —
@@ -720,6 +789,7 @@ impl DeviceStateStore {
         });
         inner.touch(&key);
         inner.entries.insert(key, entry);
+        true
     }
 
     /// Snapshot every capability entry currently known for
@@ -2362,6 +2432,33 @@ mod tests {
     /// documented remove-and-re-register deletion procedure).
     /// Contrast with `apply_delta`'s merge behavior — that path
     /// preserves absent fields.
+    #[test]
+    fn a_delta_without_the_required_key_cannot_start_a_slot() {
+        let store = DeviceStateStore::new();
+        let position = || vec![kv("position", Value::FloatVal(0.5))];
+        let delta = |fields| {
+            store.apply_delta_requiring(
+                "dev-1".into(),
+                "alpha".into(),
+                "opener".into(),
+                fields,
+                0,
+                0,
+                "state",
+            )
+        };
+        assert!(!delta(position()), "no slot to merge into");
+        assert!(store.snapshot_capability("dev-1", "opener").is_none());
+        assert!(!store.has_live_field("dev-1", "alpha", "opener", "state"));
+        let open = vec![kv("state", Value::StringVal("open".into()))];
+        assert!(delta(open));
+        assert!(store.has_live_field("dev-1", "alpha", "opener", "state"));
+        assert!(delta(position()), "merges into the live slot");
+        store.mark_instance_stale("alpha");
+        assert!(!store.has_live_field("dev-1", "alpha", "opener", "state"));
+        assert!(!delta(position()), "a stale slot is not merged into");
+    }
+
     #[test]
     fn replace_snapshot_clears_absent_fields() {
         let store = DeviceStateStore::new();

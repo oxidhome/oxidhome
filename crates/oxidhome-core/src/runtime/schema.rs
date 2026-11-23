@@ -213,11 +213,16 @@ pub(crate) fn check_snapshot_fields(
     fields: &[KeyValue],
 ) -> Result<(), String> {
     check_state_fields(info, capability, fields)?;
-    let needs_state = matches!(capability, "lock" | "opener" | "alarm-panel" | "siren");
-    if needs_state && !fields.iter().any(|kv| kv.key == "state") {
+    if needs_snapshot_state(capability) && !fields.iter().any(|kv| kv.key == "state") {
         return Err(format!("a {capability} snapshot must include `state`"));
     }
     Ok(())
+}
+
+/// The capabilities whose projected slot must always carry `state`:
+/// lock, opener, alarm panel and siren.
+pub(crate) fn needs_snapshot_state(capability: &str) -> bool {
+    matches!(capability, "lock" | "opener" | "alarm-panel" | "siren")
 }
 
 /// `true` when an `update-device` takes away its opener's position

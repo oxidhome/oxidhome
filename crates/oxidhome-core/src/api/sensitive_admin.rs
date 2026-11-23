@@ -118,12 +118,25 @@ pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
 
 /// `true` when some pattern in `granted` matches every id `pattern`
 /// can: the same pattern, or a `prefix*` that `pattern` starts with.
+/// Both sides are read in the device-id space, so `*` and `dev-*`
+/// match the same ids.
 fn pattern_covers(granted: &[String], pattern: &str) -> bool {
+    let pattern = in_id_space(pattern);
     granted.iter().any(|g| {
+        let g = in_id_space(g);
         g == pattern
             || g.strip_suffix('*')
                 .is_some_and(|prefix| pattern.starts_with(prefix))
     })
+}
+
+/// `pattern` as the device ids it can match: a `prefix*` whose prefix
+/// every id starts with (`*`, `d*`, ... `dev-*`) is `dev-*`.
+fn in_id_space(pattern: &str) -> &str {
+    match pattern.strip_suffix('*') {
+        Some(prefix) if "dev-".starts_with(prefix) => "dev-*",
+        _ => pattern,
+    }
 }
 
 /// Startup check (H6 slice 2, Q8): log at `warn` every live non-owner
@@ -639,6 +652,28 @@ mod tests {
         let gap = gaps
             .iter()
             .find(|g| g.token_id == all.id)
+            .expect("opener still missing");
+        assert!(!gap.missing.contains(SensitiveCategory::Lock), "{gap:?}");
+
+        // An explicit `*` allowlist is the same id space as `dev-*`.
+        let star = tokens
+            .create(
+                "star",
+                br#"{"scopes":["devices:command"],"constraints":{"device.send_command":{"devices":["*"]}}}"#,
+            )
+            .unwrap();
+        grant_sensitive(
+            &tokens,
+            &audit,
+            &star.id,
+            SensitiveCategory::Lock,
+            &["dev-*".into()],
+        )
+        .unwrap();
+        let gaps = sensitive_access_report(&tokens);
+        let gap = gaps
+            .iter()
+            .find(|g| g.token_id == star.id)
             .expect("opener still missing");
         assert!(!gap.missing.contains(SensitiveCategory::Lock), "{gap:?}");
 

@@ -1409,6 +1409,24 @@ impl host_events::Host for PluginState {
         //    `inference` and `custom` carry no capability contract
         //    of their own, so their capability check is a no-op.
         require_publish_authorized(&self.devices, &self.instance_id, &ev)?;
+        // H6 slice 2: a lock, opener, alarm-panel or siren delta
+        // without `state` may only update a live slot that has one;
+        // it can't start the projection without its state.
+        if let (Some(device_id), EventPayload::StateChanged(sc)) = (&ev.device, &ev.payload)
+            && super::schema::needs_snapshot_state(&sc.capability)
+            && !sc.fields.iter().any(|kv| kv.key == "state")
+            && !self.device_state.has_live_field(
+                device_id,
+                &self.instance_id,
+                &sc.capability,
+                "state",
+            )
+        {
+            return Err(WitError::InvalidArgument(format!(
+                "publish-event: device `{device_id}` has no current {} `state`; include it",
+                sc.capability
+            )));
+        }
 
         // Architecture-review C2b: stamp the event's origin from the
         // publisher's own instance / manifest identity. Any value the
@@ -1584,14 +1602,29 @@ impl host_events::Host for PluginState {
             crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
         ) = (ev.device.clone(), &ev.payload)
         {
-            self.device_state.apply_delta(
-                device_id,
-                self.instance_id.clone(),
-                sc.capability.clone(),
-                sc.fields.clone(),
-                ev.timestamp,
-                crate::state::event_log::now_unix_ms(),
-            );
+            let received = crate::state::event_log::now_unix_ms();
+            if super::schema::needs_snapshot_state(&sc.capability) {
+                // Rechecked under the store lock: the slot may have
+                // gone stale since the check above.
+                let _applied = self.device_state.apply_delta_requiring(
+                    device_id,
+                    self.instance_id.clone(),
+                    sc.capability.clone(),
+                    sc.fields.clone(),
+                    ev.timestamp,
+                    received,
+                    "state",
+                );
+            } else {
+                self.device_state.apply_delta(
+                    device_id,
+                    self.instance_id.clone(),
+                    sc.capability.clone(),
+                    sc.fields.clone(),
+                    ev.timestamp,
+                    received,
+                );
+            }
         }
 
         // Admission already consumed (pre-persistence). The bus's
