@@ -431,6 +431,16 @@ fn check_response_head(headers: &http::HeaderMap) -> Result<(), Error> {
     Ok(())
 }
 
+/// Maps a hyper error, reporting a response head that overflowed the
+/// parser's buffer as a header-section size error.
+fn hyper_error(err: hyper::Error) -> Error {
+    if err.is_parse_too_large() {
+        Error::HttpResponseHeaderSectionSize(None)
+    } else {
+        Error::from(err)
+    }
+}
+
 /// Connect to each checked address in turn, within one deadline;
 /// never a fresh lookup.
 async fn connect_any(
@@ -552,7 +562,7 @@ async fn send(
         let response = tokio::time::timeout(first_byte_timeout, sender.send_request(request))
             .await
             .map_err(|_| Error::ConnectionReadTimeout)?
-            .map_err(Error::from)?;
+            .map_err(hyper_error)?;
         check_response_head(response.headers())?;
         let mut timeout = tokio::time::interval(between_bytes_timeout);
         timeout.reset();
@@ -571,7 +581,7 @@ async fn send(
             conn = None;
             match done {
                 Ok(()) => send.as_mut().poll(cx),
-                Err(err) => Poll::Ready(Err(Error::from(err))),
+                Err(err) => Poll::Ready(Err(hyper_error(err))),
             }
         }
     })
@@ -585,7 +595,7 @@ async fn send(
                 if err.is_timeout() {
                     Error::HttpResponseTimeout
                 } else {
-                    Error::from(err)
+                    hyper_error(err)
                 }
             }),
         }

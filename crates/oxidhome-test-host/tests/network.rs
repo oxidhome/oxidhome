@@ -424,6 +424,11 @@ async fn http_requests_are_checked_on_every_hop() {
     let forbidden_url = format!("http://127.0.0.1:{}/", forbidden.port());
     let allowed = TcpServer::http(move |path| match path {
         "/redirect" => http_redirect(&forbidden_url),
+        // A head past the host's 64 KiB ceiling.
+        "/bighead" => format!(
+            "HTTP/1.1 200 OK\r\nx-big: {}\r\ncontent-length: 0\r\n\r\n",
+            "a".repeat(70 * 1024)
+        ),
         _ => http_ok("hello"),
     });
     let results = probe(
@@ -451,6 +456,7 @@ async fn http_requests_are_checked_on_every_hop() {
                 allowed.port(),
                 "a".repeat(9000)
             ),
+            format!("http http://127.0.0.1:{}/bighead", allowed.port()),
         ],
     )
     .await;
@@ -462,8 +468,12 @@ async fn http_requests_are_checked_on_every_hop() {
     assert_eq!(results[5], "err:ErrorCode::HttpRequestDenied");
     assert!(results[6].starts_with("err:"), "{results:?}");
     assert_eq!(results[7], "err:path");
-    // Only the three allowed requests and the redirecting hop reached it.
-    assert_eq!(allowed.accepted(), 4);
+    assert!(
+        results[8].starts_with("err:ErrorCode::HttpResponseHeaderSectionSize"),
+        "{results:?}"
+    );
+    // Only the four allowed requests and the redirecting hop reached it.
+    assert_eq!(allowed.accepted(), 5);
     assert_eq!(
         forbidden.accepted(),
         0,
