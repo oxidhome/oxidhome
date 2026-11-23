@@ -106,6 +106,9 @@ const MAX_METHOD_LEN: usize = 64;
 const MAX_AUTHORITY_LEN: usize = 512;
 /// Longest path-with-query a request may set.
 const MAX_PATH_LEN: usize = 8 * 1024;
+/// Largest response head (headers, counting each name per value) the
+/// host keeps; also hyper's read-buffer cap.
+const MAX_RESPONSE_HEAD: usize = 64 * 1024;
 /// Most bytes one `fields` map may hold (upstream's default is 128 KiB).
 pub(crate) const FIELD_SIZE_LIMIT: usize = 16 * 1024;
 /// Longest header name a guest may set. Upstream charges a repeated
@@ -389,6 +392,45 @@ async fn checked_addresses(
     Ok(allowed)
 }
 
+/// HTTP/1.1 handshake on `stream`, by `deadline`.
+async fn handshake(
+    stream: tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+) -> Result<
+    (
+        hyper::client::conn::http1::SendRequest<WasiBody>,
+        hyper::client::conn::http1::Connection<TokioIo<tokio::net::TcpStream>, WasiBody>,
+    ),
+    Error,
+> {
+    tokio::time::timeout_at(
+        deadline,
+        hyper::client::conn::http1::Builder::new()
+            // Bounds the response head the parser buffers.
+            .max_buf_size(MAX_RESPONSE_HEAD)
+            .handshake(TokioIo::new(stream)),
+    )
+    .await
+    .map_err(|_| Error::ConnectionTimeout)?
+    .map_err(Error::from)
+}
+
+/// Response headers stay in host memory as long as the plugin keeps the
+/// response; refuse a head over [`MAX_RESPONSE_HEAD`], counting each
+/// name once per value.
+fn check_response_head(headers: &http::HeaderMap) -> Result<(), Error> {
+    let head: usize = headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.len())
+        .sum();
+    if head > MAX_RESPONSE_HEAD {
+        return Err(Error::HttpResponseHeaderSectionSize(
+            u32::try_from(head).ok(),
+        ));
+    }
+    Ok(())
+}
+
 /// Connect to each checked address in turn, within one deadline;
 /// never a fresh lookup.
 async fn connect_any(
@@ -444,6 +486,10 @@ async fn send(
     ),
     Error,
 > {
+    // No tunnels: a `CONNECT` would go out with a path as its target.
+    if request.method() == http::Method::CONNECT {
+        return Err(Error::HttpRequestMethodInvalid);
+    }
     let uri = request.uri().clone();
     let authority = uri.authority().ok_or(Error::HttpRequestUriInvalid)?;
     // Userinfo would reach the `Host` header and the audit row; the
@@ -490,12 +536,7 @@ async fn send(
     }
 
     let stream = connect_any(addrs, deadline).await?;
-    let (mut sender, conn) = tokio::time::timeout_at(
-        deadline,
-        hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(stream)),
-    )
-    .await
-    .map_err(|_| Error::ConnectionTimeout)??;
+    let (mut sender, conn) = handshake(stream, deadline).await?;
 
     // The request line carries only the path; the authority went into
     // the `Host` header (`wasmtime-wasi-http` sets it).
@@ -512,6 +553,7 @@ async fn send(
             .await
             .map_err(|_| Error::ConnectionReadTimeout)?
             .map_err(Error::from)?;
+        check_response_head(response.headers())?;
         let mut timeout = tokio::time::interval(between_bytes_timeout);
         timeout.reset();
         Ok::<_, Error>(response.map(|incoming| IncomingBody { incoming, timeout }))
@@ -602,6 +644,18 @@ mod tests {
 
     fn plain(s: &str) -> bool {
         plain_authority(&s.parse().expect("authority"))
+    }
+
+    #[test]
+    fn response_heads_are_bounded_per_value() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-small", http::HeaderValue::from_static("1"));
+        assert!(super::check_response_head(&headers).is_ok());
+        let name = http::HeaderName::from_bytes(&[b'x'; 200]).unwrap();
+        for _ in 0..400 {
+            headers.append(name.clone(), http::HeaderValue::from_static("v"));
+        }
+        assert!(super::check_response_head(&headers).is_err());
     }
 
     #[test]
