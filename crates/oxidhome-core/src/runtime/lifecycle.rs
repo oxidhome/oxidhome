@@ -2173,8 +2173,8 @@ fn record_late_service_result(
     check: &ResultCheck,
     result: CommandResult,
 ) {
-    let result = check.apply(result);
-    if let Some(entry) = super::dispatcher::late_result_entry(ctx, command, &result) {
+    let checked = check.apply(result);
+    if let Some(entry) = super::dispatcher::late_result_entry(ctx, command, checked.as_ref()) {
         pending.record_entry(entry);
     }
 }
@@ -2541,7 +2541,7 @@ mod tests {
 
     /// Poll `fut` once.
     fn no_check() -> ResultCheck {
-        ResultCheck::new(|result| result)
+        ResultCheck::new(Ok)
     }
 
     async fn poll_once<F: std::future::Future + Unpin>(fut: &mut F) -> std::task::Poll<F::Output> {
@@ -2809,7 +2809,8 @@ mod tests {
     }
 
     /// A late result is checked against the command's `returns` as an
-    /// on-time one is: one that breaks it is recorded as `internal`.
+    /// on-time one is: one that breaks it is recorded as `internal`,
+    /// and `outcome_unknown` (the callee ran), not `rejected`.
     #[test]
     fn a_late_result_is_recorded_after_its_schema_check() {
         let (audit, pending) = journaled();
@@ -2819,7 +2820,7 @@ mod tests {
             target_instance: "inst-a".into(),
             target_service: "svc".into(),
         });
-        let broken = ResultCheck::new(|_| CommandResult::Err(WitError::Internal("schema".into())));
+        let broken = ResultCheck::new(|_| Err(WitError::Internal("schema".into())));
         record_late_service_result(&pending, &ctx, "go", &broken, CommandResult::Ok);
         let rows = rows_of(
             &audit,
@@ -2829,7 +2830,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].execution_outcome.as_deref(), Some("failed"));
         assert_eq!(rows[0].domain_error.as_deref(), Some("internal"));
-        assert_eq!(rows[0].command_outcome.as_deref(), Some("rejected"));
+        assert_eq!(rows[0].command_outcome.as_deref(), Some("outcome_unknown"));
     }
 
     /// A service call whose supervisor drops the reply: `NotRun` while

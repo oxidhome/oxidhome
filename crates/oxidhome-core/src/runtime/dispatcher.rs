@@ -498,7 +498,6 @@ pub(crate) async fn call_service(
                 ResultCheck::new(move |result| {
                     super::schema::find_command(&meta.info, &target, &name)
                         .and_then(|spec| super::schema::check_result(&target, spec, result))
-                        .unwrap_or_else(CommandResult::Err)
                 })
             };
             let outcome = target_handle
@@ -600,19 +599,21 @@ fn hop_path(callee_ctx: &InvocationContext, command: &str) -> Option<String> {
 }
 
 /// M2's `returns` check of a service call's reply, carried with the
-/// call so a late result is checked as an on-time one is: a reply that
-/// breaks the schema becomes `err(internal)`.
+/// call so a late result is checked as an on-time one is. `Err` is the
+/// violation of a reply that breaks the schema.
 #[derive(Clone)]
-pub(crate) struct ResultCheck(Arc<dyn Fn(CommandResult) -> CommandResult + Send + Sync>);
+pub(crate) struct ResultCheck(
+    Arc<dyn Fn(CommandResult) -> Result<CommandResult, WitError> + Send + Sync>,
+);
 
 impl ResultCheck {
     pub(crate) fn new(
-        check: impl Fn(CommandResult) -> CommandResult + Send + Sync + 'static,
+        check: impl Fn(CommandResult) -> Result<CommandResult, WitError> + Send + Sync + 'static,
     ) -> Self {
         Self(Arc::new(check))
     }
 
-    pub(crate) fn apply(&self, result: CommandResult) -> CommandResult {
+    pub(crate) fn apply(&self, result: CommandResult) -> Result<CommandResult, WitError> {
         (self.0)(result)
     }
 }
@@ -627,22 +628,34 @@ impl std::fmt::Debug for ResultCheck {
 /// `result` that reached the callee's supervisor after the caller
 /// stopped waiting. `None` for host-origin invocations, which stay out
 /// of the ledger as their hops do.
+///
+/// `result` is the reply after its schema check: an `Err` (the callee
+/// ran but broke its `returns`) is `failed` / `internal` with outcome
+/// `outcome_unknown`, since the callee may have acted.
 pub(crate) fn late_result_entry(
     callee_ctx: &InvocationContext,
     command: &str,
-    result: &CommandResult,
+    result: Result<&CommandResult, &WitError>,
 ) -> Option<AuditEntry> {
     let root = callee_ctx.root();
     if !root.is_external() {
         return None;
     }
     let path = hop_path(callee_ctx, command)?;
-    let (execution_outcome, domain_error) = result_columns(result);
-    // The H5 outcome names, as on `COMMAND` rows.
-    let outcome = match result {
-        CommandResult::Ok | CommandResult::OkWithState(_) => "completed",
-        CommandResult::Err(_) => "rejected",
-        CommandResult::Unknown(_) | CommandResult::Accepted => "outcome_unknown",
+    let ((execution_outcome, domain_error), outcome) = match result {
+        Err(violation) => (
+            (Some("failed"), Some(crate::api::wit_error_kind(violation))),
+            "outcome_unknown",
+        ),
+        // The H5 outcome names, as on `COMMAND` rows.
+        Ok(result) => (
+            result_columns(result),
+            match result {
+                CommandResult::Ok | CommandResult::OkWithState(_) => "completed",
+                CommandResult::Err(_) => "rejected",
+                CommandResult::Unknown(_) | CommandResult::Accepted => "outcome_unknown",
+            },
+        ),
     };
     Some(AuditEntry {
         id: 0,

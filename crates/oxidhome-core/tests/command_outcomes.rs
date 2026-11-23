@@ -617,8 +617,9 @@ async fn cancelled_service_caller_finalizes_its_hop_row() {
 /// never runs, even once the callee gets to it. The `hang` plugin's
 /// `gate` phase holds the callee in `hold` until the test releases it;
 /// a `mark` call queued behind it times out (`unavailable`, it did not
-/// run), and after the release the callee dequeues it, refuses it and
-/// goes on serving: its run counter stays unset.
+/// run), another is dropped by its caller, and after the release the
+/// callee dequeues both, refuses them and goes on serving: its run
+/// counter stays unset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // one linear end-to-end narrative
 async fn a_withdrawn_queued_service_call_never_runs() {
@@ -696,14 +697,27 @@ async fn a_withdrawn_queued_service_call_never_runs() {
         ),
         other => panic!("expected unavailable, got {other:?}"),
     }
+    // A caller dropped well before its deadline withdraws its call too:
+    // only the withdrawal, not the callee's own deadline check, keeps it
+    // from running once `hold` is released.
+    let dropped = call("mark", Duration::from_secs(60));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while engine.services().active_call_count(&service) < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "mark never queued");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    dropped.abort();
+    assert!(dropped.await.expect_err("aborted").is_cancelled());
+    // The withdrawn call released its in-flight refcount at once.
+    assert_eq!(engine.services().active_call_count(&service), 1);
 
-    // Release `hold`; the callee then dequeues the withdrawn `mark`.
+    // Release `hold`; the callee then dequeues the withdrawn calls.
     engine
         .kv()
         .set(&uuid, "gate", "release", Value::BoolVal(true))
         .expect("release");
     assert!(matches!(hold.await.expect("join"), Ok(CommandResult::Ok)));
-    // A call queued after it is served, so the withdrawn one was
+    // A call queued after them is served, so the withdrawn ones were
     // dequeued (and refused) by now.
     assert!(matches!(
         call("hold", Duration::from_secs(10)).await.expect("join"),

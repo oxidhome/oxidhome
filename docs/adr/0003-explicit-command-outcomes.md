@@ -121,7 +121,9 @@ Shipped in the second H5 follow-up PR.
 - **Late service results.** A service call's result that reaches the callee's supervisor after the caller stopped
   waiting (its hop row says `unknown`) is recorded the same way, as a `CALL_RESULT` row with the hop's `path` and
   `call_id`, the result's `execution_outcome` / `domain_error`, and `command_outcome` `completed`, `rejected` or
-  `outcome_unknown`. A refusal of a call that never ran needs none: the hop row says so.
+  `outcome_unknown`. The result is checked against the command's `returns` first, as an on-time one is; one that
+  breaks it is `failed` / `internal` with `outcome_unknown` (the callee ran). A refusal of a call that never ran needs
+  none: the hop row says so.
 - **Hop finalizes go through the command journal.** The H6 hop row's finalize, which a cancelled caller issues from a
   `Drop`, is queued on the command journal instead of a blocking task, so a runtime torn down mid-call can't cancel
   it, and shutdown drains it with the rest. Finalizes are bounded by the hops in flight (each one's intent row was

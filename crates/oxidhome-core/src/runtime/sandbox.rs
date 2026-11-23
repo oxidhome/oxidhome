@@ -578,6 +578,10 @@ impl host_sandboxes::Host for PluginState {
         // purge still purges at the next boot. The work runs in its own
         // task, so a cancelled guest call can't leave the sandbox marked
         // stopping but never stopped.
+        // Stopped at once, not behind the marker write: its parent's
+        // stop skips a sandbox already stopping. The reaper still waits
+        // for the marker before it purges.
+        handle.request_stop();
         let db = Arc::clone(&launcher.engine.db);
         let uuid = self.installation_uuid.to_string();
         let (persisted_tx, persisted) = tokio::sync::oneshot::channel();
