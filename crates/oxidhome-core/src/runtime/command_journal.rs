@@ -160,6 +160,8 @@ impl Shared {
 /// journal: the thread writes what is queued and exits.
 pub(crate) struct CommandJournal {
     shared: Arc<Shared>,
+    /// The database it writes to.
+    db: Arc<Db>,
 }
 
 impl std::fmt::Debug for CommandJournal {
@@ -180,10 +182,16 @@ impl CommandJournal {
         // A std thread, not a blocking task: tokio waits for blocking
         // tasks at runtime teardown, and a write stuck on the disk must
         // not hold that up. Shutdown drains it with a bound instead.
+        let thread_db = Arc::clone(&db);
         std::thread::Builder::new()
             .name("command-journal".into())
-            .spawn(move || run(&worker, &db))?;
-        Ok(Self { shared })
+            .spawn(move || run(&worker, &thread_db))?;
+        Ok(Self { shared, db })
+    }
+
+    /// Whether this journal writes to `db`.
+    pub(crate) fn writes_to(&self, db: &Arc<Db>) -> bool {
+        Arc::ptr_eq(&self.db, db)
     }
 
     /// Queue `row` for the `pending_command` table. `false` when the

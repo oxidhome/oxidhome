@@ -788,10 +788,10 @@ impl PendingCommands {
         self.journal.as_ref().is_some_and(|j| j.finalize(finalize))
     }
 
-    /// Whether audit rows go through a journal (the engine's table;
-    /// not the bare tables unit tests build).
-    pub(crate) fn has_journal(&self) -> bool {
-        self.journal.is_some()
+    /// Whether the journal writes to `log`'s database, so a row id of
+    /// `log` names the same row there.
+    pub(crate) fn journals_into(&self, log: &AuditLog) -> bool {
+        self.journal.as_ref().is_some_and(|j| j.writes_to(log.db()))
     }
 
     /// Expire every pending command of `owner_instance` as

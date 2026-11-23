@@ -466,7 +466,9 @@ async fn service_call_timeout_is_unknown_once_started_and_unavailable_while_queu
                         10,
                     )
                     .expect("audit");
-                if let Some(row) = rows.into_iter().find(|r| r.finalized_ms.is_some()) {
+                if let Some(row) = rows.into_iter().find(|r| {
+                    r.method == dispatcher::SERVICE_CALL_AUDIT_METHOD && r.finalized_ms.is_some()
+                }) {
                     return row;
                 }
                 assert!(
@@ -561,7 +563,9 @@ async fn cancelled_service_caller_finalizes_its_hop_row() {
                         10,
                     )
                     .expect("audit");
-                if let Some(row) = rows.into_iter().find(|r| r.finalized_ms.is_some()) {
+                if let Some(row) = rows.into_iter().find(|r| {
+                    r.method == dispatcher::SERVICE_CALL_AUDIT_METHOD && r.finalized_ms.is_some()
+                }) {
                     return row;
                 }
                 assert!(

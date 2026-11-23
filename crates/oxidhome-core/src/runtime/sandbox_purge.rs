@@ -29,10 +29,12 @@ use crate::state::{BlobStore, Db, KvStore};
 /// left running. Past it the purge is left to the next boot.
 pub(crate) const STORAGE_OP_DRAIN: Duration = Duration::from_secs(5);
 
-/// KV and blob operations in flight, per instance id.
+/// KV and blob operations in flight, per `(installation_uuid,
+/// instance_id)`: the key the purge and its marker use, so another
+/// installation's stalled write under a reused id doesn't hold it up.
 #[derive(Debug, Default)]
 pub(crate) struct StorageOps {
-    counts: Mutex<HashMap<String, usize>>,
+    counts: Mutex<HashMap<Removal, usize>>,
     idle: tokio::sync::Notify,
 }
 
@@ -42,32 +44,43 @@ pub(crate) struct StorageOps {
 #[derive(Debug)]
 pub(crate) struct StorageOpGuard {
     ops: Arc<StorageOps>,
-    instance_id: String,
+    key: Removal,
 }
 
 impl StorageOps {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Removal, usize>> {
         self.counts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Count an operation for `instance_id` until the guard drops.
-    pub(crate) fn enter(self: &Arc<Self>, instance_id: &str) -> StorageOpGuard {
-        *self.lock().entry(instance_id.to_owned()).or_default() += 1;
+    /// Count an operation for the instance until the guard drops.
+    pub(crate) fn enter(
+        self: &Arc<Self>,
+        installation_uuid: &str,
+        instance_id: &str,
+    ) -> StorageOpGuard {
+        let key = (installation_uuid.to_owned(), instance_id.to_owned());
+        *self.lock().entry(key.clone()).or_default() += 1;
         StorageOpGuard {
             ops: Arc::clone(self),
-            instance_id: instance_id.to_owned(),
+            key,
         }
     }
 
-    fn in_flight(&self, instance_id: &str) -> usize {
-        self.lock().get(instance_id).copied().unwrap_or(0)
+    fn in_flight(&self, key: &Removal) -> usize {
+        self.lock().get(key).copied().unwrap_or(0)
     }
 
-    /// Wait up to `timeout` until `instance_id` has no operation in
+    /// Wait up to `timeout` until the instance has no operation in
     /// flight. `true` when it has none.
-    pub(crate) async fn wait_idle(&self, instance_id: &str, timeout: Duration) -> bool {
+    pub(crate) async fn wait_idle(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+        timeout: Duration,
+    ) -> bool {
+        let key = (installation_uuid.to_owned(), instance_id.to_owned());
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.idle.notified();
@@ -75,7 +88,7 @@ impl StorageOps {
             // Registered before the check, so a guard dropping in
             // between still wakes this wait.
             notified.as_mut().enable();
-            if self.in_flight(instance_id) == 0 {
+            if self.in_flight(&key) == 0 {
                 return true;
             }
             // Other instances' operations wake this too; they can't
@@ -83,7 +96,7 @@ impl StorageOps {
             if tokio::time::Instant::now() >= deadline
                 || tokio::time::timeout_at(deadline, notified).await.is_err()
             {
-                return self.in_flight(instance_id) == 0;
+                return self.in_flight(&key) == 0;
             }
         }
     }
@@ -92,10 +105,10 @@ impl StorageOps {
 impl Drop for StorageOpGuard {
     fn drop(&mut self) {
         let mut counts = self.ops.lock();
-        if let Some(n) = counts.get_mut(&self.instance_id) {
+        if let Some(n) = counts.get_mut(&self.key) {
             *n -= 1;
             if *n == 0 {
-                counts.remove(&self.instance_id);
+                counts.remove(&self.key);
                 drop(counts);
                 self.ops.idle.notify_waiters();
             }
@@ -226,19 +239,21 @@ mod tests {
     #[tokio::test]
     async fn the_purge_waits_for_operations_in_flight() {
         let ops = Arc::new(StorageOps::default());
-        let guard = ops.enter("a~s");
-        let other = ops.enter("b");
-        assert!(!ops.wait_idle("a~s", Duration::from_millis(20)).await);
+        let guard = ops.enter("u", "a~s");
+        let other = ops.enter("u", "b");
+        assert!(!ops.wait_idle("u", "a~s", Duration::from_millis(20)).await);
+        // Another installation's instance of the same id doesn't count.
+        assert!(ops.wait_idle("v", "a~s", Duration::ZERO).await);
         let release = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
             drop(guard);
         });
-        assert!(ops.wait_idle("a~s", Duration::from_secs(5)).await);
+        assert!(ops.wait_idle("u", "a~s", Duration::from_secs(5)).await);
         release.await.unwrap();
         // Another instance's operation doesn't count.
-        assert_eq!(ops.in_flight("b"), 1);
+        assert_eq!(ops.in_flight(&("u".into(), "b".into())), 1);
         drop(other);
-        assert!(ops.wait_idle("b", Duration::ZERO).await);
+        assert!(ops.wait_idle("u", "b", Duration::ZERO).await);
     }
 
     #[test]

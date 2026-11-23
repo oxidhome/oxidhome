@@ -820,12 +820,15 @@ impl HopAudit {
             execution_outcome,
             domain_error,
         };
-        if let Some(journal) = self.journal.filter(|j| j.has_journal()) {
+        // Only through a journal on the intent's own ledger: a row id
+        // means nothing in another database.
+        if let Some(journal) = self.journal.filter(|j| j.journals_into(&self.log)) {
             // A closed or full journal leaves the row `pending` (logged).
             let _ = journal.finalize_audit_row(finalize);
             return;
         }
-        // No journal (unit tests): a detached blocking write.
+        // No journal on this ledger (unit tests): a detached blocking
+        // write.
         let log = self.log;
         let write = move || {
             if let Err(err) = log.finalize(

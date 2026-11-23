@@ -611,7 +611,13 @@ impl host_sandboxes::Host for PluginState {
             let _ = persisted_tx.send(write);
             let _ = handle.stop().await;
         });
-        match persisted.await {
+        // Bounded: a database writer stalled on another write can't park
+        // the parent here; the task still finishes the marker, and the
+        // reaper waits for it.
+        let persisted = tokio::time::timeout(super::sandbox_purge::STORAGE_OP_DRAIN, persisted)
+            .await
+            .unwrap_or_else(|_| Ok(Err("timed out persisting it".into())));
+        match persisted {
             Ok(Ok(())) => Ok(()),
             // The sandbox is stopping and the reaper still tries the
             // purge, but a crash before it would leave the storage for

@@ -1487,7 +1487,7 @@ impl Engine {
         }
         if !self
             .storage_ops
-            .wait_idle(instance_id, sandbox_purge::STORAGE_OP_DRAIN)
+            .wait_idle(&removal.0, instance_id, sandbox_purge::STORAGE_OP_DRAIN)
             .await
         {
             tracing::error!(

@@ -659,7 +659,7 @@ impl PluginState {
     fn storage_op(&self) -> Option<StorageOpGuard> {
         self.storage_ops
             .as_ref()
-            .map(|ops| ops.enter(&self.instance_id))
+            .map(|ops| ops.enter(&self.installation_uuid, &self.instance_id))
     }
 }
 
@@ -2385,7 +2385,7 @@ mod tests {
         for blob in [false, true] {
             let (release, gate) = std::sync::mpsc::channel::<()>();
             let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
-            let op = Some(ops.enter("p~s"));
+            let op = Some(ops.enter("u", "p~s"));
             let task = if blob {
                 tokio::spawn(async move {
                     let _ = blob_op(op, move || {
@@ -2410,12 +2410,12 @@ mod tests {
             task.abort();
             let _ = task.await;
             assert!(
-                !ops.wait_idle("p~s", Duration::from_millis(50)).await,
+                !ops.wait_idle("u", "p~s", Duration::from_millis(50)).await,
                 "blob={blob}: released on cancel"
             );
             release.send(()).unwrap();
             assert!(
-                ops.wait_idle("p~s", Duration::from_secs(5)).await,
+                ops.wait_idle("u", "p~s", Duration::from_secs(5)).await,
                 "blob={blob}"
             );
         }
