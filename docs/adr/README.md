@@ -19,3 +19,4 @@ free number.
 | [0007](0007-0x-publication-policy.md)                 | 0.x publication policy and the unpublished WIT baseline             | accepted | 2026-11-22 |
 | [0008](0008-sqlite-connection-model.md)               | One SQLite writer with pooled readers and writer priority (M6)      | accepted | 2026-11-22 |
 | [0009](0009-durable-device-state.md)                  | Durable device-state projection and plugin state reads (H2)         | accepted | 2026-11-22 |
+| [0010](0010-authorization-model.md)                   | Authorization model: sensitive actions and per-resource permissions | proposed | 2026-11-22 |
