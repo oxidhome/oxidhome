@@ -991,6 +991,9 @@ pub struct Db {
     /// reclaim legacy pre-migration-14 blob trees. `0` for a fresh
     /// (empty) database.
     pre_open_user_version: i64,
+    /// Highest `audit_event` id when the first audit handle of this
+    /// process opened (see [`Self::audit_boot_floor`]).
+    audit_boot_floor: std::sync::OnceLock<i64>,
 }
 
 /// The full pathname `SQLite` resolved for the `main` database of
@@ -1171,6 +1174,7 @@ impl Db {
             checkpointer: None,
             policy,
             pre_open_user_version,
+            audit_boot_floor: std::sync::OnceLock::new(),
         };
         db.apply_migrations()?;
         Ok(db)
@@ -1345,6 +1349,22 @@ impl Db {
             _ticket: ticket,
         };
         f(&mut conn).map(Some)
+    }
+
+    /// The highest `audit_event` id before this process wrote any audit
+    /// row, read once per `Db` (so per process) by the first caller:
+    /// a pending row above it belongs to this process and may still be
+    /// finalized. `0` if the read fails, which keeps every pending
+    /// row.
+    pub(crate) fn audit_boot_floor(&self) -> i64 {
+        *self.audit_boot_floor.get_or_init(|| {
+            self.read(|c| {
+                c.query_row("SELECT COALESCE(MAX(id), 0) FROM audit_event", [], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap_or(0)
+        })
     }
 
     /// Wake every caller waiting in

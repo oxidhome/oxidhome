@@ -982,13 +982,25 @@ pub fn invalidate_cursors_after_restore(conn: &rusqlite::Connection) -> rusqlite
              (SELECT COUNT(*) FROM device_state), holes_json, writer \
              FROM device_state_meta WHERE id = 1",
             [],
+            // Damaged columns (a BLOB hole list, a TEXT revision) pass
+            // the integrity check and the boot recovers from them, so
+            // the restore must not fail on them either.
             |row| {
+                use rusqlite::types::Value;
+                let int = |v: Value| match v {
+                    Value::Integer(n) => n,
+                    _ => 0,
+                };
+                let text = |v: Value| match v {
+                    Value::Text(s) => Some(s),
+                    _ => None,
+                };
                 Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
+                    int(row.get(0)?),
+                    int(row.get(1)?),
+                    int(row.get(2)?),
+                    text(row.get(3)?),
+                    text(row.get(4)?).unwrap_or_default(),
                 ))
             },
         )
@@ -1003,27 +1015,30 @@ pub fn invalidate_cursors_after_restore(conn: &rusqlite::Connection) -> rusqlite
     // Re-mark the row so the next boot accepts the new epoch and
     // watermark. A hole list that doesn't decode stays as it is: the
     // boot treats it as damage, which expires every cursor too.
-    let holes_json = match serde_json::from_str::<StoredRanges>(&holes_json) {
-        Ok(StoredRanges::Marked { holes, .. } | StoredRanges::Legacy(holes)) => {
+    let decoded = holes_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<StoredRanges>(j).ok());
+    let holes_json = match decoded {
+        Some(StoredRanges::Marked { holes, .. } | StoredRanges::Legacy(holes)) => {
             let holes: Vec<(u64, u64)> = holes
                 .into_iter()
                 .map(|StoredHole(lo, hi)| (lo, hi))
                 .collect();
-            encode_ranges(
+            let json = encode_ranges(
                 &epoch,
                 to_u64(revision),
                 to_u64(evicted),
                 &holes,
                 &writer,
                 u64::try_from(rows).unwrap_or(0),
-            )
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?
+            );
+            Some(json.map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?)
         }
-        Err(_) => holes_json,
+        None => None,
     };
     conn.execute(
-        "UPDATE device_state_meta SET epoch = ?1, evicted_through = ?2, holes_json = ?3 \
-         WHERE id = 1",
+        "UPDATE device_state_meta SET epoch = ?1, evicted_through = ?2, \
+         holes_json = COALESCE(?3, holes_json) WHERE id = 1",
         params![epoch, evicted, holes_json],
     )?;
     Ok(())

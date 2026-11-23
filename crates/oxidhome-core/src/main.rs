@@ -218,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
     // boundary; the loader will fail hard if the caller-supplied
     // dir happens to shadow an installed `plugin_id` at a
     // different path.
-    let _plugin_handle = if let Some(plugin_dir) = std::env::args_os().nth(1) {
+    let plugin_handle = if let Some(plugin_dir) = std::env::args_os().nth(1) {
         let plugin_dir = PathBuf::from(plugin_dir);
         let instance_id = plugin_dir
             .file_name()
@@ -337,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
     // running the full shutdown-cleanup sequence, so
     // systemd / runit still see a non-zero exit and can
     // restart.
+    close_engine((engine, log_store, plugin_handle)).await;
     exit_holding_lock(state_dir_lock, serve_error.map_or(Ok(()), Err))
 }
 
@@ -392,19 +393,36 @@ async fn stop_retention(tasks: RetentionTasks) {
 /// Bound on the H2 deny-audit drain at shutdown.
 const SHUTDOWN_AUDIT_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 
-/// H2 follow-up: write the `get-state` deny rows the stopped plugins
-/// queued, within [`SHUTDOWN_AUDIT_DRAIN_DEADLINE`].
+/// Write the `deny` audit rows the stopped plugins queued (H2
+/// `get-state`, `read-events`) within [`SHUTDOWN_AUDIT_DRAIN_DEADLINE`].
+/// `COMMAND` resolutions are flushed by the command journal's own close
+/// (`close_state_writers`).
 async fn drain_state_read_audit(engine: &Engine) {
     let engine = engine.clone();
-    let drained = tokio::task::spawn_blocking(move || {
+    let drain = tokio::task::spawn_blocking(move || {
         engine.drain_state_read_audit(SHUTDOWN_AUDIT_DRAIN_DEADLINE)
-    })
-    .await
-    .unwrap_or(false);
+    });
+    // The outer bound covers a blocking pool too busy to start the
+    // drain.
+    let drained = tokio::time::timeout(SHUTDOWN_AUDIT_DRAIN_DEADLINE * 2, drain)
+        .await
+        .is_ok_and(|joined| joined.unwrap_or(false));
     if !drained {
-        tracing::warn!(
-            "state-read audit: deny rows still queued at the shutdown deadline are lost"
-        );
+        tracing::warn!("audit: rows still being written at the shutdown deadline are lost");
+    }
+}
+
+/// Drop the engine handles so the database closes normally (final WAL
+/// checkpoint) before [`exit_holding_lock`], on the blocking pool and
+/// within [`SHUTDOWN_FLUSH_BUDGET`]: a close stuck on the disk is left
+/// to the process exit instead of holding it.
+async fn close_engine(parts: impl Send + 'static) {
+    let close = tokio::task::spawn_blocking(move || drop(parts));
+    if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, close)
+        .await
+        .is_err()
+    {
+        tracing::warn!("closing the database did not finish within the shutdown budget");
     }
 }
 
@@ -813,6 +831,7 @@ async fn run_stdio() -> anyhow::Result<()> {
     stop_retention(retention).await;
     close_state_writers(&engine).await;
 
+    tracing::info!("oxidhome mcp-stdio session closed");
     // Flush the log writer before returning so the tail of the
     // session lands in `<state_dir>/oxidhome.db`. Matches the
     // daemon's happy-path drain (round-2 P2 on PR #143).
@@ -825,9 +844,9 @@ async fn run_stdio() -> anyhow::Result<()> {
         );
     }
 
-    tracing::info!("oxidhome mcp-stdio session closed");
     // Propagate the serve error AFTER cleanup so cleanup still
     // runs on a mid-session transport failure.
+    close_engine((engine, log_store)).await;
     exit_holding_lock(
         state_dir_lock,
         serve_result.context("MCP stdio session failed"),

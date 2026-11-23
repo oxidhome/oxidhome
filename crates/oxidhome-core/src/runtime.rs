@@ -1438,10 +1438,12 @@ impl Engine {
         tasks
     }
 
-    /// H2 follow-up: wait up to `timeout` for the `host-state` deny
-    /// rows still queued for the audit worker to be written. Called
-    /// at shutdown after every supervised instance stopped; returns
-    /// whether the queue drained. Blocking.
+    /// Wait up to `timeout` for the `deny` audit rows still queued
+    /// for the background audit worker (H2 `get-state`, `read-events`
+    /// refusals) to be written. Called at shutdown after every
+    /// supervised instance stopped; returns whether the queue drained.
+    /// `COMMAND` resolutions go through the command journal instead
+    /// ([`Self::close_command_journal`]). Blocking.
     #[must_use]
     pub fn drain_state_read_audit(&self, timeout: std::time::Duration) -> bool {
         state_read::drain_state_read_audit(timeout)

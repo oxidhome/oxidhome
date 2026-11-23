@@ -257,9 +257,8 @@ fn scrub_opt(text: Option<&str>) -> Option<std::borrow::Cow<'_, str>> {
 /// `Arc<Db>`.
 pub struct AuditLog {
     db: Arc<Db>,
-    /// Highest row id when this handle was created: a pending row
-    /// above it was written by this process and may still be
-    /// finalized, so retention keeps it.
+    /// [`Db::audit_boot_floor`]: a pending row above it was written by
+    /// this process and may still be finalized, so retention keeps it.
     boot_floor: i64,
 }
 
@@ -268,19 +267,17 @@ impl AuditLog {
     /// the migration list in [`super::db`]; no per-instance setup
     /// runs here.
     ///
-    /// Reads the highest row id, which retention uses to tell this
-    /// process's pending rows from abandoned ones; if that read fails
-    /// every pending row is kept.
+    /// Reads the database's audit boot floor (the highest row id
+    /// before this process wrote any), which retention uses to tell
+    /// this process's pending rows from abandoned ones; if that read
+    /// fails every pending row is kept.
     #[must_use]
     pub fn new(db: Arc<Db>) -> Self {
-        let boot_floor = db
-            .read(|c| {
-                c.query_row("SELECT COALESCE(MAX(id), 0) FROM audit_event", [], |r| {
-                    r.get(0)
-                })
-            })
-            .unwrap_or(0);
-        Self { db, boot_floor }
+        let boot_floor = db.audit_boot_floor();
+        Self {
+            db,
+            boot_floor,
+        }
     }
 
     /// Spawn the periodic audit retention task on the current tokio
@@ -295,7 +292,13 @@ impl AuditLog {
     ///   never by the row limit;
     /// - an `accepted` device-command row (H5) whose `COMMAND`
     ///   resolution row (same `call_id` and `command_id`) hasn't been
-    ///   written yet.
+    ///   written yet, and a `COMMAND` row while its `accepted` row is
+    ///   still there (so the pair goes accepted-first, even when a
+    ///   clock rollback made the resolution look older).
+    ///
+    /// Kept rows still count toward `max_rows`: the limit picks the
+    /// newest rows by id, and kept rows older than that are kept on
+    /// top of it.
     ///
     /// The newest row is never deleted, so ids are not reused. `None`
     /// with no limits.
@@ -691,7 +694,10 @@ const AUDIT_RETENTION_DUE: &str = "\
     AND NOT (finalized_ms IS NULL AND (id > ?3 OR ?1 IS NULL OR intent_ms >= ?1)) \
     AND NOT (command_outcome IS 'accepted' AND NOT EXISTS ( \
         SELECT 1 FROM audit_event AS r WHERE r.call_id = audit_event.call_id \
-        AND r.method = 'COMMAND' AND r.command_id = audit_event.command_id))";
+        AND r.method = 'COMMAND' AND r.command_id = audit_event.command_id)) \
+    AND NOT (method = 'COMMAND' AND EXISTS ( \
+        SELECT 1 FROM audit_event AS a WHERE a.call_id = audit_event.call_id \
+        AND a.command_outcome = 'accepted' AND a.command_id = audit_event.command_id))";
 
 impl crate::state::retention::RetentionTarget for AuditLog {
     type Plan = crate::state::retention::IdWindowPlan;

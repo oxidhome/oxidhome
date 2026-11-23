@@ -340,8 +340,8 @@ async fn blocking<R: Send + 'static>(
 
 /// Handle to one task started by [`crate::Engine::spawn_retention`] or
 /// [`super::EventLog::spawn_retention`]. Dropping it without
-/// [`Self::shutdown`] stops the task after its current chunk, without
-/// waiting for it.
+/// [`Self::shutdown`] stops the task the same way, without waiting for
+/// it.
 #[derive(Debug)]
 pub struct RetentionTask {
     stop: tokio::sync::watch::Sender<bool>,
@@ -360,13 +360,19 @@ impl RetentionTask {
     /// [`Self::request_stop`], then wait for the task. A chunk that
     /// already holds the writer finishes first (each chunk is one
     /// bounded transaction).
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.request_stop();
-        if let Err(join) = self.handle.await
+        if let Err(join) = (&mut self.handle).await
             && join.is_panic()
         {
             std::panic::resume_unwind(join.into_panic());
         }
+    }
+}
+
+impl Drop for RetentionTask {
+    fn drop(&mut self) {
+        self.request_stop();
     }
 }
 
@@ -649,11 +655,6 @@ mod tests {
         assert_eq!(ids(&db, "log_event"), [newest]);
     }
 
-    fn audit() -> (Arc<Db>, Arc<AuditLog>) {
-        let db = Arc::new(Db::open_in_memory().expect("db"));
-        (Arc::clone(&db), Arc::new(AuditLog::new(db)))
-    }
-
     fn row(method: &str, call: Option<&str>, command: Option<(&str, &str)>) -> AuditEntry {
         AuditEntry {
             id: 0,
@@ -682,12 +683,24 @@ mod tests {
     /// only.
     #[test]
     fn audit_keeps_rows_unfinished_writes_need() {
-        let (db, _) = audit();
+        let dir = std::env::temp_dir().join(format!(
+            "oxidhome-audit-retention-{}-{}",
+            std::process::id(),
+            super::super::event_log::now_unix_ms()
+        ));
         // Written by an "earlier process": abandoned pending rows.
-        let log0 = AuditLog::new(Arc::clone(&db));
-        let old_pending = log0.record_intent(&row("GET", None, None)).expect("intent");
-        let old_pending_2 = log0.record_intent(&row("GET", None, None)).expect("intent");
-        // This process.
+        let (old_pending, old_pending_2) = {
+            let db = Arc::new(Db::open_file(&dir).expect("db"));
+            let log0 = AuditLog::new(Arc::clone(&db));
+            (
+                log0.record_intent(&row("GET", None, None)).expect("intent"),
+                log0.record_intent(&row("GET", None, None)).expect("intent"),
+            )
+        };
+        // This process: a second handle on its database shares the
+        // floor.
+        let db = Arc::new(Db::open_file(&dir).expect("db"));
+        let first = AuditLog::new(Arc::clone(&db));
         let log = Arc::new(AuditLog::new(Arc::clone(&db)));
         let done = log.record_completed(&row("GET", None, None)).expect("row");
         let pending = log.record_intent(&row("GET", None, None)).expect("intent");
@@ -697,7 +710,7 @@ mod tests {
         let accepted_resolved = log
             .record_completed(&row("POST", Some("call-b"), Some(("cmd-b", "accepted"))))
             .expect("row");
-        let resolution = log
+        let _resolution = log
             .record_completed(&row(
                 "COMMAND",
                 Some("call-b"),
@@ -725,7 +738,7 @@ mod tests {
         assert!(kept.contains(&as_i64(accepted)), "{kept:?}");
         assert!(!kept.contains(&as_i64(done)), "{kept:?}");
         assert!(!kept.contains(&as_i64(accepted_resolved)), "{kept:?}");
-        assert!(!kept.contains(&as_i64(resolution)), "{kept:?}");
+        // `resolution` waits for its accepted row, gone this pass.
         assert!(kept.contains(&as_i64(newest)), "{kept:?}");
         // By age: the earlier process's old pending row goes, the
         // fresh one and this process's pending row stay.
@@ -739,7 +752,36 @@ mod tests {
                 as_i64(newest)
             ]
         );
-        // Once the accepted command is resolved, its row can go.
+        // A resolution that looks older than its accepted row (clock
+        // rollback) waits for it, so the accepted row never loses its
+        // resolution.
+        let late = log
+            .record_completed(&row("POST", Some("call-c"), Some(("cmd-c", "accepted"))))
+            .expect("row");
+        let early_resolution = log
+            .record_completed(&row(
+                "COMMAND",
+                Some("call-c"),
+                Some(("cmd-c", "completed")),
+            ))
+            .expect("row");
+        log.record_completed(&row("GET", None, None)).expect("row");
+        db.write(|c| {
+            c.execute(
+                "UPDATE audit_event SET intent_ms = 90000 WHERE id = ?1",
+                [as_i64(late)],
+            )?;
+            c.execute(
+                "UPDATE audit_event SET intent_ms = 1000 WHERE id = ?1",
+                [as_i64(early_resolution)],
+            )
+        })
+        .expect("rollback");
+        run_pass_blocking(&*log, &policy(Some(10_000), None), 100_000).expect("pass");
+        let kept = ids(&db, "audit_event");
+        assert!(kept.contains(&as_i64(early_resolution)), "{kept:?}");
+        // Once the accepted command is resolved, its row can go, and
+        // then its resolution.
         log.record_completed(&row(
             "COMMAND",
             Some("call-a"),
@@ -748,6 +790,8 @@ mod tests {
         .expect("row");
         run_pass_blocking(&*log, &policy(Some(10_000), None), 100_000).expect("pass");
         assert!(!ids(&db, "audit_event").contains(&as_i64(accepted)));
+        drop((log, first, db));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A stop request cancels a chunk queued behind a hung writer, so
