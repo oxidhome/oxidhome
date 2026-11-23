@@ -6526,8 +6526,8 @@ async fn connect_device_state_rpcs_mirror_rest() {
 /// still lands as a `403` / `permission_denied` whose audit row names
 /// the missing scope in `required_scope`, exactly as the per-route
 /// scope checks recorded it. A token holding only `events:tail`
-/// exercises one route per action, including the replay branch of the
-/// tail (which needs `events:read` on top).
+/// exercises one route per action; the tail's replay branch is covered
+/// in `events_resume.rs`.
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn authorize_denials_record_the_missing_scope_on_every_surface() {

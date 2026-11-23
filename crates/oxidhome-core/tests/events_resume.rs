@@ -205,6 +205,47 @@ async fn ws_tail_cursor_requires_events_read() {
     server.abort();
 }
 
+/// The replay refusal on both tail transports lands in the audit
+/// ledger as a deny naming `events:read`, the scope the cursor needs.
+#[tokio::test(flavor = "multi_thread")]
+async fn tail_cursor_denials_audit_events_read() {
+    let engine = Engine::new().expect("engine");
+    let token = engine
+        .auth_tokens()
+        .create("tail-only", br#"["events:tail"]"#)
+        .expect("token");
+    let (addr, server) = serve_engine(&engine).await;
+    assert!(
+        ws_connect(addr, "?after_id=0", &token.plaintext)
+            .await
+            .is_err()
+    );
+    server.abort();
+    let (_, body) = connect_tail(&engine, br#"["events:tail"]"#, br#"{"afterId":"0"}"#).await;
+    let _ = connect_messages(body, 1).await;
+
+    for path in [
+        "/api/v1/events/tail",
+        "/oxidhome.v1.EventsService/TailEvents",
+    ] {
+        let mut row = None;
+        for _ in 0..50 {
+            let rows = engine
+                .audit_log()
+                .query(&oxidhome_core::state::AuditQuery::default(), 64)
+                .expect("audit query");
+            row = rows.into_iter().find(|r| r.path == path);
+            if row.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let row = row.unwrap_or_else(|| panic!("no audit row for {path}"));
+        assert_eq!(row.decision, "deny", "{path}: {row:?}");
+        assert_eq!(row.required_scope.as_deref(), Some("events:read"), "{path}");
+    }
+}
+
 fn connect_envelope(payload: &[u8]) -> Vec<u8> {
     let mut frame = vec![0u8];
     frame.extend_from_slice(&u32::try_from(payload.len()).expect("fits").to_be_bytes());

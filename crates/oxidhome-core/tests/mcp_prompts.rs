@@ -303,6 +303,35 @@ async fn get_prompt_summarize_today_requires_both_scopes() {
     );
 }
 
+/// `summarize_today` checks `events:read` first, then `logs:read`:
+/// the denial names the first missing scope in that order.
+#[tokio::test(flavor = "current_thread")]
+async fn get_prompt_summarize_today_names_the_first_missing_scope() {
+    let engine = Engine::new().expect("engine");
+    for (label, scopes, missing) in [
+        ("events-only", &["events:read"][..], "logs:read"),
+        ("neither", &["devices:list"][..], "events:read"),
+    ] {
+        let bearer = mint_bearer_with_scopes(&engine, label, scopes);
+        let (router, session) = handshake(build_router(engine.clone()), &bearer).await;
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "prompts/get",
+            json!({"name": "summarize_today"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32001, "{label}: {response}");
+        let message = response["error"]["message"].as_str().expect("message");
+        assert_eq!(
+            message,
+            format!("scope `{missing}` required for prompt `summarize_today`"),
+            "{label}",
+        );
+    }
+}
+
 /// 14.6: `draft_automation` requires `devices:list` AND both
 /// `trigger` + `action` arguments. Missing arguments land as
 /// `-32602`; missing scope as `-32001`. (Round-2 P1 on PR #135

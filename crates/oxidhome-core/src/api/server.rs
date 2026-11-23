@@ -1590,6 +1590,7 @@ async fn start_plugin_instance(
     body: Option<Json<StartBody>>,
 ) -> Result<Json<StartedRow>, PluginLifecycleError> {
     let body = body.map_or_default(|Json(b)| b);
+    require(&ctx, Action::InstanceStart, &Resource::instances())?;
     require(
         &ctx,
         Action::InstanceStart,
@@ -1684,6 +1685,7 @@ async fn stop_plugin_instances(
     body: Option<Json<StopBody>>,
 ) -> Result<Json<StoppedRow>, PluginLifecycleError> {
     let body = body.map_or_default(|Json(b)| b);
+    require(&ctx, Action::InstanceStop, &Resource::instances())?;
     require(
         &ctx,
         Action::InstanceStop,
