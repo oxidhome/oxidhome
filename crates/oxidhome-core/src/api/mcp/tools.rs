@@ -1515,7 +1515,7 @@ fn events_history_schema() -> serde_json::Map<String, JsonValue> {
                 "type": "integer",
                 "minimum": 0,
                 "maximum": i64::MAX,
-                "description": "Cursor: return only rows with `id > after_id`. Pairs with tail-client resume so a reconnect after N ms doesn't gap or duplicate rows.",
+                "description": "Cursor: return only rows with `id > after_id`. Pairs with tail-client resume so a reconnect after N ms doesn't gap or duplicate rows. If rows right after the cursor were pruned by retention (or the cursor is ahead of history), the call fails with a `cursor_expired` error; `0` never expires.",
             },
             "before_id": {
                 "type": "integer",
@@ -1680,11 +1680,12 @@ async fn events_history_call(
     let event_log = engine.event_log();
     let join = tokio::task::spawn_blocking(move || {
         let _guard = query_permit;
-        event_log.query(&event_query, limit_usize)
+        query_checking_cursor(&event_log, &event_query, limit_usize)
     })
     .await;
     let rows = match join {
-        Ok(Ok(rows)) => rows,
+        Ok(Ok(Ok(rows))) => rows,
+        Ok(Ok(Err(expired))) => return cursor_expired_outcome(expired),
         Ok(Err(err)) => {
             tracing::error!(target: "mcp.tool.events.history", %err, "event query failed");
             return ToolOutcome::Internal("event query failed".into());
@@ -1710,6 +1711,45 @@ async fn events_history_call(
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
         EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+/// H4: run an event query and check that its `after_id` cursor (if
+/// any) is still resumable. An expired cursor is the inner `Err`.
+/// The check runs after the query: rows pruned before the query ran
+/// are seen by it, rows pruned later didn't affect the result.
+fn query_checking_cursor(
+    event_log: &crate::state::EventLog,
+    query: &crate::state::EventQuery,
+    limit: usize,
+) -> Result<
+    Result<Vec<crate::state::HistoricalEvent>, crate::state::CursorExpired>,
+    crate::state::EventLogError,
+> {
+    let rows = event_log.query(query, limit)?;
+    if let Some(after_id) = query.after_id
+        && let Err(expired) = event_log.resolve_cursor(after_id)?
+    {
+        return Ok(Err(expired));
+    }
+    Ok(Ok(rows))
+}
+
+/// H4: `after_id` was pruned by retention (or is ahead of history).
+/// The structured body matches the tail's `cursor_expired` frame.
+fn cursor_expired_outcome(expired: crate::state::CursorExpired) -> ToolOutcome {
+    ToolOutcome::ExecErr {
+        message: format!(
+            "cursor_expired: after_id {} is no longer in history (oldest {}, head {}); \
+             resync from a state snapshot and resume from head_id",
+            expired.after_id,
+            expired
+                .oldest_id
+                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            expired.head_id,
+        ),
+        structured: Some(serde_json::json!({ "cursor_expired": expired })),
+        domain_kind: Some("cursor-expired"),
     }
 }
 
@@ -1796,7 +1836,7 @@ fn events_subscribe_schema() -> serde_json::Map<String, JsonValue> {
                 "type": "integer",
                 "minimum": 0,
                 "maximum": i64::MAX,
-                "description": "Cursor: return only rows with `id > after_id`, oldest first. Client resumes with the last returned event's `id`. Omitted = start at the oldest retained matching row.",
+                "description": "Cursor: return only rows with `id > after_id`, oldest first. Client resumes with the last returned event's `id`. Omitted or `0` = start at the oldest retained matching row. A cursor whose next row was pruned by retention fails with a `cursor_expired` error: resync from a state snapshot and resume from its `head_id`.",
             },
             "limit": {
                 "type": "integer",
@@ -1989,6 +2029,10 @@ async fn events_subscribe_call(
     // bounds detached tasks at `EVENTS_SUBSCRIBE_QUERY_MAX`.
     // Same cancellation-safety pattern used by the shared
     // `STORE_QUERY_SEMAPHORE`.
+    //
+    // H4: every query checks the cursor, so a cursor pruned by
+    // retention (initially or while waiting) is reported as
+    // `cursor_expired` instead of silently skipping rows.
     let engine_for_queries = engine.clone();
     let query_once =
         |event_query: crate::state::EventQuery| -> Result<tokio::task::JoinHandle<_>, ()> {
@@ -2000,7 +2044,7 @@ async fn events_subscribe_call(
             let event_log = engine_for_queries.event_log();
             Ok(tokio::task::spawn_blocking(move || {
                 let _guard = query_permit;
-                event_log.query(&event_query, limit_usize)
+                query_checking_cursor(&event_log, &event_query, limit_usize)
             }))
         };
 
@@ -2019,7 +2063,12 @@ async fn events_subscribe_call(
         ));
     };
     let rows = match initial_join.await {
-        Ok(Ok(rows)) => rows,
+        Ok(Ok(Ok(rows))) => rows,
+        Ok(Ok(Err(expired))) => {
+            drop(subscription);
+            drop(inflight_permit);
+            return cursor_expired_outcome(expired);
+        }
         Ok(Err(err)) => {
             drop(subscription);
             drop(inflight_permit);
@@ -2095,7 +2144,12 @@ async fn events_subscribe_call(
                 ));
             };
             rows = match requery_join.await {
-                Ok(Ok(r)) => r,
+                Ok(Ok(Ok(r))) => r,
+                Ok(Ok(Err(expired))) => {
+                    drop(subscription);
+                    drop(inflight_permit);
+                    return cursor_expired_outcome(expired);
+                }
                 Ok(Err(err)) => {
                     drop(subscription);
                     drop(inflight_permit);

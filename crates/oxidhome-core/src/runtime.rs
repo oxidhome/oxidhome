@@ -369,14 +369,23 @@ impl Engine {
         );
         watchdog::EpochTicker::spawn(&inner);
         let audit_log = Arc::new(AuditLog::new(Arc::clone(&db)));
+        let event_log = Arc::new(EventLog::new(Arc::clone(&db)));
+        let events = Arc::new(EventBus::new());
+        // H4: rows from earlier runs were never fanned out by this
+        // bus; cursor tails replay them from history.
+        events.note_history_head(
+            event_log
+                .head_id()
+                .context("reading the event-log head row id")?,
+        );
         Ok(Self {
             inner,
             pending_commands: Arc::new(PendingCommands::new(Some(Arc::clone(&audit_log)))),
             devices: Arc::new(DeviceRegistry::new()),
             device_state: Arc::new(DeviceStateStore::new()),
-            events: Arc::new(EventBus::new()),
+            events,
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
-            event_log: Arc::new(EventLog::new(Arc::clone(&db))),
+            event_log,
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
             audit_log,
             dashboards: Arc::new(crate::state::DashboardStore::new(Arc::clone(&db))),

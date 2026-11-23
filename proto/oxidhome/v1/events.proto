@@ -7,12 +7,19 @@
 // — every other cluster is unary.
 //
 // Same lagged-notice semantics as the JSON WebSocket: if the client
-// falls behind the broadcast channel's capacity, subsequent events
-// are dropped and the stream emits a `Lagged` variant carrying the
-// gap size, so the caller can decide whether to reconnect or accept
-// the drop. Gated on `events:tail` — the middleware runs auth once
-// before the stream is established, and a scope denial short-
-// circuits before the first message is emitted.
+// falls behind its per-subscriber queue, events are dropped and the
+// stream emits a `Lagged` variant carrying the gap size and the
+// cursor to resume from. Gated on `events:tail` (plus `events:read`
+// when `after_id` is set) — the middleware runs auth once before the
+// stream is established, and a scope denial short-circuits before
+// the first message is emitted.
+//
+// H4 resume protocol: with `after_id` set, the stream first replays
+// every history row with `row_id > after_id` in id order, then
+// switches to live delivery with no gap and no duplicate (see
+// ARCHITECTURE.md "Event delivery"). If the cursor can't be honored
+// (pruned by retention, or ahead of history after a restore), the
+// stream emits one `CursorExpired` message and ends.
 syntax = "proto3";
 
 package oxidhome.v1;
@@ -24,13 +31,20 @@ package oxidhome.v1;
 import "oxidhome/v1/devices.proto";
 
 service EventsService {
-  // Subscribe to the host event bus. `TailEventsRequest` is
-  // reserved for future filter fields (topic prefix, device id);
-  // v1 streams every event.
+  // Subscribe to the host event bus. v1 streams every event; filter
+  // fields (topic prefix, device id) are a follow-up.
   rpc TailEvents(TailEventsRequest) returns (stream TailEventsResponse);
 }
 
-message TailEventsRequest {}
+message TailEventsRequest {
+  // H4: resume cursor. Unset = live only (events published after
+  // the subscription opens). Set = replay history rows with
+  // `row_id > after_id`, then continue live; every row id is
+  // delivered exactly once and in increasing order. `0` starts at
+  // the oldest retained row. Requires the `events:read` scope in
+  // addition to `events:tail`.
+  optional uint64 after_id = 1;
+}
 
 // Each streamed message is either a bus event (via [`Event`]) or a
 // lagged-broadcast notice. Modeled as a `oneof` so a client that
@@ -45,6 +59,11 @@ message TailEventsResponse {
     // subscriber fell behind capacity. Same shape as the JSON
     // side's `{"lagged": N}` sentinel frame.
     Lagged lagged = 2;
+    // H4: `after_id` (or a row this stream still had to replay)
+    // is no longer in history. Always the last message: the stream
+    // ends after it. Resync from a snapshot (device state
+    // endpoints), then reopen with `after_id = head_id`.
+    CursorExpired cursor_expired = 3;
   }
 }
 
@@ -149,8 +168,30 @@ message CustomEvent {
 }
 
 message Lagged {
-  // Count of events the broadcast channel dropped since this
+  // Count of events the subscriber queue dropped since this
   // subscriber last saw a message. Matches the JSON WebSocket's
   // `{"lagged": N}` shape.
   uint64 skipped = 1;
+  // H4: highest row id this stream delivered before the drop.
+  // Without `after_id` the stream stays live-only and lossy;
+  // reopen with `after_id = resume_after_id` to recover the dropped
+  // events that are in history. With `after_id` the stream re-reads
+  // them from history itself, so this notice is informational
+  // (dropped events without a row id are not in history and are
+  // lost either way). Unset if no event with a row id was
+  // delivered yet.
+  optional uint64 resume_after_id = 2;
+}
+
+// H4: the requested cursor can't be resumed without a gap.
+message CursorExpired {
+  // The cursor that couldn't be honored: the request's `after_id`,
+  // or the last row id this stream delivered when a row it still
+  // had to replay was pruned mid-stream.
+  uint64 after_id = 1;
+  // Oldest row id still in history. Unset if history is empty.
+  optional uint64 oldest_id = 2;
+  // Highest row id ever assigned. A cursor above it (e.g. after a
+  // restore from an older backup) is expired too.
+  uint64 head_id = 3;
 }

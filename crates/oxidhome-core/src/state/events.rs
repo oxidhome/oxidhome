@@ -198,6 +198,13 @@ pub struct EventBus {
     /// rate-limited (C2d), so contention stays bounded. `Arc` so
     /// `EventBus` stays `Clone`-friendly.
     publish_sequence: Arc<tokio::sync::Mutex<()>>,
+    /// H4: highest `event_log` row id fanned out so far, seeded at
+    /// boot with the history head ([`Self::note_history_head`]).
+    /// Read under `publish_sequence` by [`Self::subscribe_at_head`]:
+    /// every recorded event at or below it reached subscribers
+    /// before the new subscription existed, every later fan-out
+    /// lands in its queue.
+    last_row_id: AtomicU64,
 }
 
 /// One subscription's delivery slot. Owned via `Arc` by the
@@ -335,7 +342,36 @@ impl EventBus {
             rate_capacity: DEFAULT_PUBLISH_BURST,
             rate_refill_per_sec: DEFAULT_PUBLISH_RATE_PER_SEC,
             publish_sequence: Arc::new(tokio::sync::Mutex::new(())),
+            last_row_id: AtomicU64::new(0),
         }
+    }
+
+    /// H4: raise the fanned-out row-id watermark to `head` (the
+    /// history head at boot). Rows written by an earlier daemon run
+    /// were never fanned out by this bus, so a cursor stream reads
+    /// them from history before switching to live delivery.
+    pub fn note_history_head(&self, head: u64) {
+        self.last_row_id.fetch_max(head, Ordering::AcqRel);
+    }
+
+    /// H4: subscribe and snapshot the fanned-out row-id watermark
+    /// atomically with respect to recorded publishes. Holds the
+    /// `publish_sequence` gate (the one `publish_event` holds across
+    /// mirror write and fan-out), so every recorded event with a row
+    /// id at or below the returned watermark was fanned out before
+    /// this subscription existed, and every event fanned out later
+    /// is in its queue. The gate wait is bounded by one mirror write
+    /// deadline. Never reads the database under the gate.
+    pub async fn subscribe_at_head(
+        &self,
+        filter: EventFilter,
+        label: &str,
+    ) -> (EventSubscription, u64) {
+        let gate = self.publish_sequence();
+        let _guard = gate.lock().await;
+        let subscription = self.subscribe_labeled(filter, label);
+        let head = self.last_row_id.load(Ordering::Acquire);
+        (subscription, head)
     }
 
     /// H5 review round-2 P2 F1: `Arc<tokio::sync::Mutex>` gate
@@ -385,6 +421,9 @@ impl EventBus {
         // in-process `EventBus::publish` fast path leaves it
         // `None` (host-side simulators, tests).
         event.row_id = event_id;
+        if let Some(id) = event_id {
+            self.last_row_id.fetch_max(id, Ordering::AcqRel);
+        }
         // C2e review F1: wrap the event once in an `Arc` so
         // per-subscriber fan-out is a ref-count bump, not a full
         // clone per queue slot. With unbounded custom-event

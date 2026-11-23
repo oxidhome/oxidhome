@@ -3,6 +3,15 @@
 
 #[derive(Clone, Debug, Default)]
 pub struct TailEventsRequestView<'a> {
+    /// H4: resume cursor. Unset = live only (events published after
+    /// the subscription opens). Set = replay history rows with
+    /// `row_id > after_id`, then continue live; every row id is
+    /// delivered exactly once and in increasing order. `0` starts at
+    /// the oldest retained row. Requires the `events:read` scope in
+    /// addition to `events:tail`.
+    ///
+    /// Field 1: `after_id`
+    pub after_id: ::core::option::Option<u64>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for TailEventsRequestView<'a> {
@@ -33,6 +42,13 @@ impl<'a> ::buffa::MessageView<'a> for TailEventsRequestView<'a> {
         let view = self;
         let mut cur = cur;
         match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.after_id = Some(::buffa::types::decode_uint64(&mut cur)?);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -55,6 +71,7 @@ impl<'a> ::buffa::MessageView<'a> for TailEventsRequestView<'a> {
         use ::buffa::alloc::string::ToString as _;
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::TailEventsRequest {
+            after_id: self.after_id,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -66,6 +83,9 @@ impl<'a> ::buffa::ViewEncode<'a> for TailEventsRequestView<'a> {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
+        if let Some(v) = self.after_id {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -77,6 +97,9 @@ impl<'a> ::buffa::ViewEncode<'a> for TailEventsRequestView<'a> {
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
+        if let Some(v) = self.after_id {
+            ::buffa::types::put_uint64_field(1u32, v, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -98,6 +121,9 @@ impl<'__a> ::serde::Serialize for TailEventsRequestView<'__a> {
     ) -> ::core::result::Result<__S::Ok, __S::Error> {
         use ::serde::ser::SerializeMap as _;
         let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if let ::core::option::Option::Some(__v) = self.after_id {
+            __map.serialize_entry("afterId", &::buffa::json_helpers::ProtoJson(&__v))?;
+        }
         __map.end()
     }
 }
@@ -192,6 +218,18 @@ impl TailEventsRequestOwnedView {
     #[must_use]
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
+    }
+    /// H4: resume cursor. Unset = live only (events published after
+    /// the subscription opens). Set = replay history rows with
+    /// `row_id > after_id`, then continue live; every row id is
+    /// delivered exactly once and in increasing order. `0` starts at
+    /// the oldest retained row. Requires the `events:read` scope in
+    /// addition to `events:tail`.
+    ///
+    /// Field 1: `after_id`
+    #[must_use]
+    pub fn after_id(&self) -> ::core::option::Option<u64> {
+        self.0.reborrow().after_id
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<TailEventsRequestView<'static>>>
@@ -326,6 +364,37 @@ impl<'a> ::buffa::MessageView<'a> for TailEventsResponseView<'a> {
                     );
                 }
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                if let Some(
+                    super::super::__buffa::view::oneof::tail_events_response::Body::CursorExpired(
+                        ref mut existing,
+                    ),
+                ) = view.body
+                {
+                    ::buffa::MessageView::merge_into_view(
+                        &mut **existing,
+                        sub,
+                        __sub_ctx,
+                    )?;
+                } else {
+                    view.body = Some(
+                        super::super::__buffa::view::oneof::tail_events_response::Body::CursorExpired(
+                            ::buffa::alloc::boxed::Box::new(
+                                <super::super::__buffa::view::CursorExpiredView as ::buffa::MessageView>::decode_view_ctx(
+                                    sub,
+                                    __sub_ctx,
+                                )?,
+                            ),
+                        ),
+                    );
+                }
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -370,6 +439,15 @@ impl<'a> ::buffa::MessageView<'a> for TailEventsResponseView<'a> {
                                     ),
                                 )
                             }
+                            super::super::__buffa::view::oneof::tail_events_response::Body::CursorExpired(
+                                v,
+                            ) => {
+                                super::super::__buffa::oneof::tail_events_response::Body::CursorExpired(
+                                    ::buffa::alloc::boxed::Box::new(
+                                        v.to_owned_from_source(__buffa_src)?,
+                                    ),
+                                )
+                            }
                         },
                     )
                 }
@@ -399,6 +477,16 @@ impl<'a> ::buffa::ViewEncode<'a> for TailEventsResponseView<'a> {
                             + inner as u64;
                 }
                 super::super::__buffa::view::oneof::tail_events_response::Body::Lagged(
+                    x,
+                ) => {
+                    let __slot = __cache.reserve();
+                    let inner = x.compute_size(__cache);
+                    __cache.set(__slot, inner);
+                    size
+                        += 1u64 + ::buffa::encoding::varint_len(inner as u64) as u64
+                            + inner as u64;
+                }
+                super::super::__buffa::view::oneof::tail_events_response::Body::CursorExpired(
                     x,
                 ) => {
                     let __slot = __cache.reserve();
@@ -443,6 +531,16 @@ impl<'a> ::buffa::ViewEncode<'a> for TailEventsResponseView<'a> {
                     );
                     x.write_to(__cache, buf);
                 }
+                super::super::__buffa::view::oneof::tail_events_response::Body::CursorExpired(
+                    x,
+                ) => {
+                    ::buffa::types::put_len_delimited_header(
+                        3u32,
+                        u64::from(__cache.consume_next()),
+                        buf,
+                    );
+                    x.write_to(__cache, buf);
+                }
             }
         }
         self.__buffa_unknown_fields.write_to(buf);
@@ -477,6 +575,11 @@ impl<'__a> ::serde::Serialize for TailEventsResponseView<'__a> {
                     v,
                 ) => {
                     __map.serialize_entry("lagged", v)?;
+                }
+                super::super::__buffa::view::oneof::tail_events_response::Body::CursorExpired(
+                    v,
+                ) => {
+                    __map.serialize_entry("cursorExpired", v)?;
                 }
             }
         }
@@ -2476,12 +2579,23 @@ impl ::serde::Serialize for CustomEventOwnedView {
 }
 #[derive(Clone, Debug, Default)]
 pub struct LaggedView<'a> {
-    /// Count of events the broadcast channel dropped since this
+    /// Count of events the subscriber queue dropped since this
     /// subscriber last saw a message. Matches the JSON WebSocket's
     /// `{"lagged": N}` shape.
     ///
     /// Field 1: `skipped`
     pub skipped: u64,
+    /// H4: highest row id this stream delivered before the drop.
+    /// Without `after_id` the stream stays live-only and lossy;
+    /// reopen with `after_id = resume_after_id` to recover the dropped
+    /// events that are in history. With `after_id` the stream re-reads
+    /// them from history itself, so this notice is informational
+    /// (dropped events without a row id are not in history and are
+    /// lost either way). Unset if no event with a row id was
+    /// delivered yet.
+    ///
+    /// Field 2: `resume_after_id`
+    pub resume_after_id: ::core::option::Option<u64>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for LaggedView<'a> {
@@ -2519,6 +2633,13 @@ impl<'a> ::buffa::MessageView<'a> for LaggedView<'a> {
                 )?;
                 view.skipped = ::buffa::types::decode_uint64(&mut cur)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.resume_after_id = Some(::buffa::types::decode_uint64(&mut cur)?);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -2542,6 +2663,7 @@ impl<'a> ::buffa::MessageView<'a> for LaggedView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::Lagged {
             skipped: self.skipped,
+            resume_after_id: self.resume_after_id,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -2556,6 +2678,9 @@ impl<'a> ::buffa::ViewEncode<'a> for LaggedView<'a> {
         if self.skipped != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.skipped) as u64;
         }
+        if let Some(v) = self.resume_after_id {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -2569,6 +2694,9 @@ impl<'a> ::buffa::ViewEncode<'a> for LaggedView<'a> {
         use ::buffa::Enumeration as _;
         if self.skipped != 0u64 {
             ::buffa::types::put_uint64_field(1u32, self.skipped, buf);
+        }
+        if let Some(v) = self.resume_after_id {
+            ::buffa::types::put_uint64_field(2u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2596,6 +2724,13 @@ impl<'__a> ::serde::Serialize for LaggedView<'__a> {
                 .serialize_entry(
                     "skipped",
                     &::buffa::json_helpers::ProtoJson(&self.skipped),
+                )?;
+        }
+        if let ::core::option::Option::Some(__v) = self.resume_after_id {
+            __map
+                .serialize_entry(
+                    "resumeAfterId",
+                    &::buffa::json_helpers::ProtoJson(&__v),
                 )?;
         }
         __map.end()
@@ -2685,7 +2820,7 @@ impl LaggedOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// Count of events the broadcast channel dropped since this
+    /// Count of events the subscriber queue dropped since this
     /// subscriber last saw a message. Matches the JSON WebSocket's
     /// `{"lagged": N}` shape.
     ///
@@ -2693,6 +2828,20 @@ impl LaggedOwnedView {
     #[must_use]
     pub fn skipped(&self) -> u64 {
         self.0.reborrow().skipped
+    }
+    /// H4: highest row id this stream delivered before the drop.
+    /// Without `after_id` the stream stays live-only and lossy;
+    /// reopen with `after_id = resume_after_id` to recover the dropped
+    /// events that are in history. With `after_id` the stream re-reads
+    /// them from history itself, so this notice is informational
+    /// (dropped events without a row id are not in history and are
+    /// lost either way). Unset if no event with a row id was
+    /// delivered yet.
+    ///
+    /// Field 2: `resume_after_id`
+    #[must_use]
+    pub fn resume_after_id(&self) -> ::core::option::Option<u64> {
+        self.0.reborrow().resume_after_id
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<LaggedView<'static>>> for LaggedOwnedView {
@@ -2716,6 +2865,324 @@ impl ::buffa::HasMessageView for super::super::Lagged {
     type ViewHandle = LaggedOwnedView;
 }
 impl ::serde::Serialize for LaggedOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// H4: the requested cursor can't be resumed without a gap.
+#[derive(Clone, Debug, Default)]
+pub struct CursorExpiredView<'a> {
+    /// The cursor that couldn't be honored: the request's `after_id`,
+    /// or the last row id this stream delivered when a row it still
+    /// had to replay was pruned mid-stream.
+    ///
+    /// Field 1: `after_id`
+    pub after_id: u64,
+    /// Oldest row id still in history. Unset if history is empty.
+    ///
+    /// Field 2: `oldest_id`
+    pub oldest_id: ::core::option::Option<u64>,
+    /// Highest row id ever assigned. A cursor above it (e.g. after a
+    /// restore from an older backup) is expired too.
+    ///
+    /// Field 3: `head_id`
+    pub head_id: u64,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for CursorExpiredView<'a> {
+    type Owned = super::super::CursorExpired;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.after_id = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.oldest_id = Some(::buffa::types::decode_uint64(&mut cur)?);
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.head_id = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<super::super::CursorExpired, ::buffa::DecodeError> {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<super::super::CursorExpired, ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::CursorExpired {
+            after_id: self.after_id,
+            oldest_id: self.oldest_id,
+            head_id: self.head_id,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for CursorExpiredView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.after_id != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.after_id) as u64;
+        }
+        if let Some(v) = self.oldest_id {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(v) as u64;
+        }
+        if self.head_id != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.head_id) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.after_id != 0u64 {
+            ::buffa::types::put_uint64_field(1u32, self.after_id, buf);
+        }
+        if let Some(v) = self.oldest_id {
+            ::buffa::types::put_uint64_field(2u32, v, buf);
+        }
+        if self.head_id != 0u64 {
+            ::buffa::types::put_uint64_field(3u32, self.head_id, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for CursorExpiredView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.after_id) {
+            __map
+                .serialize_entry(
+                    "afterId",
+                    &::buffa::json_helpers::ProtoJson(&self.after_id),
+                )?;
+        }
+        if let ::core::option::Option::Some(__v) = self.oldest_id {
+            __map.serialize_entry("oldestId", &::buffa::json_helpers::ProtoJson(&__v))?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.head_id) {
+            __map
+                .serialize_entry(
+                    "headId",
+                    &::buffa::json_helpers::ProtoJson(&self.head_id),
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for CursorExpiredView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "CursorExpired";
+    const FULL_NAME: &'static str = "oxidhome.v1.CursorExpired";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.CursorExpired";
+}
+::buffa::impl_default_view_instance!(CursorExpiredView);
+::buffa::impl_view_reborrow!(CursorExpiredView);
+/** Self-contained, `'static` owned view of a `CursorExpired` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`CursorExpiredView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`CursorExpiredView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct CursorExpiredOwnedView(::buffa::OwnedView<CursorExpiredView<'static>>);
+impl CursorExpiredOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            CursorExpiredOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            CursorExpiredOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::CursorExpired,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            CursorExpiredOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`CursorExpiredView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &CursorExpiredView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::CursorExpired {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// The cursor that couldn't be honored: the request's `after_id`,
+    /// or the last row id this stream delivered when a row it still
+    /// had to replay was pruned mid-stream.
+    ///
+    /// Field 1: `after_id`
+    #[must_use]
+    pub fn after_id(&self) -> u64 {
+        self.0.reborrow().after_id
+    }
+    /// Oldest row id still in history. Unset if history is empty.
+    ///
+    /// Field 2: `oldest_id`
+    #[must_use]
+    pub fn oldest_id(&self) -> ::core::option::Option<u64> {
+        self.0.reborrow().oldest_id
+    }
+    /// Highest row id ever assigned. A cursor above it (e.g. after a
+    /// restore from an older backup) is expired too.
+    ///
+    /// Field 3: `head_id`
+    #[must_use]
+    pub fn head_id(&self) -> u64 {
+        self.0.reborrow().head_id
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<CursorExpiredView<'static>>>
+for CursorExpiredOwnedView {
+    fn from(inner: ::buffa::OwnedView<CursorExpiredView<'static>>) -> Self {
+        CursorExpiredOwnedView(inner)
+    }
+}
+impl ::core::convert::From<CursorExpiredOwnedView>
+for ::buffa::OwnedView<CursorExpiredView<'static>> {
+    fn from(wrapper: CursorExpiredOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<CursorExpiredView<'static>>>
+for CursorExpiredOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<CursorExpiredView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::CursorExpired {
+    type View<'a> = CursorExpiredView<'a>;
+    type ViewHandle = CursorExpiredOwnedView;
+}
+impl ::serde::Serialize for CursorExpiredOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,

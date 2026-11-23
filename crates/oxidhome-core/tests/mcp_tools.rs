@@ -3656,3 +3656,64 @@ async fn events_subscribe_rejects_malformed_filters() {
         );
     }
 }
+
+/// H4: a cursor pruned by retention is reported as `cursor_expired`
+/// by `events.subscribe` and `events.history` instead of silently
+/// skipping the pruned rows; `after_id: 0` never expires.
+#[tokio::test(flavor = "current_thread")]
+async fn events_cursor_pruned_by_retention_reports_cursor_expired() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload,
+    };
+
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    // `received_ms` 1, 2, 3 so retention can prune the first two.
+    let ids: Vec<u64> = (1..=3)
+        .map(|n| {
+            let event = Event {
+                device: None,
+                timestamp: 0,
+                origin_plugin_id: "com.example.subscribe-test".into(),
+                origin_instance_id: "sub-a".into(),
+                row_id: None,
+                payload: EventPayload::Custom(CustomEvent {
+                    topic: "sub.expire".into(),
+                    payload: String::new(),
+                }),
+            };
+            engine
+                .event_log()
+                .record(n, &event, "sub-a", "com.example.subscribe-test")
+                .expect("record")
+        })
+        .collect();
+    let (id_1, id_3) = (ids[0], ids[2]);
+    assert_eq!(engine.event_log().trim_older_than(3).expect("trim"), 2);
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    for (tool, extra) in [
+        ("events.subscribe", json!({"timeout_ms": 0})),
+        ("events.history", json!({})),
+    ] {
+        let args = |after_id: u64| {
+            let mut args = extra.clone();
+            args["after_id"] = after_id.into();
+            json!({"name": tool, "arguments": args})
+        };
+        let response = call(&router, &bearer, &session, "tools/call", args(id_1)).await;
+        assert_eq!(response["result"]["isError"], true, "{tool}: {response}");
+        assert_eq!(
+            response["result"]["structuredContent"]["cursor_expired"],
+            json!({"after_id": id_1, "oldest_id": id_3, "head_id": id_3}),
+            "{tool}: {response}",
+        );
+
+        let response = call(&router, &bearer, &session, "tools/call", args(0)).await;
+        let events = response["result"]["structuredContent"]["events"]
+            .as_array()
+            .expect("events array");
+        assert_eq!(events.len(), 1, "{tool}: {response}");
+    }
+}

@@ -37,8 +37,10 @@ use crate::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value as WitVa
 
 use super::db::Db;
 
+mod cursor;
 mod mirror;
 
+pub use cursor::CursorExpired;
 pub use mirror::{
     EventLogHealth, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, MirrorPolicy, is_gap_marker,
 };

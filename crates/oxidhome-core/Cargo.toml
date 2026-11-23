@@ -96,6 +96,10 @@ name = "api_skeleton"
 path = "tests/api_skeleton.rs"
 
 [[test]]
+name = "events_resume"
+path = "tests/events_resume.rs"
+
+[[test]]
 name = "mcp_handshake"
 path = "tests/mcp_handshake.rs"
 

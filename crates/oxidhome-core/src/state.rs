@@ -23,6 +23,7 @@ pub mod db;
 pub mod device_state;
 pub mod devices;
 pub mod event_log;
+pub mod event_tail;
 pub mod events;
 pub mod installed_plugins;
 pub mod kv;
@@ -45,9 +46,10 @@ pub use devices::{
     DeviceMeta, DeviceRegistry, MAX_CAPABILITIES_PER_DEVICE, MAX_DEVICES_PER_INSTANCE,
 };
 pub use event_log::{
-    EventLog, EventLogError, EventLogHealth, EventOrder, EventQuery, GAP_MARKER_ORIGIN,
-    GAP_MARKER_TOPIC, GapMarker, HistoricalEvent, MirrorPolicy, TopicMatch,
+    CursorExpired, EventLog, EventLogError, EventLogHealth, EventOrder, EventQuery,
+    GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, HistoricalEvent, MirrorPolicy, TopicMatch,
 };
+pub use event_tail::{EventTail, TailError, TailItem};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
     InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, any_grant_matches,

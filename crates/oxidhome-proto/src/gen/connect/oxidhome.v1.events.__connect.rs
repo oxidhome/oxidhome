@@ -99,9 +99,8 @@ pub const EVENTS_SERVICE_TAIL_EVENTS_SPEC: ::connectrpc::Spec = ::connectrpc::Sp
 /// example` doc.
 #[allow(clippy::type_complexity)]
 pub trait EventsService: Send + Sync + 'static {
-    /// Subscribe to the host event bus. `TailEventsRequest` is
-    /// reserved for future filter fields (topic prefix, device id);
-    /// v1 streams every event.
+    /// Subscribe to the host event bus. v1 streams every event; filter
+    /// fields (topic prefix, device id) are a follow-up.
     ///
     /// `request` is borrowed from the request body and is valid for the
     /// duration of the call (until the response stream is returned);
