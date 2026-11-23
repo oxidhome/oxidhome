@@ -23,8 +23,10 @@
 //! What happens *after* authentication — the root principal with its
 //! resolved authority, call id, deadline and delegation chain that
 //! follow a request into plugin dispatch — lives in
-//! [`invocation::InvocationContext`] (H6). Every authorization decision
-//! is made by [`authorize()`] against that root authority.
+//! [`invocation::InvocationContext`] (H6). Every REST, Connect and MCP
+//! token-scope check is made by [`authorize()`] against that root
+//! authority; plugin manifest grants are still checked at their own
+//! call sites.
 //!
 //! See `ARCHITECTURE.md` "Auth & actor identity" for the
 //! cross-cutting design and `00_OVERVIEW.md` for the per-phase

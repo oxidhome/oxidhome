@@ -3813,10 +3813,13 @@ async fn tool_denials_record_scope_and_constraint_sentinels() {
         .await
         .expect("audit query join")
         .expect("audit query");
+    // One request per tool path: exactly one row each, no stray
+    // pending intent or duplicate denial.
     let deny_for = |path: &str| {
-        rows.iter()
-            .find(|r| r.path == path && r.decision == "deny")
-            .unwrap_or_else(|| panic!("no deny row for {path}"))
+        let matching: Vec<_> = rows.iter().filter(|r| r.path == path).collect();
+        assert_eq!(matching.len(), 1, "{path}: {matching:?}");
+        assert_eq!(matching[0].decision, "deny", "{path}");
+        matching[0]
     };
     for (tool, _, sentinel) in &calls {
         let row = deny_for(&format!("mcp.tool.{tool}"));
