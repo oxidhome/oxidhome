@@ -975,43 +975,40 @@ pub fn invalidate_cursors_after_restore(conn: &rusqlite::Connection) -> rusqlite
     if !has_meta {
         return Ok(());
     }
-    let Some((revision, row_max, rows, writer)) = conn
-        .query_row(
-            "SELECT revision, \
+    // One row even when the meta row is missing (the rows' watermark
+    // must still move past the backup's history).
+    let (revision, row_max, rows, writer) = conn.query_row(
+        "SELECT m.revision, \
              COALESCE((SELECT MAX(global_revision) FROM device_state), 0), \
-             (SELECT COUNT(*) FROM device_state), holes_json, writer \
-             FROM device_state_meta WHERE id = 1",
-            [],
-            // Damaged columns (a BLOB hole list, a TEXT revision) pass
-            // the integrity check and the boot recovers from them, so
-            // the restore must not fail on them either.
-            |row| {
-                use rusqlite::types::ValueRef;
-                let int = |i: usize| -> rusqlite::Result<Option<i64>> {
-                    Ok(match row.get_ref(i)? {
-                        ValueRef::Integer(n) => Some(n),
-                        _ => None,
-                    })
-                };
-                // Invalid UTF-8 counts as undecodable, not as an error.
-                let text = |i: usize| -> rusqlite::Result<Option<String>> {
-                    Ok(match row.get_ref(i)? {
-                        ValueRef::Text(t) => std::str::from_utf8(t).ok().map(str::to_owned),
-                        _ => None,
-                    })
-                };
-                Ok((
-                    int(0)?,
-                    int(1)?.unwrap_or(0),
-                    int(2)?.unwrap_or(0),
-                    text(4)?,
-                ))
-            },
-        )
-        .optional()?
-    else {
-        return Ok(());
-    };
+             (SELECT COUNT(*) FROM device_state), m.holes_json, m.writer \
+             FROM (SELECT 1) LEFT JOIN device_state_meta AS m ON m.id = 1",
+        [],
+        // Damaged columns (a BLOB hole list, a TEXT revision) pass
+        // the integrity check and the boot recovers from them, so
+        // the restore must not fail on them either.
+        |row| {
+            use rusqlite::types::ValueRef;
+            let int = |i: usize| -> rusqlite::Result<Option<i64>> {
+                Ok(match row.get_ref(i)? {
+                    ValueRef::Integer(n) => Some(n),
+                    _ => None,
+                })
+            };
+            // Invalid UTF-8 counts as undecodable, not as an error.
+            let text = |i: usize| -> rusqlite::Result<Option<String>> {
+                Ok(match row.get_ref(i)? {
+                    ValueRef::Text(t) => std::str::from_utf8(t).ok().map(str::to_owned),
+                    _ => None,
+                })
+            };
+            Ok((
+                int(0)?,
+                int(1)?.unwrap_or(0),
+                int(2)?.unwrap_or(0),
+                text(4)?,
+            ))
+        },
+    )?;
     let epoch = super::mint_epoch();
     // A damaged revision falls back to the rows' highest.
     let revision = revision.unwrap_or(row_max).max(0);
@@ -1033,8 +1030,10 @@ pub fn invalidate_cursors_after_restore(conn: &rusqlite::Connection) -> rusqlite
     )
     .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
     conn.execute(
-        "UPDATE device_state_meta SET epoch = ?1, revision = ?2, evicted_through = ?3, \
-         holes_json = ?4, writer = ?5 WHERE id = 1",
+        "INSERT INTO device_state_meta(id, epoch, revision, evicted_through, holes_json, writer) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch, \
+         revision = excluded.revision, evicted_through = excluded.evicted_through, \
+         holes_json = excluded.holes_json, writer = excluded.writer",
         params![epoch, revision, evicted, holes_json, writer],
     )?;
     Ok(())
@@ -1549,6 +1548,19 @@ mod tests {
         let store = open(&dir);
         assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
         assert!(store.current_revision() > REVISION_GAP);
+        // A missing meta row is rewritten too.
+        let cursor = store.current_revision();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| {
+            c.execute("DELETE FROM device_state_meta", [])?;
+            invalidate_cursors_after_restore(c)
+        })
+        .expect("invalidate");
+        drop(db);
+        let store = open(&dir);
+        assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
         assert!(store.close_persistence());
     }
 
