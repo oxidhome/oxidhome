@@ -41,4 +41,10 @@ message Instance {
   // A structured projection lands when a UI / CLI consumer needs
   // the distinct transition timestamps.
   string state = 3;
+  // The instance's resolved config as a JSON object, in the same
+  // masked shape as the JSON API's `config` field: a `type = "secret"`
+  // field renders as `{"secret": true, "set": <bool>, "value": "***"}`
+  // (or `"value": null` when unset) and never carries the plaintext.
+  // Empty until the instance's first successful load.
+  string config_json = 4;
 }

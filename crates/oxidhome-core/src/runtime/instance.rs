@@ -918,14 +918,14 @@ impl PluginInstance {
             match self.bindings.call_init(&mut self.store).await {
                 Err(trap) => {
                     let err: anyhow::Error = trap.into();
-                    let msg = format!("{err:#}");
+                    let msg = self.scrub_own_secrets(format!("{err:#}"));
                     if watchdog::is_watchdog_trap(&err) {
                         Err(InitError::Unresponsive(msg))
                     } else {
                         Err(InitError::Trap(msg))
                     }
                 }
-                Ok(Err(msg)) => Err(InitError::Plugin(msg)),
+                Ok(Err(msg)) => Err(InitError::Plugin(self.scrub_own_secrets(msg))),
                 Ok(Ok(())) => Ok(()),
             }
         }
@@ -1023,6 +1023,11 @@ impl PluginInstance {
         }
         .instrument(span)
         .await?;
+        let mut result = result;
+        crate::redact::scrub_command_error(
+            &mut result,
+            &crate::redact::config_secrets(&self.store.data().config),
+        );
         // H9 round-2 finding 4: `OkWithState` is authoritative
         // state (per proto docs) — project it into the store so
         // the snapshot / delta APIs reflect the post-command
@@ -1199,6 +1204,26 @@ impl PluginInstance {
         }
         .instrument(span)
         .await
+        .map(|mut result| {
+            crate::redact::scrub_command_error(
+                &mut result,
+                &crate::redact::config_secrets(&self.store.data().config),
+            );
+            result
+        })
+    }
+
+    /// M7: replace this instance's declared secret values in
+    /// plugin-authored text (an `init` error, a trap message) before it
+    /// reaches the supervisor's logs or the instance state.
+    fn scrub_own_secrets(&self, text: String) -> String {
+        match crate::redact::scrub_secret_values(
+            &text,
+            &crate::redact::config_secrets(&self.store.data().config),
+        ) {
+            std::borrow::Cow::Owned(scrubbed) => scrubbed,
+            std::borrow::Cow::Borrowed(_) => text,
+        }
     }
 
     /// Drain every pending event across this instance's subscriptions
@@ -1325,6 +1350,14 @@ impl PluginInstance {
     #[must_use]
     pub fn manifest(&self) -> &PluginManifest {
         &self.store.data().manifest
+    }
+
+    /// The resolved per-instance config, secrets included. Host-side
+    /// only: read surfaces must go through
+    /// [`crate::redact::masked_config_view`].
+    #[must_use]
+    pub fn config(&self) -> &InstanceConfig {
+        &self.store.data().config
     }
 
     /// Per-instance wake `Notify` — C2d wake-isolation. Held on

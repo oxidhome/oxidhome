@@ -285,6 +285,20 @@ pub struct Instance {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub state: ::buffa::alloc::string::String,
+    /// The instance's resolved config as a JSON object, in the same
+    /// masked shape as the JSON API's `config` field: a `type = "secret"`
+    /// field renders as `{"secret": true, "set": <bool>, "value": "***"}`
+    /// (or `"value": null` when unset) and never carries the plaintext.
+    /// Empty until the instance's first successful load.
+    ///
+    /// Field 4: `config_json`
+    #[serde(
+        rename = "configJson",
+        alias = "config_json",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub config_json: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -295,6 +309,7 @@ impl ::core::fmt::Debug for Instance {
             .field("instance_id", &self.instance_id)
             .field("plugin_id", &self.plugin_id)
             .field("state", &self.state)
+            .field("config_json", &self.config_json)
             .finish()
     }
 }
@@ -334,6 +349,9 @@ impl ::buffa::Message for Instance {
         if !self.state.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.state) as u64;
         }
+        if !self.config_json.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.config_json) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -352,6 +370,9 @@ impl ::buffa::Message for Instance {
         }
         if !self.state.is_empty() {
             ::buffa::types::put_string_field(3u32, &self.state, buf);
+        }
+        if !self.config_json.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.config_json, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -387,6 +408,13 @@ impl ::buffa::Message for Instance {
                 )?;
                 ::buffa::types::merge_string(&mut self.state, buf)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.config_json, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -398,6 +426,7 @@ impl ::buffa::Message for Instance {
         self.instance_id.clear();
         self.plugin_id.clear();
         self.state.clear();
+        self.config_json.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

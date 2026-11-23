@@ -534,6 +534,14 @@ pub struct InstanceView<'a> {
     ///
     /// Field 3: `state`
     pub state: &'a str,
+    /// The instance's resolved config as a JSON object, in the same
+    /// masked shape as the JSON API's `config` field: a `type = "secret"`
+    /// field renders as `{"secret": true, "set": <bool>, "value": "***"}`
+    /// (or `"value": null` when unset) and never carries the plaintext.
+    /// Empty until the instance's first successful load.
+    ///
+    /// Field 4: `config_json`
+    pub config_json: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for InstanceView<'a> {
@@ -585,6 +593,13 @@ impl<'a> ::buffa::MessageView<'a> for InstanceView<'a> {
                 )?;
                 view.state = ::buffa::types::borrow_str(&mut cur)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.config_json = ::buffa::types::borrow_str(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -610,6 +625,7 @@ impl<'a> ::buffa::MessageView<'a> for InstanceView<'a> {
             instance_id: self.instance_id.to_string(),
             plugin_id: self.plugin_id.to_string(),
             state: self.state.to_string(),
+            config_json: self.config_json.to_string(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -630,6 +646,9 @@ impl<'a> ::buffa::ViewEncode<'a> for InstanceView<'a> {
         if !self.state.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.state) as u64;
         }
+        if !self.config_json.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.config_json) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -649,6 +668,9 @@ impl<'a> ::buffa::ViewEncode<'a> for InstanceView<'a> {
         }
         if !self.state.is_empty() {
             ::buffa::types::put_string_field(3u32, &self.state, buf);
+        }
+        if !self.config_json.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.config_json, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -679,6 +701,9 @@ impl<'__a> ::serde::Serialize for InstanceView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.state) {
             __map.serialize_entry("state", self.state)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.config_json) {
+            __map.serialize_entry("configJson", self.config_json)?;
         }
         __map.end()
     }
@@ -793,6 +818,17 @@ impl InstanceOwnedView {
     #[must_use]
     pub fn state(&self) -> &'_ str {
         self.0.reborrow().state
+    }
+    /// The instance's resolved config as a JSON object, in the same
+    /// masked shape as the JSON API's `config` field: a `type = "secret"`
+    /// field renders as `{"secret": true, "set": <bool>, "value": "***"}`
+    /// (or `"value": null` when unset) and never carries the plaintext.
+    /// Empty until the instance's first successful load.
+    ///
+    /// Field 4: `config_json`
+    #[must_use]
+    pub fn config_json(&self) -> &'_ str {
+        self.0.reborrow().config_json
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<InstanceView<'static>>>

@@ -197,6 +197,15 @@ enum ControlCommand {
     Shutdown { reply: oneshot::Sender<()> },
 }
 
+/// Facts the supervisor learns on the first successful load and
+/// shares with its [`InstanceHandle`]. Each slot is set once; later
+/// restarts of the same install produce the same values.
+#[derive(Debug, Default)]
+pub(crate) struct LoadedSlots {
+    installation_uuid: std::sync::OnceLock<Arc<str>>,
+    config_view: std::sync::OnceLock<Arc<serde_json::Value>>,
+}
+
 /// Host-side handle to one supervised instance. Cheap to clone and
 /// `Send + Sync`, so the future registry / API layers can hold it.
 /// Dropping every clone closes the control channel, which the
@@ -217,7 +226,7 @@ pub struct InstanceHandle {
     /// same slot; the supervisor sets it exactly once (subsequent
     /// restarts of the same install re-set to the same value and
     /// `OnceLock::set` returns `Err`, which we swallow).
-    installation_uuid: Arc<std::sync::OnceLock<Arc<str>>>,
+    loaded: Arc<LoadedSlots>,
     control: mpsc::Sender<ControlCommand>,
     state: watch::Receiver<InstanceState>,
 }
@@ -255,7 +264,7 @@ impl InstanceHandle {
             // Registry-test handles never run a real load, so
             // the cell stays unset — mirrors the `Loading` state
             // that never advanced to a first successful load.
-            installation_uuid: Arc::new(std::sync::OnceLock::new()),
+            loaded: Arc::default(),
             control,
             state,
         }
@@ -284,7 +293,17 @@ impl InstanceHandle {
     /// should treat `None` as "instance is not yet ready."
     #[must_use]
     pub fn installation_uuid(&self) -> Option<&str> {
-        self.installation_uuid.get().map(Arc::as_ref)
+        self.loaded.installation_uuid.get().map(Arc::as_ref)
+    }
+
+    /// M7: the instance's resolved config as the read APIs show it —
+    /// [`crate::redact::masked_config_view`], so `type = "secret"`
+    /// fields carry a `set` flag and `"***"`, never the plaintext.
+    /// `None` until the first successful load (same lifecycle as
+    /// [`Self::installation_uuid`]).
+    #[must_use]
+    pub fn config_view(&self) -> Option<serde_json::Value> {
+        self.loaded.config_view.get().map(|v| (**v).clone())
     }
 
     /// A snapshot of the current [`InstanceState`].
@@ -609,12 +628,11 @@ pub fn supervise_with_tuning_mode_and_pin(
     let plugin_id: Arc<str> = Arc::from(plugin_id.into());
     let (control_tx, control_rx) = mpsc::channel(16);
     let (state_tx, state_rx) = watch::channel(InstanceState::Loading);
-    let installation_uuid: Arc<std::sync::OnceLock<Arc<str>>> =
-        Arc::new(std::sync::OnceLock::new());
+    let loaded: Arc<LoadedSlots> = Arc::default();
     let handle = InstanceHandle {
         instance_id: Arc::clone(&instance_id),
         plugin_id: Arc::clone(&plugin_id),
-        installation_uuid: Arc::clone(&installation_uuid),
+        loaded: Arc::clone(&loaded),
         control: control_tx,
         state: state_rx,
     };
@@ -627,7 +645,7 @@ pub fn supervise_with_tuning_mode_and_pin(
         mode,
         control_rx,
         state_tx,
-        installation_uuid,
+        loaded,
         first_load_pinned_manifest,
     ));
     handle
@@ -798,7 +816,7 @@ async fn run_supervisor(
     // first successful attempt wins; every restart re-sets to
     // the same value (same install) and the `.set()` returns
     // `Err`, which is expected and ignored.
-    installation_uuid: Arc<std::sync::OnceLock<Arc<str>>>,
+    loaded: Arc<LoadedSlots>,
     // Phase 6 leftover TOCTOU fix + review F3: when
     // `Some`, the supervisor uses this snapshot on EVERY
     // load attempt (first load AND every restart) — the
@@ -853,7 +871,7 @@ async fn run_supervisor(
             &mode,
             &mut control_rx,
             &state_tx,
-            &installation_uuid,
+            &loaded,
             pinned,
         )
         .await;
@@ -954,7 +972,7 @@ async fn run_one_lifecycle(
     // successful load with the installation UUID pinned to the
     // instance. See [`run_supervisor`] for the once-vs-restart
     // note.
-    installation_uuid_cell: &Arc<std::sync::OnceLock<Arc<str>>>,
+    loaded: &Arc<LoadedSlots>,
     // Phase 6 leftover TOCTOU fix + round-2 F3: the
     // supervisor's pinned manifest snapshot, cloned by
     // `run_supervisor` for every attempt (first load AND
@@ -1020,7 +1038,15 @@ async fn run_one_lifecycle(
     // every subsequent restart of this supervisor (same
     // install ⇒ same UUID). Set once; ignore the `Err` on
     // subsequent restarts.
-    let _ = installation_uuid_cell.set(instance.installation_uuid());
+    let _ = loaded.installation_uuid.set(instance.installation_uuid());
+    // M7: the overrides are pinned for the supervisor's lifetime, so
+    // the masked view from the first load holds for every restart.
+    let _ = loaded.config_view.get_or_init(|| {
+        Arc::new(crate::redact::masked_config_view(
+            &instance.manifest().config,
+            instance.config(),
+        ))
+    });
     instance.set_watchdog(watchdog);
     let policy = instance.manifest().runtime.restart;
 

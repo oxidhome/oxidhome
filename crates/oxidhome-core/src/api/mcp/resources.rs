@@ -54,7 +54,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::Engine;
 use crate::api::scopes::{
     BLOBS_READ, DEVICES_LIST, EVENTS_READ, LOGS_READ, PLUGINS_LIST, STATUS_READ, Scope,
-    require_scope,
+    can_read_blobs, require_scope,
 };
 use crate::auth::Actor;
 use crate::state::audit_log::AuditEntry;
@@ -693,7 +693,7 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         Kind::PluginsDetail(id) => plugins_detail(&engine, id),
         // Events + logs hit `SQLite`, so parse the query
         // and run the read under `spawn_blocking`.
-        Kind::Events => events_read(engine, query_str).await,
+        Kind::Events => events_read(engine, query_str, can_read_blobs(actor)).await,
         Kind::Logs => logs_read(engine, query_str).await,
         Kind::Status => status_read(engine.clone()).await,
         // Blob reads also hit `SQLite` (the blob index) plus
@@ -853,6 +853,9 @@ fn plugins_list(engine: &Engine) -> ReadOutcome {
 pub(super) struct PluginInstanceDetail {
     pub(super) instance_id: String,
     pub(super) state: String,
+    /// M7: masked config view (see
+    /// [`crate::InstanceHandle::config_view`]).
+    pub(super) config: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -889,6 +892,7 @@ pub(super) fn plugins_detail_body(engine: &Engine, id: &str) -> Option<PluginDet
             instances.push(PluginInstanceDetail {
                 instance_id: handle.instance_id().to_string(),
                 state: format!("{:?}", handle.state()),
+                config: handle.config_view(),
             });
         }
     }
@@ -974,7 +978,7 @@ const EVENTS_KNOWN_KEYS: &[&str] = &[
     "until",
 ];
 
-async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
+async fn events_read(engine: Engine, raw_query: &str, blobs: bool) -> ReadOutcome {
     let query = match parse_query(raw_query) {
         Ok(q) => q,
         Err(err) => return ReadOutcome::InvalidParams(err),
@@ -1069,7 +1073,7 @@ async fn events_read(engine: Engine, raw_query: &str) -> ReadOutcome {
     };
     let events: Vec<_> = rows
         .into_iter()
-        .map(super::super::server::WireHistoricalEvent::from_row)
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
         .collect();
     encode(&EventsBody { events }, "events")
 }
@@ -2015,6 +2019,35 @@ const MAX_TEXT_BODY_BYTES: usize = 3_670_016; // 3.5 * 1024 * 1024
 /// 413, contradicting the advertised 4 MiB blob range.
 const MAX_BLOB_BODY_BYTES: usize = 5_767_168; // 5.5 * 1024 * 1024
 
+/// M7: apply [`crate::redact::redact_json`] to an encoded resource
+/// body. The body is already under [`MAX_TEXT_BODY_BYTES`], so the
+/// parse-back is bounded. Re-encodes only when something was masked,
+/// and then re-checks the cap: masking a number as `"***"` grows the
+/// body by a few bytes. `None` means the redacted body no longer fits.
+fn redact_body(body: String) -> Option<String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return Some(body);
+    };
+    if !crate::redact::redact_json(&mut value) {
+        return Some(body);
+    }
+    let mut writer = CappedWriter::with_cap(MAX_TEXT_BODY_BYTES);
+    serde_json::to_writer(&mut writer, &value).ok()?;
+    writer.into_string().ok()
+}
+
+fn too_large(what: &'static str) -> ReadOutcome {
+    tracing::warn!(
+        what,
+        cap = MAX_TEXT_BODY_BYTES,
+        "MCP resource body exceeded pre-serialization cap — refusing read",
+    );
+    ReadOutcome::TooLarge(format!(
+        "MCP `{what}` body exceeds the per-response cap ({MAX_TEXT_BODY_BYTES} bytes). \
+         Narrow the query (smaller `limit`, tighter filter) and retry.",
+    ))
+}
+
 fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     // Round-7 F2 on PR #122: `serde_json::to_string` allocates
     // the ENTIRE body before we can measure it — so a single
@@ -2032,27 +2065,18 @@ fn encode<T: Serialize>(value: &T, what: &'static str) -> ReadOutcome {
     // tripped the cap).
     let mut writer = CappedWriter::with_cap(MAX_TEXT_BODY_BYTES);
     match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => match writer.into_string() {
-            Ok(body) => ReadOutcome::OkText {
+        Ok(()) => match writer.into_string().map(redact_body) {
+            Ok(Some(body)) => ReadOutcome::OkText {
                 body,
                 mime: "application/json",
             },
+            Ok(None) => too_large(what),
             Err(err) => {
                 tracing::error!(%err, what, "MCP resource body was not valid UTF-8");
                 ReadOutcome::Internal(format!("failed to serialize {what}"))
             }
         },
-        Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::WriteZero) => {
-            tracing::warn!(
-                what,
-                cap = MAX_TEXT_BODY_BYTES,
-                "MCP resource body exceeded pre-serialization cap — refusing read",
-            );
-            ReadOutcome::TooLarge(format!(
-                "MCP `{what}` body exceeds the per-response cap ({MAX_TEXT_BODY_BYTES} bytes). \
-                 Narrow the query (smaller `limit`, tighter filter) and retry.",
-            ))
-        }
+        Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::WriteZero) => too_large(what),
         Err(err) => {
             tracing::error!(%err, what, "MCP resource serialization failed");
             ReadOutcome::Internal(format!("failed to serialize {what}"))
@@ -2160,6 +2184,18 @@ const _: () = {
     );
 };
 
+fn tool_body_too_large(what: &'static str, cap: usize) -> EncodedBody {
+    tracing::warn!(
+        what,
+        cap,
+        "MCP tool body exceeded pre-serialization cap — refusing call",
+    );
+    EncodedBody::TooLarge(format!(
+        "MCP `{what}` body exceeds the per-response cap ({cap} bytes). \
+         Narrow the query (smaller `limit`, tighter filter) and retry.",
+    ))
+}
+
 pub(super) fn encode_body_capped<T: Serialize>(
     value: &T,
     what: &'static str,
@@ -2174,7 +2210,19 @@ pub(super) fn encode_body_capped<T: Serialize>(
             // `cap`. Well under the mount's 128 MiB
             // `PENDING_BODY_GATE * MAX` bound.
             match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(v) => EncodedBody::Value(v),
+                // M7: redact here, while the cap can still be
+                // re-checked (masking a number as `"***"` grows the
+                // body). `ToolOutcome::into_result` runs the same pass
+                // again as a backstop for bodies built elsewhere; on an
+                // already-redacted value it changes nothing.
+                Ok(mut v) => {
+                    if crate::redact::redact_json(&mut v)
+                        && serde_json::to_writer(CappedWriter::with_cap(cap), &v).is_err()
+                    {
+                        return tool_body_too_large(what, cap);
+                    }
+                    EncodedBody::Value(v)
+                }
                 Err(err) => {
                     tracing::error!(%err, what, "MCP tool body parse-back failed");
                     EncodedBody::SerializeFailed(format!("failed to re-parse {what}"))
@@ -2182,15 +2230,7 @@ pub(super) fn encode_body_capped<T: Serialize>(
             }
         }
         Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::WriteZero) => {
-            tracing::warn!(
-                what,
-                cap,
-                "MCP tool body exceeded pre-serialization cap — refusing call",
-            );
-            EncodedBody::TooLarge(format!(
-                "MCP `{what}` body exceeds the per-response cap ({cap} bytes). \
-                 Narrow the query (smaller `limit`, tighter filter) and retry.",
-            ))
+            tool_body_too_large(what, cap)
         }
         Err(err) => {
             tracing::error!(%err, what, "MCP tool serialization failed");
@@ -2251,5 +2291,41 @@ impl std::io::Write for CappedWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::{EncodedBody, MAX_TEXT_BODY_BYTES, ReadOutcome, encode, encode_body_capped};
+    use serde_json::json;
+
+    #[test]
+    fn resource_bodies_are_redacted() {
+        let ReadOutcome::OkText { body, .. } =
+            encode(&json!({"password": "hunter2", "host": "h"}), "test")
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(body, r#"{"host":"h","password":"***"}"#);
+    }
+
+    #[test]
+    fn redaction_growth_is_rechecked_against_the_cap() {
+        // Each `"pin":1` grows by four bytes when masked as `"***"`;
+        // size the input just under the cap so the masked body is over.
+        // `{"pin":1},` is 10 bytes, `{"pin":"***"},` is 14.
+        let pairs = MAX_TEXT_BODY_BYTES / 12;
+        let rows: Vec<_> = (0..pairs).map(|_| json!({"pin": 1})).collect();
+        let raw = serde_json::to_string(&rows).unwrap();
+        assert!(raw.len() < MAX_TEXT_BODY_BYTES);
+        assert!(matches!(encode(&rows, "test"), ReadOutcome::TooLarge(_)));
+        assert!(matches!(
+            encode_body_capped(&rows, "test", raw.len() + 1),
+            EncodedBody::TooLarge(_)
+        ));
+        let EncodedBody::Value(v) = encode_body_capped(&rows, "test", raw.len() * 2) else {
+            panic!("fits under a larger cap");
+        };
+        assert_eq!(v[0], json!({"pin": "***"}));
     }
 }

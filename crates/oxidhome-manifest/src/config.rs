@@ -12,6 +12,35 @@
 //! - `string` — arbitrary
 //! - `enum` — string-valued, restricted to a declared `values` list
 //! - `nested` — recursive `[config.<key>.fields.<subkey>]` schema
+//! - `secret` — string-valued credential (password, API key, token).
+//!   See [Secret fields](#secret-fields).
+//!
+//! # Secret fields
+//!
+//! ```toml
+//! [config.api_key]
+//! type = "secret"
+//! required = true      # optional, defaults to true
+//! description = "Cloud API key."
+//! ```
+//!
+//! A `secret` field holds a string the owning plugin needs but nobody
+//! else should read back:
+//!
+//! - It never has a `default`: a manifest ships inside the plugin
+//!   package and is served by the schema endpoint, so it is not a
+//!   place for credentials. The value arrives as a per-instance
+//!   override (the same `config_overrides` every other field uses).
+//! - `required = false` makes it optional; an unset optional secret is
+//!   simply absent from the resolved config.
+//! - The resolved value is a [`ConfigValue::Secret`] wrapping a
+//!   [`SecretString`], whose `Debug` and `Serialize` impls both emit
+//!   [`MASKED`] (`"***"`). Only the owning plugin's `host-config` calls
+//!   see the plaintext, through [`SecretString::expose`]. Every host
+//!   read surface (REST, Connect, MCP) renders the field as masked with
+//!   a `set` flag instead.
+//! - Merge errors for a secret never echo the value (there is no range
+//!   or enum check to fail, and a type mismatch reports only the type).
 
 use std::collections::BTreeMap;
 
@@ -89,6 +118,17 @@ pub enum ConfigFieldType {
     Nested {
         fields: BTreeMap<String, ConfigField>,
     },
+    /// A credential. String-valued, never defaulted, masked on every
+    /// host read surface. See the [module docs](self#secret-fields).
+    Secret {
+        /// `false` lets the instance start without the secret set.
+        #[serde(default = "default_true")]
+        required: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Strict-key helper used by [`ConfigField`]'s custom `Deserialize`.
@@ -116,6 +156,8 @@ struct ConfigFieldHelper {
     values: Option<Vec<String>>,
     #[serde(default)]
     fields: Option<BTreeMap<String, ConfigField>>,
+    #[serde(default)]
+    required: Option<toml::Value>,
 }
 
 impl<'de> Deserialize<'de> for ConfigField {
@@ -123,7 +165,7 @@ impl<'de> Deserialize<'de> for ConfigField {
         let h = ConfigFieldHelper::deserialize(d)?;
         let ty = match h.kind.as_str() {
             "bool" => {
-                ensure_unset::<D>(&h, &["values", "fields", "min", "max"], "bool")?;
+                ensure_unset::<D>(&h, &["values", "fields", "min", "max", "required"], "bool")?;
                 let default = match h.default {
                     None => None,
                     Some(toml::Value::Boolean(b)) => Some(b),
@@ -137,21 +179,25 @@ impl<'de> Deserialize<'de> for ConfigField {
                 ConfigFieldType::Bool { default }
             }
             "int" => {
-                ensure_unset::<D>(&h, &["values", "fields"], "int")?;
+                ensure_unset::<D>(&h, &["values", "fields", "required"], "int")?;
                 let default = take_int::<D>(h.default, "default")?;
                 let min = take_int::<D>(h.min, "min")?;
                 let max = take_int::<D>(h.max, "max")?;
                 ConfigFieldType::Int { default, min, max }
             }
             "float" => {
-                ensure_unset::<D>(&h, &["values", "fields"], "float")?;
+                ensure_unset::<D>(&h, &["values", "fields", "required"], "float")?;
                 let default = take_float::<D>(h.default, "default")?;
                 let min = take_float::<D>(h.min, "min")?;
                 let max = take_float::<D>(h.max, "max")?;
                 ConfigFieldType::Float { default, min, max }
             }
             "string" => {
-                ensure_unset::<D>(&h, &["values", "fields", "min", "max"], "string")?;
+                ensure_unset::<D>(
+                    &h,
+                    &["values", "fields", "min", "max", "required"],
+                    "string",
+                )?;
                 let default = match h.default {
                     None => None,
                     Some(toml::Value::String(s)) => Some(s),
@@ -165,7 +211,7 @@ impl<'de> Deserialize<'de> for ConfigField {
                 ConfigFieldType::String { default }
             }
             "enum" => {
-                ensure_unset::<D>(&h, &["fields", "min", "max"], "enum")?;
+                ensure_unset::<D>(&h, &["fields", "min", "max", "required"], "enum")?;
                 let values = h.values.ok_or_else(|| {
                     D::Error::custom("config field `type = \"enum\"` requires `values`")
                 })?;
@@ -182,16 +228,21 @@ impl<'de> Deserialize<'de> for ConfigField {
                 ConfigFieldType::Enum { values, default }
             }
             "nested" => {
-                ensure_unset::<D>(&h, &["default", "values", "min", "max"], "nested")?;
+                ensure_unset::<D>(
+                    &h,
+                    &["default", "values", "min", "max", "required"],
+                    "nested",
+                )?;
                 let fields = h.fields.ok_or_else(|| {
                     D::Error::custom("config field `type = \"nested\"` requires `fields`")
                 })?;
                 ConfigFieldType::Nested { fields }
             }
+            "secret" => parse_secret::<D>(&h)?,
             other => {
                 return Err(D::Error::custom(format!(
                     "unknown config field `type` `{other}` \
-                     (expected bool/int/float/string/enum/nested)"
+                     (expected bool/int/float/string/enum/nested/secret)"
                 )));
             }
         };
@@ -200,6 +251,31 @@ impl<'de> Deserialize<'de> for ConfigField {
             description: h.description,
         })
     }
+}
+
+/// `type = "secret"` arm of [`ConfigField`]'s `Deserialize`.
+fn parse_secret<'de, D: Deserializer<'de>>(
+    h: &ConfigFieldHelper,
+) -> Result<ConfigFieldType, D::Error> {
+    if h.default.is_some() {
+        return Err(D::Error::custom(
+            "config field `type = \"secret\"`: `default` is not allowed — a manifest \
+             ships with the package and is served by the schema endpoint, so it must \
+             not carry credentials; supply the value as a per-instance config override",
+        ));
+    }
+    ensure_unset::<D>(h, &["values", "fields", "min", "max"], "secret")?;
+    let required = match &h.required {
+        None => true,
+        Some(toml::Value::Boolean(b)) => *b,
+        Some(other) => {
+            return Err(D::Error::custom(format!(
+                "config field `type = \"secret\"`: `required` must be a boolean, got {}",
+                type_name(other),
+            )));
+        }
+    };
+    Ok(ConfigFieldType::Secret { required })
 }
 
 /// Helper: return an error if any of the named helper fields is
@@ -217,6 +293,7 @@ fn ensure_unset<'de, D: Deserializer<'de>>(
             "max" => h.max.is_some(),
             "values" => h.values.is_some(),
             "fields" => h.fields.is_some(),
+            "required" => h.required.is_some(),
             _ => false,
         };
         if present {
@@ -263,8 +340,51 @@ fn take_float<'de, D: Deserializer<'de>>(
     }
 }
 
+/// The placeholder every host surface renders in place of a secret
+/// value.
+pub const MASKED: &str = "***";
+
+/// A secret config value. The plaintext is reachable only through
+/// [`Self::expose`]; `Debug` and `Serialize` both emit [`MASKED`], so a
+/// stray `{:?}`, `tracing` field, or JSON encoding of an
+/// [`InstanceConfig`] cannot leak it.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Wrap a plaintext secret.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The plaintext. Call this only on the path that hands the value to
+    /// the owning plugin (`host-config`) or that scrubs it from text.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretString({MASKED:?})")
+    }
+}
+
+impl Serialize for SecretString {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(MASKED)
+    }
+}
+
 /// Resolved value for a single config field after defaults are
 /// applied and user overrides are merged in.
+///
+/// `Serialize` is lossy for [`Self::Secret`] by design (it emits
+/// [`MASKED`]); `Deserialize` never produces a `Secret` because the
+/// untagged representation can't tell it from a `String`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ConfigValue {
@@ -273,6 +393,9 @@ pub enum ConfigValue {
     Float(f64),
     String(String),
     Nested(BTreeMap<String, ConfigValue>),
+    /// A `type = "secret"` field's value. Masked everywhere except
+    /// [`SecretString::expose`].
+    Secret(SecretString),
 }
 
 /// The whole resolved config for one plugin instance — what the host
@@ -368,7 +491,37 @@ fn resolve_field(
             resolve_enum(path, values, default.as_deref(), override_val, errors)
         }
         ConfigFieldType::Nested { fields } => resolve_nested(path, fields, override_val, errors),
+        ConfigFieldType::Secret { required } => {
+            resolve_secret(path, *required, override_val, errors)
+        }
     }
+}
+
+fn resolve_secret(
+    path: &str,
+    required: bool,
+    override_val: Option<&toml::Value>,
+    errors: &mut Vec<ValidationError>,
+) -> Option<ConfigValue> {
+    // Errors here name the type only, never the value — the override
+    // may be the credential itself.
+    if let Some(v) = override_val {
+        if let Some(s) = v.as_str() {
+            return Some(ConfigValue::Secret(SecretString::new(s)));
+        }
+        errors.push(ValidationError::ConfigTypeMismatch {
+            path: path.to_owned(),
+            expected: "string",
+            got: type_name(v),
+        });
+        return None;
+    }
+    if required {
+        errors.push(ValidationError::ConfigRequired {
+            path: path.to_owned(),
+        });
+    }
+    None
 }
 
 fn resolve_bool(
@@ -1876,5 +2029,111 @@ max = 65535
             Some(&ConfigValue::String("mqtt.local".into())),
         );
         assert_eq!(inner.get("port"), Some(&ConfigValue::Int(1883)));
+    }
+
+    fn secret_field(required: bool) -> ConfigField {
+        ConfigField {
+            ty: ConfigFieldType::Secret { required },
+            description: None,
+        }
+    }
+
+    #[test]
+    fn secret_parses_with_required_defaulting_to_true() {
+        let f: ConfigField = toml::from_str("type = \"secret\"\ndescription = \"k\"\n").unwrap();
+        assert_eq!(f.ty, ConfigFieldType::Secret { required: true });
+        let f: ConfigField = toml::from_str("type = \"secret\"\nrequired = false\n").unwrap();
+        assert_eq!(f.ty, ConfigFieldType::Secret { required: false });
+    }
+
+    #[test]
+    fn secret_rejects_default_and_foreign_keys() {
+        let err = toml::from_str::<ConfigField>("type = \"secret\"\ndefault = \"hunter2\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`default` is not allowed"), "{err}");
+        assert!(
+            !err.contains("hunter2"),
+            "error must not echo the value: {err}"
+        );
+        for bad in [
+            "type = \"secret\"\nmin = 1\n",
+            "type = \"secret\"\nvalues = [\"a\"]\n",
+            "type = \"secret\"\nfields = {}\n",
+        ] {
+            let err = toml::from_str::<ConfigField>(bad).unwrap_err();
+            assert!(err.to_string().contains("not valid for this type"), "{err}");
+        }
+        let err =
+            toml::from_str::<ConfigField>("type = \"secret\"\nrequired = \"yes\"\n").unwrap_err();
+        assert!(err.to_string().contains("must be a boolean"), "{err}");
+    }
+
+    #[test]
+    fn required_key_is_secret_only() {
+        let err =
+            toml::from_str::<ConfigField>("type = \"string\"\nrequired = true\n").unwrap_err();
+        assert!(err.to_string().contains("not valid for this type"), "{err}");
+    }
+
+    #[test]
+    fn secret_round_trips_schema_serialization() {
+        let f = secret_field(false);
+        let toml_text = toml::to_string(&f).unwrap();
+        let back: ConfigField = toml::from_str(&toml_text).unwrap();
+        assert_eq!(back, f);
+    }
+
+    #[test]
+    fn secret_merge_wraps_value_and_masks_debug_and_serialize() {
+        let mut fields = BTreeMap::new();
+        fields.insert("api_key".to_owned(), secret_field(true));
+        let m = manifest_with(fields);
+        let overrides: toml::Value = toml::from_str("api_key = \"hunter2\"\n").unwrap();
+        let cfg = merge(&m, &overrides).unwrap();
+        let Some(ConfigValue::Secret(secret)) = cfg.get("api_key") else {
+            panic!("expected a secret, got {cfg:?}");
+        };
+        assert_eq!(secret.expose(), "hunter2");
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        let json = toml::to_string(&cfg).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
+        assert!(json.contains(MASKED), "{json}");
+    }
+
+    #[test]
+    fn secret_merge_required_and_optional() {
+        let mut fields = BTreeMap::new();
+        fields.insert("needed".to_owned(), secret_field(true));
+        fields.insert("maybe".to_owned(), secret_field(false));
+        let m = manifest_with(fields);
+        let empty = toml::Value::Table(toml::value::Table::new());
+        let errors = merge(&m, &empty).unwrap_err();
+        assert_eq!(
+            errors,
+            vec![ValidationError::ConfigRequired {
+                path: "needed".into()
+            }]
+        );
+        let overrides: toml::Value = toml::from_str("needed = \"x\"\n").unwrap();
+        let cfg = merge(&m, &overrides).unwrap();
+        assert!(cfg.contains_key("needed"));
+        assert!(
+            !cfg.contains_key("maybe"),
+            "unset optional secret is absent"
+        );
+    }
+
+    #[test]
+    fn secret_type_mismatch_does_not_echo_value() {
+        let mut fields = BTreeMap::new();
+        fields.insert("pin".to_owned(), secret_field(true));
+        let m = manifest_with(fields);
+        let overrides: toml::Value = toml::from_str("pin = 987654\n").unwrap();
+        let errors = merge(&m, &overrides).unwrap_err();
+        let text = errors.iter().map(ToString::to_string).collect::<String>();
+        assert!(text.contains("expected string, got int"), "{text}");
+        assert!(!text.contains("987654"), "{text}");
     }
 }

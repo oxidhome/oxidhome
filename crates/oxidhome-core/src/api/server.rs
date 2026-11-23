@@ -36,7 +36,8 @@ use super::auth::{AuthState, require_token};
 use super::scopes::{
     AUDIT_READ, DASHBOARDS_READ, DASHBOARDS_WRITE, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ,
     EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST,
-    PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, require_scope,
+    PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, can_read_blobs,
+    require_scope,
 };
 use super::ui_ticket;
 
@@ -349,6 +350,11 @@ struct InstanceSummary {
     /// A structured projection (with `state_changed_at` etc.) is a
     /// follow-up once a UI/CLI consumer asks for it.
     state: String,
+    /// M7: the resolved config as [`crate::redact::masked_config_view`]
+    /// renders it — `type = "secret"` fields appear as
+    /// `{"secret": true, "set": …, "value": "***" | null}`, never in
+    /// plaintext. `null` until the instance's first successful load.
+    config: Option<serde_json::Value>,
 }
 
 /// Authenticated `GET /api/v1/instances`. Returns every supervised
@@ -366,6 +372,7 @@ async fn list_instances(
             instance_id: handle.instance_id().to_string(),
             plugin_id: handle.plugin_id().to_string(),
             state: format!("{:?}", handle.state()),
+            config: handle.config_view(),
         });
     }
     Ok(Json(InstancesBody { instances }))
@@ -479,17 +486,17 @@ struct DeviceStateEntry {
 }
 
 impl DeviceStateEntry {
-    fn from_state(state: &crate::state::DeviceState) -> Self {
+    /// `blobs` is [`can_read_blobs`] for the caller: without it, every
+    /// `bytes-val` field is withheld (M7).
+    fn from_state(state: &crate::state::DeviceState, blobs: bool) -> Self {
         Self {
             device_id: state.device_id.clone(),
             capability: state.capability.clone(),
             fields: state
                 .fields
                 .iter()
-                .map(|kv| WireKeyValue {
-                    key: kv.key.clone(),
-                    value: kv.value.clone().into(),
-                })
+                .cloned()
+                .map(|kv| WireKeyValue::from_wit(kv, blobs))
                 .collect(),
             global_revision: state.global_revision,
             received_ms: state.received_ms,
@@ -519,6 +526,7 @@ async fn get_device_state(
     Path(device_id): Path<String>,
 ) -> Result<Json<DeviceStateSnapshot>, ScopeDenied> {
     require_scope(&actor, DEVICES_READ)?;
+    let blobs = can_read_blobs(&actor);
     // H9 round-3 finding 3: read `revision` and `entries` **under
     // one lock**. The pre-fix shape called `current_revision()`
     // then `snapshot_device()` in two separate lock acquires, so
@@ -532,7 +540,7 @@ async fn get_device_state(
         .snapshot_device_with_revision(&device_id);
     let mut capabilities: Vec<DeviceStateEntry> = entries
         .iter()
-        .map(|s| DeviceStateEntry::from_state(s))
+        .map(|s| DeviceStateEntry::from_state(s, blobs))
         .collect();
     // Deterministic ordering so a client can eyeball snapshots.
     capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
@@ -717,6 +725,7 @@ async fn get_all_device_state(
     Query(params): Query<AllDevicesStateParams>,
 ) -> Result<Json<AllDevicesStateSnapshot>, AllDevicesStateError> {
     require_scope(&actor, DEVICES_READ)?;
+    let blobs = can_read_blobs(&actor);
     let limit = params
         .limit
         .filter(|n| *n > 0)
@@ -858,7 +867,7 @@ async fn get_all_device_state(
                 .clone();
             let mut wire: Vec<DeviceStateEntry> = caps
                 .iter()
-                .map(|a| DeviceStateEntry::from_state(a))
+                .map(|a| DeviceStateEntry::from_state(a, blobs))
                 .collect();
             wire.sort_by(|a, b| a.capability.cmp(&b.capability));
             DeviceStateSnapshot {
@@ -981,6 +990,7 @@ async fn query_device_state_changes(
     Query(params): Query<StateChangesParams>,
 ) -> Result<Json<StateChangesBody>, ScopeDenied> {
     require_scope(&actor, DEVICES_READ)?;
+    let blobs = can_read_blobs(&actor);
     let limit = params
         .limit
         .filter(|n| *n > 0)
@@ -1000,7 +1010,7 @@ async fn query_device_state_changes(
     let changes: Vec<DeviceStateEntry> = page
         .entries
         .iter()
-        .map(|s| DeviceStateEntry::from_state(s))
+        .map(|s| DeviceStateEntry::from_state(s, blobs))
         .collect();
     Ok(Json(StateChangesBody {
         epoch: page.epoch,
@@ -1127,7 +1137,13 @@ impl From<WitError> for WireWitError {
     }
 }
 
-pub(crate) fn command_result_to_wire(r: CommandResult) -> WireCommandResult {
+/// Project a plugin's command result onto the wire. Without `blobs`
+/// (the caller's [`can_read_blobs`]), returned `bytes-val` state is
+/// withheld (M7).
+pub(crate) fn command_result_to_wire(mut r: CommandResult, blobs: bool) -> WireCommandResult {
+    if !blobs {
+        crate::redact::withhold_bytes_in_command_result(&mut r);
+    }
     match r {
         CommandResult::Ok => WireCommandResult::Ok,
         CommandResult::OkWithState(kvs) => WireCommandResult::OkWithState {
@@ -1233,7 +1249,7 @@ async fn send_command(
             domain_error: crate::api::auth::wit_error_kind(err),
         }),
     };
-    let mut response = Json(command_result_to_wire(result)).into_response();
+    let mut response = Json(command_result_to_wire(result, can_read_blobs(&actor))).into_response();
     if let Some(outcome) = domain_outcome {
         response.extensions_mut().insert(outcome);
     }
@@ -2439,10 +2455,15 @@ async fn tail_events(
         },
         "http-tail",
     );
-    Ok(upgrade.on_upgrade(move |socket| tail_events_loop(socket, subscription)))
+    let blobs = can_read_blobs(&actor);
+    Ok(upgrade.on_upgrade(move |socket| tail_events_loop(socket, subscription, blobs)))
 }
 
-async fn tail_events_loop(mut socket: WebSocket, mut sub: crate::state::EventSubscription) {
+async fn tail_events_loop(
+    mut socket: WebSocket,
+    mut sub: crate::state::EventSubscription,
+    blobs: bool,
+) {
     use axum::extract::ws::Message;
     // C2e: per-subscriber mpsc queue. `recv()` returns `None` when
     // the bus drops (engine shutdown) or the subscription's
@@ -2483,7 +2504,7 @@ async fn tail_events_loop(mut socket: WebSocket, mut sub: crate::state::EventSub
                     // `GET /api/v1/events` history query without
                     // double-counting or missing rows across a
                     // reconnect boundary.
-                    let wire = WireEvent::from_host(&event);
+                    let wire = WireEvent::from_host(&event, blobs);
                     let Ok(text) = serde_json::to_string(&wire) else {
                         continue;
                     };
@@ -2600,7 +2621,13 @@ impl WireKeyValue {
     /// WIT record — reuses the existing `Value → WireValue`
     /// conversion so a single value decoder covers both storage
     /// and event surfaces.
-    fn from_wit(kv: KeyValue) -> Self {
+    ///
+    /// M7: without `blobs` (the caller's [`can_read_blobs`]) a
+    /// `bytes-val` is replaced by the withheld marker.
+    fn from_wit(mut kv: KeyValue, blobs: bool) -> Self {
+        if !blobs {
+            crate::redact::withhold_bytes(&mut kv.value);
+        }
         Self {
             key: kv.key,
             value: WireValue::from(kv.value),
@@ -2609,7 +2636,7 @@ impl WireKeyValue {
 }
 
 impl WireEvent {
-    fn from_host(event: &Event) -> Self {
+    fn from_host(event: &Event, blobs: bool) -> Self {
         let id = event.row_id;
         let (topic, payload) = match &event.payload {
             EventPayload::StateChanged(sc) => (
@@ -2620,7 +2647,7 @@ impl WireEvent {
                         .fields
                         .iter()
                         .cloned()
-                        .map(WireKeyValue::from_wit)
+                        .map(|kv| WireKeyValue::from_wit(kv, blobs))
                         .collect(),
                 },
             ),
@@ -2895,7 +2922,7 @@ async fn query_events(
         run_events_query(&state.engine.event_log(), &query, limit).map_err(EventsError::Storage)?;
     let events = rows
         .into_iter()
-        .map(WireHistoricalEvent::from_row)
+        .map(|row| WireHistoricalEvent::from_row(row, can_read_blobs(&actor)))
         .collect();
     Ok(Json(EventsBody { events }))
 }
@@ -2950,7 +2977,7 @@ pub(crate) struct WireHistoricalEvent {
 }
 
 impl WireHistoricalEvent {
-    pub(crate) fn from_row(row: HistoricalEvent) -> Self {
+    pub(crate) fn from_row(row: HistoricalEvent, blobs: bool) -> Self {
         // Build a scratch `Event` so `WireEvent::from_host`'s
         // payload-projection logic can be reused. The event's
         // `origin_*` / `timestamp` fields are populated from
@@ -2968,7 +2995,7 @@ impl WireHistoricalEvent {
         };
         // Reuse the tail-side payload projection so a single
         // client codec handles both live tail + history reads.
-        let wire = WireEvent::from_host(&ev);
+        let wire = WireEvent::from_host(&ev, blobs);
         Self {
             id: row.id,
             received_ms: row.received_ms,
@@ -3592,7 +3619,7 @@ mod tests {
                 row_id: None,
                 payload: EventPayload::Button(input),
             };
-            let wire = WireEvent::from_host(&event);
+            let wire = WireEvent::from_host(&event, true);
             match wire.payload {
                 WireEventPayload::Button { variant, delta } => {
                     assert_eq!(variant, expected_variant, "variant mismatch for {input:?}");
@@ -3624,7 +3651,7 @@ mod tests {
                 },
             ),
         };
-        let wire = WireEvent::from_host(&event);
+        let wire = WireEvent::from_host(&event, true);
         assert_eq!(wire.origin_plugin_id, "com.example.publisher");
         assert_eq!(wire.origin_instance_id, "publisher-42");
         // The origin fields serialize into the wire JSON so a

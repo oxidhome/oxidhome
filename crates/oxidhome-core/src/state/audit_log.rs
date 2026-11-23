@@ -221,6 +221,22 @@ pub enum AuditLogError {
     NotFound(u64),
 }
 
+/// M7: free-text audit columns go through redaction on every write:
+/// `path` via [`crate::redact::scrub_text`], and `domain_error` /
+/// `invocation_json` via [`crate::redact::redact_text`] (structural for
+/// JSON, so the invocation stays parseable), so a credential in a request path or an invocation summary
+/// never reaches the ledger. The ledger records *who did what*, never
+/// command arguments or config values; a future column that does (the
+/// UI plan's audited parameter values) must pass them through
+/// [`crate::redact::redact_json`] first.
+fn scrub(text: &str) -> std::borrow::Cow<'_, str> {
+    crate::redact::scrub_text(text)
+}
+
+fn scrub_opt(text: Option<&str>) -> Option<std::borrow::Cow<'_, str>> {
+    text.map(crate::redact::redact_text)
+}
+
 /// Per-host audit ledger.
 ///
 /// Held behind `Arc` and cloned into every axum request-handler
@@ -312,10 +328,10 @@ impl AuditLog {
                         &entry.token_id,
                         &entry.actor_kind,
                         &entry.method,
-                        &entry.path,
+                        scrub(&entry.path),
                         &entry.credential_fp,
                         &entry.call_id,
-                        &entry.invocation,
+                        scrub_opt(entry.invocation.as_deref()),
                     ],
                 )?;
         Ok(conn.last_insert_rowid())
@@ -360,7 +376,7 @@ impl AuditLog {
                     decision,
                     required_scope,
                     execution_outcome,
-                    domain_error,
+                    scrub_opt(domain_error),
                     id_i,
                 ],
             )?)
@@ -397,15 +413,15 @@ impl AuditLog {
                         &entry.token_id,
                         &entry.actor_kind,
                         &entry.method,
-                        &entry.path,
+                        scrub(&entry.path),
                         i64::from(entry.status),
                         &entry.decision,
                         &entry.required_scope,
                         &entry.credential_fp,
                         &entry.execution_outcome,
-                        &entry.domain_error,
+                        scrub_opt(entry.domain_error.as_deref()),
                         &entry.call_id,
-                        &entry.invocation,
+                        scrub_opt(entry.invocation.as_deref()),
                     ],
                 )?;
                 Ok(conn.last_insert_rowid())
@@ -588,6 +604,39 @@ mod tests {
             call_id: None,
             invocation: None,
         }
+    }
+
+    /// M7: text columns are scrubbed on insert and finalize.
+    #[test]
+    fn text_columns_are_redacted_on_write() {
+        let log = store();
+        let mut entry = sample_intent("tok", "/api/v1/x?api_key=abc123");
+        entry.invocation = Some(r#"{"subject":"bob","password":"hunter2"}"#.into());
+        let id = log.record_intent(&entry).unwrap();
+        log.finalize(id, 200, "allow", None, Some("failed"), Some("token=zzz"))
+            .unwrap();
+        let mut probe = sample_intent("anonymous", "/x?password=p");
+        probe.domain_error = Some("Bearer abc".into());
+        log.record_completed(&probe).unwrap();
+
+        let rows = log.query(&AuditQuery::default(), 10).unwrap();
+        let text = format!("{rows:?}");
+        for leaked in ["abc123", "hunter2", "zzz", "password=p", "Bearer abc"] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+        }
+        let first = rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(first.path, "/api/v1/x?api_key=***");
+        assert_eq!(first.domain_error.as_deref(), Some("token=***"));
+        // Redaction keeps the invocation summary valid JSON, even when a
+        // value's text would trip the unquoted-value scanner.
+        let mut entry = sample_intent("tok", "/api/v1/y");
+        entry.invocation = Some(r#"{"service":"password=abc\"tail"}"#.into());
+        let id = log.record_intent(&entry).unwrap();
+        let rows = log.query(&AuditQuery::default(), 10).unwrap();
+        let row = rows.iter().find(|r| r.id == id).unwrap();
+        let invocation: serde_json::Value =
+            serde_json::from_str(row.invocation.as_deref().unwrap()).expect("still JSON");
+        assert_eq!(invocation["service"], "password=***\"tail");
     }
 
     #[test]

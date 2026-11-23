@@ -14,6 +14,10 @@
 //! - [`merge`] — folds a manifest's `[config]` defaults with a
 //!   user-supplied override `toml::Value` into a typed
 //!   [`InstanceConfig`].
+//! - `type = "secret"` config fields (M7) resolve to
+//!   [`ConfigValue::Secret`] / [`SecretString`], which mask themselves
+//!   as [`MASKED`] in `Debug` and `Serialize`. See the [`config`]
+//!   module docs.
 //! - [`compatibility::check`] — the host's preflight that a plugin's
 //!   declared `sdk_version` is acceptable.
 //!
@@ -31,7 +35,9 @@ pub mod validate;
 mod manifest;
 
 pub use compatibility::{CompatError, check as check_compatibility};
-pub use config::{ConfigField, ConfigFieldType, ConfigValue, InstanceConfig, merge};
+pub use config::{
+    ConfigField, ConfigFieldType, ConfigValue, InstanceConfig, MASKED, SecretString, merge,
+};
 pub use extension::{ExtensionId, ExtensionIdError};
 pub use manifest::{
     CapabilitiesSection, PluginManifest, PluginSection, RestartPolicy, RuntimeSection,
