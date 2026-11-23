@@ -699,8 +699,12 @@ pub(super) async fn call(
         }
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => {
-            events_history_call(engine.clone(), request.arguments, can_read_blobs(&invocation))
-                .await
+            events_history_call(
+                engine.clone(),
+                request.arguments,
+                can_read_blobs(&invocation),
+            )
+            .await
         }
         "events.subscribe" => {
             events_subscribe_call(
@@ -713,15 +717,11 @@ pub(super) async fn call(
         }
         "plugins.list" => plugins_list_call(&engine, request.arguments),
         "plugins.show" => plugins_show_call(&engine, request.arguments, &invocation),
-        "plugins.stop" => {
-            plugins_stop_call(engine.clone(), request.arguments, &invocation).await
-        }
+        "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments, &invocation).await,
         "plugins.uninstall" => {
             plugins_uninstall_call(engine.clone(), request.arguments, &invocation).await
         }
-        "plugins.start" => {
-            plugins_start_call(engine.clone(), request.arguments, &invocation).await
-        }
+        "plugins.start" => plugins_start_call(engine.clone(), request.arguments, &invocation).await,
         "plugins.install" => {
             plugins_install_call(engine.clone(), request.arguments, &invocation).await
         }

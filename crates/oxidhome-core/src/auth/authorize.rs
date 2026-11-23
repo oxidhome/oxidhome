@@ -17,7 +17,7 @@
 //! The evaluator reproduces the token scope semantics exactly:
 //!
 //! 1. Each action maps to the one scope that has always gated it
-//!    ([`Action::legacy_scope`]). A token holds the action when its scope
+//!    (`Action::legacy_scope`). A token holds the action when its scope
 //!    list contains that scope literally or the wildcard `*`. An action
 //!    no scope maps to is refused ([`Reason::NoPermit`]).
 //! 2. For a few (action, resource) pairs, a 14.4 per-token constraint
@@ -824,7 +824,10 @@ mod tests {
         let actor = Actor::api("tok-a", vec!["devices:read".into()]);
         let ctx = ctx_for(&actor).entering("alpha");
         assert_eq!(ctx.root().authority().token_id(), Some("tok-a"));
-        assert_eq!(ctx.root().authority().scopes(), &["devices:read".to_string()]);
+        assert_eq!(
+            ctx.root().authority().scopes(),
+            &["devices:read".to_string()]
+        );
         assert!(authorize(&ctx, Action::DeviceRead, &Resource::devices()).allow);
     }
 

@@ -38,8 +38,7 @@ pub mod invocation;
 pub mod policy;
 
 pub use authorize::{
-    Action, AuditLevel, Authority, Decision, Obligations, Reason, Resource, ResourceKind,
-    authorize,
+    Action, AuditLevel, Authority, Decision, Obligations, Reason, Resource, ResourceKind, authorize,
 };
 pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
 #[cfg(test)]

@@ -539,8 +539,8 @@ fn enforced_for(transport: Transport) -> &'static [EnforcedConstraint] {
     }
 }
 
-fn allow(list: &[&str]) -> Option<Vec<String>> {
-    Some(list.iter().map(|s| (*s).to_string()).collect())
+fn allow(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_string()).collect()
 }
 
 fn constrained(scopes: &[&str], entries: &[(&str, ToolConstraint)]) -> Actor {
@@ -557,7 +557,7 @@ fn constrained(scopes: &[&str], entries: &[(&str, ToolConstraint)]) -> Actor {
 
 fn devices(list: &[&str]) -> ToolConstraint {
     ToolConstraint {
-        devices: allow(list),
+        devices: Some(allow(list)),
         plugins: None,
     }
 }
@@ -565,7 +565,7 @@ fn devices(list: &[&str]) -> ToolConstraint {
 fn plugins(list: &[&str]) -> ToolConstraint {
     ToolConstraint {
         devices: None,
-        plugins: allow(list),
+        plugins: Some(allow(list)),
     }
 }
 
@@ -632,8 +632,8 @@ fn tokens() -> Vec<(&'static str, Actor)> {
                 &[(
                     "device.send_command",
                     ToolConstraint {
-                        devices: allow(&["dev-a1b2c3d4*"]),
-                        plugins: allow(&["acme.*"]),
+                        devices: Some(allow(&["dev-a1b2c3d4*"])),
+                        plugins: Some(allow(&["acme.*"])),
                     },
                 )],
             ),
@@ -743,7 +743,8 @@ fn authorize_matches_every_legacy_call_site() {
                 let (action, resource) = (site.modern)(target);
                 let new = authorize(&ctx, action, &resource).into_result().map(drop);
                 assert_eq!(
-                    old, new,
+                    old,
+                    new,
                     "{}: token `{label}` {:?} target `{target}`",
                     site.name,
                     actor.scopes(),
@@ -767,7 +768,10 @@ fn stdio_ambient_actor_matches_legacy() {
         Principal::local_process(ActorKind::Mcp, actor.id(), Transport::McpStdio)
             .with_authority(super::Authority::of_local_process(&actor)),
     );
-    for site in sites().into_iter().filter(|s| s.transport == Transport::McpHttp) {
+    for site in sites()
+        .into_iter()
+        .filter(|s| s.transport == Transport::McpHttp)
+    {
         for target in TARGETS {
             let (action, resource) = (site.modern)(target);
             assert_eq!(

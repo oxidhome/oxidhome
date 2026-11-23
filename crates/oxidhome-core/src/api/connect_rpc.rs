@@ -28,7 +28,7 @@
 //! probes still work without credentials.
 //!
 //! Per-RPC authorization happens inside each handler via
-//! [`require_connect`], which asks [`crate::auth::authorize`] — the
+//! [`require_connect`], which asks [`crate::auth::authorize()`] — the
 //! same decision the JSON handlers' `require` uses. Handlers record
 //! their outcome (the deny's audit label on `permission_denied`, or
 //! the synthesized HTTP

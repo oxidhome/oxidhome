@@ -70,7 +70,7 @@ pub fn build_router(engine: Engine) -> Router {
         audit_log: engine.audit_log(),
         // H6: `POST /api/v1/devices/{id}/command` applies the
         // `device.send_command` per-device allowlist through the
-        // shared `authorize_device_command` check, same as Connect
+        // shared `crate::auth::authorize` decision, same as Connect
         // and MCP. Every other constraint key is still refused here.
         // See [`AuthState::enforced_constraints`] docs.
         enforced_constraints: &[crate::auth::DEVICE_COMMAND_ENFORCED],
@@ -1249,11 +1249,8 @@ async fn send_command(
     // middleware on a response extension.
     let status = command_outcome_status(&report.outcome);
     let domain_outcome = crate::api::auth::DomainOutcome::from_report(&report);
-    let mut response = (
-        status,
-        Json(WireCommandReport::from_report(report, blobs)),
-    )
-        .into_response();
+    let mut response =
+        (status, Json(WireCommandReport::from_report(report, blobs))).into_response();
     response.extensions_mut().insert(domain_outcome);
     Ok(response)
 }
@@ -1955,7 +1952,11 @@ async fn post_plugin_ui_session(
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
 ) -> Result<Response, PluginUiError> {
-    require(&ctx, Action::PluginUi, &Resource::plugin(plugin_id.as_str()))?;
+    require(
+        &ctx,
+        Action::PluginUi,
+        &Resource::plugin(plugin_id.as_str()),
+    )?;
     let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
         return Err(PluginUiError::NotFound);
     };

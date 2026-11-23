@@ -3733,3 +3733,96 @@ async fn events_cursor_pruned_by_retention_reports_cursor_expired() {
         assert!(rows.iter().any(|r| r.path == path), "{path} audited");
     }
 }
+
+// ── H6 slice 2: `authorize()` deny reasons in the audit ledger ──
+
+/// MCP tools now ask `auth::authorize` for both the route pre-check
+/// and the per-target 14.4 constraint. Each deny still writes one
+/// `deny` row whose `required_scope` is the missing scope or the
+/// `constraint:<tool>:<field>` sentinel, as the inline checks did.
+#[tokio::test(flavor = "current_thread")]
+async fn tool_denials_record_scope_and_constraint_sentinels() {
+    let engine = Engine::new().expect("engine");
+    let constrained = mint_bearer_with_constraint(
+        &engine,
+        "constrained-all",
+        r#"{
+            "device.send_command": {"devices": ["dev-a1b2*"]},
+            "plugins.show": {"plugins": ["acme.*"]},
+            "plugins.stop": {"plugins": ["acme.*"]},
+            "plugins.uninstall": {"plugins": ["acme.*"]},
+            "plugins.start": {"plugins": ["acme.*"]}
+        }"#,
+    );
+    let logs_only = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let router = build_router(engine.clone());
+
+    let (router, session) = handshake(router, &constrained).await;
+    let calls = [
+        (
+            "device.send_command",
+            json!({"device_id": "dev-ffff000000000000", "capability": "switch", "action": "toggle"}),
+            "constraint:device.send_command:devices",
+        ),
+        (
+            "plugins.show",
+            json!({"plugin_id": "outside.p"}),
+            "constraint:plugins.show:plugins",
+        ),
+        (
+            "plugins.stop",
+            json!({"plugin_id": "outside.p"}),
+            "constraint:plugins.stop:plugins",
+        ),
+        (
+            "plugins.uninstall",
+            json!({"plugin_id": "outside.p"}),
+            "constraint:plugins.uninstall:plugins",
+        ),
+        (
+            "plugins.start",
+            json!({"plugin_id": "outside.p"}),
+            "constraint:plugins.start:plugins",
+        ),
+    ];
+    for (tool, args, _) in &calls {
+        let response = call(
+            &router,
+            &constrained,
+            &session,
+            "tools/call",
+            json!({"name": tool, "arguments": args}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32001, "{tool}: {response}");
+    }
+
+    let (router, session) = handshake(router, &logs_only).await;
+    let response = call(
+        &router,
+        &logs_only,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.list", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32001, "{response}");
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 256))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let deny_for = |path: &str| {
+        rows.iter()
+            .find(|r| r.path == path && r.decision == "deny")
+            .unwrap_or_else(|| panic!("no deny row for {path}"))
+    };
+    for (tool, _, sentinel) in &calls {
+        let row = deny_for(&format!("mcp.tool.{tool}"));
+        assert_eq!(row.status, 403, "{tool}");
+        assert_eq!(row.required_scope.as_deref(), Some(*sentinel), "{tool}");
+    }
+    let row = deny_for("mcp.tool.plugins.list");
+    assert_eq!(row.required_scope.as_deref(), Some("plugins:list"));
+}

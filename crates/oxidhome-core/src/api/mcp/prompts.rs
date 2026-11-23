@@ -31,7 +31,7 @@
 //! `prompts/list` is public — every session sees the full
 //! catalogue regardless of scope. `prompts/get` authorizes the
 //! actions the prompt's resources need (through
-//! [`crate::auth::authorize`]) and lands denials as
+//! [`crate::auth::authorize()`]) and lands denials as
 //! `ScopeDenied` (`-32001`), matching the resource + tool
 //! surface's shape. The rationale: a prompt template is not
 //! itself sensitive (it's a documented pattern for using the

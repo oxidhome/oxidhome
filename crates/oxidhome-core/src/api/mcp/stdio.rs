@@ -19,7 +19,7 @@
 //! state dir, so it already has the operator's authority. The
 //! handler runs under a wildcard-scope
 //! `Actor::api("mcp-stdio-parent-process", ["*"])` so
-//! `require_scope` decisions land as `allow`; the audit ledger
+//! `authorize` decisions land as `allow`; the audit ledger
 //! records every action with that exact token id, distinct from
 //! any HTTP token id an operator would mint, so a forensic
 //! sweep filters mcp-stdio traffic by matching on it.

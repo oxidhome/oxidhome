@@ -1,4 +1,4 @@
-//! Token scopes and the REST adapter for [`crate::auth::authorize`].
+//! Token scopes and the REST adapter for [`crate::auth::authorize()`].
 //!
 //! A **scope** is a free-form string like `"devices:list"` or
 //! `"instances:start"`. Each token carries a list of authorized
@@ -7,7 +7,7 @@
 //! directly: they call [`require`] with an
 //! [`Action`](crate::auth::Action) and a
 //! [`Resource`](crate::auth::Resource), and the
-//! [`crate::auth::authorize`] evaluator maps the action to the scope
+//! [`crate::auth::authorize()`] evaluator maps the action to the scope
 //! below that has always gated it
 //! (`Action::legacy_scope`).
 //!

@@ -97,7 +97,7 @@ impl Transport {
 /// without touching `credential_id`.
 ///
 /// It also carries the principal's resolved [`Authority`] (scopes and
-/// 14.4 constraints) that [`crate::auth::authorize`] decides on. The
+/// 14.4 constraints) that [`crate::auth::authorize()`] decides on. The
 /// authority is host-only: [`InvocationContext::audit_json`] does not
 /// include it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +187,7 @@ impl Principal {
         self.transport
     }
 
-    /// Resolved scopes and constraints [`crate::auth::authorize`]
+    /// Resolved scopes and constraints [`crate::auth::authorize()`]
     /// decides on. Empty for host-origin principals.
     #[must_use]
     pub fn authority(&self) -> &Authority {

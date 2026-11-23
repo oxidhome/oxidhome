@@ -6529,6 +6529,7 @@ async fn connect_device_state_rpcs_mirror_rest() {
 /// exercises one route per action, including the replay branch of the
 /// tail (which needs `events:read` on top).
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn authorize_denials_record_the_missing_scope_on_every_surface() {
     use oxidhome_core::state::AuditQuery;
 
@@ -6538,7 +6539,7 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
         .create("tail-only", b"[\"events:tail\"]")
         .expect("create token");
     let bearer = format!("Bearer {}", issued.plaintext);
-    let rest: &[(&str, &str, &str, Option<&str>)] = &[
+    let rest_routes: &[(&str, &str, &str, Option<&str>)] = &[
         ("GET", "/api/v1/config", "status:read", None),
         ("GET", "/api/v1/instances", "instances:list", None),
         ("GET", "/api/v1/devices", "devices:list", None),
@@ -6563,10 +6564,25 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
             "plugins:install",
             Some(r#"{"source_dir":"/nonexistent"}"#),
         ),
-        ("POST", "/api/v1/plugins/acme.p/start", "plugins:start", None),
+        (
+            "POST",
+            "/api/v1/plugins/acme.p/start",
+            "plugins:start",
+            None,
+        ),
         ("POST", "/api/v1/plugins/acme.p/stop", "plugins:stop", None),
-        ("DELETE", "/api/v1/plugins/acme.p", "plugins:uninstall", None),
-        ("POST", "/api/v1/plugins/acme.p/ui-session", "plugins:ui", None),
+        (
+            "DELETE",
+            "/api/v1/plugins/acme.p",
+            "plugins:uninstall",
+            None,
+        ),
+        (
+            "POST",
+            "/api/v1/plugins/acme.p/ui-session",
+            "plugins:ui",
+            None,
+        ),
         ("GET", "/api/v1/logs", "logs:read", None),
         ("GET", "/api/v1/events", "events:read", None),
         ("GET", "/api/v1/audit", "audit:read", None),
@@ -6574,7 +6590,7 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
         ("GET", "/api/v1/dashboards/1", "dashboards:read", None),
         ("DELETE", "/api/v1/dashboards/1", "dashboards:write", None),
     ];
-    for (method, uri, _, body) in rest {
+    for (method, uri, _, body) in rest_routes {
         let mut req = Request::builder()
             .method(*method)
             .uri(*uri)
@@ -6582,14 +6598,14 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
         if body.is_some() {
             req = req.header(header::CONTENT_TYPE, "application/json");
         }
-        let resp = build_router(engine.clone())
+        let response = build_router(engine.clone())
             .oneshot(
                 req.body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
     }
     let connect: &[(&str, &str, &str)] = &[
         (
@@ -6605,7 +6621,7 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
         ("/oxidhome.v1.LogsService/QueryLogs", "{}", "logs:read"),
     ];
     for (path, body, _) in connect {
-        let resp = build_router(engine.clone())
+        let response = build_router(engine.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -6617,7 +6633,7 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
     }
 
     let rows = engine
@@ -6629,11 +6645,15 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
             .find(|r| r.method == method && r.path == path)
             .unwrap_or_else(|| panic!("no audit row for {method} {path}"))
     };
-    for (method, uri, scope, _) in rest {
+    for (method, uri, scope, _) in rest_routes {
         let row = row_for(method, uri);
         assert_eq!(row.decision, "deny", "{method} {uri}");
         assert_eq!(row.status, 403, "{method} {uri}");
-        assert_eq!(row.required_scope.as_deref(), Some(*scope), "{method} {uri}");
+        assert_eq!(
+            row.required_scope.as_deref(),
+            Some(*scope),
+            "{method} {uri}"
+        );
     }
     for (path, _, scope) in connect {
         let row = row_for("POST", path);

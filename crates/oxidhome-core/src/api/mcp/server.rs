@@ -201,10 +201,9 @@ pub fn mount_routes_with_all_limits(
     )
 }
 
-
 /// Constraint keys the MCP mount enforces, each with the
 /// `ToolConstraint` field its dispatch site consults through
-/// [`crate::auth::authorize`]:
+/// [`crate::auth::authorize()`]:
 ///
 /// - 14.4b: `device.send_command` / `devices`.
 /// - 14.4c: four `plugins.*` entries / `plugins`, each checked

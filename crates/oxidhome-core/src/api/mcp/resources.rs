@@ -230,7 +230,7 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
 /// `actor` carries the bearer's resolved [`Actor::id`] for the
 /// audit row; `ctx` carries its authority. Round-2 F1: authorize
 /// the per-resource action up front through
-/// [`crate::auth::authorize`] (the same decision the REST endpoints
+/// [`crate::auth::authorize()`] (the same decision the REST endpoints
 /// use), so a token holding e.g. `logs:read` can't enumerate
 /// devices just by hitting the MCP mount.
 /// Result of dispatching a resource read.
