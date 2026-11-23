@@ -13,8 +13,8 @@ use oxidhome_manifest::{CapabilitiesSection, ServiceGrant};
 /// one an operator could actually issue for this manifest.
 ///
 /// Set-shaped fields must be subsets, quotas must not exceed the
-/// request (nor may `script_sandboxes`), `subscribes_events` may only
-/// be granted when requested, and each `consumes_services` entry must
+/// request (nor may `script_sandboxes`), `subscribes_events` and
+/// `reads_event_bytes` may only be granted when requested, and each `consumes_services` entry must
 /// be covered by some requested entry (same plugin and service, a
 /// selector no wider than the requested one, commands drawn from the
 /// requested list).
@@ -64,6 +64,9 @@ pub fn grant_excess(requested: &CapabilitiesSection, granted: &CapabilitiesSecti
             "script_sandboxes {} exceeds the requested {}",
             granted.script_sandboxes, requested.script_sandboxes
         ));
+    }
+    if granted.reads_event_bytes && !requested.reads_event_bytes {
+        excess.push("reads_event_bytes is not requested".to_owned());
     }
     for (index, grant) in granted.reads_state.iter().enumerate() {
         if !requested.reads_state.contains(grant) {
@@ -131,6 +134,7 @@ mod tests {
                 devices: vec!["*".into()],
                 bytes: false,
             }],
+            reads_event_bytes: true,
         }
     }
 
@@ -168,7 +172,7 @@ mod tests {
         let req = CapabilitiesSection::default();
         let wide = requested();
         let excess = grant_excess(&req, &wide);
-        assert_eq!(excess.len(), 9, "{excess:?}");
+        assert_eq!(excess.len(), 10, "{excess:?}");
     }
 
     #[test]

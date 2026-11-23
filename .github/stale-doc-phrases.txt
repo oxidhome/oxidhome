@@ -15,3 +15,6 @@ gRPC deferred
 not limited by design
 no compute limits
 does not cap a plugin's CPU
+
+# Plugins read event history through host-events::read-events.
+no history access

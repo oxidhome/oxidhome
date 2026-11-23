@@ -1,0 +1,412 @@
+//! Bounded forward scans from a resume cursor, for readers that filter
+//! rows themselves (the plugin `host-events::read-events` import).
+//!
+//! [`EventLog::scan_after_cursor`] checks the cursor and walks the
+//! rows after it in one `Db::read` snapshot (M6), like
+//! [`EventLog::query_after_cursor`], but hands each decoded row to a
+//! caller-supplied step instead of returning a fixed row count. The
+//! caller decides per row whether to keep it, skip it, or stop because
+//! its page is full, and the scan reports the exact cursor to resume
+//! from: past every row it looked at, or just before the row it
+//! stopped on.
+
+use super::cursor::{CursorExpired, bounds, resolve_on};
+use super::{EventLog, EventLogError, StoredEventPayload};
+use crate::host_impl::plugin::oxidhome::plugin::events::Event;
+
+/// What [`EventLog::scan_after_cursor`] does with one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanStep {
+    /// Keep the row in the page.
+    Take,
+    /// Leave the row out; the cursor still moves past it.
+    Skip,
+    /// The page is full: stop before this row, so the next scan starts
+    /// with it. Treated as [`Self::Take`] while the page is empty, so
+    /// every scan that finds a row makes progress.
+    Full,
+    /// Keep the row and stop right after it (the page just filled).
+    TakeLast,
+}
+
+/// One [`EventLog::scan_after_cursor`] result.
+#[derive(Debug, Clone)]
+pub struct ScanPage {
+    /// Kept rows as WIT events (each with its `row-id`), oldest first.
+    pub events: Vec<Event>,
+    /// Cursor to resume from: the last row the scan consumed (kept or
+    /// skipped). It equals `head_id` once the scan reached the end.
+    pub next_after_id: u64,
+    /// Highest row id ever assigned, in the scan's snapshot.
+    pub head_id: u64,
+}
+
+impl EventLog {
+    /// Resolve `after_id` (as [`Self::resolve_cursor`]: `0` starts at
+    /// the oldest retained row and never expires) and pass up to
+    /// `scan_budget` rows after it, oldest first, to `step`. The
+    /// cursor check and every read share one `Db::read` closure, so
+    /// they see one snapshot and a concurrent prune can't fall
+    /// between them. `step` may rewrite the event it keeps (e.g. to
+    /// withhold bytes). A row whose payload doesn't decode is skipped
+    /// (the cursor moves past it) and logged once per scan, so it
+    /// can't block every reader behind it. An expired cursor is the
+    /// inner `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any SQL error.
+    pub fn scan_after_cursor(
+        &self,
+        after_id: u64,
+        scan_budget: usize,
+        mut step: impl FnMut(&mut Event) -> ScanStep,
+    ) -> Result<Result<ScanPage, CursorExpired>, EventLogError> {
+        self.db.read(|conn| {
+            let mut pos = match resolve_on(conn, after_id)? {
+                Ok(cursor) => cursor,
+                Err(expired) => return Ok(Err(expired)),
+            };
+            let (head_id, _) = bounds(conn)?;
+            let mut events = Vec::new();
+            if scan_budget == 0 || pos >= head_id {
+                return Ok(Ok(ScanPage {
+                    events,
+                    next_after_id: pos,
+                    head_id,
+                }));
+            }
+            // One statement, stepped lazily: a row is decoded only
+            // when the scan gets to it, so a full page stops decoding.
+            let mut stmt = conn.prepare(
+                "SELECT id, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob \
+                 FROM event_log WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![
+                i64::try_from(pos).unwrap_or(i64::MAX),
+                i64::try_from(scan_budget).unwrap_or(i64::MAX),
+            ])?;
+            let mut bad = BadRows::default();
+            while let Some(row) = rows.next()? {
+                let id = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
+                if id != pos + 1 {
+                    // A hole inside history (left by pre-H4 retention,
+                    // which deleted by time): stop before it, so the
+                    // next read from `pos` reports `cursor-expired`
+                    // instead of silently crossing it.
+                    break;
+                }
+                // An undecodable row is skipped (and logged once per
+                // scan) rather than failing every read that reaches it.
+                if let Some(mut event) = decode_row(row, id, &mut bad)? {
+                    match step(&mut event) {
+                        ScanStep::Full if !events.is_empty() => {
+                            bad.log();
+                            return Ok(Ok(ScanPage {
+                                events,
+                                next_after_id: pos,
+                                head_id,
+                            }));
+                        }
+                        ScanStep::TakeLast => {
+                            events.push(event);
+                            bad.log();
+                            return Ok(Ok(ScanPage {
+                                events,
+                                next_after_id: id,
+                                head_id,
+                            }));
+                        }
+                        ScanStep::Take | ScanStep::Full => events.push(event),
+                        ScanStep::Skip => {}
+                    }
+                }
+                pos = id;
+            }
+            // `pos` stays at the last row consumed. In a dense log
+            // the end of the scan is the head; if rows up to the head
+            // are missing (a pruned suffix), the next read from `pos`
+            // reports `cursor-expired` instead of skipping them.
+            bad.log();
+            Ok(Ok(ScanPage {
+                events,
+                next_after_id: pos,
+                head_id,
+            }))
+        })
+    }
+}
+
+/// Rows one scan skipped because their payload doesn't decode,
+/// reported in one log line per scan.
+#[derive(Default)]
+struct BadRows {
+    count: u64,
+    first: Option<(u64, String)>,
+}
+
+impl BadRows {
+    fn log(&self) {
+        if let Some((id, error)) = &self.first {
+            tracing::error!(
+                target: "state.event_log",
+                skipped = self.count,
+                first_id = id,
+                error = %error,
+                "event_log rows do not decode; skipped by the history scan",
+            );
+        }
+    }
+}
+
+/// Decode one `event_log` row selected by [`EventLog::scan_after_cursor`].
+/// A payload that doesn't decode yields `None` and is counted in `bad`.
+fn decode_row(
+    row: &rusqlite::Row<'_>,
+    id: u64,
+    bad: &mut BadRows,
+) -> Result<Option<Event>, EventLogError> {
+    let decoded = (|| -> Result<Result<Event, String>, rusqlite::Error> {
+        let stored = match row.get_ref(6)? {
+            rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b) => {
+                serde_json::from_slice::<StoredEventPayload>(b)
+            }
+            other => return Ok(Err(format!("payload_blob is {:?}", other.data_type()))),
+        };
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(err) => return Ok(Err(err.to_string())),
+        };
+        Ok(Ok(Event {
+            device: row.get(2)?,
+            timestamp: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+            origin_plugin_id: row.get(4)?,
+            origin_instance_id: row.get(3)?,
+            row_id: Some(id),
+            payload: stored.into_wit(),
+        }))
+    })();
+    let error = match decoded {
+        Ok(Ok(event)) => return Ok(Some(event)),
+        Ok(Err(error)) => error,
+        // A column of the wrong type is this row's problem, not the
+        // statement's: skip the row like a bad payload.
+        Err(
+            err @ (rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)),
+        ) => err.to_string(),
+        Err(err) => return Err(err.into()),
+    };
+    bad.count += 1;
+    if bad.first.is_none() {
+        bad.first = Some((id, error));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::host_impl::plugin::oxidhome::plugin::events::{CustomEvent, EventPayload};
+    use crate::state::db::Db;
+
+    fn log_with(rows: u64) -> EventLog {
+        let log = EventLog::new(Arc::new(Db::open_in_memory().expect("db")));
+        for n in 1..=rows {
+            let ev = Event {
+                device: None,
+                timestamp: n,
+                payload: EventPayload::Custom(CustomEvent {
+                    topic: if n % 2 == 0 { "even" } else { "odd" }.into(),
+                    payload: n.to_string(),
+                }),
+                origin_plugin_id: "example.test".into(),
+                origin_instance_id: "inst".into(),
+                row_id: None,
+            };
+            #[allow(clippy::cast_possible_wrap)]
+            log.record(n as i64, &ev, "inst", "example.test")
+                .expect("record");
+        }
+        log
+    }
+
+    fn ids(page: &ScanPage) -> Vec<u64> {
+        page.events.iter().filter_map(|e| e.row_id).collect()
+    }
+
+    fn is_even(e: &Event) -> bool {
+        matches!(&e.payload, EventPayload::Custom(c) if c.topic == "even")
+    }
+
+    #[test]
+    fn skipped_rows_still_advance_the_cursor() {
+        let log = log_with(10);
+        let page = log
+            .scan_after_cursor(0, 4, |e| {
+                if is_even(e) {
+                    ScanStep::Take
+                } else {
+                    ScanStep::Skip
+                }
+            })
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![2, 4]);
+        assert_eq!((page.next_after_id, page.head_id), (4, 10));
+        // A trailing skipped row moves the cursor past it.
+        let page = log
+            .scan_after_cursor(4, 5, |e| {
+                if is_even(e) {
+                    ScanStep::Take
+                } else {
+                    ScanStep::Skip
+                }
+            })
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![6, 8]);
+        assert_eq!(page.next_after_id, 9);
+    }
+
+    #[test]
+    fn full_stops_before_the_row_and_never_returns_an_empty_page() {
+        let log = log_with(5);
+        let mut kept = 0;
+        let page = log
+            .scan_after_cursor(0, 100, |_| {
+                kept += 1;
+                if kept > 2 {
+                    ScanStep::Full
+                } else {
+                    ScanStep::Take
+                }
+            })
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![1, 2]);
+        assert_eq!(page.next_after_id, 2);
+        // `Full` on the first row still takes it.
+        let page = log
+            .scan_after_cursor(2, 100, |_| ScanStep::Full)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![3]);
+        assert_eq!(page.next_after_id, 3);
+    }
+
+    #[test]
+    fn reaching_the_end_resumes_from_the_head() {
+        let log = log_with(130);
+        let page = log
+            .scan_after_cursor(0, 1000, |_| ScanStep::Skip)
+            .expect("scan")
+            .expect("cursor");
+        assert!(page.events.is_empty());
+        assert_eq!((page.next_after_id, page.head_id), (130, 130));
+        let page = log
+            .scan_after_cursor(130, 1000, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert!(page.events.is_empty());
+        assert_eq!(page.next_after_id, 130);
+    }
+
+    #[test]
+    fn an_interior_hole_ends_the_page_and_then_expires() {
+        let log = log_with(5);
+        log.db
+            .write(|conn| conn.execute("DELETE FROM event_log WHERE id = 3", ()))
+            .expect("delete");
+        let page = log
+            .scan_after_cursor(1, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![2]);
+        assert_eq!(page.next_after_id, 2);
+        assert!(
+            log.scan_after_cursor(2, 10, |_| ScanStep::Take)
+                .expect("scan")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pruned_suffix_expires_instead_of_reporting_caught_up() {
+        let log = log_with(5);
+        log.db
+            .write(|conn| conn.execute("DELETE FROM event_log WHERE id > 3", ()))
+            .expect("delete");
+        let page = log
+            .scan_after_cursor(1, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![2, 3]);
+        assert_eq!((page.next_after_id, page.head_id), (3, 5));
+        assert!(
+            log.scan_after_cursor(3, 10, |_| ScanStep::Take)
+                .expect("scan")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn undecodable_rows_are_skipped() {
+        let log = log_with(3);
+        log.db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE event_log SET payload_blob = x'7b7d' WHERE id = 2",
+                    (),
+                )
+            })
+            .expect("corrupt");
+        let page = log
+            .scan_after_cursor(0, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![1, 3]);
+        assert_eq!(page.next_after_id, 3);
+        // A column of the wrong type is skipped the same way.
+        log.db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE event_log SET payload_blob = 42, device_id = x'00' WHERE id = 3",
+                    (),
+                )
+            })
+            .expect("corrupt");
+        let page = log
+            .scan_after_cursor(0, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![1]);
+        assert_eq!(page.next_after_id, 3);
+    }
+
+    #[test]
+    fn expired_cursors_are_reported() {
+        let log = log_with(5);
+        log.trim_older_than(4).expect("trim");
+        let expired = log
+            .scan_after_cursor(1, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect_err("expired");
+        assert_eq!(
+            expired,
+            CursorExpired {
+                after_id: 1,
+                oldest_id: Some(4),
+                head_id: 5,
+            }
+        );
+        let page = log
+            .scan_after_cursor(0, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![4, 5]);
+    }
+}

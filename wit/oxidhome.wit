@@ -1266,7 +1266,8 @@ interface host-sandboxes {
 }
 
 /// Event bus pub/sub. Subscribed events are delivered via the plugin's
-/// exported `on-event(...)`.
+/// exported `on-event(...)`; `read-events` replays the same events
+/// from the host's durable history.
 interface host-events {
   use types.{subscription-id, error};
   use events.{event, event-filter};
@@ -1274,6 +1275,59 @@ interface host-events {
   publish-event: func(ev: event) -> result<_, error>;
   subscribe:     func(filter: event-filter) -> result<subscription-id, error>;
   unsubscribe:   func(id: subscription-id) -> result<_, error>;
+
+  /// One page of `read-events`.
+  record event-page {
+    /// Visible events with `row-id` above the request's `after-id`,
+    /// oldest first. Every event carries its `row-id`.
+    events: list<event>,
+    /// The cursor for the next call. It can be past the last returned
+    /// event, because rows this plugin may not see are skipped. Store
+    /// it (for example in `storage`) to resume after a restart.
+    next-after-id: u64,
+    /// Highest row id in history when the page was read. The plugin
+    /// has caught up when `next-after-id >= head-id`.
+    head-id: u64,
+  }
+
+  /// `after-id` can't be resumed without a gap: the rows right after
+  /// it were deleted by retention, or it is above the history head
+  /// (for example after the host restored an older backup). Resume
+  /// from `head-id` and rebuild what you track from `host-state`.
+  record cursor-expired {
+    after-id: u64,
+    /// Oldest row id still in history; `none` if history is empty.
+    oldest-id: option<u64>,
+    /// Highest row id ever assigned.
+    head-id: u64,
+  }
+
+  variant event-read {
+    page(event-page),
+    cursor-expired(cursor-expired),
+  }
+
+  /// Read recorded events with `row-id > after-id`, oldest first: the
+  /// events `on-event` would have delivered to this instance's
+  /// current subscriptions, plus host gap markers (topic
+  /// `host.event_log.gap`), which every reader sees. `0` starts at
+  /// the oldest retained row. Rows matching no current subscription
+  /// are skipped without saying why, so subscribe before reading. A
+  /// recorded row the host can no longer decode is skipped too (and
+  /// logged on the host).
+  ///
+  /// Needs `capabilities.subscribes_events`; without it the call is
+  /// `permission-denied`. `bytes-val` fields are replaced by a
+  /// `json-val` marker
+  /// `{"withheld":"bytes","size_bytes":N,"required_scope":"reads_event_bytes"}`
+  /// unless the manifest requests `capabilities.reads_event_bytes`
+  /// and the operator's grant for the installation keeps it.
+  ///
+  /// A page holds at most `limit` events (0 means 64; capped at 256)
+  /// and about 1 MiB, and one call looks at a bounded number of rows,
+  /// so a page can be short or empty before the plugin has caught up:
+  /// keep reading from `next-after-id` until it reaches `head-id`.
+  read-events: func(after-id: u64, limit: u32) -> result<event-read, error>;
 }
 
 /// Per-instance configuration the user set for this plugin instance.

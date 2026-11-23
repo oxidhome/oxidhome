@@ -2,9 +2,10 @@
 //!
 //! Phase 5d's read side: every event a plugin publishes lands in the
 //! `event_log` table so the CLI/UI (Phase 12) can answer questions
-//! like "what did the front-door sensor do yesterday?" Plugins keep
-//! using `subscribe`/`on-event` for live delivery; they don't query
-//! history themselves (host-only — by design, see `03_core.md` §5d).
+//! like "what did the front-door sensor do yesterday?" Plugins use
+//! `subscribe`/`on-event` for live delivery and replay the rows their
+//! subscriptions match through `host-events::read-events`
+//! ([`EventLog::scan_after_cursor`]).
 //!
 //! Trust separation on timestamps:
 //!
@@ -40,6 +41,7 @@ use super::db::Db;
 mod cursor;
 mod mirror;
 mod retention;
+mod scan;
 
 pub use cursor::CursorExpired;
 pub use mirror::{
@@ -50,6 +52,7 @@ pub use retention::{
     DEFAULT_EVENT_LOG_RETENTION_INTERVAL, ENV_EVENT_LOG_MAX_ROWS, ENV_EVENT_LOG_RETENTION_DAYS,
     EventLogRetention, RetentionTask,
 };
+pub use scan::{ScanPage, ScanStep};
 
 /// Errors returned by [`EventLog`]. Maps onto the WIT `error` variant
 /// in `host_impl::events::publish_event` via the same `Internal`-or-

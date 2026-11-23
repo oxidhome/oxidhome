@@ -455,3 +455,239 @@ async fn plugin_reads_device_state_only_with_a_grant() {
             && matches!(&kv.value, Value::StringVal(q) if q == "stale"))
     );
 }
+
+fn recorder(action: &str, args: Vec<(&str, Value)>) -> Command {
+    Command {
+        id: "cmd-recorder".into(),
+        capability: "recorder".into(),
+        action: action.into(),
+        args: args
+            .into_iter()
+            .map(|(key, value)| oxidhome_test_host::wit::types::KeyValue {
+                key: key.into(),
+                value,
+            })
+            .collect(),
+    }
+}
+
+/// Run a `recorder` command and return its fields by key.
+async fn recorder_fields(
+    instance: &mut oxidhome_test_host::TestPluginInstance,
+    action: &str,
+    args: Vec<(&str, Value)>,
+) -> std::collections::HashMap<String, Value> {
+    match instance
+        .send_command("", recorder(action, args))
+        .await
+        .unwrap()
+    {
+        CommandResult::OkWithState(fields) => {
+            fields.into_iter().map(|kv| (kv.key, kv.value)).collect()
+        }
+        other => panic!("recorder::{action} failed: {other:?}"),
+    }
+}
+
+fn int_of(fields: &std::collections::HashMap<String, Value>, key: &str) -> i64 {
+    match fields.get(key) {
+        Some(Value::IntVal(n)) => *n,
+        other => panic!("{key}: {other:?}"),
+    }
+}
+
+fn ids_of(fields: &std::collections::HashMap<String, Value>) -> String {
+    match fields.get("ids") {
+        Some(Value::StringVal(ids)) => ids.clone(),
+        other => panic!("ids: {other:?}"),
+    }
+}
+
+/// `host-events::read-events`: the recorder catches up on events
+/// recorded while it was stopped (resuming from the cursor it keeps in
+/// KV), skips live duplicates, sees only rows its subscriptions match,
+/// gets bytes withheld without `reads_event_bytes`, and starts over
+/// from the head when its cursor expired.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn plugin_reads_event_history_from_its_cursor() {
+    use oxidhome_test_host::wit::events::{CustomEvent, Event, StateChange};
+    use oxidhome_test_host::wit::types::KeyValue;
+
+    let host = TestHost::new().unwrap();
+    let log = host.engine().event_log();
+    let custom = |topic: &str| Event {
+        device: None,
+        timestamp: 0,
+        origin_plugin_id: "test.publisher".into(),
+        origin_instance_id: "publisher".into(),
+        row_id: None,
+        payload: EventPayload::Custom(CustomEvent {
+            topic: topic.into(),
+            payload: "{}".into(),
+        }),
+    };
+    let record = |ev: Event| {
+        log.record(1, &ev, &ev.origin_instance_id, &ev.origin_plugin_id)
+            .unwrap()
+    };
+    record(custom("a.one"));
+    record(custom("b.one"));
+    record(custom("a.two"));
+    record(Event {
+        device: Some("dev-cam".into()),
+        payload: EventPayload::StateChanged(StateChange {
+            capability: "camera".into(),
+            fields: vec![KeyValue {
+                key: "frame".into(),
+                value: Value::BytesVal(vec![1, 2, 3]),
+            }],
+        }),
+        ..custom("")
+    });
+
+    let staged = stage_unchanged(EVENT_RECORDER);
+    let load = || async {
+        let mut rec = host
+            .load_with(staged.path(), LoadOptions::new().instance_id("rec"))
+            .await
+            .unwrap();
+        rec.init().await.unwrap();
+        rec
+    };
+
+    // First start: the whole history.
+    let mut rec = load().await;
+    let history = recorder_fields(&mut rec, "history", Vec::new()).await;
+    assert_eq!(int_of(&history, "caught_up"), 4);
+    assert_eq!(int_of(&history, "cursor"), 4);
+    let page = recorder_fields(&mut rec, "read-events", Vec::new()).await;
+    assert_eq!(ids_of(&page), "1,2,3,4");
+    assert_eq!((int_of(&page, "bytes"), int_of(&page, "withheld")), (0, 1));
+    assert_eq!(int_of(&page, "next_after_id"), int_of(&page, "head_id"));
+    let page = recorder_fields(
+        &mut rec,
+        "read-events",
+        vec![("after", Value::IntVal(1)), ("limit", Value::IntVal(2))],
+    )
+    .await;
+    assert_eq!(ids_of(&page), "2,3");
+    assert_eq!(int_of(&page, "next_after_id"), 3);
+
+    // Narrower subscription, narrower history; the cursor still moves
+    // past the rows it skipped.
+    recorder_fields(
+        &mut rec,
+        "resubscribe",
+        vec![("topic", Value::StringVal("a.".into()))],
+    )
+    .await;
+    let page = recorder_fields(&mut rec, "read-events", Vec::new()).await;
+    assert_eq!(ids_of(&page), "1,3");
+    assert_eq!(int_of(&page, "next_after_id"), 4);
+    drop(rec);
+
+    // Events recorded while stopped are caught up after a restart.
+    record(custom("a.three"));
+    record(custom("c.one"));
+    let mut rec = load().await;
+    let history = recorder_fields(&mut rec, "history", Vec::new()).await;
+    assert_eq!(int_of(&history, "caught_up"), 2);
+    assert_eq!(int_of(&history, "cursor"), 6);
+    // A live event at or below the cursor is a duplicate.
+    host.engine()
+        .events()
+        .publish_with_id(custom("a.three"), Some(5));
+    assert_eq!(rec.deliver_pending_events().await.unwrap(), 1);
+    let history = recorder_fields(&mut rec, "history", Vec::new()).await;
+    assert_eq!(int_of(&history, "duplicates"), 1);
+    // Events reaching two subscriptions' queues arrive in row-id
+    // order, so the cursor doesn't drop the older one.
+    recorder_fields(
+        &mut rec,
+        "resubscribe",
+        vec![("topic", Value::StringVal("x.".into()))],
+    )
+    .await;
+    recorder_fields(
+        &mut rec,
+        "subscribe",
+        vec![("topic", Value::StringVal("y.".into()))],
+    )
+    .await;
+    let y = record(custom("y.1"));
+    let x = record(custom("x.1"));
+    host.engine()
+        .events()
+        .publish_with_id(custom("y.1"), Some(y));
+    host.engine()
+        .events()
+        .publish_with_id(custom("x.1"), Some(x));
+    assert_eq!(rec.deliver_pending_events().await.unwrap(), 2);
+    let history = recorder_fields(&mut rec, "history", Vec::new()).await;
+    assert_eq!(int_of(&history, "duplicates"), 1);
+    assert_eq!(int_of(&history, "cursor"), 8);
+    drop(rec);
+
+    // Retention pruned the rows after the saved cursor: the recorder
+    // reports the expiry and resumes from the head.
+    record(custom("d.one"));
+    log.trim_older_than(i64::MAX).unwrap();
+    let mut rec = load().await;
+    let history = recorder_fields(&mut rec, "history", Vec::new()).await;
+    assert!(matches!(history.get("expired"), Some(Value::BoolVal(true))));
+    assert_eq!(int_of(&history, "caught_up"), 0);
+    assert_eq!(int_of(&history, "cursor"), 9);
+    let expired = recorder_fields(&mut rec, "read-events", vec![("after", Value::IntVal(2))]).await;
+    assert_eq!(int_of(&expired, "expired_head_id"), 9);
+    drop(rec);
+
+    // With `reads_event_bytes` the frame comes back as written.
+    let bytes = stage(EVENT_RECORDER, |caps| {
+        caps.insert("reads_event_bytes".into(), toml::Value::Boolean(true));
+    });
+    record(Event {
+        device: Some("dev-cam".into()),
+        payload: EventPayload::StateChanged(StateChange {
+            capability: "camera".into(),
+            fields: vec![KeyValue {
+                key: "frame".into(),
+                value: Value::BytesVal(vec![4, 5]),
+            }],
+        }),
+        ..custom("")
+    });
+    let mut reader = host
+        .load_with(bytes.path(), LoadOptions::new().instance_id("bytes"))
+        .await
+        .unwrap();
+    reader.init().await.unwrap();
+    let page = recorder_fields(
+        &mut reader,
+        "read-events",
+        vec![("after", Value::IntVal(9))],
+    )
+    .await;
+    assert_eq!(ids_of(&page), "10");
+    assert_eq!((int_of(&page, "bytes"), int_of(&page, "withheld")), (1, 0));
+    let mut grant = reader.manifest().capabilities.clone();
+    drop(reader);
+
+    // Requested but not granted: still withheld.
+    grant.reads_event_bytes = false;
+    let mut narrowed = host
+        .load_with(
+            bytes.path(),
+            LoadOptions::new().instance_id("narrowed").grant(grant),
+        )
+        .await
+        .unwrap();
+    narrowed.init().await.unwrap();
+    let page = recorder_fields(
+        &mut narrowed,
+        "read-events",
+        vec![("after", Value::IntVal(9))],
+    )
+    .await;
+    assert_eq!((int_of(&page, "bytes"), int_of(&page, "withheld")), (0, 1));
+}

@@ -45,6 +45,8 @@ const DENY_AUDIT_QUEUE: usize = 64;
 const MAX_DEVICE_ID_LEN: usize = 256;
 /// Audit `method` for state reads.
 pub(crate) const STATE_READ_AUDIT_METHOD: &str = "STATE";
+/// Audit `method` for event-history reads (`host-events::read-events`).
+pub(crate) const EVENT_READ_AUDIT_METHOD: &str = "EVENTS";
 
 /// What a plugin may see of one entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -117,7 +119,15 @@ pub(crate) struct DenyAudit {
     /// worker, off the guest's path.
     ctx: Option<invocation::InvocationContext>,
     instance_id: String,
-    device: String,
+    read: DeniedRead,
+}
+
+/// What a [`DenyAudit`] row refused.
+pub(crate) enum DeniedRead {
+    /// `host-state::get-state` of a device with no visible entry.
+    State { device: String },
+    /// `host-events::read-events` without `subscribes_events`.
+    Events,
 }
 
 /// Queue the audit `deny` row for a `get-state` that found state the
@@ -127,6 +137,22 @@ pub(crate) struct DenyAudit {
 /// neither the error nor its latency tells the plugin the device
 /// exists. The operator still sees the row.
 fn audit_state_denied(log: Option<Arc<crate::state::AuditLog>>, instance_id: &str, device: &str) {
+    queue_deny_audit(
+        log,
+        instance_id,
+        DeniedRead::State {
+            device: device.to_owned(),
+        },
+    );
+}
+
+/// Queue an audit `deny` row for a refused plugin read. Never blocks:
+/// past the queue limit the row is dropped and counted.
+pub(crate) fn queue_deny_audit(
+    log: Option<Arc<crate::state::AuditLog>>,
+    instance_id: &str,
+    read: DeniedRead,
+) {
     let Some(log) = log else {
         return;
     };
@@ -134,7 +160,7 @@ fn audit_state_denied(log: Option<Arc<crate::state::AuditLog>>, instance_id: &st
         log,
         ctx: invocation::current(),
         instance_id: instance_id.to_owned(),
-        device: device.to_owned(),
+        read,
     };
     if deny_audit_queue().is_none_or(|q| q.try_send(job).is_err()) {
         DENY_AUDIT_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -159,7 +185,7 @@ pub(crate) fn deny_audit_queue() -> Option<&'static std::sync::mpsc::SyncSender<
             .name("state-deny-audit".into())
             .spawn(move || deny_audit_worker(&rx, &DENY_AUDIT_DROPPED))
             .map_err(|err| {
-                tracing::error!(target: "host.audit", error = %err, "state-read audit worker not started");
+                tracing::error!(target: "host.audit", error = %err, "plugin-read audit worker not started");
             })
             .ok()
             .map(|_| tx)
@@ -174,14 +200,39 @@ fn deny_audit_worker(
     while let Ok(job) = rx.recv() {
         let lost = dropped.swap(0, std::sync::atomic::Ordering::Relaxed);
         if lost > 0 {
-            tracing::warn!(target: "host.audit", lost, "state-read deny rows dropped: queue full");
+            tracing::warn!(target: "host.audit", lost, "plugin-read deny rows dropped: queue full");
         }
-        tracing::warn!(
-            target: "host.state",
-            instance_id = %job.instance_id,
-            device = %job.device,
-            "get-state denied — no matching capabilities.reads_state grant",
-        );
+        let (method, path, scope) = match &job.read {
+            DeniedRead::State { device } => {
+                tracing::warn!(
+                    target: "host.state",
+                    instance_id = %job.instance_id,
+                    device = %device,
+                    "get-state denied — no matching capabilities.reads_state grant",
+                );
+                (
+                    STATE_READ_AUDIT_METHOD,
+                    format!(
+                        "device.state/{}/{}",
+                        invocation::audit_cap(&job.instance_id),
+                        invocation::audit_cap(device)
+                    ),
+                    "reads_state",
+                )
+            }
+            DeniedRead::Events => {
+                tracing::warn!(
+                    target: "host.events",
+                    instance_id = %job.instance_id,
+                    "read-events denied — capabilities.subscribes_events is not set",
+                );
+                (
+                    EVENT_READ_AUDIT_METHOD,
+                    format!("event.history/{}", invocation::audit_cap(&job.instance_id)),
+                    "subscribes_events",
+                )
+            }
+        };
         let ctx = job
             .ctx
             .unwrap_or_else(|| invocation::InvocationContext::host_origin(&job.instance_id));
@@ -192,15 +243,11 @@ fn deny_audit_worker(
             finalized_ms: None,
             token_id: root.audit_token_id().to_owned(),
             actor_kind: root.kind().as_str().to_owned(),
-            method: STATE_READ_AUDIT_METHOD.to_owned(),
-            path: format!(
-                "device.state/{}/{}",
-                invocation::audit_cap(&job.instance_id),
-                invocation::audit_cap(&job.device)
-            ),
+            method: method.to_owned(),
+            path,
             status: 403,
             decision: "deny".into(),
-            required_scope: Some("reads_state".into()),
+            required_scope: Some(scope.into()),
             execution_outcome: None,
             domain_error: None,
             credential_fp: None,
@@ -210,7 +257,7 @@ fn deny_audit_worker(
             command_outcome: None,
         };
         if let Err(err) = job.log.record_completed(&entry) {
-            tracing::error!(target: "host.audit", error = %err, "state-read deny row failed");
+            tracing::error!(target: "host.audit", method, error = %err, "plugin-read deny row failed");
         }
     }
 }

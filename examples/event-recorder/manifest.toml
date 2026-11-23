@@ -22,3 +22,6 @@ singleton = false
 # call — without it, `host::subscribe_all()` in the plugin's
 # `init` returns `permission-denied`.
 subscribes_events = true
+# The recorder keeps its event-history cursor (the last `row-id` it
+# handled) in KV, so a restart resumes where it left off.
+storage_quota_kb = 4
