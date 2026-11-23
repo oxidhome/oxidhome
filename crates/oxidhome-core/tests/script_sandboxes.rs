@@ -427,14 +427,14 @@ async fn sandboxes_end_with_their_manager() {
 
     manager.stop().await.expect("stop manager");
     let deadline = Instant::now() + Duration::from_mins(1);
-    while engine.instance("main~a").is_some() || engine.instance("main~b").is_some() {
-        assert!(Instant::now() < deadline, "sandboxes outlived the manager");
+    // The manager leaves the registry only after its sandboxes have.
+    while engine.instance(MANAGER).is_some() {
+        assert!(Instant::now() < deadline, "manager never left the registry");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        engine.sandboxes().list(MANAGER),
-        Vec::<(String, String)>::new()
-    );
+    assert!(engine.instance("main~a").is_none());
+    assert!(engine.instance("main~b").is_none());
+    assert!(!engine.sandboxes().has_children(MANAGER));
 }
 
 /// `script_sandboxes` caps the sandboxes one instance runs, and a
@@ -485,11 +485,8 @@ async fn sandbox_limit_counts_stopping_sandboxes() {
         assert!(Instant::now() < deadline, "a never finished stopping");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // `a`'s slot goes just before its instance-registry entry.
-    while engine.instance("main~a").is_some() {
-        assert!(Instant::now() < deadline, "a never left the registry");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // `a`'s slot goes only after its instance-registry entry.
+    assert!(engine.instance("main~a").is_none());
 
     manager.stop().await.expect("stop manager");
 }

@@ -63,7 +63,8 @@ the decision.
   cap and liveness watchdog. A trap or a wedged loop in one script crashes and restarts only that sandbox. Sandboxes
   outlive a crash of their parent: they are still listed when the parent's next life runs `init`. They stop when the
   parent reaches a terminal state (stopped by the operator, or `Failed`), when the parent stops them, or on daemon
-  shutdown.
+  shutdown. A terminal parent leaves the instance registry only after all its sandboxes have, so stopping it and
+  then uninstalling never races a child that is still running.
 - Sandboxes don't nest: `start-sandbox` from inside a sandbox is `permission-denied`. Only instances the engine
   starts and reaps can start sandboxes; one driven without that (the test host's unsupervised `load`, the
   `supervise*` helpers) gets `unavailable`.

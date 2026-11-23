@@ -45,7 +45,12 @@ enum Role {
     /// `pending` holds saved scripts whose restore hit a transient
     /// `unavailable` (a previous sandbox with that id still stopping);
     /// `tick` retries them.
-    Manager { pending: BTreeMap<String, String> },
+    Manager {
+        pending: BTreeMap<String, String>,
+        /// Whether the saved scripts have been read; a storage error
+        /// leaves this `false` for `tick` to retry.
+        scanned: bool,
+    },
     Script {
         parent: String,
         commands: BTreeMap<String, Action>,
@@ -90,6 +95,32 @@ fn string_arg<'a>(args: &'a [KeyValue], name: &str) -> Option<&'a str> {
     })
 }
 
+/// Read the saved scripts into `pending`. `false` on a storage error,
+/// so `tick` reads them again rather than leaving them offline.
+fn scan(pending: &mut BTreeMap<String, String>) -> bool {
+    let read = || -> Result<Vec<(String, String)>, Error> {
+        let mut saved = Vec::new();
+        for key in host::storage::list_keys(KV_PREFIX)? {
+            if let (Some(id), Some(Value::StringVal(source))) =
+                (key.strip_prefix(KV_PREFIX), host::storage::get(&key)?)
+            {
+                saved.push((id.to_owned(), source));
+            }
+        }
+        Ok(saved)
+    };
+    match read() {
+        Ok(saved) => {
+            pending.extend(saved);
+            true
+        }
+        Err(e) => {
+            oxidhome_sdk::tracing::warn!(error = ?e, "reading saved scripts failed; retrying");
+            false
+        }
+    }
+}
+
 /// Start every pending script; keep the ones refused as `unavailable`
 /// Longest `sleep` a script may ask for, in milliseconds.
 const MAX_SLEEP_MS: u64 = 10_000;
@@ -126,21 +157,10 @@ impl ScriptHost {
         .map_err(|e| format!("register-service failed: {e:?}"))?;
         // Re-adopt (after a manager crash) or re-create (after a daemon
         // restart) every script this instance had loaded.
-        // A storage error fails init (and the supervisor retries it)
-        // rather than leaving saved scripts offline for this whole life.
         let mut pending = BTreeMap::new();
-        let keys = host::storage::list_keys(KV_PREFIX)
-            .map_err(|e| format!("listing saved scripts failed: {e:?}"))?;
-        for key in keys {
-            let saved = host::storage::get(&key)
-                .map_err(|e| format!("reading saved script `{key}` failed: {e:?}"))?;
-            if let (Some(id), Some(Value::StringVal(source))) = (key.strip_prefix(KV_PREFIX), saved)
-            {
-                pending.insert(id.to_owned(), source);
-            }
-        }
+        let scanned = scan(&mut pending);
         restore(&mut pending);
-        self.role = Some(Role::Manager { pending });
+        self.role = Some(Role::Manager { pending, scanned });
         Ok(())
     }
 
@@ -179,12 +199,14 @@ impl ScriptHost {
                 if let Err(e) = host::storage::set(&key, &Value::StringVal(source.into())) {
                     return CommandResult::Err(e);
                 }
-                pending.remove(id);
                 match host::sandboxes::start(id, source) {
-                    Ok(instance_id) => CommandResult::OkWithState(vec![KeyValue {
-                        key: "instance_id".into(),
-                        value: Value::StringVal(instance_id),
-                    }]),
+                    Ok(instance_id) => {
+                        pending.remove(id);
+                        CommandResult::OkWithState(vec![KeyValue {
+                            key: "instance_id".into(),
+                            value: Value::StringVal(instance_id),
+                        }])
+                    }
                     Err(e) => {
                         let undone = match previous {
                             Some(previous) => host::storage::set(&key, &previous),
@@ -201,14 +223,19 @@ impl ScriptHost {
             }
             // Forget first, so a stopped script never comes back.
             "unload" => {
+                let saved = match host::storage::get(&key) {
+                    Ok(saved) => saved.is_some(),
+                    Err(e) => return CommandResult::Err(e),
+                };
                 if let Err(e) = host::storage::delete(&key) {
                     return CommandResult::Err(e);
                 }
-                let was_pending = pending.remove(id).is_some();
+                pending.remove(id);
                 match host::sandboxes::stop(id) {
                     Ok(()) => CommandResult::Ok,
-                    // Never started this life: forgetting it was enough.
-                    Err(Error::NotFound(_)) if was_pending => CommandResult::Ok,
+                    // Not running (pending, failed, or stopped by the
+                    // operator): forgetting the saved script was enough.
+                    Err(Error::NotFound(_)) if saved => CommandResult::Ok,
                     Err(e) => CommandResult::Err(e),
                 }
             }
@@ -252,7 +279,10 @@ impl Plugin for ScriptHost {
     fn shutdown(&mut self) {}
 
     fn tick(&mut self) {
-        if let Some(Role::Manager { pending }) = &mut self.role {
+        if let Some(Role::Manager { pending, scanned }) = &mut self.role {
+            if !*scanned {
+                *scanned = scan(pending);
+            }
             restore(pending);
         }
     }
@@ -264,7 +294,7 @@ impl Plugin for ScriptHost {
         args: Vec<KeyValue>,
     ) -> CommandResult {
         match &mut self.role {
-            Some(Role::Manager { pending }) => Self::manage(pending, &command, &args),
+            Some(Role::Manager { pending, .. }) => Self::manage(pending, &command, &args),
             Some(Role::Script { parent, commands }) => match commands.get(&command) {
                 Some(action) => Self::run(parent, action),
                 None => CommandResult::Err(Error::InvalidArgument(format!(
