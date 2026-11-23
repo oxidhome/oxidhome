@@ -622,6 +622,9 @@ impl BlobStore {
 
     /// Read bytes by id.
     ///
+    /// The bytes always belong to a version of the blob that was
+    /// committed under this id (see [`Self::open_current`]).
+    ///
     /// # Errors
     ///
     /// - [`BlobError::Unavailable`] for in-memory engines.
@@ -641,31 +644,40 @@ impl BlobStore {
         // plugin could read another instance's blob by guessing the
         // id (filenames are predictable enough that we don't want
         // to rely on FS-only path scoping).
-        let exists: bool = self.db.read(|conn| -> Result<_, BlobError> {
-            Ok(conn
-                .query_row(
-                    "SELECT 1 FROM blob \
+        let (id, file) = self.open_current(
+            blobs_root,
+            installation_uuid,
+            instance_id,
+            |conn| {
+                conn.query_row(
+                    "SELECT id FROM blob \
                      WHERE installation_uuid = ?1 AND instance_id = ?2 AND id = ?3",
                     params![installation_uuid, instance_id, id],
-                    |_| Ok(true),
+                    |row| row.get::<_, String>(0),
                 )
-                .optional()?
-                .unwrap_or(false))
-        })?;
-        if !exists {
-            return Err(BlobError::NotFound {
+                .optional()
+            },
+            String::as_str,
+            || BlobError::NotFound {
                 what: format!(
                     "id `{id}` for instance `{instance_id}` \
                      (installation `{installation_uuid}`)"
                 ),
-            });
-        }
-        let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(id);
-        ensure_contained(blobs_root, &path)?;
-        std::fs::read(&path).map_err(|source| BlobError::Io { path, source })
+            },
+        )?;
+        read_open_file(
+            file,
+            0,
+            instance_dir_for(blobs_root, installation_uuid, instance_id).join(id),
+        )
     }
 
     /// Read bytes by user-chosen name.
+    ///
+    /// The bytes are the complete contents of one committed version
+    /// of the blob: a concurrent overwrite or delete yields either
+    /// the old bytes, the new bytes, or `NotFound`, never a mix or
+    /// a spurious I/O error (see [`Self::open_current`]).
     ///
     /// # Errors
     ///
@@ -679,35 +691,39 @@ impl BlobStore {
         check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
-        let id: String = self
-            .db
-            .read(|conn| -> Result<_, BlobError> {
-                Ok(conn
-                    .query_row(
-                        "SELECT id FROM blob \
-                         WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
-                        params![installation_uuid, instance_id, name],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?)
-            })?
-            .ok_or_else(|| BlobError::NotFound {
+        let (id, file) = self.open_current(
+            blobs_root,
+            installation_uuid,
+            instance_id,
+            |conn| {
+                conn.query_row(
+                    "SELECT id FROM blob \
+                     WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
+                    params![installation_uuid, instance_id, name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            },
+            String::as_str,
+            || BlobError::NotFound {
                 what: format!(
                     "name `{name}` for instance `{instance_id}` \
                      (installation `{installation_uuid}`)"
                 ),
-            })?;
-        let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&id);
-        ensure_contained(blobs_root, &path)?;
-        std::fs::read(&path).map_err(|source| BlobError::Io { path, source })
+            },
+        )?;
+        read_open_file(
+            file,
+            0,
+            instance_dir_for(blobs_root, installation_uuid, instance_id).join(id),
+        )
     }
 
     /// Atomic "metadata + bytes" fetch by user-chosen name.
     /// The blob-index row is decoded and the file it points at
-    /// is read inside the same call, so callers see a
-    /// consistent view: the bytes returned are the bytes the
-    /// [`BlobInfo`] describes, and both belong to the same
-    /// version of that blob.
+    /// is opened as one consistent pair (see [`Self::open_current`]),
+    /// so the bytes returned are the bytes the [`BlobInfo`]
+    /// describes, and both belong to the same version of that blob.
     ///
     /// The two-call shape (`get_info` + `read_by_name`) is
     /// racy — a concurrent `write` can replace the blob
@@ -736,95 +752,121 @@ impl BlobStore {
         name: &str,
         size_bytes_max: Option<u64>,
     ) -> Result<(BlobInfo, Vec<u8>), BlobError> {
-        use std::io::Read as _;
-
         check_installation_uuid(installation_uuid)?;
         check_instance_id(instance_id)?;
         let blobs_root = self.blobs_root.as_deref().ok_or(BlobError::Unavailable)?;
-        // Round-3 F2 on PR #122: the previous shape queried the
-        // row under the DB mutex, released the mutex, and then
-        // opened the file — a concurrent overwrite in that
-        // window could delete the pre-image before this reader
-        // opened it, surfacing as `Io { not found }` even
-        // though the operator observed the blob at query time.
-        //
-        // The fix opens the file INSIDE the DB read closure.
-        // Under POSIX `unlink`-while-open semantics the file
-        // descriptor pins the pre-image bytes for the reader's
-        // lifetime — a concurrent writer can rename its
-        // replacement into place and delete the prior file, but
-        // this reader still sees the version the row described.
-        // Windows lacks that semantic, but the store's own
-        // atomic-rename write path prevents the reader from
-        // observing a partial write regardless of platform.
-        //
-        // M6: this runs on the writer, not the read pool. A pooled
-        // reader's snapshot can predate an overwrite that commits
-        // and unlinks the old file before the open; the writer
-        // serializes lookup + open against the overwrite commit,
-        // which is what the fix above relies on.
-        let (info, mut file) = self.db.write(|conn| -> Result<_, BlobError> {
-            // Round-10 F1 on PR #122: filter out over-cap
-            // legacy mimes at select time — see
-            // [`BLOB_SELECT_COLUMNS`] for the projection.
-            let info: Option<BlobInfo> = conn
-                .query_row(
+        let what = || {
+            format!(
+                "name `{name}` for instance `{instance_id}` \
+                 (installation `{installation_uuid}`)"
+            )
+        };
+        let (info, file) = self.open_current(
+            blobs_root,
+            installation_uuid,
+            instance_id,
+            |conn| {
+                // Round-10 F1 on PR #122: filter out over-cap
+                // legacy mimes at select time — see
+                // [`BLOB_SELECT_COLUMNS`] for the projection.
+                conn.query_row(
                     &format!(
                         "SELECT {BLOB_SELECT_COLUMNS} FROM blob \
                          WHERE installation_uuid = ?1 AND instance_id = ?2 AND name = ?3",
                     ),
-                    params![installation_uuid, instance_id, name, blob_mime_cap_param(),],
+                    params![installation_uuid, instance_id, name, blob_mime_cap_param()],
                     decode_blob_info,
                 )
-                .optional()?;
-            let Some(info) = info else {
-                return Err(BlobError::NotFound {
-                    what: format!(
-                        "name `{name}` for instance `{instance_id}` \
-                             (installation `{installation_uuid}`)"
-                    ),
-                });
-            };
-            let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id);
-            ensure_contained(blobs_root, &path)?;
-            let file =
-                std::fs::File::open(&path).map_err(|source| BlobError::Io { path, source })?;
-            Ok((info, file))
-        })?;
+                .optional()
+            },
+            |info: &BlobInfo| info.id.as_str(),
+            || BlobError::NotFound { what: what() },
+        )?;
         if let Some(cap) = size_bytes_max
             && info.size_bytes > cap
         {
             return Err(BlobError::TooLarge {
-                what: format!(
-                    "name `{name}` for instance `{instance_id}` \
-                     (installation `{installation_uuid}`)"
-                ),
+                what: what(),
                 size_bytes: info.size_bytes,
                 cap,
             });
         }
-        // Reserve exact capacity so the Vec matches
-        // `info.size_bytes` — cheaper than doubling growth for
-        // large blobs. `size_bytes` is a `u64`; `usize::try_from`
-        // guards against 64→32 truncation on unusual targets.
+        // `size_bytes` is a `u64`; `usize::try_from` guards against
+        // 64→32 truncation on unusual targets.
         let capacity = usize::try_from(info.size_bytes).map_err(|_| BlobError::TooLarge {
-            what: format!(
-                "name `{name}` for instance `{instance_id}` \
-                     (installation `{installation_uuid}`)"
-            ),
+            what: what(),
             size_bytes: info.size_bytes,
             cap: usize::MAX as u64,
         })?;
-        let mut bytes = Vec::with_capacity(capacity);
-        file.read_to_end(&mut bytes)
-            .map_err(|source| BlobError::Io {
-                // Path lost inside the closure; recompute for
-                // the error message (identical to the one used
-                // at open time).
-                path: instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id),
+        let path = instance_dir_for(blobs_root, installation_uuid, instance_id).join(&info.id);
+        let bytes = read_open_file(file, capacity, path)?;
+        Ok((info, bytes))
+    }
+
+    /// Look up a blob row and open the file it points at, as one
+    /// consistent pair.
+    ///
+    /// Blob files are immutable once their row commits, and an
+    /// overwrite or delete unlinks the old file only after its
+    /// transaction commits. So once the file is open, the
+    /// descriptor pins exactly the bytes the row described (POSIX
+    /// unlink-while-open; on Windows the unlink fails while the
+    /// file is open and the old file is left for the orphan sweep).
+    /// The one race is between the lookup and the open: the row can
+    /// be read from a pooled snapshot that predates an overwrite
+    /// or delete whose unlink then runs before the open.
+    ///
+    /// The lookup runs on a pooled reader first. If the open finds
+    /// the file gone, the lookup and the open are repeated under
+    /// the writer, which serializes them against every commit +
+    /// unlink pair: the retry sees the newer row (or no row, and
+    /// returns `not_found`), and a file still missing there is a
+    /// real I/O error. A reader therefore gets the old version, the
+    /// new version, or `NotFound`, never a torn read or a spurious
+    /// `Io { NotFound }`.
+    fn open_current<T: Send>(
+        &self,
+        blobs_root: &Path,
+        installation_uuid: &str,
+        instance_id: &str,
+        lookup: impl Fn(&rusqlite::Connection) -> rusqlite::Result<Option<T>>,
+        id_of: impl Fn(&T) -> &str,
+        not_found: impl Fn() -> BlobError,
+    ) -> Result<(T, std::fs::File), BlobError> {
+        let instance_dir = instance_dir_for(blobs_root, installation_uuid, instance_id);
+        let open = |row: &T| -> Result<std::io::Result<std::fs::File>, BlobError> {
+            let path = instance_dir.join(id_of(row));
+            ensure_contained(blobs_root, &path)?;
+            Ok(std::fs::File::open(&path))
+        };
+        let row = self
+            .db
+            .read(|conn| lookup(conn).map_err(BlobError::from))?
+            .ok_or_else(&not_found)?;
+        #[cfg(test)]
+        tests::AFTER_POOLED_LOOKUP.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        match open(&row)? {
+            Ok(file) => return Ok((row, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(BlobError::Io {
+                    path: instance_dir.join(id_of(&row)),
+                    source,
+                });
+            }
+        }
+        self.db.write(|conn| -> Result<_, BlobError> {
+            let row = lookup(conn)?.ok_or_else(&not_found)?;
+            let file = open(&row)?.map_err(|source| BlobError::Io {
+                path: instance_dir.join(id_of(&row)),
                 source,
             })?;
-        Ok((info, bytes))
+            Ok((row, file))
+        })
     }
 
     /// Look up metadata without fetching bytes.
@@ -1107,6 +1149,21 @@ fn finalize_write_outcome(
             Err(e)
         }
     }
+}
+
+/// Read an opened blob file to the end. `capacity` pre-sizes the
+/// buffer when the caller knows the recorded size (0 otherwise);
+/// `path` is only for the error message.
+fn read_open_file(
+    mut file: std::fs::File,
+    capacity: usize,
+    path: PathBuf,
+) -> Result<Vec<u8>, BlobError> {
+    use std::io::Read as _;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)
+        .map_err(|source| BlobError::Io { path, source })?;
+    Ok(bytes)
 }
 
 fn write_and_fsync(path: &Path, data: &[u8]) -> Result<(), BlobError> {
@@ -1935,6 +1992,153 @@ mod tests {
             "multibyte mime past the BYTE cap must be filtered even though its CHAR count fits: {:?}",
             info.mime,
         );
+    }
+
+    /// Lookup/open race: every read of a name that is being
+    /// overwritten concurrently returns one complete committed
+    /// version (uniform bytes whose length matches the row), never
+    /// `NotFound` or `Io`. Uses a file-backed `Db`, so the lookup
+    /// runs on the read pool and can see a snapshot older than the
+    /// overwrite that unlinked its file.
+    #[test]
+    fn reads_during_concurrent_overwrites_are_consistent() {
+        let dir = tempdir();
+        let db = Arc::new(Db::open_file(&dir.path.join("state")).expect("db"));
+        let store = Arc::new(BlobStore::new(db, Some(dir.path.join("blobs"))));
+        store
+            .register_instance(INST_A, "alpha", 1 << 20)
+            .expect("register");
+        store
+            .write(INST_A, "alpha", "k", &[0u8; 16], None)
+            .expect("seed");
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let uniform = |bytes: &[u8]| bytes.windows(2).all(|w| w[0] == w[1]);
+        let mut readers = Vec::new();
+        for r in 0..3 {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&done);
+            readers.push(std::thread::spawn(move || {
+                let mut reads = 0u32;
+                while !done.load(Ordering::Relaxed) || reads == 0 {
+                    if r == 0 {
+                        let (info, bytes) = store
+                            .read_with_info(INST_A, "alpha", "k", None)
+                            .expect("read_with_info during overwrite");
+                        assert_eq!(bytes.len() as u64, info.size_bytes);
+                        assert!(uniform(&bytes), "torn read_with_info");
+                    } else {
+                        let bytes = store
+                            .read_by_name(INST_A, "alpha", "k")
+                            .expect("read_by_name during overwrite");
+                        assert!(!bytes.is_empty() && uniform(&bytes), "torn read_by_name");
+                    }
+                    reads += 1;
+                }
+            }));
+        }
+        for n in 1..=100u16 {
+            let byte = u8::try_from(n % 251).expect("fits");
+            let len = 16 + usize::from(n % 7) * 512;
+            store
+                .write(INST_A, "alpha", "k", &vec![byte; len], None)
+                .expect("overwrite");
+        }
+        done.store(true, Ordering::Relaxed);
+        for h in readers {
+            h.join().expect("reader panicked");
+        }
+    }
+
+    thread_local! {
+        /// Runs once on this thread between `open_current`'s pooled
+        /// lookup and its open, to force the lookup/open race.
+        pub(super) static AFTER_POOLED_LOOKUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Deterministic lookup/open race: the pooled lookup sees the
+    /// old row, then an overwrite (or delete) commits and unlinks
+    /// the old file before the open. The read must fall back to the
+    /// writer and return the new bytes (or `NotFound`), not
+    /// `Io { NotFound }`.
+    #[test]
+    fn read_retries_when_file_is_unlinked_after_lookup() {
+        let dir = tempdir();
+        let db = Arc::new(Db::open_file(&dir.path.join("state")).expect("db"));
+        let store = Arc::new(BlobStore::new(db, Some(dir.path.join("blobs"))));
+        store
+            .register_instance(INST_A, "alpha", 4096)
+            .expect("register");
+        let race = |action: Box<dyn FnOnce()>| {
+            AFTER_POOLED_LOOKUP.with(|hook| *hook.borrow_mut() = Some(action));
+        };
+        let overwrite = |store: &Arc<BlobStore>, bytes: &'static [u8]| -> Box<dyn FnOnce()> {
+            let store = Arc::clone(store);
+            Box::new(move || {
+                store
+                    .write(INST_A, "alpha", "k", bytes, Some("text/plain"))
+                    .expect("overwrite");
+            })
+        };
+
+        store.write(INST_A, "alpha", "k", b"v1", None).expect("v1");
+        race(overwrite(&store, b"v2"));
+        assert_eq!(
+            store.read_by_name(INST_A, "alpha", "k").expect("read"),
+            b"v2"
+        );
+
+        race(overwrite(&store, b"v3"));
+        let (info, bytes) = store
+            .read_with_info(INST_A, "alpha", "k", None)
+            .expect("read_with_info");
+        assert_eq!(bytes, b"v3");
+        assert_eq!(info.mime.as_deref(), Some("text/plain"));
+        assert_eq!(info.size_bytes, 2);
+
+        // By id: the overwritten id is gone, so the retry is NotFound.
+        let id = store.get_info(INST_A, "alpha", "k").expect("info").id;
+        race(overwrite(&store, b"v4"));
+        assert!(matches!(
+            store.read(INST_A, "alpha", &id),
+            Err(BlobError::NotFound { .. })
+        ));
+
+        // Delete after lookup: NotFound.
+        let deleter = Arc::clone(&store);
+        race(Box::new(move || {
+            deleter.delete(INST_A, "alpha", "k").expect("delete");
+        }));
+        assert!(matches!(
+            store.read_by_name(INST_A, "alpha", "k"),
+            Err(BlobError::NotFound { .. })
+        ));
+    }
+
+    /// A row whose file is genuinely missing is an I/O error after
+    /// the writer-side retry, not a loop and not `NotFound`.
+    #[test]
+    fn missing_file_under_live_row_is_io_error() {
+        let (store, dir) = store_with_root();
+        store
+            .register_instance(INST_A, "alpha", 4096)
+            .expect("register");
+        let id = store
+            .write(INST_A, "alpha", "k", b"bytes", None)
+            .expect("write");
+        std::fs::remove_file(dir.path.join(INST_A).join("alpha").join(&id)).expect("rm");
+        assert!(matches!(
+            store.read_by_name(INST_A, "alpha", "k"),
+            Err(BlobError::Io { .. })
+        ));
+        assert!(matches!(
+            store.read(INST_A, "alpha", &id),
+            Err(BlobError::Io { .. })
+        ));
+        assert!(matches!(
+            store.read_with_info(INST_A, "alpha", "k", None),
+            Err(BlobError::Io { .. })
+        ));
     }
 
     fn install_legacy_mime(store: &BlobStore, name: &str, mime: &str) {
