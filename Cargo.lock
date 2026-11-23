@@ -1528,7 +1528,7 @@ dependencies = [
  "tracing-subscriber",
  "wasmtime",
  "wasmtime-wasi",
- "wit-component 0.259.0",
+ "wit-component 0.261.0",
  "wit-parser 0.261.0",
 ]
 
@@ -1581,7 +1581,7 @@ version = "0.1.0"
 dependencies = [
  "semver",
  "wit-bindgen 0.62.0",
- "wit-component 0.259.0",
+ "wit-component 0.261.0",
  "wit-parser 0.261.0",
 ]
 
@@ -3418,7 +3418,6 @@ dependencies = [
  "wasm-encoder 0.259.0",
  "wasm-metadata 0.259.0",
  "wasmparser 0.259.0",
- "wat",
  "wit-parser 0.259.0",
 ]
 
@@ -3438,6 +3437,7 @@ dependencies = [
  "wasm-encoder 0.261.0",
  "wasm-metadata 0.261.0",
  "wasmparser 0.261.0",
+ "wat",
  "wit-parser 0.261.0",
 ]
 
