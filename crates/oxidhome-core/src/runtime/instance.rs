@@ -205,6 +205,11 @@ pub struct PluginInstance {
     /// Fixed [`watchdog::WATCHDOG_DEFAULT`] in production; the
     /// supervisor lowers it for tests via [`Self::set_watchdog`].
     watchdog: std::time::Duration,
+    /// Events taken off the subscription queues but held for the
+    /// next drain: they were fanned out after the drain's cutoff, so
+    /// an older event may still be on its way to another queue (see
+    /// [`Self::collect_pending_events`]). Bounded by the queues.
+    deferred_events: Vec<(u64, Event)>,
 }
 
 /// H11 round-2 F1: caller-declared load provenance. Passed through
@@ -1038,6 +1043,7 @@ impl PluginInstance {
             bindings,
             store,
             watchdog: watchdog::WATCHDOG_DEFAULT,
+            deferred_events: Vec::new(),
         })
     }
 
@@ -1396,8 +1402,11 @@ impl PluginInstance {
     /// signal a real driver should surface; here we just continue.
     fn collect_pending_events(&mut self) -> Vec<Event> {
         use crate::state::SubscriberMessage;
-        let mut events = Vec::new();
         let state = self.store.data_mut();
+        // Every event with a row id up to `cutoff` has reached (or is
+        // reaching) every queue; later ones may not have yet.
+        let cutoff = state.events.fanned_out_row_id();
+        let mut events = std::mem::take(&mut self.deferred_events);
         for sub in &mut state.subscriptions {
             // C2e: publish filters before enqueue, so every event
             // that reaches `try_recv` already matches. The
@@ -1437,14 +1446,25 @@ impl PluginInstance {
             }
         }
         // Each subscription has its own queue, so draining them one
-        // after another can hand over row 12 before row 11. Restore
-        // publish order across subscriptions: publishes are
-        // serialized, `rows_through` is the bus watermark at each
-        // fan-out (an event's own row id, or the last one fanned out
-        // before an event without one), and the sort is stable, so
-        // order within a queue is kept. Plugins resuming from a
-        // `row-id` cursor (`host-events::read-events`) rely on it.
+        // after another can hand over row 12 before row 11, and a
+        // publish can land between two queue drains. Plugins resuming
+        // from a `row-id` cursor (`host-events::read-events`) need
+        // row-id order, so: publishes are serialized, `rows_through`
+        // is the bus watermark at each fan-out (an event's own row
+        // id, or the last one fanned out before an event without
+        // one), and events above the cutoff read before draining are
+        // held for the next drain, when every older event has reached
+        // its queues. The sort is stable, so order within a queue is
+        // kept. (Two events without a row id on different queues
+        // share a key and keep drain order.)
         events.sort_by_key(|(rows_through, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
+        let split = events.partition_point(|(rows_through, _)| *rows_through <= cutoff);
+        self.deferred_events = events.split_off(split);
+        if !self.deferred_events.is_empty() {
+            // Make sure a later drain picks them up even if their
+            // wake was consumed by this one.
+            state.wake.notify_one();
+        }
         events.into_iter().map(|(_, ev)| ev).collect()
     }
 

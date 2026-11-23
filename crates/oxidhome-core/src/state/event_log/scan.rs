@@ -14,10 +14,6 @@ use super::cursor::{CursorExpired, bounds, resolve_on};
 use super::{EventLog, EventLogError, StoredEventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
 
-/// Rows read per statement. Bounds the memory a scan holds at once
-/// (an event payload is at most 64 KiB serialized).
-const SCAN_CHUNK: usize = 64;
-
 /// What [`EventLog::scan_after_cursor`] does with one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanStep {
@@ -68,19 +64,30 @@ impl EventLog {
             };
             let (head_id, _) = bounds(conn)?;
             let mut events = Vec::new();
-            let mut left = scan_budget;
-            while left > 0 && pos < head_id {
-                let want = left.min(SCAN_CHUNK);
-                let rows = read_chunk(conn, pos, want)?;
-                let short = rows.len() < want;
-                for (id, event) in rows {
-                    // An undecodable row is skipped (and logged) rather
-                    // than failing every read that reaches it.
-                    let Some(mut event) = event else {
-                        pos = id;
-                        left -= 1;
-                        continue;
-                    };
+            if scan_budget == 0 || pos >= head_id {
+                return Ok(Ok(ScanPage {
+                    events,
+                    next_after_id: pos,
+                    head_id,
+                }));
+            }
+            // One statement, stepped lazily: a row is decoded only
+            // when the scan gets to it, so a full page stops decoding.
+            let mut stmt = conn.prepare(
+                "SELECT id, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob \
+                 FROM event_log WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![
+                i64::try_from(pos).unwrap_or(i64::MAX),
+                i64::try_from(scan_budget).unwrap_or(i64::MAX),
+            ])?;
+            let mut scanned = 0;
+            while let Some(row) = rows.next()? {
+                scanned += 1;
+                let id = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
+                // An undecodable row is skipped (and logged) rather
+                // than failing every read that reaches it.
+                if let Some(mut event) = decode_row(row, id)? {
                     match step(&mut event) {
                         ScanStep::Full if !events.is_empty() => {
                             return Ok(Ok(ScanPage {
@@ -92,15 +99,13 @@ impl EventLog {
                         ScanStep::Take | ScanStep::Full => events.push(event),
                         ScanStep::Skip => {}
                     }
-                    pos = id;
-                    left -= 1;
                 }
-                if short {
-                    // Nothing after `pos` in this snapshot: every row
-                    // up to the snapshot's head has been seen.
-                    pos = pos.max(head_id);
-                    break;
-                }
+                pos = id;
+            }
+            if scanned < scan_budget {
+                // Nothing after `pos` in this snapshot: every row up
+                // to the snapshot's head has been seen.
+                pos = pos.max(head_id);
             }
             Ok(Ok(ScanPage {
                 events,
@@ -111,51 +116,31 @@ impl EventLog {
     }
 }
 
-/// Up to `limit` rows with `id > after`, oldest first, each decoded on
-/// its own: a row whose payload doesn't decode comes back as `None`
-/// (with an error log) instead of failing the chunk.
-fn read_chunk(
-    conn: &rusqlite::Connection,
-    after: u64,
-    limit: usize,
-) -> Result<Vec<(u64, Option<Event>)>, EventLogError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob \
-         FROM event_log WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![
-        i64::try_from(after).unwrap_or(i64::MAX),
-        i64::try_from(limit).unwrap_or(i64::MAX),
-    ])?;
-    let mut out = Vec::with_capacity(limit.min(SCAN_CHUNK));
-    while let Some(row) = rows.next()? {
-        let id = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
-        let payload_ms: i64 = row.get(1)?;
-        let topic: String = row.get(5)?;
-        let blob: Vec<u8> = row.get(6)?;
-        let event = match serde_json::from_slice::<StoredEventPayload>(&blob) {
-            Ok(stored) => Some(Event {
-                device: row.get(2)?,
-                timestamp: u64::try_from(payload_ms).unwrap_or(0),
-                origin_plugin_id: row.get(4)?,
-                origin_instance_id: row.get(3)?,
-                row_id: Some(id),
-                payload: stored.into_wit(),
-            }),
-            Err(err) => {
-                tracing::error!(
-                    target: "state.event_log",
-                    id,
-                    topic = %topic,
-                    error = %err,
-                    "event_log row does not decode; skipped by the history scan",
-                );
-                None
-            }
-        };
-        out.push((id, event));
+/// Decode one `event_log` row selected by [`EventLog::scan_after_cursor`].
+/// A payload that doesn't decode yields `None` (with an error log).
+fn decode_row(row: &rusqlite::Row<'_>, id: u64) -> Result<Option<Event>, EventLogError> {
+    let blob: Vec<u8> = row.get(6)?;
+    match serde_json::from_slice::<StoredEventPayload>(&blob) {
+        Ok(stored) => Ok(Some(Event {
+            device: row.get(2)?,
+            timestamp: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+            origin_plugin_id: row.get(4)?,
+            origin_instance_id: row.get(3)?,
+            row_id: Some(id),
+            payload: stored.into_wit(),
+        })),
+        Err(err) => {
+            let topic: String = row.get(5)?;
+            tracing::error!(
+                target: "state.event_log",
+                id,
+                topic = %topic,
+                error = %err,
+                "event_log row does not decode; skipped by the history scan",
+            );
+            Ok(None)
+        }
     }
-    Ok(out)
 }
 
 #[cfg(test)]

@@ -93,10 +93,14 @@ impl Plugin for EventRecorder {
         // during the catch-up is missed; `on_event` drops the overlap.
         let id = host::subscribe_all().map_err(|e| format!("subscribe failed: {e:?}"))?;
         self.subscriptions.push(id);
-        let saved = host::storage::get_typed::<u64>(CURSOR_KEY)
-            .ok()
-            .flatten()
-            .unwrap_or(0);
+        let saved = match host::storage::get_typed::<u64>(CURSOR_KEY) {
+            Ok(saved) => saved.unwrap_or(0),
+            // No storage grant: run without a saved cursor.
+            Err(host::storage::StorageError::Host(Error::PermissionDenied(_))) => 0,
+            // Anything else would silently restart from the oldest
+            // row; refuse to start instead.
+            Err(e) => return Err(format!("reading the saved cursor failed: {e}")),
+        };
         self.cursor = Cursor::new(saved);
         self.catch_up()?;
         oxidhome_sdk::tracing::info!(caught_up = self.caught_up, "event-recorder ready");

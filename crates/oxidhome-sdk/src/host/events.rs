@@ -28,7 +28,9 @@
 //!
 //! # fn handle(_: &oxidhome_sdk::bindings::oxidhome::plugin::events::Event) {}
 //! let mut cursor = Cursor::new(
-//!     host::storage::get_typed::<u64>("cursor").ok().flatten().unwrap_or(0),
+//!     host::storage::get_typed::<u64>("cursor")
+//!         .expect("saved cursor")
+//!         .unwrap_or(0),
 //! );
 //! host::subscribe_topic("automation.").expect("subscribe");
 //! loop {
@@ -65,7 +67,9 @@
 //! A plugin that must not miss a recorded event can treat `on-event`
 //! as a signal and handle events from history instead: read from its
 //! cursor on each delivery, and handle directly only events without a
-//! `row-id` (which history doesn't have).
+//! `row-id`. Those are normally not in history, but a mirror write that
+//! timed out can still commit later (H3), so such an event can show up
+//! again in history, with a row id.
 //!
 //! These functions call wit-bindgen import stubs, so they only link
 //! inside a wasm component; see the coverage note in [`super`].
@@ -242,8 +246,9 @@ impl Cursor {
 
     /// Record `event` and return whether it is new: `false` for an
     /// event whose `row-id` is at or below the cursor. An event
-    /// without a row id is not in history (the host couldn't record
-    /// it); it is always new and leaves the cursor where it is.
+    /// without a row id (the host couldn't record it in time) is
+    /// always new and leaves the cursor where it is; if its late write
+    /// commits after all, history can return it once more.
     pub fn advance(&mut self, event: &Event) -> bool {
         match event.row_id {
             Some(id) if id <= self.after_id => false,

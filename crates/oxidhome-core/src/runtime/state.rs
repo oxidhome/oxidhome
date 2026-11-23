@@ -2845,7 +2845,7 @@ mod tests {
             subscribes_events: false,
             ..manifest.capabilities
         };
-        let mut state = PluginState::new(
+        let state = PluginState::new(
             "alpha",
             "no.subscribe",
             Arc::new(manifest),
@@ -2860,10 +2860,30 @@ mod tests {
             Arc::new(ServiceRegistry::new()),
             Arc::new(InstanceRegistry::new()),
         );
+        let audit = Arc::new(crate::state::AuditLog::new(Arc::new(
+            crate::state::Db::open_in_memory().expect("db"),
+        )));
+        let mut state = state.with_audit_log(Arc::clone(&audit));
         let err = host_events::Host::read_events(&mut state, 0, 0)
             .await
             .unwrap_err();
         assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+        // The refusal lands in the audit ledger, written in the
+        // background.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let row = loop {
+            let rows = audit
+                .query(&crate::state::AuditQuery::default(), 16)
+                .expect("audit query");
+            if let Some(row) = rows.into_iter().find(|r| r.method == "EVENTS") {
+                break row;
+            }
+            assert!(std::time::Instant::now() < deadline, "no EVENTS deny row");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(row.decision, "deny");
+        assert_eq!(row.path, "event.history/alpha");
+        assert_eq!(row.required_scope.as_deref(), Some("subscribes_events"));
     }
 
     /// `read-events` replays recorded events matching the instance's
