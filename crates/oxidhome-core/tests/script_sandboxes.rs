@@ -378,6 +378,9 @@ async fn deadline_propagates_to_the_sibling_hop() {
     let inner: serde_json::Value =
         serde_json::from_str(rows[1].invocation.as_deref().expect("invocation")).expect("json");
     assert_eq!(inner["chain"][1]["caller"], "main~a");
+    // ...and timed out too, rather than running `b`'s sleep to success.
+    assert_eq!(rows[1].status, 503, "{:?}", rows[1]);
+    assert_eq!(rows[1].decision, "error", "{:?}", rows[1]);
 
     manager.stop().await.expect("stop manager");
 }

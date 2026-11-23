@@ -65,8 +65,9 @@ struct ScriptHost {
 
 /// The example's script size limit. The host takes up to 64 KiB, but
 /// the manager saves each source as one KV value, which is capped at
-/// 64 KiB after JSON encoding (escapes can double a source's size).
-const MAX_SOURCE_BYTES: usize = 16 * 1024;
+/// 64 KiB after JSON encoding; a control character escapes to six
+/// bytes, so 8 KiB fits in the worst case.
+const MAX_SOURCE_BYTES: usize = 8 * 1024;
 /// The host's limits on a service's commands (`register-service`).
 const MAX_COMMANDS: usize = 64;
 const MAX_COMMAND_NAME: usize = 64;
