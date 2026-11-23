@@ -2376,6 +2376,51 @@ mod tests {
         CustomEvent, EventPayload, StateChange,
     };
 
+    /// A storage op counts as in flight until its blocking closure
+    /// ends, not until the guest call awaiting it is cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_storage_op_stays_in_flight_until_it_ends() {
+        use std::time::Duration;
+        let ops = Arc::new(StorageOps::default());
+        for blob in [false, true] {
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
+            let op = Some(ops.enter("p~s"));
+            let task = if blob {
+                tokio::spawn(async move {
+                    let _ = blob_op(op, move || {
+                        let _ = started_tx.send(());
+                        let _ = gate.recv();
+                        Ok(())
+                    })
+                    .await;
+                })
+            } else {
+                tokio::spawn(async move {
+                    let _ = kv_op(op, move || {
+                        let _ = started_tx.send(());
+                        let _ = gate.recv();
+                        Ok(())
+                    })
+                    .await;
+                })
+            };
+            // Cancelled while the operation runs.
+            started.await.expect("started");
+            task.abort();
+            let _ = task.await;
+            assert!(
+                !ops.wait_idle("p~s", Duration::from_millis(50)).await,
+                "blob={blob}: released on cancel"
+            );
+            release.send(()).unwrap();
+            assert!(
+                ops.wait_idle("p~s", Duration::from_secs(5)).await,
+                "blob={blob}"
+            );
+        }
+    }
+
     fn empty_device(local: &str) -> DeviceInfo {
         DeviceInfo {
             local_id: local.into(),

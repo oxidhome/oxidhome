@@ -1768,6 +1768,10 @@ async fn run_one_lifecycle(
     // Deliver anything the plugin's subscriptions buffered during init.
     match drain_events(&mut instance, stop).await {
         None => return stop_after_cancel(instance, instance_id),
+        // A stop ended the drain early: never `Running`.
+        Some(Ok(_)) if stop_is_requested(stop) => {
+            return shutdown_before_serving(instance, state_tx, instance_id).await;
+        }
         Some(Ok(_)) => {}
         Some(Err(e)) => {
             return LifecycleOutcome::Crashed {

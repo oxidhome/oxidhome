@@ -1299,10 +1299,11 @@ interface host-services {
   /// outcome of a call that doesn't finish normally depends on which
   /// side of that line it ended on:
   ///
-  /// - **Still queued.** If the timeout passes, or the callee stops,
-  ///   restarts or refuses the call, before it started, the call did
-  ///   not run and never will: the result is `err(unavailable)`, and
-  ///   retrying is safe.
+  /// - **Still queued.** If the timeout passes before the callee
+  ///   started the call, or the callee refuses it (stopped, or
+  ///   restarting), the call did not run and never will: the result
+  ///   is `err(unavailable)`, and retrying is safe. A call still queued
+  ///   when the callee restarts may instead run in its next life.
   /// - **Started.** If the callee traps, is stopped, or the timeout
   ///   passes after it started the call, the result is
   ///   `ok(command-result::unknown)`: the callee may have acted, so

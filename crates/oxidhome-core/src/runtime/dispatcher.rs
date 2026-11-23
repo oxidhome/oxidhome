@@ -436,7 +436,8 @@ pub(crate) async fn call_service(
     // before the callee can act on the root's behalf.
     // Bounded by `wait_until`: ledger contention must not hold the
     // caller past its deadline. A write that lands after we gave up
-    // leaves a `pending` row — evidence of an attempt that never ran.
+    // (or after the caller was cancelled) is finalized `error`: an
+    // attempt that never ran.
     let audit_id = match &hop_audit {
         Some(hop_audit) => {
             let intent = tokio::time::timeout_at(wait_until, hop_audit.record_intent())
@@ -549,6 +550,29 @@ pub(crate) async fn call_service(
 /// Finalizes a hop's intent row exactly once: with the call's outcome,
 /// or — when the caller's future is dropped mid-dispatch — with what
 /// the dispatch ticket says happened, so the row never stays `pending`.
+/// A committed hop intent row nobody has claimed yet; dropped
+/// unclaimed, it is finalized `error` (the call never ran).
+struct ArmedIntent(Option<(HopAudit, u64)>);
+
+impl ArmedIntent {
+    fn claim(mut self) -> u64 {
+        self.0.take().map_or(0, |(_, id)| id)
+    }
+}
+
+impl Drop for ArmedIntent {
+    fn drop(&mut self) {
+        if let Some((audit, id)) = self.0.take() {
+            audit.finalize(
+                id,
+                &Err(WitError::Unavailable(
+                    "the caller stopped waiting before the call was dispatched".into(),
+                )),
+            );
+        }
+    }
+}
+
 struct HopFinalizer {
     pending: Option<(HopAudit, u64)>,
     ticket: DispatchTicket,
@@ -693,6 +717,7 @@ fn result_columns(result: &CommandResult) -> (Option<&'static str>, Option<&'sta
 
 /// Audit writer for one delegated hop (H6). Built only for
 /// externally-rooted invocations.
+#[derive(Clone)]
 struct HopAudit {
     log: Arc<AuditLog>,
     /// Finalizes the row (see the module docs); `None` in unit tests.
@@ -762,11 +787,17 @@ impl HopAudit {
         }
     }
 
+    /// Write the intent row. The row comes back armed, so one the
+    /// caller never reads (cancelled, or past its deadline, while the
+    /// write ran) is finalized `error` rather than left `pending`.
     async fn record_intent(&self) -> Result<u64, String> {
-        let log = Arc::clone(&self.log);
-        let entry = self.entry.clone();
-        match tokio::task::spawn_blocking(move || log.record_intent(&entry)).await {
-            Ok(Ok(id)) => Ok(id),
+        let audit = self.clone();
+        let write = move || {
+            let id = audit.log.record_intent(&audit.entry)?;
+            Ok::<_, crate::state::AuditLogError>(ArmedIntent(Some((audit, id))))
+        };
+        match tokio::task::spawn_blocking(write).await {
+            Ok(Ok(armed)) => Ok(armed.claim()),
             Ok(Err(err)) => Err(err.to_string()),
             Err(err) => Err(err.to_string()),
         }
