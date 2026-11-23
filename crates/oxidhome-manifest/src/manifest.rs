@@ -230,8 +230,9 @@ pub struct StateGrant {
     /// or a list containing `"*"`.
     pub capabilities: Vec<String>,
     /// Host-minted device ids, or a list containing `"*"` (default).
-    /// Device ids are only known after registration, so this is the
-    /// operator's narrowing axis in the granted copy.
+    /// An operator grants whole requested entries: an entry takes
+    /// effect only if the granted copy holds an identical one, so
+    /// editing its selectors drops it rather than narrowing it.
     #[serde(default = "any_list")]
     pub devices: Vec<String>,
     /// Whether `bytes-val` fields are returned as is.

@@ -1182,7 +1182,10 @@ impl DeviceStateStore {
             // H2: a pre-H2 cursor (`<epoch>.<revision>.<device>.<mac>`)
             // comes from an earlier daemon process: restart the resync
             // (409) rather than report a client bug (400).
-            if !epoch.is_empty() && boot.parse::<u64>().is_ok() && !rev.is_empty() {
+            let legacy_mac_ok =
+                mac_hex.len() == 32 && mac_hex.bytes().all(|b| b.is_ascii_hexdigit());
+            if !epoch.is_empty() && boot.parse::<u64>().is_ok() && !rev.is_empty() && legacy_mac_ok
+            {
                 return Err(CursorError::EpochChanged);
             }
             return Err(CursorError::Bad);

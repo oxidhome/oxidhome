@@ -269,6 +269,11 @@ impl DeviceStateStore {
                 );
                 inner.epoch = super::mint_epoch();
                 inner.evicted_through_revision = base;
+                // Rewrite the table from what decoded, so the dropped
+                // rows don't trip this again on the next boot.
+                if let Some(dirty) = inner.dirty.as_mut() {
+                    dirty.rewrite_all = true;
+                }
             }
         } else {
             inner.global_revision = max_row_revision;
@@ -1038,6 +1043,19 @@ mod tests {
         assert_ne!(store.epoch(), epoch);
         assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
         assert!(store.snapshot_capability("dev-a", "switch").is_some());
+        let recovered_epoch = store.epoch();
+        let recovered_cursor = store.current_revision();
+        assert!(store.close_persistence());
+        drop(store);
+        // The bad row is gone: the next boot keeps the new epoch and
+        // the cursors issued after recovery.
+        let store = open(&dir);
+        assert_eq!(store.epoch(), recovered_epoch);
+        assert!(
+            !store
+                .deltas_since_with_revision(recovered_cursor, 10)
+                .reset_required
+        );
         assert!(store.close_persistence());
     }
 
@@ -1072,5 +1090,6 @@ mod tests {
             store.verify_cursor("epoch-00.12.dev-x.00000000000000000000000000000000"),
             Err(CursorError::EpochChanged)
         );
+        assert_eq!(store.verify_cursor("x.1.y.z"), Err(CursorError::Bad));
     }
 }

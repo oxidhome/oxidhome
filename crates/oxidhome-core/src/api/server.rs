@@ -775,12 +775,18 @@ async fn get_all_device_state(
     // (shared with Connect and the plugin `list-state` import). Caps
     // are applied on the raw `Arc` entries; only the retained ones are
     // converted to wire values (H9 round-18/19).
+    // H2: a continuation page leaves out entries newer than the pinned
+    // revision. The client picks them up from `/state/changes` since
+    // that revision, so a slot written mid-resync and then lost in a
+    // crash is never in the client's snapshot with nothing to retract
+    // it (the restored store accepts the pinned cursor).
+    let pinned = cursor_fields.as_ref().map(|(_, r, _)| *r);
     let page = state.engine.device_state().snapshot_page_capped(
         cursor_fields.as_ref().map(|(_, _, did)| did.as_str()),
         limit,
         MAX_ALL_DEVICES_STATE_PAGE_BYTES,
         usize::MAX,
-        |_| true,
+        |e| pinned.is_none_or(|r| e.global_revision <= r),
     );
     let epoch = page.epoch;
     // On page one (no cursor), report the store's current

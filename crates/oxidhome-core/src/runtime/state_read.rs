@@ -45,6 +45,10 @@ const DENY_AUDIT_WAIT: Duration = Duration::from_secs(2);
 const MAX_PENDING_DENY_AUDITS: usize = 32;
 static DENY_AUDIT_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_PENDING_DENY_AUDITS);
+/// Longest device id `get-state` / a `list-state` filter accepts.
+/// Host-minted ids are 20 bytes; this only stops a guest from making
+/// the host copy a huge string under the store lock.
+const MAX_DEVICE_ID_LEN: usize = 256;
 /// Audit `method` for state reads.
 pub(crate) const STATE_READ_AUDIT_METHOD: &str = "STATE";
 
@@ -152,17 +156,27 @@ async fn audit_state_denied(
             );
             return;
         };
-        let write = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            log.record_completed(&entry)
-        });
-        match tokio::time::timeout(DENY_AUDIT_WAIT, write).await {
+        // A detached std thread, not `spawn_blocking`: Tokio waits for
+        // blocking tasks at runtime teardown, so a write stuck on the
+        // disk would hold the daemon's shutdown open.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("state-deny-audit".into())
+            .spawn(move || {
+                let _permit = permit;
+                let _ = tx.send(log.record_completed(&entry));
+            });
+        if let Err(err) = spawned {
+            tracing::error!(target: "host.audit", error = %err, "state-read deny row not started");
+            return;
+        }
+        match tokio::time::timeout(DENY_AUDIT_WAIT, rx).await {
             Ok(Ok(Ok(_))) => {}
             Ok(Ok(Err(err))) => {
                 tracing::error!(target: "host.audit", error = %err, "state-read deny row failed");
             }
-            Ok(Err(err)) => {
-                tracing::error!(target: "host.audit", error = %err, "state-read deny row panicked");
+            Ok(Err(_)) => {
+                tracing::error!(target: "host.audit", "state-read deny row panicked");
             }
             Err(_) => {
                 tracing::warn!(target: "host.audit", "state-read deny row still pending");
@@ -173,6 +187,11 @@ async fn audit_state_denied(
 
 impl host_state::Host for PluginState {
     async fn get_state(&mut self, device: DeviceId) -> Result<Vec<WitDeviceState>, WitError> {
+        if device.len() > MAX_DEVICE_ID_LEN {
+            return Err(WitError::InvalidArgument(format!(
+                "device id longer than {MAX_DEVICE_ID_LEN} bytes"
+            )));
+        }
         let entries = self.device_state.snapshot_device(&device);
         if entries.is_empty() {
             return Err(WitError::NotFound(format!("no state for device {device}")));
@@ -215,6 +234,15 @@ impl host_state::Host for PluginState {
         cursor: Option<String>,
         limit: u32,
     ) -> Result<StatePage, WitError> {
+        if filter
+            .device
+            .as_ref()
+            .is_some_and(|d| d.len() > MAX_DEVICE_ID_LEN)
+        {
+            return Err(WitError::InvalidArgument(format!(
+                "filter device id longer than {MAX_DEVICE_ID_LEN} bytes"
+            )));
+        }
         // The cursor is sealed: the scan may stop on a device this
         // plugin can't see, and its id must not leak.
         let after = match cursor.as_deref() {

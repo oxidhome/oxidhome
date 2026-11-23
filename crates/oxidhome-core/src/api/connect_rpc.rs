@@ -485,7 +485,9 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             limit,
             MAX_ALL_DEVICES_STATE_PAGE_BYTES,
             usize::MAX,
-            |_| true,
+            // Same as REST: a continuation page leaves out entries
+            // newer than the pinned revision.
+            |e| pinned.as_ref().is_none_or(|(r, _)| e.global_revision <= *r),
         );
         let revision = pinned.as_ref().map_or(page.revision, |(r, _)| *r);
         let devices: Vec<ProtoDeviceStateSnapshot> = page

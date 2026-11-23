@@ -4534,7 +4534,26 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
         0,
         0,
     );
-    assert_eq!(store.current_revision(), 5);
+    // H2: and a write to a device still ahead of the cursor (dev-3)
+    // plus a brand-new device: page 2 leaves both out (they're newer
+    // than the pin) and `/state/changes` delivers them.
+    store.apply_delta(
+        "dev-3".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    store.apply_delta(
+        "dev-9".into(),
+        "alpha".into(),
+        "switch".into(),
+        Vec::new(),
+        0,
+        0,
+    );
+    assert_eq!(store.current_revision(), 7);
 
     // Page 2: pass the server-issued cursor back. Its embedded
     // pinned revision (not the store's `current_revision`) is
@@ -4545,6 +4564,13 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
         pinned,
         "pinned revision must be echoed so the client's post-resync cursor is the pre-pagination anchor",
     );
+    let page2_ids: Vec<&str> = page2["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page2_ids, ["dev-2"], "entries newer than the pin are left out");
 
     // A follow-up `/state/changes?since_revision=<pinned>`
     // now picks up dev-0's update (it has global_revision > pinned).
@@ -4562,6 +4588,9 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
         changed_ids.contains(&"dev-0"),
         "the update that landed during pagination must surface via /state/changes; got {changed_ids:?}",
     );
+    for id in ["dev-3", "dev-9"] {
+        assert!(changed_ids.contains(&id), "{id} missing from {changed_ids:?}");
+    }
 }
 
 /// H9 round-13 finding 1: the pin is enforced by the
