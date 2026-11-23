@@ -1871,6 +1871,9 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 19 (H2): device-state tables.
+                    DROP TABLE device_state;
+                    DROP TABLE device_state_meta;
                     -- 18 (H5): audit_event command columns.
                     ALTER TABLE audit_event DROP COLUMN command_outcome;
                     ALTER TABLE audit_event DROP COLUMN command_id;

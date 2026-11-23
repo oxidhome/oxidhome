@@ -1296,8 +1296,9 @@ interface host-config {
 /// `list-state` leaves those entries out. `bytes-val` fields are
 /// replaced by a `json-val` marker
 /// `{"withheld":"bytes","size_bytes":N,"required_scope":"reads_state.bytes"}`
-/// unless the matching grant sets `bytes = true`. Refused reads are
-/// recorded in the host's audit ledger.
+/// unless the matching grant sets `bytes = true`; a plugin's own
+/// entries are returned as written. Refused reads are recorded in the
+/// host's audit ledger.
 interface host-state {
   use types.{device-id, unix-ms, key-value, error};
 

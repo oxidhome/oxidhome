@@ -853,9 +853,12 @@ impl DeviceStateStore {
                 pending_device = Some(did);
             }
             if keep(entry) {
+                // Plus a per-field allowance: a withheld `bytes-val`
+                // (even an empty one) is sent as a JSON marker.
                 pending_bytes = pending_bytes
                     .saturating_add(entry.capability.len())
-                    .saturating_add(entry.field_byte_estimate());
+                    .saturating_add(entry.field_byte_estimate())
+                    .saturating_add(entry.fields.len().saturating_mul(PAGE_FIELD_OVERHEAD));
                 pending.push(Arc::clone(entry));
             }
         }
@@ -1192,6 +1195,9 @@ impl DeviceStateStore {
     /// # Errors
     /// See [`CursorError`].
     pub fn verify_cursor(&self, raw: &str) -> Result<(String, u64, String), CursorError> {
+        if raw.len() > MAX_CURSOR_LEN {
+            return Err(CursorError::Bad);
+        }
         let (payload, mac_hex) = raw.rsplit_once('.').ok_or(CursorError::Bad)?;
         let mut parts = payload.splitn(4, '.');
         let epoch = parts.next().ok_or(CursorError::Bad)?;
@@ -1215,17 +1221,21 @@ impl DeviceStateStore {
             return Err(CursorError::Bad);
         }
         let pinned_revision = rev.parse::<u64>().map_err(|_| CursorError::Bad)?;
-        let inner = self.inner_read();
+        // Compare and copy under the lock; hash outside it.
+        let secret = {
+            let inner = self.inner_read();
+            if epoch != inner.epoch || boot != inner.boot {
+                return Err(CursorError::EpochChanged);
+            }
+            inner.cursor_secret
+        };
         // Round-15 finding 3: epoch check first — a
         // pre-restart cursor cleanly surfaces as
         // `EpochChanged` even though its MAC is signed
         // with the previous life's secret.
         // H2: the epoch survives a clean restart, the cursor secret
         // doesn't; a cursor from an earlier process is a restart too.
-        if epoch != inner.epoch || boot != inner.boot {
-            return Err(CursorError::EpochChanged);
-        }
-        let expected = hmac_sha256(&inner.cursor_secret, payload.as_bytes());
+        let expected = hmac_sha256(&secret, payload.as_bytes());
         let mut supplied = [0u8; 16];
         for (i, chunk) in mac_hex.as_bytes().chunks(2).enumerate() {
             supplied[i] = u8::from_str_radix(
@@ -1555,6 +1565,15 @@ impl DeviceStateStore {
         }
     }
 }
+
+/// Per-field bytes a snapshot page charges on top of the field's own
+/// estimate: covers the withheld-bytes marker (about 80 bytes) and
+/// per-field framing.
+const PAGE_FIELD_OVERHEAD: usize = 96;
+
+/// Longest pagination cursor accepted (an epoch, nonce, revision, a
+/// device id and a MAC are far shorter).
+const MAX_CURSOR_LEN: usize = 1024;
 
 /// Longest `list-state` cursor accepted (a sealed device id is about
 /// 2 × (16 + id length) + 33 characters).

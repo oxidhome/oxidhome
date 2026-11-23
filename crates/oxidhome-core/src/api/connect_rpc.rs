@@ -426,6 +426,14 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         require_scope_connect(&ctx, DEVICES_READ)?;
         let blobs = ctx_can_read_blobs(&ctx);
         let device_id = request.to_owned_message().device_id;
+        // Host-minted ids are short; don't copy a huge one under the
+        // projection lock.
+        if device_id.len() > MAX_DEVICE_ID_LEN {
+            return Err(rpc_err(
+                &ctx,
+                ConnectError::invalid_argument("`device_id` is too long"),
+            ));
+        }
         let (epoch, revision, mut entries) = self
             .engine
             .device_state()
@@ -549,6 +557,10 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
 /// touching the transport status or the authorization decision. See
 /// [`super::auth::DomainOutcome`] for why authorization and execution
 /// outcomes are kept as distinct audit fields.
+/// Longest device id `GetDeviceState` looks up (host-minted ids are
+/// 20 bytes).
+const MAX_DEVICE_ID_LEN: usize = 256;
+
 fn record_domain_outcome(ctx: &RequestContext, report: &CommandReport) {
     if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
         slot.set(HandlerOutcome {

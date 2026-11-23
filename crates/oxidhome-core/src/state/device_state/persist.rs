@@ -77,6 +77,12 @@ pub(super) const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// JSON-number precision limit) for about two million restarts.
 pub const REVISION_GAP: u64 = 1 << 32;
 
+/// Highest flushed revision a restore continues from. Above it the
+/// persisted numbers are treated as damage (a new history starts): a
+/// real store never gets near it, and it leaves room for the gap and
+/// the renumbering of every restored slot.
+const MAX_RESTORABLE_REVISION: u64 = 1 << 62;
+
 /// Skipped ranges kept for cursor checks.
 pub(super) const MAX_HOLES: usize = 16;
 
@@ -242,39 +248,7 @@ impl DeviceStateStore {
                 Arc::new(row),
             );
         }
-        if let Some(meta) = meta {
-            let flushed = meta.revision.max(max_row_revision);
-            let base = flushed.saturating_add(REVISION_GAP);
-            inner.epoch = meta.epoch;
-            inner.evicted_through_revision = meta.evicted_through;
-            inner.holes = meta.holes;
-            inner.holes.push((flushed, base));
-            if inner.holes.len() > MAX_HOLES {
-                let excess = inner.holes.len() - MAX_HOLES;
-                for (_, hi) in inner.holes.drain(..excess) {
-                    inner.evicted_through_revision = inner.evicted_through_revision.max(hi);
-                }
-            }
-            inner.global_revision = base;
-            if damaged {
-                // Part of the persisted state couldn't be read back: no
-                // earlier cursor can be trusted to describe what was
-                // dropped. Rotate the epoch and expire every cursor.
-                tracing::warn!(
-                    target: "device_state.persist",
-                    "persisted device state was partly unreadable; every client cursor resyncs",
-                );
-                inner.epoch = super::mint_epoch();
-                inner.evicted_through_revision = base;
-                // Rewrite the table from what decoded, so the dropped
-                // rows don't trip this again on the next boot.
-                if let Some(dirty) = inner.dirty.as_mut() {
-                    dirty.rewrite_all = true;
-                }
-            }
-        } else {
-            inner.global_revision = max_row_revision;
-        }
+        restore_revisions(&mut inner, meta, max_row_revision, damaged);
         // Every restored slot gets a revision above the base, so a
         // client polling from any surviving cursor is sent the whole
         // restored projection again. Otherwise a slot whose newer
@@ -283,12 +257,16 @@ impl DeviceStateStore {
         // pin), would come back at its old revision, below the cursor.
         // Stale slots keep their `received_ms`; fresh ones are
         // renumbered by the stale flip below.
-        let stale_keys: Vec<Key> = inner
+        // In persisted revision order, so stale eviction (oldest
+        // revision first) keeps its order across the restart.
+        let mut stale_keys: Vec<(u64, Key)> = inner
             .entries
             .iter()
             .filter(|(_, e)| e.quality == StateQuality::Stale)
-            .map(|(k, _)| k.clone())
+            .map(|(k, e)| (e.global_revision, k.clone()))
             .collect();
+        stale_keys.sort_unstable();
+        let stale_keys: Vec<Key> = stale_keys.into_iter().map(|(_, k)| k).collect();
         for key in &stale_keys {
             let global_revision = inner.next_revision();
             if let Some(entry) = inner.entries.get_mut(key) {
@@ -471,6 +449,68 @@ impl Drop for DeviceStateStore {
         // the last `Arc` may be the flusher's own upgrade.
         if let Some(backing) = &self.backing {
             backing.signal.close();
+        }
+    }
+}
+
+/// H2: set the restored store's epoch, revision, watermark and holes
+/// (see the module docs).
+fn restore_revisions(
+    inner: &mut StoreInner,
+    meta: Option<Meta>,
+    max_row_revision: u64,
+    damaged: bool,
+) {
+    // A revision too close to the top of `u64` (a damaged row or
+    // meta) can't fit the gap and the renumbering below: start a
+    // new history instead.
+    let flushed = meta
+        .as_ref()
+        .map_or(max_row_revision, |m| m.revision.max(max_row_revision));
+    let usable = flushed <= MAX_RESTORABLE_REVISION;
+    if let Some(meta) = meta.filter(|_| usable) {
+        let base = flushed + REVISION_GAP;
+        inner.epoch = meta.epoch;
+        inner.evicted_through_revision = meta.evicted_through;
+        inner.holes = meta.holes;
+        inner.holes.push((flushed, base));
+        if inner.holes.len() > MAX_HOLES {
+            let excess = inner.holes.len() - MAX_HOLES;
+            for (_, hi) in inner.holes.drain(..excess) {
+                inner.evicted_through_revision = inner.evicted_through_revision.max(hi);
+            }
+        }
+        inner.global_revision = base;
+        if damaged {
+            // Part of the persisted state couldn't be read back: no
+            // earlier cursor can be trusted to describe what was
+            // dropped. Rotate the epoch and expire every cursor.
+            tracing::warn!(
+                target: "device_state.persist",
+                "persisted device state was partly unreadable; every client cursor resyncs",
+            );
+            inner.epoch = super::mint_epoch();
+            inner.evicted_through_revision = base;
+            // Rewrite the table from what decoded, so the dropped
+            // rows don't trip this again on the next boot.
+            if let Some(dirty) = inner.dirty.as_mut() {
+                dirty.rewrite_all = true;
+            }
+        }
+    } else if usable && !damaged {
+        // First boot with persistence: no cursor can predate it.
+        inner.global_revision = max_row_revision;
+    } else {
+        tracing::warn!(
+            target: "device_state.persist",
+            "persisted device-state metadata unusable; starting a new revision history",
+        );
+        inner.epoch = super::mint_epoch();
+        inner.global_revision = 0;
+        inner.evicted_through_revision = 0;
+        inner.holes.clear();
+        if let Some(dirty) = inner.dirty.as_mut() {
+            dirty.rewrite_all = true;
         }
     }
 }
@@ -723,16 +763,27 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
                 "SELECT epoch, revision, evicted_through, holes_json FROM device_state_meta \
                  WHERE id = 1",
                 [],
+                // Conversion failures are damage, not a failed boot.
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
+                    Ok((|| -> rusqlite::Result<_> {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })()
+                    .ok())
                 },
             )
             .optional()?
+            .and_then(|decoded| {
+                if decoded.is_none() {
+                    tracing::warn!(target: "device_state.persist", "unreadable device-state meta row");
+                    damaged = true;
+                }
+                decoded
+            })
             .map(|(epoch, revision, evicted, holes_json)| {
                 let holes = serde_json::from_str::<Vec<StoredHole>>(&holes_json)
                     .unwrap_or_else(|err| {
@@ -1233,5 +1284,31 @@ mod tests {
         assert!(store.snapshot_capability("dev-a", "switch").is_some());
         assert!(store.snapshot_capability("dev-b", "switch").is_none());
         assert!(store.close_persistence());
+    }
+
+    /// Round-4: unusable metadata (a wrong SQL type, or a revision
+    /// with no room left) starts a new history instead of failing the
+    /// boot or overflowing.
+    #[test]
+    fn unusable_meta_starts_a_new_history() {
+        for corrupt in [
+            "UPDATE device_state_meta SET holes_json = x'00'",
+            "UPDATE device_state_meta SET revision = -1",
+        ] {
+            let dir = tempdir();
+            let store = open(&dir);
+            put(&store, "dev-a", true);
+            let epoch = store.epoch();
+            assert!(store.close_persistence());
+            let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+            drop(store);
+            db.write(|c| c.execute(corrupt, [])).expect("corrupt meta");
+            drop(db);
+            let store = open(&dir);
+            assert_ne!(store.epoch(), epoch, "{corrupt}");
+            assert!(store.current_revision() < REVISION_GAP, "{corrupt}");
+            assert!(store.snapshot_capability("dev-a", "switch").is_some());
+            assert!(store.close_persistence());
+        }
     }
 }
