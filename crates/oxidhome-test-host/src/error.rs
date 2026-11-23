@@ -25,7 +25,8 @@ pub enum TestHostError {
     #[error("building the host engine")]
     Engine(#[source] Source),
     /// The instance id is one the host refuses: empty, too long, a
-    /// path separator, or the reserved `*` wildcard.
+    /// path separator, the reserved `*` wildcard, or the `~` reserved
+    /// for script sandbox ids.
     #[error("instance id `{0}` is not permitted")]
     InvalidInstanceId(String),
     /// Another live instance on this host already uses the id.

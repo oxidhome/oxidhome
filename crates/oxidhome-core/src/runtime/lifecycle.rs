@@ -46,6 +46,7 @@ use super::command::{
     AbandonOnDrop, CommandOutcome, CommandReport, DispatchTicket, mint_command_id,
 };
 use super::instance::{InitError, PluginInstance};
+use super::sandbox::{SandboxLauncher, SandboxRole, SandboxScript};
 
 /// Tunable supervisor timing — restart backoff plus the consecutive-
 /// restart cap and its healthy-reset window. Production code uses
@@ -274,6 +275,21 @@ impl InstanceHandle {
             // Registry-test handles never run a real load, so
             // the cell stays unset — mirrors the `Loading` state
             // that never advanced to a first successful load.
+            loaded: Arc::default(),
+            control,
+            state,
+        }
+    }
+
+    /// A handle that reports `Running` forever, for sandbox-registry
+    /// unit tests that need a live child.
+    #[cfg(test)]
+    pub(crate) fn running_for_test(instance_id: &str, plugin_id: &str) -> Self {
+        let (control, _rx) = tokio::sync::mpsc::channel(1);
+        let (_tx, state) = tokio::sync::watch::channel(InstanceState::Running);
+        Self {
+            instance_id: Arc::from(instance_id),
+            plugin_id: Arc::from(plugin_id),
             loaded: Arc::default(),
             control,
             state,
@@ -516,10 +532,12 @@ impl InstanceHandle {
     ///
     /// # Errors
     ///
-    /// `Err` if the supervisor is gone, the supervisor dropped the
-    /// reply, or the call trapped (a trap also crashes the instance).
-    /// A plugin returning a normal error result surfaces as
-    /// `Ok(CommandResult::Err(..))`.
+    /// `Err` if the call never ran: the supervisor is gone, dropped the
+    /// reply, is restarting, or refused the call at its deadline. A
+    /// plugin returning a normal error result surfaces as
+    /// `Ok(CommandResult::Err(..))`; a trap mid-call as
+    /// `Ok(CommandResult::Unknown(..))` (H5; the trap also crashes the
+    /// instance).
     pub(crate) async fn execute_service_command(
         &self,
         ctx: InvocationContext,
@@ -693,11 +711,86 @@ pub fn supervise_with_tuning_mode_and_pin(
     tuning: SupervisorTuning,
     first_load_pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) -> InstanceHandle {
-    let instance_id: Arc<str> = Arc::from(instance_id.into());
-    let plugin_id: Arc<str> = Arc::from(plugin_id.into());
+    spawn_supervisor(
+        engine,
+        plugin_dir,
+        instance_id.into(),
+        plugin_id.into(),
+        overrides,
+        mode,
+        tuning,
+        first_load_pinned_manifest,
+        SandboxSpawn::Disabled,
+    )
+}
+
+/// ADR-0001: spawn the supervisor for a script sandbox. It loads the
+/// parent's component under the parent's manifest snapshot, load mode,
+/// config overrides and tuning; only the instance id and the script
+/// differ.
+pub(crate) fn supervise_sandbox(
+    engine: Engine,
+    launcher: &SandboxLauncher,
+    instance_id: String,
+    plugin_id: String,
+    script: Arc<SandboxScript>,
+) -> InstanceHandle {
+    spawn_supervisor(
+        engine,
+        launcher.plugin_dir.clone(),
+        instance_id,
+        plugin_id,
+        launcher.overrides.clone(),
+        launcher.mode.clone(),
+        launcher.tuning.clone(),
+        launcher.pinned_manifest.clone(),
+        SandboxSpawn::Child(script),
+    )
+}
+
+/// ADR-0001: a new supervisor's place in the sandbox model.
+pub(crate) enum SandboxSpawn {
+    /// Can't start sandboxes: the supervisor isn't registry-managed
+    /// (`supervise*` entry points), so nothing would reap its children.
+    Disabled,
+    /// A registry-managed instance; its reaper stops its sandboxes.
+    Parent,
+    /// A script sandbox.
+    Child(Arc<SandboxScript>),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_supervisor(
+    engine: Engine,
+    plugin_dir: PathBuf,
+    instance_id: String,
+    plugin_id: String,
+    overrides: Option<toml::Value>,
+    mode: crate::runtime::LoadMode,
+    tuning: SupervisorTuning,
+    first_load_pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
+    sandbox: SandboxSpawn,
+) -> InstanceHandle {
+    let instance_id: Arc<str> = Arc::from(instance_id);
+    let plugin_id: Arc<str> = Arc::from(plugin_id);
     let (control_tx, control_rx) = mpsc::channel(16);
     let (state_tx, state_rx) = watch::channel(InstanceState::Loading);
     let loaded: Arc<LoadedSlots> = Arc::default();
+    // ADR-0001: a sandbox serves its script to `current-sandbox`; any
+    // other instance may start sandboxes of itself with the inputs
+    // this supervisor was spawned with.
+    let sandbox_role = match sandbox {
+        SandboxSpawn::Disabled => None,
+        SandboxSpawn::Parent => Some(SandboxRole::Parent(Arc::new(SandboxLauncher {
+            engine: engine.clone(),
+            plugin_dir: plugin_dir.clone(),
+            overrides: overrides.clone(),
+            mode: mode.clone(),
+            tuning: tuning.clone(),
+            pinned_manifest: first_load_pinned_manifest.clone(),
+        }))),
+        SandboxSpawn::Child(script) => Some(SandboxRole::Child(script)),
+    };
     let handle = InstanceHandle {
         instance_id: Arc::clone(&instance_id),
         plugin_id: Arc::clone(&plugin_id),
@@ -716,6 +809,7 @@ pub fn supervise_with_tuning_mode_and_pin(
         state_tx,
         loaded,
         first_load_pinned_manifest,
+        sandbox_role,
     ));
     handle
 }
@@ -906,6 +1000,9 @@ async fn run_supervisor(
     // every attempt because there's no pre-flight parse
     // to pin.
     pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
+    // ADR-0001: whether this instance is a script sandbox or may
+    // start them; `None` for neither.
+    sandbox_role: Option<SandboxRole>,
 ) {
     // C2d — the pre-C2d supervisor eagerly subscribed to
     // `subscribe_all()` so every published event woke every
@@ -942,6 +1039,7 @@ async fn run_supervisor(
             &state_tx,
             &loaded,
             pinned,
+            sandbox_role.as_ref(),
         )
         .await;
 
@@ -1051,6 +1149,7 @@ async fn run_one_lifecycle(
     // test-suite paths; those re-read from disk on every
     // attempt.
     pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
+    sandbox_role: Option<&SandboxRole>,
 ) -> LifecycleOutcome {
     // Sweep any device/service registry entries this instance left
     // behind on a previous life. First load is a no-op; on a restart
@@ -1122,6 +1221,9 @@ async fn run_one_lifecycle(
         ))
     });
     instance.set_watchdog(watchdog);
+    if let Some(role) = sandbox_role {
+        instance.set_sandbox_role(role.clone());
+    }
     let policy = instance.manifest().runtime.restart;
 
     match instance.init().await {
@@ -1487,10 +1589,21 @@ async fn handle_control(
                     let _ = reply.send(Ok(result));
                     Ok(LoopAction::Continue)
                 }
+                // H5: the callee was entered, so whatever it did may
+                // stand — the caller hears `unknown`, not a dispatch
+                // failure it could safely retry. The trap detail stays
+                // in the logs and the instance's failure reason. The
+                // trap still crashes (and restarts) this instance only.
                 Err(trap) => {
-                    let _ = reply.send(Err(anyhow!(
-                        "instance `{instance_id}` crashed during execute-service-command: {trap:#}",
-                    )));
+                    tracing::warn!(
+                        instance_id = %instance_id,
+                        error = %format!("{trap:#}"),
+                        "execute-service-command trapped; call outcome unknown",
+                    );
+                    let _ = reply.send(Ok(CommandResult::Unknown(format!(
+                        "instance `{instance_id}` crashed during execute-service-command; \
+                         the call may have taken effect",
+                    ))));
                     Err(trap)
                 }
             }

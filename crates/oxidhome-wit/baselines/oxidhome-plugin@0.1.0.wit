@@ -577,6 +577,29 @@ interface host-services {
   call-service: func(target: service-id, command: string, args: list<key-value>) -> result<command-result, error>;
 }
 
+interface host-sandboxes {
+  use types.{error};
+
+  record sandbox-info {
+    local-id: string,
+    instance-id: string,
+    parent-instance: string,
+  }
+
+  record sandbox-script {
+    info: sandbox-info,
+    source: string,
+  }
+
+  start-sandbox: func(local-id: string, source: string) -> result<string, error>;
+
+  stop-sandbox: func(local-id: string) -> result<_, error>;
+
+  list-sandboxes: func() -> list<sandbox-info>;
+
+  current-sandbox: func() -> option<sandbox-script>;
+}
+
 interface host-events {
   use types.{subscription-id, error};
   use events.{event, event-filter};
@@ -622,6 +645,7 @@ world plugin {
   import host-config;
   import services;
   import host-services;
+  import host-sandboxes;
   import storage;
   import blob-store;
   import logging;
@@ -657,6 +681,7 @@ world streaming-plugin {
   import host-config;
   import services;
   import host-services;
+  import host-sandboxes;
   import storage;
   import blob-store;
   import logging;
@@ -683,6 +708,7 @@ world ai-plugin {
   import host-config;
   import services;
   import host-services;
+  import host-sandboxes;
   import storage;
   import blob-store;
   import logging;
@@ -719,6 +745,7 @@ world streaming-ai-plugin {
   import host-config;
   import services;
   import host-services;
+  import host-sandboxes;
   import storage;
   import blob-store;
   import logging;

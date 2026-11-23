@@ -634,11 +634,12 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         // that aren't safe as FS segments before they reach the
         // blob store's path construction. Mirrors the JSON side's
         // check in `api::server::start_plugin_instance`.
-        if !crate::state::is_safe_instance_id(&instance_id) {
+        if !crate::runtime::is_operator_instance_id(&instance_id) {
             return Err(rpc_err(
                 &ctx,
                 ConnectError::invalid_argument(format!(
-                    "instance_id {instance_id:?} is unsafe for use as a filesystem segment"
+                    "instance_id {instance_id:?} is unsafe for use as a filesystem segment \
+                     or uses the reserved `~`"
                 )),
             ));
         }

@@ -889,6 +889,12 @@ impl PluginInstance {
         self.watchdog = timeout;
     }
 
+    /// ADR-0001: attach this instance's place in the sandbox model.
+    /// The supervisor sets it after every load.
+    pub(crate) fn set_sandbox_role(&mut self, role: super::sandbox::SandboxRole) {
+        self.store.data_mut().sandbox = Some(role);
+    }
+
     /// Arm the per-call epoch deadline before a host-driven entry
     /// point so a call that never returns is interrupted and the
     /// supervisor regains control. Infallible — `set_epoch_deadline`

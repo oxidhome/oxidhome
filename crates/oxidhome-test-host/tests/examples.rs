@@ -18,8 +18,8 @@ use oxidhome_test_host::{
     SupervisedInstance, SupervisorTuning, TestHost, TestHostError, block_on, test_supervision,
 };
 use support::{
-    CRASHER, DEFERRED_SWITCH, HANG, HELLO_WORLD, KV_COUNTER, SERVICE_BOUNCER, SERVICE_CALLER,
-    SERVICE_COUNTER, SIMULATED_SWITCH, SNAPSHOT_SAVER, stage_unchanged,
+    CRASHER, DEFERRED_SWITCH, HANG, HELLO_WORLD, KV_COUNTER, SCRIPT_HOST, SERVICE_BOUNCER,
+    SERVICE_CALLER, SERVICE_COUNTER, SIMULATED_SWITCH, SNAPSHOT_SAVER, stage_unchanged,
 };
 
 fn config(text: &str) -> toml::Value {
@@ -263,6 +263,77 @@ async fn service_caller_grant_and_routing_are_enforced() {
         }
         other => panic!("expected the call to be unavailable, got {other:?}"),
     }
+}
+
+// ── script-host ────────────────────────────────────────────────────
+
+/// ADR-0001 under the harness: a supervised script-host runs each
+/// script in its own sandbox instance, and one script calls another
+/// through the host dispatcher. An unsupervised load can't start
+/// sandboxes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_host_runs_scripts_in_sandboxes() {
+    let staged = stage_unchanged(SCRIPT_HOST);
+    let host = TestHost::new().unwrap();
+    let manager = host
+        .start_with(staged.path(), LoadOptions::new().instance_id("main"))
+        .await
+        .unwrap();
+    manager.wait_for_running().await.unwrap();
+    let scripts = manager.service_id("scripts").unwrap();
+    let load = |id: &str, source: &str| {
+        vec![
+            arg("id", Value::StringVal(id.into())),
+            arg("source", Value::StringVal(source.into())),
+        ]
+    };
+    for (id, source) in [("b", "pong ok\n"), ("a", "ping call b pong\n")] {
+        let reply = host.call_service(&scripts, "load", load(id, source)).await;
+        assert!(
+            matches!(reply, Ok(CommandResult::OkWithState(_))),
+            "load {id}: {reply:?}"
+        );
+    }
+    let services = host.engine().services();
+    // Every sandbox compiles the component on load, which is slow in
+    // debug builds on a loaded machine.
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let svc_a = loop {
+        let a = services.resolve_by_local_id("example.script-host", "main~a", "script");
+        let b = services.resolve_by_local_id("example.script-host", "main~b", "script");
+        if let (Some(a), Some(_)) = (a, b) {
+            break a;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scripts not running: {:?}",
+            host.engine().instance("main~a").map(|h| h.state())
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(matches!(
+        host.call_service(&svc_a, "ping", Vec::new()).await,
+        Ok(CommandResult::Ok)
+    ));
+    manager.stop().await.unwrap();
+
+    // Unsupervised, the same component can't start a sandbox.
+    let mut direct = host
+        .load_with(staged.path(), LoadOptions::new().instance_id("direct"))
+        .await
+        .unwrap();
+    direct.init().await.unwrap();
+    let scripts = direct.service_id("scripts").unwrap();
+    let reply = direct
+        .inner_mut()
+        .execute_service_command(scripts, "load".into(), load("a", "pong ok\n"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply, CommandResult::Err(WitError::Unavailable(_))),
+        "{reply:?}"
+    );
+    direct.shutdown().await.unwrap();
 }
 
 // ── service-bouncer ────────────────────────────────────────────────

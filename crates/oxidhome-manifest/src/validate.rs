@@ -66,6 +66,12 @@ pub enum ValidationError {
     TooManyConsumesServicesGrants { count: usize, max: usize },
 
     #[error(
+        "capabilities.script_sandboxes is {count}; the cap is {max}. Each sandbox \
+         is a separate store with its own memory ceiling."
+    )]
+    TooManyScriptSandboxes { count: u32, max: u32 },
+
+    #[error(
         "capabilities.consumes_services[{index}].commands has {count} entries; \
          the cap is {max}. Use `[\"*\"]` to authorize every command instead of \
          enumerating them past the cap."
@@ -217,6 +223,16 @@ pub enum ValidationError {
     )]
     RuntimeTickIntervalTooSmall { got: u64, min: u64 },
 
+    /// ADR-0001: a singleton plugin can't run script sandboxes. Every
+    /// sandbox is another copy of the component with the same
+    /// capabilities, which would defeat the exclusivity `singleton`
+    /// promises.
+    #[error(
+        "runtime.singleton = true can't be combined with capabilities.script_sandboxes > 0: \
+         every sandbox runs another copy of the component"
+    )]
+    SingletonWithScriptSandboxes,
+
     /// Phase 13: a `[ui]` asset path is empty, absolute, or
     /// contains `..` / `.` components — same escape family
     /// as [`Self::RuntimeWasmPathEscapes`]. The host serves
@@ -324,6 +340,11 @@ pub const MIN_TICK_INTERVAL_MS: u64 = 10;
 /// non-DoS-able from the manifest side.
 pub const MAX_CONSUMES_SERVICES_GRANTS: usize = 128;
 
+/// ADR-0001: cap on `capabilities.script_sandboxes`. Every sandbox
+/// is a full `Store` with its own memory ceiling, so the cap bounds
+/// one scripting-plugin instance's aggregate footprint.
+pub const MAX_SCRIPT_SANDBOXES: u32 = 64;
+
 /// H9 round-14 finding 2: cap on
 /// `capabilities.declares_devices` — the list of
 /// capabilities this plugin is authorized to publish on
@@ -418,6 +439,12 @@ pub fn check_capability_limits(
         errors.push(ValidationError::TooManyConsumesServicesGrants {
             count: caps.consumes_services.len(),
             max: MAX_CONSUMES_SERVICES_GRANTS,
+        });
+    }
+    if caps.script_sandboxes > MAX_SCRIPT_SANDBOXES {
+        errors.push(ValidationError::TooManyScriptSandboxes {
+            count: caps.script_sandboxes,
+            max: MAX_SCRIPT_SANDBOXES,
         });
     }
     for (index, grant) in caps.consumes_services.iter().enumerate() {
@@ -572,6 +599,10 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
             got: interval,
             min: MIN_TICK_INTERVAL_MS,
         });
+    }
+
+    if m.runtime.singleton && m.capabilities.script_sandboxes > 0 {
+        errors.push(ValidationError::SingletonWithScriptSandboxes);
     }
 
     if m.capabilities.declares_devices.len() > MAX_DECLARES_DEVICES {
@@ -1297,6 +1328,34 @@ mod tests {
             e,
             ValidationError::TooManyConsumesServicesGrants { count, max }
                 if *max == MAX_CONSUMES_SERVICES_GRANTS && *count == MAX_CONSUMES_SERVICES_GRANTS + 1
+        )));
+    }
+
+    /// ADR-0001: a singleton can't run sandboxes.
+    #[test]
+    fn singleton_rejects_script_sandboxes() {
+        let mut m = ok_manifest();
+        m.runtime.singleton = true;
+        m.capabilities.script_sandboxes = 1;
+        let errs = validate(&m).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::SingletonWithScriptSandboxes))
+        );
+    }
+
+    /// ADR-0001: `script_sandboxes` is capped; the cap itself passes.
+    #[test]
+    fn script_sandboxes_reject_over_cap() {
+        let mut m = ok_manifest();
+        m.capabilities.script_sandboxes = MAX_SCRIPT_SANDBOXES;
+        assert!(validate(&m).is_ok());
+        m.capabilities.script_sandboxes = MAX_SCRIPT_SANDBOXES + 1;
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::TooManyScriptSandboxes { count, max }
+                if *max == MAX_SCRIPT_SANDBOXES && *count == MAX_SCRIPT_SANDBOXES + 1
         )));
     }
 
