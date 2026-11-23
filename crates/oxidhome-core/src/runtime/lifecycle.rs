@@ -395,6 +395,23 @@ impl InstanceHandle {
         }
     }
 
+    /// A handle whose control messages land on `control`'s receiver,
+    /// for tests that play the supervisor.
+    #[cfg(test)]
+    fn with_control_for_test(instance_id: &str, control: mpsc::Sender<ControlCommand>) -> Self {
+        let (_tx, state) = tokio::sync::watch::channel(InstanceState::Running);
+        Self {
+            instance_id: Arc::from(instance_id),
+            plugin_id: Arc::from("test.plugin"),
+            loaded: Arc::default(),
+            control,
+            state,
+            stop: Arc::new(watch::Sender::new(false)),
+            reaped: Arc::new(watch::Sender::new(false)),
+            sandbox: None,
+        }
+    }
+
     /// A handle that reports `Running` forever, for sandbox-registry
     /// unit tests that need a live child.
     #[cfg(test)]
@@ -1895,13 +1912,9 @@ fn refuse_unserved(ctrl: ControlCommand, instance_id: &str, why: &str, pending: 
                     error: WitError::Unavailable(format!("instance `{instance_id}` {why}")),
                 }
             };
-            // A caller that withdrew at its own deadline reported
-            // `timed_out` itself.
-            if let Err(outcome) = reply.send(refused)
-                && !ticket.withdrawn_by_caller()
-            {
-                pending.record_resolution(&ctx, &cmd.id, &device, &outcome);
-            }
+            record_refusal(&ticket, reply, refused, |outcome| {
+                pending.record_resolution(&ctx, &cmd.id, &device, outcome);
+            });
         }
         ControlCommand::ExecuteService {
             guard,
@@ -1919,6 +1932,27 @@ fn refuse_unserved(ctrl: ControlCommand, instance_id: &str, why: &str, pending: 
         ControlCommand::Shutdown { reply } => {
             let _ = reply.send(());
         }
+    }
+}
+
+/// Reply with the refusal of a command that never ran, and record it
+/// as its `COMMAND` row when nobody will read the reply: the caller was
+/// dropped (even if the send landed before its receiver closed), or
+/// the send failed. A caller that withdrew at its own deadline reported
+/// `timed_out` itself.
+fn record_refusal(
+    ticket: &DispatchTicket,
+    reply: oneshot::Sender<CommandOutcome>,
+    refused: CommandOutcome,
+    record: impl FnOnce(&CommandOutcome),
+) {
+    if ticket.disconnected() {
+        record(&refused);
+        let _ = reply.send(refused);
+    } else if let Err(outcome) = reply.send(refused)
+        && !ticket.withdrawn_by_caller()
+    {
+        record(&outcome);
     }
 }
 
@@ -1952,16 +1986,16 @@ async fn run_execute(
                 ctx.call_id(),
             ),
         };
-        if let Err(outcome) = reply.send(refused)
-            && !ticket.withdrawn_by_caller()
-        {
-            // The caller went away (disconnect, not its deadline:
-            // that path reports `timed_out` itself) while the command
-            // was queued; its request row has no outcome, so record
-            // that it never ran.
-            if let Some(pending) = instance.pending_commands() {
-                pending.record_resolution(&ctx, &cmd.id, &device, &outcome);
-            }
+        // The caller went away (disconnect, not its deadline: that
+        // path reports `timed_out` itself) while the command was
+        // queued; its request row has no outcome, so record that it
+        // never ran.
+        if let Some(pending) = instance.pending_commands() {
+            record_refusal(ticket, reply, refused, |outcome| {
+                pending.record_resolution(&ctx, &cmd.id, &device, outcome);
+            });
+        } else {
+            let _ = reply.send(refused);
         }
         return Ok(LoopAction::Continue);
     }
@@ -2181,6 +2215,103 @@ mod tests {
 
     /// The restart cap used across the decision-matrix tests.
     const CAP: u32 = 10;
+
+    fn api_ctx() -> InvocationContext {
+        use crate::auth::{Actor, ActorKind, Principal, Transport};
+        let actor = Actor::api("tok-1", vec!["*".into()]);
+        InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
+    }
+
+    /// A refusal racing a dropped caller: the ticket says the caller
+    /// is gone but its receiver is still open, so the send succeeds.
+    /// The refusal is still recorded, exactly once.
+    #[tokio::test]
+    async fn refusal_of_a_disconnected_caller_is_recorded_even_if_the_send_lands() {
+        use crate::state::{AuditLog, AuditQuery, Db};
+        let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
+        let pending = PendingCommands::new(Some(Arc::clone(&audit))).unwrap();
+        let ticket = DispatchTicket::default();
+        let (reply, _rx) = oneshot::channel();
+        assert!(ticket.try_disconnect());
+        refuse_unserved(
+            ControlCommand::Execute {
+                ctx: api_ctx(),
+                device: "dev-1".into(),
+                cmd: Command {
+                    id: "cmd-race".into(),
+                    capability: "switch".into(),
+                    action: "toggle".into(),
+                    args: Vec::new(),
+                },
+                ticket,
+                reply,
+            },
+            "inst-a",
+            "stopped before running it",
+            &pending,
+        );
+        assert!(pending.flush_journal(Duration::from_secs(5)));
+        let rows: Vec<_> = audit
+            .query(&AuditQuery::default(), 10)
+            .expect("query")
+            .into_iter()
+            .filter(|r| r.command_id.as_deref() == Some("cmd-race"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].command_outcome.as_deref(), Some("timed_out"));
+    }
+
+    /// A service call whose supervisor drops the reply: `NotRun` while
+    /// still queued (safe to retry), `Unknown` once the callee started.
+    #[tokio::test]
+    async fn lost_service_reply_is_not_run_while_queued_and_unknown_once_started() {
+        use crate::host_impl::plugin::oxidhome::plugin::services::ServiceInfo;
+        let services = Arc::new(crate::state::ServiceRegistry::new());
+        let service = services
+            .register(
+                "inst-a".into(),
+                "test.plugin".into(),
+                ServiceInfo {
+                    local_id: "svc".into(),
+                    name: "svc".into(),
+                    metadata: Vec::new(),
+                    commands: Vec::new(),
+                },
+            )
+            .expect("register");
+        let (control, mut rx) = mpsc::channel(4);
+        let handle = InstanceHandle::with_control_for_test("inst-a", control);
+        for start in [false, true] {
+            let supervisor = tokio::spawn(async move {
+                if let Some(ControlCommand::ExecuteService { ticket, reply, .. }) = rx.recv().await
+                {
+                    if start {
+                        assert!(ticket.try_start());
+                    }
+                    drop(reply);
+                }
+                rx
+            });
+            let outcome = handle
+                .execute_service_command(
+                    InvocationContext::host_origin("caller"),
+                    services.acquire_call(&service).expect("acquire"),
+                    service.clone(),
+                    "go".into(),
+                    Vec::new(),
+                    DispatchTicket::default(),
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await;
+            rx = supervisor.await.expect("join");
+            match (start, outcome) {
+                (false, ServiceCallOutcome::NotRun(_)) | (true, ServiceCallOutcome::Unknown(_)) => {
+                }
+                (_, other) => panic!("start={start}: {other:?}"),
+            }
+            assert_eq!(services.active_call_count(&service), 0);
+        }
+    }
 
     #[test]
     fn default_tuning_matches_the_phase6_plan() {

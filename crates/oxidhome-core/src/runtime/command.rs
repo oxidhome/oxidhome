@@ -206,6 +206,10 @@ const WITHDRAWN: u8 = 3;
 /// The supervisor holds the ticket while it reads the clock; it
 /// resolves to `STARTED` or `ABANDONED` without any await in between.
 const CLAIMING: u8 = 4;
+/// Abandoned by a caller that was dropped (disconnect): nobody reads a
+/// reply, so whoever refuses the command records its outcome, even if
+/// the reply send happens to succeed before the receiver is gone.
+const DISCONNECTED: u8 = 5;
 
 /// Shared between the caller waiting on a command and the supervisor
 /// that will run it; decides `timed_out` vs `outcome_unknown` (see the
@@ -248,6 +252,12 @@ impl DispatchTicket {
         self.withdraw(ABANDONED)
     }
 
+    /// Caller side, dropped while waiting: like [`Self::try_abandon`],
+    /// and marks the caller as gone for the refusal's audit write.
+    pub(crate) fn try_disconnect(&self) -> bool {
+        self.withdraw(DISCONNECTED)
+    }
+
     /// Caller side, on its own deadline: like [`Self::try_abandon`],
     /// but the caller reports `timed_out` itself.
     pub(crate) fn try_withdraw(&self) -> bool {
@@ -288,6 +298,12 @@ impl DispatchTicket {
         self.0.load(Ordering::Acquire) == WITHDRAWN
     }
 
+    /// Whether a dropped caller withdrew the command: its refusal must
+    /// be recorded, since no reply will be read.
+    pub(crate) fn disconnected(&self) -> bool {
+        self.0.load(Ordering::Acquire) == DISCONNECTED
+    }
+
     /// Supervisor teardown: refuse a still-queued command. `None` if
     /// the plugin was entered; `Some(true)` if the caller had already
     /// gone (disconnect or deadline) before the refusal, `Some(false)`
@@ -320,7 +336,7 @@ pub(crate) struct AbandonOnDrop(pub(crate) DispatchTicket);
 
 impl Drop for AbandonOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.try_abandon();
+        let _ = self.0.try_disconnect();
     }
 }
 
@@ -1067,6 +1083,8 @@ mod tests {
         let t = DispatchTicket::default();
         drop(AbandonOnDrop(t.clone()));
         assert!(!t.try_start());
+        assert!(t.disconnected());
+        assert_eq!(t.try_refuse(), Some(true));
     }
 
     fn host_ctx() -> InvocationContext {

@@ -347,8 +347,10 @@ fn retry_while_closing(shared: &Shared) -> bool {
     let delay = match shared.lock().retry {
         Retry::Never => return false,
         // A last attempt fits in whatever budget is left.
+        // Near the end, retry after half of what is left, so an attempt
+        // still lands inside the budget.
         Retry::Until(until) => match until.checked_duration_since(Instant::now()) {
-            Some(left) if !left.is_zero() => left.min(CLOSING_RETRY_DELAY),
+            Some(left) if left >= Duration::from_millis(2) => (left / 2).min(CLOSING_RETRY_DELAY),
             _ => return false,
         },
         Retry::Unbounded => CLOSING_RETRY_DELAY,

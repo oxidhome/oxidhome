@@ -207,13 +207,24 @@ async fn clean_stop_leaves_nothing_to_reconcile() {
 }
 
 /// The stop expiry is queued before the terminal state is published:
-/// a journal closed as soon as the instance is terminal, without
-/// waiting for the reaper, already holds it.
+/// an instance run by `supervise` has no reaper, so only the
+/// supervisor itself can have queued it by the time it is terminal.
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_expiry_is_queued_before_the_terminal_state() {
+    let _wasm = support::build_example("deferred-switch", "deferred_switch.wasm");
     let state_dir = support::tempdir("h5-stop-order");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let (handle, device) = start_deferred(&engine).await;
+    let handle = oxidhome_core::runtime::supervise(
+        engine.clone(),
+        support::workspace_root()
+            .join("examples")
+            .join("deferred-switch"),
+        "deferred",
+        "example.deferred-switch",
+        None,
+    );
+    handle.wait_for_running().await.expect("running");
+    let device = first_device_of(&engine, "deferred");
     let report = handle
         .execute_command_in(api_root(), device, toggle(true))
         .await;
