@@ -397,6 +397,38 @@ impl KvStore {
     }
 }
 
+impl KvStore {
+    /// Wipe one instance's KV rows and usage row. ADR-0001: a script
+    /// sandbox's storage goes with the script when its parent removes
+    /// it (`stop-sandbox`). Idempotent; one write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any `SQLite` error verbatim.
+    pub fn purge_instance(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+    ) -> Result<usize, KvError> {
+        let uuid_owned = installation_uuid.to_owned();
+        let instance_owned = instance_id.to_owned();
+        self.db.write(move |conn| -> Result<usize, KvError> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // Usage row first, as in `purge_installation`.
+            let usage_rows = tx.execute(
+                "DELETE FROM kv_usage WHERE installation_uuid = ?1 AND instance_id = ?2",
+                params![uuid_owned, instance_owned],
+            )?;
+            let kv_rows = tx.execute(
+                "DELETE FROM kv WHERE installation_uuid = ?1 AND instance_id = ?2",
+                params![uuid_owned, instance_owned],
+            )?;
+            tx.commit()?;
+            Ok(usage_rows + kv_rows)
+        })
+    }
+}
+
 fn now_unix_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -757,6 +789,28 @@ mod tests {
         let b_keys = kv.list_keys(INST_B, "shared-id", "").expect("list b");
         assert_eq!(a_keys, vec!["k".to_string()]);
         assert_eq!(b_keys, vec!["k".to_string()]);
+    }
+
+    /// ADR-0001: `purge_instance` wipes one instance's rows and leaves
+    /// its siblings in the same installation alone.
+    #[test]
+    fn purge_instance_wipes_only_that_instance() {
+        let kv = store();
+        kv.register_instance(INST_A, "main~a", 4096)
+            .expect("register a");
+        kv.register_instance(INST_A, "main~b", 4096)
+            .expect("register b");
+        kv.set(INST_A, "main~a", "k", WitValue::IntVal(1))
+            .expect("set a");
+        kv.set(INST_A, "main~b", "k", WitValue::IntVal(2))
+            .expect("set b");
+
+        assert_eq!(kv.purge_instance(INST_A, "main~a").expect("purge"), 2);
+        assert!(kv.usage(INST_A, "main~a").expect("usage a").is_none());
+        assert!(kv.get(INST_A, "main~a", "k").expect("get a").is_none());
+        assert!(kv.usage(INST_A, "main~b").expect("usage b").is_some());
+        assert!(kv.get(INST_A, "main~b", "k").expect("get b").is_some());
+        assert_eq!(kv.purge_instance(INST_A, "main~a").expect("again"), 0);
     }
 
     /// H2: `purge_installation` wipes every row (kv + `kv_usage`) for

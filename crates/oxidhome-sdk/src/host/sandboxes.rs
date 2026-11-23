@@ -55,6 +55,10 @@ pub fn start(local_id: &str, source: &str) -> Result<String, Error> {
 
 /// Stop a sandbox this instance started. It stops in the background.
 ///
+/// This removes the script: once the sandbox has stopped, the host
+/// deletes its storage (KV and blobs). Keep anything that must outlive
+/// a script, or a change of its source, in this instance's own storage.
+///
 /// # Errors
 ///
 /// [`Error::NotFound`] if no such sandbox is live;

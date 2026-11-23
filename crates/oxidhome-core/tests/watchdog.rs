@@ -42,7 +42,7 @@ tick_interval_ms = 10
 restart = "never"
 [config.phase]
 type = "enum"
-values = ["init", "tick"]
+values = ["init", "tick", "sleep", "shutdown-sleep"]
 default = "{phase}"
 "#,
     )
@@ -105,6 +105,77 @@ async fn watchdog_interrupts_a_hung_init() {
                 error.contains("unresponsive"),
                 "expected the watchdog reason named: {error}",
             );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// The epoch watchdog only interrupts guest code. A `tick` parked in a
+/// WASI `sleep` (a host import) is cancelled by a stop instead, after
+/// the grace period, and `Stopped` is published once its `Store` is
+/// gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_cancels_a_call_blocked_in_a_host_sleep() {
+    let wasm = support::build_example("hang", "hang.wasm");
+    let plugin = support::stage_plugin("stop-sleep", &wasm, "hang.wasm", &hang_manifest("sleep"));
+    let engine = Engine::new().expect("engine");
+    let handle = supervise_with_tuning(
+        engine,
+        plugin.path().to_path_buf(),
+        "hang",
+        "example.hang",
+        None,
+        fast_watchdog_tuning(),
+    );
+    handle.wait_for_running().await.expect("Running");
+    // Let the first tick (10 ms in) enter its hour-long sleep, well
+    // past the 500 ms watchdog.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(handle.state(), InstanceState::Running);
+
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(20), handle.stop())
+        .await
+        .expect("stop must not wait for the guest's sleep")
+        .expect("stop");
+    assert!(
+        started.elapsed() >= oxidhome_core::runtime::STOP_GRACE,
+        "cancelled before the grace period: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(handle.state(), InstanceState::Stopped);
+}
+
+/// An `on-shutdown` parked in a WASI `sleep` is bounded by the
+/// watchdog deadline: the stop ends `Failed` (the teardown didn't
+/// finish) instead of hanging.
+#[tokio::test(flavor = "multi_thread")]
+async fn blocked_on_shutdown_is_bounded() {
+    let wasm = support::build_example("hang", "hang.wasm");
+    let plugin = support::stage_plugin(
+        "shutdown-sleep",
+        &wasm,
+        "hang.wasm",
+        &hang_manifest("shutdown-sleep"),
+    );
+    let engine = Engine::new().expect("engine");
+    let handle = supervise_with_tuning(
+        engine,
+        plugin.path().to_path_buf(),
+        "hang",
+        "example.hang",
+        None,
+        fast_watchdog_tuning(),
+    );
+    handle.wait_for_running().await.expect("Running");
+
+    tokio::time::timeout(Duration::from_secs(20), handle.stop())
+        .await
+        .expect("a sleeping on-shutdown must not hold the stop")
+        .expect("stop");
+    match handle.state() {
+        InstanceState::Failed { error } => {
+            assert!(error.contains("did not return"), "{error}");
         }
         other => panic!("expected Failed, got {other:?}"),
     }

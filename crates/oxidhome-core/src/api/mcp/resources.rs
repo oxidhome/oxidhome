@@ -879,6 +879,10 @@ pub(super) struct PluginInstanceDetail {
     /// M7: masked config view (see
     /// [`crate::InstanceHandle::config_view`]).
     pub(super) config: Option<serde_json::Value>,
+    /// ADR-0001: for a script sandbox, the instance that started it.
+    pub(super) parent_instance_id: Option<String>,
+    /// ADR-0001: for a script sandbox, its `local-id` in the parent.
+    pub(super) sandbox_local_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -916,6 +920,8 @@ pub(super) fn plugins_detail_body(engine: &Engine, id: &str) -> Option<PluginDet
                 instance_id: handle.instance_id().to_string(),
                 state: format!("{:?}", handle.state()),
                 config: handle.config_view(),
+                parent_instance_id: handle.parent_instance_id().map(str::to_owned),
+                sandbox_local_id: handle.sandbox_local_id().map(str::to_owned),
             });
         }
     }

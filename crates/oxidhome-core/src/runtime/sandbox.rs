@@ -34,7 +34,7 @@ use crate::host_impl::plugin::oxidhome::plugin::host_sandboxes::{
 };
 use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
 
-use super::instance::LoadMode;
+use super::instance::{ComponentCache, LoadMode};
 use super::lifecycle::{InstanceHandle, InstanceState, SupervisorTuning};
 use super::registry::RegistryError;
 use super::state::PluginState;
@@ -90,6 +90,16 @@ pub(crate) struct SandboxScript {
 }
 
 impl SandboxScript {
+    /// The script's id within its parent.
+    pub(crate) fn local_id(&self) -> &str {
+        &self.local_id
+    }
+
+    /// The instance that started the sandbox.
+    pub(crate) fn parent_instance(&self) -> &str {
+        &self.parent_instance
+    }
+
     fn info(&self) -> SandboxInfo {
         SandboxInfo {
             local_id: self.local_id.clone(),
@@ -108,6 +118,10 @@ pub(crate) struct SandboxLauncher {
     pub(crate) mode: LoadMode,
     pub(crate) tuning: SupervisorTuning,
     pub(crate) pinned_manifest: Option<(Vec<u8>, PluginManifest)>,
+    /// The parent supervisor's compiled component: every sandbox (and
+    /// each of its restarts) instantiates it rather than compiling the
+    /// `.wasm` again, and so runs exactly the parent's bytes.
+    pub(crate) component_cache: Arc<ComponentCache>,
 }
 
 impl std::fmt::Debug for SandboxLauncher {
@@ -143,6 +157,11 @@ struct Entry {
     /// loop can't pile up stores that are still loading or shutting
     /// down.
     stopping: bool,
+    /// Its parent removed it (`stop-sandbox`): the reaper purges its
+    /// storage and per-instance bookkeeping. A sandbox stopped any
+    /// other way (its parent stopping, an operator, shutdown) keeps
+    /// them for the parent to re-create it.
+    retire: bool,
 }
 
 impl Entry {
@@ -232,7 +251,8 @@ impl SandboxRegistry {
         })
     }
 
-    /// Mark one live sandbox stopping and return its handle.
+    /// `stop-sandbox`: mark one live sandbox stopping and retired, and
+    /// return its handle.
     fn take_child(&self, parent: &str, local_id: &str) -> Option<InstanceHandle> {
         let mut guard = self.lock();
         let entry = guard.get_mut(parent)?.get_mut(local_id)?;
@@ -240,7 +260,17 @@ impl SandboxRegistry {
             return None;
         }
         entry.stopping = true;
+        entry.retire = true;
         Some(entry.handle.clone())
+    }
+
+    /// Reaper hook: whether the sandbox in `slot` was removed by its
+    /// parent (see [`Entry::retire`]).
+    pub(crate) fn is_retired(&self, slot: &SandboxSlot) -> bool {
+        self.lock()
+            .get(&slot.parent)
+            .and_then(|children| children.get(&slot.local_id))
+            .is_some_and(|e| e.generation == slot.generation && e.retire)
     }
 }
 
@@ -358,6 +388,7 @@ impl Engine {
                 handle,
                 generation,
                 stopping: false,
+                retire: false,
             },
         );
         Ok(instance_id)
@@ -507,6 +538,7 @@ mod tests {
                     handle: InstanceHandle::running_for_test(&instance_id, "p"),
                     generation,
                     stopping: false,
+                    retire: false,
                 },
             );
         generation

@@ -542,6 +542,17 @@ pub struct InstanceView<'a> {
     ///
     /// Field 4: `config_json`
     pub config_json: &'a str,
+    /// ADR-0001: for a script sandbox, the instance that started it
+    /// (the sandbox's id is `<parent_instance_id>~<sandbox_local_id>`).
+    /// Unset for any other instance.
+    ///
+    /// Field 5: `parent_instance_id`
+    pub parent_instance_id: ::core::option::Option<&'a str>,
+    /// ADR-0001: for a script sandbox, its `local-id` within the parent.
+    /// Unset for any other instance.
+    ///
+    /// Field 6: `sandbox_local_id`
+    pub sandbox_local_id: ::core::option::Option<&'a str>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for InstanceView<'a> {
@@ -600,6 +611,20 @@ impl<'a> ::buffa::MessageView<'a> for InstanceView<'a> {
                 )?;
                 view.config_json = ::buffa::types::borrow_str(&mut cur)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.parent_instance_id = Some(::buffa::types::borrow_str(&mut cur)?);
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.sandbox_local_id = Some(::buffa::types::borrow_str(&mut cur)?);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -626,6 +651,8 @@ impl<'a> ::buffa::MessageView<'a> for InstanceView<'a> {
             plugin_id: self.plugin_id.to_string(),
             state: self.state.to_string(),
             config_json: self.config_json.to_string(),
+            parent_instance_id: self.parent_instance_id.map(|s| s.to_string()),
+            sandbox_local_id: self.sandbox_local_id.map(|s| s.to_string()),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -649,6 +676,12 @@ impl<'a> ::buffa::ViewEncode<'a> for InstanceView<'a> {
         if !self.config_json.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.config_json) as u64;
         }
+        if let Some(ref v) = self.parent_instance_id {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
+        if let Some(ref v) = self.sandbox_local_id {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -671,6 +704,12 @@ impl<'a> ::buffa::ViewEncode<'a> for InstanceView<'a> {
         }
         if !self.config_json.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.config_json, buf);
+        }
+        if let Some(ref v) = self.parent_instance_id {
+            ::buffa::types::put_string_field(5u32, v, buf);
+        }
+        if let Some(ref v) = self.sandbox_local_id {
+            ::buffa::types::put_string_field(6u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -704,6 +743,12 @@ impl<'__a> ::serde::Serialize for InstanceView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.config_json) {
             __map.serialize_entry("configJson", self.config_json)?;
+        }
+        if let ::core::option::Option::Some(__v) = self.parent_instance_id {
+            __map.serialize_entry("parentInstanceId", __v)?;
+        }
+        if let ::core::option::Option::Some(__v) = self.sandbox_local_id {
+            __map.serialize_entry("sandboxLocalId", __v)?;
         }
         __map.end()
     }
@@ -829,6 +874,23 @@ impl InstanceOwnedView {
     #[must_use]
     pub fn config_json(&self) -> &'_ str {
         self.0.reborrow().config_json
+    }
+    /// ADR-0001: for a script sandbox, the instance that started it
+    /// (the sandbox's id is `<parent_instance_id>~<sandbox_local_id>`).
+    /// Unset for any other instance.
+    ///
+    /// Field 5: `parent_instance_id`
+    #[must_use]
+    pub fn parent_instance_id(&self) -> ::core::option::Option<&'_ str> {
+        self.0.reborrow().parent_instance_id
+    }
+    /// ADR-0001: for a script sandbox, its `local-id` within the parent.
+    /// Unset for any other instance.
+    ///
+    /// Field 6: `sandbox_local_id`
+    #[must_use]
+    pub fn sandbox_local_id(&self) -> ::core::option::Option<&'_ str> {
+        self.0.reborrow().sandbox_local_id
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<InstanceView<'static>>>

@@ -9,7 +9,12 @@
 //!   `execute_command` never returns. The H5 fixture for a deadline
 //!   that passes while the plugin is running a command
 //!   (`outcome_unknown`), and for a command that expires in the queue
-//!   behind it (`timed_out`).
+//!   behind it (`timed_out`);
+//! - `"sleep"` — `tick` blocks in a WASI `sleep` for an hour. The epoch
+//!   watchdog can't interrupt a guest parked in a host import; the
+//!   fixture for a stop cancelling the call instead;
+//! - `"shutdown-sleep"` — `on-shutdown` blocks in a WASI `sleep` for an
+//!   hour; the fixture for the host bounding `on-shutdown`.
 //!
 //! It's the fixture for the liveness-watchdog tests: the host must be
 //! able to interrupt the wedged call (`Trap::Interrupt`) so the
@@ -27,6 +32,12 @@ fn cfg_phase() -> String {
         .ok()
         .flatten()
         .unwrap_or_else(|| "tick".to_string())
+}
+
+/// Block in a host import (`wasi:clocks` + `wasi:io/poll`) rather
+/// than in guest code.
+fn sleep_an_hour() {
+    std::thread::sleep(std::time::Duration::from_secs(3600));
 }
 
 fn spin() -> ! {
@@ -57,8 +68,10 @@ impl Plugin for Hang {
     }
 
     fn tick(&mut self) {
-        if cfg_phase() == "tick" {
-            spin();
+        match cfg_phase().as_str() {
+            "tick" => spin(),
+            "sleep" => sleep_an_hour(),
+            _ => {}
         }
     }
 
@@ -66,7 +79,11 @@ impl Plugin for Hang {
         spin();
     }
 
-    fn shutdown(&mut self) {}
+    fn shutdown(&mut self) {
+        if cfg_phase() == "shutdown-sleep" {
+            sleep_an_hour();
+        }
+    }
 }
 
 oxidhome_sdk::plugin!(Hang);

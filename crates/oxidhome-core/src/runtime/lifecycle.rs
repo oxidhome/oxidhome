@@ -45,8 +45,20 @@ use crate::state::CallGuard;
 use super::command::{
     AbandonOnDrop, CommandOutcome, CommandReport, DispatchTicket, mint_command_id,
 };
-use super::instance::{InitError, PluginInstance};
+use super::instance::{ComponentCache, InitError, PluginInstance, SupervisedLoad};
 use super::sandbox::{SandboxLauncher, SandboxRole, SandboxScript};
+
+/// How long a plugin call that is running when a stop is requested
+/// may take to finish before the supervisor cancels it. Covers a guest
+/// blocked in a host import (a WASI `sleep`, a slow `call-service`),
+/// which the epoch watchdog can't interrupt.
+pub const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Upper bound the API stop handlers wait for a stopped instance to be
+/// reaped. A parent's `on-shutdown` and then its sandboxes' (in
+/// parallel) are each bounded by the watchdog, plus [`STOP_GRACE`] for
+/// a call in flight; this leaves room for both and some scheduling.
+pub const STOP_WAIT_LIMIT: Duration = Duration::from_secs(75);
 
 /// Tunable supervisor timing — restart backoff plus the consecutive-
 /// restart cap and its healthy-reset window. Production code uses
@@ -240,9 +252,37 @@ pub struct InstanceHandle {
     loaded: Arc<LoadedSlots>,
     control: mpsc::Sender<ControlCommand>,
     state: watch::Receiver<InstanceState>,
+    /// Set once a stop is requested. The supervisor stops on it even if
+    /// no `Shutdown` message arrives, and cancels a plugin call still
+    /// running [`STOP_GRACE`] after it is set.
+    stop: Arc<watch::Sender<bool>>,
+    /// Set by the reaper once the instance has left the registry (a
+    /// registry-managed instance only).
+    reaped: Arc<watch::Sender<bool>>,
+    /// ADR-0001: for a script sandbox, the script it runs.
+    sandbox: Option<Arc<SandboxScript>>,
 }
 
 impl InstanceHandle {
+    /// A handle whose supervisor never runs: the instance is already
+    /// `Failed` with `error`. The `supervise*` entry points return one
+    /// for an instance id they refuse.
+    fn refused(instance_id: String, plugin_id: String, error: String) -> Self {
+        tracing::warn!(instance_id = %instance_id, error = %error, "supervise refused");
+        let (control, _rx) = mpsc::channel(1);
+        let (_tx, state) = watch::channel(InstanceState::Failed { error });
+        Self {
+            instance_id: Arc::from(instance_id),
+            plugin_id: Arc::from(plugin_id),
+            loaded: Arc::default(),
+            control,
+            state,
+            stop: Arc::new(watch::Sender::new(false)),
+            reaped: Arc::new(watch::Sender::new(false)),
+            sandbox: None,
+        }
+    }
+
     /// Round-9 F2: test-only constructor for
     /// `runtime::registry::tests`, which needs a plausible
     /// `InstanceHandle` to feed into `InstanceRegistry::register`
@@ -278,6 +318,9 @@ impl InstanceHandle {
             loaded: Arc::default(),
             control,
             state,
+            stop: Arc::new(watch::Sender::new(false)),
+            reaped: Arc::new(watch::Sender::new(false)),
+            sandbox: None,
         }
     }
 
@@ -293,6 +336,9 @@ impl InstanceHandle {
             loaded: Arc::default(),
             control,
             state,
+            stop: Arc::new(watch::Sender::new(false)),
+            reaped: Arc::new(watch::Sender::new(false)),
+            sandbox: None,
         }
     }
 
@@ -300,6 +346,20 @@ impl InstanceHandle {
     #[must_use]
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// ADR-0001: for a script sandbox, the instance that started it.
+    /// `None` for any other instance.
+    #[must_use]
+    pub fn parent_instance_id(&self) -> Option<&str> {
+        self.sandbox.as_deref().map(SandboxScript::parent_instance)
+    }
+
+    /// ADR-0001: for a script sandbox, its `local-id` within the
+    /// parent. `None` for any other instance.
+    #[must_use]
+    pub fn sandbox_local_id(&self) -> Option<&str> {
+        self.sandbox.as_deref().map(SandboxScript::local_id)
     }
 
     /// The manifest-resolved `plugin.id` this instance is a copy of.
@@ -576,8 +636,19 @@ impl InstanceHandle {
         })?
     }
 
-    /// Ask the supervisor to run `shutdown` and end the task. Awaits
-    /// the shutdown completing. Idempotent — calling `stop` on an
+    /// Ask the supervisor to stop, without waiting. A plugin call in
+    /// flight gets [`STOP_GRACE`] to finish and is then cancelled (so
+    /// a guest blocked in a host import can't hold the stop up), then
+    /// `on-shutdown` runs, bounded by the watchdog. Commands still
+    /// queued are refused as `unavailable` without running.
+    /// Idempotent.
+    pub fn request_stop(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Ask the supervisor to run `shutdown` and end the task, and wait
+    /// until the instance is terminal: its `Store` is dropped by then.
+    /// See [`Self::request_stop`]. Idempotent — calling `stop` on an
     /// already-terminal instance returns `Ok(())`.
     ///
     /// # Errors
@@ -585,21 +656,81 @@ impl InstanceHandle {
     /// This call itself does not fail; the `Result` is reserved for a
     /// future where `stop` can report a shutdown trap.
     pub async fn stop(&self) -> anyhow::Result<()> {
+        self.request_stop();
         let (reply, rx) = oneshot::channel();
         if self
             .control
             .send(ControlCommand::Shutdown { reply })
             .await
-            .is_err()
+            .is_ok()
         {
-            // Supervisor already exited — already Stopped or Failed.
-            return Ok(());
+            // A dropped reply means the task ended before acking;
+            // that's still "stopped" from the caller's point of view.
+            let _ = rx.await;
         }
-        // A dropped reply means the task ended before acking; that's
-        // still "stopped" from the caller's point of view.
-        let _ = rx.await;
+        // Supervisor already exited, or acked: either way, wait for the
+        // terminal state, which is published after the `Store` drop.
+        self.wait_terminal().await;
         Ok(())
     }
+
+    /// Wait until the reaper has released the instance: it is terminal,
+    /// its sandboxes (for a parent) are gone, and it has left the
+    /// instance registry. Only registry-managed instances
+    /// ([`crate::Engine::start_instance`] and the sandboxes they start)
+    /// are reaped; for any other this never returns.
+    pub async fn wait_reaped(&self) {
+        let mut rx = self.reaped.subscribe();
+        // `Err` means every sender dropped, which can't happen while
+        // `self` holds one.
+        let _ = rx.wait_for(|reaped| *reaped).await;
+    }
+
+    /// Reaper hook: the instance has been released.
+    pub(crate) fn mark_reaped(&self) {
+        self.reaped.send_replace(true);
+    }
+}
+
+/// What [`stop_and_wait_reaped`] saw.
+#[derive(Debug, Default)]
+pub struct StopWaitReport {
+    /// Instances that stopped and were reaped in time.
+    pub stopped: Vec<String>,
+    /// Instances asked to stop that weren't reaped before the bound.
+    /// They keep stopping in the background.
+    pub still_stopping: Vec<String>,
+}
+
+/// Ask every instance in `handles` to stop at once, then wait for each
+/// to be reaped (see [`InstanceHandle::wait_reaped`]), at most `bound`
+/// in total. The API stop handlers use this with [`STOP_WAIT_LIMIT`]:
+/// a parent is reaped only once its sandboxes are, so waiting for the
+/// reap (not just the parent's terminal state) means a stopped plugin
+/// leaves nothing running.
+pub async fn stop_and_wait_reaped(handles: Vec<InstanceHandle>, bound: Duration) -> StopWaitReport {
+    for handle in &handles {
+        handle.request_stop();
+    }
+    let deadline = Instant::now() + bound;
+    let mut report = StopWaitReport::default();
+    for handle in handles {
+        let id = handle.instance_id().to_owned();
+        if tokio::time::timeout_at(deadline, handle.wait_reaped())
+            .await
+            .is_ok()
+        {
+            report.stopped.push(id);
+        } else {
+            tracing::warn!(
+                instance_id = %id,
+                bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+                "instance still stopping after the stop wait limit",
+            );
+            report.still_stopping.push(id);
+        }
+    }
+    report
 }
 
 /// Spawn a supervisor task for the plugin in `plugin_dir` and return
@@ -711,11 +842,20 @@ pub fn supervise_with_tuning_mode_and_pin(
     tuning: SupervisorTuning,
     first_load_pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
 ) -> InstanceHandle {
+    let instance_id = instance_id.into();
+    let plugin_id = plugin_id.into();
+    // These helpers bypass the instance registry, so they can't claim
+    // an id the registry or the sandbox namespace owns. The refusal is
+    // an already-`Failed` handle, so callers see it where they'd see a
+    // load failure.
+    if let Err(err) = super::instance::check_embedder_instance_id(&engine, &instance_id) {
+        return InstanceHandle::refused(instance_id, plugin_id, format!("{err:#}"));
+    }
     spawn_supervisor(
         engine,
         plugin_dir,
-        instance_id.into(),
-        plugin_id.into(),
+        instance_id,
+        plugin_id,
         overrides,
         mode,
         tuning,
@@ -744,7 +884,10 @@ pub(crate) fn supervise_sandbox(
         launcher.mode.clone(),
         launcher.tuning.clone(),
         launcher.pinned_manifest.clone(),
-        SandboxSpawn::Child(script),
+        SandboxSpawn::Child {
+            script,
+            cache: Arc::clone(&launcher.component_cache),
+        },
     )
 }
 
@@ -755,8 +898,11 @@ pub(crate) enum SandboxSpawn {
     Disabled,
     /// A registry-managed instance; its reaper stops its sandboxes.
     Parent,
-    /// A script sandbox.
-    Child(Arc<SandboxScript>),
+    /// A script sandbox. It shares its parent's compiled component.
+    Child {
+        script: Arc<SandboxScript>,
+        cache: Arc<ComponentCache>,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -775,21 +921,40 @@ pub(crate) fn spawn_supervisor(
     let plugin_id: Arc<str> = Arc::from(plugin_id);
     let (control_tx, control_rx) = mpsc::channel(16);
     let (state_tx, state_rx) = watch::channel(InstanceState::Loading);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let loaded: Arc<LoadedSlots> = Arc::default();
+    // ADR-0001 follow-up: compile once per supervisor. A supervisor
+    // whose manifest is pinned pins the component bytes with it, and
+    // its sandboxes share that cache; the unpinned test entry points
+    // re-read both on every attempt.
+    let own_cache = || first_load_pinned_manifest.as_ref().map(|_| Arc::default());
     // ADR-0001: a sandbox serves its script to `current-sandbox`; any
     // other instance may start sandboxes of itself with the inputs
     // this supervisor was spawned with.
-    let sandbox_role = match sandbox {
-        SandboxSpawn::Disabled => None,
-        SandboxSpawn::Parent => Some(SandboxRole::Parent(Arc::new(SandboxLauncher {
-            engine: engine.clone(),
-            plugin_dir: plugin_dir.clone(),
-            overrides: overrides.clone(),
-            mode: mode.clone(),
-            tuning: tuning.clone(),
-            pinned_manifest: first_load_pinned_manifest.clone(),
-        }))),
-        SandboxSpawn::Child(script) => Some(SandboxRole::Child(script)),
+    let (sandbox_role, component_cache, child_script) = match sandbox {
+        SandboxSpawn::Disabled => (None, own_cache(), None),
+        SandboxSpawn::Parent => {
+            let cache: Arc<ComponentCache> = own_cache().unwrap_or_default();
+            let launcher = SandboxLauncher {
+                engine: engine.clone(),
+                plugin_dir: plugin_dir.clone(),
+                overrides: overrides.clone(),
+                mode: mode.clone(),
+                tuning: tuning.clone(),
+                pinned_manifest: first_load_pinned_manifest.clone(),
+                component_cache: Arc::clone(&cache),
+            };
+            (
+                Some(SandboxRole::Parent(Arc::new(launcher))),
+                Some(cache),
+                None,
+            )
+        }
+        SandboxSpawn::Child { script, cache } => (
+            Some(SandboxRole::Child(Arc::clone(&script))),
+            Some(cache),
+            Some(script),
+        ),
     };
     let handle = InstanceHandle {
         instance_id: Arc::clone(&instance_id),
@@ -797,6 +962,9 @@ pub(crate) fn spawn_supervisor(
         loaded: Arc::clone(&loaded),
         control: control_tx,
         state: state_rx,
+        stop: Arc::new(stop_tx),
+        reaped: Arc::new(watch::Sender::new(false)),
+        sandbox: child_script,
     };
     tokio::spawn(run_supervisor(
         engine,
@@ -805,13 +973,50 @@ pub(crate) fn spawn_supervisor(
         overrides,
         tuning,
         mode,
-        control_rx,
-        state_tx,
+        Channels {
+            control: control_rx,
+            state: state_tx,
+            stop: stop_rx,
+        },
         loaded,
         first_load_pinned_manifest,
         sandbox_role,
+        component_cache,
     ));
     handle
+}
+
+/// The supervisor's ends of its handle's channels.
+struct Channels {
+    control: mpsc::Receiver<ControlCommand>,
+    state: watch::Sender<InstanceState>,
+    stop: watch::Receiver<bool>,
+}
+
+/// Resolves once a stop is requested. Pending forever if every handle
+/// is gone without asking: the closed control channel stops the
+/// supervisor then.
+async fn stop_requested(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|requested| *requested).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Drive one plugin call. If a stop is requested while it runs, it
+/// gets [`STOP_GRACE`] to finish; past that it is cancelled (`None`):
+/// the future is dropped, which also cancels a guest blocked in a host
+/// import. A cancelled instance must not be entered again.
+async fn guest_call<T>(
+    stop: &mut watch::Receiver<bool>,
+    call: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(call);
+    tokio::select! {
+        biased;
+        out = &mut call => return Some(out),
+        () = stop_requested(stop) => {}
+    }
+    tokio::time::timeout(STOP_GRACE, call).await.ok()
 }
 
 /// What the run loop should do after a `select!` arm completes.
@@ -828,6 +1033,9 @@ enum LoopAction {
     /// surfaces on the `Failed` transition so the audit
     /// row records the trap.
     StopFailed(String),
+    /// A stop cancelled the plugin call in flight: the instance can't
+    /// be entered again, so it stops without `on-shutdown`.
+    Cancelled,
 }
 
 /// Publish a state transition: log it under `runtime.lifecycle` and
@@ -948,6 +1156,8 @@ enum ServeOutcome {
     /// carries the trap reason for the `Failed` transition
     /// in the outer supervisor.
     StoppedFailed(String),
+    /// A stop cancelled the plugin call in flight.
+    Cancelled,
     /// The instance trapped.
     Crashed(TrapReason),
 }
@@ -971,8 +1181,7 @@ async fn run_supervisor(
     overrides: Option<toml::Value>,
     tuning: SupervisorTuning,
     mode: crate::runtime::LoadMode,
-    mut control_rx: mpsc::Receiver<ControlCommand>,
-    state_tx: watch::Sender<InstanceState>,
+    channels: Channels,
     // Pinned by the FIRST successful load and shared with the
     // `InstanceHandle` this supervisor was spawned alongside.
     // `run_one_lifecycle` sets it via `OnceLock::set` — the
@@ -980,30 +1189,24 @@ async fn run_supervisor(
     // the same value (same install) and the `.set()` returns
     // `Err`, which is expected and ignored.
     loaded: Arc<LoadedSlots>,
-    // Phase 6 leftover TOCTOU fix + review F3: when
-    // `Some`, the supervisor uses this snapshot on EVERY
-    // load attempt (first load AND every restart) — the
-    // manifest is treated as immutable for the supervisor's
-    // lifetime. A first cut of this fix only used the
-    // snapshot on the first attempt and re-read on
-    // restarts; reviewers flagged that as reopening the
-    // identity race during backoff (a dev-mode manifest
-    // could change plugin_id / singleton / capabilities
-    // between crashes while the registry stayed registered
-    // as the pre-change identity). A legitimate reinstall
-    // between crashes now requires the operator to stop
-    // and re-start (the install/uninstall API's per-plugin
-    // lifecycle lock enforces that path).
-    //
-    // `None` is the test-suite entry (`supervise` /
-    // `supervise_with_tuning`) — those still re-read on
-    // every attempt because there's no pre-flight parse
-    // to pin.
+    // Phase 6 leftover TOCTOU fix + review F3: when `Some`, every
+    // load attempt (first load and every restart) uses this snapshot,
+    // so the manifest is immutable for the supervisor's lifetime; a
+    // reinstall needs a stop and start. `None` is the test-suite entry
+    // (`supervise*`), which re-reads it on every attempt.
     pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
     // ADR-0001: whether this instance is a script sandbox or may
     // start them; `None` for neither.
     sandbox_role: Option<SandboxRole>,
+    // ADR-0001 follow-up: the compiled component, shared by every
+    // attempt (and, for a parent, its sandboxes).
+    component_cache: Option<Arc<ComponentCache>>,
 ) {
+    let Channels {
+        control: mut control_rx,
+        state: state_tx,
+        stop: mut stop_rx,
+    } = channels;
     // C2d — the pre-C2d supervisor eagerly subscribed to
     // `subscribe_all()` so every published event woke every
     // supervisor system-wide (F2 amplification). That subscription
@@ -1036,10 +1239,14 @@ async fn run_supervisor(
             tuning.watchdog,
             &mode,
             &mut control_rx,
+            &mut stop_rx,
             &state_tx,
             &loaded,
             pinned,
-            sandbox_role.as_ref(),
+            SupervisedLoad {
+                cache: component_cache.as_deref(),
+                sandbox: sandbox_role.clone(),
+            },
         )
         .await;
 
@@ -1073,20 +1280,17 @@ async fn run_supervisor(
                 if ran_healthy {
                     restarts = 0;
                 }
+                // A stop requested while the instance was crashing
+                // (say, the watchdog interrupting a call a stop was
+                // waiting on) wins over the restart policy.
+                if *stop_rx.borrow() {
+                    transition(&state_tx, &instance_id, InstanceState::Stopped);
+                    return;
+                }
                 if restart_decision(policy, &reason, restarts, tuning.max_restarts)
                     == RestartDecision::GiveUp
                 {
-                    let error = if restarts >= tuning.max_restarts {
-                        format!(
-                            "gave up after {} consecutive restarts; last crash: {reason}",
-                            tuning.max_restarts,
-                        )
-                    } else {
-                        format!(
-                            "not restarting under `{}` policy: {reason}",
-                            policy.as_str()
-                        )
-                    };
+                    let error = give_up_reason(policy, &reason, restarts, tuning.max_restarts);
                     transition(&state_tx, &instance_id, InstanceState::Failed { error });
                     return;
                 }
@@ -1106,13 +1310,30 @@ async fn run_supervisor(
                     InstanceState::Restarting { attempt: restarts },
                 );
                 if let BackoffOutcome::Shutdown =
-                    backoff_wait(delay, &mut control_rx, &instance_id).await
+                    backoff_wait(delay, &mut control_rx, &mut stop_rx, &instance_id).await
                 {
                     transition(&state_tx, &instance_id, InstanceState::Stopped);
                     return;
                 }
             }
         }
+    }
+}
+
+/// The `Failed` reason when the restart decision gives up.
+fn give_up_reason(
+    policy: RestartPolicy,
+    reason: &TrapReason,
+    restarts: u32,
+    max_restarts: u32,
+) -> String {
+    if restarts >= max_restarts {
+        format!("gave up after {max_restarts} consecutive restarts; last crash: {reason}")
+    } else {
+        format!(
+            "not restarting under `{}` policy: {reason}",
+            policy.as_str()
+        )
     }
 }
 
@@ -1133,6 +1354,7 @@ async fn run_one_lifecycle(
     watchdog: Duration,
     mode: &crate::runtime::LoadMode,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
+    stop: &mut watch::Receiver<bool>,
     state_tx: &watch::Sender<InstanceState>,
     // Slot shared with the [`InstanceHandle`] this supervisor
     // was spawned alongside — populated after the first
@@ -1149,7 +1371,7 @@ async fn run_one_lifecycle(
     // test-suite paths; those re-read from disk on every
     // attempt.
     pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
-    sandbox_role: Option<&SandboxRole>,
+    supervised: SupervisedLoad<'_>,
 ) -> LifecycleOutcome {
     // Sweep any device/service registry entries this instance left
     // behind on a previous life. First load is a no-op; on a restart
@@ -1179,30 +1401,17 @@ async fn run_one_lifecycle(
 
     transition(state_tx, instance_id, InstanceState::Loading);
 
-    let load_result = match pinned_manifest {
-        Some((bytes, manifest)) => {
-            PluginInstance::load_with_pinned_manifest(
-                engine,
-                plugin_dir,
-                instance_id.to_string(),
-                overrides,
-                mode.clone(),
-                bytes,
-                manifest,
-            )
-            .await
-        }
-        None => {
-            PluginInstance::load_with_mode(
-                engine,
-                plugin_dir,
-                instance_id.to_string(),
-                overrides,
-                mode.clone(),
-            )
-            .await
-        }
-    };
+    // `None` pin: the un-pinned test-suite path re-reads the manifest.
+    let load_result = PluginInstance::load_supervised(
+        engine,
+        plugin_dir,
+        instance_id.to_string(),
+        overrides,
+        mode.clone(),
+        pinned_manifest,
+        supervised,
+    )
+    .await;
     let mut instance = match load_result {
         Ok(instance) => instance,
         Err(e) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
@@ -1221,14 +1430,16 @@ async fn run_one_lifecycle(
         ))
     });
     instance.set_watchdog(watchdog);
-    if let Some(role) = sandbox_role {
-        instance.set_sandbox_role(role.clone());
-    }
     let policy = instance.manifest().runtime.restart;
 
-    match instance.init().await {
-        Ok(()) => {}
-        Err(e) => {
+    // Stopped while loading: don't enter the plugin at all.
+    if *stop.borrow() {
+        return stop_after_cancel(instance, state_tx, instance_id);
+    }
+    match guest_call(stop, instance.init()).await {
+        None => return stop_after_cancel(instance, state_tx, instance_id),
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
             let reason = match e {
                 InitError::Plugin(msg) => TrapReason::InitFailed(msg),
                 InitError::Trap(msg) => TrapReason::Trap(msg),
@@ -1244,12 +1455,16 @@ async fn run_one_lifecycle(
     transition(state_tx, instance_id, InstanceState::Inited);
 
     // Deliver anything the plugin's subscriptions buffered during init.
-    if let Err(e) = instance.drain_events().await {
-        return LifecycleOutcome::Crashed {
-            policy,
-            reason: classify_post_init_trap(&e),
-            ran_healthy: false,
-        };
+    match guest_call(stop, instance.drain_events()).await {
+        None => return stop_after_cancel(instance, state_tx, instance_id),
+        Some(Ok(_)) => {}
+        Some(Err(e)) => {
+            return LifecycleOutcome::Crashed {
+                policy,
+                reason: classify_post_init_trap(&e),
+                ran_healthy: false,
+            };
+        }
     }
 
     let tick = build_tick_interval(&instance);
@@ -1265,6 +1480,7 @@ async fn run_one_lifecycle(
     match serve_loop(
         &mut instance,
         control_rx,
+        stop,
         &wake,
         state_tx,
         instance_id,
@@ -1272,7 +1488,15 @@ async fn run_one_lifecycle(
     )
     .await
     {
-        ServeOutcome::Stopped => LifecycleOutcome::Stopped,
+        ServeOutcome::Stopped => {
+            // `Stopped` is published only once the `Store` is gone, so
+            // a caller that saw it (and the reaper) knows no guest code
+            // of this life can still run.
+            drop(instance);
+            transition(state_tx, instance_id, InstanceState::Stopped);
+            LifecycleOutcome::Stopped
+        }
+        ServeOutcome::Cancelled => stop_after_cancel(instance, state_tx, instance_id),
         ServeOutcome::StoppedFailed(reason) => LifecycleOutcome::StoppedFailed(reason),
         ServeOutcome::Crashed(reason) => LifecycleOutcome::Crashed {
             policy,
@@ -1280,6 +1504,24 @@ async fn run_one_lifecycle(
             ran_healthy: running_since.elapsed() >= healthy_reset,
         },
     }
+}
+
+/// A stop cancelled (or preempted) a plugin call: the instance can't
+/// be entered again, so skip `on-shutdown`, drop the `Store`, then
+/// publish `Stopped`.
+fn stop_after_cancel(
+    instance: PluginInstance,
+    state_tx: &watch::Sender<InstanceState>,
+    instance_id: &str,
+) -> LifecycleOutcome {
+    tracing::warn!(
+        instance_id,
+        "stop requested: a plugin call didn't finish within the grace period and was \
+         cancelled; on-shutdown skipped",
+    );
+    drop(instance);
+    transition(state_tx, instance_id, InstanceState::Stopped);
+    LifecycleOutcome::Stopped
 }
 
 /// Build the tick interval if the manifest declares a cadence. The
@@ -1298,25 +1540,34 @@ fn build_tick_interval(instance: &PluginInstance) -> Option<Interval> {
     })
 }
 
+/// Which `select!` arm woke the serve loop.
+enum Wakeup {
+    Stop,
+    Control(Option<ControlCommand>),
+    Tick,
+    Event,
+}
+
 /// The steady-state `select!` loop — see the module docs.
 async fn serve_loop(
     instance: &mut PluginInstance,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
+    stop: &mut watch::Receiver<bool>,
     wake: &tokio::sync::Notify,
     state_tx: &watch::Sender<InstanceState>,
     instance_id: &str,
     mut tick: Option<Interval>,
 ) -> ServeOutcome {
     loop {
-        let outcome: anyhow::Result<LoopAction> = tokio::select! {
-            ctrl = control_rx.recv() => {
-                handle_control(instance, state_tx, instance_id, ctrl).await
-            }
+        let wakeup = tokio::select! {
+            // A requested stop goes first: queued commands are then
+            // dropped with the channel and refused without running.
+            biased;
+            () = stop_requested(stop) => Wakeup::Stop,
+            ctrl = control_rx.recv() => Wakeup::Control(ctrl),
             // `if tick.is_some()` gates the `unwrap` — the arm is only
             // polled when an interval exists.
-            _ = async { tick.as_mut().unwrap().tick().await }, if tick.is_some() => {
-                instance.tick().await.map(|()| LoopAction::Continue)
-            }
+            _ = async { tick.as_mut().unwrap().tick().await }, if tick.is_some() => Wakeup::Tick,
             // C2d wake path — signaled by `EventBus::signal_wakes`
             // when a published event matches one of the plugin's
             // active subscription filters. `Notify` deduplicates
@@ -1324,21 +1575,28 @@ async fn serve_loop(
             // `notified().await`s to a single wake, so a burst of
             // matching publishes drains together in one pass —
             // exactly the behaviour we want.
-            () = wake.notified() => {
-                Ok(LoopAction::Continue)
+            () = wake.notified() => Wakeup::Event,
+        };
+        let outcome: anyhow::Result<LoopAction> = match wakeup {
+            Wakeup::Stop => Ok(shutdown_on_request(instance, state_tx, instance_id).await),
+            Wakeup::Control(ctrl) => {
+                handle_control(instance, state_tx, stop, instance_id, ctrl).await
             }
+            Wakeup::Tick => match guest_call(stop, instance.tick()).await {
+                Some(result) => result.map(|()| LoopAction::Continue),
+                None => Ok(LoopAction::Cancelled),
+            },
+            Wakeup::Event => Ok(LoopAction::Continue),
         };
 
         match outcome {
-            Ok(LoopAction::Continue) => {
-                if let Err(e) = instance.drain_events().await {
-                    return ServeOutcome::Crashed(classify_post_init_trap(&e));
-                }
-            }
-            Ok(LoopAction::Stop) => {
-                transition(state_tx, instance_id, InstanceState::Stopped);
-                return ServeOutcome::Stopped;
-            }
+            Ok(LoopAction::Continue) => match guest_call(stop, instance.drain_events()).await {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),
+                None => return ServeOutcome::Cancelled,
+            },
+            Ok(LoopAction::Stop) => return ServeOutcome::Stopped,
+            Ok(LoopAction::Cancelled) => return ServeOutcome::Cancelled,
             Ok(LoopAction::StopFailed(reason)) => {
                 tracing::warn!(
                     instance_id,
@@ -1352,18 +1610,38 @@ async fn serve_loop(
     }
 }
 
+/// Run `on-shutdown` for a stop (a `Shutdown` message, the stop flag,
+/// or every handle dropped). Round-3 F1: an operator-requested stop is
+/// terminal whether or not the guest's teardown ran cleanly: a trap
+/// (or a hook that didn't return in time) is `StopFailed`, which the
+/// outer supervisor turns into `Failed` without a restart.
+async fn shutdown_on_request(
+    instance: &mut PluginInstance,
+    state_tx: &watch::Sender<InstanceState>,
+    instance_id: &str,
+) -> LoopAction {
+    transition(state_tx, instance_id, InstanceState::Stopping);
+    match instance.shutdown().await {
+        Ok(()) => LoopAction::Stop,
+        Err(err) => LoopAction::StopFailed(format!("shutdown trapped: {err:#}")),
+    }
+}
+
 /// Wait out a restart backoff delay. Returns early if a shutdown is
 /// requested mid-backoff; an `execute-command` arriving during the
 /// wait is answered with an error (the instance isn't running).
 async fn backoff_wait(
     delay: Duration,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
+    stop: &mut watch::Receiver<bool>,
     instance_id: &str,
 ) -> BackoffOutcome {
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
     loop {
         tokio::select! {
+            biased;
+            () = stop_requested(stop) => return BackoffOutcome::Shutdown,
             () = &mut sleep => return BackoffOutcome::Elapsed,
             ctrl = control_rx.recv() => match ctrl {
                 // Every handle dropped, or an explicit shutdown.
@@ -1400,8 +1678,10 @@ async fn backoff_wait(
 
 /// `ControlCommand::Execute`: run one device command and reply with
 /// its H5 outcome. A trap is still a crash (propagated after replying).
+#[allow(clippy::too_many_arguments)]
 async fn run_execute(
     instance: &mut PluginInstance,
+    stop: &mut watch::Receiver<bool>,
     instance_id: &str,
     ctx: InvocationContext,
     device: DeviceId,
@@ -1448,16 +1728,30 @@ async fn run_execute(
     let ctx = ctx.entering(instance_id);
     // For a late-result audit row: keeps the executing instance.
     let entered_ctx = ctx.clone();
-    let result = invocation::CURRENT
-        .scope(ctx, instance.execute_command(device, cmd))
-        .await;
+    let result = guest_call(
+        stop,
+        invocation::CURRENT.scope(ctx, instance.execute_command(device, cmd)),
+    )
+    .await;
+    let result_cancelled = result.is_none();
     let (outcome, trap) = match result {
-        Ok(result) => (CommandOutcome::from_plugin(result), None),
+        // A stop cancelled the call: the plugin was entered, so the
+        // command may have taken effect.
+        None => (
+            CommandOutcome::Unknown {
+                message: format!(
+                    "instance `{instance_id}` was stopped while executing the command; it may \
+                     have taken effect",
+                ),
+            },
+            None,
+        ),
+        Some(Ok(result)) => (CommandOutcome::from_plugin(result), None),
         // An `execute-command` trap is a crash. The plugin was
         // entered, so whatever it did to the device may stand.
         // The caller gets a short message; the trap detail (wasm
         // backtrace) stays in the instance's failure reason and logs.
-        Err(trap) => {
+        Some(Err(trap)) => {
             tracing::warn!(
                 instance_id = %instance_id,
                 command_id = %command_id,
@@ -1491,9 +1785,10 @@ async fn run_execute(
             &outcome,
         );
     }
-    match trap {
-        None => Ok(LoopAction::Continue),
-        Some(trap) => Err(trap),
+    match (result_cancelled, trap) {
+        (true, _) => Ok(LoopAction::Cancelled),
+        (false, None) => Ok(LoopAction::Continue),
+        (false, Some(trap)) => Err(trap),
     }
 }
 
@@ -1502,37 +1797,20 @@ async fn run_execute(
 async fn handle_control(
     instance: &mut PluginInstance,
     state_tx: &watch::Sender<InstanceState>,
+    stop: &mut watch::Receiver<bool>,
     instance_id: &str,
     ctrl: Option<ControlCommand>,
 ) -> anyhow::Result<LoopAction> {
     match ctrl {
         // Every handle was dropped — nobody can observe or drive the
         // instance anymore. Shut it down cleanly.
-        None => {
-            transition(state_tx, instance_id, InstanceState::Stopping);
-            instance.shutdown().await?;
-            Ok(LoopAction::Stop)
-        }
+        None => Ok(shutdown_on_request(instance, state_tx, instance_id).await),
         Some(ControlCommand::Shutdown { reply }) => {
-            transition(state_tx, instance_id, InstanceState::Stopping);
-            let result = instance.shutdown().await;
+            let action = shutdown_on_request(instance, state_tx, instance_id).await;
             // Ack the caller whether or not `shutdown` trapped so
             // they aren't left waiting on the reply channel.
             let _ = reply.send(());
-            // Round-3 F1: an operator-requested shutdown MUST be
-            // terminal, regardless of whether the guest's
-            // teardown ran cleanly. Pre-fix, propagating the trap
-            // via `?` funneled the outcome into
-            // `ServeOutcome::Crashed` and the outer supervisor
-            // then applied the `on-trap` restart policy —
-            // silently restarting an instance the operator asked
-            // to stop. Now a shutdown trap goes to `StopFailed`,
-            // which the outer supervisor treats as terminal
-            // (Failed state, no restart).
-            match result {
-                Ok(()) => Ok(LoopAction::Stop),
-                Err(err) => Ok(LoopAction::StopFailed(format!("shutdown trapped: {err:#}"))),
-            }
+            Ok(action)
         }
         Some(ControlCommand::Execute {
             ctx,
@@ -1540,7 +1818,19 @@ async fn handle_control(
             cmd,
             ticket,
             reply,
-        }) => run_execute(instance, instance_id, ctx, device, cmd, &ticket, reply).await,
+        }) => {
+            run_execute(
+                instance,
+                stop,
+                instance_id,
+                ctx,
+                device,
+                cmd,
+                &ticket,
+                reply,
+            )
+            .await
+        }
         Some(ControlCommand::ExecuteService {
             ctx,
             guard,
@@ -1577,15 +1867,26 @@ async fn handle_control(
                 )));
                 return Ok(LoopAction::Continue);
             }
-            let outcome = invocation::CURRENT
-                .scope(
+            let outcome = guest_call(
+                stop,
+                invocation::CURRENT.scope(
                     ctx,
                     instance.execute_service_command(service, command, args),
-                )
-                .await;
+                ),
+            )
+            .await;
             drop(guard);
             match outcome {
-                Ok(result) => {
+                // A stop cancelled the call after the callee was
+                // entered (H5: it may have acted).
+                None => {
+                    let _ = reply.send(Ok(CommandResult::Unknown(format!(
+                        "instance `{instance_id}` was stopped during execute-service-command; \
+                         the call may have taken effect",
+                    ))));
+                    Ok(LoopAction::Cancelled)
+                }
+                Some(Ok(result)) => {
                     let _ = reply.send(Ok(result));
                     Ok(LoopAction::Continue)
                 }
@@ -1594,7 +1895,7 @@ async fn handle_control(
                 // failure it could safely retry. The trap detail stays
                 // in the logs and the instance's failure reason. The
                 // trap still crashes (and restarts) this instance only.
-                Err(trap) => {
+                Some(Err(trap)) => {
                     tracing::warn!(
                         instance_id = %instance_id,
                         error = %format!("{trap:#}"),

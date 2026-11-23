@@ -1042,6 +1042,55 @@ impl BlobStore {
         Ok(deleted)
     }
 
+    /// Wipe one instance's blobs: its index and usage rows, then its
+    /// directory. ADR-0001: a script sandbox's storage goes with the
+    /// script when its parent removes it (`stop-sandbox`). Same SQL
+    /// first, FS second order (and retry story) as
+    /// [`Self::purge_installation`]. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobError::Sql`] for SQL failures, [`BlobError::Io`] for a
+    /// failed directory removal, [`BlobError::UnsafeInstanceId`] for a
+    /// malformed id.
+    pub fn purge_instance(
+        &self,
+        installation_uuid: &str,
+        instance_id: &str,
+    ) -> Result<usize, BlobError> {
+        check_installation_uuid(installation_uuid)?;
+        check_instance_id(instance_id)?;
+        let uuid_owned = installation_uuid.to_owned();
+        let instance_owned = instance_id.to_owned();
+        let deleted = self.db.write(move |conn| -> Result<usize, BlobError> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let usage_rows = tx.execute(
+                "DELETE FROM blob_usage WHERE installation_uuid = ?1 AND instance_id = ?2",
+                params![uuid_owned, instance_owned],
+            )?;
+            let blob_rows = tx.execute(
+                "DELETE FROM blob WHERE installation_uuid = ?1 AND instance_id = ?2",
+                params![uuid_owned, instance_owned],
+            )?;
+            tx.commit()?;
+            Ok(usage_rows + blob_rows)
+        })?;
+        if let Some(blobs_root) = self.blobs_root.as_deref() {
+            let instance_dir = instance_dir_for(blobs_root, installation_uuid, instance_id);
+            ensure_contained(blobs_root, &instance_dir)?;
+            if instance_dir.exists() {
+                std::fs::remove_dir_all(&instance_dir).map_err(|source| BlobError::Io {
+                    path: instance_dir.clone(),
+                    source,
+                })?;
+                if let Some(install_dir) = instance_dir.parent() {
+                    fsync_dir(install_dir)?;
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Mint a new blob id. Format:
     /// `<unix_ms_13hex>-<counter_8hex>-<nanos_8hex>` — host-minted,
     /// filesystem-safe, sortable by creation time. The counter is
@@ -1583,6 +1632,34 @@ mod tests {
 
     /// `purge_installation` on an install that never wrote is a
     /// no-op — safe to call from the uninstall path unconditionally.
+    #[test]
+    fn purge_instance_wipes_sql_and_fs_for_only_that_instance() {
+        let (store, dir) = store_with_root();
+        store
+            .register_instance(INST_A, "main~a", 4096)
+            .expect("register a");
+        store
+            .register_instance(INST_A, "main~b", 4096)
+            .expect("register b");
+        store
+            .write(INST_A, "main~a", "x", b"aaa", None)
+            .expect("write a");
+        store
+            .write(INST_A, "main~b", "x", b"bbb", None)
+            .expect("write b");
+        let a_dir = dir.path.join(INST_A).join("main~a");
+        assert!(a_dir.is_dir());
+
+        assert!(store.purge_instance(INST_A, "main~a").expect("purge") >= 2);
+        assert!(!a_dir.exists(), "instance dir should be gone");
+        assert!(store.usage(INST_A, "main~a").expect("usage a").is_none());
+        assert_eq!(
+            store.read_by_name(INST_A, "main~b", "x").expect("read b"),
+            b"bbb"
+        );
+        assert_eq!(store.purge_instance(INST_A, "main~a").expect("again"), 0);
+    }
+
     #[test]
     fn purge_installation_is_idempotent() {
         let (store, _dir) = store_with_root();

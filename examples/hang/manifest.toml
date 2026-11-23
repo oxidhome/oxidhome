@@ -23,6 +23,6 @@ declares_devices = ["switch"]
 
 [config.phase]
 type = "enum"
-values = ["init", "tick", "command"]
+values = ["init", "tick", "command", "sleep", "shutdown-sleep"]
 default = "tick"
 description = "Which lifecycle hook spins forever."

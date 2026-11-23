@@ -481,6 +481,17 @@ impl DeviceStateStore {
         Self::bump_generation_locked(&mut inner, owner_instance)
     }
 
+    /// Drop the supervisor generation of an instance id that won't be
+    /// used again (a removed script sandbox, ADR-0001), so retired ids
+    /// don't accumulate. Its entries stay (they are `Stale` by now and
+    /// age out under the stale cap). Should the id come back, its
+    /// generations restart at 1; that can't revive an old entry,
+    /// because only a `Fresh` entry of the current generation is ever
+    /// merged into.
+    pub fn forget_instance(&self, owner_instance: &str) {
+        self.inner_write().generations.remove(owner_instance);
+    }
+
     fn bump_generation_locked(inner: &mut StoreInner, owner_instance: &str) -> u64 {
         let next = inner.generations.get(owner_instance).copied().unwrap_or(0) + 1;
         inner.generations.insert(owner_instance.to_string(), next);
@@ -2607,6 +2618,18 @@ mod tests {
     /// followed by a Fresh entry from the pre-bump generation).
     /// This is a deterministic check; the fuzz test above catches
     /// the interleaving under load.
+    #[test]
+    fn forget_instance_drops_its_generation_only() {
+        let store = DeviceStateStore::new();
+        assert_eq!(store.bump_generation("main~a"), 1);
+        assert_eq!(store.bump_generation("main~a"), 2);
+        assert_eq!(store.bump_generation("main~b"), 1);
+        store.forget_instance("main~a");
+        assert!(!store.inner_read().generations.contains_key("main~a"));
+        assert_eq!(store.inner_read().generations.get("main~b"), Some(&1));
+        assert_eq!(store.bump_generation("main~a"), 1);
+    }
+
     #[test]
     fn restart_generation_marks_stale_and_bumps_atomically() {
         let store = DeviceStateStore::new();

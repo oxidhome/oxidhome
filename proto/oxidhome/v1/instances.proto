@@ -47,4 +47,11 @@ message Instance {
   // (or `"value": null` when unset) and never carries the plaintext.
   // Empty until the instance's first successful load.
   string config_json = 4;
+  // ADR-0001: for a script sandbox, the instance that started it
+  // (the sandbox's id is `<parent_instance_id>~<sandbox_local_id>`).
+  // Unset for any other instance.
+  optional string parent_instance_id = 5;
+  // ADR-0001: for a script sandbox, its `local-id` within the parent.
+  // Unset for any other instance.
+  optional string sandbox_local_id = 6;
 }
