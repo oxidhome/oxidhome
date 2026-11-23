@@ -444,7 +444,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
     ) -> ServiceResult<impl Encodable<ListDeviceStateResponse> + Send + use<'a>> {
         use super::server::{
             DEFAULT_ALL_DEVICES_STATE_LIMIT, MAX_ALL_DEVICES_STATE_LIMIT,
-            MAX_ALL_DEVICES_STATE_PAGE_BYTES,
+            MAX_ALL_DEVICES_STATE_PAGE_BYTES, MAX_ALL_DEVICES_STATE_SCAN,
         };
         require_scope_connect(&ctx, DEVICES_READ)?;
         let blobs = ctx_can_read_blobs(&ctx);
@@ -484,7 +484,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             pinned.as_ref().map(|(_, after)| after.as_str()),
             limit,
             MAX_ALL_DEVICES_STATE_PAGE_BYTES,
-            usize::MAX,
+            MAX_ALL_DEVICES_STATE_SCAN,
             // Same as REST: a continuation page leaves out entries
             // newer than the pinned revision.
             |e| pinned.as_ref().is_none_or(|(r, _)| e.global_revision <= *r),

@@ -185,6 +185,12 @@ pub struct FlushError(String);
 
 /// One consistent write: the store's state at `revision`.
 struct FlushBatch {
+    /// Boot nonce of the store that took the batch. The boot flush
+    /// claims the table for it; any other flush is refused once a
+    /// newer store has claimed it, so a batch still in flight from a
+    /// dropped store can't overwrite the new one's reservation.
+    writer: String,
+    claim: bool,
     epoch: String,
     revision: u64,
     evicted_through: u64,
@@ -231,15 +237,6 @@ impl DeviceStateStore {
                 .entry(row.owner_instance.clone())
                 .or_insert(0);
             *generation = (*generation).max(row.source_generation);
-            if !row.owner_plugin.is_empty() {
-                inner.owner_plugins.insert(
-                    row.owner_instance.clone(),
-                    super::OwnerIdentity {
-                        plugin: row.owner_plugin.clone(),
-                        install: row.owner_install.clone(),
-                    },
-                );
-            }
             inner.entries.insert(
                 (row.device_id.clone(), row.capability.clone()),
                 Arc::new(row),
@@ -277,6 +274,27 @@ impl DeviceStateStore {
             }
         } else {
             inner.global_revision = max_row_revision;
+        }
+        // Every restored slot gets a revision above the base, so a
+        // client polling from any surviving cursor is sent the whole
+        // restored projection again. Otherwise a slot whose newer
+        // write was lost in the crash, and which the client skipped
+        // (e.g. a continuation page left it out as newer than its
+        // pin), would come back at its old revision, below the cursor.
+        // Stale slots keep their `received_ms`; fresh ones are
+        // renumbered by the stale flip below.
+        let stale_keys: Vec<Key> = inner
+            .entries
+            .iter()
+            .filter(|(_, e)| e.quality == StateQuality::Stale)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &stale_keys {
+            let global_revision = inner.next_revision();
+            if let Some(entry) = inner.entries.get_mut(key) {
+                Arc::make_mut(entry).global_revision = global_revision;
+            }
+            inner.touch(key);
         }
         // Restored values are unconfirmed until the owner republishes.
         let now = crate::state::event_log::now_unix_ms();
@@ -415,6 +433,8 @@ impl DeviceStateStore {
             (upserts, deletes)
         };
         Some(FlushBatch {
+            writer: inner.boot.clone(),
+            claim: force_meta,
             epoch: inner.epoch.clone(),
             revision: inner.global_revision,
             evicted_through: inner.evicted_through_revision,
@@ -517,6 +537,20 @@ fn to_u64(v: i64) -> u64 {
 
 fn write_batch(conn: &mut rusqlite::Connection, batch: &FlushBatch) -> rusqlite::Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !batch.claim {
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT writer FROM device_state_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner.is_some_and(|w| w != batch.writer) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                "device-state table was claimed by a newer store".into(),
+            ));
+        }
+    }
     if batch.rewrite_all {
         tx.execute("DELETE FROM device_state", [])?;
     }
@@ -564,15 +598,17 @@ fn write_batch(conn: &mut rusqlite::Connection, batch: &FlushBatch) -> rusqlite:
     let holes_json = serde_json::to_string(&holes)
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
     tx.execute(
-        "INSERT INTO device_state_meta(id, epoch, revision, evicted_through, holes_json) \
-         VALUES (1, ?1, ?2, ?3, ?4) \
+        "INSERT INTO device_state_meta(id, epoch, revision, evicted_through, holes_json, writer) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5) \
          ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch, revision = excluded.revision, \
-         evicted_through = excluded.evicted_through, holes_json = excluded.holes_json",
+         evicted_through = excluded.evicted_through, holes_json = excluded.holes_json, \
+         writer = excluded.writer",
         params![
             batch.epoch,
             to_i64(batch.revision),
             to_i64(batch.evicted_through),
             holes_json,
+            batch.writer,
         ],
     )?;
     tx.commit()
@@ -727,29 +763,13 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
         let mut out = Vec::new();
         let mut skipped = 0usize;
         while let Some(row) = rows.next()? {
-            let blob: Vec<u8> = row.get(4)?;
-            let Ok(fields) = decode_fields(&blob) else {
-                skipped += 1;
-                continue;
-            };
-            let quality: String = row.get(9)?;
-            out.push(DeviceState {
-                device_id: row.get(0)?,
-                capability: row.get(1)?,
-                owner_instance: row.get(2)?,
-                owner_plugin: row.get(3)?,
-                owner_install: row.get(10)?,
-                fields,
-                global_revision: to_u64(row.get(5)?),
-                received_ms: row.get(6)?,
-                observed_ms: to_u64(row.get(7)?),
-                source_generation: to_u64(row.get(8)?),
-                quality: if quality == "fresh" {
-                    StateQuality::Fresh
-                } else {
-                    StateQuality::Stale
-                },
-            });
+            // A row whose columns don't convert (wrong SQL type, bad
+            // field encoding) is skipped like any other damage; only
+            // the cursor's own I/O errors abort the boot.
+            match decode_row(row) {
+                Some(entry) => out.push(entry),
+                None => skipped += 1,
+            }
         }
         if skipped > 0 {
             damaged = true;
@@ -760,6 +780,29 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
             );
         }
         Ok((meta, out, damaged))
+    })
+}
+
+fn decode_row(row: &rusqlite::Row<'_>) -> Option<DeviceState> {
+    let blob: Vec<u8> = row.get(4).ok()?;
+    let fields = decode_fields(&blob).ok()?;
+    let quality: String = row.get(9).ok()?;
+    Some(DeviceState {
+        device_id: row.get(0).ok()?,
+        capability: row.get(1).ok()?,
+        owner_instance: row.get(2).ok()?,
+        owner_plugin: row.get(3).ok()?,
+        owner_install: row.get(10).ok()?,
+        fields,
+        global_revision: to_u64(row.get(5).ok()?),
+        received_ms: row.get(6).ok()?,
+        observed_ms: to_u64(row.get(7).ok()?),
+        source_generation: to_u64(row.get(8).ok()?),
+        quality: if quality == "fresh" {
+            StateQuality::Fresh
+        } else {
+            StateQuality::Stale
+        },
     })
 }
 
@@ -793,6 +836,21 @@ mod tests {
     fn open(dir: &TempDir) -> Arc<DeviceStateStore> {
         let db = Arc::new(Db::open_file(&dir.0).expect("db"));
         DeviceStateStore::open_persistent(db).expect("open store")
+    }
+
+    /// Stop the background flusher without a final flush, so the
+    /// writes that follow are lost on drop like in a crash.
+    fn stop_flusher(store: &DeviceStateStore) {
+        let backing = store.backing.as_ref().expect("backing");
+        backing.signal.close();
+        if let Some(handle) = backing
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.join().expect("flusher");
+        }
     }
 
     fn on(v: bool) -> Vec<KeyValue> {
@@ -876,8 +934,8 @@ mod tests {
         put(&store, "dev-a", true);
         store.flush().expect("flush");
         let flushed = store.current_revision();
-        // Not flushed: dropped like a crash (the flusher coalesces for
-        // 250 ms first, and it holds only a weak reference).
+        stop_flusher(&store);
+        // Not flushed: dropped like a crash.
         put(&store, "dev-a", false);
         put(&store, "dev-new", true);
         let lost_cursor = store.current_revision();
@@ -1091,5 +1149,89 @@ mod tests {
             Err(CursorError::EpochChanged)
         );
         assert_eq!(store.verify_cursor("x.1.y.z"), Err(CursorError::Bad));
+    }
+
+    /// Round-3: a slot already stale on disk, whose newer write was
+    /// lost, comes back above every surviving cursor, so a client
+    /// polling from the flushed revision is sent it again.
+    #[test]
+    fn restored_stale_slots_are_redelivered_to_surviving_cursors() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        store.mark_device_stale("dev-a");
+        store.flush().expect("flush");
+        let pin = store.current_revision();
+        stop_flusher(&store);
+        put(&store, "dev-a", false);
+        drop(store);
+        let store = open(&dir);
+        let page = store.deltas_since_with_revision(pin, 10);
+        assert!(!page.reset_required);
+        assert!(
+            page.entries.iter().any(|e| e.device_id == "dev-a"),
+            "the restored slot must be re-sent",
+        );
+        assert!(store.close_persistence());
+    }
+
+    /// Round-3: once a newer store has claimed the table, a batch from
+    /// an older store is refused instead of overwriting its meta.
+    #[test]
+    fn a_superseded_store_cannot_flush() {
+        let dir = tempdir();
+        let old = open(&dir);
+        stop_flusher(&old);
+        put(&old, "dev-a", true);
+        let new = open(&dir);
+        let new_revision = new.current_revision();
+        assert!(old.flush().is_err(), "old store must be refused");
+        assert!(new.close_persistence());
+        drop(new);
+        drop(old);
+        let store = open(&dir);
+        assert!(store.current_revision() > new_revision);
+        assert!(store.close_persistence());
+    }
+
+    /// Round-3: owner bindings are released with their last holder,
+    /// and an older holder can't release a newer installation's.
+    #[test]
+    fn owner_bindings_are_refcounted() {
+        let store = DeviceStateStore::new();
+        store.bind_owner_plugin("i", "p", "u1");
+        store.bind_owner_plugin("i", "p", "u1");
+        store.unbind_owner_plugin("i", "u1");
+        assert_eq!(store.inner_read().owner_identity("i").install, "u1");
+        store.bind_owner_plugin("i", "p", "u2");
+        store.unbind_owner_plugin("i", "u1");
+        assert_eq!(store.inner_read().owner_identity("i").install, "u2");
+        store.unbind_owner_plugin("i", "u2");
+        assert!(store.inner_read().owner_plugins.is_empty());
+    }
+
+    /// Round-3: a row with a column of the wrong SQL type is skipped
+    /// like any other damage instead of failing the boot.
+    #[test]
+    fn a_row_with_a_wrong_column_type_is_skipped() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        put(&store, "dev-b", true);
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| {
+            c.execute(
+                "UPDATE device_state SET global_revision = 'x' WHERE device_id = 'dev-b'",
+                [],
+            )
+        })
+        .expect("corrupt a row");
+        drop(db);
+        let store = open(&dir);
+        assert!(store.snapshot_capability("dev-a", "switch").is_some());
+        assert!(store.snapshot_capability("dev-b", "switch").is_none());
+        assert!(store.close_persistence());
     }
 }

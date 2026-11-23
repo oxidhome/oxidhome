@@ -4476,6 +4476,7 @@ async fn devices_state_full_snapshot_returns_every_device_atomically() {
 /// revision as its cursor could miss updates that happened
 /// mid-pagination.
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn devices_state_full_snapshot_pins_revision_across_pages() {
     let engine = Engine::new().expect("engine");
     let reader = engine

@@ -845,7 +845,8 @@ const MIGRATIONS: &[&str] = &[
         epoch             TEXT NOT NULL,
         revision          INTEGER NOT NULL,
         evicted_through   INTEGER NOT NULL,
-        holes_json        TEXT NOT NULL
+        holes_json        TEXT NOT NULL,
+        writer            TEXT NOT NULL
     );
     ",
 ];

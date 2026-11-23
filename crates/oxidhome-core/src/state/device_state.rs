@@ -255,10 +255,11 @@ struct StoreInner {
     /// told apart by this value (409, restart the resync) instead of
     /// failing its MAC (400).
     boot: String,
-    /// H2: `plugin.id` per owning `instance_id`, stamped onto every
-    /// entry the instance writes. See
+    /// H2: plugin and installation per live `instance_id` (with the
+    /// number of live `PluginState`s holding the binding), stamped onto
+    /// every entry the instance writes. See
     /// [`DeviceStateStore::bind_owner_plugin`].
-    owner_plugins: HashMap<String, OwnerIdentity>,
+    owner_plugins: HashMap<String, (OwnerIdentity, usize)>,
     /// H2: revision ranges `(lo, hi)` that a boot skipped over (`hi` is
     /// the restored store's base revision, a valid cursor itself). A
     /// cursor inside one may come from writes that were lost before
@@ -362,8 +363,7 @@ impl StoreInner {
     fn owner_identity(&self, owner_instance: &str) -> OwnerIdentity {
         self.owner_plugins
             .get(owner_instance)
-            .cloned()
-            .unwrap_or_default()
+            .map_or_else(OwnerIdentity::default, |(identity, _)| identity.clone())
     }
 }
 
@@ -385,9 +385,10 @@ impl DeviceStateStore {
         Self::default()
     }
 
-    /// H2: remember which plugin `owner_instance` belongs to, so the
-    /// entries it writes carry `owner_plugin`. Called when an instance
-    /// is loaded.
+    /// H2: remember which plugin and installation `owner_instance`
+    /// runs as, so the entries it writes carry them. Called when an
+    /// instance's `PluginState` is built; released by
+    /// [`Self::unbind_owner_plugin`] when it is dropped.
     pub fn bind_owner_plugin(
         &self,
         owner_instance: &str,
@@ -399,10 +400,28 @@ impl DeviceStateStore {
             install: installation_uuid.to_owned(),
         };
         let mut inner = self.inner_write();
-        if inner.owner_plugins.get(owner_instance) != Some(&identity) {
-            inner
-                .owner_plugins
-                .insert(owner_instance.to_owned(), identity);
+        match inner.owner_plugins.get_mut(owner_instance) {
+            Some((bound, refs)) if *bound == identity => *refs += 1,
+            _ => {
+                inner
+                    .owner_plugins
+                    .insert(owner_instance.to_owned(), (identity, 1));
+            }
+        }
+    }
+
+    /// H2: release one [`Self::bind_owner_plugin`]. The binding goes
+    /// away with its last holder; a binding since replaced by another
+    /// installation is left alone. Entries keep their owner identity.
+    pub fn unbind_owner_plugin(&self, owner_instance: &str, installation_uuid: &str) {
+        let mut inner = self.inner_write();
+        if let Some((bound, refs)) = inner.owner_plugins.get_mut(owner_instance)
+            && bound.install == installation_uuid
+        {
+            *refs -= 1;
+            if *refs == 0 {
+                inner.owner_plugins.remove(owner_instance);
+            }
         }
     }
 
@@ -1190,7 +1209,9 @@ impl DeviceStateStore {
             }
             return Err(CursorError::Bad);
         };
-        if epoch.is_empty() || device.is_empty() || mac_hex.len() != 32 {
+        let is_hex =
+            |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
+        if epoch.is_empty() || device.is_empty() || !is_hex(boot, 16) || !is_hex(mac_hex, 32) {
             return Err(CursorError::Bad);
         }
         let pinned_revision = rev.parse::<u64>().map_err(|_| CursorError::Bad)?;

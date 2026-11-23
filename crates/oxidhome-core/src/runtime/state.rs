@@ -589,6 +589,15 @@ impl PluginState {
     }
 }
 
+impl Drop for PluginState {
+    fn drop(&mut self) {
+        // H2: release the owner binding taken in `new`, so bindings
+        // don't outlive their instances.
+        self.device_state
+            .unbind_owner_plugin(&self.instance_id, &self.installation_uuid);
+    }
+}
+
 impl WasiView for PluginState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {

@@ -657,6 +657,12 @@ pub(crate) const MAX_ALL_DEVICES_STATE_LIMIT: usize = 256;
 /// cap before the count cap does.
 pub(crate) const MAX_ALL_DEVICES_STATE_PAGE_BYTES: usize = 1024 * 1024;
 
+/// H2: entries one snapshot page looks at. A continuation page skips
+/// entries newer than its pin, so without a budget a page could walk
+/// the rest of the store under the read lock; past it the page ends
+/// early (possibly empty) with a `next_cursor`.
+pub(crate) const MAX_ALL_DEVICES_STATE_SCAN: usize = 16_384;
+
 /// Body of `GET /api/v1/devices/state`. Same shape as
 /// [`DeviceStateSnapshot`] but returns entries across every
 /// device — the resync primitive a client falls back on after
@@ -785,7 +791,7 @@ async fn get_all_device_state(
         cursor_fields.as_ref().map(|(_, _, did)| did.as_str()),
         limit,
         MAX_ALL_DEVICES_STATE_PAGE_BYTES,
-        usize::MAX,
+        MAX_ALL_DEVICES_STATE_SCAN,
         |e| pinned.is_none_or(|r| e.global_revision <= r),
     );
     let epoch = page.epoch;
