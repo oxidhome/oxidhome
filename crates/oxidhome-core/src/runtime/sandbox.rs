@@ -278,6 +278,11 @@ impl Engine {
                 crate::auth::invocation::audit_cap(&instance_id),
             )));
         }
+        // Before re-adopting too: a host that is shutting down hands
+        // out no sandbox ids.
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(WitError::Unavailable("the host is shutting down".into()));
+        }
         let registry = self.sandboxes();
         let mut guard = registry.lock();
         let children = guard.entry(parent.to_owned()).or_default();

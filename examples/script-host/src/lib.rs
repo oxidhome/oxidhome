@@ -206,6 +206,16 @@ impl ScriptHost {
                     Ok(previous) => previous,
                     Err(e) => return CommandResult::Err(e),
                 };
+                // A live script keeps its saved source: refuse a
+                // different one before touching KV, so a crash here
+                // can't leave KV disagreeing with the running script.
+                let running = host::sandboxes::list().iter().any(|s| s.local_id == id);
+                let same = matches!(&previous, Some(Value::StringVal(saved)) if saved == source);
+                if running && !same {
+                    return CommandResult::Err(Error::InvalidArgument(format!(
+                        "script `{id}` is running different source; unload it first"
+                    )));
+                }
                 if let Err(e) = host::storage::set(&key, &Value::StringVal(source.into())) {
                     return CommandResult::Err(e);
                 }
