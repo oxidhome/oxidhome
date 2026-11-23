@@ -737,9 +737,14 @@ mod tests {
         db.write(|c| c.execute_batch("ALTER TABLE pending_command RENAME TO pc_away"))
             .unwrap();
         assert!(journal.persist(row("cmd-a", i64::MAX)));
-        // The first attempt fails; the worker is now in its 1 s retry
-        // wait.
-        std::thread::sleep(Duration::from_millis(100));
+        // The worker took the batch before any close, so its first
+        // attempt fails while open; it is then in its 1 s retry wait.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !journal.shared.lock().busy {
+            assert!(Instant::now() < deadline, "the worker never took the batch");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
         let restore = {
             let db = Arc::clone(&db);
             std::thread::spawn(move || {
