@@ -662,7 +662,7 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
                 }
                 CommandOutcome::Rejected { error } => format!(" {}", render_error(error)),
                 CommandOutcome::TimedOut { message } | CommandOutcome::Unknown { message } => {
-                    format!(" {}", esc(&mask_json_doc(message)))
+                    format!(" {}", esc(&mask_text(message)))
                 }
             };
             format!("{head} {}{detail}", outcome.as_str())
@@ -738,7 +738,7 @@ fn render_error(error: &WitError) -> String {
         WitError::Unavailable(m) => ("unavailable", m),
         WitError::Internal(m) => ("internal", m),
     };
-    format!("{kind}({:?})", mask_json_doc(message).as_ref())
+    format!("{kind}({:?})", mask_text(message).as_ref())
 }
 
 /// The redaction pass over a rendered snapshot (see [`Snapshot`],
@@ -877,9 +877,12 @@ fn mask_json_doc(text: &str) -> std::borrow::Cow<'_, str> {
         .ok()
         .filter(|doc| doc.is_object() || doc.is_array())
         .and_then(|mut doc| {
-            // Declared secrets first, whole, before the credential
-            // rules could mask part of one and stop it matching.
-            let masked = CAPTURE_SECRETS.with(|s| mask_secret_leaves(&mut doc, &s.borrow()));
+            // Credential-keyed values first (a declared secret may
+            // match a key's name), then declared secrets, whole, before
+            // the credential text rules could mask part of one.
+            let paired = mask_sensitive_pairs(&mut doc);
+            let masked =
+                CAPTURE_SECRETS.with(|s| mask_secret_leaves(&mut doc, &s.borrow())) | paired;
             let redacted = oxidhome_core::redact::redact_json(&mut doc);
             (masked || redacted).then(|| doc.to_string())
         })
@@ -907,6 +910,61 @@ impl SecretsInScope {
 impl Drop for SecretsInScope {
     fn drop(&mut self) {
         CAPTURE_SECRETS.with(|s| s.borrow_mut().clear());
+    }
+}
+
+/// Free text as a snapshot prints it, masked before escaping (escaping
+/// changes separators the credential rules look for): a JSON document
+/// as [`mask_json_doc`]; other text with the declared secrets of the
+/// capture replaced, then credential-like text scrubbed.
+fn mask_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let json = mask_json_doc(text);
+    if matches!(json, std::borrow::Cow::Owned(_)) {
+        return json;
+    }
+    let mut out = text.to_owned();
+    CAPTURE_SECRETS.with(|s| {
+        for secret in s.borrow().iter().filter(|s| !s.is_empty()) {
+            out = out.replace(secret.as_str(), "***");
+        }
+    });
+    let scrubbed = oxidhome_core::redact::scrub_text(&out).into_owned();
+    if scrubbed == text {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(scrubbed)
+    }
+}
+
+/// Mask the values the core JSON redactor would, by key, before
+/// anything rewrites the keys: an object entry under a credential-like
+/// key, and a `{"key": <credential-like>, "value": …}` pair. `true` if
+/// anything changed.
+fn mask_sensitive_pairs(doc: &mut serde_json::Value) -> bool {
+    use oxidhome_core::redact::is_sensitive_key;
+    let masked = serde_json::Value::String(oxidhome_core::redact::REDACTED.to_owned());
+    match doc {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            let pair_key = map
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_sensitive_key);
+            for (key, value) in map.iter_mut() {
+                let sensitive = is_sensitive_key(key) || (pair_key && key == "value");
+                if sensitive && (value.is_string() || value.is_number()) {
+                    *value = masked.clone();
+                    changed = true;
+                } else {
+                    changed |= mask_sensitive_pairs(value);
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |acc, v| mask_sensitive_pairs(v) | acc),
+        _ => false,
     }
 }
 
@@ -996,7 +1054,7 @@ pub fn render_value(value: &Value) -> String {
         Value::FloatVal(x) => format!("{x:?}"),
         // A string may hold a JSON document: its structured
         // credentials are masked as the API masks them.
-        Value::StringVal(s) => format!("{:?}", mask_json_doc(s)),
+        Value::StringVal(s) => format!("{:?}", mask_text(s)),
         Value::BytesVal(bytes) => {
             let mut out = String::from("0x");
             for b in bytes.iter().take(SHOWN_BYTES) {
@@ -1084,13 +1142,11 @@ fn render_payload(payload: &EventPayload) -> String {
         EventPayload::Inference(r) => format!(
             "inference {} {}",
             tok(&r.model),
-            esc(&mask_json_doc(&r.payload))
+            esc(&mask_text(&r.payload))
         ),
-        EventPayload::Custom(c) => format!(
-            "custom {} {}",
-            tok(&c.topic),
-            esc(&mask_json_doc(&c.payload))
-        ),
+        EventPayload::Custom(c) => {
+            format!("custom {} {}", tok(&c.topic), esc(&mask_text(&c.payload)))
+        }
     }
 }
 
@@ -1420,6 +1476,18 @@ mod tests {
             snap.storage,
             ["conn = \"***\"", r#"doc = json:"{\"url\":\"***\"}""#]
         );
+    }
+
+    #[test]
+    fn secrets_named_like_keys_and_tab_separated_tokens() {
+        let secrets = ["pass".to_owned()];
+        let _scope = SecretsInScope::new(&secrets);
+        let doc = render_value(&Value::JsonVal(
+            r#"{"key":"password","value":"hunter2"}"#.into(),
+        ));
+        assert!(!doc.contains("hunter2"), "{doc}");
+        let note = render_value(&Value::StringVal("Bearer\tabcdef123456".into()));
+        assert!(!note.contains("abcdef123456"), "{note}");
     }
 
     #[test]
