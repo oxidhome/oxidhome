@@ -85,7 +85,7 @@ use super::auth::{
 use super::scopes::{
     DEVICES_COMMAND, DEVICES_LIST, EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
     PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope,
-    ScopeDenied, require_scope,
+    ScopeDenied, can_read_blobs, require_scope,
 };
 
 /// `HealthService` implementation. Anonymous — no engine state is
@@ -1037,12 +1037,15 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         let resume_after_id = tail.resume_after_id();
         // The tail (and its `SubscriberToken`) lives in the unfold
         // state, so the bus slot is freed when the stream ends.
-        let response_stream = futures_util::stream::unfold(Some(tail), |tail| async move {
+        // M7: live and replayed events alike withhold `bytes-val`
+        // payloads unless the caller holds `blobs:read`.
+        let blobs = ctx_can_read_blobs(&ctx);
+        let response_stream = futures_util::stream::unfold(Some(tail), move |tail| async move {
             use crate::state::TailItem;
             let mut tail = tail?;
             let body = match tail.next().await {
                 Ok(Some(TailItem::Event(event))) => tail_events_response::Body::Event(Box::new(
-                    wit_event_to_proto(std::sync::Arc::unwrap_or_clone(event)),
+                    wit_event_to_proto(std::sync::Arc::unwrap_or_clone(event), blobs),
                 )),
                 Ok(Some(TailItem::Lagged {
                     skipped,

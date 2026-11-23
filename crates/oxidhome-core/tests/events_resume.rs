@@ -373,3 +373,56 @@ async fn history_query_reports_pruned_cursor_as_gone() {
         assert_eq!(response.status(), StatusCode::OK, "{ok}");
     }
 }
+
+/// M7 + H4: events replayed from history withhold `bytes-val`
+/// payloads from a token without `blobs:read`, like live ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn replayed_events_withhold_bytes_without_blobs_read() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::StateChange;
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value as WitValue};
+
+    let engine = Engine::new().expect("engine");
+    let event = Event {
+        device: Some("dev-1".into()),
+        timestamp: 1,
+        origin_plugin_id: "com.example.resume".into(),
+        origin_instance_id: "resume-a".into(),
+        row_id: None,
+        payload: EventPayload::StateChanged(StateChange {
+            capability: "camera".into(),
+            fields: vec![KeyValue {
+                key: "frame".into(),
+                value: WitValue::BytesVal(vec![1, 2, 3]),
+            }],
+        }),
+    };
+    // Recorded and fanned out before the tail opens, so it reaches
+    // the client only through the history replay.
+    {
+        let bus = engine.events();
+        let gate = bus.publish_sequence();
+        let _guard = gate.lock().await;
+        let id = engine
+            .event_log()
+            .record(1, &event, "resume-a", "com.example.resume")
+            .expect("record");
+        bus.publish_with_id(event, Some(id));
+    }
+    let token = engine
+        .auth_tokens()
+        .create("resume", br#"["events:tail","events:read"]"#)
+        .expect("token");
+    let (addr, server) = serve_engine(&engine).await;
+    let mut ws = ws_connect(addr, "?after_id=0", &token.plaintext)
+        .await
+        .expect("connect");
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["id"], 1);
+    let value = &frame["payload"]["fields"][0]["value"];
+    assert!(
+        value.to_string().contains("withheld"),
+        "bytes must be withheld on replay, got {frame}"
+    );
+    let _ = ws.close(None).await;
+    server.abort();
+}

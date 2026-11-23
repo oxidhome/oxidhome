@@ -2512,7 +2512,10 @@ async fn tail_events(
         }
     };
     let resume_after_id = tail.resume_after_id();
-    let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail));
+    // M7: live and replayed events alike withhold `bytes-val`
+    // payloads unless the caller holds `blobs:read`.
+    let blobs = can_read_blobs(&actor);
+    let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail, blobs));
     if let Some(id) = resume_after_id {
         response
             .headers_mut()
@@ -2548,7 +2551,7 @@ async fn tail_step(
     (tail, item)
 }
 
-async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail) {
+async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail, blobs: bool) {
     use crate::state::TailItem;
     use axum::extract::ws::{CloseFrame, Message};
     // C2e: per-subscriber mpsc queue. The tail ends when the bus
@@ -2571,7 +2574,7 @@ async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail) 
                 step = Box::pin(tail_step(tail));
                 let text = match item {
                     Ok(Some(TailItem::Event(event))) => {
-                        match serde_json::to_string(&WireEvent::from_host(&event)) {
+                        match serde_json::to_string(&WireEvent::from_host(&event, blobs)) {
                             Ok(text) => text,
                             Err(_) => continue,
                         }
