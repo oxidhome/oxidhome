@@ -261,6 +261,11 @@ async fn list_resources_advertises_devices_and_plugins() {
         uris.contains(&"oxidhome://status"),
         "resources/list missing oxidhome://status (14.2c); got {uris:?}",
     );
+    let config = resources
+        .iter()
+        .find(|r| r["uri"] == "oxidhome://config")
+        .unwrap_or_else(|| panic!("resources/list missing oxidhome://config; got {uris:?}"));
+    assert_eq!(config["mimeType"], "application/json");
 }
 
 /// 14.2b — `oxidhome://events` on a fresh engine returns an
@@ -1083,6 +1088,154 @@ async fn status_resource_requires_status_read_scope() {
         response["error"]["code"], -32001,
         "devices:list must not satisfy status:read; got {response}",
     );
+}
+
+// ── oxidhome://config ─────────────────────────────────────────
+
+/// Installs the process-wide daemon snapshot the config surfaces
+/// serve. The state dir carries a credential-looking segment so the
+/// tests can see M7 redaction applied. Idempotent: every caller
+/// installs the same value, so test order doesn't matter.
+fn install_test_daemon_config() {
+    use oxidhome_core::api::mcp::{DaemonConfig, DaemonMode, install_daemon_config};
+    use oxidhome_core::state::EventLogRetention;
+
+    let addr = "127.0.0.1:7780".parse().expect("addr");
+    let _ = install_daemon_config(
+        DaemonConfig::resolve(
+            DaemonMode::Http,
+            std::path::Path::new("/srv/password=hunter2/state"),
+            &EventLogRetention::default(),
+        )
+        .with_listener(addr, addr),
+    );
+}
+
+fn assert_config_body(body: &Value) {
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["sdk_version"], oxidhome_core::OXIDHOME_SDK_VERSION);
+    assert_eq!(
+        body["wit_version"],
+        oxidhome_core::runtime::contract::host_contract_version()
+    );
+    let daemon = &body["daemon"];
+    assert_eq!(daemon["mode"], "http");
+    assert_eq!(daemon["listen_addr"], "127.0.0.1:7780");
+    assert_eq!(daemon["bind"]["value"], "127.0.0.1:7780");
+    assert_eq!(daemon["bind"]["env"], "OXIDHOME_BIND");
+    assert!(
+        matches!(daemon["bind"]["source"].as_str(), Some("default" | "env")),
+        "bind source must be default/env; got {}",
+        daemon["bind"],
+    );
+    let state_dir = daemon["state_dir"]["value"].as_str().expect("state_dir");
+    assert!(
+        state_dir.starts_with("/srv/"),
+        "path stays readable: {state_dir}"
+    );
+    assert!(
+        !state_dir.contains("hunter2"),
+        "credential-looking path segment must be redacted: {state_dir}",
+    );
+    assert_eq!(
+        daemon["event_log_retention"]["max_rows"]["env"],
+        "OXIDHOME_EVENT_LOG_MAX_ROWS"
+    );
+    assert_eq!(daemon["log_filter"]["env"], "RUST_LOG");
+    assert_eq!(body["mcp"]["max_sessions"]["source"], "default");
+    assert!(body["mcp"]["rate_limit"]["per_bearer_burst"]["value"].is_u64());
+}
+
+/// `oxidhome://config` returns the installed daemon snapshot with
+/// sources, the build/contract versions and the MCP limits, redacted,
+/// and records one `mcp.resource.config` audit row.
+#[tokio::test(flavor = "current_thread")]
+async fn read_config_returns_redacted_snapshot() {
+    install_test_daemon_config();
+    let engine = Engine::new().expect("engine");
+    let audit = engine.audit_log();
+    let bearer = mint_bearer_with_scopes(&engine, "status-only", &["status:read"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://config"}),
+    )
+    .await;
+    let contents = &response["result"]["contents"][0];
+    assert_eq!(contents["mimeType"], "application/json", "got {response}");
+    let body: Value = serde_json::from_str(contents["text"].as_str().expect("text"))
+        .expect("config body decodes as JSON");
+    assert_config_body(&body);
+
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 256))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    assert!(
+        rows.iter()
+            .any(|r| r.path == "mcp.resource.config" && r.status == 200),
+        "missing mcp.resource.config audit row",
+    );
+}
+
+/// `oxidhome://config` shares `status:read`; any other scope is denied.
+#[tokio::test(flavor = "current_thread")]
+async fn config_resource_requires_status_read_scope() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read", "plugins:list"]);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://config"}),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32001,
+        "config must require status:read; got {response}",
+    );
+}
+
+/// REST parity: `GET /api/v1/config` serves the same redacted body
+/// under the same scope.
+#[tokio::test(flavor = "current_thread")]
+async fn rest_config_matches_mcp_gate_and_body() {
+    install_test_daemon_config();
+    let engine = Engine::new().expect("engine");
+    let allowed = mint_bearer_with_scopes(&engine, "status-only", &["status:read"]);
+    let denied = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let router = build_router(engine);
+
+    let get = |bearer: &str| {
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/config")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .expect("request")
+    };
+    let response = router.clone().oneshot(get(&denied)).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = router.oneshot(get(&allowed)).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("config body is JSON");
+    assert_config_body(&body);
 }
 
 /// A malformed blobs URI (missing the `<name>` half) surfaces

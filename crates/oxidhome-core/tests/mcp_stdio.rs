@@ -108,7 +108,7 @@ async fn stdio_handshake_and_resources_list() {
         .iter()
         .map(|r| r["name"].as_str().unwrap())
         .collect();
-    for expected in ["devices", "plugins", "events", "logs", "status"] {
+    for expected in ["devices", "plugins", "events", "logs", "status", "config"] {
         assert!(
             names.contains(&expected),
             "resources/list must include `{expected}`; got {names:?}",

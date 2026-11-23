@@ -64,7 +64,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use oxidhome_core::Engine;
-use oxidhome_core::api::mcp::serve_stdio;
+use oxidhome_core::api::mcp::{
+    DaemonConfig, DaemonMode, ENV_BIND, ENV_STATE_DIR, install_daemon_config, serve_stdio,
+};
 use oxidhome_core::api::{
     ApiConfig, RevokeScope, bind, ensure_admin_token, reconcile_admin_token_files,
     recover_admin_token_offline, serve,
@@ -241,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding the API listener at {bind_addr}"))?;
     let actual = listener.local_addr()?;
     tracing::info!(addr = %actual, "oxidhome API listening");
+    publish_http_config(&state_dir, &retention, bind_addr, actual);
     let event_log_retention = spawn_event_log_retention(&engine, retention);
 
     // Serve until a shutdown signal arrives. `serve` returning
@@ -338,6 +341,23 @@ async fn main() -> anyhow::Result<()> {
         return Err(err);
     }
     Ok(())
+}
+
+/// `oxidhome://config` / `GET /api/v1/config`: publish what the HTTP
+/// daemon resolved, before the first request can ask. The dev-time
+/// plugin directory is argv\[1\], the value `main` starts.
+fn publish_http_config(
+    state_dir: &std::path::Path,
+    retention: &EventLogRetention,
+    configured: SocketAddr,
+    bound: SocketAddr,
+) {
+    let mut config = DaemonConfig::resolve(DaemonMode::Http, state_dir, retention)
+        .with_listener(configured, bound);
+    if let Some(dir) = std::env::args_os().nth(1) {
+        config = config.with_dev_plugin_dir(std::path::Path::new(&dir));
+    }
+    install_daemon_config(config);
 }
 
 /// H4 / M6 follow-up: periodic event-log retention (age and row
@@ -538,7 +558,7 @@ fn run_restore() -> anyhow::Result<()> {
 }
 
 fn resolve_state_dir() -> anyhow::Result<PathBuf> {
-    if let Some(env_dir) = std::env::var_os("OXIDHOME_STATE_DIR") {
+    if let Some(env_dir) = std::env::var_os(ENV_STATE_DIR) {
         return Ok(PathBuf::from(env_dir));
     }
     let cwd = std::env::current_dir().context("reading current working directory")?;
@@ -546,7 +566,7 @@ fn resolve_state_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn resolve_bind_addr() -> anyhow::Result<SocketAddr> {
-    let raw = std::env::var("OXIDHOME_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    let raw = std::env::var(ENV_BIND).unwrap_or_else(|_| DEFAULT_BIND.to_string());
     raw.parse::<SocketAddr>()
         .with_context(|| format!("parsing $OXIDHOME_BIND ({raw:?}) as a socket address"))
 }
@@ -674,6 +694,11 @@ async fn run_stdio() -> anyhow::Result<()> {
         .with(engine.log_store().layer())
         .try_init();
 
+    install_daemon_config(DaemonConfig::resolve(
+        DaemonMode::McpStdio,
+        &state_dir,
+        &retention,
+    ));
     let event_log_retention = spawn_event_log_retention(&engine, retention);
     tracing::info!(
         state_dir = %state_dir.display(),

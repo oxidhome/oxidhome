@@ -12,7 +12,7 @@
 //! - [`list_resources`] — the fixed-URI catalog
 //!   (`oxidhome://devices`, `oxidhome://plugins`,
 //!   `oxidhome://events`, `oxidhome://logs`,
-//!   `oxidhome://status`).
+//!   `oxidhome://status`, `oxidhome://config`).
 //! - [`list_resource_templates`] — parametric families
 //!   (`oxidhome://devices/{device_id}`,
 //!   `oxidhome://plugins/{plugin_id}`,
@@ -34,7 +34,8 @@
 //! [`AuditLog::record_completed`] row with
 //! `path = "mcp.resource.<name>"`. The `<name>` is the resource
 //! family (`devices`, `devices.detail`, `plugins`,
-//! `plugins.detail`, `events`, `logs`), NOT the concrete URI —
+//! `plugins.detail`, `events`, `logs`, `status`, `config`,
+//! `blobs`), NOT the concrete URI —
 //! a device id can appear thousands of times in log-tail
 //! traffic and a per-URI path would make the audit index churn
 //! without adding forensic value (the resolved URI is already
@@ -171,6 +172,18 @@ pub(super) fn list_resources() -> Vec<Resource> {
                  MCP-agent-friendly equivalent with a broader body.",
             )
             .with_mime_type("application/json"),
+        Resource::new("oxidhome://config", "config")
+            .with_title("Host configuration")
+            .with_description(
+                "JSON snapshot of the daemon's effective configuration: run mode, state \
+                 directory, listen address, event-log retention, stdout log filter and the \
+                 MCP mount's limits. Each setting is `{value, source, env?}` where `source` \
+                 is `default`, `env` or `flag` and `env` names the overriding variable. \
+                 Also carries `version`, `sdk_version`, `min_supported_sdk_version` and \
+                 `wit_version`. No secrets; per-instance plugin config is on \
+                 `oxidhome://plugins/{id}`. Mirrors `GET /api/v1/config`.",
+            )
+            .with_mime_type("application/json"),
     ]
 }
 
@@ -225,7 +238,7 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
 /// tracing tag ([Phase 14.7c]) without re-parsing the URI.
 /// Family is a small closed set (`devices`, `devices.detail`,
 /// `plugins`, `plugins.detail`, `events`, `logs`, `status`,
-/// `blobs`, `unknown`); the URI itself is caller-controlled
+/// `config`, `blobs`, `unknown`); the URI itself is caller-controlled
 /// and unbounded (blob names, device ids, query strings) and
 /// must never appear in a dashboard label.
 pub(super) struct ReadDispatch {
@@ -529,6 +542,7 @@ enum Kind<'a> {
     Events,
     Logs,
     Status,
+    Config,
     /// `(instance_id, name)`. Both segments are already validated
     /// by the routing match — non-empty and, for `instance_id`,
     /// slash-free. `name` may contain further path segments; the
@@ -639,6 +653,15 @@ fn resolve_route(uri: &str) -> Route<'_> {
             required: STATUS_READ,
             kind: Kind::Status,
         },
+        // Host configuration: operational metadata next to
+        // `status` (versions, paths, listen address, limits), no
+        // secrets, so it shares `status:read` rather than minting
+        // a new scope.
+        ("config", None) => Route::Dispatch {
+            family: "config",
+            required: STATUS_READ,
+            kind: Kind::Config,
+        },
         // Blobs URI: `oxidhome://blobs/<instance_id>/<name>`.
         // Split the tail on the *first* `/` — instance ids are
         // slash-free (validated by the blob store's
@@ -717,6 +740,7 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         Kind::Events => events_read(engine, query_str, can_read_blobs(actor)).await,
         Kind::Logs => logs_read(engine, query_str).await,
         Kind::Status => status_read(engine.clone()).await,
+        Kind::Config => encode(&super::config::config_body(), "config"),
         // Blob reads also hit `SQLite` (the blob index) plus
         // a filesystem `read()`, so run under `spawn_blocking`
         // like the events / logs paths.
@@ -2023,7 +2047,7 @@ fn clamp_limit(query: &HashMap<String, String>, default: u32, max: u32) -> Resul
 /// past 8 MiB and force [`crate::api::mcp::server::PermitBody`]
 /// to truncate a response that had already been audited as
 /// a success.
-const MAX_TEXT_BODY_BYTES: usize = 3_670_016; // 3.5 * 1024 * 1024
+pub(super) const MAX_TEXT_BODY_BYTES: usize = 3_670_016; // 3.5 * 1024 * 1024
 
 /// Pre-serialization ceiling for **blob** resource bodies —
 /// the base64-encoded string we hand to rmcp as the

@@ -48,6 +48,7 @@ share one axum listener, so a household hub only exposes one endpoint.
 | Resource | `oxidhome://logs` | `logs:read` | Structured logs with `since`/`level`/`plugin`/… filters. |
 | Resource | `oxidhome://plugins` [+ `/{id}`] | `plugins:list` | Installed + running plugins; per-plugin detail. |
 | Resource | `oxidhome://status` | `status:read` | Version, uptime, DB ping, counts. |
+| Resource | `oxidhome://config` | `status:read` | Daemon's effective configuration (state dir, listen address, retention, log filter, MCP limits), each value tagged with its source (`default` / `env` / `flag`), plus build, SDK and WIT versions. No secrets. REST: `GET /api/v1/config`. |
 | Resource | `oxidhome://blobs/{instance}/{name}` | `blobs:read` | Base64-encoded blob store entries. `blobs:read` also unlocks raw `bytes-val` fields in events, device state, and command results on every surface; without it they come back as a `json-val` "withheld" marker. |
 | Tool | `device.send_command` | `devices:command` | Dispatch a capability command; sensitive. |
 | Tool | `logs.query` | `logs:read` | Tool-shape of `oxidhome://logs`. |
