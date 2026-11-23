@@ -563,7 +563,7 @@ async fn close_device_state(engine: &oxidhome_core::Engine) {
     let flush = tokio::task::spawn_blocking(move || engine.close_device_state());
     match tokio::time::timeout(SHUTDOWN_DEVICE_STATE_DEADLINE, flush).await {
         Ok(Ok(true)) => {}
-        Ok(Ok(false)) | Ok(Err(_)) => {
+        Ok(Ok(false) | Err(_)) => {
             tracing::warn!("device-state projection: final flush failed");
         }
         Err(_) => tracing::warn!("device-state projection: final flush exceeded its deadline"),

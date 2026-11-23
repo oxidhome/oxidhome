@@ -538,6 +538,7 @@ pub fn effective_capabilities(
         consumes_services: granted.consumes_services.clone(),
         subscribes_events: requested.subscribes_events && granted.subscribes_events,
         script_sandboxes: requested.script_sandboxes.min(granted.script_sandboxes),
+        reads_state: intersect_by_eq(&requested.reads_state, &granted.reads_state),
     }
 }
 

@@ -498,8 +498,7 @@ impl DeviceStateSnapshot {
         Self {
             device_id: caps
                 .first()
-                .map(|c| c.device_id.clone())
-                .unwrap_or_default(),
+                .map_or_else(String::new, |c| c.device_id.clone()),
             epoch: epoch.to_owned(),
             revision,
             capabilities: caps

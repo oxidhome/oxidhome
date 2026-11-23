@@ -6360,6 +6360,7 @@ async fn connect_device_state_scope_deny_returns_permission_denied() {
 /// H2: the Connect state RPCs mirror the REST state endpoints,
 /// including M7 bytes withholding without `blobs:read`.
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn connect_device_state_rpcs_mirror_rest() {
     use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
 

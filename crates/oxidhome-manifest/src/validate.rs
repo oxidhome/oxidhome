@@ -83,6 +83,22 @@ pub enum ValidationError {
     },
 
     #[error(
+        "capabilities.reads_state has {count} entries; the cap is {max}. \
+         Use `\"*\"` selectors instead of enumerating past the cap."
+    )]
+    TooManyReadsStateGrants { count: usize, max: usize },
+
+    #[error(
+        "capabilities.reads_state[{index}] lists {count} capabilities or devices; \
+         the cap is {max}. Use `[\"*\"]` instead."
+    )]
+    ReadsStateGrantTooLong {
+        index: usize,
+        count: usize,
+        max: usize,
+    },
+
+    #[error(
         "plugin.keywords has {count} entries; the cap is {max}. Trim the list — \
          beyond that it's harder to skim than the plugin's name and description."
     )]
@@ -359,6 +375,11 @@ pub const MAX_SCRIPT_SANDBOXES: u32 = 64;
 /// picks a handful).
 pub const MAX_DECLARES_DEVICES: usize = 64;
 
+/// H2: hard cap on `[[capabilities.reads_state]]` entries, and on
+/// each entry's `capabilities` / `devices` lists. Every state read
+/// checks the grants once per entry, so the caps bound that work.
+pub const MAX_READS_STATE_GRANTS: usize = 64;
+
 /// H10 round-4: hard cap on a single grant's `commands` list.
 /// A grant that wants "every command" uses `["*"]` — the cap
 /// bounds enumerated lists.
@@ -446,6 +467,22 @@ pub fn check_capability_limits(
             count: caps.script_sandboxes,
             max: MAX_SCRIPT_SANDBOXES,
         });
+    }
+    if caps.reads_state.len() > MAX_READS_STATE_GRANTS {
+        errors.push(ValidationError::TooManyReadsStateGrants {
+            count: caps.reads_state.len(),
+            max: MAX_READS_STATE_GRANTS,
+        });
+    }
+    for (index, grant) in caps.reads_state.iter().enumerate() {
+        let longest = grant.capabilities.len().max(grant.devices.len());
+        if longest > MAX_READS_STATE_GRANTS {
+            errors.push(ValidationError::ReadsStateGrantTooLong {
+                index,
+                count: longest,
+                max: MAX_READS_STATE_GRANTS,
+            });
+        }
     }
     for (index, grant) in caps.consumes_services.iter().enumerate() {
         if grant.commands.len() > MAX_COMMANDS_PER_GRANT {

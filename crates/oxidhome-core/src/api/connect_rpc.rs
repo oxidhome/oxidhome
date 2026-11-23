@@ -493,8 +493,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .map(|caps| {
                 let id = caps
                     .first()
-                    .map(|c| c.device_id.clone())
-                    .unwrap_or_default();
+                    .map_or_else(String::new, |c| c.device_id.clone());
                 device_snapshot_to_proto(id, caps, &page.epoch, revision, blobs)
             })
             .collect();

@@ -23,6 +23,7 @@ mod registry;
 pub mod sandbox;
 mod schema;
 mod state;
+mod state_read;
 pub(crate) mod watchdog;
 
 pub use command::{CommandOutcome, CommandReport, PendingCommands};
@@ -1302,6 +1303,7 @@ impl Engine {
     /// stop its flusher. Called once at shutdown, after every
     /// supervised instance has stopped (so their stale flips are
     /// included). Blocking; returns whether the final write succeeded.
+    #[must_use]
     pub fn close_device_state(&self) -> bool {
         self.device_state.close_persistence()
     }

@@ -65,6 +65,14 @@ pub fn grant_excess(requested: &CapabilitiesSection, granted: &CapabilitiesSecti
             granted.script_sandboxes, requested.script_sandboxes
         ));
     }
+    for (index, grant) in granted.reads_state.iter().enumerate() {
+        if !requested.reads_state.contains(grant) {
+            excess.push(format!(
+                "reads_state[{index}] ({}) is not requested",
+                grant.plugin
+            ));
+        }
+    }
     excess
 }
 
@@ -117,7 +125,26 @@ mod tests {
             consumes_services: vec![svc("*", &["get", "increment"], "*")],
             subscribes_events: true,
             script_sandboxes: 2,
+            reads_state: vec![oxidhome_manifest::StateGrant {
+                plugin: "*".into(),
+                capabilities: vec!["switch".into()],
+                devices: vec!["*".into()],
+                bytes: false,
+            }],
         }
+    }
+
+    #[test]
+    fn reads_state_grant_must_be_requested() {
+        let req = requested();
+        let mut wider = req.clone();
+        wider.reads_state[0].bytes = true;
+        let excess = grant_excess(&req, &wider);
+        assert_eq!(excess.len(), 1, "{excess:?}");
+        assert!(excess[0].contains("reads_state[0]"));
+        let mut none = req.clone();
+        none.reads_state.clear();
+        assert_eq!(grant_excess(&req, &none), Vec::<String>::new());
     }
 
     #[test]

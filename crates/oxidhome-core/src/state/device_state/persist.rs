@@ -339,7 +339,7 @@ impl DeviceStateStore {
         match result {
             Ok(()) => Ok(true),
             Err(err) => {
-                self.requeue(batch);
+                self.requeue(&batch);
                 Err(FlushError(err.to_string()))
             }
         }
@@ -377,7 +377,7 @@ impl DeviceStateStore {
         })
     }
 
-    fn requeue(&self, batch: FlushBatch) {
+    fn requeue(&self, batch: &FlushBatch) {
         let mut inner = self.inner_write();
         let Some(dirty) = inner.dirty.as_mut() else {
             return;

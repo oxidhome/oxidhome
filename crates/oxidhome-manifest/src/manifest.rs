@@ -193,6 +193,69 @@ pub struct CapabilitiesSection {
     /// [`crate::validate::MAX_SCRIPT_SANDBOXES`].
     #[serde(default)]
     pub script_sandboxes: u32,
+    /// H2: which entries of the host-owned device-state projection the
+    /// plugin may read through `host-state::get-state` /
+    /// `list-state`, beyond its own devices (always readable). Empty
+    /// / absent ⇒ every read of another instance's device is refused
+    /// (`get-state` returns `permission-denied`, `list-state` leaves
+    /// it out). See [`StateGrant`]. The effective grant is the
+    /// requested ∩ granted lists (equal entries), capped at
+    /// [`crate::validate::MAX_READS_STATE_GRANTS`].
+    #[serde(default)]
+    pub reads_state: Vec<StateGrant>,
+}
+
+/// H2: one selector inside `[capabilities] reads_state`.
+///
+/// ```toml
+/// [[capabilities.reads_state]]
+/// plugin       = "example.simulated-switch"  # owner plugin id, or "*"
+/// capabilities = ["switch"]                  # capability keys, or ["*"]
+/// devices      = ["*"]                       # device ids, or ["*"] (default)
+/// bytes        = false                       # see `bytes-val` fields (default false)
+/// ```
+///
+/// An entry is readable when some grant matches its owner plugin,
+/// its capability and its device id. Without `bytes = true` on a
+/// matching grant, every `bytes-val` field is replaced by a
+/// `json-val` marker `{"withheld":"bytes","size_bytes":N,
+/// "required_scope":"reads_state.bytes"}`, the same shape the API
+/// uses for M7. Empty `capabilities` or `devices` authorizes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateGrant {
+    /// Owner `plugin.id`, or `"*"` for any plugin.
+    pub plugin: String,
+    /// Capability keys (`"switch"`, `"extension(com.acme/shade@1)"`),
+    /// or a list containing `"*"`.
+    pub capabilities: Vec<String>,
+    /// Host-minted device ids, or a list containing `"*"` (default).
+    /// Device ids are only known after registration, so this is the
+    /// operator's narrowing axis in the granted copy.
+    #[serde(default = "any_list")]
+    pub devices: Vec<String>,
+    /// Whether `bytes-val` fields are returned as is.
+    #[serde(default)]
+    pub bytes: bool,
+}
+
+fn any_list() -> Vec<String> {
+    vec![StateGrant::ANY.into()]
+}
+
+impl StateGrant {
+    /// Wildcard selector value.
+    pub const ANY: &'static str = "*";
+
+    /// Whether this grant covers an entry of `capability` on `device`
+    /// owned by `owner_plugin`.
+    #[must_use]
+    pub fn matches(&self, owner_plugin: &str, device: &str, capability: &str) -> bool {
+        let any_of = |list: &[String], v: &str| list.iter().any(|x| x == Self::ANY || x == v);
+        (self.plugin == Self::ANY || self.plugin == owner_plugin)
+            && any_of(&self.capabilities, capability)
+            && any_of(&self.devices, device)
+    }
 }
 
 /// H10: one resource selector inside `[capabilities] consumes_services`.
