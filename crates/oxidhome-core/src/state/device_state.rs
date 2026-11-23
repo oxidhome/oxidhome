@@ -803,7 +803,9 @@ impl DeviceStateStore {
     ) -> (String, u64, Vec<Arc<DeviceState>>) {
         let inner = self.inner_read();
         let start = match after_device_id {
-            Some(cursor) => Bound::Excluded((cursor.to_string(), MAX_CAP_SENTINEL.to_string())),
+            // `cursor + "\0"` is the smallest id above `cursor`, so one
+            // seek skips every capability of the cursor device.
+            Some(cursor) => Bound::Included((format!("{cursor}\0"), String::new())),
             None => Bound::Unbounded,
         };
         let mut entries: Vec<Arc<DeviceState>> = Vec::new();
@@ -858,7 +860,9 @@ impl DeviceStateStore {
     ) -> CappedPage {
         let inner = self.inner_read();
         let start = match after_device_id {
-            Some(cursor) => Bound::Excluded((cursor.to_string(), MAX_CAP_SENTINEL.to_string())),
+            // `cursor + "\0"` is the smallest id above `cursor`, so one
+            // seek skips every capability of the cursor device.
+            Some(cursor) => Bound::Included((format!("{cursor}\0"), String::new())),
             None => Bound::Unbounded,
         };
         let mut devices: Vec<Vec<Arc<DeviceState>>> = Vec::new();
@@ -885,9 +889,8 @@ impl DeviceStateStore {
             *pending_bytes = 0;
             true
         };
-        // Seek past the cursor device by id, not only by the sentinel
-        // capability: a capability sorting after the sentinel must not
-        // put the cursor device on the next page again.
+        // `start` already lies past the cursor device; the filter is a
+        // guard, never a scan.
         for (scanned, ((did, _cap), entry)) in inner
             .entries
             .range((start, Bound::Unbounded))
@@ -2225,15 +2228,6 @@ fn value_wire_bound(
         Value::BytesVal(_) => WITHHELD_WIRE_BYTES,
     }
 }
-
-/// H9 round-12 finding 2: sentinel string that sorts strictly
-/// after every real capability name. Bytes are `F4 8F BF BF`
-/// (`\u{10FFFF}` in UTF-8), higher than any lowercase-ASCII
-/// capability name (`switch`, `dimmer`, `sensor`, …), so
-/// `Bound::Excluded((cursor, MAX_CAP_SENTINEL.to_string()))`
-/// skips every entry whose `device_id == cursor` — exactly
-/// what "`device_id` > cursor" pagination needs.
-const MAX_CAP_SENTINEL: &str = "\u{10FFFF}";
 
 /// H9 round-6 finding 2: total-Stale-entries cap, enforced by
 /// `DeviceStateStore::stale_where_locked` via LRU eviction on

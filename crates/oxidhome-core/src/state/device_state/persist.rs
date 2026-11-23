@@ -1134,6 +1134,17 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
                 "skipped undecodable device-state rows",
             );
         }
+        if meta.is_none() && out.len() + skipped > 0 {
+            // Rows without their meta row: the revision and watermark
+            // are lost, so recover as from damage (gap + watermark)
+            // instead of taking the first-boot path.
+            damaged = true;
+            tracing::warn!(
+                target: "device_state.persist",
+                rows = out.len() + skipped,
+                "device-state rows without a meta row",
+            );
+        }
         if let (Some(m), Some(marker)) = (meta.as_mut(), marker) {
             let total = u64::try_from(out.len() + skipped).unwrap_or(u64::MAX);
             m.consistent = marker_matches(m, &marker, total);
@@ -1522,6 +1533,25 @@ mod tests {
                 .deltas_since_with_revision(recovered_cursor, 10)
                 .reset_required
         );
+        assert!(store.close_persistence());
+    }
+
+    /// Rows without a meta row are recovered like damage: an old
+    /// cursor resets instead of matching a renumbered slot.
+    #[test]
+    fn rows_without_a_meta_row_reset_old_cursors() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        assert!(store.close_persistence());
+        let cursor = store.current_revision() + 1;
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| c.execute("DELETE FROM device_state_meta", []))
+            .expect("drop meta");
+        drop(db);
+        let store = open(&dir);
+        assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
         assert!(store.close_persistence());
     }
 
