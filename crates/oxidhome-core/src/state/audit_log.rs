@@ -501,9 +501,35 @@ impl AuditLog {
     ///
     /// Forwards any `rusqlite` error.
     pub fn record_completed(&self, entry: &AuditEntry) -> Result<u64, AuditLogError> {
+        self.insert_completed(entry, false)
+    }
+
+    /// [`Self::record_completed`] committed at `synchronous = FULL`:
+    /// for a row that must survive power loss once the action it
+    /// records has happened (H6 slice 2: a sensitive command's `warn`
+    /// row).
+    ///
+    /// # Errors
+    ///
+    /// Forwards any `rusqlite` error.
+    pub fn record_completed_durable(&self, entry: &AuditEntry) -> Result<u64, AuditLogError> {
+        self.insert_completed(entry, true)
+    }
+
+    fn insert_completed(&self, entry: &AuditEntry, durable: bool) -> Result<u64, AuditLogError> {
         let now = now_unix_ms();
         let id = self.db.write(|conn| -> Result<i64, AuditLogError> {
-            Self::insert_completed_row(conn, now, entry)
+            if durable {
+                conn.pragma_update(None, "synchronous", "FULL")?;
+            }
+            let result = Self::insert_completed_row(conn, now, entry);
+            if durable && let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                tracing::warn!(
+                    error = %err,
+                    "failed to restore synchronous = NORMAL after durable audit row",
+                );
+            }
+            result
         })?;
         #[allow(clippy::cast_sign_loss)]
         Ok(id as u64)

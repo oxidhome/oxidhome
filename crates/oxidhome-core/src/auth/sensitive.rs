@@ -235,7 +235,13 @@ impl SensitiveGuard {
             command_outcome: None,
             level: Some(AUDIT_LEVEL_WARN.to_owned()),
         };
-        self.audit.record_completed(&entry)
+        // A command's row commits durably before the command runs:
+        // a lock that moved must not lose its record to a power cut.
+        if action == Action::DeviceCommand {
+            self.audit.record_completed_durable(&entry)
+        } else {
+            self.audit.record_completed(&entry)
+        }
     }
 }
 

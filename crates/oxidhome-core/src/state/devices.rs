@@ -191,6 +191,17 @@ impl DeviceRegistry {
         }
     }
 
+    /// The class of `id` with `row` (rather than the stored row) on
+    /// top of its derived class: for reporting a write's result
+    /// without a second, racing read of the override.
+    #[must_use]
+    pub fn class_with(&self, id: &str, row: &super::DeviceMetaRow) -> DeviceClass {
+        let derived = self.read().get(id).map_or_else(DeviceClass::other, |m| {
+            DeviceClass::derive(&m.info.capabilities)
+        });
+        row.apply(derived)
+    }
+
     /// The authorization resource for device `id`, with its class.
     #[must_use]
     pub fn resource(&self, id: &str) -> Resource {
@@ -289,9 +300,13 @@ impl DeviceRegistry {
         // Unchecked path (tests and embedders; plugins go through
         // `try_register`). A refused floor write fails closed: the
         // device is not registered (and so can't be commanded or
-        // read), the error is logged, and the id is still returned.
+        // read; an earlier registration of the same id is dropped),
+        // the error is logged, and the id is still returned.
         if let Err(err) = self.observe(&id, &owner_instance, &info) {
             tracing::error!(target: "auth.device_meta", device_id = %id, ?err, "floor not recorded; device not registered");
+            // A re-registration must not leave the previous entry
+            // commandable under its old class.
+            self.write().remove(&id);
             return id;
         }
         let meta = Arc::new(DeviceMeta {
@@ -737,5 +752,29 @@ mod tests {
         let reopened =
             DeviceRegistry::with_meta(Arc::new(DeviceMetaStore::open(db).expect("reopen")));
         assert!(reopened.instance_is_camera("inst"), "offline, from the row");
+    }
+
+    /// A re-registration whose floor can't be recorded drops the old
+    /// entry instead of leaving it commandable under its old class.
+    #[test]
+    fn refused_reregistration_fails_closed() {
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::CapabilitySpec;
+        let reg = DeviceRegistry::new();
+        let mut lamp = empty_info();
+        lamp.local_id = "lamp".into();
+        let id = reg.register("u", "inst".into(), lamp.clone());
+        // Fill the instance's floor rows with other sensitive ids.
+        for i in 0..super::super::device_meta::MAX_FLOOR_ROWS_PER_INSTANCE {
+            reg.meta()
+                .observe(
+                    &format!("dev-{i:016x}"),
+                    "inst",
+                    DeviceClass::derive(&[CapabilitySpec::Lock]),
+                )
+                .expect("room");
+        }
+        lamp.capabilities = vec![CapabilitySpec::Lock];
+        assert_eq!(reg.register("u", "inst".into(), lamp), id);
+        assert!(reg.get_any(&id).is_none(), "old switch entry dropped");
     }
 }

@@ -582,7 +582,9 @@ async fn set_device_category(
         category = category.map_or("(cleared)", crate::auth::DeviceCategory::as_str),
         "device category override changed",
     );
-    let class = state.engine.devices().class_of(&device_id);
+    // From the row this request stored, so the response can't mix
+    // its override with a concurrent request's.
+    let class = state.engine.devices().class_with(&device_id, &stored);
     Ok(Json(CategoryResponse {
         device_id,
         category_override: stored

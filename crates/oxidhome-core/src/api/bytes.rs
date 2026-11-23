@@ -260,6 +260,26 @@ mod tests {
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
     }
 
+    /// An open gate (a tail) sees an instance become a camera source:
+    /// the next byte value from a sibling device is withheld.
+    #[tokio::test]
+    async fn an_open_gate_follows_a_new_camera() {
+        let engine = Engine::new().expect("engine");
+        let bell =
+            engine
+                .devices()
+                .register("u", "inst".into(), info("b", vec![CapabilitySpec::Button]));
+        let gate = BytesGate::new(&ctx(&["*"], vec![]), &engine);
+        assert!(gate.allows(Some(&bell), None));
+        engine.devices().register(
+            "u",
+            "inst".into(),
+            info("c", vec![CapabilitySpec::VideoStream]),
+        );
+        assert!(!gate.allows(Some(&bell), None));
+        assert!(!gate.allows(None, Some("inst")));
+    }
+
     #[tokio::test]
     async fn camera_bytes_follow_the_decision() {
         let engine = Engine::new().expect("engine");

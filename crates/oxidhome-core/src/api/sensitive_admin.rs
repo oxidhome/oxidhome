@@ -141,6 +141,12 @@ fn live_policy(tokens: &TokenStore, token_id: &str) -> anyhow::Result<TokenPolic
         .context("reading the token")?
         .filter(|r| r.revoked_ms.is_none())
         .ok_or_else(|| anyhow::anyhow!("no live token `{token_id}`"))?;
+    if rec.owner {
+        anyhow::bail!(
+            "token `{token_id}` is the owner token: it holds every sensitive category and its \
+             grants can't be edited; rotate it with `oxidhome recover-admin-token`"
+        );
+    }
     parse_policy(&rec.scope_json).ok_or_else(|| {
         anyhow::anyhow!(
             "token `{token_id}` has a policy the host can't parse (it is treated as deny-all); \
@@ -388,6 +394,21 @@ mod tests {
             rows.iter()
                 .any(|r| r.path == "cli.auth.grant_sensitive:lock")
         );
+    }
+
+    /// The owner's grants aren't editable: it holds every category.
+    #[test]
+    fn owner_grants_are_refused_before_any_audit_row() {
+        let (tokens, audit) = stores();
+        let owner = TokenStore::generate();
+        assert!(
+            tokens
+                .insert_owner_if_empty(&owner, "admin", br#"["*"]"#)
+                .unwrap()
+        );
+        assert!(grant_sensitive(&tokens, &audit, &owner.id, SensitiveCategory::Lock, &[]).is_err());
+        assert!(revoke_sensitive(&tokens, &audit, &owner.id, SensitiveCategory::Lock).is_err());
+        assert_eq!(audit.query(&AuditQuery::default(), 10).unwrap().len(), 0);
     }
 
     #[test]

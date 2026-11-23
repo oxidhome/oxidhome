@@ -28,7 +28,12 @@ impl Bucket {
             .saturating_duration_since(self.last_observed)
             .as_secs_f64();
         self.tokens = (self.tokens + elapsed * refill_per_second).min(capacity);
-        self.last_observed = now;
+        // Monotonic: a caller that sampled `now` before taking the
+        // lock may arrive after a later sample; moving the stamp back
+        // would credit the same interval twice.
+        if now > self.last_observed {
+            self.last_observed = now;
+        }
     }
 
     /// Seconds until one token is available, at least 1. Meaningful
@@ -61,6 +66,23 @@ impl Bucket {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// An out-of-order sample neither refills nor moves the stamp back.
+    #[test]
+    fn refill_is_monotonic() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(10);
+        let mut b = Bucket {
+            tokens: 0.0,
+            last_observed: t0,
+        };
+        b.refill(t1, 10.0, 0.1);
+        assert!((b.tokens - 1.0).abs() < 1e-9);
+        b.refill(t0, 10.0, 0.1);
+        assert_eq!(b.last_observed, t1);
+        b.refill(t1, 10.0, 0.1);
+        assert!((b.tokens - 1.0).abs() < 1e-9, "no double credit");
+    }
 
     #[test]
     fn drains_then_refills() {
