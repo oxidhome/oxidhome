@@ -138,7 +138,8 @@ impl Device {
 
     /// An `alarm-panel` arming `modes` (1 to 8; sensitive, like
     /// [`Self::lock`]). Commands by convention: `arm` with a `mode`
-    /// arg, `disarm`, plus a `code` arg when `code_required`.
+    /// arg, `disarm`, plus a `pin` arg when `code_required` (named
+    /// `pin` so host log redaction masks it).
     #[must_use]
     pub fn alarm_panel(
         self,

@@ -50,6 +50,9 @@ share one axum listener, so a household hub only exposes one endpoint.
   sensitive category only with `--allow-sensitive <category>`. The owner can
   raise a device's category with `PUT /api/v1/devices/{id}/category`
   (`{"category": "lock"}`) or offline with `oxidhome device set-category`.
+  **Upgrading:** this release adds the `lock`, `opener`, `alarm-panel` and
+  `siren` capability cases to the WIT contract, so device plugins must be
+  rebuilt against the new SDK and redeployed with the host.
 
 ### Surface at a glance
 

@@ -334,8 +334,9 @@ interface capabilities {
     /// `opener-state` case name) and optional float `position`.
     opener(opener-spec),
     /// An alarm panel. Commands: `arm` with a string `mode` (an
-    /// `alarm-mode` case name), `disarm`, and a string `code` argument
-    /// when the spec requires it. State field `state` (string: an
+    /// `alarm-mode` case name), `disarm`, and a string `pin` argument
+    /// when the spec requires it (named `pin` so the host's log
+    /// redaction masks it). State field `state` (string: an
     /// `alarm-state` case name).
     alarm-panel(alarm-panel-spec),
     /// A siren. Commands: `set` with a bool `state`, `toggle`. State

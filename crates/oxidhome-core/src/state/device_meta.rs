@@ -100,6 +100,9 @@ pub enum DeviceMetaError {
          start its plugin and set the category again"
     )]
     UnknownOwner(String),
+    /// A new row would pass [`MAX_FLOOR_ROWS_TOTAL`].
+    #[error("the host has {MAX_FLOOR_ROWS_TOTAL} devices on record; clear an override first")]
+    TooMany,
 }
 
 /// The `device_meta` table plus its in-memory copy. One per
@@ -354,6 +357,12 @@ impl DeviceMetaStore {
         }
         if category == Some(DeviceCategory::Camera) && owner.is_none() {
             return Err(DeviceMetaError::UnknownOwner(device_id.to_owned()));
+        }
+        {
+            let rows = self.rows.read().unwrap_or_else(PoisonError::into_inner);
+            if !rows.contains_key(device_id) && rows.len() >= MAX_FLOOR_ROWS_TOTAL {
+                return Err(DeviceMetaError::TooMany);
+            }
         }
         if let Some(db) = &self.db {
             durable_write(db, |conn| {

@@ -568,9 +568,8 @@ async fn set_device_category(
         .await
         .map_err(|_| CategoryError::Internal)?
         .map_err(|err| match err {
-            crate::state::DeviceMetaError::UnknownOwner(_) => {
-                CategoryError::BadRequest(err.to_string())
-            }
+            crate::state::DeviceMetaError::UnknownOwner(_)
+            | crate::state::DeviceMetaError::TooMany => CategoryError::BadRequest(err.to_string()),
             err => {
                 tracing::error!(target: "api.devices", error = %err, "storing a category override failed");
                 CategoryError::Internal

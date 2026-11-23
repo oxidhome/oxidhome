@@ -222,6 +222,22 @@ pub(crate) fn check_state_fields(
     capability: &str,
     fields: &[KeyValue],
 ) -> Result<(), String> {
+    // The typed sensitive capabilities: `state` keeps its documented
+    // shape on every update (partial deltas without it are fine).
+    let state_ok = |ok: &dyn Fn(&Value) -> bool, what: &str| -> Result<(), String> {
+        match fields.iter().find(|kv| kv.key == "state") {
+            Some(kv) if !ok(&kv.value) => Err(format!("{capability} `state` must be {what}")),
+            _ => Ok(()),
+        }
+    };
+    let one_of = |names: &'static [&'static str]| move |v: &Value| matches!(v, Value::StringVal(s) if names.contains(&s.as_str()));
+    match capability {
+        "lock" => state_ok(&one_of(LOCK_STATES), "a `lock-state` case name")?,
+        "opener" => state_ok(&one_of(OPENER_STATES), "an `opener-state` case name")?,
+        "alarm-panel" => state_ok(&one_of(ALARM_STATES), "an `alarm-state` case name")?,
+        "siren" => state_ok(&|v| matches!(v, Value::BoolVal(_)), "a bool")?,
+        _ => {}
+    }
     if capability == "opener" {
         let supports_position = opener_supports_position(info);
         for kv in fields.iter().filter(|kv| kv.key == "position") {
@@ -324,6 +340,20 @@ fn check_sensor_spec(spec: &SensorSpec) -> Result<(), String> {
 
 /// Most armed modes an `alarm-panel-spec` may list.
 pub(crate) const MAX_ALARM_MODES: usize = 8;
+
+/// Every projected lock / opener / alarm `state` string.
+const LOCK_STATES: &[&str] = &["locked", "unlocked", "locking", "unlocking", "jammed"];
+const OPENER_STATES: &[&str] = &["open", "closed", "opening", "closing", "stopped"];
+const ALARM_STATES: &[&str] = &[
+    "disarmed",
+    "armed-home",
+    "armed-away",
+    "armed-night",
+    "armed-vacation",
+    "arming",
+    "pending",
+    "triggered",
+];
 
 /// The projected `state` string of a lock: the WIT case name.
 pub(crate) fn lock_state_name(state: LockState) -> &'static str {
@@ -976,6 +1006,29 @@ mod tests {
         let with = info.clone();
         info.capabilities = vec![opener(false)];
         assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(0.5))).is_err());
+        // `state` keeps its documented shape on every update.
+        let st = |v: Value| {
+            vec![KeyValue {
+                key: "state".into(),
+                value: v,
+            }]
+        };
+        assert!(check_state_fields(&info, "lock", &st(Value::StringVal("jammed".into()))).is_ok());
+        assert!(check_state_fields(&info, "lock", &st(Value::BoolVal(true))).is_err());
+        assert!(check_state_fields(&info, "opener", &st(Value::StringVal("ajar".into()))).is_err());
+        assert!(
+            check_state_fields(
+                &info,
+                "alarm-panel",
+                &st(Value::StringVal("armed-away".into()))
+            )
+            .is_ok()
+        );
+        assert!(check_state_fields(&info, "siren", &st(Value::StringVal("on".into()))).is_err());
+        assert!(
+            check_state_fields(&info, "lock", &[]).is_ok(),
+            "partial delta"
+        );
         // Dropping the support invalidates the projected position.
         assert!(opener_position_dropped(&with, &info));
         assert!(!opener_position_dropped(&info, &with));

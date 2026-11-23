@@ -168,10 +168,17 @@ impl SensitiveGuard {
         if !decision.allow || sensitive.is_empty() {
             return Ok(());
         }
+        let principal = ctx.root().audit_token_id();
         if rate_limit.is_some() {
-            self.charge(ctx.root().audit_token_id(), sensitive)?;
+            self.charge(principal, sensitive)?;
         }
-        self.record(ctx, action, target, decision)?;
+        if let Err(err) = self.record(ctx, action, target, decision) {
+            // The action is refused; don't keep its charge.
+            if rate_limit.is_some() {
+                self.refund(principal, sensitive);
+            }
+            return Err(err.into());
+        }
         Ok(())
     }
 
