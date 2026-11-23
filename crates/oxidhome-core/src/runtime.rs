@@ -886,7 +886,9 @@ impl Engine {
         let plugin_id_for_spawn = plugin_id.clone();
         self.instances
             .register(instance_id, plugin_id.clone(), singleton, || {
-                let handle = crate::runtime::lifecycle::supervise_with_tuning_mode_and_pin(
+                // ADR-0001: registry-managed, so its reaper stops any
+                // sandboxes it starts.
+                let handle = lifecycle::spawn_supervisor(
                     engine_for_spawn,
                     plugin_dir_for_spawn,
                     instance_id_for_spawn.clone(),
@@ -895,6 +897,7 @@ impl Engine {
                     mode,
                     tuning,
                     pinned_manifest,
+                    lifecycle::SandboxSpawn::Parent,
                 );
                 self.spawn_tracked_reaper(&handle, instance_id_for_spawn, plugin_id, None);
                 handle

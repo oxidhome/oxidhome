@@ -6,7 +6,8 @@
 //! - **Manager** — the instance the operator starts. It registers the
 //!   `scripts` service with `load {id, source}` and `unload {id}`,
 //!   starts one sandbox per loaded script, and keeps the sources in KV
-//!   so its next life (or the next daemon start) re-creates them.
+//!   so its next life (or the next daemon start) re-creates them,
+//!   retrying on `tick` while a previous sandbox is still stopping.
 //! - **Script** — a sandbox the manager started. `init` reads the
 //!   script with `host::sandboxes::current()` and registers the
 //!   service `script` with one command per script line.
@@ -41,7 +42,10 @@ enum Action {
 }
 
 enum Role {
-    Manager,
+    /// `pending` holds saved scripts whose restore hit a transient
+    /// `unavailable` (a previous sandbox with that id still stopping);
+    /// `tick` retries them.
+    Manager { pending: BTreeMap<String, String> },
     Script {
         parent: String,
         commands: BTreeMap<String, Action>,
@@ -86,6 +90,19 @@ fn string_arg<'a>(args: &'a [KeyValue], name: &str) -> Option<&'a str> {
     })
 }
 
+/// Start every pending script; keep the ones refused as `unavailable`
+/// (retried on the next tick) and drop the rest.
+fn restore(pending: &mut BTreeMap<String, String>) {
+    pending.retain(|id, source| match host::sandboxes::start(id, source) {
+        Ok(_) => false,
+        Err(Error::Unavailable(_)) => true,
+        Err(e) => {
+            oxidhome_sdk::tracing::warn!(script = %id, error = ?e, "restoring script failed");
+            false
+        }
+    });
+}
+
 impl ScriptHost {
     fn init_manager(&mut self) -> Result<(), String> {
         host::register_service(
@@ -106,18 +123,16 @@ impl ScriptHost {
         .map_err(|e| format!("register-service failed: {e:?}"))?;
         // Re-adopt (after a manager crash) or re-create (after a daemon
         // restart) every script this instance had loaded.
-        let keys = host::storage::list_keys(KV_PREFIX).unwrap_or_default();
-        for key in keys {
-            let Some(id) = key.strip_prefix(KV_PREFIX) else {
-                continue;
-            };
-            if let Ok(Some(Value::StringVal(source))) = host::storage::get(&key)
-                && let Err(e) = host::sandboxes::start(id, &source)
+        let mut pending = BTreeMap::new();
+        for key in host::storage::list_keys(KV_PREFIX).unwrap_or_default() {
+            if let (Some(id), Ok(Some(Value::StringVal(source)))) =
+                (key.strip_prefix(KV_PREFIX), host::storage::get(&key))
             {
-                oxidhome_sdk::tracing::warn!(script = id, error = ?e, "re-starting script failed");
+                pending.insert(id.to_owned(), source);
             }
         }
-        self.role = Some(Role::Manager);
+        restore(&mut pending);
+        self.role = Some(Role::Manager { pending });
         Ok(())
     }
 
@@ -141,23 +156,41 @@ impl ScriptHost {
         };
         let key = format!("{KV_PREFIX}{id}");
         match command {
+            // Save first, so a script that is running is always one the
+            // next life restores; undo the save if the start is refused.
             "load" => {
                 let source = string_arg(args, "source").unwrap_or_default();
+                let previous = match host::storage::get(&key) {
+                    Ok(previous) => previous,
+                    Err(e) => return CommandResult::Err(e),
+                };
+                if let Err(e) = host::storage::set(&key, &Value::StringVal(source.into())) {
+                    return CommandResult::Err(e);
+                }
                 match host::sandboxes::start(id, source) {
-                    Ok(instance_id) => {
-                        if let Err(e) = host::storage::set(&key, &Value::StringVal(source.into())) {
-                            return CommandResult::Err(e);
+                    Ok(instance_id) => CommandResult::OkWithState(vec![KeyValue {
+                        key: "instance_id".into(),
+                        value: Value::StringVal(instance_id),
+                    }]),
+                    Err(e) => {
+                        let undone = match previous {
+                            Some(previous) => host::storage::set(&key, &previous),
+                            None => host::storage::delete(&key),
+                        };
+                        match undone {
+                            Ok(()) => CommandResult::Err(e),
+                            Err(_) => CommandResult::Unknown(format!(
+                                "start refused ({e:?}) and the saved source could not be restored"
+                            )),
                         }
-                        CommandResult::OkWithState(vec![KeyValue {
-                            key: "instance_id".into(),
-                            value: Value::StringVal(instance_id),
-                        }])
                     }
-                    Err(e) => CommandResult::Err(e),
                 }
             }
+            // Forget first, so a stopped script never comes back.
             "unload" => {
-                let _ = host::storage::delete(&key);
+                if let Err(e) = host::storage::delete(&key) {
+                    return CommandResult::Err(e);
+                }
                 match host::sandboxes::stop(id) {
                     Ok(()) => CommandResult::Ok,
                     Err(e) => CommandResult::Err(e),
@@ -200,6 +233,12 @@ impl Plugin for ScriptHost {
 
     fn shutdown(&mut self) {}
 
+    fn tick(&mut self) {
+        if let Some(Role::Manager { pending }) = &mut self.role {
+            restore(pending);
+        }
+    }
+
     fn execute_service_command(
         &mut self,
         _service: String,
@@ -207,7 +246,7 @@ impl Plugin for ScriptHost {
         args: Vec<KeyValue>,
     ) -> CommandResult {
         match &self.role {
-            Some(Role::Manager) => Self::manage(&command, &args),
+            Some(Role::Manager { .. }) => Self::manage(&command, &args),
             Some(Role::Script { parent, commands }) => match commands.get(&command) {
                 Some(action) => Self::run(parent, action),
                 None => CommandResult::Err(Error::InvalidArgument(format!(

@@ -204,7 +204,8 @@ async fn script_calls_sibling_through_host_dispatch_with_audited_chain() {
     for id in ["main~a", "main~b"] {
         let handle = engine.instance(id).expect("sandbox registered");
         assert_eq!(handle.plugin_id(), PLUGIN);
-        assert_eq!(handle.state(), InstanceState::Running);
+        // The service registers inside `init`, just before `Running`.
+        handle.wait_for_running().await.expect("sandbox Running");
     }
     assert_eq!(
         engine.sandboxes().list(MANAGER),
@@ -434,4 +435,57 @@ async fn sandboxes_end_with_their_manager() {
         engine.sandboxes().list(MANAGER),
         Vec::<(String, String)>::new()
     );
+}
+
+/// `script_sandboxes` caps the sandboxes one instance runs, and a
+/// sandbox that is still stopping counts until its supervisor is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_limit_counts_stopping_sandboxes() {
+    let state = support::tempdir("sandbox-limit");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let granted = CapabilitiesSection {
+        declares_services: vec!["scripts".into(), "script".into()],
+        script_sandboxes: 1,
+        storage_quota_kb: 256,
+        ..CapabilitiesSection::default()
+    };
+    let manager = start_manager(
+        &engine,
+        LoadMode::Granted {
+            granted: granted.into(),
+        },
+    )
+    .await;
+    let scripts = service_of(&engine, MANAGER, "scripts").await;
+    let load_b = || {
+        call(
+            &engine,
+            scripts.clone(),
+            "load",
+            vec![string("id", "b"), string("source", "pong ok\n")],
+        )
+    };
+
+    load(&engine, "a", "pong ok\n").await;
+    match load_b().await {
+        Ok(CommandResult::Err(Error::Unavailable(msg))) => assert!(msg.contains("limit"), "{msg}"),
+        other => panic!("expected the limit, got {other:?}"),
+    }
+
+    let outcome = call(&engine, scripts.clone(), "unload", vec![string("id", "a")]).await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    // Once `a` is gone, `b` fits.
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        match load_b().await {
+            Ok(CommandResult::OkWithState(_)) => break,
+            Ok(CommandResult::Err(Error::Unavailable(_))) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "a never finished stopping");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(engine.instance("main~a").is_none());
+
+    manager.stop().await.expect("stop manager");
 }

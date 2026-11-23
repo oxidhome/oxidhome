@@ -705,7 +705,7 @@ pub fn supervise_with_tuning_mode_and_pin(
         mode,
         tuning,
         first_load_pinned_manifest,
-        None,
+        SandboxSpawn::Disabled,
     )
 }
 
@@ -729,12 +729,23 @@ pub(crate) fn supervise_sandbox(
         launcher.mode.clone(),
         launcher.tuning.clone(),
         launcher.pinned_manifest.clone(),
-        Some(script),
+        SandboxSpawn::Child(script),
     )
 }
 
+/// ADR-0001: a new supervisor's place in the sandbox model.
+pub(crate) enum SandboxSpawn {
+    /// Can't start sandboxes: the supervisor isn't registry-managed
+    /// (`supervise*` entry points), so nothing would reap its children.
+    Disabled,
+    /// A registry-managed instance; its reaper stops its sandboxes.
+    Parent,
+    /// A script sandbox.
+    Child(Arc<SandboxScript>),
+}
+
 #[allow(clippy::too_many_arguments)]
-fn spawn_supervisor(
+pub(crate) fn spawn_supervisor(
     engine: Engine,
     plugin_dir: PathBuf,
     instance_id: String,
@@ -743,7 +754,7 @@ fn spawn_supervisor(
     mode: crate::runtime::LoadMode,
     tuning: SupervisorTuning,
     first_load_pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
-    sandbox_script: Option<Arc<SandboxScript>>,
+    sandbox: SandboxSpawn,
 ) -> InstanceHandle {
     let instance_id: Arc<str> = Arc::from(instance_id);
     let plugin_id: Arc<str> = Arc::from(plugin_id);
@@ -753,19 +764,18 @@ fn spawn_supervisor(
     // ADR-0001: a sandbox serves its script to `current-sandbox`; any
     // other instance may start sandboxes of itself with the inputs
     // this supervisor was spawned with.
-    let sandbox_role = sandbox_script.map_or_else(
-        || {
-            SandboxRole::Parent(Arc::new(SandboxLauncher {
-                engine: engine.clone(),
-                plugin_dir: plugin_dir.clone(),
-                overrides: overrides.clone(),
-                mode: mode.clone(),
-                tuning: tuning.clone(),
-                pinned_manifest: first_load_pinned_manifest.clone(),
-            }))
-        },
-        SandboxRole::Child,
-    );
+    let sandbox_role = match sandbox {
+        SandboxSpawn::Disabled => None,
+        SandboxSpawn::Parent => Some(SandboxRole::Parent(Arc::new(SandboxLauncher {
+            engine: engine.clone(),
+            plugin_dir: plugin_dir.clone(),
+            overrides: overrides.clone(),
+            mode: mode.clone(),
+            tuning: tuning.clone(),
+            pinned_manifest: first_load_pinned_manifest.clone(),
+        }))),
+        SandboxSpawn::Child(script) => Some(SandboxRole::Child(script)),
+    };
     let handle = InstanceHandle {
         instance_id: Arc::clone(&instance_id),
         plugin_id: Arc::clone(&plugin_id),
@@ -976,8 +986,8 @@ async fn run_supervisor(
     // to pin.
     pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
     // ADR-0001: whether this instance is a script sandbox or may
-    // start them.
-    sandbox_role: SandboxRole,
+    // start them; `None` for neither.
+    sandbox_role: Option<SandboxRole>,
 ) {
     // C2d — the pre-C2d supervisor eagerly subscribed to
     // `subscribe_all()` so every published event woke every
@@ -1014,7 +1024,7 @@ async fn run_supervisor(
             &state_tx,
             &loaded,
             pinned,
-            &sandbox_role,
+            sandbox_role.as_ref(),
         )
         .await;
 
@@ -1124,7 +1134,7 @@ async fn run_one_lifecycle(
     // test-suite paths; those re-read from disk on every
     // attempt.
     pinned_manifest: Option<(Vec<u8>, oxidhome_manifest::PluginManifest)>,
-    sandbox_role: &SandboxRole,
+    sandbox_role: Option<&SandboxRole>,
 ) -> LifecycleOutcome {
     // Sweep any device/service registry entries this instance left
     // behind on a previous life. First load is a no-op; on a restart
@@ -1196,7 +1206,9 @@ async fn run_one_lifecycle(
         ))
     });
     instance.set_watchdog(watchdog);
-    instance.set_sandbox_role(sandbox_role.clone());
+    if let Some(role) = sandbox_role {
+        instance.set_sandbox_role(role.clone());
+    }
     let policy = instance.manifest().runtime.restart;
 
     match instance.init().await {

@@ -130,16 +130,23 @@ pub(crate) enum SandboxRole {
     Child(Arc<SandboxScript>),
 }
 
-/// One live sandbox in [`SandboxRegistry`].
+/// One sandbox in [`SandboxRegistry`], from `start-sandbox` until its
+/// reaper runs.
 struct Entry {
     script: Arc<SandboxScript>,
     handle: InstanceHandle,
     /// Distinguishes this entry from a later sandbox with the same
     /// `local-id`, so a late reaper can't remove its replacement.
     generation: u64,
+    /// Asked to stop, not yet terminal. Hidden from `list-sandboxes`
+    /// but still counted against the parent's limit, so a start/stop
+    /// loop can't pile up stores that are still loading or shutting
+    /// down.
+    stopping: bool,
 }
 
-/// Live sandboxes per parent instance. Owned by the [`Engine`].
+/// Sandboxes per parent instance, live or stopping. Owned by the
+/// [`Engine`].
 #[derive(Default)]
 pub struct SandboxRegistry {
     inner: Mutex<HashMap<String, BTreeMap<String, Entry>>>,
@@ -153,22 +160,27 @@ impl SandboxRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The sandboxes `parent` started that are still live, ordered by
-    /// `local-id`.
+    /// The sandboxes `parent` started that are live (not stopping), as
+    /// `(local-id, instance-id)` ordered by `local-id`.
     #[must_use]
     pub fn list(&self, parent: &str) -> Vec<(String, String)> {
         self.lock().get(parent).map_or_default(|children| {
             children
                 .values()
+                .filter(|e| !e.stopping)
                 .map(|e| (e.script.local_id.clone(), e.script.instance_id.clone()))
                 .collect()
         })
     }
 
     fn infos(&self, parent: &str) -> Vec<SandboxInfo> {
-        self.lock()
-            .get(parent)
-            .map_or_default(|children| children.values().map(|e| e.script.info()).collect())
+        self.lock().get(parent).map_or_default(|children| {
+            children
+                .values()
+                .filter(|e| !e.stopping)
+                .map(|e| e.script.info())
+                .collect()
+        })
     }
 
     /// Reaper hook: drop the entry for `(parent, local_id)` if it is
@@ -188,22 +200,31 @@ impl SandboxRegistry {
         }
     }
 
-    /// Remove every sandbox of `parent` and return their handles, for
-    /// the caller to stop.
+    /// Mark every live sandbox of `parent` stopping and return their
+    /// handles, for the caller to stop. Each entry stays until its own
+    /// reaper removes it.
     pub(crate) fn take_children(&self, parent: &str) -> Vec<InstanceHandle> {
-        self.lock()
-            .remove(parent)
-            .map_or_default(|children| children.into_values().map(|e| e.handle).collect())
+        self.lock().get_mut(parent).map_or_default(|children| {
+            children
+                .values_mut()
+                .filter(|e| !e.stopping)
+                .map(|e| {
+                    e.stopping = true;
+                    e.handle.clone()
+                })
+                .collect()
+        })
     }
 
+    /// Mark one live sandbox stopping and return its handle.
     fn take_child(&self, parent: &str, local_id: &str) -> Option<InstanceHandle> {
         let mut guard = self.lock();
-        let children = guard.get_mut(parent)?;
-        let entry = children.remove(local_id);
-        if children.is_empty() {
-            guard.remove(parent);
+        let entry = guard.get_mut(parent)?.get_mut(local_id)?;
+        if entry.stopping {
+            return None;
         }
-        entry.map(|e| e.handle)
+        entry.stopping = true;
+        Some(entry.handle.clone())
     }
 }
 
@@ -245,7 +266,11 @@ impl Engine {
         let mut guard = registry.lock();
         let children = guard.entry(parent.to_owned()).or_default();
         if let Some(existing) = children.get(&local_id) {
-            return if *existing.script.source == *source {
+            return if existing.stopping {
+                Err(WitError::Unavailable(format!(
+                    "sandbox `{local_id}` is still stopping; retry shortly"
+                )))
+            } else if *existing.script.source == *source {
                 Ok(existing.script.instance_id.clone())
             } else {
                 Err(WitError::InvalidArgument(format!(
@@ -255,8 +280,8 @@ impl Engine {
         }
         if children.len() >= limit as usize {
             let err = WitError::Unavailable(format!(
-                "instance `{parent}` already runs {} sandboxes, the limit \
-                 (capabilities.script_sandboxes) is {limit}",
+                "instance `{parent}` already has {} sandboxes running or stopping; \
+                 the limit (capabilities.script_sandboxes) is {limit}",
                 children.len(),
             ));
             if children.is_empty() {
@@ -311,6 +336,7 @@ impl Engine {
                 script,
                 handle,
                 generation,
+                stopping: false,
             },
         );
         Ok(instance_id)
@@ -347,7 +373,14 @@ impl host_sandboxes::Host for PluginState {
         local_id: String,
         source: String,
     ) -> Result<String, WitError> {
-        let limit = self.granted_capabilities.script_sandboxes;
+        // A singleton's manifest can't ask for sandboxes (validation),
+        // but a zero limit is the gate either way; the singleton check
+        // keeps a hand-edited grant from reopening it.
+        let limit = if self.manifest.runtime.singleton {
+            0
+        } else {
+            self.granted_capabilities.script_sandboxes
+        };
         let launcher = match self.sandbox_launcher() {
             Err(WitError::Unavailable(_)) | Ok(_) if limit == 0 => {
                 return Err(WitError::PermissionDenied(
@@ -430,6 +463,59 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    fn entry(registry: &SandboxRegistry, parent: &str, local_id: &str) -> u64 {
+        let instance_id = sandbox_instance_id(parent, local_id);
+        let generation = registry.generation.fetch_add(1, Ordering::Relaxed);
+        registry
+            .lock()
+            .entry(parent.to_owned())
+            .or_default()
+            .insert(
+                local_id.to_owned(),
+                Entry {
+                    script: Arc::new(SandboxScript {
+                        local_id: local_id.to_owned(),
+                        instance_id: instance_id.clone(),
+                        parent_instance: parent.to_owned(),
+                        source: Arc::from(""),
+                    }),
+                    handle: InstanceHandle::for_registry_test(&instance_id, "p"),
+                    generation,
+                    stopping: false,
+                },
+            );
+        generation
+    }
+
+    /// A stopped sandbox leaves the list at once but stays registered
+    /// (counted) until its reaper removes it; a stale reaper can't
+    /// remove a newer entry.
+    #[test]
+    fn stopping_entries_stay_until_their_reaper_runs() {
+        let registry = SandboxRegistry::default();
+        let gen_a = entry(&registry, "main", "a");
+        entry(&registry, "main", "b");
+        assert!(registry.take_child("main", "a").is_some());
+        assert!(
+            registry.take_child("main", "a").is_none(),
+            "already stopping"
+        );
+        assert_eq!(
+            registry.list("main"),
+            [("b".to_owned(), "main~b".to_owned())]
+        );
+        assert_eq!(registry.lock()["main"].len(), 2);
+
+        registry.remove_if_current("main", "a", gen_a + 100);
+        assert_eq!(registry.lock()["main"].len(), 2, "stale generation");
+        registry.remove_if_current("main", "a", gen_a);
+        assert_eq!(registry.lock()["main"].len(), 1);
+
+        assert_eq!(registry.take_children("main").len(), 1);
+        assert_eq!(registry.take_children("main").len(), 0, "already stopping");
+        assert_eq!(registry.list("main"), Vec::<(String, String)>::new());
     }
 
     #[test]

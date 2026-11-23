@@ -17,6 +17,8 @@ singleton = false
 wasm = "target/wasm32-wasip2/debug/script_host.wasm"
 # A crashing script restarts on its own; so does the manager.
 restart = "on-trap"
+# The manager retries restoring saved scripts that were still stopping.
+tick_interval_ms = 500
 
 [capabilities]
 # `scripts` is the manager service of the instance the operator starts;

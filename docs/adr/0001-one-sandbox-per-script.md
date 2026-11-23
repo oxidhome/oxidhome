@@ -56,24 +56,32 @@ the decision.
   the child's `init`. Calling it again with the same `local-id` and the same source is a no-op that returns the
   same instance id, so a restarted parent can re-adopt its scripts. A different source for a live `local-id` is
   refused (`invalid-argument`): stop the old one first.
-- `stop-sandbox` removes the sandbox from the parent's set at once and stops the child in the background. Until the
-  child's supervisor is gone, starting the same `local-id` again answers `unavailable`, and the parent retries.
+- `stop-sandbox` removes the sandbox from the parent's list at once and stops the child in the background. Until the
+  child's supervisor is gone it still counts against the parent's limit, and starting the same `local-id` again
+  answers `unavailable`; the parent retries.
 - **Supervision.** Each sandbox has its own supervisor, restart policy (the manifest's `restart`), backoff, restart
   cap and liveness watchdog. A trap or a wedged loop in one script crashes and restarts only that sandbox. Sandboxes
   outlive a crash of their parent: they are still listed when the parent's next life runs `init`. They stop when the
   parent reaches a terminal state (stopped by the operator, or `Failed`), when the parent stops them, or on daemon
   shutdown.
-- Sandboxes don't nest: `start-sandbox` from inside a sandbox is `permission-denied`.
+- Sandboxes don't nest: `start-sandbox` from inside a sandbox is `permission-denied`. Only instances the engine
+  starts and reaps can start sandboxes; one driven without that (the test host's unsupervised `load`, the
+  `supervise*` helpers) gets `unavailable`.
+- A singleton plugin can't run sandboxes: every sandbox is another copy of the component, which would break the
+  exclusivity `singleton` promises. Manifest validation refuses `singleton = true` with `script_sandboxes > 0`.
 - A sandbox's KV, blob and device-state rows key on its own instance id, so each script has its own storage that
-  survives its restarts. Unlike the parent's, nothing purges them when the script is removed; they go with the
-  installation on uninstall, like any instance's.
+  survives its restarts. Nothing purges them when the script is removed; they go with the installation on
+  uninstall, like any instance's. The live-sandbox limit therefore doesn't bound a plugin's stored data: a plugin
+  that keeps starting scripts under new `local-id`s gets a fresh quota for each. Purging a removed script's storage
+  is deferred (below).
 
 ### Identity
 
 - A sandbox's instance id is `<parent-instance>~<local-id>`. `local-id` is 1–64 bytes of `[a-z0-9_-]`, starting with
   a letter or digit, and the whole id must still be a safe instance id (at most 128 bytes). `~` is reserved:
   `Engine::start_instance` refuses an operator-chosen instance id containing it, so a sandbox id can't collide with
-  an ordinary instance.
+  an ordinary instance. An existing instance whose id already contains `~` can't be started under that id any more; 0.x
+  accepts the break ([ADR-0007](0007-0x-publication-policy.md)).
 - The sandbox runs under the parent's installation identity (`plugin_id`, `installation_uuid`, load mode) and the
   same effective capabilities. The instance id is what distinguishes it everywhere else: service ownership, the
   `caller_instance` and `instance` axes of `consumes_services` grants, the delegation chain, audit rows, logs and
@@ -115,7 +123,11 @@ its own policy. A call that never reached B (B restarting, not running, deadline
 ### Deferred
 
 - Per-script tuning of the ceilings, and a per-plugin aggregate memory budget across sandboxes.
+- Bounding the storage of removed scripts (purge on `stop-sandbox`, or a per-plugin budget across sandbox
+  namespaces), and dropping the per-instance bookkeeping (device-state generation, publish rate limiter) a removed
+  script's instance id leaves behind.
+- Compiling the component once per parent: today every sandbox load (and restart) compiles it again from the
+  plugin directory, which is slow and, for dev loads, picks up a rebuilt `.wasm`.
 - Showing the parent/child relation in the REST, Connect, MCP and UI instance views (a sandbox shows up there as an
   ordinary instance today).
 - Persisting sandboxes across daemon restarts: the parent re-creates them from its own storage in `init`.
-- The test-host harness drives a single unsupervised instance, so `start-sandbox` there answers `unavailable`.
