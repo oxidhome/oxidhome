@@ -753,6 +753,16 @@ async fn a_failed_purge_blocks_the_id_until_a_restart_finishes_it() {
     let scripts = service_of(&engine, MANAGER, "scripts").await;
     let outcome = call(&engine, scripts.clone(), "unload", vec![string("id", "a")]).await;
     assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    // The removal is on disk once `stop-sandbox` returns, before the
+    // reaper gets to it.
+    let marked: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sandbox_removal WHERE instance_id = 'main~a'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("marker");
+    assert_eq!(marked, 1);
     wait_gone(&engine, "main~a").await;
     let kv = engine.kv();
     assert!(kv.usage(&uuid, "main~a").expect("usage").is_some());

@@ -224,8 +224,19 @@ impl SandboxRegistry {
             .retain(|(uuid, _)| uuid != installation_uuid);
     }
 
-    fn refuse_while_purging(&self, local_id: &str, instance_id: &str) -> Result<(), WitError> {
-        if self.removal_pending(instance_id) {
+    fn refuse_while_purging(
+        &self,
+        installation_uuid: &str,
+        local_id: &str,
+        instance_id: &str,
+    ) -> Result<(), WitError> {
+        // Storage keys on the installation too: another installation's
+        // leftovers under a reused parent id don't block this one.
+        if self
+            .removals()
+            .iter()
+            .any(|(uuid, id)| uuid == installation_uuid && id == instance_id)
+        {
             return Err(WitError::Unavailable(format!(
                 "sandbox `{local_id}` was removed and its storage is still being purged; retry \
                  later (a failed purge is retried when the host restarts)"
@@ -406,7 +417,7 @@ impl Engine {
         // A removed sandbox's id stays taken until its storage is
         // purged, so a new one can't inherit the old rows.
         if !guard.get(parent).is_some_and(|c| c.contains_key(&local_id)) {
-            registry.refuse_while_purging(&local_id, &instance_id)?;
+            registry.refuse_while_purging(installation_uuid, &local_id, &instance_id)?;
         }
         let children = guard.entry(parent.to_owned()).or_default();
         if let Some(existing) = children.get(&local_id) {
