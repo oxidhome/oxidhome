@@ -37,8 +37,8 @@ use super::auth::{AuthState, require_token};
 use super::scopes::{
     AUDIT_READ, DASHBOARDS_READ, DASHBOARDS_WRITE, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ,
     EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST,
-    PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL, ScopeDenied, can_read_blobs,
-    require_scope,
+    PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL, STATUS_READ, ScopeDenied,
+    can_read_blobs, require_scope,
 };
 use super::ui_ticket;
 
@@ -133,6 +133,7 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/events", get(query_events))
         .route("/api/v1/logs", get(query_logs))
         .route("/api/v1/audit", get(query_audit))
+        .route("/api/v1/config", get(get_config))
         // C6: bearer-gated JSON endpoint that mints a
         // short-lived HMAC ticket and returns the wrapper
         // URL for the dashboard to hand off as an iframe
@@ -194,6 +195,17 @@ pub fn build_router(engine: Engine) -> Router {
         .fallback_service(connect_service)
         .with_state(ApiState { engine })
         .merge(mcp)
+}
+
+/// `GET /api/v1/config` — the daemon's effective configuration, the
+/// same redacted body as the MCP `oxidhome://config` resource. Gated on
+/// `status:read`: operational metadata next to the status surface, no
+/// secrets.
+async fn get_config(
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<serde_json::Value>, ScopeDenied> {
+    require_scope(&actor, STATUS_READ)?;
+    Ok(Json(super::mcp::config_json()))
 }
 
 /// `GET /api/v1/readyz` — anonymous JSON readiness probe. Same body

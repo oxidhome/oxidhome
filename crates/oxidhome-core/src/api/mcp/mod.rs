@@ -21,11 +21,14 @@
 //! - `tools` — 14.3 tools registry. Starts with
 //!   `device.send_command`; more tools land per the design
 //!   doc's ordering.
+//! - `config` — the daemon's effective configuration behind
+//!   `oxidhome://config` (and `GET /api/v1/config`).
 //! - `stdio` — 14.5 subprocess transport (`oxidhome mcp-stdio`
 //!   binary mode). Serves the same handler over
 //!   `(stdin, stdout)` via `rmcp::transport::stdio()` under
 //!   an ambient wildcard actor (parent-process trust model).
 
+mod config;
 mod handler;
 mod prompts;
 mod rate_limit;
@@ -35,6 +38,10 @@ mod session_store;
 mod stdio;
 mod tools;
 
+pub(crate) use config::config_json;
+pub use config::{
+    ConfigSource, DaemonConfig, DaemonMode, ENV_BIND, ENV_STATE_DIR, install_daemon_config,
+};
 /// Re-export so `crate::api::auth::require_token` can pull the
 /// pre-verify result off the request extensions without a
 /// circular module dep (round-3 P1 on PR #140).
