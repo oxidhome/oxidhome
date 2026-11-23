@@ -166,9 +166,11 @@ struct Entry {
 
 impl Entry {
     /// Live: not asked to stop here, and not stopping or stopped by
-    /// anyone else (an operator stopping the instance directly).
+    /// anyone else (an operator stopping the instance directly, which
+    /// counts from the request on).
     fn is_live(&self) -> bool {
         !self.stopping
+            && !self.handle.stop_requested()
             && !matches!(self.handle.state(), InstanceState::Stopping)
             && !self.handle.state().is_terminal()
     }

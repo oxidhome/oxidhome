@@ -285,6 +285,12 @@ impl DispatchTicket {
         self.0.load(Ordering::Acquire) == WITHDRAWN
     }
 
+    /// Whether the command was abandoned while queued (its caller went
+    /// away, or the supervisor refused it).
+    pub(crate) fn abandoned(&self) -> bool {
+        self.0.load(Ordering::Acquire) == ABANDONED
+    }
+
     /// Whether the supervisor entered the plugin.
     pub(crate) fn started(&self) -> bool {
         self.0.load(Ordering::Acquire) == STARTED

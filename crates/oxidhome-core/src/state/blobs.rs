@@ -1096,7 +1096,12 @@ impl BlobStore {
             // A file already gone is fine; one this instance doesn't
             // index keeps the directory.
             for id in &ids {
-                let _ = std::fs::remove_file(instance_dir.join(id));
+                let path = instance_dir.join(id);
+                if let Err(err) = std::fs::remove_file(&path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(path = %path.display(), error = %err, "purged blob file not removed");
+                }
             }
             let _ = std::fs::remove_dir(instance_dir.join(".tmp"));
             if std::fs::remove_dir(&instance_dir).is_ok()

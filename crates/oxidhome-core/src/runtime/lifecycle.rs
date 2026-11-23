@@ -646,6 +646,11 @@ impl InstanceHandle {
         self.stop.send_replace(true);
     }
 
+    /// Whether a stop was requested.
+    pub(crate) fn stop_requested(&self) -> bool {
+        *self.stop.borrow()
+    }
+
     /// Ask the supervisor to run `shutdown` and end the task, and wait
     /// until the instance is terminal: its `Store` is dropped by then.
     /// See [`Self::request_stop`]. Idempotent — calling `stop` on an
@@ -993,13 +998,11 @@ struct Channels {
     stop: watch::Receiver<bool>,
 }
 
-/// Resolves once a stop is requested. Pending forever if every handle
-/// is gone without asking: the closed control channel stops the
-/// supervisor then.
+/// Resolves once a stop is requested, or every handle is gone (also a
+/// stop request, and the only one a guest blocked in a host import
+/// can hear).
 async fn stop_requested(stop: &mut watch::Receiver<bool>) {
-    if stop.wait_for(|requested| *requested).await.is_err() {
-        std::future::pending::<()>().await;
-    }
+    let _ = stop.wait_for(|requested| *requested).await;
 }
 
 /// Drive one plugin call. If a stop is requested while it runs, it
@@ -1058,15 +1061,26 @@ impl Drop for ControlQueue {
                     ticket,
                     reply,
                 } => {
+                    // A caller that went away while queued already made
+                    // it `timed_out` (H5); the stop refuses the rest.
+                    let caller_gone = ticket.abandoned();
                     // `false` only if the plugin was entered, which a
                     // command still in the channel never was.
                     if !ticket.try_abandon() {
                         continue;
                     }
-                    let refused = CommandOutcome::Rejected {
-                        error: WitError::Unavailable(format!(
-                            "instance `{instance_id}` stopped before running the command",
-                        )),
+                    let refused = if caller_gone {
+                        CommandOutcome::TimedOut {
+                            message: format!(
+                                "instance `{instance_id}` stopped; the command did not run",
+                            ),
+                        }
+                    } else {
+                        CommandOutcome::Rejected {
+                            error: WitError::Unavailable(format!(
+                                "instance `{instance_id}` stopped before running the command",
+                            )),
+                        }
                     };
                     if let Err(outcome) = reply.send(refused)
                         && !ticket.withdrawn_by_caller()
@@ -1461,13 +1475,9 @@ async fn run_one_lifecycle(
     engine
         .pending_commands()
         .expire_owner(instance_id, "the plugin instance restarted");
-    // H9: mark any device-state entries this instance previously
-    // published as `Stale` and bump the supervisor generation so
-    // fresh entries applied under this life are distinguishable
-    // from anything left over. Consumers polling `deltas_since`
-    // observe the stale transition; consumers hitting the snapshot
-    // API see `quality: "stale"` on the pre-restart values until
-    // the plugin re-publishes. H9 round-5 finding 1: the composite
+    // H9: mark this instance's previous device-state entries `Stale`
+    // and bump the supervisor generation, so entries applied under
+    // this life are distinguishable. H9 round-5 finding 1: the composite
     // `restart_generation` holds the store's write lock across
     // both steps — the pre-fix two-call shape let a delayed
     // writer read the pre-bump generation and insert a fresh
@@ -1496,11 +1506,7 @@ async fn run_one_lifecycle(
     let mut instance = match load_result {
         Some(Ok(instance)) => instance,
         Some(Err(e)) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
-        None => {
-            tracing::warn!(instance_id, "stop requested while loading; load cancelled");
-            transition(state_tx, instance_id, InstanceState::Stopped);
-            return LifecycleOutcome::Stopped;
-        }
+        None => return stopped_while_loading(state_tx, instance_id),
     };
     // The installation UUID is now known and stable across
     // every subsequent restart of this supervisor (same
@@ -1539,7 +1545,10 @@ async fn run_one_lifecycle(
         }
     }
     transition(state_tx, instance_id, InstanceState::Inited);
-
+    if *stop.borrow() {
+        // Stopped while `init` ran: no event handlers.
+        return shutdown_before_serving(instance, state_tx, instance_id).await;
+    }
     // Deliver anything the plugin's subscriptions buffered during init.
     match guest_call(stop, instance.drain_events()).await {
         None => return stop_after_cancel(instance, state_tx, instance_id),
@@ -1590,6 +1599,33 @@ async fn run_one_lifecycle(
             ran_healthy: running_since.elapsed() >= healthy_reset,
         },
     }
+}
+
+/// A stop cancelled the load (instantiation runs start functions).
+fn stopped_while_loading(
+    state_tx: &watch::Sender<InstanceState>,
+    instance_id: &str,
+) -> LifecycleOutcome {
+    tracing::warn!(instance_id, "stop requested while loading; load cancelled");
+    transition(state_tx, instance_id, InstanceState::Stopped);
+    LifecycleOutcome::Stopped
+}
+
+/// A stop requested while `init` ran: run `on-shutdown` without
+/// delivering events first, drop the `Store`, then publish `Stopped`.
+async fn shutdown_before_serving(
+    mut instance: PluginInstance,
+    state_tx: &watch::Sender<InstanceState>,
+    instance_id: &str,
+) -> LifecycleOutcome {
+    if let LoopAction::StopFailed(reason) =
+        shutdown_on_request(&mut instance, state_tx, instance_id).await
+    {
+        return LifecycleOutcome::StoppedFailed(reason);
+    }
+    drop(instance);
+    transition(state_tx, instance_id, InstanceState::Stopped);
+    LifecycleOutcome::Stopped
 }
 
 /// A stop cancelled (or preempted) a plugin call: the instance can't
@@ -2010,6 +2046,18 @@ async fn handle_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_wait_reports_unreaped_instances_after_the_bound() {
+        let slow = InstanceHandle::running_for_test("slow", "p");
+        let done = InstanceHandle::running_for_test("done", "p");
+        done.mark_reaped();
+        let report =
+            stop_and_wait_reaped(vec![slow.clone(), done.clone()], Duration::from_millis(50)).await;
+        assert_eq!(report.stopped, ["done"]);
+        assert_eq!(report.still_stopping, ["slow"]);
+        assert!(slow.stop_requested() && done.stop_requested());
+    }
 
     /// The restart cap used across the decision-matrix tests.
     const CAP: u32 = 10;
