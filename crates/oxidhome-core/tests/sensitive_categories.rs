@@ -297,3 +297,22 @@ fn set_bad_id(engine: &Engine) -> anyhow::Result<()> {
     )
     .map(drop)
 }
+
+/// Offline token / device commands don't migrate the database: that
+/// is the daemon's job (some migrations come with on-disk cleanup).
+#[test]
+fn offline_commands_refuse_an_unmigrated_database() {
+    use oxidhome_core::api::sensitive_admin::with_offline_stores;
+    use oxidhome_core::state::db::schema_version;
+    let state = support::tempdir("sensitive-offline-version");
+    let db = oxidhome_core::state::Db::open_file(state.path()).expect("db");
+    let set = |v: i64| {
+        db.write(|c| c.pragma_update(None, "user_version", v))
+            .expect("set version");
+    };
+    set(schema_version() - 1);
+    let err = with_offline_stores(state.path(), |_| Ok(())).unwrap_err();
+    assert!(err.to_string().contains("start the daemon"), "{err:#}");
+    set(schema_version());
+    with_offline_stores(state.path(), |s| Ok(s.tokens.list()?.len())).expect("current schema");
+}

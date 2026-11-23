@@ -620,7 +620,13 @@ impl AuditLog {
             push(&mut binds, &mut sql, "call_id =", c.clone().into());
         }
         if let Some(l) = &filter.level {
-            push(&mut binds, &mut sql, "level =", l.clone().into());
+            // Ordinary rows store NULL for `info`.
+            push(
+                &mut binds,
+                &mut sql,
+                "COALESCE(level, 'info') =",
+                l.clone().into(),
+            );
         }
         // Cursor pagination — lexicographic `(intent_ms, id) <
         // (before_ms, before_id)`. SQLite's row-value comparison
@@ -1050,6 +1056,49 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(log.count().unwrap(), 5);
+    }
+
+    /// `level=info` finds ordinary rows (stored as NULL); `level=warn`
+    /// only warn rows.
+    #[test]
+    fn level_filter_treats_null_as_info() {
+        let log = AuditLog::new(Arc::new(Db::open_in_memory().unwrap()));
+        let entry = |level: Option<&str>| AuditEntry {
+            id: 0,
+            intent_ms: 0,
+            finalized_ms: None,
+            token_id: "tok".into(),
+            actor_kind: "api".into(),
+            method: "GET".into(),
+            path: "/x".into(),
+            status: 200,
+            decision: "allow".into(),
+            required_scope: None,
+            execution_outcome: None,
+            domain_error: None,
+            credential_fp: None,
+            call_id: None,
+            invocation: None,
+            command_id: None,
+            command_outcome: None,
+            level: level.map(str::to_owned),
+        };
+        log.record_completed(&entry(None)).unwrap();
+        log.record_completed(&entry(Some(AUDIT_LEVEL_WARN)))
+            .unwrap();
+        let count = |level: &str| {
+            log.query(
+                &AuditQuery {
+                    level: Some(level.into()),
+                    ..AuditQuery::default()
+                },
+                10,
+            )
+            .unwrap()
+            .len()
+        };
+        assert_eq!(count("info"), 1);
+        assert_eq!(count("warn"), 1);
     }
 
     /// `record_intent_durable` writes the same pending row as

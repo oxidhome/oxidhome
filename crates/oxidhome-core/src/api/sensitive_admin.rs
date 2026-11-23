@@ -96,9 +96,10 @@ pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
                 // pattern restore all the token reached.
                 let granted: Vec<String> =
                     grants.filter_map(|g| g.devices.clone()).flatten().collect();
-                c.guards_commands()
-                    && command_devices
-                        .is_some_and(|allowed| allowed.iter().all(|a| pattern_covers(&granted, a)))
+                // No allowlist: the token reached every device id.
+                let every = ["dev-*".to_owned()];
+                let allowed: &[String] = command_devices.unwrap_or(&every);
+                c.guards_commands() && allowed.iter().all(|a| pattern_covers(&granted, a))
             };
             let reached = reached_by(&policy.scopes);
             let missing: SensitiveSet = reached
@@ -357,6 +358,21 @@ pub fn with_offline_stores<T>(
     }
     let _lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
         .context("this command needs exclusive access — stop the daemon first")?;
+    // Migrations are the daemon's to run: some come with engine-side
+    // cleanup (files on disk) that opening the database alone skips,
+    // and a later daemon start would see the schema current.
+    let path = state_dir.join(crate::state::db::DB_FILE_NAME);
+    let version: i64 =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
+            .with_context(|| format!("reading the schema version of {}", path.display()))?;
+    if version != crate::state::db::schema_version() {
+        anyhow::bail!(
+            "the database is at schema {version}, this binary expects {}; start the daemon \
+             once to upgrade it, stop it, then run this command again",
+            crate::state::db::schema_version(),
+        );
+    }
     let db = std::sync::Arc::new(
         crate::state::Db::open_file(state_dir)
             .with_context(|| format!("opening the database under {}", state_dir.display()))?,
@@ -606,6 +622,23 @@ mod tests {
         let gap = gaps
             .iter()
             .find(|g| g.token_id == wide.id)
+            .expect("opener still missing");
+        assert!(!gap.missing.contains(SensitiveCategory::Lock), "{gap:?}");
+
+        // Without an allowlist, a `dev-*` grant covers every device.
+        let all = tokens.create("all", br#"["devices:command"]"#).unwrap();
+        grant_sensitive(
+            &tokens,
+            &audit,
+            &all.id,
+            SensitiveCategory::Lock,
+            &["dev-*".into()],
+        )
+        .unwrap();
+        let gaps = sensitive_access_report(&tokens);
+        let gap = gaps
+            .iter()
+            .find(|g| g.token_id == all.id)
             .expect("opener still missing");
         assert!(!gap.missing.contains(SensitiveCategory::Lock), "{gap:?}");
 

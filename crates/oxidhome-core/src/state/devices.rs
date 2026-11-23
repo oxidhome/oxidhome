@@ -370,12 +370,28 @@ impl DeviceRegistry {
             self.write().remove(&id);
             return Err(err);
         }
+        let mut guard = self.write();
+        // Re-check under the insertion lock: the lock was released for
+        // the floor write, so a concurrent caller may have taken the
+        // last slot meanwhile.
+        if !guard.contains_key(&id) {
+            let owned = guard
+                .values()
+                .filter(|m| m.owner_instance == owner_instance)
+                .count();
+            if owned >= MAX_DEVICES_PER_INSTANCE {
+                return Err(WitError::Unavailable(format!(
+                    "instance `{owner_instance}` has {owned} devices registered; \
+                     the per-instance cap is {MAX_DEVICES_PER_INSTANCE}"
+                )));
+            }
+        }
         let meta = Arc::new(DeviceMeta {
             id: id.clone(),
             owner_instance,
             info,
         });
-        self.write().insert(id.clone(), meta);
+        guard.insert(id.clone(), meta);
         Ok(id)
     }
 

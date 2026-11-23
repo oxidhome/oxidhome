@@ -204,6 +204,22 @@ pub(crate) fn sensor_unit_changed(old: &DeviceInfo, new: &DeviceInfo) -> bool {
     }
 }
 
+/// [`check_state_fields`] for a full snapshot (an `ok-with-state`
+/// reply, which replaces the slot): a lock, opener, alarm panel or
+/// siren snapshot must also carry its `state`.
+pub(crate) fn check_snapshot_fields(
+    info: &DeviceInfo,
+    capability: &str,
+    fields: &[KeyValue],
+) -> Result<(), String> {
+    check_state_fields(info, capability, fields)?;
+    let needs_state = matches!(capability, "lock" | "opener" | "alarm-panel" | "siren");
+    if needs_state && !fields.iter().any(|kv| kv.key == "state") {
+        return Err(format!("a {capability} snapshot must include `state`"));
+    }
+    Ok(())
+}
+
 /// `true` when an `update-device` takes away its opener's position
 /// support: the projected `position` is then no longer valid.
 pub(crate) fn opener_position_dropped(old: &DeviceInfo, new: &DeviceInfo) -> bool {
@@ -1036,6 +1052,13 @@ mod tests {
         assert!(
             check_state_fields(&info, "lock", &dup).is_err(),
             "every duplicate"
+        );
+        assert!(
+            check_snapshot_fields(&info, "lock", &[]).is_err(),
+            "snapshot needs state"
+        );
+        assert!(
+            check_snapshot_fields(&info, "lock", &st(Value::StringVal("locked".into()))).is_ok()
         );
         // Dropping the support invalidates the projected position.
         assert!(opener_position_dropped(&with, &info));

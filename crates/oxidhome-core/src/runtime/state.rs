@@ -980,6 +980,7 @@ impl host_devices::Host for PluginState {
         // check-then-insert can't overshoot. Refusal returns
         // `Unavailable` — the plugin can retry after removing
         // some devices.
+        let existed = self.devices.get_any(&would_be_id).is_some();
         let id =
             match self
                 .devices
@@ -995,7 +996,7 @@ impl host_devices::Host for PluginState {
                     // A refused re-registration dropped the earlier
                     // entry (fail closed); its state goes stale like
                     // a `remove-device`.
-                    if self.devices.get_any(&would_be_id).is_none() {
+                    if existed && self.devices.get_any(&would_be_id).is_none() {
                         self.device_state.mark_device_stale(&would_be_id);
                     }
                     return Err(err);
@@ -1079,9 +1080,10 @@ impl host_devices::Host for PluginState {
         if outcome.is_ok() {
             self.device_state
                 .reconcile_capabilities(&id, &live_capabilities);
-        } else if self.devices.get_any(&id).is_none() {
+        } else if old.is_some() && self.devices.get_any(&id).is_none() {
             // A refused floor write dropped the device (fail closed);
-            // its state goes stale like a `remove-device`.
+            // its state goes stale like a `remove-device`. Only then:
+            // an ordinary `NotFound` mustn't sweep the projection.
             self.device_state.mark_device_stale(&id);
         }
         outcome

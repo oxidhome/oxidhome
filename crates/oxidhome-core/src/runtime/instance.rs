@@ -1639,8 +1639,10 @@ pub(crate) fn project_command_state(
                  declare; skipping state projection",
             );
         }
-        // M2: a sensor reading must carry the spec's unit.
-        if let Err(e) = super::schema::check_state_fields(&meta.info, capability, &fields) {
+        // M2: a sensor reading must carry the spec's unit. A full
+        // snapshot of a lock / opener / alarm / siren must carry its
+        // `state` (it replaces the slot).
+        if let Err(e) = super::schema::check_snapshot_fields(&meta.info, capability, &fields) {
             // The detail quotes plugin-registered labels (Debug-escaped,
             // so exact-value secret scrubbing can miss them): log it,
             // keep it out of the caller's message.
@@ -1649,11 +1651,11 @@ pub(crate) fn project_command_state(
                 device_id = %device,
                 capability = %capability,
                 error = %e,
-                "command OkWithState fails the sensor spec; reporting outcome_unknown",
+                "command OkWithState fails the capability's state checks; reporting outcome_unknown",
             );
             return CommandResult::Unknown(format!(
                 "plugin reported success, but its state for `{device}/{capability}` does \
-                 not match the device's sensor spec"
+                 not match the device's capability spec"
             ));
         }
         capability_declared
