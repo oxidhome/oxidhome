@@ -402,12 +402,17 @@ async fn binds_go_only_to_the_unspecified_address_and_listen_is_refused() {
             "bind 0.0.0.0:0".to_owned(),
             "bind 127.0.0.1:0".to_owned(),
             "listen 0.0.0.0:0".to_owned(),
+            // Header names are capped (host memory), not a network op.
+            "hdr 32".to_owned(),
+            "hdr 300".to_owned(),
         ],
     )
     .await;
     assert_eq!(results[0], "ok:bound");
     assert_eq!(results[1], "err:PermissionDenied");
     assert!(results[2].starts_with("err:"), "{results:?}");
+    assert_eq!(results[3], "ok:appended");
+    assert_eq!(results[4], "err:HeaderError::InvalidSyntax");
     wait_for_deny(&host, "bind", "binds", "127.0.0.1:0").await;
     wait_for_deny(&host, "listen", "binds", "0.0.0.0").await;
 }

@@ -111,6 +111,10 @@ fn drain_socket(socket: &UdpSocket, buf: &mut [u8]) -> i64 {
 
 impl Plugin for NetworkDiscovery {
     fn init(&mut self) -> Result<(), String> {
+        // Keep counting across restarts.
+        if let Ok(Some(Value::IntVal(n))) = storage::get(REPLIES_KEY) {
+            self.replies = n;
+        }
         let targets = parse_targets(&config_string("targets").unwrap_or_default())?;
         let probe = config_string("probe").unwrap_or_else(|| "discover".into());
         for ipv6 in [false, true] {

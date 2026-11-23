@@ -64,6 +64,7 @@ fn run(op: &str) -> Result<String, String> {
         "udp" => udp(arg),
         "dns" => dns(arg),
         "http" => http(arg),
+        "hdr" => header(arg),
         "httppoll" => http_get(arg, false)
             .map(|(status, _, body)| format!("{status}:{}", String::from_utf8_lossy(&body))),
         "bind" => UdpSocket::bind(arg).map(|_| "bound".into()).map_err(io_err),
@@ -124,6 +125,15 @@ fn dns(host: &str) -> Result<String, String> {
         .map(|a| a.ip().to_string())
         .collect();
     Ok(addrs.join(","))
+}
+
+/// Append a header whose name is `len` bytes to a fresh field map.
+fn header(len: &str) -> Result<String, String> {
+    let len: usize = len.parse().map_err(|_| format!("bad length `{len}`"))?;
+    Fields::new()
+        .append(&"x".repeat(len), b"v")
+        .map(|()| "appended".into())
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// GET `url`, following redirects; returns `<status>:<body>`.

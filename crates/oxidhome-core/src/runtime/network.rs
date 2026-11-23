@@ -33,7 +33,7 @@ mod http;
 mod policy;
 mod sockets;
 
-pub(crate) use http::HttpHooks;
+pub(crate) use http::{FIELD_SIZE_LIMIT, HttpHooks};
 pub(crate) use policy::NetworkPolicy;
 pub(crate) use sockets::address_check;
 

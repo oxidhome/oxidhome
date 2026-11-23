@@ -106,6 +106,73 @@ const MAX_METHOD_LEN: usize = 64;
 const MAX_AUTHORITY_LEN: usize = 512;
 /// Longest path-with-query a request may set.
 const MAX_PATH_LEN: usize = 8 * 1024;
+/// Most bytes one `fields` map may hold (upstream's default is 128 KiB).
+pub(crate) const FIELD_SIZE_LIMIT: usize = 16 * 1024;
+/// Longest header name a guest may set. Upstream charges a repeated
+/// name once against [`FIELD_SIZE_LIMIT`] but copies it for every value
+/// when listing or encoding the map; capping the name bounds that.
+const MAX_FIELD_NAME_LEN: usize = 256;
+
+/// `fields` constructors and mutators, wrapped to refuse header names over
+/// [`MAX_FIELD_NAME_LEN`] (`invalid-syntax`).
+fn limit_field_names(
+    types: &mut wasmtime::component::LinkerInstance<'_, crate::runtime::state::PluginState>,
+) -> wasmtime::Result<()> {
+    use wasmtime_wasi_http::FieldMap;
+    use wasmtime_wasi_http::WasiHttpView as _;
+    use wasmtime_wasi_http::p2::bindings::http::types::{HeaderError, HostFields};
+    type Store<'a> = wasmtime::StoreContextMut<'a, crate::runtime::state::PluginState>;
+    fn lift<T>(
+        result: wasmtime_wasi_http::p2::HeaderResult<T>,
+    ) -> wasmtime::Result<(Result<T, HeaderError>,)> {
+        Ok((match result {
+            Ok(value) => Ok(value),
+            Err(err) => Err(err.downcast()?),
+        },))
+    }
+    let too_long = |name: &str| name.len() > MAX_FIELD_NAME_LEN;
+
+    types.func_wrap(
+        "[static]fields.from-list",
+        move |mut store: Store<'_>, (entries,): (Vec<(String, Vec<u8>)>,)| {
+            if entries.iter().any(|(name, _)| too_long(name)) {
+                return Ok((Err(HeaderError::InvalidSyntax),));
+            }
+            lift(HostFields::from_list(&mut store.data_mut().http(), entries))
+        },
+    )?;
+    types.func_wrap(
+        "[method]fields.set",
+        move |mut store: Store<'_>,
+              (fields, name, values): (Resource<FieldMap>, String, Vec<Vec<u8>>)| {
+            if too_long(&name) {
+                return Ok((Err(HeaderError::InvalidSyntax),));
+            }
+            lift(HostFields::set(
+                &mut store.data_mut().http(),
+                fields,
+                name,
+                values,
+            ))
+        },
+    )?;
+    types.func_wrap(
+        "[method]fields.append",
+        move |mut store: Store<'_>,
+              (fields, name, value): (Resource<FieldMap>, String, Vec<u8>)| {
+            if too_long(&name) {
+                return Ok((Err(HeaderError::InvalidSyntax),));
+            }
+            lift(HostFields::append(
+                &mut store.data_mut().http(),
+                fields,
+                name,
+                value,
+            ))
+        },
+    )?;
+    Ok(())
+}
 
 /// The `outgoing-request` setters `wasmtime-wasi-http` stores without a
 /// length limit, wrapped to refuse oversized values: a request that is
@@ -119,6 +186,7 @@ fn limit_request_setters(
     type Request = Resource<HostOutgoingRequest>;
 
     let mut types = linker.instance(HTTP_TYPES)?;
+    limit_field_names(&mut types)?;
     // Upstream `get` returns `none` for a pending entry even after the
     // request finished, until the guest polls a subscription; a plugin
     // that just calls `get` each tick would never see its response.
@@ -238,11 +306,18 @@ impl WasiHttpHooks for HttpHooks {
         // Request-body errors reach the plugin through the body stream;
         // nothing here needs them.
         drop(fut);
+        // Admitted here, before `wasmtime-wasi-http` spawns the send, so
+        // requests over the limit fail at once instead of queueing with
+        // their headers and body.
+        let Ok(permit) = Arc::clone(&self.policy.http_requests).try_acquire_owned() else {
+            drop(request);
+            return Box::new(std::future::ready(Err(Error::ConnectionLimitReached)));
+        };
         let policy = Arc::clone(&self.policy);
         // Sent on a spawned task: carry the invocation for audit rows.
         let ctx = crate::auth::invocation::current();
         Box::new(super::in_invocation(ctx, async move {
-            send(policy, request, options).await
+            send(policy, permit, request, options).await
         }))
     }
 
@@ -283,10 +358,18 @@ async fn checked_addresses(
             policy.audit_denial("http", target, &denial);
             Error::HttpRequestDenied
         })?;
-        let addrs =
-            super::sockets::resolve(policy, host, &rules, "http", target, Some((using, port)))
-                .await
-                .map_err(dns_error)?;
+        let permits = super::sockets::lookup_permits(policy).map_err(dns_error)?;
+        let addrs = super::sockets::resolve(
+            policy,
+            permits,
+            host,
+            &rules,
+            "http",
+            target,
+            Some((using, port)),
+        )
+        .await
+        .map_err(dns_error)?;
         (addrs, Some(rules))
     };
     let mut denial = None;
@@ -351,6 +434,7 @@ fn plain_authority(authority: &http::uri::Authority) -> bool {
 
 async fn send(
     policy: Arc<NetworkPolicy>,
+    permit: tokio::sync::OwnedSemaphorePermit,
     mut request: http::Request<WasiBody>,
     options: Option<RequestOptions>,
 ) -> Result<
@@ -381,9 +465,6 @@ async fn send(
     let port = authority.port_u16().unwrap_or(default_port);
     let target = format!("{scheme}://{authority}");
 
-    let permit = Arc::clone(&policy.http_requests)
-        .try_acquire_owned()
-        .map_err(|_| Error::ConnectionLimitReached)?;
     let options = options.unwrap_or_default();
     let connect_timeout = options.connect_timeout.unwrap_or(CONNECT_TIMEOUT);
     let first_byte_timeout = options.first_byte_timeout.unwrap_or(FIRST_BYTE_TIMEOUT);

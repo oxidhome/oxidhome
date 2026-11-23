@@ -238,6 +238,29 @@ fn ip_literal(name: &str) -> Option<IpAddr> {
     bare.parse().ok()
 }
 
+/// The right to run one blocking lookup: the instance's permit and the
+/// host-wide one. Taken before any task is spawned, so lookups waiting
+/// for a permit can't queue up.
+pub(super) struct LookupPermits {
+    permit: tokio::sync::OwnedSemaphorePermit,
+    global: tokio::sync::SemaphorePermit<'static>,
+}
+
+/// Take a lookup's permits, or fail at once when the instance or the
+/// host is at its limit.
+pub(super) fn lookup_permits(policy: &NetworkPolicy) -> Result<LookupPermits, ErrorCode> {
+    let permit = Arc::clone(&policy.lookups)
+        .try_acquire_owned()
+        .map_err(|_| ErrorCode::TemporaryResolverFailure)?;
+    // A timed-out `getaddrinfo` keeps its thread until it returns, and a
+    // restarted instance gets a fresh per-instance limit; this one is
+    // process-wide, so lookups can't pile up threads across restarts.
+    let global = HOST_LOOKUPS
+        .try_acquire()
+        .map_err(|_| ErrorCode::TemporaryResolverFailure)?;
+    Ok(LookupPermits { permit, global })
+}
+
 /// Blocking name lookups in flight across every instance.
 static HOST_LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_HOST_LOOKUPS);
 /// Cap for [`HOST_LOOKUPS`].
@@ -248,21 +271,14 @@ const MAX_HOST_LOOKUPS: usize = 32;
 /// returns, so timed-out lookups can't pile up threads.
 pub(super) async fn resolve(
     policy: &Arc<NetworkPolicy>,
+    permits: LookupPermits,
     name: &str,
     rules: &[usize],
     op: &'static str,
     target: &str,
     only: Option<(Use, u16)>,
 ) -> Result<Vec<IpAddr>, ErrorCode> {
-    let Ok(permit) = Arc::clone(&policy.lookups).try_acquire_owned() else {
-        return Err(ErrorCode::TemporaryResolverFailure);
-    };
-    // A timed-out `getaddrinfo` keeps its thread until it returns, and a
-    // restarted instance gets a fresh per-instance limit; this one is
-    // process-wide, so lookups can't pile up threads across restarts.
-    let Ok(global) = HOST_LOOKUPS.try_acquire() else {
-        return Err(ErrorCode::TemporaryResolverFailure);
-    };
+    let LookupPermits { permit, global } = permits;
     // Resolved as an absolute name, so a resolver search list can't
     // turn it into a different name than the one the rules matched.
     let host = format!("{}.", super::policy::normalize_name(name));
@@ -311,12 +327,13 @@ impl ip_name_lookup::Host for NetView<'_> {
                     return Err(code.into());
                 }
             };
+            let permits = lookup_permits(&self.policy).map_err(SocketError::from)?;
             let policy = Arc::clone(&self.policy);
             // The task-local invocation doesn't cross `spawn`; carry it so
             // a refusal is audited against the call that caused it.
             let ctx = crate::auth::invocation::current();
             LookupState::Pending(tokio::spawn(super::in_invocation(ctx, async move {
-                resolve(&policy, &name, &rules, "lookup", &name, None).await
+                resolve(&policy, permits, &name, &rules, "lookup", &name, None).await
             })))
         };
         let lookup = self.sockets.table.push(Lookup { state })?;
