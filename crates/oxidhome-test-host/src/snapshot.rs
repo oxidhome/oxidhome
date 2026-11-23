@@ -325,6 +325,7 @@ impl Snapshot {
         options: &SnapshotOptions,
     ) -> Result<Self, TestHostError> {
         let stamp = Stamp::new(instance.engine.clock(), options.times);
+        let _secrets_in_scope = SecretsInScope::new(&instance.secrets.secret_values());
         let devices = instance
             .devices()
             .iter()
@@ -691,10 +692,12 @@ fn render_audit(instance: &InstanceRef<'_>) -> Result<Vec<String>, TestHostError
         token_id: Some(instance.instance_id.to_owned()),
         ..AuditQuery::default()
     };
+    // `token_id` also holds API credential ids; keep the plugin's.
     let mut rows = instance
         .engine
         .audit_log()
         .query(&query, AUDIT_ROWS.saturating_add(1))?;
+    rows.retain(|r| r.actor_kind == "plugin");
     if rows.len() > AUDIT_ROWS {
         return Err(TestHostError::AuditTooLarge { limit: AUDIT_ROWS });
     }
@@ -873,8 +876,60 @@ fn mask_json_doc(text: &str) -> std::borrow::Cow<'_, str> {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
         .filter(|doc| doc.is_object() || doc.is_array())
-        .and_then(|mut doc| oxidhome_core::redact::redact_json(&mut doc).then(|| doc.to_string()))
+        .and_then(|mut doc| {
+            // Declared secrets first, whole, before the credential
+            // rules could mask part of one and stop it matching.
+            let masked = CAPTURE_SECRETS.with(|s| mask_secret_leaves(&mut doc, &s.borrow()));
+            let redacted = oxidhome_core::redact::redact_json(&mut doc);
+            (masked || redacted).then(|| doc.to_string())
+        })
         .map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
+}
+
+thread_local! {
+    /// The declared secrets of the snapshot being captured on this
+    /// thread, for [`mask_json_doc`] (see [`SecretsInScope`]).
+    static CAPTURE_SECRETS: std::cell::RefCell<Vec<String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Makes `secrets` visible to [`mask_json_doc`] while it lives.
+struct SecretsInScope;
+
+impl SecretsInScope {
+    fn new(secrets: &[String]) -> Self {
+        CAPTURE_SECRETS.with(|s| s.borrow_mut().clone_from(&secrets.to_vec()));
+        Self
+    }
+}
+
+impl Drop for SecretsInScope {
+    fn drop(&mut self) {
+        CAPTURE_SECRETS.with(|s| s.borrow_mut().clear());
+    }
+}
+
+/// Replace every string leaf of `doc` containing a declared secret
+/// with `"***"`. `true` if anything changed.
+fn mask_secret_leaves(doc: &mut serde_json::Value, secrets: &[String]) -> bool {
+    match doc {
+        serde_json::Value::String(s)
+            if secrets
+                .iter()
+                .any(|secret| !secret.is_empty() && s.contains(secret.as_str())) =>
+        {
+            "***".clone_into(s);
+            true
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |acc, v| mask_secret_leaves(v, secrets) | acc),
+        serde_json::Value::Object(map) => map
+            .values_mut()
+            .fold(false, |acc, v| mask_secret_leaves(v, secrets) | acc),
+        _ => false,
+    }
 }
 
 /// Marks a bytes value cut off after its first bytes.
@@ -1350,13 +1405,21 @@ mod tests {
     #[test]
     fn declared_secrets_match_before_credential_scrubbing() {
         let url = "https://alice:letmein@hub.example/?api_key=abc123";
+        let secrets = [url.to_owned()];
+        let _scope = SecretsInScope::new(&secrets);
         let mut snap = sample();
-        snap.storage = vec![format!(
-            "conn = {}",
-            render_value(&Value::StringVal(url.into()))
-        )];
-        Redactor::new(&[], &[url.to_owned()]).apply(&mut snap);
-        assert_eq!(snap.storage, ["conn = \"***\""]);
+        snap.storage = vec![
+            format!("conn = {}", render_value(&Value::StringVal(url.into()))),
+            format!(
+                "doc = {}",
+                render_value(&Value::JsonVal(format!(r#"{{"url":"{url}"}}"#)))
+            ),
+        ];
+        Redactor::new(&[], &secrets).apply(&mut snap);
+        assert_eq!(
+            snap.storage,
+            ["conn = \"***\"", r#"doc = json:"{\"url\":\"***\"}""#]
+        );
     }
 
     #[test]

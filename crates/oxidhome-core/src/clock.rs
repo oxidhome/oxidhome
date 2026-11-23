@@ -821,10 +821,30 @@ mod tests {
         let v = VirtualClock::new();
         Clock::from(v.clone()).drive_epoch(&engine);
         // Observable through a store deadline: armed at 2 ticks, it
-        // is reached after 200 ms of virtual time.
+        // is reached after 200 ms of virtual time, not before. The
+        // module exports one empty function, `f`.
+        let wasm: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+            0x03, 0x02, 0x01, 0x00, // func 0: type 0
+            0x07, 0x05, 0x01, 0x01, b'f', 0x00, 0x00, // export "f"
+            0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // body: end
+        ];
+        let module = wasmtime::Module::new(&engine, wasm).unwrap();
         let mut store = wasmtime::Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        let f = instance.get_typed_func::<(), ()>(&mut store, "f").unwrap();
         store.set_epoch_deadline(2);
-        v.advance(Duration::from_millis(200));
+        v.advance(Duration::from_millis(100));
+        f.call(&mut store, ())
+            .expect("one tick: before the deadline");
+        v.advance(Duration::from_millis(100));
+        let err = f.call(&mut store, ()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<wasmtime::Trap>(),
+            Some(&wasmtime::Trap::Interrupt)
+        );
+        drop(store);
         drop(engine);
         v.advance(Duration::from_millis(100));
         assert_eq!(v.lock().engines.len(), 0, "dead engines are pruned");
