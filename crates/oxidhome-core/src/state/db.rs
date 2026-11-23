@@ -945,18 +945,23 @@ pub struct Db {
 /// after the open, so the bytes are taken as they are (Unix paths
 /// are arbitrary bytes). Elsewhere a path must be UTF-8.
 fn opened_main_path(conn: &Connection) -> anyhow::Result<PathBuf> {
-    let bytes: Vec<u8> = conn
-        .query_row(
-            "SELECT file FROM pragma_database_list WHERE name = 'main'",
-            (),
-            |row| match row.get_ref(0)? {
-                rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => {
-                    Ok(b.to_vec())
-                }
-                _ => Ok(Vec::new()),
-            },
-        )
+    // The `PRAGMA` statement, not the `pragma_database_list` table
+    // function: a schema object with that name would shadow it.
+    let mut stmt = conn
+        .prepare("PRAGMA database_list")
         .context("reading the main database path")?;
+    let mut rows = stmt.query(()).context("reading the main database path")?;
+    let mut bytes = Vec::new();
+    while let Some(row) = rows.next().context("reading the main database path")? {
+        if row.get_ref(1)?.as_str().ok() == Some("main") {
+            if let rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) =
+                row.get_ref(2)?
+            {
+                bytes = b.to_vec();
+            }
+            break;
+        }
+    }
     anyhow::ensure!(
         !bytes.is_empty(),
         "SQLite reported no file path for the main database"

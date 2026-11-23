@@ -152,10 +152,13 @@ impl EventLog {
             let by_rows: Option<i64> = match max_rows {
                 Some(keep) => {
                     let keep = i64::try_from(keep).unwrap_or(i64::MAX);
-                    let (lo, hi): (Option<i64>, Option<i64>) =
-                        conn.query_row("SELECT MIN(id), MAX(id) FROM event_log", (), |row| {
-                            Ok((row.get(0)?, row.get(1)?))
-                        })?;
+                    // Separate scalar subqueries, so each is a seek to
+                    // one end of the primary key, not an index scan.
+                    let (lo, hi): (Option<i64>, Option<i64>) = conn.query_row(
+                        "SELECT (SELECT MIN(id) FROM event_log), (SELECT MAX(id) FROM event_log)",
+                        (),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
                     match (lo, hi) {
                         (Some(lo), Some(hi)) if hi.saturating_sub(lo) >= keep => conn
                             .query_row(
