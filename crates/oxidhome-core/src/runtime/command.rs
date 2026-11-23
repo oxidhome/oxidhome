@@ -624,8 +624,10 @@ pub(crate) fn scrub_and_cap_reply(result: &mut CommandResult, secrets: &[&str]) 
     crate::redact::scrub_command_error(result, secrets);
 }
 
-/// The largest char boundary `<= limit`, moved forward past every
-/// secret occurrence that starts before it and ends after it.
+/// The largest char boundary `<= limit`, moved back before every
+/// secret occurrence that would straddle it, so the kept prefix holds
+/// only whole matches. Never exceeds `limit`, so the scrubber's input
+/// stays bounded.
 fn secret_safe_cut(text: &str, limit: usize, secrets: &[&str]) -> usize {
     let bytes = text.as_bytes();
     let mut cut = limit.min(text.len());
@@ -634,19 +636,20 @@ fn secret_safe_cut(text: &str, limit: usize, secrets: &[&str]) -> usize {
     }
     loop {
         // Occurrences crossing `cut` start in `(cut - len, cut)`.
-        let crossing_end = secrets
+        let crossing_start = secrets
             .iter()
             .map(|s| s.as_bytes())
             .filter(|s| !s.is_empty())
             .flat_map(|secret| {
-                (cut.saturating_sub(secret.len() - 1)..cut).filter_map(move |start| {
+                (cut.saturating_sub(secret.len() - 1)..cut).filter(move |&start| {
                     let end = start + secret.len();
-                    (end > cut && bytes.get(start..end) == Some(secret)).then_some(end)
+                    end > cut && bytes.get(start..end) == Some(secret)
                 })
             })
-            .max();
-        match crossing_end {
-            Some(end) => cut = end,
+            .min();
+        match crossing_start {
+            // Strictly decreasing, so this terminates.
+            Some(start) => cut = start,
             None => return cut,
         }
     }
@@ -961,6 +964,18 @@ mod message_cap_tests {
         };
         let out = cap_plugin_text(out);
         assert!(!out.contains("s3cr3t"), "partial secret leaked");
+    }
+
+    #[test]
+    fn overlapping_secret_runs_keep_the_cut_bounded() {
+        let secret = "aaaa";
+        let mut reply = CommandResult::Unknown("a".repeat(1 << 20));
+        scrub_and_cap_reply(&mut reply, &[secret]);
+        let CommandResult::Unknown(out) = reply else {
+            panic!("variant kept")
+        };
+        assert!(out.len() < MAX_PLUGIN_MESSAGE_BYTES + 128, "{}", out.len());
+        assert!(!out.contains(secret), "{out}");
     }
 
     #[test]

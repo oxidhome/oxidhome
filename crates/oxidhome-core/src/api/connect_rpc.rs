@@ -1530,3 +1530,33 @@ fn connect_error_response(err: ConnectError, req_headers: &HeaderMap) -> AxumRes
     let (parts, body) = err.into_http_response(req_headers).into_parts();
     AxumResponse::from_parts(parts, Body::new(body))
 }
+
+#[cfg(test)]
+mod command_report_tests {
+    use super::*;
+
+    /// M7 + H5: Connect withholds a `completed` report's `bytes-val`
+    /// state from a caller without `blobs:read`.
+    #[test]
+    fn command_report_withholds_bytes_without_blobs_read() {
+        let report = || CommandReport {
+            command_id: "cmd-00000000000000000000000000000001".into(),
+            outcome: CommandOutcome::Completed {
+                state: Some(vec![KeyValue {
+                    key: "frame".into(),
+                    value: Value::BytesVal(vec![1, 2, 3]),
+                }]),
+            },
+        };
+        let state_value = |resp: ExecuteCommandResponse| match resp.outcome {
+            Some(execute_command_response::Outcome::OkWithState(s)) => {
+                s.state[0].value.clone().into_option().expect("value").kind
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        };
+        let narrow = state_value(command_report_to_proto(report(), false));
+        let full = state_value(command_report_to_proto(report(), true));
+        assert_eq!(full, Some(value::Kind::BytesVal(vec![1, 2, 3])));
+        assert_ne!(narrow, full);
+    }
+}

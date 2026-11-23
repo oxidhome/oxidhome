@@ -3586,6 +3586,32 @@ impl IntoResponse for DashboardsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M7 + H5: a `completed` report's `bytes-val` state is withheld
+    /// from a caller without `blobs:read` (REST and MCP share this
+    /// encoder) and passed through for one with it.
+    #[test]
+    fn command_report_withholds_bytes_without_blobs_read() {
+        let report = || CommandReport {
+            command_id: "cmd-00000000000000000000000000000001".into(),
+            outcome: CommandOutcome::Completed {
+                state: Some(vec![KeyValue {
+                    key: "frame".into(),
+                    value: Value::BytesVal(vec![1, 2, 3]),
+                }]),
+            },
+        };
+        let narrow = serde_json::to_value(WireCommandReport::from_report(report(), false)).unwrap();
+        let full = serde_json::to_value(WireCommandReport::from_report(report(), true)).unwrap();
+        assert_ne!(narrow["state"]["frame"], full["state"]["frame"], "{narrow}");
+        let mut withheld = Value::BytesVal(vec![1, 2, 3]);
+        crate::redact::withhold_bytes(&mut withheld);
+        let expected: WireValue = withheld.into();
+        assert_eq!(
+            narrow["state"]["frame"],
+            serde_json::to_value(expected).unwrap()
+        );
+    }
     use crate::host_impl::plugin::oxidhome::plugin::events::{
         ButtonEvent as WitButtonEvent, Event,
     };
