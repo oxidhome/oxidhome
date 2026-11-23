@@ -62,7 +62,7 @@ not "queued by the host": a host-side queue that answers before the plugin runs 
 | pending, plugin calls `complete-command` | the reply's outcome, as above |
 | pending, 5 min pass or the instance restarts or stops | `outcome_unknown` |
 | pending when the daemon stopped (resolved at the next boot) | `outcome_unknown` |
-| queued, refused in restart backoff or by a terminal supervisor | `rejected` |
+| queued, refused in restart backoff or by a terminal supervisor | `rejected` (`timed_out` if the caller had gone) |
 
 `rejected` and `timed_out` are safe to retry. REST maps the outcomes to 200 / 202 / 422 / 504 / 502; Connect keeps an
 OK status and carries `command_outcome`; MCP sets `isError` for the three failure outcomes. Pending and late results

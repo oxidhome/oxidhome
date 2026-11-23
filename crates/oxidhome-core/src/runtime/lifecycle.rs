@@ -1843,10 +1843,13 @@ async fn backoff_wait(
 
 /// Refuse a control message the instance can't serve (restart backoff,
 /// or a terminal supervisor draining its queue): `instance
-/// `<id>` <why>`. A device command is `rejected` (it never ran, so a
-/// retry is safe); when its caller already disconnected, the refusal is
-/// recorded as its `COMMAND` row, since the request row has no outcome.
-/// A service call gets a dispatch error; a shutdown is acknowledged.
+/// `<id>` <why>`. The ticket's `try_refuse` settles the call, the same
+/// decision a stop and the caller's own withdrawal take. A device
+/// command is `rejected`, or `timed_out` when its caller had already
+/// gone or its deadline passed (neither ran, so a retry is safe); when
+/// its caller disconnected, the refusal is recorded as its `COMMAND`
+/// row, since the request row has no outcome. A service call gets a
+/// dispatch error; a shutdown is acknowledged.
 fn refuse_unserved(ctrl: ControlCommand, instance_id: &str, why: &str, pending: &PendingCommands) {
     match ctrl {
         ControlCommand::Execute {

@@ -220,8 +220,9 @@ async fn enqueue_and_disconnect(handle: &InstanceHandle, root: InvocationContext
 }
 
 /// A command queued while the instance waits out a restart backoff is
-/// refused (`rejected`); when its caller already disconnected, the
-/// refusal is still audited as a `COMMAND` row. A current-thread
+/// refused (`rejected`, or `timed_out` once its caller is gone); when
+/// its caller already disconnected, the refusal is still audited as a
+/// `COMMAND` row. A current-thread
 /// runtime keeps the supervisor from answering before the caller drops.
 #[tokio::test(flavor = "current_thread")]
 async fn command_refused_in_restart_backoff_is_audited_for_a_gone_caller() {
@@ -259,8 +260,9 @@ async fn command_refused_in_restart_backoff_is_audited_for_a_gone_caller() {
     let call_id = root.call_id().to_owned();
     enqueue_and_disconnect(&handle, root, device.clone()).await;
     let row = command_row(&engine, |r| r.call_id.as_deref() == Some(call_id.as_str())).await;
-    assert_eq!(row.command_outcome.as_deref(), Some("rejected"));
-    assert_eq!(row.domain_error.as_deref(), Some("unavailable"));
+    // The caller was gone before the refusal: `timed_out` (it never
+    // ran, safe to retry), as for a stop refusing its queue.
+    assert_eq!(row.command_outcome.as_deref(), Some("timed_out"));
     assert_eq!(row.path, format!("device.command/{device}"));
     assert!(
         row.command_id
@@ -318,8 +320,9 @@ async fn command_queued_at_a_terminal_supervisor_is_audited_for_a_gone_caller() 
         InstanceState::Failed { .. }
     ));
     let row = command_row(&engine, |r| r.call_id.as_deref() == Some(call_id.as_str())).await;
-    assert_eq!(row.command_outcome.as_deref(), Some("rejected"));
-    assert_eq!(row.domain_error.as_deref(), Some("unavailable"));
+    // The caller was gone before the refusal: `timed_out` (it never
+    // ran, safe to retry), as for a stop refusing its queue.
+    assert_eq!(row.command_outcome.as_deref(), Some("timed_out"));
 }
 
 /// H5 for `call-service`: a call whose deadline passes after the
