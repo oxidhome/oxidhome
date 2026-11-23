@@ -1,6 +1,6 @@
 //! One authorization decision point (H6 slice 2).
 //!
-//! Every external authorization check goes through [`authorize`]:
+//! Every external token-scope check goes through [`authorize`]:
 //! REST and Connect handlers, MCP tools, resources and prompts, the
 //! 14.4 per-token constraints, and the M7 byte-withholding check. A
 //! call names *what* is being done ([`Action`], a closed enum) and *to
@@ -35,9 +35,11 @@
 //! [`Action::StateRead`] exist so the taxonomy is complete, and are
 //! refused here.
 //!
-//! Denies are quiet to the caller (a bare 403 / `permission-denied`);
-//! [`Reason::audit_label`] is what lands in the audit row's
-//! `required_scope` column.
+//! Each transport keeps its existing deny wire shape (an empty REST
+//! 403, Connect `permission_denied` with `scope <label> required`, a
+//! generic MCP `-32001` for tools and resources, the missing scope
+//! named for prompts); [`Reason::audit_label`] is what lands in the
+//! audit row's `required_scope` column.
 
 use std::collections::HashMap;
 use std::sync::Arc;
