@@ -1406,9 +1406,19 @@ pub(crate) fn project_command_state(
         }
         // M2: a sensor reading must carry the spec's unit.
         if let Err(e) = super::schema::check_sensor_fields(&meta.info, capability, &fields) {
+            // The detail quotes plugin-registered labels (Debug-escaped,
+            // so exact-value secret scrubbing can miss them): log it,
+            // keep it out of the caller's message.
+            tracing::warn!(
+                instance_id = %owner_instance,
+                device_id = %device,
+                capability = %capability,
+                error = %e,
+                "command OkWithState fails the sensor spec; reporting outcome_unknown",
+            );
             return CommandResult::Unknown(format!(
-                "plugin reported success, but its state for `{device}/{capability}` is \
-                 invalid: {e}"
+                "plugin reported success, but its state for `{device}/{capability}` does \
+                 not match the device's sensor spec"
             ));
         }
         capability_declared

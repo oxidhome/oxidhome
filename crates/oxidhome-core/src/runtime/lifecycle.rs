@@ -1312,10 +1312,10 @@ async fn run_execute(
     // a device nobody is waiting on any more. H5: the ticket
     // makes "did not run" race-free against the caller's own
     // deadline (and its disconnect).
-    // Claim the ticket first, then read the clock: a deadline that
-    // passes between the two still refuses the command (the caller
-    // sees the `timed_out` reply, or the late-row audit records it).
-    if !ticket.try_start() || ctx.is_expired() {
+    // The deadline check and the claim are one ticket decision, so a
+    // caller withdrawing at its deadline sees either "started" or
+    // "never ran", never a refused command marked started.
+    if !ticket.try_start_unless(|| ctx.is_expired()) {
         let _ = ticket.try_abandon();
         let refused = CommandOutcome::TimedOut {
             message: format!(

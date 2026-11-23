@@ -200,6 +200,9 @@ const ABANDONED: u8 = 2;
 /// Withdrawn by the caller's own deadline: the caller reports
 /// `timed_out` itself, so the supervisor doesn't audit it again.
 const WITHDRAWN: u8 = 3;
+/// The supervisor holds the ticket while it reads the clock; it
+/// resolves to `STARTED` or `ABANDONED` without any await in between.
+const CLAIMING: u8 = 4;
 
 /// Shared between the caller waiting on a command and the supervisor
 /// that will run it; decides `timed_out` vs `outcome_unknown` (see the
@@ -210,10 +213,28 @@ pub(crate) struct DispatchTicket(Arc<AtomicU8>);
 impl DispatchTicket {
     /// Supervisor side: claim the command for execution. `false` means
     /// the caller already gave up and the command must not run.
+    #[cfg(test)]
     pub(crate) fn try_start(&self) -> bool {
+        self.try_start_unless(|| false)
+    }
+
+    /// Supervisor side: claim the command, then refuse it (abandoned,
+    /// reported `timed_out`) if `expired()` says its deadline passed.
+    /// The deadline check and the start are one decision: a caller
+    /// withdrawing meanwhile waits for it, so an expired command that
+    /// never ran can't be reported as started.
+    pub(crate) fn try_start_unless(&self, expired: impl FnOnce() -> bool) -> bool {
+        if self
+            .0
+            .compare_exchange(QUEUED, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let start = !expired();
         self.0
-            .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .store(if start { STARTED } else { ABANDONED }, Ordering::Release);
+        start
     }
 
     /// Abandon a still-queued command nobody will report on (caller
@@ -231,10 +252,16 @@ impl DispatchTicket {
     }
 
     fn withdraw(&self, to: u8) -> bool {
-        match self
+        let mut observed = self
             .0
-            .compare_exchange(QUEUED, to, Ordering::AcqRel, Ordering::Acquire)
-        {
+            .compare_exchange(QUEUED, to, Ordering::AcqRel, Ordering::Acquire);
+        // The supervisor is between claiming and deciding: a clock read,
+        // no await. Wait for its decision.
+        while observed == Err(CLAIMING) {
+            std::thread::yield_now();
+            observed = Err(self.0.load(Ordering::Acquire));
+        }
+        match observed {
             Ok(_) => true,
             // The supervisor refused it first; a caller about to
             // report `timed_out` itself takes over the audit write.
@@ -846,6 +873,16 @@ mod tests {
         assert!(t.try_withdraw());
         assert!(t.withdrawn_by_caller());
         assert!(!t.try_start());
+    }
+
+    #[test]
+    fn expired_claim_is_never_started() {
+        let t = DispatchTicket::default();
+        assert!(!t.try_start_unless(|| true));
+        assert!(!t.started());
+        // The caller's withdrawal sees "never ran" and owns the report.
+        assert!(t.try_withdraw());
+        assert!(t.withdrawn_by_caller());
     }
 
     #[test]
