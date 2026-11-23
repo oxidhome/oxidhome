@@ -259,11 +259,24 @@ impl EventTail {
                         self.replay_through = fanned_out;
                         continue;
                     }
-                    match self.subscription.receiver.recv().await {
-                        Some(message) => Some(message),
-                        // Closed while waiting: take the
-                        // `Disconnected` path above.
-                        None => continue,
+                    // A cursor tail also wakes when the watermark rises
+                    // without a message: the row was dropped from the
+                    // full queue just before it drained.
+                    let watermark = self.watermark.clone();
+                    let cursor_wait = async {
+                        match self.mode {
+                            Mode::Cursor { .. } => watermark.advanced_past(fanned_out).await,
+                            Mode::Live { .. } => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        message = self.subscription.receiver.recv() => match message {
+                            Some(message) => Some(message),
+                            // Closed while waiting: take the
+                            // `Disconnected` path above.
+                            None => continue,
+                        },
+                        () = cursor_wait => continue,
                     }
                 }
             };
@@ -750,5 +763,27 @@ mod tests {
             drop(bus);
             assert!(next_item(&mut tail).await.is_none(), "{after_id:?}");
         }
+    }
+
+    /// A watermark rise with nothing enqueued (the row was dropped
+    /// from a full queue) wakes a cursor tail waiting on an empty
+    /// queue.
+    #[tokio::test]
+    async fn watermark_rise_wakes_an_idle_cursor_tail() {
+        let (bus, log) = setup();
+        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(0), "test")
+            .await
+            .expect("open");
+        let waiter = tokio::spawn(async move {
+            let id = next_id(&mut tail).await;
+            (tail, id)
+        });
+        tokio::task::yield_now().await;
+        let id = log
+            .record(1, &event(1), "inst", "example.test")
+            .expect("record");
+        bus.note_history_head(id);
+        let (_tail, got) = waiter.await.expect("waiter");
+        assert_eq!(got, id);
     }
 }

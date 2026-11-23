@@ -418,11 +418,37 @@ async fn replayed_events_withhold_bytes_without_blobs_read() {
         .expect("connect");
     let frame = next_json(&mut ws).await;
     assert_eq!(frame["id"], 1);
-    let value = &frame["payload"]["fields"][0]["value"];
-    assert!(
-        value.to_string().contains("withheld"),
-        "bytes must be withheld on replay, got {frame}"
-    );
+    let withheld = serde_json::json!({
+        "t": "Json",
+        "v": r#"{"withheld":"bytes","size_bytes":3,"required_scope":"blobs:read"}"#,
+    });
+    assert_eq!(frame["payload"]["fields"][0]["value"], withheld, "{frame}");
     let _ = ws.close(None).await;
     server.abort();
+
+    // Connect replay withholds the same way.
+    let (_, body) = connect_tail(
+        &engine,
+        br#"["events:tail","events:read"]"#,
+        br#"{"afterId":"0"}"#,
+    )
+    .await;
+    let (messages, _) = connect_messages(body, 1).await;
+    let value = &messages[0]["event"]["stateChanged"]["fields"][0]["value"];
+    assert!(value.get("bytesVal").is_none(), "bytes leaked: {value}");
+    assert_eq!(
+        value["jsonVal"], r#"{"withheld":"bytes","size_bytes":3,"required_scope":"blobs:read"}"#,
+        "{value}"
+    );
+
+    // With `blobs:read` the bytes come through.
+    let (_, body) = connect_tail(
+        &engine,
+        br#"["events:tail","events:read","blobs:read"]"#,
+        br#"{"afterId":"0"}"#,
+    )
+    .await;
+    let (messages, _) = connect_messages(body, 1).await;
+    let value = &messages[0]["event"]["stateChanged"]["fields"][0]["value"];
+    assert!(value.get("bytesVal").is_some(), "{value}");
 }

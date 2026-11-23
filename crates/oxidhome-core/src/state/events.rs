@@ -217,7 +217,25 @@ pub struct EventBus {
     /// fan-out to every subscriber queue finished. Idle cursor tails
     /// replay up to this one, so they never re-read from history a
     /// row that is still on its way into their queue.
-    queued_row_id: Arc<AtomicU64>,
+    queued_row_id: Arc<QueuedRowId>,
+}
+
+/// H4: the post-fan-out row-id watermark plus a wakeup for cursor
+/// tails waiting on an empty queue. A row dropped from a full queue
+/// raises the watermark without enqueueing anything, so the tail must
+/// be woken by the watermark itself.
+#[derive(Debug, Default)]
+struct QueuedRowId {
+    id: AtomicU64,
+    advanced: Notify,
+}
+
+impl QueuedRowId {
+    fn raise(&self, id: u64) {
+        if self.id.fetch_max(id, Ordering::AcqRel) < id {
+            self.advanced.notify_waiters();
+        }
+    }
 }
 
 /// H4: read handle on the bus's queued row-id watermark (see
@@ -225,13 +243,27 @@ pub struct EventBus {
 /// bus, so a holder doesn't keep subscriber senders alive past engine
 /// shutdown.
 #[derive(Debug, Clone)]
-pub struct RowWatermark(Arc<AtomicU64>);
+pub struct RowWatermark(Arc<QueuedRowId>);
 
 impl RowWatermark {
     /// Current watermark.
     #[must_use]
     pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.0.id.load(Ordering::Acquire)
+    }
+
+    /// Wait until the watermark rises above `seen`. Registers for the
+    /// wakeup before re-checking, so a raise can't slip in between.
+    pub async fn advanced_past(&self, seen: u64) {
+        loop {
+            let notified = self.0.advanced.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.get() > seen {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -371,7 +403,7 @@ impl EventBus {
             rate_refill_per_sec: DEFAULT_PUBLISH_RATE_PER_SEC,
             publish_sequence: Arc::new(tokio::sync::Mutex::new(())),
             last_row_id: Arc::new(AtomicU64::new(0)),
-            queued_row_id: Arc::new(AtomicU64::new(0)),
+            queued_row_id: Arc::new(QueuedRowId::default()),
         }
     }
 
@@ -381,7 +413,7 @@ impl EventBus {
     /// them from history before switching to live delivery.
     pub fn note_history_head(&self, head: u64) {
         self.last_row_id.fetch_max(head, Ordering::AcqRel);
-        self.queued_row_id.fetch_max(head, Ordering::AcqRel);
+        self.queued_row_id.raise(head);
     }
 
     /// H4: highest row id fanned out so far (or the boot-time
@@ -592,7 +624,7 @@ impl EventBus {
             }
         }
         if let Some(id) = event_id {
-            self.queued_row_id.fetch_max(id, Ordering::AcqRel);
+            self.queued_row_id.raise(id);
         }
         self.signal_wakes(event.as_ref());
         delivered
