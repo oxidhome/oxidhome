@@ -389,11 +389,15 @@ impl Engine {
                  rows from earlier runs only once a new event is recorded",
             ),
         }
+        // H2: restore the durable projection before any plugin runs,
+        // so reads are correct before owners republish.
+        let device_state = DeviceStateStore::open_persistent(Arc::clone(&db))
+            .context("restoring the device-state projection")?;
         Ok(Self {
             inner,
             pending_commands: Arc::new(PendingCommands::new(Some(Arc::clone(&audit_log)))),
             devices: Arc::new(DeviceRegistry::new()),
-            device_state: Arc::new(DeviceStateStore::new()),
+            device_state,
             events,
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
             event_log,
@@ -1292,6 +1296,14 @@ impl Engine {
     #[must_use]
     pub fn sandboxes(&self) -> Arc<SandboxRegistry> {
         Arc::clone(&self.sandboxes)
+    }
+
+    /// H2: write the device-state projection's pending changes and
+    /// stop its flusher. Called once at shutdown, after every
+    /// supervised instance has stopped (so their stale flips are
+    /// included). Blocking; returns whether the final write succeeded.
+    pub fn close_device_state(&self) -> bool {
+        self.device_state.close_persistence()
     }
 
     /// Post-terminal cleanup for one instance: drop the device and

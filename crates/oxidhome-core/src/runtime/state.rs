@@ -525,6 +525,9 @@ impl PluginState {
         // cap a true per-instance ceiling across all memories /
         // tables (C4 review P1 F1) and traps on refusal (P2 F1).
         let limits = PluginResourceLimits::new();
+        // H2: entries this instance writes carry its plugin id, which
+        // the `reads_state` grant's `plugin` selector matches on.
+        device_state.bind_owner_plugin(&instance_id, &manifest.plugin.id);
         Self {
             instance_id,
             installation_uuid: installation_uuid.into(),

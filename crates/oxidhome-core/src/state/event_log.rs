@@ -718,6 +718,21 @@ impl StoredValue {
     }
 }
 
+/// Encode a state slot's fields with the same tagged shape as an
+/// `event_log` `state-changed` payload. Used by the H2 durable
+/// projection (`device_state` table), so both tables share one
+/// value encoding.
+pub(crate) fn encode_fields(fields: &[KeyValue]) -> Result<Vec<u8>, serde_json::Error> {
+    let stored: Vec<StoredKeyValue> = fields.iter().map(StoredKeyValue::from_wit).collect();
+    serde_json::to_vec(&stored)
+}
+
+/// Inverse of [`encode_fields`].
+pub(crate) fn decode_fields(blob: &[u8]) -> Result<Vec<KeyValue>, serde_json::Error> {
+    let stored: Vec<StoredKeyValue> = serde_json::from_slice(blob)?;
+    Ok(stored.into_iter().map(StoredKeyValue::into_wit).collect())
+}
+
 /// Insert one `event_log` row on an already-locked connection and
 /// return its `AUTOINCREMENT` id. Shared by [`EventLog::record_prepared`]
 /// and the H3 mirror's gap-marker + event transaction.

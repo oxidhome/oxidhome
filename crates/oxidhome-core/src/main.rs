@@ -314,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
     stop_event_log_retention(event_log_retention).await;
+    close_device_state(&engine).await;
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s
@@ -550,6 +551,25 @@ fn resolve_bind_addr() -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("parsing $OXIDHOME_BIND ({raw:?}) as a socket address"))
 }
 
+/// Bound on the final device-state flush (H2) at shutdown.
+const SHUTDOWN_DEVICE_STATE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// H2: final device-state flush after every supervisor stopped, so
+/// the persisted projection carries their stale flips. Bounded: a hung
+/// disk costs the unflushed changes, which the next boot treats like a
+/// crash (their cursors resync).
+async fn close_device_state(engine: &oxidhome_core::Engine) {
+    let engine = engine.clone();
+    let flush = tokio::task::spawn_blocking(move || engine.close_device_state());
+    match tokio::time::timeout(SHUTDOWN_DEVICE_STATE_DEADLINE, flush).await {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) | Ok(Err(_)) => {
+            tracing::warn!("device-state projection: final flush failed");
+        }
+        Err(_) => tracing::warn!("device-state projection: final flush exceeded its deadline"),
+    }
+}
+
 /// Waits for the first arriving shutdown signal and returns its
 /// name for the tracing line. On non-Unix platforms only `SIGINT`
 /// (ctrl-c) is observable; `SIGTERM` is Unix-only.
@@ -675,6 +695,7 @@ async fn run_stdio() -> anyhow::Result<()> {
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
     stop_event_log_retention(event_log_retention).await;
+    close_device_state(&engine).await;
 
     // Flush the log writer before returning so the tail of the
     // session lands in `<state_dir>/oxidhome.db`. Matches the

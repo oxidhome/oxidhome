@@ -66,16 +66,20 @@
 //!   assuming any value they see is current — the review's
 //!   "silently retain old values across restart" failure mode.
 //!
-//! - **In-memory only for the H9 first cut.** Matches
-//!   [`super::DeviceRegistry`]. Persistence to `SQLite` is a
-//!   follow-up if a use case surfaces (post-restart state
-//!   reconciliation without re-observing).
+//! - **Durable (H2).** [`DeviceStateStore::open_persistent`] restores
+//!   the store from the `device_state` table at boot and starts a
+//!   flusher thread that writes changed slots back in coalesced
+//!   batches, off the publish path. See the [`persist`] module for
+//!   the freshness and revision rules across a restart.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rand::TryRng;
+
+mod persist;
+pub use persist::FlushError;
 
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue};
 
@@ -136,6 +140,11 @@ pub struct DeviceState {
     /// the slot — the same operator-facing name maps to the same
     /// entry, just with a new generation).
     pub owner_instance: String,
+    /// `plugin.id` of the owning instance's plugin, or empty when the
+    /// host doesn't know it (an instance loaded without
+    /// [`DeviceStateStore::bind_owner_plugin`]). Matched by the H2
+    /// `reads_state` grant's `plugin` selector.
+    pub owner_plugin: String,
     pub quality: StateQuality,
 }
 
@@ -233,6 +242,23 @@ struct StoreInner {
     /// life fails epoch verification long before the MAC
     /// check ever fires.
     cursor_secret: [u8; 32],
+    /// H2: per-process nonce carried in the pagination cursor. The
+    /// epoch survives a restart now that the store is durable, but the
+    /// cursor secret doesn't, so a cursor from an earlier process is
+    /// told apart by this value (409, restart the resync) instead of
+    /// failing its MAC (400).
+    boot: String,
+    /// H2: `plugin.id` per owning `instance_id`, stamped onto every
+    /// entry the instance writes. See
+    /// [`DeviceStateStore::bind_owner_plugin`].
+    owner_plugins: HashMap<String, String>,
+    /// H2: revision ranges `(lo, hi]` that a boot skipped over. A
+    /// cursor inside one may come from writes that were lost before
+    /// they were flushed, so it must resync. See [`persist`].
+    holes: Vec<(u64, u64)>,
+    /// H2: slots changed since the last flush. `None` for a store
+    /// without a backing database.
+    dirty: Option<persist::Dirty>,
 }
 
 impl Default for StoreInner {
@@ -244,8 +270,27 @@ impl Default for StoreInner {
             evicted_through_revision: 0,
             generations: HashMap::new(),
             cursor_secret: mint_cursor_secret(),
+            boot: mint_boot_nonce(),
+            owner_plugins: HashMap::new(),
+            holes: Vec::new(),
+            dirty: None,
         }
     }
+}
+
+/// H2: 64-bit OS-random per-process nonce, hex. See
+/// [`StoreInner::boot`].
+fn mint_boot_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system RNG must be available");
+    let mut hex = String::with_capacity(16);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// H9 round-14 finding 3: 256-bit OS-random secret used to
@@ -290,6 +335,21 @@ impl StoreInner {
         self.global_revision += 1;
         self.global_revision
     }
+
+    /// H2: record that `key` changed (written, flipped or evicted)
+    /// so the flusher persists it. No-op without a backing database.
+    fn touch(&mut self, key: &(DeviceId, String)) {
+        if let Some(dirty) = self.dirty.as_mut() {
+            dirty.touch(key);
+        }
+    }
+
+    fn owner_plugin(&self, owner_instance: &str) -> String {
+        self.owner_plugins
+            .get(owner_instance)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// H9 host-owned device-state projection. One per
@@ -297,12 +357,29 @@ impl StoreInner {
 #[derive(Debug, Default)]
 pub struct DeviceStateStore {
     inner: RwLock<StoreInner>,
+    /// H2: the database the store flushes to, and its flusher thread.
+    /// `None` for [`Self::new`] (in-memory only).
+    backing: Option<persist::Backing>,
 }
 
 impl DeviceStateStore {
+    /// An in-memory store with no backing database: nothing survives
+    /// the process. The daemon uses [`Self::open_persistent`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// H2: remember which plugin `owner_instance` belongs to, so the
+    /// entries it writes carry `owner_plugin`. Called when an instance
+    /// is loaded.
+    pub fn bind_owner_plugin(&self, owner_instance: &str, plugin_id: &str) {
+        let mut inner = self.inner_write();
+        if inner.owner_plugins.get(owner_instance).map(String::as_str) != Some(plugin_id) {
+            inner
+                .owner_plugins
+                .insert(owner_instance.to_owned(), plugin_id.to_owned());
+        }
     }
 
     fn inner_read(&self) -> RwLockReadGuard<'_, StoreInner> {
@@ -545,6 +622,7 @@ impl DeviceStateStore {
         // fits `MAX_BYTES_PER_SLOT`, matching the
         // field-count backstop pattern above.
         let final_fields = truncate_to_byte_cap(final_fields, &device_id, &capability);
+        let owner_plugin = inner.owner_plugin(&owner_instance);
         let entry = Arc::new(DeviceState {
             device_id,
             capability,
@@ -554,8 +632,10 @@ impl DeviceStateStore {
             observed_ms,
             source_generation: generation,
             owner_instance,
+            owner_plugin,
             quality: StateQuality::Fresh,
         });
+        inner.touch(&key);
         inner.entries.insert(key, entry);
     }
 
@@ -887,7 +967,10 @@ impl DeviceStateStore {
     #[must_use]
     pub fn issue_cursor(&self, pinned_revision: u64, after_device_id: &str) -> String {
         let inner = self.inner_read();
-        let payload = format!("{}.{pinned_revision}.{after_device_id}", inner.epoch);
+        let payload = format!(
+            "{}.{}.{pinned_revision}.{after_device_id}",
+            inner.epoch, inner.boot
+        );
         let mac = hmac_sha256(&inner.cursor_secret, payload.as_bytes());
         let mut hex = String::with_capacity(32);
         for b in &mac[..16] {
@@ -925,8 +1008,9 @@ impl DeviceStateStore {
     /// See [`CursorError`].
     pub fn verify_cursor(&self, raw: &str) -> Result<(String, u64, String), CursorError> {
         let (payload, mac_hex) = raw.rsplit_once('.').ok_or(CursorError::Bad)?;
-        let mut parts = payload.splitn(3, '.');
+        let mut parts = payload.splitn(4, '.');
         let epoch = parts.next().ok_or(CursorError::Bad)?;
+        let boot = parts.next().ok_or(CursorError::Bad)?;
         let rev = parts.next().ok_or(CursorError::Bad)?;
         let device = parts.next().ok_or(CursorError::Bad)?;
         if epoch.is_empty() || device.is_empty() || mac_hex.len() != 32 {
@@ -938,7 +1022,9 @@ impl DeviceStateStore {
         // pre-restart cursor cleanly surfaces as
         // `EpochChanged` even though its MAC is signed
         // with the previous life's secret.
-        if epoch != inner.epoch {
+        // H2: the epoch survives a clean restart, the cursor secret
+        // doesn't; a cursor from an earlier process is a restart too.
+        if epoch != inner.epoch || boot != inner.boot {
             return Err(CursorError::EpochChanged);
         }
         let expected = hmac_sha256(&inner.cursor_secret, payload.as_bytes());
@@ -1010,7 +1096,12 @@ impl DeviceStateStore {
     #[must_use]
     pub fn deltas_since_with_revision(&self, since_revision: u64, limit: usize) -> DeltaPage {
         let inner = self.inner_read();
-        if since_revision > inner.global_revision || since_revision < inner.evicted_through_revision
+        if since_revision > inner.global_revision
+            || since_revision < inner.evicted_through_revision
+            || inner
+                .holes
+                .iter()
+                .any(|&(lo, hi)| since_revision > lo && since_revision <= hi)
         {
             return DeltaPage {
                 epoch: inner.epoch.clone(),
@@ -1118,6 +1209,7 @@ impl DeviceStateStore {
         // as `write_entry` so post-restart writes stamp the right
         // generation onto the reseeded slots.
         let generation = inner.generations.get(owner_instance).copied().unwrap_or(0);
+        let owner_plugin = inner.owner_plugin(owner_instance);
         for (capability, fields) in initial_state {
             // H9 round-16 finding 1: canonicalize the input
             // by folding duplicate keys last-wins BEFORE
@@ -1148,8 +1240,10 @@ impl DeviceStateStore {
                 observed_ms,
                 source_generation: generation,
                 owner_instance: owner_instance.to_string(),
+                owner_plugin: owner_plugin.clone(),
                 quality: StateQuality::Fresh,
             });
+            inner.touch(&key);
             inner.entries.insert(key, entry);
         }
     }
@@ -1197,6 +1291,7 @@ impl DeviceStateStore {
                 quality: StateQuality::Stale,
                 ..(*prev).clone()
             });
+            inner.touch(key);
             inner.entries.insert(key.clone(), updated);
         }
         Self::enforce_stale_cap_locked(inner);
@@ -1249,6 +1344,7 @@ impl DeviceStateStore {
         stale_by_age.sort_by_key(|(rev, _)| *rev);
         for (rev, key) in stale_by_age.into_iter().take(excess) {
             inner.entries.remove(&key);
+            inner.touch(&key);
             // Round-7 finding 1: advance the watermark to the
             // highest evicted revision. Cursors at or below
             // this value need a reset (they may have missed
@@ -2921,15 +3017,16 @@ mod tests {
 
         // Mutate the pinned revision — MAC fails.
         let (payload, mac) = cursor.rsplit_once('.').unwrap();
-        let mut parts = payload.splitn(3, '.');
+        let mut parts = payload.splitn(4, '.');
         let stored_epoch = parts.next().unwrap();
+        let stored_boot = parts.next().unwrap();
         let _rev = parts.next().unwrap();
         let stored_device = parts.next().unwrap();
-        let mutated = format!("{stored_epoch}.999.{stored_device}.{mac}");
+        let mutated = format!("{stored_epoch}.{stored_boot}.999.{stored_device}.{mac}");
         assert_eq!(store.verify_cursor(&mutated), Err(CursorError::Bad));
 
         // Mutate the device id — MAC fails.
-        let mutated = format!("{stored_epoch}.42.dev-forged.{mac}");
+        let mutated = format!("{stored_epoch}.{stored_boot}.42.dev-forged.{mac}");
         assert_eq!(store.verify_cursor(&mutated), Err(CursorError::Bad));
 
         // A cursor issued by a *different* store fails.
