@@ -1019,6 +1019,77 @@ async fn guest_call<T>(
     tokio::time::timeout(STOP_GRACE, call).await.ok()
 }
 
+/// The supervisor's control receiver. When the supervisor ends, the
+/// commands still queued are refused (`rejected`: they never ran)
+/// instead of dropped, and a queued command whose caller disconnected
+/// gets its H5 resolution row here, since nobody else will write it.
+struct ControlQueue {
+    rx: mpsc::Receiver<ControlCommand>,
+    audit: Arc<crate::state::AuditLog>,
+    instance_id: Arc<str>,
+}
+
+impl std::ops::Deref for ControlQueue {
+    type Target = mpsc::Receiver<ControlCommand>;
+    fn deref(&self) -> &Self::Target {
+        &self.rx
+    }
+}
+
+impl std::ops::DerefMut for ControlQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rx
+    }
+}
+
+impl Drop for ControlQueue {
+    fn drop(&mut self) {
+        self.rx.close();
+        let instance_id = &self.instance_id;
+        while let Ok(command) = self.rx.try_recv() {
+            match command {
+                ControlCommand::Shutdown { reply } => {
+                    let _ = reply.send(());
+                }
+                ControlCommand::Execute {
+                    ctx,
+                    device,
+                    cmd,
+                    ticket,
+                    reply,
+                } => {
+                    // `false` only if the plugin was entered, which a
+                    // command still in the channel never was.
+                    if !ticket.try_abandon() {
+                        continue;
+                    }
+                    let refused = CommandOutcome::Rejected {
+                        error: WitError::Unavailable(format!(
+                            "instance `{instance_id}` stopped before running the command",
+                        )),
+                    };
+                    if let Err(outcome) = reply.send(refused)
+                        && !ticket.withdrawn_by_caller()
+                    {
+                        super::command::record_resolution(
+                            Some(&self.audit),
+                            &ctx,
+                            &cmd.id,
+                            &device,
+                            &outcome,
+                        );
+                    }
+                }
+                ControlCommand::ExecuteService { reply, .. } => {
+                    let _ = reply.send(Err(anyhow!(
+                        "instance `{instance_id}` stopped before running the service command",
+                    )));
+                }
+            }
+        }
+    }
+}
+
 /// What the run loop should do after a `select!` arm completes.
 enum LoopAction {
     /// Stay in the loop (after draining pending events).
@@ -1203,10 +1274,15 @@ async fn run_supervisor(
     component_cache: Option<Arc<ComponentCache>>,
 ) {
     let Channels {
-        control: mut control_rx,
+        control,
         state: state_tx,
         stop: mut stop_rx,
     } = channels;
+    let mut control_rx = ControlQueue {
+        rx: control,
+        audit: engine.audit_log(),
+        instance_id: Arc::clone(&instance_id),
+    };
     // C2d — the pre-C2d supervisor eagerly subscribed to
     // `subscribe_all()` so every published event woke every
     // supervisor system-wide (F2 amplification). That subscription
@@ -1402,19 +1478,29 @@ async fn run_one_lifecycle(
     transition(state_tx, instance_id, InstanceState::Loading);
 
     // `None` pin: the un-pinned test-suite path re-reads the manifest.
-    let load_result = PluginInstance::load_supervised(
-        engine,
-        plugin_dir,
-        instance_id.to_string(),
-        overrides,
-        mode.clone(),
-        pinned_manifest,
-        supervised,
+    // Instantiation runs component start functions, so a stop cancels
+    // it like any other guest call.
+    let load_result = guest_call(
+        stop,
+        PluginInstance::load_supervised(
+            engine,
+            plugin_dir,
+            instance_id.to_string(),
+            overrides,
+            mode.clone(),
+            pinned_manifest,
+            supervised,
+        ),
     )
     .await;
     let mut instance = match load_result {
-        Ok(instance) => instance,
-        Err(e) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
+        Some(Ok(instance)) => instance,
+        Some(Err(e)) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
+        None => {
+            tracing::warn!(instance_id, "stop requested while loading; load cancelled");
+            transition(state_tx, instance_id, InstanceState::Stopped);
+            return LifecycleOutcome::Stopped;
+        }
     };
     // The installation UUID is now known and stable across
     // every subsequent restart of this supervisor (same
@@ -1559,23 +1645,29 @@ async fn serve_loop(
     mut tick: Option<Interval>,
 ) -> ServeOutcome {
     loop {
+        let next = async {
+            tokio::select! {
+                ctrl = control_rx.recv() => Wakeup::Control(ctrl),
+                // `if tick.is_some()` gates the `unwrap` — the arm is only
+                // polled when an interval exists.
+                _ = async { tick.as_mut().unwrap().tick().await }, if tick.is_some() => Wakeup::Tick,
+                // C2d wake path — signaled by `EventBus::signal_wakes`
+                // when a published event matches one of the plugin's
+                // active subscription filters. `Notify` deduplicates
+                // multiple `notify_one` calls that land between two
+                // `notified().await`s to a single wake, so a burst of
+                // matching publishes drains together in one pass —
+                // exactly the behaviour we want.
+                () = wake.notified() => Wakeup::Event,
+            }
+        };
+        // A requested stop goes first: queued commands are then refused
+        // without running (see `ControlQueue`). The others are polled
+        // fairly, so a stream of commands can't starve the tick.
         let wakeup = tokio::select! {
-            // A requested stop goes first: queued commands are then
-            // dropped with the channel and refused without running.
             biased;
             () = stop_requested(stop) => Wakeup::Stop,
-            ctrl = control_rx.recv() => Wakeup::Control(ctrl),
-            // `if tick.is_some()` gates the `unwrap` — the arm is only
-            // polled when an interval exists.
-            _ = async { tick.as_mut().unwrap().tick().await }, if tick.is_some() => Wakeup::Tick,
-            // C2d wake path — signaled by `EventBus::signal_wakes`
-            // when a published event matches one of the plugin's
-            // active subscription filters. `Notify` deduplicates
-            // multiple `notify_one` calls that land between two
-            // `notified().await`s to a single wake, so a burst of
-            // matching publishes drains together in one pass —
-            // exactly the behaviour we want.
-            () = wake.notified() => Wakeup::Event,
+            wakeup = next => wakeup,
         };
         let outcome: anyhow::Result<LoopAction> = match wakeup {
             Wakeup::Stop => Ok(shutdown_on_request(instance, state_tx, instance_id).await),
@@ -1590,6 +1682,9 @@ async fn serve_loop(
         };
 
         match outcome {
+            // A stop requested meanwhile goes straight to shutdown,
+            // without entering new event handlers.
+            Ok(LoopAction::Continue) if *stop.borrow() => {}
             Ok(LoopAction::Continue) => match guest_call(stop, instance.drain_events()).await {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),

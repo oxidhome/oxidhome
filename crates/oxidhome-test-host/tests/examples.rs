@@ -876,6 +876,55 @@ async fn command_deadline_before_and_after_start() {
     assert!(error.contains("unresponsive"), "{error}");
 }
 
+/// A stop while a command runs and another waits behind it: the
+/// running one ends `outcome_unknown` (the watchdog interrupts the
+/// spinning guest), the queued one is refused without running
+/// (`rejected`), and the instance ends `Stopped`: the stop wins over
+/// the crash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_refuses_queued_commands() {
+    let staged = stage_unchanged(HANG);
+    let host = TestHost::new().unwrap();
+    let hang = host
+        .start_with(
+            staged.path(),
+            LoadOptions::new()
+                .config(config("phase = \"command\""))
+                .supervision(SupervisorTuning {
+                    watchdog: Duration::from_secs(1),
+                    ..test_supervision()
+                }),
+        )
+        .await
+        .unwrap();
+    hang.wait_for_running().await.unwrap();
+    let device = only_device(&hang);
+
+    let (running, queued, ()) = tokio::join!(
+        hang.send_command(device.clone(), switch_command("toggle", Vec::new())),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            hang.send_command(device.clone(), switch_command("toggle", Vec::new()))
+                .await
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            hang.handle().request_stop();
+        },
+    );
+    assert!(
+        matches!(running.outcome, CommandOutcome::Unknown { .. }),
+        "{running:?}"
+    );
+    match &queued.outcome {
+        CommandOutcome::Rejected { error } => {
+            assert!(error.to_string().contains("stopped before"), "{error}");
+        }
+        other => panic!("expected rejected, got {other:?}"),
+    }
+    assert_eq!(hang.wait_terminal().await, InstanceState::Stopped);
+}
+
 /// `accepted`: the caller hears it at once, the plugin completes the
 /// command on its next tick with `complete-command`, and the pending
 /// entry goes away with the state projected and published.

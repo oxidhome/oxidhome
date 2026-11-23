@@ -1261,8 +1261,19 @@ impl Engine {
             if let Some(slot) = &slot
                 && engine.sandboxes.is_retired(slot)
             {
+                // A sandbox removed before it finished loading has no
+                // installation of its own yet; it runs its parent's.
+                let installation = reaper_handle
+                    .installation_uuid()
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        engine
+                            .instances
+                            .get(&slot.parent)
+                            .and_then(|parent| parent.installation_uuid().map(str::to_owned))
+                    });
                 engine
-                    .retire_sandbox_instance(&instance_id, reaper_handle.installation_uuid())
+                    .retire_sandbox_instance(&instance_id, installation.as_deref())
                     .await;
             }
             engine.instances.unregister(&instance_id, &plugin_id);
@@ -1334,8 +1345,8 @@ impl Engine {
     async fn retire_sandbox_instance(&self, instance_id: &str, installation_uuid: Option<&str>) {
         self.device_state.forget_instance(instance_id);
         self.events.forget_instance(instance_id);
-        // No installation: the sandbox never loaded, so it stored
-        // nothing.
+        // No installation: neither the sandbox nor its parent ever
+        // loaded, so it stored nothing.
         let Some(installation_uuid) = installation_uuid else {
             return;
         };

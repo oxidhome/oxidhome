@@ -996,7 +996,18 @@ impl PluginInstance {
         // component start functions included.
         let mut state = state;
         state.sandbox = sandbox;
-        let installation_for_cache = Arc::clone(&state.installation_uuid);
+        // Publish the verified component before any guest code runs,
+        // so a sandbox started from it can't compile other bytes.
+        if compiled.cached.is_none()
+            && let Some(cache) = compiled.cache
+        {
+            cache.fill(CachedComponent {
+                wasm_path: wasm_path.to_path_buf(),
+                wasm_bytes: Arc::clone(wasm_bytes),
+                component: component.clone(),
+                installation_uuid: Arc::clone(&state.installation_uuid),
+            });
+        }
         let mut store = Store::new(engine.raw(), state);
         // C4: install the wasmtime resource limiter so linear-memory
         // grows / table extensions / additional instance/memory/table
@@ -1022,17 +1033,6 @@ impl PluginInstance {
             .await
             .map_err(anyhow::Error::from)
             .context("instantiating plugin component")?;
-
-        if compiled.cached.is_none()
-            && let Some(cache) = compiled.cache
-        {
-            cache.fill(CachedComponent {
-                wasm_path: wasm_path.to_path_buf(),
-                wasm_bytes: Arc::clone(wasm_bytes),
-                component,
-                installation_uuid: installation_for_cache,
-            });
-        }
 
         Ok(Self {
             bindings,

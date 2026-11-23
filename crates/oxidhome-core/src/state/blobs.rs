@@ -1062,30 +1062,49 @@ impl BlobStore {
         check_instance_id(instance_id)?;
         let uuid_owned = installation_uuid.to_owned();
         let instance_owned = instance_id.to_owned();
-        let deleted = self.db.write(move |conn| -> Result<usize, BlobError> {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let usage_rows = tx.execute(
-                "DELETE FROM blob_usage WHERE installation_uuid = ?1 AND instance_id = ?2",
-                params![uuid_owned, instance_owned],
-            )?;
-            let blob_rows = tx.execute(
-                "DELETE FROM blob WHERE installation_uuid = ?1 AND instance_id = ?2",
-                params![uuid_owned, instance_owned],
-            )?;
-            tx.commit()?;
-            Ok(usage_rows + blob_rows)
-        })?;
+        let (deleted, ids) =
+            self.db
+                .write(move |conn| -> Result<(usize, Vec<String>), BlobError> {
+                    let tx =
+                        conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    let ids = {
+                        let mut stmt = tx.prepare(
+                            "SELECT id FROM blob WHERE installation_uuid = ?1 AND instance_id = ?2",
+                        )?;
+                        stmt.query_map(params![uuid_owned, instance_owned], |row| {
+                            row.get::<_, String>(0)
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                    };
+                    let usage_rows = tx.execute(
+                        "DELETE FROM blob_usage WHERE installation_uuid = ?1 AND instance_id = ?2",
+                        params![uuid_owned, instance_owned],
+                    )?;
+                    let blob_rows = tx.execute(
+                        "DELETE FROM blob WHERE installation_uuid = ?1 AND instance_id = ?2",
+                        params![uuid_owned, instance_owned],
+                    )?;
+                    tx.commit()?;
+                    Ok((usage_rows + blob_rows, ids))
+                })?;
         if let Some(blobs_root) = self.blobs_root.as_deref() {
             let instance_dir = instance_dir_for(blobs_root, installation_uuid, instance_id);
             ensure_contained(blobs_root, &instance_dir)?;
-            if instance_dir.exists() {
-                std::fs::remove_dir_all(&instance_dir).map_err(|source| BlobError::Io {
-                    path: instance_dir.clone(),
-                    source,
-                })?;
-                if let Some(install_dir) = instance_dir.parent() {
-                    fsync_dir(install_dir)?;
-                }
+            // Unlink only this instance's indexed files, then the
+            // directory if that left it empty: on a case-insensitive
+            // filesystem two instance ids can share the directory.
+            // A file already gone is fine; one this instance doesn't
+            // index keeps the directory.
+            for id in &ids {
+                let _ = std::fs::remove_file(instance_dir.join(id));
+            }
+            let _ = std::fs::remove_dir(instance_dir.join(".tmp"));
+            if std::fs::remove_dir(&instance_dir).is_ok()
+                && let Some(install_dir) = instance_dir.parent()
+            {
+                fsync_dir(install_dir)?;
+            } else if instance_dir.exists() {
+                fsync_dir(&instance_dir)?;
             }
         }
         Ok(deleted)
@@ -1658,6 +1677,26 @@ mod tests {
             b"bbb"
         );
         assert_eq!(store.purge_instance(INST_A, "main~a").expect("again"), 0);
+    }
+
+    #[test]
+    fn purge_instance_leaves_files_it_does_not_index() {
+        // Stands in for another instance sharing the directory on a
+        // case-insensitive filesystem (`Main~a` vs `main~a`).
+        let (store, dir) = store_with_root();
+        store
+            .register_instance(INST_A, "main~a", 4096)
+            .expect("register a");
+        store
+            .write(INST_A, "main~a", "x", b"aaa", None)
+            .expect("write a");
+        let a_dir = dir.path.join(INST_A).join("main~a");
+        let foreign = a_dir.join("not-mine");
+        std::fs::write(&foreign, b"keep").expect("foreign file");
+
+        store.purge_instance(INST_A, "main~a").expect("purge");
+        assert_eq!(std::fs::read(&foreign).expect("still there"), b"keep");
+        assert_eq!(std::fs::read_dir(&a_dir).expect("dir").count(), 1);
     }
 
     #[test]
