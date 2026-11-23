@@ -322,8 +322,9 @@ fn read_state(device: &str) -> Command {
 
 /// H2: a plugin reads another plugin's device state through
 /// `host-state` only with a matching `reads_state` grant; a refused
-/// read is a `permission-denied` with an audit `deny` row, and
-/// `list-state` leaves the device out.
+/// read is the same `not-found` as for an unknown device (plus an
+/// operator-side audit `deny` row), and `list-state` leaves the
+/// device out.
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn plugin_reads_device_state_only_with_a_grant() {
