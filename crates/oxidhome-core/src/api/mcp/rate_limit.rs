@@ -71,9 +71,11 @@
 //!
 //! Between the two buckets the `TokenStore::verify_read_only`
 //! call runs off the async worker via
-//! `tokio::task::spawn_blocking` — `Db::read` uses the shared
-//! `SQLite` mutex and its own docs require blocking-pool
-//! isolation for async callers (round-4 P1 on PR #140).
+//! `tokio::task::spawn_blocking` — `Db::read` is synchronous
+//! `SQLite` work that can wait for one of the few pooled reader
+//! connections (or the writer, on an in-memory database), and its
+//! own docs require blocking-pool isolation for async callers
+//! (round-4 P1 on PR #140).
 //!
 //! # Wire shape
 //!

@@ -327,10 +327,10 @@ fn mount_inner(
     // getting a fresh capacity-60 slot. Round-4 P1 added a
     // coarse global ingress bucket in front of the verify so
     // a flood of syntactically-valid-but-unknown tokens can't
-    // push serialized SELECTs through the shared SQLite mutex
-    // before either bucket returns 429; the verify itself now
-    // runs on the blocking pool via spawn_blocking (Db::read
-    // uses a std::sync::Mutex). Tests that need to drive the
+    // push SELECTs through the small SQLite reader pool before
+    // either bucket returns 429; the verify itself runs on the
+    // blocking pool via spawn_blocking (Db::read is synchronous
+    // and can wait for a pooled reader). Tests that need to drive the
     // 429 shape override the limiter via
     // `mount_routes_with_rate_limiter`.
     //

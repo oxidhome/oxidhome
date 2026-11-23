@@ -757,7 +757,13 @@ impl BlobStore {
         // Windows lacks that semantic, but the store's own
         // atomic-rename write path prevents the reader from
         // observing a partial write regardless of platform.
-        let (info, mut file) = self.db.read(|conn| -> Result<_, BlobError> {
+        //
+        // M6: this runs on the writer, not the read pool. A pooled
+        // reader's snapshot can predate an overwrite that commits
+        // and unlinks the old file before the open; the writer
+        // serializes lookup + open against the overwrite commit,
+        // which is what the fix above relies on.
+        let (info, mut file) = self.db.write(|conn| -> Result<_, BlobError> {
             // Round-10 F1 on PR #122: filter out over-cap
             // legacy mimes at select time — see
             // [`BLOB_SELECT_COLUMNS`] for the projection.

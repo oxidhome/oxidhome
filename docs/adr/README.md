@@ -17,3 +17,4 @@ free number.
 | [0005](0005-connect-rpc-alongside-rest.md)            | Connect RPC alongside the JSON/REST API                             | accepted | 2026-07-28 |
 | [0006](0006-resource-ceilings.md)                     | Host resource ceilings replace "no compute limits" (C4)             | accepted | 2026-07-31 |
 | [0007](0007-0x-publication-policy.md)                 | 0.x publication policy and the unpublished WIT baseline             | accepted | 2026-11-22 |
+| [0008](0008-sqlite-connection-model.md)               | One SQLite writer with pooled readers and writer priority (M6)      | accepted | 2026-11-22 |
