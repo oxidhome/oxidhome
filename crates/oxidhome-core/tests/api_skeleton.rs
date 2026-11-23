@@ -3237,10 +3237,10 @@ async fn rest_trap_after_start_is_outcome_unknown() {
     assert_eq!(body["outcome"], "outcome_unknown", "{body:?}");
     assert_eq!(body["retry_safe"], false, "{body:?}");
     assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("crashed during execute-command")),
-        "{body:?}"
+        body["message"].as_str().is_some_and(
+            |m| m.contains("crashed during execute-command") && !m.contains("backtrace")
+        ),
+        "the caller gets a short message, not the trap chain: {body:?}"
     );
     let command_id = body["command_id"].as_str().expect("command id");
     let row = engine

@@ -1349,20 +1349,34 @@ async fn run_execute(
         Ok(result) => (CommandOutcome::from_plugin(result), None),
         // An `execute-command` trap is a crash. The plugin was
         // entered, so whatever it did to the device may stand.
-        Err(trap) => (
-            CommandOutcome::Unknown {
-                message: format!(
-                    "instance `{instance_id}` crashed during execute-command: {trap:#}",
-                ),
-            },
-            Some(trap),
-        ),
+        // The caller gets a short message; the trap detail (wasm
+        // backtrace) stays in the instance's failure reason and logs.
+        Err(trap) => {
+            tracing::warn!(
+                instance_id = %instance_id,
+                command_id = %command_id,
+                error = %format!("{trap:#}"),
+                "execute-command trapped; command outcome unknown",
+            );
+            (
+                CommandOutcome::Unknown {
+                    message: format!(
+                        "instance `{instance_id}` crashed during execute-command; the \
+                         command may have taken effect",
+                    ),
+                },
+                Some(trap),
+            )
+        }
     };
-    if let Err(outcome) = reply.send(outcome) {
+    if let Err(outcome) = reply.send(outcome)
+        && !matches!(outcome, CommandOutcome::Accepted)
+    {
         // The caller stopped waiting (deadline or disconnect)
         // after the plugin was entered and reported
         // `outcome_unknown`; record how the command really
-        // ended.
+        // ended. A late `accepted` is skipped: the pending entry
+        // records the terminal outcome.
         super::command::record_resolution(
             instance.audit_log().as_ref(),
             &root_ctx,

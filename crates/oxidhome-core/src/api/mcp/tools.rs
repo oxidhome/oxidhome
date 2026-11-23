@@ -1168,18 +1168,6 @@ pub(super) const CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS: &str =
 pub(super) const CONSTRAINT_PLUGINS_START_PLUGINS: &str = "constraint:plugins.start:plugins";
 pub(super) const CONSTRAINT_PLUGINS_INSTALL_PLUGINS: &str = "constraint:plugins.install:plugins";
 
-/// Cap on the plugin-supplied error message before we let it
-/// enter any JSON serialisation. The WIT contract lets a
-/// plugin's `command-result::err` payload carry an
-/// unconstrained string — a misbehaving guest could push
-/// close to its 128 MiB memory ceiling of text and drive the
-/// host into two full copies (once through
-/// `serde_json::to_value`, once through
-/// `CallToolResult::structured_error`) before any downstream
-/// bound sees it. 4 KiB is generous for a real error message
-/// while capping the runaway path (round-1 F2 on PR #123).
-const MAX_PLUGIN_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
-
 async fn device_send_command_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
@@ -1257,15 +1245,12 @@ async fn device_send_command_call(
             .collect(),
     };
 
-    let mut report = handle
+    let report = handle
         .execute_command_in(invocation, args.device_id, cmd)
         .await;
 
-    // Round-1 F2 on PR #123: truncate plugin-supplied text BEFORE the
-    // wire conversion + `serde_json::Value` copies; a misbehaving
-    // plugin can push arbitrarily many bytes into an `err` or
-    // `unknown` reply.
-    report.outcome = truncate_plugin_text(report.outcome);
+    // Round-1 F2 on PR #123: plugin-supplied text is already capped
+    // (`runtime::command::cap_plugin_text`) before any wire copy.
     let audit = crate::api::auth::DomainOutcome::from_report(&report);
     let is_error = !matches!(
         report.outcome,
@@ -1285,51 +1270,6 @@ async fn device_send_command_call(
             ToolOutcome::Internal("failed to serialise command result".into())
         }
     }
-}
-
-/// Truncate plugin-supplied text (a `rejected` WIT `error` message or
-/// an `outcome_unknown` message) to [`MAX_PLUGIN_ERROR_MESSAGE_BYTES`]
-/// BEFORE it reaches the wire-conversion helpers. `truncate` operates
-/// on UTF-8 char boundaries, so we back the cap off to the largest char
-/// boundary that's ≤ the cap — avoids splitting a multi-byte character.
-fn truncate_plugin_text(outcome: CommandOutcome) -> CommandOutcome {
-    use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
-    match outcome {
-        CommandOutcome::Rejected { error } => CommandOutcome::Rejected {
-            error: match error {
-                WitError::NotFound(m) => WitError::NotFound(cap_message(m)),
-                WitError::InvalidArgument(m) => WitError::InvalidArgument(cap_message(m)),
-                WitError::PermissionDenied(m) => WitError::PermissionDenied(cap_message(m)),
-                WitError::Unavailable(m) => WitError::Unavailable(cap_message(m)),
-                WitError::Internal(m) => WitError::Internal(cap_message(m)),
-            },
-        },
-        CommandOutcome::Unknown { message } => CommandOutcome::Unknown {
-            message: cap_message(message),
-        },
-        other => other,
-    }
-}
-
-fn cap_message(mut m: String) -> String {
-    if m.len() > MAX_PLUGIN_ERROR_MESSAGE_BYTES {
-        // Walk back to the largest char boundary ≤ cap so
-        // `truncate` doesn't panic on multi-byte characters.
-        let mut cap = MAX_PLUGIN_ERROR_MESSAGE_BYTES;
-        while !m.is_char_boundary(cap) {
-            cap -= 1;
-        }
-        let original_len = m.len();
-        m.truncate(cap);
-        tracing::warn!(
-            target: "mcp.tool.device.send_command",
-            original_len,
-            cap = MAX_PLUGIN_ERROR_MESSAGE_BYTES,
-            "plugin error message exceeded cap — truncated",
-        );
-        m.push_str("… [truncated by host]");
-    }
-    m
 }
 
 // ── logs.query ──────────────────────────────────────────────────
@@ -3197,45 +3137,6 @@ fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome
         invocation: None,
         command_id: None,
         command_outcome: None,
-    }
-}
-
-#[cfg(test)]
-mod message_cap_tests {
-    use super::{MAX_PLUGIN_ERROR_MESSAGE_BYTES, cap_message};
-
-    #[test]
-    fn passes_through_short_messages_unchanged() {
-        let short = "brief plugin error".to_string();
-        assert_eq!(cap_message(short.clone()), short);
-    }
-
-    #[test]
-    fn truncates_over_cap_ascii_message() {
-        let big = "x".repeat(MAX_PLUGIN_ERROR_MESSAGE_BYTES + 100);
-        let out = cap_message(big);
-        assert!(
-            out.len() <= MAX_PLUGIN_ERROR_MESSAGE_BYTES + 32,
-            "capped output {} B must fit within cap + suffix; got {}",
-            MAX_PLUGIN_ERROR_MESSAGE_BYTES,
-            out.len(),
-        );
-        assert!(out.ends_with("[truncated by host]"));
-    }
-
-    #[test]
-    fn truncation_respects_utf8_char_boundaries() {
-        // Fill the message with 4-byte emojis so a naïve
-        // byte truncation at exactly the cap would split a
-        // scalar. `cap_message` walks back to the largest
-        // safe boundary — the output is always valid UTF-8.
-        let emoji = "😀";
-        assert_eq!(emoji.len(), 4);
-        let big: String = emoji.repeat((MAX_PLUGIN_ERROR_MESSAGE_BYTES / 4) + 100);
-        assert!(big.len() > MAX_PLUGIN_ERROR_MESSAGE_BYTES);
-        let out = cap_message(big);
-        assert!(out.is_char_boundary(out.len() - "… [truncated by host]".len()));
-        assert!(out.ends_with("[truncated by host]"));
     }
 }
 

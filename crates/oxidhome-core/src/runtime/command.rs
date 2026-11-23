@@ -160,8 +160,12 @@ impl CommandOutcome {
         match result {
             CommandResult::Ok => Self::Completed { state: None },
             CommandResult::OkWithState(state) => Self::Completed { state: Some(state) },
-            CommandResult::Err(error) => Self::Rejected { error },
-            CommandResult::Unknown(message) => Self::Unknown { message },
+            CommandResult::Err(error) => Self::Rejected {
+                error: cap_wit_error(error),
+            },
+            CommandResult::Unknown(message) => Self::Unknown {
+                message: cap_plugin_text(message),
+            },
             CommandResult::Accepted => Self::Accepted,
         }
     }
@@ -229,6 +233,19 @@ impl DispatchTicket {
             .compare_exchange(QUEUED, to, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => true,
+            // The supervisor refused it first; a caller about to
+            // report `timed_out` itself takes over the audit write.
+            Err(ABANDONED) => {
+                if to == WITHDRAWN {
+                    let _ = self.0.compare_exchange(
+                        ABANDONED,
+                        WITHDRAWN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                true
+            }
             Err(current) => current != STARTED,
         }
     }
@@ -559,6 +576,34 @@ pub(crate) fn complete_command(
     Ok(())
 }
 
+/// Longest plugin-supplied message (an `err` or `unknown` reply) the
+/// host passes on; longer text is cut at a char boundary.
+pub const MAX_PLUGIN_MESSAGE_BYTES: usize = 4 * 1024;
+
+/// Cap plugin-supplied text at [`MAX_PLUGIN_MESSAGE_BYTES`] before any
+/// transport copies or encodes it.
+pub(crate) fn cap_plugin_text(mut m: String) -> String {
+    if m.len() > MAX_PLUGIN_MESSAGE_BYTES {
+        let mut cap = MAX_PLUGIN_MESSAGE_BYTES;
+        while !m.is_char_boundary(cap) {
+            cap -= 1;
+        }
+        m.truncate(cap);
+        m.push_str("… [truncated by host]");
+    }
+    m
+}
+
+fn cap_wit_error(error: WitError) -> WitError {
+    match error {
+        WitError::NotFound(m) => WitError::NotFound(cap_plugin_text(m)),
+        WitError::InvalidArgument(m) => WitError::InvalidArgument(cap_plugin_text(m)),
+        WitError::PermissionDenied(m) => WitError::PermissionDenied(cap_plugin_text(m)),
+        WitError::Unavailable(m) => WitError::Unavailable(cap_plugin_text(m)),
+        WitError::Internal(m) => WitError::Internal(cap_plugin_text(m)),
+    }
+}
+
 fn duration_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
@@ -678,7 +723,10 @@ mod tests {
         // Abandoned by the supervisor first: the caller still learns
         // the command never ran.
         assert!(t.try_withdraw());
-        assert!(!t.withdrawn_by_caller());
+        assert!(
+            t.withdrawn_by_caller(),
+            "the caller owns the timeout report"
+        );
 
         let t = DispatchTicket::default();
         assert!(t.try_withdraw());
@@ -799,5 +847,44 @@ mod tests {
         table.expire_owner("inst-a", "instance restarted");
         assert_eq!(table.len(), 1);
         assert!(table.take("inst-b", &b).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod message_cap_tests {
+    use super::{MAX_PLUGIN_MESSAGE_BYTES, cap_plugin_text};
+
+    #[test]
+    fn passes_through_short_messages_unchanged() {
+        let short = "brief plugin error".to_string();
+        assert_eq!(cap_plugin_text(short.clone()), short);
+    }
+
+    #[test]
+    fn truncates_over_cap_ascii_message() {
+        let big = "x".repeat(MAX_PLUGIN_MESSAGE_BYTES + 100);
+        let out = cap_plugin_text(big);
+        assert!(
+            out.len() <= MAX_PLUGIN_MESSAGE_BYTES + 32,
+            "capped output {} B must fit within cap + suffix; got {}",
+            MAX_PLUGIN_MESSAGE_BYTES,
+            out.len(),
+        );
+        assert!(out.ends_with("[truncated by host]"));
+    }
+
+    #[test]
+    fn truncation_respects_utf8_char_boundaries() {
+        // Fill the message with 4-byte emojis so a naïve
+        // byte truncation at exactly the cap would split a
+        // scalar. `cap_plugin_text` walks back to the largest
+        // safe boundary — the output is always valid UTF-8.
+        let emoji = "😀";
+        assert_eq!(emoji.len(), 4);
+        let big: String = emoji.repeat((MAX_PLUGIN_MESSAGE_BYTES / 4) + 100);
+        assert!(big.len() > MAX_PLUGIN_MESSAGE_BYTES);
+        let out = cap_plugin_text(big);
+        assert!(out.is_char_boundary(out.len() - "… [truncated by host]".len()));
+        assert!(out.ends_with("[truncated by host]"));
     }
 }
