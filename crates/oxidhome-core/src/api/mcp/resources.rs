@@ -342,14 +342,16 @@ pub(super) static AUDIT_QUEUE_SEMAPHORE: std::sync::LazyLock<
 /// running — drops any outer-scope permit but leaves the
 /// blocking task queued. Without a permit held inside the
 /// closure, repeat cancellations can pile up unbounded
-/// tasks behind the shared `SQLite` mutex.
+/// tasks waiting on `SQLite` connections.
 ///
 /// Sized TIGHTER than [`AUDIT_QUEUE_MAX`] (8 vs. 32):
-/// a query holds the shared `SQLite` mutex for a SELECT +
-/// row decode — cheap and short — while an audit write is
-/// an INSERT + index maintenance. Neither operation
-/// benefits from unbounded parallelism (the mutex serialises
-/// them anyway), so the tighter cap here is a
+/// on a file-backed database a query holds one of the
+/// `Db`'s four pooled reader connections for a SELECT +
+/// row decode — cheap and short — so of the 8 admitted tasks
+/// at most 4 run at once and the rest wait for a reader,
+/// while audit writes go through the separate writer. Neither
+/// operation benefits from unbounded parallelism, so the
+/// tighter cap here is a
 /// defense-in-depth choice for the disconnect-flood path,
 /// not a throughput bound. 8 concurrent SELECTs is a
 /// comfortable ceiling for a home hub; the mount's

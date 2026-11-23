@@ -390,10 +390,11 @@ impl LogStore {
         self.counters.written.load(Ordering::Relaxed)
     }
 
-    /// Number of writer-side `SQLite` errors. Used as a smoke check —
-    /// in normal operation this stays at zero. The writer keeps
-    /// running on failure so a single bad row doesn't kill the
-    /// store.
+    /// Number of log records lost to writer-side `SQLite` errors
+    /// (a failed batch counts every row in it, which keeps the
+    /// `flush` accounting per row). Used as a smoke check — in
+    /// normal operation this stays at zero. The writer keeps
+    /// running on failure so one bad batch doesn't kill the store.
     #[must_use]
     pub fn write_errors(&self) -> u64 {
         self.counters.write_errors.load(Ordering::Relaxed)

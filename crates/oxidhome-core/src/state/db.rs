@@ -988,11 +988,16 @@ impl Db {
         let path = state_dir.join(DB_FILE_NAME);
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database at {}", path.display()))?;
-        // The file exists now (the writer created it if needed), so a
-        // symlinked database file, even one that was dangling, can be
-        // pinned to the target the writer opened.
-        let path = std::fs::canonicalize(&path)
-            .with_context(|| format!("resolving {}", path.display()))?;
+        // Pin every later connection to the file the writer actually
+        // opened: `SQLite` reports the full pathname it resolved
+        // (symlinks included), so a link retargeted during or after
+        // startup can't split readers from the writer. Fall back to
+        // resolving the name ourselves if the path isn't UTF-8.
+        let path = match conn.path().filter(|p| !p.is_empty()) {
+            Some(opened) => PathBuf::from(opened),
+            None => std::fs::canonicalize(&path)
+                .with_context(|| format!("resolving {}", path.display()))?,
+        };
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("setting busy_timeout")?;
         // WAL: many concurrent readers + one writer, plus crash safety
