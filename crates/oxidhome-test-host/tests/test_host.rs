@@ -615,16 +615,18 @@ async fn plugin_reads_event_history_from_its_cursor() {
         vec![("topic", Value::StringVal("y.".into()))],
     )
     .await;
+    let y = record(custom("y.1"));
+    let x = record(custom("x.1"));
     host.engine()
         .events()
-        .publish_with_id(custom("y.1"), Some(20));
+        .publish_with_id(custom("y.1"), Some(y));
     host.engine()
         .events()
-        .publish_with_id(custom("x.1"), Some(21));
+        .publish_with_id(custom("x.1"), Some(x));
     assert_eq!(rec.deliver_pending_events().await.unwrap(), 2);
     let history = recorder_fields(&mut rec, "history", Vec::new()).await;
     assert_eq!(int_of(&history, "duplicates"), 1);
-    assert_eq!(int_of(&history, "cursor"), 21);
+    assert_eq!(int_of(&history, "cursor"), 8);
     drop(rec);
 
     // Retention pruned the rows after the saved cursor: the recorder
@@ -635,9 +637,9 @@ async fn plugin_reads_event_history_from_its_cursor() {
     let history = recorder_fields(&mut rec, "history", Vec::new()).await;
     assert!(matches!(history.get("expired"), Some(Value::BoolVal(true))));
     assert_eq!(int_of(&history, "caught_up"), 0);
-    assert_eq!(int_of(&history, "cursor"), 7);
+    assert_eq!(int_of(&history, "cursor"), 9);
     let expired = recorder_fields(&mut rec, "read-events", vec![("after", Value::IntVal(2))]).await;
-    assert_eq!(int_of(&expired, "expired_head_id"), 7);
+    assert_eq!(int_of(&expired, "expired_head_id"), 9);
     drop(rec);
 
     // With `reads_event_bytes` the frame comes back as written.
@@ -663,10 +665,10 @@ async fn plugin_reads_event_history_from_its_cursor() {
     let page = recorder_fields(
         &mut reader,
         "read-events",
-        vec![("after", Value::IntVal(7))],
+        vec![("after", Value::IntVal(9))],
     )
     .await;
-    assert_eq!(ids_of(&page), "8");
+    assert_eq!(ids_of(&page), "10");
     assert_eq!((int_of(&page, "bytes"), int_of(&page, "withheld")), (1, 0));
     let mut grant = reader.manifest().capabilities.clone();
     drop(reader);
@@ -684,7 +686,7 @@ async fn plugin_reads_event_history_from_its_cursor() {
     let page = recorder_fields(
         &mut narrowed,
         "read-events",
-        vec![("after", Value::IntVal(7))],
+        vec![("after", Value::IntVal(9))],
     )
     .await;
     assert_eq!((int_of(&page, "bytes"), int_of(&page, "withheld")), (0, 1));

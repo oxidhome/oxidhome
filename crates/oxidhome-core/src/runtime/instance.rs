@@ -18,7 +18,9 @@ use crate::auth::Actor;
 use crate::host_impl::plugin::Plugin as PluginBindings;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
-use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
+use crate::host_impl::plugin::oxidhome::plugin::types::{
+    DeviceId, KeyValue, ServiceId, SubscriptionId,
+};
 use crate::{MIN_SUPPORTED_SDK_VERSION, OXIDHOME_SDK_VERSION};
 
 use super::Engine;
@@ -209,7 +211,8 @@ pub struct PluginInstance {
     /// next drain: they were fanned out after the drain's cutoff, so
     /// an older event may still be on its way to another queue (see
     /// [`Self::collect_pending_events`]). Bounded by the queues.
-    deferred_events: Vec<(u64, Event)>,
+    /// Each entry is `(rows_through, subscription id, event)`.
+    deferred_events: Vec<(u64, SubscriptionId, Event)>,
 }
 
 /// H11 round-2 F1: caller-declared load provenance. Passed through
@@ -1403,10 +1406,13 @@ impl PluginInstance {
     fn collect_pending_events(&mut self) -> Vec<Event> {
         use crate::state::SubscriberMessage;
         let state = self.store.data_mut();
-        // Every event with a row id up to `cutoff` has reached (or is
-        // reaching) every queue; later ones may not have yet.
-        let cutoff = state.events.fanned_out_row_id();
+        // Every event with a row id up to `cutoff` has finished its
+        // fan-out (it is in every matching queue); later ones may not
+        // have yet.
+        let cutoff = state.events.row_watermark().get();
         let mut events = std::mem::take(&mut self.deferred_events);
+        // Held events of a subscription dropped since go with it.
+        events.retain(|(_, id, _)| state.subscriptions.iter().any(|s| s.id == *id));
         for sub in &mut state.subscriptions {
             // C2e: publish filters before enqueue, so every event
             // that reaches `try_recv` already matches. The
@@ -1441,7 +1447,7 @@ impl PluginInstance {
                 // write per subscription.
                 let ev = Arc::unwrap_or_clone(ev);
                 if sub.matches(&ev) {
-                    events.push((rows_through, ev));
+                    events.push((rows_through, sub.id, ev));
                 }
             }
         }
@@ -1452,20 +1458,20 @@ impl PluginInstance {
         // row-id order, so: publishes are serialized, `rows_through`
         // is the bus watermark at each fan-out (an event's own row
         // id, or the last one fanned out before an event without
-        // one), and events above the cutoff read before draining are
-        // held for the next drain, when every older event has reached
-        // its queues. The sort is stable, so order within a queue is
+        // one), and events above the cutoff (the bus's queued-row
+        // watermark, read before draining) are held for the next
+        // drain, when every older event has reached its queues. The sort is stable, so order within a queue is
         // kept. (Two events without a row id on different queues
         // share a key and keep drain order.)
-        events.sort_by_key(|(rows_through, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
-        let split = events.partition_point(|(rows_through, _)| *rows_through <= cutoff);
+        events.sort_by_key(|(rows_through, _, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
+        let split = events.partition_point(|(rows_through, _, _)| *rows_through <= cutoff);
         self.deferred_events = events.split_off(split);
         if !self.deferred_events.is_empty() {
             // Make sure a later drain picks them up even if their
             // wake was consumed by this one.
             state.wake.notify_one();
         }
-        events.into_iter().map(|(_, ev)| ev).collect()
+        events.into_iter().map(|(_, _, ev)| ev).collect()
     }
 
     /// The instance id this state was built with. Currently the plugin's

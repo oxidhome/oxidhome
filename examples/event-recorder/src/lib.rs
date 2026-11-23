@@ -116,9 +116,6 @@ impl Plugin for EventRecorder {
             self.duplicates += 1;
             return;
         }
-        if event.row_id.is_some() {
-            self.save_cursor();
-        }
         self.count += 1;
         // Render a stable shape on every event so the integration
         // test's log-capture assertion can match deterministically.
@@ -135,6 +132,11 @@ impl Plugin for EventRecorder {
             count = self.count,
             "event-recorder received event",
         );
+        // Checkpoint only once the event is handled, so a crash before
+        // this point replays it rather than skipping it.
+        if event.row_id.is_some() {
+            self.save_cursor();
+        }
     }
 
     fn execute_command(&mut self, _device: String, cmd: Command) -> CommandResult {

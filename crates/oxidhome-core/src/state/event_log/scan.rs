@@ -82,14 +82,16 @@ impl EventLog {
                 i64::try_from(scan_budget).unwrap_or(i64::MAX),
             ])?;
             let mut scanned = 0;
+            let mut bad = BadRows::default();
             while let Some(row) = rows.next()? {
                 scanned += 1;
                 let id = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
-                // An undecodable row is skipped (and logged) rather
-                // than failing every read that reaches it.
-                if let Some(mut event) = decode_row(row, id)? {
+                // An undecodable row is skipped (and logged once per
+                // scan) rather than failing every read that reaches it.
+                if let Some(mut event) = decode_row(row, id, &mut bad)? {
                     match step(&mut event) {
                         ScanStep::Full if !events.is_empty() => {
+                            bad.log();
                             return Ok(Ok(ScanPage {
                                 events,
                                 next_after_id: pos,
@@ -107,6 +109,7 @@ impl EventLog {
                 // to the snapshot's head has been seen.
                 pos = pos.max(head_id);
             }
+            bad.log();
             Ok(Ok(ScanPage {
                 events,
                 next_after_id: pos,
@@ -116,9 +119,35 @@ impl EventLog {
     }
 }
 
+/// Rows one scan skipped because their payload doesn't decode,
+/// reported in one log line per scan.
+#[derive(Default)]
+struct BadRows {
+    count: u64,
+    first: Option<(u64, String)>,
+}
+
+impl BadRows {
+    fn log(&self) {
+        if let Some((id, error)) = &self.first {
+            tracing::error!(
+                target: "state.event_log",
+                skipped = self.count,
+                first_id = id,
+                error = %error,
+                "event_log rows do not decode; skipped by the history scan",
+            );
+        }
+    }
+}
+
 /// Decode one `event_log` row selected by [`EventLog::scan_after_cursor`].
-/// A payload that doesn't decode yields `None` (with an error log).
-fn decode_row(row: &rusqlite::Row<'_>, id: u64) -> Result<Option<Event>, EventLogError> {
+/// A payload that doesn't decode yields `None` and is counted in `bad`.
+fn decode_row(
+    row: &rusqlite::Row<'_>,
+    id: u64,
+    bad: &mut BadRows,
+) -> Result<Option<Event>, EventLogError> {
     let blob: Vec<u8> = row.get(6)?;
     match serde_json::from_slice::<StoredEventPayload>(&blob) {
         Ok(stored) => Ok(Some(Event {
@@ -130,14 +159,10 @@ fn decode_row(row: &rusqlite::Row<'_>, id: u64) -> Result<Option<Event>, EventLo
             payload: stored.into_wit(),
         })),
         Err(err) => {
-            let topic: String = row.get(5)?;
-            tracing::error!(
-                target: "state.event_log",
-                id,
-                topic = %topic,
-                error = %err,
-                "event_log row does not decode; skipped by the history scan",
-            );
+            bad.count += 1;
+            if bad.first.is_none() {
+                bad.first = Some((id, err.to_string()));
+            }
             Ok(None)
         }
     }
