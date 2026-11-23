@@ -391,6 +391,8 @@ impl TestHost {
             supervision,
             secrets,
         } = self.prepare(plugin_dir, options).await?;
+        // Before the guest runs, as for `load_with`.
+        self.secrets.add(secrets.iter().map(String::as_str));
         let handle = self
             .engine
             .start_instance_with_tuning(
@@ -405,7 +407,6 @@ impl TestHost {
                 plugin_id,
                 source: e.into(),
             })?;
-        self.secrets.add(secrets.iter().map(String::as_str));
         Ok(SupervisedInstance::new(
             self.engine.clone(),
             handle,

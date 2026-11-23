@@ -661,7 +661,7 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
                 }
                 CommandOutcome::Rejected { error } => format!(" {}", render_error(error)),
                 CommandOutcome::TimedOut { message } | CommandOutcome::Unknown { message } => {
-                    format!(" {}", esc(&oxidhome_core::redact::redact_text(message)))
+                    format!(" {}", esc(&mask_json_doc(message)))
                 }
             };
             format!("{head} {}{detail}", outcome.as_str())
@@ -735,10 +735,7 @@ fn render_error(error: &WitError) -> String {
         WitError::Unavailable(m) => ("unavailable", m),
         WitError::Internal(m) => ("internal", m),
     };
-    format!(
-        "{kind}({:?})",
-        oxidhome_core::redact::redact_text(message).as_ref()
-    )
+    format!("{kind}({:?})", mask_json_doc(message).as_ref())
 }
 
 /// The redaction pass over a rendered snapshot (see [`Snapshot`],
@@ -868,6 +865,18 @@ impl<'a> Redactor<'a> {
 /// How many bytes of a bytes value a snapshot shows.
 const SHOWN_BYTES: usize = 32;
 
+/// `text` with structured credentials masked if it is a JSON document
+/// that has some, else as is. Plain text is left to the redaction
+/// pass, which matches declared secrets first, then credential-like
+/// text: masking part of a secret here would stop it matching whole.
+fn mask_json_doc(text: &str) -> std::borrow::Cow<'_, str> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(|doc| doc.is_object() || doc.is_array())
+        .and_then(|mut doc| oxidhome_core::redact::redact_json(&mut doc).then(|| doc.to_string()))
+        .map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
+}
+
 /// Marks a bytes value cut off after its first bytes.
 const TRUNCATED: char = '…';
 
@@ -932,7 +941,7 @@ pub fn render_value(value: &Value) -> String {
         Value::FloatVal(x) => format!("{x:?}"),
         // A string may hold a JSON document: its structured
         // credentials are masked as the API masks them.
-        Value::StringVal(s) => format!("{:?}", oxidhome_core::redact::redact_text(s)),
+        Value::StringVal(s) => format!("{:?}", mask_json_doc(s)),
         Value::BytesVal(bytes) => {
             let mut out = String::from("0x");
             for b in bytes.iter().take(SHOWN_BYTES) {
@@ -943,17 +952,10 @@ pub fn render_value(value: &Value) -> String {
             }
             out
         }
-        Value::JsonVal(json) => {
-            // Structured credentials (`{"password": …}`, a `key-value`
-            // whose key is credential-like) are masked as the API
-            // masks them; other JSON prints as stored.
-            let masked = serde_json::from_str::<serde_json::Value>(json)
-                .ok()
-                .and_then(|mut doc| {
-                    oxidhome_core::redact::redact_json(&mut doc).then(|| doc.to_string())
-                });
-            format!("json:{:?}", masked.as_deref().unwrap_or(json))
-        }
+        // Structured credentials (`{"password": …}`, a `key-value`
+        // whose key is credential-like) are masked as the API masks
+        // them; other JSON prints as stored.
+        Value::JsonVal(json) => format!("json:{:?}", mask_json_doc(json)),
     }
 }
 
@@ -1027,12 +1029,12 @@ fn render_payload(payload: &EventPayload) -> String {
         EventPayload::Inference(r) => format!(
             "inference {} {}",
             tok(&r.model),
-            esc(&oxidhome_core::redact::redact_text(&r.payload))
+            esc(&mask_json_doc(&r.payload))
         ),
         EventPayload::Custom(c) => format!(
             "custom {} {}",
             tok(&c.topic),
-            esc(&oxidhome_core::redact::redact_text(&c.payload))
+            esc(&mask_json_doc(&c.payload))
         ),
     }
 }
@@ -1343,6 +1345,18 @@ mod tests {
                 )
             )
         );
+    }
+
+    #[test]
+    fn declared_secrets_match_before_credential_scrubbing() {
+        let url = "https://alice:letmein@hub.example/?api_key=abc123";
+        let mut snap = sample();
+        snap.storage = vec![format!(
+            "conn = {}",
+            render_value(&Value::StringVal(url.into()))
+        )];
+        Redactor::new(&[], &[url.to_owned()]).apply(&mut snap);
+        assert_eq!(snap.storage, ["conn = \"***\""]);
     }
 
     #[test]
