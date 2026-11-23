@@ -325,7 +325,22 @@ impl Snapshot {
         options: &SnapshotOptions,
     ) -> Result<Self, TestHostError> {
         let stamp = Stamp::new(instance.engine.clock(), options.times);
-        let _secrets_in_scope = SecretsInScope::new(&instance.secrets.secret_values());
+        let secrets = instance.secrets.secret_values();
+        let mut redactor = Redactor::new(&options.redactions, &secrets);
+        // Number the commands' ids in the order they were sent — this
+        // instance's first, then earlier loads' — not in the order the
+        // snapshot happens to print them.
+        let own: Vec<String> = instance
+            .commands
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|r| r.command_id.clone())
+            .collect();
+        for id in own.iter().chain(&instance.secrets.command_ids()) {
+            let _ = redactor.minted_ids(id);
+        }
+        let _secrets_in_scope = SecretsInScope::new(&secrets, redactor.ids.clone());
         let devices = instance
             .devices()
             .iter()
@@ -406,21 +421,6 @@ impl Snapshot {
             commands,
             audit,
         };
-        let secrets = instance.secrets.secret_values();
-        let mut redactor = Redactor::new(&options.redactions, &secrets);
-        // Number the commands' ids in the order they were sent — this
-        // instance's first, then earlier loads' — not in the order the
-        // snapshot happens to print them.
-        let own: Vec<String> = instance
-            .commands
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .map(|r| r.command_id.clone())
-            .collect();
-        for id in own.iter().chain(&instance.secrets.command_ids()) {
-            let _ = redactor.minted_ids(id);
-        }
         redactor.apply(&mut snapshot);
         Ok(snapshot)
     }
@@ -873,43 +873,93 @@ const SHOWN_BYTES: usize = 32;
 /// pass, which matches declared secrets first, then credential-like
 /// text: masking part of a secret here would stop it matching whole.
 fn mask_json_doc(text: &str) -> std::borrow::Cow<'_, str> {
-    serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .filter(|doc| doc.is_object() || doc.is_array())
-        .and_then(|mut doc| {
+    let changed = match serde_json::from_str::<serde_json::Value>(text) {
+        // A JSON string scalar: its decoded text, masked as plain text.
+        Ok(serde_json::Value::String(inner)) => {
+            mask_plain(&inner).map(|m| serde_json::Value::String(m).to_string())
+        }
+        Ok(mut doc) if doc.is_object() || doc.is_array() => {
             // Credential-keyed values first (a declared secret may
             // match a key's name), then declared secrets, whole, before
-            // the credential text rules could mask part of one.
+            // the credential text rules could mask part of one. Object
+            // keys that are ids the harness sent get their placeholders
+            // before the object is re-encoded (and so re-sorted).
             let paired = mask_sensitive_pairs(&mut doc);
-            let masked =
-                CAPTURE_SECRETS.with(|s| mask_secret_leaves(&mut doc, &s.borrow())) | paired;
+            let masked = CAPTURE_SCOPE.with(|s| {
+                let scope = s.borrow();
+                mask_secret_leaves(&mut doc, &scope.secrets) | rename_id_keys(&mut doc, &scope.ids)
+            }) | paired;
             let redacted = oxidhome_core::redact::redact_json(&mut doc);
             (masked || redacted).then(|| doc.to_string())
-        })
-        .map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
+        }
+        _ => None,
+    };
+    changed.map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
+}
+
+/// Rename object keys that are ids in `ids` to their placeholders.
+/// `true` if any was renamed.
+fn rename_id_keys(doc: &mut serde_json::Value, ids: &HashMap<String, String>) -> bool {
+    match doc {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for value in map.values_mut() {
+                changed |= rename_id_keys(value, ids);
+            }
+            let known: Vec<String> = map
+                .keys()
+                .filter(|k| ids.contains_key(*k))
+                .cloned()
+                .collect();
+            for key in known {
+                if let Some(value) = map.remove(&key) {
+                    map.insert(ids[&key].clone(), value);
+                    changed = true;
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |acc, v| rename_id_keys(v, ids) | acc),
+        _ => false,
+    }
+}
+
+/// What the rendering helpers mask with while a snapshot is captured
+/// on this thread (see [`SecretsInScope`]).
+#[derive(Default)]
+struct CaptureScope {
+    /// Declared secrets.
+    secrets: Vec<String>,
+    /// Ids the harness sent, and their placeholders.
+    ids: HashMap<String, String>,
 }
 
 thread_local! {
-    /// The declared secrets of the snapshot being captured on this
-    /// thread, for [`mask_json_doc`] (see [`SecretsInScope`]).
-    static CAPTURE_SECRETS: std::cell::RefCell<Vec<String>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
+    static CAPTURE_SCOPE: std::cell::RefCell<CaptureScope> =
+        std::cell::RefCell::new(CaptureScope::default());
 }
 
-/// Makes `secrets` visible to [`mask_json_doc`] while it lives.
+/// Makes a capture's secrets and seeded ids visible to
+/// [`mask_json_doc`] and [`mask_text`] while it lives.
 struct SecretsInScope;
 
 impl SecretsInScope {
-    fn new(secrets: &[String]) -> Self {
-        CAPTURE_SECRETS.with(|s| s.borrow_mut().clone_from(&secrets.to_vec()));
+    fn new(secrets: &[String], ids: HashMap<String, String>) -> Self {
+        CAPTURE_SCOPE.with(|s| {
+            *s.borrow_mut() = CaptureScope {
+                secrets: secrets.to_vec(),
+                ids,
+            };
+        });
         Self
     }
 }
 
 impl Drop for SecretsInScope {
     fn drop(&mut self) {
-        CAPTURE_SECRETS.with(|s| s.borrow_mut().clear());
+        CAPTURE_SCOPE.with(|s| *s.borrow_mut() = CaptureScope::default());
     }
 }
 
@@ -922,18 +972,20 @@ fn mask_text(text: &str) -> std::borrow::Cow<'_, str> {
     if matches!(json, std::borrow::Cow::Owned(_)) {
         return json;
     }
+    mask_plain(text).map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
+}
+
+/// Plain `text` with the capture's declared secrets replaced, then
+/// credential-like text scrubbed; `None` if nothing changed.
+fn mask_plain(text: &str) -> Option<String> {
     let mut out = text.to_owned();
-    CAPTURE_SECRETS.with(|s| {
-        for secret in s.borrow().iter().filter(|s| !s.is_empty()) {
+    CAPTURE_SCOPE.with(|s| {
+        for secret in s.borrow().secrets.iter().filter(|s| !s.is_empty()) {
             out = out.replace(secret.as_str(), "***");
         }
     });
     let scrubbed = oxidhome_core::redact::scrub_text(&out).into_owned();
-    if scrubbed == text {
-        std::borrow::Cow::Borrowed(text)
-    } else {
-        std::borrow::Cow::Owned(scrubbed)
-    }
+    (scrubbed != text).then_some(scrubbed)
 }
 
 /// Mask the values the core JSON redactor would, by key, before
@@ -1462,7 +1514,7 @@ mod tests {
     fn declared_secrets_match_before_credential_scrubbing() {
         let url = "https://alice:letmein@hub.example/?api_key=abc123";
         let secrets = [url.to_owned()];
-        let _scope = SecretsInScope::new(&secrets);
+        let _scope = SecretsInScope::new(&secrets, HashMap::new());
         let mut snap = sample();
         snap.storage = vec![
             format!("conn = {}", render_value(&Value::StringVal(url.into()))),
@@ -1481,13 +1533,31 @@ mod tests {
     #[test]
     fn secrets_named_like_keys_and_tab_separated_tokens() {
         let secrets = ["pass".to_owned()];
-        let _scope = SecretsInScope::new(&secrets);
+        let _scope = SecretsInScope::new(&secrets, HashMap::new());
         let doc = render_value(&Value::JsonVal(
             r#"{"key":"password","value":"hunter2"}"#.into(),
         ));
         assert!(!doc.contains("hunter2"), "{doc}");
         let note = render_value(&Value::StringVal("Bearer\tabcdef123456".into()));
         assert!(!note.contains("abcdef123456"), "{note}");
+        // As a typed (JSON string) value too.
+        let typed = render_value(&Value::JsonVal(r#""Bearer\tabcdef123456""#.into()));
+        assert!(!typed.contains("abcdef123456"), "{typed}");
+    }
+
+    #[test]
+    fn json_keys_take_seeded_placeholders() {
+        let (a, b) = (
+            format!("cmd-{}", "f".repeat(32)),
+            format!("cmd-{}", "0".repeat(32)),
+        );
+        let ids = HashMap::from([
+            (a.clone(), "<cmd-1>".to_owned()),
+            (b.clone(), "<cmd-2>".to_owned()),
+        ]);
+        let _scope = SecretsInScope::new(&[], ids);
+        let doc = render_value(&Value::JsonVal(format!(r#"{{"{b}":2,"{a}":1}}"#)));
+        assert_eq!(doc, r#"json:"{\"<cmd-1>\":1,\"<cmd-2>\":2}""#);
     }
 
     #[test]
