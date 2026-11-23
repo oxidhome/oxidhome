@@ -317,8 +317,7 @@ async fn main() -> anyhow::Result<()> {
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
     stop_event_log_retention(event_log_retention).await;
-    close_device_state(&engine).await;
-    close_command_journal(&engine).await;
+    close_state_writers(&engine).await;
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s
@@ -583,6 +582,13 @@ const SHUTDOWN_DEVICE_STATE_DEADLINE: Duration = Duration::from_secs(5);
 /// Runs on a detached std thread rather than `spawn_blocking`: the
 /// Tokio runtime waits for its blocking tasks on teardown, so a flush
 /// stuck on the disk would hold the process past the deadline.
+/// Flush the write-behind state writers once the supervisors are down:
+/// the device-state projection, then the command journal.
+async fn close_state_writers(engine: &oxidhome_core::Engine) {
+    close_device_state(engine).await;
+    close_command_journal(engine).await;
+}
+
 async fn close_device_state(engine: &oxidhome_core::Engine) {
     let engine = engine.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -765,8 +771,7 @@ async fn run_stdio() -> anyhow::Result<()> {
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
     stop_event_log_retention(event_log_retention).await;
-    close_device_state(&engine).await;
-    close_command_journal(&engine).await;
+    close_state_writers(&engine).await;
 
     // Flush the log writer before returning so the tail of the
     // session lands in `<state_dir>/oxidhome.db`. Matches the
