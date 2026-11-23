@@ -65,6 +65,38 @@ pub(crate) const fn is_streaming(world: World) -> bool {
     matches!(world, World::StreamingPlugin | World::StreamingAiPlugin)
 }
 
+/// A streaming world's component must export `oxidhome:plugin/streaming`
+/// (`setup-pipeline`); contract verification checks only the base
+/// `plugin` exports.
+///
+/// # Errors
+///
+/// When the manifest selects a streaming world and the component
+/// doesn't export the interface.
+pub(crate) fn check_world_exports(
+    component: &wasmtime::component::Component,
+    engine: &wasmtime::Engine,
+    world: World,
+) -> anyhow::Result<()> {
+    if !is_streaming(world) {
+        return Ok(());
+    }
+    let exports_streaming = component
+        .component_type()
+        .exports(engine)
+        .any(|(name, _)| name.starts_with(STREAMING_EXPORT));
+    anyhow::ensure!(
+        exports_streaming,
+        "the manifest selects a streaming world, but the component doesn't export \
+         `{STREAMING_EXPORT}` (build it with the SDK's `streaming-plugin` feature and \
+         `streaming_plugin!`)"
+    );
+    Ok(())
+}
+
+/// The interface every streaming-world component exports.
+const STREAMING_EXPORT: &str = "oxidhome:plugin/streaming@";
+
 /// Add the WASI imports for an instance of `world` to `linker`.
 ///
 /// # Errors

@@ -251,6 +251,7 @@ pub(super) async fn resolve(
     name: &str,
     rules: &[usize],
     op: &'static str,
+    target: &str,
 ) -> Result<Vec<IpAddr>, ErrorCode> {
     let Ok(permit) = Arc::clone(&policy.lookups).try_acquire_owned() else {
         return Err(ErrorCode::TemporaryResolverFailure);
@@ -280,7 +281,7 @@ pub(super) async fn resolve(
     if admitted.is_empty() {
         // Resolved, but only to addresses the rules refuse: a policy
         // refusal, not a DNS failure.
-        policy.audit_denial(op, name, &Denial::ResolvedRefused(name.to_owned()));
+        policy.audit_denial(op, target, &Denial::ResolvedRefused(name.to_owned()));
         return Err(ErrorCode::AccessDenied);
     }
     Ok(admitted)
@@ -314,7 +315,7 @@ impl ip_name_lookup::Host for NetView<'_> {
             // a refusal is audited against the call that caused it.
             let ctx = crate::auth::invocation::current();
             LookupState::Pending(tokio::spawn(super::in_invocation(ctx, async move {
-                resolve(&policy, &name, &rules, "lookup").await
+                resolve(&policy, &name, &rules, "lookup", &name).await
             })))
         };
         let lookup = self.sockets.table.push(Lookup { state })?;

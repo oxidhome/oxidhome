@@ -686,6 +686,8 @@ impl PluginInstance {
         // component importing them fails to instantiate.
         super::network::add_wasi_to_linker(&mut linker, manifest.plugin.world)
             .context("adding WASI to linker")?;
+        super::network::check_world_exports(&component, engine.raw(), manifest.plugin.world)
+            .with_context(|| format!("rejecting plugin {}", manifest.plugin.id))?;
 
         // Host imports declared by the `plugin` world: host-devices,
         // host-events, host-config, storage, logging. All wired

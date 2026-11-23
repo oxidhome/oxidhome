@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use oxidhome_core::state::{AuditEntry, AuditQuery};
 use oxidhome_test_host::wit::types::Value;
 use oxidhome_test_host::{LoadOptions, TestHost, TestPluginInstance};
-use support::{NET_PROBE, NETWORK_DISCOVERY, stage, stage_with};
+use support::{HELLO_WORLD, NET_PROBE, NETWORK_DISCOVERY, stage, stage_with};
 
 /// A TCP server on loopback answering each connection once: a line
 /// protocol (`ping` → `pong`) or, for an HTTP request, `respond`'s
@@ -109,6 +109,18 @@ fn udp_reply_from_elsewhere() -> SocketAddr {
         }
     });
     addr
+}
+
+/// `err` and its sources, `: `-joined.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = err.to_string();
+    let mut source = err.source();
+    while let Some(e) = source {
+        chain.push_str(": ");
+        chain.push_str(&e.to_string());
+        source = e.source();
+    }
+    chain
 }
 
 fn http_ok(body: &str) -> String {
@@ -474,21 +486,34 @@ async fn plugin_world_components_get_no_network_imports() {
     });
     let err = match host.load(dir.path()).await {
         Ok(_) => panic!("a plugin-world instance must not link wasi:sockets"),
-        Err(err) => {
-            let mut chain = err.to_string();
-            let mut source = std::error::Error::source(&err);
-            while let Some(e) = source {
-                chain.push_str(": ");
-                chain.push_str(&e.to_string());
-                source = e.source();
-            }
-            chain
-        }
+        Err(err) => error_chain(&err),
     };
     assert!(
         err.contains("wasi:sockets") || err.contains("wasi:http"),
         "{err}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_manifests_need_the_streaming_export() {
+    let host = TestHost::new().unwrap();
+    // A `plugin`-world component under a streaming manifest: it would
+    // get the network imports without implementing the world.
+    let dir = stage_with(HELLO_WORLD, |manifest| {
+        manifest
+            .get_mut("plugin")
+            .and_then(toml::Value::as_table_mut)
+            .expect("[plugin]")
+            .insert(
+                "world".into(),
+                toml::Value::String("streaming-plugin".into()),
+            );
+    });
+    let err = match host.load(dir.path()).await {
+        Ok(_) => panic!("a component without the streaming export must not load"),
+        Err(err) => error_chain(&err),
+    };
+    assert!(err.contains("oxidhome:plugin/streaming@"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

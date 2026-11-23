@@ -236,7 +236,7 @@ async fn checked_addresses(
             policy.audit_denial("http", target, &denial);
             Error::HttpRequestDenied
         })?;
-        let addrs = super::sockets::resolve(policy, host, &rules, "http")
+        let addrs = super::sockets::resolve(policy, host, &rules, "http", target)
             .await
             .map_err(dns_error)?;
         (addrs, Some(rules))
@@ -266,14 +266,19 @@ async fn connect_any(
 ) -> Result<tokio::net::TcpStream, Error> {
     let deadline = tokio::time::Instant::now() + connect_timeout;
     let mut last_error = None;
-    for addr in addrs {
-        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+    let count = addrs.len();
+    for (i, addr) in addrs.into_iter().enumerate() {
+        // An equal share of what's left, so a stalled address can't use
+        // up the time the next ones need.
+        let left = u32::try_from(count - i).unwrap_or(u32::MAX).max(1);
+        let attempt = deadline.saturating_duration_since(tokio::time::Instant::now()) / left;
+        match tokio::time::timeout(attempt, tokio::net::TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(err)) => last_error = Some(err),
-            Err(_) => return Err(Error::ConnectionTimeout),
+            Ok(Err(err)) => last_error = Some(Error::Connect(err)),
+            Err(_) => last_error = Some(Error::ConnectionTimeout),
         }
     }
-    Err(last_error.map_or(Error::ConnectionTimeout, Error::Connect))
+    Err(last_error.unwrap_or(Error::ConnectionTimeout))
 }
 
 /// `authority` exactly as `host[:port]`: nothing hidden after a

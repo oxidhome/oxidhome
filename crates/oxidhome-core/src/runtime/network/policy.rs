@@ -48,6 +48,8 @@ pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const RESOLVED_TTL: Duration = Duration::from_mins(10);
 /// Most resolved addresses remembered per instance.
 pub(crate) const MAX_RESOLVED: usize = 1024;
+/// Most addresses one lookup hands the plugin (and records).
+pub(crate) const MAX_LOOKUP_RESULTS: usize = 32;
 /// Longest DNS name, without the root dot.
 const MAX_NAME_LEN: usize = 253;
 /// Audited denials allowed in a burst, per instance.
@@ -463,10 +465,16 @@ impl NetworkPolicy {
     /// rebinding answer never reaches the plugin.
     pub(crate) fn admit_resolved(&self, addrs: Vec<IpAddr>, rules: &[usize]) -> Vec<IpAddr> {
         let now = Instant::now();
-        let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for ip in addrs {
+            if out.len() >= MAX_LOOKUP_RESULTS {
+                break;
+            }
             let ip = ip.to_canonical();
+            if !seen.insert(ip) {
+                continue;
+            }
             let class = classify(ip);
             let usable = match class {
                 AddressClass::Forbidden => false,
@@ -475,14 +483,14 @@ impl NetworkPolicy {
                 // LAN name with a matching CIDR rule works.
                 _ => self.rules.iter().any(|r| r.covers_ip(ip, class)),
             };
-            if !usable {
-                continue;
-            }
-            if class == AddressClass::Public {
-                resolved.insert(ip, rules, now);
-            }
-            if !out.contains(&ip) {
+            if usable {
                 out.push(ip);
+            }
+        }
+        let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
+        for ip in &out {
+            if classify(*ip) == AddressClass::Public {
+                resolved.insert(*ip, rules, now);
             }
         }
         out
@@ -769,6 +777,20 @@ mod tests {
             p.name_rules("api.example.org", &[Use::Tcp, Use::Udp])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn lookup_results_are_deduplicated_and_capped() {
+        let p = policy(&["tcp://*.example.com:*"]);
+        let rules = p.name_rules("a.example.com", &[Use::Tcp]).expect("named");
+        let many: Vec<IpAddr> = (0..100u32)
+            .map(|i| IpAddr::from(std::net::Ipv4Addr::from(0x0808_0000 + i)))
+            .chain([ip("8.8.0.0"), ip("::ffff:8.8.0.1")])
+            .collect();
+        let admitted = p.admit_resolved(many, &rules);
+        assert_eq!(admitted.len(), MAX_LOOKUP_RESULTS);
+        assert_eq!(admitted[0], ip("8.8.0.0"));
+        assert_eq!(admitted[1], ip("8.8.0.1"));
     }
 
     #[test]
