@@ -8,6 +8,20 @@
 //! against a table of tokens and targets; the two must agree on
 //! allow / deny and on the deny's audit label.
 //!
+//! The table compares non-sensitive targets (class `other`, a
+//! non-camera blob), where `authorize` must agree with the old checks
+//! exactly. H6 slice 2 changes behaviour **on purpose** for sensitive
+//! targets; [`sensitive_targets_diverge_from_legacy_by_design`] pins
+//! each intentional difference:
+//!
+//! - a command on a lock, opener or alarm device: allowed before for
+//!   `*` / `devices:command`, now denied (`sensitive:<category>`)
+//!   without an explicit grant;
+//! - camera bytes (a camera device's `bytes-val`, a camera instance's
+//!   blob): allowed before for `*` / `blobs:read`, now denied
+//!   (`sensitive:camera`) without an explicit grant;
+//! - the owner token (bootstrap / recovered `*`) keeps every category.
+//!
 //! Tokens a transport's bearer middleware refuses at verify time
 //! (a constraint key or field the transport does not enforce) never
 //! reach a handler, so they are skipped for that transport's sites —
@@ -21,8 +35,8 @@ use crate::api::mcp::MCP_ENFORCED_CONSTRAINTS;
 use crate::api::scopes::{self, Scope, require_scope};
 use crate::auth::policy::{DEVICE_COMMAND_ENFORCED, EnforcedConstraint};
 use crate::auth::{
-    Actor, ActorKind, InvocationContext, Principal, ToolConstraint, Transport,
-    authorize_device_command,
+    Actor, ActorKind, DeviceCategory, DeviceClass, InvocationContext, Principal, SensitiveCategory,
+    SensitiveGrant, TokenPolicy, ToolConstraint, Transport, authorize_device_command,
 };
 
 type Legacy = fn(&Actor, &str) -> Result<(), &'static str>;
@@ -110,7 +124,12 @@ fn sites() -> Vec<Site> {
             name: "rest GET /devices/{id}/state",
             transport: Rest,
             legacy: |a, _| scope(a, scopes::DEVICES_READ),
-            modern: |t| (Action::DeviceRead, Resource::device(t)),
+            modern: |t| {
+                (
+                    Action::DeviceRead,
+                    Resource::device(t, DeviceClass::other()),
+                )
+            },
         },
         flat!(
             "rest GET /devices/state",
@@ -133,7 +152,12 @@ fn sites() -> Vec<Site> {
                 scope(a, scopes::DEVICES_COMMAND)?;
                 authorize_device_command(a, t)
             },
-            modern: |t| (Action::DeviceCommand, Resource::device(t)),
+            modern: |t| {
+                (
+                    Action::DeviceCommand,
+                    Resource::device(t, DeviceClass::other()),
+                )
+            },
         },
         flat!(
             "rest GET /plugins",
@@ -276,13 +300,23 @@ fn sites() -> Vec<Site> {
                 scope(a, scopes::DEVICES_COMMAND)?;
                 authorize_device_command(a, t)
             },
-            modern: |t| (Action::DeviceCommand, Resource::device(t)),
+            modern: |t| {
+                (
+                    Action::DeviceCommand,
+                    Resource::device(t, DeviceClass::other()),
+                )
+            },
         },
         Site {
             name: "connect GetDeviceState",
             transport: Connect,
             legacy: |a, _| scope(a, scopes::DEVICES_READ),
-            modern: |t| (Action::DeviceRead, Resource::device(t)),
+            modern: |t| {
+                (
+                    Action::DeviceRead,
+                    Resource::device(t, DeviceClass::other()),
+                )
+            },
         },
         flat!(
             "connect ListDeviceState(Changes)",
@@ -423,7 +457,12 @@ fn sites() -> Vec<Site> {
                 scope(a, scopes::DEVICES_COMMAND)?;
                 authorize_device_command(a, t)
             },
-            modern: |t| (Action::DeviceCommand, Resource::device(t)),
+            modern: |t| {
+                (
+                    Action::DeviceCommand,
+                    Resource::device(t, DeviceClass::other()),
+                )
+            },
         },
         Site {
             name: "mcp tool plugins.show",
@@ -492,7 +531,12 @@ fn sites() -> Vec<Site> {
             name: "mcp resource devices/{id}",
             transport: McpHttp,
             legacy: |a, _| scope(a, scopes::DEVICES_LIST),
-            modern: |t| (Action::DeviceList, Resource::device(t)),
+            modern: |t| {
+                (
+                    Action::DeviceList,
+                    Resource::device(t, DeviceClass::other()),
+                )
+            },
         },
         flat!(
             "mcp resource plugins and plugins/{id}",
@@ -526,7 +570,7 @@ fn sites() -> Vec<Site> {
             name: "mcp resource blobs/{instance}/{name}",
             transport: McpHttp,
             legacy: |a, _| scope(a, scopes::BLOBS_READ),
-            modern: |t| (Action::BlobRead, Resource::blob(t, "snap.jpg")),
+            modern: |t| (Action::BlobRead, Resource::blob(t, "snap.jpg", false)),
         },
     ]
 }
@@ -830,4 +874,92 @@ fn every_scope_constant_maps_to_one_action() {
             .collect();
         assert_eq!(actions.len(), 1, "scope {} maps to {actions:?}", s.name());
     }
+}
+
+/// H6 slice 2: the intentional departures from the old checks. Every
+/// row was `allow` under the legacy check.
+#[test]
+fn sensitive_targets_diverge_from_legacy_by_design() {
+    let dev = "dev-a1b2c3d4e5f60718";
+    let wildcard = Actor::api("tok", vec!["*".into()]);
+    let command = Actor::api("tok", vec!["devices:command".into()]);
+    let blobs = Actor::api("tok", vec!["blobs:read".into()]);
+    let owner = Actor::from_token_policy(
+        "tok-owner",
+        TokenPolicy {
+            scopes: vec!["*".into()],
+            ..TokenPolicy::default()
+        },
+        true,
+    );
+    let granted = |scope: &str, category| {
+        Actor::from_token_policy(
+            "tok-granted",
+            TokenPolicy {
+                scopes: vec![scope.into()],
+                sensitive: vec![SensitiveGrant::all(category)],
+                ..TokenPolicy::default()
+            },
+            false,
+        )
+    };
+    let decide = |actor: &Actor, action, resource: &Resource| {
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, actor, Transport::Rest));
+        authorize(&ctx, action, resource).into_result().map(drop)
+    };
+
+    for (category, sensitive) in [
+        (DeviceCategory::Lock, SensitiveCategory::Lock),
+        (DeviceCategory::Opener, SensitiveCategory::Opener),
+        (DeviceCategory::Alarm, SensitiveCategory::Alarm),
+    ] {
+        let target = Resource::device(dev, DeviceClass::of(category));
+        for actor in [&wildcard, &command] {
+            assert_eq!(
+                scope(actor, scopes::DEVICES_COMMAND),
+                Ok(()),
+                "legacy allowed"
+            );
+            assert_eq!(
+                decide(actor, Action::DeviceCommand, &target),
+                Err(sensitive.deny_label()),
+                "{category:?}",
+            );
+        }
+        assert_eq!(decide(&owner, Action::DeviceCommand, &target), Ok(()));
+        assert_eq!(
+            decide(
+                &granted("devices:command", sensitive),
+                Action::DeviceCommand,
+                &target
+            ),
+            Ok(())
+        );
+        // Reading the device is unchanged.
+        assert_eq!(decide(&wildcard, Action::DeviceRead, &target), Ok(()));
+    }
+
+    let camera = Resource::device(dev, DeviceClass::of(DeviceCategory::Camera));
+    let camera_blob = Resource::blob("cam", "snap.jpg", true);
+    for target in [&camera, &camera_blob] {
+        for actor in [&wildcard, &blobs] {
+            assert_eq!(scope(actor, scopes::BLOBS_READ), Ok(()), "legacy allowed");
+            assert_eq!(
+                decide(actor, Action::BlobRead, target),
+                Err("sensitive:camera")
+            );
+        }
+        assert_eq!(decide(&owner, Action::BlobRead, target), Ok(()));
+        assert_eq!(
+            decide(
+                &granted("blobs:read", SensitiveCategory::Camera),
+                Action::BlobRead,
+                target
+            ),
+            Ok(())
+        );
+    }
+    // Camera *control* is not sensitive (Q4).
+    assert_eq!(decide(&wildcard, Action::DeviceCommand, &camera), Ok(()));
 }

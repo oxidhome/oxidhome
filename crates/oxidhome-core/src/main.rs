@@ -23,6 +23,15 @@
 //!   the same transaction, and writes the secret to
 //!   `<state_dir>/admin-token`. Never reachable over the network:
 //!   it needs filesystem access to the state dir.
+//! - **`token list` / `token grant-sensitive <id> <category>
+//!   [--device <dev-id>]...` / `token revoke-sensitive <id>
+//!   <category>` (H6 slice 2)** — offline: list tokens with their
+//!   owner flag and sensitive grants, or edit a token's explicit
+//!   grants for `lock`, `opener`, `alarm` or `camera`. No scope, the
+//!   wildcard included, reaches those without a grant; only the
+//!   bootstrap / recovered owner token holds them all.
+//! - **`device set-category <dev-id> <category>|--clear` (H6 slice
+//!   2)** — offline: the operator's category raise (raise only).
 //! - **`backup <out-dir>` (M3)** — writes a consistent snapshot
 //!   of the database, the blob files it indexes and the installed
 //!   plugin packages to a new directory with a checksummed
@@ -65,12 +74,18 @@ use std::time::Duration;
 use anyhow::Context;
 use oxidhome_core::Engine;
 use oxidhome_core::api::mcp::{
-    DaemonConfig, DaemonMode, ENV_BIND, ENV_STATE_DIR, install_daemon_config, serve_stdio,
+    DaemonConfig, DaemonMode, ENV_BIND, ENV_STATE_DIR, StdioOptions, install_daemon_config,
+    serve_stdio,
+};
+use oxidhome_core::api::sensitive_admin::{
+    grant_sensitive, revoke_sensitive, sensitive_access_report, set_device_category,
+    with_offline_engine,
 };
 use oxidhome_core::api::{
     ApiConfig, RevokeScope, bind, ensure_admin_token, reconcile_admin_token_files,
     recover_admin_token_offline, serve,
 };
+use oxidhome_core::auth::{DeviceCategory, SensitiveCategory};
 use oxidhome_core::exclusive_lock::acquire_state_dir_lock;
 use oxidhome_core::state::{RetentionConfig, RetentionTasks};
 use tracing_subscriber::Layer as _;
@@ -145,24 +160,8 @@ async fn run_mode() -> anyhow::Result<()> {
     // Desktop, MCP Inspector, agent SDKs). Detected here so
     // stdout isn't polluted with the daemon's tracing lines
     // before the JSON-RPC session opens.
-    if std::env::args_os().nth(1).is_some_and(|a| a == "mcp-stdio") {
-        return run_stdio().await;
-    }
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|a| a == "recover-admin-token")
-    {
-        return run_recover_admin_token();
-    }
-    match std::env::args_os()
-        .nth(1)
-        .as_deref()
-        .and_then(|a| a.to_str())
-    {
-        Some("backup") => return run_backup(),
-        Some("verify-backup") => return run_verify_backup(),
-        Some("restore") => return run_restore(),
-        _ => {}
+    if let Some(result) = run_subcommand().await {
+        return result;
     }
 
     let state_dir = resolve_state_dir()?;
@@ -221,6 +220,8 @@ async fn run_mode() -> anyhow::Result<()> {
     // the secret is on disk before its row is committed).
     reconcile_admin_token_files(&engine.auth_tokens(), &engine.audit_log(), &state_dir)?;
     ensure_admin_token(&engine.auth_tokens(), &engine.audit_log(), &state_dir)?;
+    // H6 slice 2 (Q8): warn about tokens that lost sensitive reach.
+    sensitive_access_report(&engine.auth_tokens());
 
     // Optional dev-time plugin start. Preserves the Phase-6 demo
     // affordance (point at one plugin dir on argv to get it
@@ -356,6 +357,30 @@ async fn run_mode() -> anyhow::Result<()> {
     serve_error.map_or(Ok(()), Err)
 }
 
+/// The non-daemon modes, chosen by argv\[1\]; `None` runs the daemon.
+async fn run_subcommand() -> Option<anyhow::Result<()>> {
+    Some(
+        match std::env::args_os()
+            .nth(1)
+            .as_deref()
+            .and_then(|a| a.to_str())
+        {
+            Some("mcp-stdio") => match parse_stdio_args() {
+                Ok(Some(options)) => run_stdio(options).await,
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            },
+            Some("recover-admin-token") => run_recover_admin_token(),
+            Some("backup") => run_backup(),
+            Some("verify-backup") => run_verify_backup(),
+            Some("restore") => run_restore(),
+            Some("token") => run_token(),
+            Some("device") => run_device(),
+            _ => return None,
+        },
+    )
+}
+
 /// `oxidhome://config` / `GET /api/v1/config`: publish what the HTTP
 /// daemon resolved, before the first request can ask. The dev-time
 /// plugin directory is argv\[1\], the value `main` starts.
@@ -485,6 +510,184 @@ fn run_recover_admin_token() -> anyhow::Result<()> {
         println!("revoked: {}", report.revoked.join(", "));
     }
     Ok(())
+}
+
+/// `oxidhome mcp-stdio [--allow-sensitive <category>]...`. `Ok(None)`
+/// means help was printed.
+fn parse_stdio_args() -> anyhow::Result<Option<StdioOptions>> {
+    const USAGE: &str =
+        "usage: oxidhome mcp-stdio [--allow-sensitive <lock|opener|alarm|camera>]...";
+    let mut options = StdioOptions::default();
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--allow-sensitive" => {
+                let value = args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--allow-sensitive needs a category\n{USAGE}")
+                })?;
+                let category: SensitiveCategory =
+                    value.parse().map_err(|e| anyhow::anyhow!("{e}\n{USAGE}"))?;
+                if !options.allow_sensitive.contains(&category) {
+                    options.allow_sensitive.push(category);
+                }
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                println!(
+                    "Serves MCP over stdin/stdout as the ambient wildcard actor. Commands on locks, \
+                     openers and alarms and camera bytes stay out of reach unless named with \
+                     --allow-sensitive."
+                );
+                return Ok(None);
+            }
+            other => anyhow::bail!("unexpected argument `{other}`\n{USAGE}"),
+        }
+    }
+    Ok(Some(options))
+}
+
+/// H6 slice 2: `oxidhome token <list|grant-sensitive|revoke-sensitive>`.
+/// Offline, like `recover-admin-token`.
+fn run_token() -> anyhow::Result<()> {
+    const USAGE: &str = "usage: oxidhome token list\n       \
+         oxidhome token grant-sensitive <token-id> <lock|opener|alarm|camera> [--device <dev-id>]...\n       \
+         oxidhome token revoke-sensitive <token-id> <lock|opener|alarm|camera>";
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let usage = || anyhow::anyhow!("{USAGE}");
+    match args.first().map(String::as_str) {
+        Some("-h" | "--help") | None => {
+            println!("{USAGE}");
+            println!(
+                "Commands on locks, openers and alarms and camera bytes need an explicit grant; \
+                 no scope, the wildcard included, reaches them. Run with the daemon stopped."
+            );
+            Ok(())
+        }
+        Some("list") if args.len() == 1 => {
+            init_cli_tracing();
+            let state_dir = resolve_state_dir()?;
+            with_offline_engine(&state_dir, |engine| {
+                for t in engine.auth_tokens().list()? {
+                    let policy = oxidhome_core::auth::parse_policy(&t.scope_json);
+                    let sensitive = policy.as_ref().map_or_else(
+                        || "(unparseable policy: deny-all)".to_owned(),
+                        |p| {
+                            p.sensitive
+                                .iter()
+                                .map(|g| match &g.devices {
+                                    None => g.category.as_str().to_owned(),
+                                    Some(d) => format!("{}[{}]", g.category.as_str(), d.join(" ")),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        },
+                    );
+                    println!(
+                        "{}\t{}\t{}{}\tscopes={}\tsensitive={}",
+                        t.id,
+                        t.label,
+                        if t.owner { "owner" } else { "-" },
+                        if t.revoked_ms.is_some() {
+                            " revoked"
+                        } else {
+                            ""
+                        },
+                        policy.map_or_else(String::new, |p| p.scopes.join(",")),
+                        if t.owner {
+                            "(all)".to_owned()
+                        } else {
+                            sensitive
+                        },
+                    );
+                }
+                Ok(())
+            })
+        }
+        Some(cmd @ ("grant-sensitive" | "revoke-sensitive")) => {
+            let token_id = args.get(1).ok_or_else(usage)?;
+            let category: SensitiveCategory = args
+                .get(2)
+                .ok_or_else(usage)?
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{e}\n{USAGE}"))?;
+            let mut devices = Vec::new();
+            let mut rest = args.iter().skip(3);
+            while let Some(flag) = rest.next() {
+                match flag.as_str() {
+                    "--device" if cmd == "grant-sensitive" => {
+                        devices.push(rest.next().ok_or_else(usage)?.clone());
+                    }
+                    other => anyhow::bail!("unexpected argument `{other}`\n{USAGE}"),
+                }
+            }
+            init_cli_tracing();
+            let state_dir = resolve_state_dir()?;
+            let policy = with_offline_engine(&state_dir, |engine| {
+                let (tokens, audit) = (engine.auth_tokens(), engine.audit_log());
+                if cmd == "grant-sensitive" {
+                    grant_sensitive(&tokens, &audit, token_id, category, &devices)
+                } else {
+                    revoke_sensitive(&tokens, &audit, token_id, category)
+                }
+            })?;
+            println!(
+                "token {token_id} sensitive grants: {}",
+                if policy.sensitive.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    policy
+                        .sensitive
+                        .iter()
+                        .map(|g| g.category.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            );
+            Ok(())
+        }
+        _ => Err(usage()),
+    }
+}
+
+/// H6 slice 2: `oxidhome device set-category <dev-id> <category>|--clear`.
+/// Offline. A raise only adds protection; it never lowers what the
+/// host derived.
+fn run_device() -> anyhow::Result<()> {
+    const USAGE: &str = "usage: oxidhome device set-category <dev-id> <category>|--clear\n\
+         categories: alarm lock opener camera light climate media switch sensor other";
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["set-category", device_id, value] => {
+            let category = match *value {
+                "--clear" => None,
+                v => Some(
+                    v.parse::<DeviceCategory>()
+                        .map_err(|e| anyhow::anyhow!("{e}\n{USAGE}"))?,
+                ),
+            };
+            init_cli_tracing();
+            let state_dir = resolve_state_dir()?;
+            let row = with_offline_engine(&state_dir, |engine| {
+                set_device_category(engine, device_id, category)
+            })?;
+            println!(
+                "device {device_id} category override: {}",
+                row.category_override
+                    .map_or("(none)", DeviceCategory::as_str)
+            );
+            Ok(())
+        }
+        [] | ["-h" | "--help"] => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        _ => anyhow::bail!("{USAGE}"),
+    }
 }
 
 /// Stderr-only tracing for the offline / one-shot subcommands.
@@ -755,7 +958,7 @@ async fn shutdown_signal() -> &'static str {
 /// started via `plugins.start` reach a terminal state before
 /// the process exits, instead of relying on runtime teardown
 /// to abort mid-supervisor.
-async fn run_stdio() -> anyhow::Result<()> {
+async fn run_stdio(options: StdioOptions) -> anyhow::Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
     let state_dir = resolve_state_dir()?;
@@ -793,6 +996,23 @@ async fn run_stdio() -> anyhow::Result<()> {
         &state_dir,
         &retention,
     ));
+    if options.allow_sensitive.is_empty() {
+        tracing::info!(
+            "mcp-stdio session reaches no sensitive category (lock, opener, alarm, camera); \
+             pass --allow-sensitive <category> to opt in",
+        );
+    } else {
+        tracing::warn!(
+            target: "auth.sensitive",
+            categories = %options
+                .allow_sensitive
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            "mcp-stdio session allowed sensitive categories",
+        );
+    }
     let retention = spawn_retention(&engine, retention);
     tracing::info!(
         state_dir = %state_dir.display(),
@@ -806,7 +1026,7 @@ async fn run_stdio() -> anyhow::Result<()> {
     // awaited `serve_stdio` directly, so ctrl-c bypassed the
     // whole cleanup path.
     let serve_result = tokio::select! {
-        result = serve_stdio(engine.clone()) => result,
+        result = serve_stdio(engine.clone(), options) => result,
         signal = shutdown_signal() => {
             tracing::info!(signal = signal, "shutdown signal received; draining stdio session");
             Ok(())

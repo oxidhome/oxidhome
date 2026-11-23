@@ -595,6 +595,8 @@ impl HopAudit {
             invocation: Some(callee_ctx.audit_json()),
             command_id: None,
             command_outcome: None,
+
+            level: None,
         };
         Self { log, entry }
     }

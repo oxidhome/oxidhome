@@ -2224,7 +2224,14 @@ fn value_wire_bound(
         Value::StringVal(s) | Value::JsonVal(s) => json_escaped_len(s).saturating_add(2),
         // REST sends bytes as a JSON array (at most four bytes per
         // element, comma included); base64 and protobuf are smaller.
-        Value::BytesVal(b) if blobs => b.len().saturating_mul(4).saturating_add(2),
+        // With `blobs` the value may still be withheld per device (a
+        // camera's bytes without the camera grant, H6 slice 2), so the
+        // bound covers the marker too.
+        Value::BytesVal(b) if blobs => b
+            .len()
+            .saturating_mul(4)
+            .saturating_add(2)
+            .max(WITHHELD_WIRE_BYTES),
         Value::BytesVal(_) => WITHHELD_WIRE_BYTES,
     }
 }

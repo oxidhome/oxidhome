@@ -172,7 +172,15 @@ pub struct AuditEntry {
     /// which keeps its coarse `success` / `failed` meaning.
     #[serde(default)]
     pub command_outcome: Option<String>,
+    /// H6 slice 2: `Some("warn")` on the extra row an allowed sensitive
+    /// action writes (lock, opener, alarm commands; camera bytes);
+    /// `None` (info) everywhere else.
+    #[serde(default)]
+    pub level: Option<String>,
 }
+
+/// Audit `level` of the row an allowed sensitive action writes.
+pub const AUDIT_LEVEL_WARN: &str = "warn";
 
 /// Query shape for [`AuditLog::query`]. Every field is optional and
 /// AND-combined; `None` everywhere returns the most recent `limit`
@@ -196,6 +204,9 @@ pub struct AuditQuery {
     /// Exact `call_id` match (H6): every row one invocation produced —
     /// the entry point's row plus its delegated `call-service` hops.
     pub call_id: Option<String>,
+    /// Exact `level` match (H6 slice 2): `warn` returns the rows of
+    /// allowed sensitive actions.
+    pub level: Option<String>,
     /// Cursor-based pagination floor: return only rows strictly
     /// *older* than `(before.0, before.1)` in `(intent_ms, id)`
     /// order. The default `ORDER BY intent_ms DESC, id DESC LIMIT
@@ -509,8 +520,8 @@ impl AuditLog {
     ) -> Result<i64, AuditLogError> {
         conn.execute(
             "INSERT INTO audit_event \
-             (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome) \
-             VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, level) \
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 now,
                 &entry.token_id,
@@ -527,6 +538,7 @@ impl AuditLog {
                 scrub_opt(entry.invocation.as_deref()),
                 &entry.command_id,
                 &entry.command_outcome,
+                &entry.level,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -552,7 +564,7 @@ impl AuditLog {
         use std::fmt::Write as _;
 
         let mut sql = String::from(
-            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome \
+            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, level \
              FROM audit_event WHERE 1=1",
         );
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -580,6 +592,9 @@ impl AuditLog {
         }
         if let Some(c) = &filter.call_id {
             push(&mut binds, &mut sql, "call_id =", c.clone().into());
+        }
+        if let Some(l) = &filter.level {
+            push(&mut binds, &mut sql, "level =", l.clone().into());
         }
         // Cursor pagination — lexicographic `(intent_ms, id) <
         // (before_ms, before_id)`. SQLite's row-value comparison
@@ -639,6 +654,7 @@ impl AuditLog {
                     invocation: row.get(14)?,
                     command_id: row.get(15)?,
                     command_outcome: row.get(16)?,
+                    level: row.get(17)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -766,6 +782,8 @@ mod tests {
             invocation: None,
             command_id: None,
             command_outcome: None,
+
+            level: None,
         }
     }
 
@@ -930,6 +948,8 @@ mod tests {
             invocation: None,
             command_id: None,
             command_outcome: None,
+
+            level: None,
         };
         log.record_completed(&entry).unwrap();
         let rows = log.query(&AuditQuery::default(), 1).unwrap();
@@ -962,6 +982,8 @@ mod tests {
                 invocation: None,
                 command_id: None,
                 command_outcome: None,
+
+                level: None,
             }
         }
         let log = store();
@@ -1030,6 +1052,8 @@ mod tests {
             invocation: None,
             command_id: None,
             command_outcome: None,
+
+            level: None,
         };
         let id = log.record_intent_durable(&entry).unwrap();
         let sync: i64 = db

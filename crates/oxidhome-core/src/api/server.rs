@@ -16,7 +16,7 @@ use axum::{
     http::StatusCode,
     middleware::from_fn_with_state,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -34,7 +34,8 @@ use crate::state::{
 };
 
 use super::auth::{AuthState, require_token};
-use super::scopes::{ScopeDenied, can_read_blobs, require};
+use super::bytes::BytesGate;
+use super::scopes::{ScopeDenied, require};
 use super::ui_ticket;
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
@@ -89,6 +90,10 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/devices/state", get(get_all_device_state))
         .route("/api/v1/devices/{device_id}/state", get(get_device_state))
         .route("/api/v1/devices/{device_id}/command", post(send_command))
+        .route(
+            "/api/v1/devices/{device_id}/category",
+            put(set_device_category),
+        )
         .route("/api/v1/plugins", get(list_plugins).post(install_plugin))
         .route(
             "/api/v1/plugins/{plugin_id}",
@@ -419,6 +424,32 @@ struct DeviceSummary {
     owner_instance: String,
     /// Human-readable name from the registration `DeviceInfo`.
     name: String,
+    /// H6 slice 2: host-derived category (`lock`, `light`, … or
+    /// `other`), after any operator raise.
+    category: &'static str,
+    /// Sensitive categories the device falls under (`lock`, `opener`,
+    /// `alarm`, `camera`); a token needs an explicit grant for each.
+    sensitive: Vec<&'static str>,
+}
+
+/// H6 slice 2: a device's classification on the wire.
+#[derive(Serialize)]
+pub(crate) struct WireDeviceClass {
+    pub(crate) category: &'static str,
+    pub(crate) sensitive: Vec<&'static str>,
+}
+
+impl From<crate::auth::DeviceClass> for WireDeviceClass {
+    fn from(class: crate::auth::DeviceClass) -> Self {
+        Self {
+            category: class.category().as_str(),
+            sensitive: class
+                .sensitive()
+                .iter()
+                .map(crate::auth::SensitiveCategory::as_str)
+                .collect(),
+        }
+    }
 }
 
 /// Authenticated `GET /api/v1/devices`. Lists every device any
@@ -439,13 +470,113 @@ async fn list_devices(
         .devices()
         .list()
         .into_iter()
-        .map(|meta| DeviceSummary {
-            device_id: meta.id.clone(),
-            owner_instance: meta.owner_instance.clone(),
-            name: meta.info.name.clone(),
+        .map(|meta| {
+            let class = WireDeviceClass::from(state.engine.devices().class_of(&meta.id));
+            DeviceSummary {
+                device_id: meta.id.clone(),
+                owner_instance: meta.owner_instance.clone(),
+                name: meta.info.name.clone(),
+                category: class.category,
+                sensitive: class.sensitive,
+            }
         })
         .collect();
     Ok(Json(DevicesBody { devices }))
+}
+
+/// Body of `PUT /api/v1/devices/{device_id}/category`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CategoryBody {
+    /// A category name, or `null` to clear the override.
+    category: Option<String>,
+}
+
+/// Response of `PUT /api/v1/devices/{device_id}/category`.
+#[derive(Serialize)]
+struct CategoryResponse {
+    device_id: String,
+    /// The operator override now stored, if any.
+    category_override: Option<&'static str>,
+    #[serde(flatten)]
+    class: WireDeviceClass,
+}
+
+enum CategoryError {
+    Scope(ScopeDenied),
+    BadRequest(String),
+    Internal,
+}
+
+impl IntoResponse for CategoryError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+}
+
+/// H6 slice 2: `PUT /api/v1/devices/{device_id}/category` — the
+/// operator raises a device's category (`{"category": "lock"}`) or
+/// clears the raise (`{"category": null}`). A raise only ever adds
+/// protection: the host-derived category and every sensitive category
+/// the host has seen for the device stay. The device need not be
+/// registered right now (an override survives restarts).
+///
+/// `policy.manage`: the owner token only; no scope, the wildcard
+/// included, grants it.
+///
+/// # Errors
+/// - `400` malformed device id or unknown category.
+/// - `403` not the owner.
+/// - `500` the override couldn't be stored.
+async fn set_device_category(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(device_id): Path<String>,
+    Json(body): Json<CategoryBody>,
+) -> Result<Json<CategoryResponse>, CategoryError> {
+    require(
+        &ctx,
+        Action::PolicyManage,
+        &state.engine.devices().resource(&device_id),
+    )
+    .map_err(CategoryError::Scope)?;
+    if !crate::state::is_device_id(&device_id) {
+        return Err(CategoryError::BadRequest("malformed device id".into()));
+    }
+    let category = match body.category.as_deref() {
+        None => None,
+        Some(name) => Some(
+            name.parse::<crate::auth::DeviceCategory>()
+                .map_err(|e| CategoryError::BadRequest(e.to_string()))?,
+        ),
+    };
+    let devices = state.engine.devices();
+    let id = device_id.clone();
+    let stored = tokio::task::spawn_blocking(move || devices.meta().set_override(&id, category))
+        .await
+        .map_err(|_| CategoryError::Internal)?
+        .map_err(|err| {
+            tracing::error!(target: "api.devices", error = %err, "storing a category override failed");
+            CategoryError::Internal
+        })?;
+    tracing::warn!(
+        target: "auth.sensitive",
+        device_id = %device_id,
+        category = category.map_or("(cleared)", crate::auth::DeviceCategory::as_str),
+        "device category override changed",
+    );
+    let class = state.engine.devices().class_of(&device_id);
+    Ok(Json(CategoryResponse {
+        device_id,
+        category_override: stored
+            .category_override
+            .map(crate::auth::DeviceCategory::as_str),
+        class: class.into(),
+    }))
 }
 
 // ── Device state (H9 host-owned projection) ──────────────────────
@@ -520,7 +651,7 @@ impl DeviceStateSnapshot {
         caps: &[Arc<crate::state::DeviceState>],
         epoch: &str,
         revision: u64,
-        blobs: bool,
+        gate: &BytesGate,
     ) -> Self {
         Self {
             device_id: caps
@@ -530,16 +661,17 @@ impl DeviceStateSnapshot {
             revision,
             capabilities: caps
                 .iter()
-                .map(|c| DeviceStateEntry::from_state(c, blobs))
+                .map(|c| DeviceStateEntry::from_state(c, gate))
                 .collect(),
         }
     }
 }
 
 impl DeviceStateEntry {
-    /// `blobs` is [`can_read_blobs`] for the caller: without it, every
-    /// `bytes-val` field is withheld (M7).
-    fn from_state(state: &crate::state::DeviceState, blobs: bool) -> Self {
+    /// `bytes-val` fields the caller's [`BytesGate`] doesn't release
+    /// are withheld (M7, H6 slice 2).
+    fn from_state(state: &crate::state::DeviceState, gate: &BytesGate) -> Self {
+        let blobs = gate.release_state(state);
         Self {
             device_id: state.device_id.clone(),
             capability: state.capability.clone(),
@@ -579,9 +711,9 @@ async fn get_device_state(
     require(
         &ctx,
         Action::DeviceRead,
-        &Resource::device(device_id.as_str()),
+        &state.engine.devices().resource(&device_id),
     )?;
-    let blobs = can_read_blobs(&ctx);
+    let gate = BytesGate::new(&ctx, &state.engine);
     // H9 round-3 finding 3: read `revision` and `entries` **under
     // one lock**. The pre-fix shape called `current_revision()`
     // then `snapshot_device()` in two separate lock acquires, so
@@ -595,7 +727,7 @@ async fn get_device_state(
         .snapshot_device_with_revision(&device_id);
     let mut capabilities: Vec<DeviceStateEntry> = entries
         .iter()
-        .map(|s| DeviceStateEntry::from_state(s, blobs))
+        .map(|s| DeviceStateEntry::from_state(s, &gate))
         .collect();
     // Deterministic ordering so a client can eyeball snapshots.
     capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
@@ -791,7 +923,8 @@ async fn get_all_device_state(
     Query(params): Query<AllDevicesStateParams>,
 ) -> Result<Json<AllDevicesStateSnapshot>, AllDevicesStateError> {
     require(&ctx, Action::DeviceRead, &Resource::devices())?;
-    let blobs = can_read_blobs(&ctx);
+    let gate = BytesGate::new(&ctx, &state.engine);
+    let blobs = gate.general();
     let limit = params
         .limit
         .filter(|n| *n > 0)
@@ -843,7 +976,7 @@ async fn get_all_device_state(
     let devices: Vec<DeviceStateSnapshot> = page
         .devices
         .into_iter()
-        .map(|caps| DeviceStateSnapshot::from_entries(&caps, &epoch, revision, blobs))
+        .map(|caps| DeviceStateSnapshot::from_entries(&caps, &epoch, revision, &gate))
         .collect();
     let next_cursor = page
         .resume_after
@@ -951,7 +1084,8 @@ async fn query_device_state_changes(
     Query(params): Query<StateChangesParams>,
 ) -> Result<Json<StateChangesBody>, ScopeDenied> {
     require(&ctx, Action::DeviceRead, &Resource::devices())?;
-    let blobs = can_read_blobs(&ctx);
+    let gate = BytesGate::new(&ctx, &state.engine);
+    let blobs = gate.general();
     let limit = params
         .limit
         .filter(|n| *n > 0)
@@ -973,7 +1107,7 @@ async fn query_device_state_changes(
     let changes: Vec<DeviceStateEntry> = page
         .entries
         .iter()
-        .map(|s| DeviceStateEntry::from_state(s, blobs))
+        .map(|s| DeviceStateEntry::from_state(s, &gate))
         .collect();
     Ok(Json(StateChangesBody {
         epoch: page.epoch,
@@ -1085,8 +1219,8 @@ pub(crate) struct WireCommandReport {
 }
 
 impl WireCommandReport {
-    /// Without `blobs` (the caller's [`can_read_blobs`]), returned
-    /// `bytes-val` state is withheld (M7).
+    /// Without `blobs` (the caller's [`BytesGate`] for the device),
+    /// returned `bytes-val` state is withheld (M7).
     pub(crate) fn from_report(mut report: CommandReport, blobs: bool) -> Self {
         if !blobs {
             report.withhold_bytes();
@@ -1198,13 +1332,14 @@ async fn send_command(
     Path(device_id): Path<String>,
     Json(body): Json<CommandBody>,
 ) -> Result<axum::response::Response, CommandError> {
-    // H6: `device.command` on the addressed device — the scope and the
-    // token's per-device allowlist, shared with Connect and MCP.
-    // Before the lookup so a refused token can't probe device ids.
-    require(
+    // H6: `device.command` on the addressed device — the scope, the
+    // token's per-device allowlist and (slice 2) the sensitive-category
+    // grant, shared with Connect and MCP. Before the lookup so a
+    // refused token can't probe device ids.
+    let decision = require(
         &invocation,
         Action::DeviceCommand,
-        &Resource::device(device_id.as_str()),
+        &state.engine.devices().resource(&device_id),
     )
     .map_err(CommandError::Scope)?;
 
@@ -1224,6 +1359,15 @@ async fn send_command(
         .get(&owner)
         .ok_or(CommandError::NotFound)?;
 
+    // H6 slice 2: an allowed sensitive command is rate limited and
+    // leaves a `warn` audit row before it runs.
+    state
+        .engine
+        .sensitive()
+        .discharge_blocking(&invocation, Action::DeviceCommand, &device_id, &decision)
+        .await
+        .map_err(CommandError::Obligation)?;
+
     // Build the WIT command. JSON `value` shapes map to typed
     // `Value` variants via the `From<WireValue>` impl. The supervisor
     // handle mints `id` (H5).
@@ -1241,8 +1385,11 @@ async fn send_command(
             .collect(),
     };
 
-    let blobs = can_read_blobs(&invocation);
-    let report = handle.execute_command_in(invocation, device_id, cmd).await;
+    let gate = BytesGate::new(&invocation, &state.engine);
+    let report = handle
+        .execute_command_in(invocation, device_id.clone(), cmd)
+        .await;
+    let blobs = gate.release_report(&device_id, &report);
 
     // F4 + H5: the authorization decision stays `allow` whatever the
     // command outcome; the outcome and command id ride to the audit
@@ -1258,6 +1405,7 @@ async fn send_command(
 enum CommandError {
     Scope(ScopeDenied),
     NotFound,
+    Obligation(crate::auth::sensitive::ObligationError),
 }
 
 impl IntoResponse for CommandError {
@@ -1265,6 +1413,41 @@ impl IntoResponse for CommandError {
         match self {
             CommandError::Scope(s) => s.into_response(),
             CommandError::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            CommandError::Obligation(e) => obligation_response(&e),
+        }
+    }
+}
+
+/// H6 slice 2: the response for a sensitive action whose obligations
+/// weren't met — `429` with `Retry-After` when rate limited, `500` when
+/// the `warn` audit row couldn't be written (the action didn't run).
+pub(crate) fn obligation_response(
+    err: &crate::auth::sensitive::ObligationError,
+) -> axum::response::Response {
+    use crate::auth::sensitive::ObligationError;
+    match err {
+        ObligationError::RateLimited {
+            category,
+            retry_after_secs,
+        } => {
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "rate_limited",
+                    "category": category.as_str(),
+                    "retry_after_secs": retry_after_secs,
+                })),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(*retry_after_secs),
+            );
+            resp
+        }
+        ObligationError::Audit(_) | ObligationError::Join(_) => {
+            tracing::error!(target: "auth.sensitive", error = %err, "sensitive action refused");
+            (StatusCode::INTERNAL_SERVER_ERROR, "").into_response()
         }
     }
 }
@@ -2496,8 +2679,8 @@ async fn tail_events(
     let resume_after_id = tail.resume_after_id();
     // M7: live and replayed events alike withhold `bytes-val`
     // payloads unless the caller holds `blobs:read`.
-    let blobs = can_read_blobs(&ctx);
-    let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail, blobs));
+    let gate = BytesGate::new(&ctx, &state.engine);
+    let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail, gate));
     if let Some(id) = resume_after_id {
         response
             .headers_mut()
@@ -2534,7 +2717,7 @@ async fn tail_step(
     (tail, item)
 }
 
-async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail, blobs: bool) {
+async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail, gate: BytesGate) {
     use crate::state::TailItem;
     use axum::extract::ws::{CloseFrame, Message};
     // C2e: per-subscriber mpsc queue. The tail ends when the bus
@@ -2557,7 +2740,7 @@ async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail, 
                 step = Box::pin(tail_step(tail));
                 let text = match item {
                     Ok(Some(TailItem::Event(event))) => {
-                        match serde_json::to_string(&WireEvent::from_host(&event, blobs)) {
+                        match serde_json::to_string(&WireEvent::from_host(&event, &gate)) {
                             Ok(text) => text,
                             Err(_) => continue,
                         }
@@ -2705,7 +2888,7 @@ impl WireKeyValue {
     /// conversion so a single value decoder covers both storage
     /// and event surfaces.
     ///
-    /// M7: without `blobs` (the caller's [`can_read_blobs`]) a
+    /// M7: without `blobs` (the caller's [`BytesGate`] answer) a
     /// `bytes-val` is replaced by the withheld marker.
     fn from_wit(mut kv: KeyValue, blobs: bool) -> Self {
         if !blobs {
@@ -2719,7 +2902,8 @@ impl WireKeyValue {
 }
 
 impl WireEvent {
-    fn from_host(event: &Event, blobs: bool) -> Self {
+    fn from_host(event: &Event, gate: &BytesGate) -> Self {
+        let blobs = gate.release_event(event);
         let id = event.row_id;
         let (topic, payload) = match &event.payload {
             EventPayload::StateChanged(sc) => (
@@ -3029,9 +3213,10 @@ async fn query_events(
     .map_err(|_| EventsError::Join)?
     .map_err(EventsError::Storage)?
     .map_err(EventsError::CursorExpired)?;
+    let gate = BytesGate::new(&ctx, &state.engine);
     let events = rows
         .into_iter()
-        .map(|row| WireHistoricalEvent::from_row(row, can_read_blobs(&ctx)))
+        .map(|row| WireHistoricalEvent::from_row(row, &gate))
         .collect();
     Ok(Json(EventsBody { events }))
 }
@@ -3095,7 +3280,7 @@ pub(crate) struct WireHistoricalEvent {
 }
 
 impl WireHistoricalEvent {
-    pub(crate) fn from_row(row: HistoricalEvent, blobs: bool) -> Self {
+    pub(crate) fn from_row(row: HistoricalEvent, gate: &BytesGate) -> Self {
         // Build a scratch `Event` so `WireEvent::from_host`'s
         // payload-projection logic can be reused. The event's
         // `origin_*` / `timestamp` fields are populated from
@@ -3113,7 +3298,7 @@ impl WireHistoricalEvent {
         };
         // Reuse the tail-side payload projection so a single
         // client codec handles both live tail + history reads.
-        let wire = WireEvent::from_host(&ev, blobs);
+        let wire = WireEvent::from_host(&ev, gate);
         Self {
             id: row.id,
             received_ms: row.received_ms,
@@ -3153,6 +3338,9 @@ struct AuditParams {
     /// Exact `call_id` match (H6) — the entry point's row plus every
     /// delegated `call-service` hop it caused.
     call_id: Option<String>,
+    /// Exact `level` match (H6 slice 2): `level=warn` lists the rows
+    /// allowed sensitive actions wrote.
+    level: Option<String>,
     /// Cursor for lossless pagination. Opaque `"<intent_ms>:<id>"`
     /// string returned as `next_cursor` on the previous page.
     /// Callers should not construct it by hand — pass the previous
@@ -3195,6 +3383,7 @@ async fn query_audit(
         decision: params.decision,
         path: params.path,
         call_id: params.call_id,
+        level: params.level,
         before,
         // F3 self-exclusion: hide the query's own pending intent
         // row from its results.
@@ -3311,6 +3500,10 @@ struct WireAuditEntry {
     /// H5 explicit command outcome for `command_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     command_outcome: Option<String>,
+    /// H6 slice 2: `warn` on the row an allowed sensitive action
+    /// wrote; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
 }
 
 impl WireAuditEntry {
@@ -3336,6 +3529,7 @@ impl WireAuditEntry {
                 .and_then(|j| serde_json::from_str(j).ok()),
             command_id: row.command_id,
             command_outcome: row.command_outcome,
+            level: row.level,
         }
     }
 }
@@ -3836,7 +4030,10 @@ mod tests {
                 row_id: None,
                 payload: EventPayload::Button(input),
             };
-            let wire = WireEvent::from_host(&event, true);
+            let wire = WireEvent::from_host(
+                &event,
+                &BytesGate::deny_all(&crate::Engine::new().expect("engine")),
+            );
             match wire.payload {
                 WireEventPayload::Button { variant, delta } => {
                     assert_eq!(variant, expected_variant, "variant mismatch for {input:?}");
@@ -3868,7 +4065,10 @@ mod tests {
                 },
             ),
         };
-        let wire = WireEvent::from_host(&event, true);
+        let wire = WireEvent::from_host(
+            &event,
+            &BytesGate::deny_all(&crate::Engine::new().expect("engine")),
+        );
         assert_eq!(wire.origin_plugin_id, "com.example.publisher");
         assert_eq!(wire.origin_instance_id, "publisher-42");
         // The origin fields serialize into the wire JSON so a

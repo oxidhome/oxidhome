@@ -530,11 +530,15 @@ fn restore_migrates_an_archive_at_the_schema_floor() {
     let archive = out_path(&out_dir);
     backup::create_backup(fx.state.path(), &archive).unwrap();
     rewrite_archived_db(&archive, |conn| {
-        // Undo every migration after the floor (20: H5 pending
+        // Undo every migration after the floor (21: H6 slice 2 owner
+        // flag, audit level and device categories, 20: H5 pending
         // commands, 19: H2 device state, 18: H5 command columns, 17: H6
         // audit columns).
         conn.execute_batch(
-            "DROP TABLE pending_command;
+            "DROP TABLE device_meta;
+             ALTER TABLE audit_event DROP COLUMN level;
+             ALTER TABLE auth_token DROP COLUMN owner;
+             DROP TABLE pending_command;
              DROP TABLE device_state;
              DROP TABLE device_state_meta;
              ALTER TABLE audit_event DROP COLUMN command_outcome;
@@ -623,6 +627,8 @@ fn backup_round_trips_invocation_audit_columns() {
                 invocation: Some(INVOCATION.into()),
                 command_id: None,
                 command_outcome: None,
+
+                level: None,
             })
             .unwrap();
     }

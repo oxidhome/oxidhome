@@ -52,4 +52,7 @@ pub use server::{
     MAX_REQUEST_BODY_BYTES, MCP_ENDPOINT, mount_routes, mount_routes_with_all_limits,
     mount_routes_with_cap, mount_routes_with_limits, mount_routes_with_rate_limiter,
 };
-pub use stdio::{ServeStdioError, serve_stdio, serve_stdio_over};
+pub use stdio::{
+    STDIO_TOKEN_ID, ServeStdioError, StdioOptions, serve_stdio, serve_stdio_over,
+    serve_stdio_over_with, stdio_actor,
+};

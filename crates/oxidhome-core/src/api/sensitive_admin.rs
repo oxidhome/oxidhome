@@ -1,0 +1,438 @@
+//! H6 slice 2: operator tooling for sensitive categories.
+//!
+//! - `oxidhome token list` — every token with its owner flag, scopes
+//!   and sensitive grants.
+//! - `oxidhome token grant-sensitive <token-id> <category>
+//!   [--device <id>]...` / `revoke-sensitive <token-id> <category>` —
+//!   edit a token's explicit sensitive grants
+//!   ([`crate::auth::SensitiveGrant`]).
+//! - `oxidhome device set-category <device-id> <category>|--clear` —
+//!   the operator's category raise (also `PUT
+//!   /api/v1/devices/{id}/category` for the owner token).
+//!
+//! Like `recover-admin-token`, the CLI forms run offline: they take the
+//! exclusive state-dir lock, so they refuse while the daemon or an
+//! `mcp-stdio` session is up. Each change leaves a two-phase `LOCAL`
+//! audit row (actor `cli`).
+//!
+//! [`sensitive_access_report`] is the startup check: it names every
+//! live non-owner token whose `*`, `devices:command` or `blobs:read`
+//! scope no longer reaches the sensitive categories it used to.
+
+use std::path::Path;
+
+use anyhow::Context;
+
+use super::bootstrap::{AUDIT_METHOD_LOCAL, audited};
+use crate::auth::{
+    DeviceCategory, SensitiveCategory, SensitiveGrant, SensitiveSet, TokenPolicy, parse_policy,
+};
+use crate::state::{AuditLog, DeviceMetaRow, TokenRecord, TokenStore};
+
+/// Audit `path` prefix of a sensitive grant (`…:<category>`).
+pub const AUDIT_PATH_GRANT_SENSITIVE: &str = "cli.auth.grant_sensitive";
+/// Audit `path` prefix of a sensitive revoke (`…:<category>`).
+pub const AUDIT_PATH_REVOKE_SENSITIVE: &str = "cli.auth.revoke_sensitive";
+/// Audit `path` prefix of a category override (`…:<category|clear>`).
+/// The row's `token_id` column holds the device id.
+pub const AUDIT_PATH_DEVICE_CATEGORY: &str = "cli.device.category";
+
+/// Longest device pattern a grant may carry, in bytes.
+const MAX_DEVICE_PATTERN_LEN: usize = 64;
+/// Most device patterns one grant may carry.
+const MAX_DEVICE_PATTERNS: usize = 64;
+
+/// One live token whose scopes lost sensitive reach in slice 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitiveGap {
+    /// Token id.
+    pub token_id: String,
+    /// Token label.
+    pub label: String,
+    /// Categories its scopes used to reach and no grant now covers on
+    /// every device.
+    pub missing: SensitiveSet,
+}
+
+/// Which sensitive categories `scopes` reached before slice 2.
+fn reached_by(scopes: &[String]) -> SensitiveSet {
+    let has = |s: &str| scopes.iter().any(|x| x == "*" || x == s);
+    let mut set = SensitiveSet::empty();
+    if has("devices:command") {
+        for c in [
+            SensitiveCategory::Lock,
+            SensitiveCategory::Opener,
+            SensitiveCategory::Alarm,
+        ] {
+            set.insert(c);
+        }
+    }
+    if has("blobs:read") {
+        set.insert(SensitiveCategory::Camera);
+    }
+    set
+}
+
+/// The tokens [`sensitive_access_report`] would name, from records.
+#[must_use]
+pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
+    records
+        .iter()
+        .filter(|r| r.revoked_ms.is_none() && !r.owner)
+        .filter_map(|r| {
+            let policy = parse_policy(&r.scope_json)?;
+            let granted: SensitiveSet = policy
+                .sensitive
+                .iter()
+                .filter(|g| g.devices.is_none())
+                .map(|g| g.category)
+                .collect();
+            let reached = reached_by(&policy.scopes);
+            let missing: SensitiveSet = reached.iter().filter(|c| !granted.contains(*c)).collect();
+            (!missing.is_empty()).then(|| SensitiveGap {
+                token_id: r.id.clone(),
+                label: r.label.clone(),
+                missing,
+            })
+        })
+        .collect()
+}
+
+/// Startup check (H6 slice 2, Q8): log at `warn` every live non-owner
+/// token whose `*` / `devices:command` / `blobs:read` scope no longer
+/// reaches a lock, opener, alarm or camera bytes, and how to restore
+/// it. Returns what it logged.
+pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
+    let records = match tokens.list() {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(target: "auth.sensitive", error = %err, "listing tokens for the sensitive-access check failed");
+            return Vec::new();
+        }
+    };
+    let gaps = sensitive_gaps(&records);
+    for gap in &gaps {
+        tracing::warn!(
+            target: "auth.sensitive",
+            token_id = %gap.token_id,
+            label = %gap.label,
+            missing = %gap.missing.to_csv(),
+            "token's scopes no longer reach sensitive categories (lock, opener, alarm commands and \
+             camera bytes need an explicit grant); restore with \
+             `oxidhome token grant-sensitive <token-id> <category>`",
+        );
+    }
+    gaps
+}
+
+fn live_policy(tokens: &TokenStore, token_id: &str) -> anyhow::Result<TokenPolicy> {
+    let rec = tokens
+        .get(token_id)
+        .context("reading the token")?
+        .filter(|r| r.revoked_ms.is_none())
+        .ok_or_else(|| anyhow::anyhow!("no live token `{token_id}`"))?;
+    parse_policy(&rec.scope_json).ok_or_else(|| {
+        anyhow::anyhow!(
+            "token `{token_id}` has a policy the host can't parse (it is treated as deny-all); \
+             refusing to rewrite it"
+        )
+    })
+}
+
+fn check_devices(devices: &[String]) -> anyhow::Result<()> {
+    if devices.len() > MAX_DEVICE_PATTERNS {
+        anyhow::bail!("at most {MAX_DEVICE_PATTERNS} --device patterns");
+    }
+    for d in devices {
+        if d.is_empty() || d == "*" || d.len() > MAX_DEVICE_PATTERN_LEN {
+            anyhow::bail!(
+                "device pattern {d:?} must be a device id or `prefix*`, 1 to \
+                 {MAX_DEVICE_PATTERN_LEN} bytes (omit --device to grant every device)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `policy` with `category` granted: on every device (`devices` empty)
+/// or added to the category's device list. A category already granted
+/// on every device stays that way.
+#[must_use]
+pub fn with_grant(
+    mut policy: TokenPolicy,
+    category: SensitiveCategory,
+    devices: &[String],
+) -> TokenPolicy {
+    let existing: Vec<SensitiveGrant> = policy
+        .sensitive
+        .iter()
+        .filter(|g| g.category == category)
+        .cloned()
+        .collect();
+    policy.sensitive.retain(|g| g.category != category);
+    let all = devices.is_empty() || existing.iter().any(|g| g.devices.is_none());
+    let grant = if all {
+        SensitiveGrant::all(category)
+    } else {
+        let mut list: Vec<String> = existing
+            .into_iter()
+            .flat_map(|g| g.devices.unwrap_or_default())
+            .chain(devices.iter().cloned())
+            .collect();
+        list.sort();
+        list.dedup();
+        SensitiveGrant {
+            category,
+            devices: Some(list),
+        }
+    };
+    policy.sensitive.push(grant);
+    policy.sensitive.sort_by_key(|g| g.category);
+    policy
+}
+
+/// Grant `category` to `token_id` (every device, or the `devices`
+/// patterns). Returns the policy as stored.
+///
+/// # Errors
+///
+/// Unknown or revoked token, an unparseable stored policy, a bad
+/// device pattern, or a storage / audit failure.
+pub fn grant_sensitive(
+    tokens: &TokenStore,
+    audit: &AuditLog,
+    token_id: &str,
+    category: SensitiveCategory,
+    devices: &[String],
+) -> anyhow::Result<TokenPolicy> {
+    check_devices(devices)?;
+    let policy = with_grant(live_policy(tokens, token_id)?, category, devices);
+    let path = format!("{AUDIT_PATH_GRANT_SENSITIVE}:{}", category.as_str());
+    audited(audit, "cli", token_id, &path, || {
+        store(tokens, token_id, &policy)?;
+        Ok(())
+    })?;
+    tracing::warn!(
+        target: "auth.sensitive",
+        token_id,
+        category = category.as_str(),
+        devices = ?devices,
+        "sensitive grant added",
+    );
+    Ok(policy)
+}
+
+/// Remove every grant of `category` from `token_id`. Returns the policy
+/// as stored.
+///
+/// # Errors
+///
+/// As [`grant_sensitive`].
+pub fn revoke_sensitive(
+    tokens: &TokenStore,
+    audit: &AuditLog,
+    token_id: &str,
+    category: SensitiveCategory,
+) -> anyhow::Result<TokenPolicy> {
+    let mut policy = live_policy(tokens, token_id)?;
+    policy.sensitive.retain(|g| g.category != category);
+    let path = format!("{AUDIT_PATH_REVOKE_SENSITIVE}:{}", category.as_str());
+    audited(audit, "cli", token_id, &path, || {
+        store(tokens, token_id, &policy)?;
+        Ok(())
+    })?;
+    Ok(policy)
+}
+
+fn store(tokens: &TokenStore, token_id: &str, policy: &TokenPolicy) -> anyhow::Result<()> {
+    if tokens
+        .set_policy(token_id, &policy.to_json())
+        .context("storing the token policy")?
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("token `{token_id}` was revoked meanwhile")
+    }
+}
+
+/// Run `op` against an engine opened on `state_dir` under the exclusive
+/// state-dir lock (the daemon must be stopped).
+///
+/// # Errors
+///
+/// No database, the lock is held, or `op` failed.
+pub fn with_offline_engine<T>(
+    state_dir: &Path,
+    op: impl FnOnce(&crate::Engine) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if !state_dir.join("oxidhome.db").exists() {
+        anyhow::bail!(
+            "no oxidhome database under {} (set $OXIDHOME_STATE_DIR to the daemon's state dir)",
+            state_dir.display(),
+        );
+    }
+    let _lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
+        .context("this command needs exclusive access — stop the daemon first")?;
+    let engine = crate::Engine::with_state_dir(state_dir)
+        .with_context(|| format!("opening engine state at {}", state_dir.display()))?;
+    let result = op(&engine);
+    let _ = engine.log_store().flush(std::time::Duration::from_secs(5));
+    result
+}
+
+/// Set (or with `None` clear) the operator's category raise for
+/// `device_id`, audited. Returns the stored row.
+///
+/// # Errors
+///
+/// A malformed device id, or a storage / audit failure.
+pub fn set_device_category(
+    engine: &crate::Engine,
+    device_id: &str,
+    category: Option<DeviceCategory>,
+) -> anyhow::Result<DeviceMetaRow> {
+    if !crate::state::is_device_id(device_id) {
+        anyhow::bail!("`{device_id}` is not a device id (expected `dev-` and 16 hex digits)");
+    }
+    let path = format!(
+        "{AUDIT_PATH_DEVICE_CATEGORY}:{}",
+        category.map_or("clear", DeviceCategory::as_str)
+    );
+    let devices = engine.devices();
+    audited(&engine.audit_log(), "cli", device_id, &path, || {
+        devices
+            .meta()
+            .set_override(device_id, category)
+            .context("storing the category override")
+    })
+}
+
+/// `method` of every row this module writes.
+pub const AUDIT_METHOD: &str = AUDIT_METHOD_LOCAL;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{AuditQuery, Db};
+    use std::sync::Arc;
+
+    fn stores() -> (TokenStore, AuditLog) {
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        (TokenStore::new(Arc::clone(&db)), AuditLog::new(db))
+    }
+
+    #[test]
+    fn grant_and_revoke_round_trip_through_the_store() {
+        let (tokens, audit) = stores();
+        let t = tokens.create("ha", br#"["*"]"#).unwrap();
+        let p = grant_sensitive(&tokens, &audit, &t.id, SensitiveCategory::Lock, &[]).unwrap();
+        assert_eq!(
+            p.sensitive,
+            vec![SensitiveGrant::all(SensitiveCategory::Lock)]
+        );
+        let stored = parse_policy(&tokens.get(&t.id).unwrap().unwrap().scope_json).unwrap();
+        assert_eq!(stored, p);
+        assert_eq!(stored.scopes, vec!["*".to_string()]);
+
+        let p = grant_sensitive(
+            &tokens,
+            &audit,
+            &t.id,
+            SensitiveCategory::Opener,
+            &["dev-00000000000000aa".into()],
+        )
+        .unwrap();
+        assert_eq!(p.sensitive.len(), 2);
+
+        let p = revoke_sensitive(&tokens, &audit, &t.id, SensitiveCategory::Lock).unwrap();
+        assert_eq!(p.sensitive.len(), 1);
+        assert_eq!(p.sensitive[0].category, SensitiveCategory::Opener);
+
+        let rows = audit.query(&AuditQuery::default(), 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|r| r.method == AUDIT_METHOD && r.decision == "allow")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.path == "cli.auth.grant_sensitive:lock")
+        );
+    }
+
+    #[test]
+    fn grants_merge_device_lists_and_never_narrow_an_all_grant() {
+        let base = TokenPolicy::default();
+        let p = with_grant(base, SensitiveCategory::Lock, &["dev-b".into()]);
+        let p = with_grant(
+            p,
+            SensitiveCategory::Lock,
+            &["dev-a".into(), "dev-b".into()],
+        );
+        assert_eq!(
+            p.sensitive,
+            vec![SensitiveGrant {
+                category: SensitiveCategory::Lock,
+                devices: Some(vec!["dev-a".into(), "dev-b".into()]),
+            }]
+        );
+        let p = with_grant(p, SensitiveCategory::Lock, &[]);
+        let p = with_grant(p, SensitiveCategory::Lock, &["dev-c".into()]);
+        assert_eq!(
+            p.sensitive,
+            vec![SensitiveGrant::all(SensitiveCategory::Lock)]
+        );
+    }
+
+    #[test]
+    fn refuses_revoked_unparseable_and_bad_patterns() {
+        let (tokens, audit) = stores();
+        let t = tokens.create("x", br#"["*"]"#).unwrap();
+        assert!(
+            grant_sensitive(
+                &tokens,
+                &audit,
+                &t.id,
+                SensitiveCategory::Lock,
+                &["*".into()]
+            )
+            .is_err()
+        );
+        tokens.revoke(&t.id).unwrap();
+        assert!(grant_sensitive(&tokens, &audit, &t.id, SensitiveCategory::Lock, &[]).is_err());
+        let bad = tokens.create("bad", b"not json").unwrap();
+        assert!(grant_sensitive(&tokens, &audit, &bad.id, SensitiveCategory::Lock, &[]).is_err());
+        assert!(
+            grant_sensitive(&tokens, &audit, "tok-missing", SensitiveCategory::Lock, &[]).is_err()
+        );
+    }
+
+    #[test]
+    fn startup_report_names_wildcard_tokens_without_grants() {
+        let (tokens, audit) = stores();
+        let wildcard = tokens.create("ha", br#"["*"]"#).unwrap();
+        let reader = tokens.create("ro", br#"["devices:list"]"#).unwrap();
+        let cam = tokens.create("cam", br#"["blobs:read"]"#).unwrap();
+        let revoked = tokens.create("old", br#"["*"]"#).unwrap();
+        tokens.revoke(&revoked.id).unwrap();
+        grant_sensitive(&tokens, &audit, &cam.id, SensitiveCategory::Camera, &[]).unwrap();
+
+        let gaps = sensitive_access_report(&tokens);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].token_id, wildcard.id);
+        assert_eq!(gaps[0].missing.to_csv(), "lock,opener,alarm,camera");
+        assert!(gaps.iter().all(|g| g.token_id != reader.id));
+
+        // A device-narrowed grant still leaves the category reported.
+        grant_sensitive(
+            &tokens,
+            &audit,
+            &wildcard.id,
+            SensitiveCategory::Lock,
+            &["dev-1*".into()],
+        )
+        .unwrap();
+        let gaps = sensitive_access_report(&tokens);
+        assert!(gaps[0].missing.contains(SensitiveCategory::Lock));
+    }
+}

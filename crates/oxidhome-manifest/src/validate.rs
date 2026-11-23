@@ -370,7 +370,8 @@ pub const MAX_SCRIPT_SANDBOXES: u32 = 64;
 /// work AND the ceiling of any one device's capability set.
 /// Chosen generously — the known capability universe is
 /// small (`switch`, `dimmer`, `color-light`, `sensor`,
-/// `button`, `video-stream`, `audio-stream`, plus
+/// `button`, `video-stream`, `audio-stream`, `lock`, `opener`,
+/// `alarm-panel`, `siren`, plus
 /// `extension(<namespace>/<name>@<version>)` keys — a real plugin
 /// picks a handful).
 pub const MAX_DECLARES_DEVICES: usize = 64;
@@ -1002,6 +1003,10 @@ const KNOWN_DEVICE_CAPABILITIES: &[&str] = &[
     "button",
     "video-stream",
     "audio-stream",
+    "lock",
+    "opener",
+    "alarm-panel",
+    "siren",
 ];
 
 #[cfg(test)]

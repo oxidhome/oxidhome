@@ -646,6 +646,10 @@ pub(crate) fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
         capabilities::CapabilitySpec::Button => "button".into(),
         capabilities::CapabilitySpec::VideoStream => "video-stream".into(),
         capabilities::CapabilitySpec::AudioStream => "audio-stream".into(),
+        capabilities::CapabilitySpec::Lock => "lock".into(),
+        capabilities::CapabilitySpec::Opener(_) => "opener".into(),
+        capabilities::CapabilitySpec::AlarmPanel(_) => "alarm-panel".into(),
+        capabilities::CapabilitySpec::Siren => "siren".into(),
         capabilities::CapabilitySpec::Extension(ext) => {
             super::schema::extension_capability_key(ext)
         }
@@ -664,6 +668,10 @@ fn capability_state_name(state: &capabilities::CapabilityState) -> &'static str 
         capabilities::CapabilityState::Dimmer(_) => "dimmer",
         capabilities::CapabilityState::ColorLight(_) => "color-light",
         capabilities::CapabilityState::Sensor(_) => "sensor",
+        capabilities::CapabilityState::Lock(_) => "lock",
+        capabilities::CapabilityState::Opener(_) => "opener",
+        capabilities::CapabilityState::AlarmPanel(_) => "alarm-panel",
+        capabilities::CapabilityState::Siren(_) => "siren",
     }
 }
 
@@ -680,7 +688,8 @@ fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
         .map(|state| {
             let name = capability_state_name(state).to_string();
             let fields = match state {
-                capabilities::CapabilityState::Switch(s) => vec![KeyValue {
+                capabilities::CapabilityState::Switch(s)
+                | capabilities::CapabilityState::Siren(s) => vec![KeyValue {
                     key: "state".into(),
                     value: Value::BoolVal(s.state),
                 }],
@@ -714,6 +723,27 @@ fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
                 capabilities::CapabilityState::Sensor(m) => {
                     super::schema::measurement_fields(m.value, &m.unit)
                 }
+                capabilities::CapabilityState::Lock(l) => vec![KeyValue {
+                    key: "state".into(),
+                    value: Value::StringVal(super::schema::lock_state_name(*l).into()),
+                }],
+                capabilities::CapabilityState::Opener(o) => {
+                    let mut fields = vec![KeyValue {
+                        key: "state".into(),
+                        value: Value::StringVal(super::schema::opener_state_name(o.state).into()),
+                    }];
+                    if let Some(position) = o.position {
+                        fields.push(KeyValue {
+                            key: "position".into(),
+                            value: Value::FloatVal(position),
+                        });
+                    }
+                    fields
+                }
+                capabilities::CapabilityState::AlarmPanel(a) => vec![KeyValue {
+                    key: "state".into(),
+                    value: Value::StringVal(super::schema::alarm_state_name(*a).into()),
+                }],
             };
             (name, fields)
         })

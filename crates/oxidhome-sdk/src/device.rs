@@ -23,10 +23,11 @@
 //! ```
 
 use crate::bindings::oxidhome::plugin::capabilities::{
-    CapabilitySpec, CapabilityState, ExtensionSpec,
+    AlarmMode, AlarmPanelSpec, AlarmState, CapabilitySpec, CapabilityState, ExtensionSpec,
+    LockState, OpenerKind, OpenerSpec, OpenerState, OpenerStatus, Switchable,
 };
 use crate::bindings::oxidhome::plugin::devices::DeviceInfo;
-use crate::bindings::oxidhome::plugin::types::KeyValue;
+use crate::bindings::oxidhome::plugin::types::{KeyValue, Value};
 
 /// Fluent builder for [`DeviceInfo`].
 ///
@@ -103,6 +104,54 @@ impl Device {
         }))
     }
 
+    /// A `lock` in `state`. Lock devices are a **sensitive** category:
+    /// the host lets a token command them only with an explicit
+    /// `lock` grant, rate limits those commands and audits each at
+    /// `warn`. Commands by convention: `lock`, `unlock`.
+    #[must_use]
+    pub fn lock(self, state: LockState) -> Self {
+        self.capability(CapabilitySpec::Lock)
+            .initial_state(CapabilityState::Lock(state))
+    }
+
+    /// A garage door, gate or other `opener` (sensitive, like
+    /// [`Self::lock`]). `position` (0.0 closed to 1.0 open) only when
+    /// the device reports one. Commands by convention: `open`, `close`,
+    /// `stop`, and `set` with a `position` arg when `supports_position`.
+    #[must_use]
+    pub fn opener(self, kind: OpenerKind, state: OpenerState, position: Option<f64>) -> Self {
+        self.capability(CapabilitySpec::Opener(OpenerSpec {
+            kind,
+            supports_position: position.is_some(),
+        }))
+        .initial_state(CapabilityState::Opener(OpenerStatus { state, position }))
+    }
+
+    /// An `alarm-panel` arming `modes` (1 to 8; sensitive, like
+    /// [`Self::lock`]). Commands by convention: `arm` with a `mode`
+    /// arg, `disarm`, plus a `code` arg when `code_required`.
+    #[must_use]
+    pub fn alarm_panel(
+        self,
+        modes: Vec<AlarmMode>,
+        code_required: bool,
+        state: AlarmState,
+    ) -> Self {
+        self.capability(CapabilitySpec::AlarmPanel(AlarmPanelSpec {
+            modes,
+            code_required,
+        }))
+        .initial_state(CapabilityState::AlarmPanel(state))
+    }
+
+    /// A `siren`, sounding or not (sensitive: the `alarm` category).
+    /// Commands by convention: `on`, `off`, `toggle`.
+    #[must_use]
+    pub fn siren(self, sounding: bool) -> Self {
+        self.capability(CapabilitySpec::Siren)
+            .initial_state(CapabilityState::Siren(Switchable { state: sounding }))
+    }
+
     /// Append an initial-state snapshot for one stateful capability.
     /// The host treats `initial_state` as a hint, not a requirement —
     /// devices that can't report state at registration time can leave
@@ -140,6 +189,66 @@ impl Device {
 impl From<Device> for DeviceInfo {
     fn from(d: Device) -> Self {
         d.info
+    }
+}
+
+/// `state-changed` fields for a lock, as the host projects them:
+/// `state` = `locked` / `unlocked` / `locking` / `unlocking` / `jammed`.
+#[must_use]
+pub fn lock_fields(state: LockState) -> Vec<KeyValue> {
+    let name = match state {
+        LockState::Locked => "locked",
+        LockState::Unlocked => "unlocked",
+        LockState::Locking => "locking",
+        LockState::Unlocking => "unlocking",
+        LockState::Jammed => "jammed",
+    };
+    vec![string_field("state", name)]
+}
+
+/// `state-changed` fields for an opener: `state` (`open`, `closed`,
+/// `opening`, `closing`, `stopped`) and, when known, `position`.
+#[must_use]
+pub fn opener_fields(status: OpenerStatus) -> Vec<KeyValue> {
+    let name = match status.state {
+        OpenerState::Open => "open",
+        OpenerState::Closed => "closed",
+        OpenerState::Opening => "opening",
+        OpenerState::Closing => "closing",
+        OpenerState::Stopped => "stopped",
+    };
+    let mut fields = vec![string_field("state", name)];
+    if let Some(position) = status.position {
+        fields.push(KeyValue {
+            key: "position".into(),
+            value: Value::FloatVal(position),
+        });
+    }
+    fields
+}
+
+/// `state-changed` fields for an alarm panel: `state` = `disarmed`,
+/// `armed-home`, `armed-away`, `armed-night`, `armed-vacation`,
+/// `arming`, `pending` or `triggered`.
+#[must_use]
+pub fn alarm_fields(state: AlarmState) -> Vec<KeyValue> {
+    let name = match state {
+        AlarmState::Disarmed => "disarmed",
+        AlarmState::ArmedHome => "armed-home",
+        AlarmState::ArmedAway => "armed-away",
+        AlarmState::ArmedNight => "armed-night",
+        AlarmState::ArmedVacation => "armed-vacation",
+        AlarmState::Arming => "arming",
+        AlarmState::Pending => "pending",
+        AlarmState::Triggered => "triggered",
+    };
+    vec![string_field("state", name)]
+}
+
+fn string_field(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.into(),
+        value: Value::StringVal(value.into()),
     }
 }
 
@@ -221,6 +330,49 @@ mod tests {
             CapabilitySpec::Extension(ExtensionSpec { namespace, name, version: 1 })
                 if namespace == "com.acme" && name == "window-shade"
         ));
+    }
+
+    #[test]
+    fn sensitive_capability_shortcuts() {
+        let info = Device::new("door", "Front door")
+            .lock(LockState::Locked)
+            .build();
+        assert!(matches!(info.capabilities[0], CapabilitySpec::Lock));
+        assert!(matches!(
+            info.initial_state[0],
+            CapabilityState::Lock(LockState::Locked)
+        ));
+
+        let info = Device::new("gate", "Gate")
+            .opener(OpenerKind::Gate, OpenerState::Closed, Some(0.0))
+            .build();
+        assert!(matches!(
+            info.capabilities[0],
+            CapabilitySpec::Opener(OpenerSpec {
+                supports_position: true,
+                ..
+            })
+        ));
+
+        let info = Device::new("panel", "Panel")
+            .alarm_panel(vec![AlarmMode::ArmedAway], true, AlarmState::Disarmed)
+            .siren(false)
+            .build();
+        assert_eq!(info.capabilities.len(), 2);
+        assert_eq!(info.initial_state.len(), 2);
+
+        let fields = opener_fields(OpenerStatus {
+            state: OpenerState::Opening,
+            position: Some(0.25),
+        });
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(&fields[0].value, Value::StringVal(s) if s == "opening"));
+        assert!(
+            matches!(&lock_fields(LockState::Jammed)[0].value, Value::StringVal(s) if s == "jammed")
+        );
+        assert!(
+            matches!(&alarm_fields(AlarmState::ArmedNight)[0].value, Value::StringVal(s) if s == "armed-night")
+        );
     }
 
     #[test]

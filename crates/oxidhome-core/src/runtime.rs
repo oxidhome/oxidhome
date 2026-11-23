@@ -95,6 +95,9 @@ pub struct Engine {
     sandboxes: Arc<SandboxRegistry>,
     /// H5: accepted-but-unfinished device commands.
     pending_commands: Arc<PendingCommands>,
+    /// H6 slice 2: rate limits and `warn` audit rows for allowed
+    /// sensitive actions, shared by every transport.
+    sensitive: Arc<crate::auth::sensitive::SensitiveGuard>,
     auth_tokens: Arc<crate::state::TokenStore>,
     installed_plugins: Arc<InstalledPluginRegistry>,
     /// H2 round-2 F1: per-`plugin_id` async mutex used by both API
@@ -418,10 +421,18 @@ impl Engine {
             PendingCommands::new(Some(Arc::clone(&audit_log)))
                 .context("starting the command journal")?,
         );
+        // H6 slice 2: the durable device-category floor and operator
+        // overrides, before any plugin registers a device.
+        let device_meta = crate::state::DeviceMetaStore::open(Arc::clone(&db))
+            .context("loading device categories")?;
+        let sensitive = Arc::new(crate::auth::sensitive::SensitiveGuard::new(Arc::clone(
+            &audit_log,
+        )));
         Ok(Self {
             inner,
             pending_commands,
-            devices: Arc::new(DeviceRegistry::new()),
+            sensitive,
+            devices: Arc::new(DeviceRegistry::with_meta(Arc::new(device_meta))),
             device_state,
             events,
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
@@ -506,6 +517,13 @@ impl Engine {
     #[must_use]
     pub fn devices(&self) -> Arc<DeviceRegistry> {
         Arc::clone(&self.devices)
+    }
+
+    /// H6 slice 2: obligations (rate limit, `warn` audit row) of
+    /// allowed sensitive actions.
+    #[must_use]
+    pub fn sensitive(&self) -> Arc<crate::auth::sensitive::SensitiveGuard> {
+        Arc::clone(&self.sensitive)
     }
 
     /// H9 host-owned device-state projection. Consumers (API/UI,

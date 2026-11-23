@@ -114,6 +114,63 @@ interface capabilities {
     max: option<f64>,
   }
 
+  enum lock-state {
+    locked,
+    unlocked,
+    locking,
+    unlocking,
+    jammed,
+  }
+
+  enum opener-kind {
+    garage-door,
+    gate,
+    door,
+    window,
+    other,
+  }
+
+  record opener-spec {
+    kind: opener-kind,
+    supports-position: bool,
+  }
+
+  enum opener-state {
+    open,
+    closed,
+    opening,
+    closing,
+    stopped,
+  }
+
+  record opener-status {
+    state: opener-state,
+    position: option<f64>,
+  }
+
+  enum alarm-mode {
+    armed-home,
+    armed-away,
+    armed-night,
+    armed-vacation,
+  }
+
+  record alarm-panel-spec {
+    modes: list<alarm-mode>,
+    code-required: bool,
+  }
+
+  enum alarm-state {
+    disarmed,
+    armed-home,
+    armed-away,
+    armed-night,
+    armed-vacation,
+    arming,
+    pending,
+    triggered,
+  }
+
   record extension-spec {
     namespace: string,
     name: string,
@@ -128,6 +185,10 @@ interface capabilities {
     button,
     video-stream,
     audio-stream,
+    lock,
+    opener(opener-spec),
+    alarm-panel(alarm-panel-spec),
+    siren,
     extension(extension-spec),
   }
 
@@ -136,6 +197,10 @@ interface capabilities {
     dimmer(dimmable),
     color-light(color),
     sensor(measurement),
+    lock(lock-state),
+    opener(opener-status),
+    alarm-panel(alarm-state),
+    siren(switchable),
   }
 }
 

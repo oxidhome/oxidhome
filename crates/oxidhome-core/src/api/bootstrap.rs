@@ -620,6 +620,8 @@ fn record_intent(
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     };
     // Durable: every caller follows the intent with a durable
     // filesystem or token change that must not outlive its evidence.
@@ -643,7 +645,7 @@ fn finalize(audit: &AuditLog, id: u64, outcome: Outcome) {
 }
 
 /// Two-phase audit around a single local action.
-fn audited<T>(
+pub(super) fn audited<T>(
     audit: &AuditLog,
     actor_kind: &str,
     token_id: &str,

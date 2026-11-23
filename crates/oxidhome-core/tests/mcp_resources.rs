@@ -1384,3 +1384,81 @@ async fn events_resource_reports_pruned_cursor() {
     .await;
     assert!(response["error"].is_null(), "{response}");
 }
+
+/// H6 slice 2: a camera instance's blobs are camera bytes. The
+/// wildcard scope (and plain `blobs:read`) no longer reaches them; a
+/// token with an explicit `camera` grant does, and the read leaves a
+/// `warn` audit row.
+#[tokio::test(flavor = "current_thread")]
+async fn camera_blobs_need_the_camera_grant() {
+    use oxidhome_core::api::sensitive_admin::grant_sensitive;
+    use oxidhome_core::auth::SensitiveCategory;
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::capabilities::CapabilitySpec;
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::DeviceInfo;
+
+    let engine = Engine::new().expect("engine");
+    engine.devices().register(
+        "u",
+        "cam-inst".into(),
+        DeviceInfo {
+            local_id: "front".into(),
+            name: "Front camera".into(),
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            capabilities: vec![CapabilitySpec::VideoStream],
+            initial_state: Vec::new(),
+            metadata: Vec::new(),
+        },
+    );
+    let wildcard = mint_bearer(&engine);
+    let reader = mint_bearer_with_scopes(&engine, "reader", &["blobs:read"]);
+    let viewer = engine
+        .auth_tokens()
+        .create("viewer", br#"["blobs:read"]"#)
+        .unwrap();
+    grant_sensitive(
+        &engine.auth_tokens(),
+        &engine.audit_log(),
+        &viewer.id,
+        SensitiveCategory::Camera,
+        &[],
+    )
+    .unwrap();
+    let router = build_router(engine.clone());
+    let uri = json!({"uri": "oxidhome://blobs/cam-inst/snap.jpg"});
+
+    for bearer in [&wildcard, &reader] {
+        let (router, session) = handshake(router.clone(), bearer).await;
+        let response = call(&router, bearer, &session, "resources/read", uri.clone()).await;
+        assert_eq!(response["error"]["code"], -32001, "{response}");
+    }
+    // A non-camera instance's blobs are unchanged for the wildcard.
+    let (r, session) = handshake(router.clone(), &wildcard).await;
+    let response = call(
+        &r,
+        &wildcard,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://blobs/lamp-inst/snap.jpg"}),
+    )
+    .await;
+    assert_ne!(response["error"]["code"], -32001, "{response}");
+
+    let (router, session) = handshake(router, &viewer.plaintext).await;
+    let response = call(&router, &viewer.plaintext, &session, "resources/read", uri).await;
+    assert_ne!(response["error"]["code"], -32001, "{response}");
+    let warn = engine
+        .audit_log()
+        .query(
+            &AuditQuery {
+                level: Some("warn".into()),
+                ..AuditQuery::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(warn.len(), 1, "{warn:?}");
+    assert_eq!(warn[0].token_id, viewer.id);
+    assert_eq!(warn[0].required_scope.as_deref(), Some("sensitive:camera"));
+}

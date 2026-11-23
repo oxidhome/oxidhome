@@ -18,6 +18,11 @@
 //! - **Wildcard.** A token whose scope list contains the single
 //!   element `"*"` satisfies every required scope. This is the
 //!   first-run bootstrap admin token's shape (`ADMIN_SCOPE_JSON`).
+//! - **Sensitive categories (H6 slice 2).** No scope, the wildcard
+//!   included, reaches a command on a lock, opener or alarm device or
+//!   camera bytes: those need an explicit grant in the token's policy
+//!   (`"sensitive": ["lock"]`, see [`crate::auth::SensitiveGrant`]).
+//!   The bootstrap / recovered owner token holds every category.
 //!
 //! Hierarchical / glob matching (`devices:*` matches `devices:list`
 //! *and* `devices:write`) is **not** in v1.
@@ -232,16 +237,10 @@ pub(crate) const STATUS_READ: Scope = Scope::new("status:read");
 /// name.
 pub(crate) const BLOBS_READ: Scope = Scope::new("blobs:read");
 
-/// M7: may this caller see raw `bytes-val` payloads? Camera
-/// snapshots, audio clips and inference frames ride device state,
-/// events and command results as `bytes-val`; the root needs
-/// `blob.read` (the `blobs:read` scope, or the wildcard) to receive
-/// them. Without it every read surface (REST, Connect, MCP) replaces
-/// the bytes with a `json-val` marker naming the size and this scope,
-/// see [`crate::redact::withhold_bytes`].
-pub(crate) fn can_read_blobs(ctx: &InvocationContext) -> bool {
-    authorize(ctx, Action::BlobRead, &Resource::blobs()).allow
-}
+// M7: who may see raw `bytes-val` payloads in state, events and
+// command results is decided per source by `crate::api::bytes::BytesGate`
+// (H6 slice 2: a camera source needs the camera grant on top of
+// `blobs:read`).
 
 /// C6: `plugins:ui` — see `GET /api/v1/plugins/{plugin_id}/ui`.
 /// Gates the sandboxed-iframe wrapper endpoint that hosts the

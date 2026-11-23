@@ -53,7 +53,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::Engine;
-use crate::api::scopes::can_read_blobs;
+use crate::api::bytes::BytesGate;
 use crate::auth::{Action, Actor, InvocationContext, Resource as AuthResource, authorize};
 use crate::state::audit_log::AuditEntry;
 use crate::state::event_log::now_unix_ms;
@@ -105,6 +105,11 @@ pub(super) const RESOURCE_BUSY_CODE: ErrorCode = ErrorCode(-32004);
 /// `data` is `{"cursor_expired": {after_id, oldest_id, head_id}}`, the
 /// same body the REST history and the event tails return.
 pub(super) const CURSOR_EXPIRED_CODE: ErrorCode = ErrorCode(-32005);
+
+/// H6 slice 2: the principal has used up its allowance for a
+/// sensitive category (lock, opener, alarm, camera). Retriable after
+/// the delay in the message; audits as HTTP 429.
+pub(super) const SENSITIVE_RATE_LIMITED_CODE: ErrorCode = ErrorCode(-32006);
 
 /// [`AuditEntry::actor_kind`] value we stamp on every MCP row.
 /// Matches [`crate::auth::ActorKind::Mcp`]'s `as_str()` — kept
@@ -447,6 +452,10 @@ enum ReadOutcome {
     Denied {
         required: &'static str,
     },
+    /// H6 slice 2: a camera blob read over the principal's camera
+    /// allowance. Reported as [`SENSITIVE_RATE_LIMITED_CODE`] and
+    /// audited as HTTP 429.
+    RateLimited(String),
     Internal(String),
 }
 
@@ -482,6 +491,9 @@ impl ReadOutcome {
                 "scope denied for MCP resource",
                 None,
             )),
+            Self::RateLimited(reason) => {
+                Err(McpError::new(SENSITIVE_RATE_LIMITED_CODE, reason, None))
+            }
             Self::Internal(reason) => Err(McpError::internal_error(reason, None)),
         }
     }
@@ -494,6 +506,7 @@ impl ReadOutcome {
             Self::TooLarge(_) => 413,
             Self::Busy(_) => 503,
             Self::CursorExpired(_) => 410,
+            Self::RateLimited(_) => 429,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -519,7 +532,8 @@ impl ReadOutcome {
             | Self::Denied { .. }
             | Self::InvalidParams(_)
             | Self::TooLarge(_)
-            | Self::CursorExpired(_) => "deny",
+            | Self::CursorExpired(_)
+            | Self::RateLimited(_) => "deny",
             Self::Internal(_) | Self::Busy(_) => "error",
         }
     }
@@ -558,11 +572,13 @@ enum Kind<'a> {
 }
 
 impl Kind<'_> {
-    /// What the read targets, for [`authorize`].
-    fn resource(&self) -> AuthResource {
+    /// What the read targets, for [`authorize`]. A blob's class comes
+    /// from its instance: a camera plugin's blobs are camera bytes
+    /// (H6 slice 2).
+    fn resource(&self, engine: &Engine) -> AuthResource {
         match self {
             Kind::DevicesList => AuthResource::devices(),
-            Kind::DevicesDetail(id) => AuthResource::device(*id),
+            Kind::DevicesDetail(id) => engine.devices().resource(id),
             // The detail read is checked against the plugin collection:
             // `plugin.read` on `oxidhome://plugins/{id}` has always been
             // the flat `plugins:list` scope, and naming the plugin here
@@ -570,7 +586,11 @@ impl Kind<'_> {
             Kind::PluginsList | Kind::PluginsDetail(_) => AuthResource::plugins(),
             Kind::Events => AuthResource::events(),
             Kind::Logs | Kind::Status | Kind::Config => AuthResource::Host,
-            Kind::Blob(instance, name) => AuthResource::blob(*instance, *name),
+            Kind::Blob(instance, name) => AuthResource::blob(
+                *instance,
+                *name,
+                engine.devices().instance_is_camera(instance),
+            ),
         }
     }
 }
@@ -750,8 +770,27 @@ async fn read_inner(
         Route::Terminal { family, outcome } => return (family, outcome),
     };
 
-    if let Err(required) = authorize(ctx, action, &kind.resource()).into_result() {
+    let decision = authorize(ctx, action, &kind.resource(&engine));
+    if let Err(required) = decision.clone().into_result() {
         return (family, ReadOutcome::Denied { required });
+    }
+    // H6 slice 2: a camera blob is rate limited and leaves a `warn`
+    // row before it's read.
+    if let Kind::Blob(instance, name) = &kind
+        && let Err(e) = engine
+            .sensitive()
+            .discharge_blocking(ctx, action, &format!("{instance}/{name}"), &decision)
+            .await
+    {
+        use crate::auth::sensitive::ObligationError;
+        let outcome = match e {
+            ObligationError::RateLimited { .. } => ReadOutcome::RateLimited(e.to_string()),
+            ObligationError::Audit(_) | ObligationError::Join(_) => {
+                tracing::error!(target: "auth.sensitive", error = %e, "camera blob read refused");
+                ReadOutcome::Internal("sensitive read refused".into())
+            }
+        };
+        return (family, outcome);
     }
 
     let outcome = match kind {
@@ -761,7 +800,10 @@ async fn read_inner(
         Kind::PluginsDetail(id) => plugins_detail(&engine, id),
         // Events + logs hit `SQLite`, so parse the query
         // and run the read under `spawn_blocking`.
-        Kind::Events => events_read(engine, query_str, can_read_blobs(ctx)).await,
+        Kind::Events => {
+            let gate = BytesGate::new(ctx, &engine);
+            events_read(engine, query_str, gate).await
+        }
         Kind::Logs => logs_read(engine, query_str).await,
         Kind::Status => status_read(engine.clone()).await,
         Kind::Config => encode(&super::config::config_body(), "config"),
@@ -792,6 +834,8 @@ fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> Audit
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     }
 }
 
@@ -809,6 +853,9 @@ struct DeviceListEntry {
     device_id: String,
     owner_instance: String,
     name: String,
+    /// H6 slice 2: host-derived category and sensitive categories.
+    #[serde(flatten)]
+    class: crate::api::server::WireDeviceClass,
 }
 
 #[derive(Serialize)]
@@ -825,6 +872,7 @@ fn devices_list(engine: &Engine) -> ReadOutcome {
             device_id: meta.id.clone(),
             owner_instance: meta.owner_instance.clone(),
             name: meta.info.name.clone(),
+            class: engine.devices().class_of(&meta.id).into(),
         })
         .collect();
     encode(&DeviceListBody { devices }, "devices list")
@@ -843,6 +891,9 @@ struct DeviceDetail {
     manufacturer: Option<String>,
     model: Option<String>,
     capabilities: Vec<String>,
+    /// H6 slice 2: host-derived category and sensitive categories.
+    #[serde(flatten)]
+    class: crate::api::server::WireDeviceClass,
 }
 
 fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
@@ -861,6 +912,7 @@ fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
             .iter()
             .map(crate::runtime::capability_name)
             .collect(),
+        class: engine.devices().class_of(&meta.id).into(),
     };
     encode(&detail, "device detail")
 }
@@ -1055,7 +1107,7 @@ const EVENTS_KNOWN_KEYS: &[&str] = &[
     "until",
 ];
 
-async fn events_read(engine: Engine, raw_query: &str, blobs: bool) -> ReadOutcome {
+async fn events_read(engine: Engine, raw_query: &str, gate: BytesGate) -> ReadOutcome {
     let query = match parse_query(raw_query) {
         Ok(q) => q,
         Err(err) => return ReadOutcome::InvalidParams(err),
@@ -1151,7 +1203,7 @@ async fn events_read(engine: Engine, raw_query: &str, blobs: bool) -> ReadOutcom
     };
     let events: Vec<_> = rows
         .into_iter()
-        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
     encode(&EventsBody { events }, "events")
 }

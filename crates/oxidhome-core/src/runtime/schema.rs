@@ -26,7 +26,8 @@
 use std::collections::HashSet;
 
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::{
-    CapabilitySpec, CapabilityState, ExtensionSpec, SensorSpec, Unit,
+    AlarmState, CapabilitySpec, CapabilityState, ExtensionSpec, LockState, OpenerState, SensorSpec,
+    Unit,
 };
 use crate::host_impl::plugin::oxidhome::plugin::devices::{CommandResult, DeviceInfo};
 use crate::host_impl::plugin::oxidhome::plugin::services::{
@@ -292,6 +293,45 @@ fn check_sensor_spec(spec: &SensorSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Most armed modes an `alarm-panel-spec` may list.
+pub(crate) const MAX_ALARM_MODES: usize = 8;
+
+/// The projected `state` string of a lock: the WIT case name.
+pub(crate) fn lock_state_name(state: LockState) -> &'static str {
+    match state {
+        LockState::Locked => "locked",
+        LockState::Unlocked => "unlocked",
+        LockState::Locking => "locking",
+        LockState::Unlocking => "unlocking",
+        LockState::Jammed => "jammed",
+    }
+}
+
+/// The projected `state` string of an opener: the WIT case name.
+pub(crate) fn opener_state_name(state: OpenerState) -> &'static str {
+    match state {
+        OpenerState::Open => "open",
+        OpenerState::Closed => "closed",
+        OpenerState::Opening => "opening",
+        OpenerState::Closing => "closing",
+        OpenerState::Stopped => "stopped",
+    }
+}
+
+/// The projected `state` string of an alarm panel: the WIT case name.
+pub(crate) fn alarm_state_name(state: AlarmState) -> &'static str {
+    match state {
+        AlarmState::Disarmed => "disarmed",
+        AlarmState::ArmedHome => "armed-home",
+        AlarmState::ArmedAway => "armed-away",
+        AlarmState::ArmedNight => "armed-night",
+        AlarmState::ArmedVacation => "armed-vacation",
+        AlarmState::Arming => "arming",
+        AlarmState::Pending => "pending",
+        AlarmState::Triggered => "triggered",
+    }
+}
+
 /// Validate the typed parts of a `register-device` / `update-device`
 /// payload: extension identities, sensor units and ranges, and that a
 /// sensor's `initial-state` reading uses its spec's unit. Every
@@ -324,10 +364,26 @@ pub(crate) fn check_device_info(info: &DeviceInfo) -> Result<(), WitError> {
                 check_sensor_spec(sensor).map_err(invalid)?;
                 sensor_unit = Some(&sensor.unit);
             }
+            CapabilitySpec::AlarmPanel(spec)
+                if spec.modes.is_empty() || spec.modes.len() > MAX_ALARM_MODES =>
+            {
+                return Err(invalid(format!(
+                    "alarm-panel spec lists {} armed modes; it must list 1 to {MAX_ALARM_MODES}",
+                    spec.modes.len(),
+                )));
+            }
             _ => {}
         }
     }
     for state in &info.initial_state {
+        if let CapabilityState::Opener(o) = state
+            && let Some(position) = o.position
+            && !(position.is_finite() && (0.0..=1.0).contains(&position))
+        {
+            return Err(invalid(format!(
+                "opener position {position} is outside 0.0 to 1.0"
+            )));
+        }
         if let CapabilityState::Sensor(m) = state {
             check_unit(&m.unit).map_err(invalid)?;
             // A missing sensor spec is refused by the declaration gate
@@ -849,6 +905,42 @@ mod tests {
             "an `other` reading must carry its label"
         );
         assert!(check_sensor_fields(&other, "sensor", &[unit("other"), label("paces")]).is_err());
+    }
+
+    #[test]
+    fn sensitive_capability_checks() {
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::{
+            AlarmMode, AlarmPanelSpec, OpenerKind, OpenerSpec, OpenerStatus,
+        };
+        let panel = |modes: Vec<AlarmMode>| {
+            CapabilitySpec::AlarmPanel(AlarmPanelSpec {
+                modes,
+                code_required: false,
+            })
+        };
+        check_device_info(&device(vec![panel(vec![AlarmMode::ArmedAway])], vec![])).unwrap();
+        assert!(check_device_info(&device(vec![panel(vec![])], vec![])).is_err());
+        assert!(
+            check_device_info(&device(vec![panel(vec![AlarmMode::ArmedHome; 9])], vec![])).is_err()
+        );
+        let opener = CapabilitySpec::Opener(OpenerSpec {
+            kind: OpenerKind::Gate,
+            supports_position: true,
+        });
+        let at = |position| {
+            CapabilityState::Opener(OpenerStatus {
+                state: OpenerState::Stopped,
+                position,
+            })
+        };
+        check_device_info(&device(vec![opener.clone()], vec![at(Some(0.5))])).unwrap();
+        check_device_info(&device(vec![opener.clone()], vec![at(None)])).unwrap();
+        for bad in [-0.1, 1.5, f64::NAN] {
+            assert!(check_device_info(&device(vec![opener.clone()], vec![at(Some(bad))])).is_err());
+        }
+        assert_eq!(lock_state_name(LockState::Jammed), "jammed");
+        assert_eq!(opener_state_name(OpenerState::Closing), "closing");
+        assert_eq!(alarm_state_name(AlarmState::ArmedNight), "armed-night");
     }
 
     #[test]

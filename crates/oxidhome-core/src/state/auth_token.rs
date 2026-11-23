@@ -74,6 +74,11 @@ pub struct TokenRecord {
     pub created_ms: i64,
     pub last_used_ms: Option<i64>,
     pub revoked_ms: Option<i64>,
+    /// H6 slice 2: `true` for the owner token, the one the host minted
+    /// at first-run bootstrap or with `recover-admin-token`. Set only
+    /// by those two code paths (and the migration's backfill from
+    /// their audit rows); never from a label or an API call.
+    pub owner: bool,
 }
 
 /// Newly-minted token. The plaintext field is the **only** copy of
@@ -151,7 +156,7 @@ impl TokenStore {
             .db
             .read(move |conn| -> Result<Option<TokenRecord>, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token WHERE id = ?1",
                 )?;
                 let row = stmt
@@ -174,7 +179,7 @@ impl TokenStore {
             .db
             .read(|conn| -> Result<Vec<TokenRecord>, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token ORDER BY created_ms ASC",
                 )?;
                 let iter = stmt.query_map([], row_to_record)?;
@@ -229,7 +234,7 @@ impl TokenStore {
         self.db
             .read(move |conn| -> Result<TokenRecord, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token WHERE hash = ?1",
                 )?;
                 let row = stmt
@@ -451,6 +456,26 @@ impl TokenStore {
         })
     }
 
+    /// Replace a token's policy blob (`scope_json`). The offline
+    /// `oxidhome token grant-sensitive` / `revoke-sensitive` commands
+    /// use it; the API never does. Returns `false` when no live token
+    /// has that id.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Sqlite`] on DB failure.
+    pub fn set_policy(&self, token_id: &str, scope_json: &[u8]) -> Result<bool, TokenError> {
+        let id_owned = token_id.to_string();
+        let blob = scope_json.to_vec();
+        self.durable_write(move |conn| -> Result<bool, TokenError> {
+            let n = conn.execute(
+                "UPDATE auth_token SET scope_json = ?2 WHERE id = ?1 AND revoked_ms IS NULL",
+                params![id_owned, blob],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     /// Hard-delete a token row that was **never used** (null
     /// `last_used_ms`, not revoked). Only the bootstrap uses this,
     /// to roll back a freshly-minted admin row whose secret could
@@ -545,11 +570,14 @@ impl PendingRow {
         })
     }
 
+    /// Insert the row as the owner token: `PendingRow` is only used by
+    /// the first-run bootstrap and offline recovery, the two paths
+    /// that mint the owner (H6 slice 2).
     fn insert(&self, conn: &rusqlite::Connection) -> Result<(), TokenError> {
         conn.execute(
             "INSERT INTO auth_token \
-               (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+               (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms, owner) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 1)",
             params![
                 self.id,
                 self.label,
@@ -570,6 +598,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRecord> {
         created_ms: row.get(3)?,
         last_used_ms: row.get(4)?,
         revoked_ms: row.get(5)?,
+        owner: row.get::<_, i64>(6)? != 0,
     })
 }
 
