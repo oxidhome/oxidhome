@@ -274,10 +274,7 @@ impl AuditLog {
     #[must_use]
     pub fn new(db: Arc<Db>) -> Self {
         let boot_floor = db.audit_boot_floor();
-        Self {
-            db,
-            boot_floor,
-        }
+        Self { db, boot_floor }
     }
 
     /// Spawn the periodic audit retention task on the current tokio
