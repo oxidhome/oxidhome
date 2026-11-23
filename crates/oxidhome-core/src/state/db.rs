@@ -850,7 +850,9 @@ pub const READ_POOL_SIZE: usize = 4;
 /// off the commit path on the checkpointer thread
 /// ([`CHECKPOINT_INTERVAL`]); this only fires if that thread falls
 /// far behind, so a committing writer (an event publish holding
-/// the bus gate) almost never pays for a checkpoint.
+/// the bus gate) almost never pays for a checkpoint. If a long read
+/// pins an old snapshot past this size, each commit attempts a
+/// passive checkpoint until the WAL can reset.
 pub const WAL_AUTOCHECKPOINT_PAGES: i64 = 16_384;
 
 /// Size the WAL file is truncated back to after a checkpoint lets
@@ -977,10 +979,13 @@ impl Db {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("creating state dir {}", state_dir.display()))?;
         crate::backup::ensure_no_interrupted_restore(state_dir)?;
-        // Absolute, so readers and the checkpointer (which open later,
-        // possibly after a working-directory change) reach this file.
-        let path = std::path::absolute(state_dir.join(DB_FILE_NAME))
-            .with_context(|| format!("resolving {}", state_dir.display()))?;
+        // Canonical (absolute, symlinks resolved) before the writer
+        // opens, so readers and the checkpointer, which open later,
+        // reach the same file even after a working-directory change
+        // or a symlinked state dir being retargeted.
+        let path = std::fs::canonicalize(state_dir)
+            .with_context(|| format!("resolving state dir {}", state_dir.display()))?
+            .join(DB_FILE_NAME);
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database at {}", path.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
@@ -1286,9 +1291,16 @@ fn apply_checkpoint_pragmas(conn: &Connection) -> anyhow::Result<()> {
 /// Admission to the writer (M6). Ownership is decided here, under
 /// one mutex, so a low-priority caller can't slip into the writer
 /// mutex's queue ahead of a normal-priority caller that is already
-/// waiting: on release, queued normal-priority callers always go
-/// first, and low-priority callers go only when none is queued (or
-/// their deferral bound has run out).
+/// waiting. Rules, evaluated whenever the writer is free:
+///
+/// - A queued normal-priority caller goes before a low-priority one,
+///   even if the low-priority caller queued earlier.
+/// - A low-priority caller that has deferred for its full bound is
+///   *overdue*: it gets the next turn after a normal-priority
+///   transaction, so a stream of normal writes can't starve it.
+/// - After a low-priority transaction, a queued normal-priority
+///   caller goes next, so several overdue low-priority callers
+///   alternate with normal ones rather than running back to back.
 #[derive(Default)]
 struct WriteGate {
     state: Mutex<GateState>,
@@ -1301,6 +1313,17 @@ struct GateState {
     held: bool,
     normal_waiting: usize,
     low_waiting: usize,
+    /// Low-priority waiters whose deferral bound has run out.
+    overdue: usize,
+    /// The last owner was low priority.
+    last_was_low: bool,
+}
+
+impl GateState {
+    /// An overdue low-priority caller is owed the next turn.
+    fn low_owed_turn(&self) -> bool {
+        self.overdue > 0 && !self.last_was_low
+    }
 }
 
 impl WriteGate {
@@ -1315,15 +1338,16 @@ impl WriteGate {
 
     fn acquire_normal(&self) -> GateTicket<'_> {
         let mut state = self.lock_state();
-        if state.held {
+        if state.held || state.low_owed_turn() {
             state.normal_waiting += 1;
             state = self
                 .changed
-                .wait_while(state, |s| s.held)
+                .wait_while(state, |s| s.held || s.low_owed_turn())
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.normal_waiting -= 1;
         }
         state.held = true;
+        state.last_was_low = false;
         GateTicket { gate: self }
     }
 
@@ -1331,16 +1355,24 @@ impl WriteGate {
         let deadline = Instant::now().checked_add(max_defer);
         let mut state = self.lock_state();
         state.low_waiting += 1;
+        let mut overdue = false;
         loop {
             let now = Instant::now();
-            let expired = deadline.is_some_and(|d| now >= d);
-            if !state.held && (state.normal_waiting == 0 || expired) {
+            if !overdue && deadline.is_some_and(|d| now >= d) {
+                overdue = true;
+                state.overdue += 1;
+                // Normal waiters re-check: this caller may now be
+                // owed the next turn.
+                self.changed.notify_all();
+            }
+            let eligible = state.normal_waiting == 0 || (overdue && !state.last_was_low);
+            if !state.held && eligible {
                 break;
             }
             state = match deadline {
-                // Free but deferring to a queued normal caller: wake
-                // on the next change or when the deferral runs out.
-                Some(d) if !state.held && !expired => {
+                // Deferring with a deadline still ahead: wake on the
+                // next change or when the deferral runs out.
+                Some(d) if !overdue => {
                     self.changed
                         .wait_timeout(state, d - now)
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1353,7 +1385,11 @@ impl WriteGate {
             };
         }
         state.low_waiting -= 1;
+        if overdue {
+            state.overdue -= 1;
+        }
         state.held = true;
+        state.last_was_low = true;
         GateTicket { gate: self }
     }
 }
@@ -2355,17 +2391,52 @@ mod tests {
         assert_eq!(logs, 5_001);
     }
 
-    /// The low-priority deferral is bounded: once it runs out, a
-    /// low-priority caller takes a free writer even while a
-    /// normal-priority caller is counted as waiting.
+    /// Run `who` on a thread that takes the gate and appends its
+    /// label to `order` while it owns the writer.
+    fn gate_contender(
+        gate: &Arc<WriteGate>,
+        order: &Arc<Mutex<Vec<&'static str>>>,
+        who: &'static str,
+        low_defer: Option<Duration>,
+    ) -> std::thread::JoinHandle<()> {
+        let gate = Arc::clone(gate);
+        let order = Arc::clone(order);
+        std::thread::spawn(move || {
+            let _ticket = match low_defer {
+                Some(defer) => gate.acquire_low(defer),
+                None => gate.acquire_normal(),
+            };
+            order.lock().unwrap().push(who);
+        })
+    }
+
+    /// An overdue low-priority caller gets the next turn ahead of a
+    /// queued normal-priority caller (no starvation), and two
+    /// overdue low-priority callers alternate with normal ones
+    /// instead of running back to back.
     #[test]
-    fn low_priority_deferral_is_bounded() {
-        let gate = WriteGate::default();
-        gate.lock_state().normal_waiting = 1;
-        let ticket = gate.acquire_low(Duration::ZERO);
-        assert!(gate.lock_state().held);
-        drop(ticket);
-        assert!(!gate.lock_state().held);
+    fn overdue_low_priority_gets_a_turn_but_not_two_in_a_row() {
+        let gate = Arc::new(WriteGate::default());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let held = gate.acquire_normal();
+        let low_a = gate_contender(&gate, &order, "low-a", Some(Duration::ZERO));
+        wait_until("low-a overdue", || gate.lock_state().overdue == 1);
+        let low_b = gate_contender(&gate, &order, "low-b", Some(Duration::ZERO));
+        wait_until("low-b overdue", || gate.lock_state().overdue == 2);
+        let normal = gate_contender(&gate, &order, "normal", None);
+        wait_until("normal queued", || gate.lock_state().normal_waiting == 1);
+        drop(held);
+        for t in [low_a, low_b, normal] {
+            t.join().expect("contender");
+        }
+        let order = order.lock().unwrap().clone();
+        assert_eq!(order.len(), 3);
+        assert!(
+            order[0].starts_with("low"),
+            "overdue low goes first: {order:?}"
+        );
+        assert_eq!(order[1], "normal", "then the queued normal: {order:?}");
+        assert!(order[2].starts_with("low"), "{order:?}");
     }
 
     /// A read closure sees one snapshot even if a write commits
@@ -2384,7 +2455,9 @@ mod tests {
                 db.read(|c| -> rusqlite::Result<(i64, i64)> {
                     let a: i64 = c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0))?;
                     first_tx.send(()).expect("signal");
-                    go_rx.recv().expect("go");
+                    // Bounded, so a regression where reads hold the
+                    // writer fails instead of deadlocking.
+                    go_rx.recv_timeout(PROGRESS_BOUND).expect("go");
                     let b: i64 = c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0))?;
                     Ok((a, b))
                 })
@@ -2414,7 +2487,17 @@ mod tests {
         let db = Db::open_file_with_policy(dir.path(), policy).expect("open");
         db.write(|c| insert_log_rows(c, 100)).expect("insert");
         wait_until("a passive checkpoint", || db.checkpoints_run() >= 1);
+        let worker = Arc::downgrade(
+            &db.checkpointer
+                .as_ref()
+                .expect("file db has a checkpointer")
+                .shared,
+        );
         drop(db);
+        assert!(
+            worker.upgrade().is_none(),
+            "the checkpointer thread must have exited before Db::drop returned",
+        );
         // Reopen proves no connection or lock leaked from the drop.
         let db = Db::open_file(dir.path()).expect("reopen");
         let n: i64 = db

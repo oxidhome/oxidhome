@@ -275,7 +275,7 @@ pub(crate) async fn require_token(
         .remove::<super::mcp::PreVerifiedBearer>()
     {
         Some(super::mcp::PreVerifiedBearer::Verified(rec)) => {
-            try_best_effort_touch(inflight.as_ref(), &state.tokens, &rec.id).await;
+            try_best_effort_touch(inflight.as_ref(), &state.tokens, &rec).await;
             Ok(rec)
         }
         Some(super::mcp::PreVerifiedBearer::Denied) => Err(TokenError::Unknown),
@@ -695,8 +695,13 @@ pub(super) async fn record_authenticated_denial(
 async fn try_best_effort_touch(
     inflight: Option<&super::mcp::PreAdmissionInflight>,
     tokens: &Arc<crate::state::TokenStore>,
-    token_id: &str,
+    rec: &crate::state::TokenRecord,
 ) {
+    // M6: a bump the store would coalesce away needs no blocking hop.
+    if crate::state::TokenStore::last_used_is_current(rec.last_used_ms) {
+        return;
+    }
+    let token_id = rec.id.as_str();
     if let Some(gate) = inflight {
         let Ok(permit) = Arc::clone(&gate.0).try_acquire_owned() else {
             tracing::debug!(
@@ -707,18 +712,18 @@ async fn try_best_effort_touch(
             return;
         };
         let tokens = Arc::clone(tokens);
-        let id = token_id.to_string();
+        let rec = rec.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let _guard = permit;
-            let _ = tokens.touch_last_used(&id);
+            let _ = tokens.touch_last_used_from(&rec);
         })
         .await;
         return;
     }
     let tokens = Arc::clone(tokens);
-    let id = token_id.to_string();
+    let rec = rec.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let _ = tokens.touch_last_used(&id);
+        let _ = tokens.touch_last_used_from(&rec);
     })
     .await;
 }

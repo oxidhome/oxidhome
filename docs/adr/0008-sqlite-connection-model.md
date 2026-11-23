@@ -25,8 +25,8 @@ possible. Around it:
   writer. In-memory databases keep a single connection.
 - **Writer priority.** `Db::write` is normal priority; `Db::write_low_priority` is for work nobody waits on. An
   admission gate hands the writer to queued normal-priority callers first; a low-priority caller defers at most
-  250 ms. Diagnostic logs are committed in batches of up to 256 rows and trimmed in chunks, both at low priority.
-  Token `last_used_ms` is coalesced to a 60 s resolution.
+  250 ms, then gets the next turn after a normal-priority transaction. Diagnostic logs are committed in batches of
+  up to 256 rows and trimmed in chunks, both at low priority. Token `last_used_ms` is coalesced to a 60 s resolution.
 - **Busy and checkpoint policy.** Every connection uses a 5 s `busy_timeout`. A background thread runs a passive
   WAL checkpoint every 10 s; the writer's `wal_autocheckpoint` is raised to 16384 pages as a backstop, and
   `journal_size_limit` is 64 MiB.

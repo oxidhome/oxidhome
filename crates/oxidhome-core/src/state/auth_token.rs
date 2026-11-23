@@ -256,28 +256,49 @@ impl TokenStore {
     /// [`LAST_USED_RESOLUTION_MS`]. Returns the recorded timestamp.
     #[must_use]
     pub fn touch_last_used(&self, token_id: &str) -> i64 {
-        let recorded = self
-            .last_written
+        self.bump_last_used(token_id, self.cached_last_used(token_id))
+    }
+
+    /// [`Self::touch_last_used`] for a caller that already holds the
+    /// row from [`Self::verify_read_only`]: coalesces on the newer of
+    /// the row's `last_used_ms` and this process's last write, so
+    /// eviction from the in-process map never forces a write.
+    #[must_use]
+    pub fn touch_last_used_from(&self, rec: &TokenRecord) -> i64 {
+        let recorded = rec.last_used_ms.max(self.cached_last_used(&rec.id));
+        self.bump_last_used(&rec.id, recorded)
+    }
+
+    /// Whether a `last_used_ms` value is recent enough that a bump
+    /// would be coalesced away. Lets async callers skip the blocking
+    /// hop entirely. A value ahead of the clock (wall-clock rollback)
+    /// counts as current, matching the SQL re-check.
+    #[must_use]
+    pub fn last_used_is_current(recorded: Option<i64>) -> bool {
+        recorded.is_some_and(|t| t > now_ms().saturating_sub(LAST_USED_RESOLUTION_MS))
+    }
+
+    fn cached_last_used(&self, token_id: &str) -> Option<i64> {
+        self.last_written
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(token_id)
-            .copied();
-        self.bump_last_used(token_id, recorded)
+            .copied()
     }
 
     /// Write `last_used_ms = now` unless `recorded` (the row's value
     /// from [`Self::verify`], or this process's last write from
     /// [`Self::touch_last_used`]) is less than
-    /// [`LAST_USED_RESOLUTION_MS`] old. `None` (never used) always
-    /// writes. Returns the timestamp now on record (best effort: a
+    /// [`LAST_USED_RESOLUTION_MS`] old (or ahead of the clock).
+    /// `None` (never used) always writes. Returns the timestamp now on record (best effort: a
     /// failed write is logged and `now` returned, as before M6).
     fn bump_last_used(&self, token_id: &str, recorded: Option<i64>) -> i64 {
-        let now = now_ms();
         if let Some(t) = recorded
-            && (0..LAST_USED_RESOLUTION_MS).contains(&(now - t))
+            && Self::last_used_is_current(recorded)
         {
             return t;
         }
+        let now = now_ms();
         let Some(on_record) = touch_last_used(&self.db, token_id, now) else {
             return now;
         };
@@ -602,8 +623,8 @@ fn touch_last_used(db: &Db, token_id: &str, now: i64) -> Option<i64> {
     match db.write(move |conn| -> Result<Option<i64>, TokenError> {
         let n = conn.execute(
             "UPDATE auth_token SET last_used_ms = ?1 \
-             WHERE id = ?2 AND (last_used_ms IS NULL OR last_used_ms <= ?1 - ?3)",
-            params![now, id_for_db, LAST_USED_RESOLUTION_MS],
+             WHERE id = ?2 AND (last_used_ms IS NULL OR last_used_ms <= ?3)",
+            params![now, id_for_db, now.saturating_sub(LAST_USED_RESOLUTION_MS)],
         )?;
         if n > 0 {
             return Ok(Some(now));
@@ -1044,5 +1065,39 @@ mod tests {
         let row = store.get(&issued.id).unwrap().unwrap();
         assert_eq!(row.last_used_ms, Some(newer));
         assert_eq!(touch_last_used(&db, "missing", newer), None);
+    }
+
+    /// M6 review: a value ahead of the clock (wall-clock rollback)
+    /// is current, so verifies don't fall through to the writer.
+    #[test]
+    fn future_last_used_is_current() {
+        let db = fresh();
+        let store = TokenStore::new(Arc::clone(&db));
+        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let future = now_ms() + 10 * LAST_USED_RESOLUTION_MS;
+        set_last_used(&db, &issued.id, future);
+        assert!(TokenStore::last_used_is_current(Some(future)));
+        let rec = store.verify(&issued.plaintext).unwrap();
+        assert_eq!(rec.last_used_ms, Some(future));
+        assert!(!TokenStore::last_used_is_current(None));
+    }
+
+    /// M6 review: the MCP path coalesces on the row it verified,
+    /// even with nothing in the process cache.
+    #[test]
+    fn touch_last_used_from_coalesces_on_the_row() {
+        let db = fresh();
+        let store = TokenStore::new(Arc::clone(&db));
+        let issued = store.create("mcp", b"[\"*\"]").unwrap();
+        let recent = now_ms() - 1_000;
+        set_last_used(&db, &issued.id, recent);
+        let rec = store.verify_read_only(&issued.plaintext).unwrap();
+        // Stale the row behind the record's back: the record wins.
+        set_last_used(&db, &issued.id, 1);
+        assert_eq!(store.touch_last_used_from(&rec), recent);
+        assert_eq!(
+            store.get(&issued.id).unwrap().unwrap().last_used_ms,
+            Some(1)
+        );
     }
 }
