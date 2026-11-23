@@ -58,7 +58,11 @@ enum Visibility {
 /// Own entries are the ones this instance wrote *as this
 /// installation*: an instance id reused by another plugin, or by a
 /// reinstall of the same plugin, doesn't inherit the stale entries its
-/// predecessor left behind.
+/// predecessor left behind. Script sandboxes (ADR-0001,
+/// `<parent>~<local-id>`) are distinct instances: a sandbox and its
+/// parent don't see each other's entries as their own. They share the
+/// installation's `reads_state` grants, so a grant naming the plugin's
+/// own id lets them read each other.
 fn visibility(
     instance_id: &str,
     installation_uuid: &str,
@@ -364,6 +368,28 @@ mod tests {
         // Same instance id, another installation (reinstall or another
         // plugin): not its own.
         assert_eq!(visibility("me", "inst-p.new", &[], &e), Visibility::Hidden);
+    }
+
+    /// H1 × H2: a sandbox child and its parent share the installation
+    /// but not own-entry visibility; a grant on their own plugin id
+    /// opens it.
+    #[test]
+    fn sandbox_children_do_not_inherit_own_entries() {
+        let parent = entry("me", "p.me", "dev-1", "switch");
+        assert_eq!(
+            visibility("me~s1", "inst-p.me", &[], &parent),
+            Visibility::Hidden
+        );
+        let child = entry("me~s1", "p.me", "dev-2", "switch");
+        assert_eq!(
+            visibility("me", "inst-p.me", &[], &child),
+            Visibility::Hidden
+        );
+        let own_plugin = grant("p.me", &["*"], &["*"], false);
+        assert_eq!(
+            visibility("me~s1", "inst-p.me", &[own_plugin], &parent),
+            Visibility::Withheld
+        );
     }
 
     #[test]

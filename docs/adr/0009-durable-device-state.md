@@ -30,7 +30,8 @@ rule that a disk problem never stops live control, and it must not add disk work
   cursors inside a skipped range get `reset_required`. Undecodable persisted data and a backup restore rotate the epoch
   and expire every cursor.
 - Plugins read state through a new `host-state` WIT import (`get-state`, `list-state`). An instance always reads what
-  it wrote as the same installation. Other entries need a `[[capabilities.reads_state]]` grant selecting owner plugin, capability and device,
+  it wrote as the same installation. Script sandboxes (ADR-0001) are distinct instances and don't inherit their
+  parent's own entries; they share its `reads_state` grants. Other entries need a `[[capabilities.reads_state]]` grant selecting owner plugin, capability and device,
   with `bytes = true` required to see `bytes-val` fields. Requested and granted lists are intersected by equality.
   `get-state` answers `not-found` alike for an unknown device and an invisible one, so plugins can't probe for device
   ids; the refused case is still audited for the operator.

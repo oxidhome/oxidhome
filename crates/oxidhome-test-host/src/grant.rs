@@ -168,7 +168,7 @@ mod tests {
         let req = CapabilitiesSection::default();
         let wide = requested();
         let excess = grant_excess(&req, &wide);
-        assert_eq!(excess.len(), 8, "{excess:?}");
+        assert_eq!(excess.len(), 9, "{excess:?}");
     }
 
     #[test]
