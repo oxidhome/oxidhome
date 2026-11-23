@@ -88,6 +88,11 @@ const MAX_RESTORABLE_REVISION: u64 = 1 << 62;
 /// pagination cursor.
 const MAX_RESTORED_ID_LEN: usize = 256;
 
+/// Largest encoded field blob read at restore. A valid slot is at most
+/// 16 KiB of field data; hex, JSON escaping and per-field framing stay
+/// well under this.
+const MAX_RESTORED_BLOB_BYTES: usize = 1024 * 1024;
+
 /// Skipped ranges kept for cursor checks.
 pub(super) const MAX_HOLES: usize = 16;
 
@@ -888,8 +893,13 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
 }
 
 fn decode_row(row: &rusqlite::Row<'_>) -> Option<DeviceState> {
-    let blob: Vec<u8> = row.get(4).ok()?;
-    let fields = decode_fields(&blob).ok()?;
+    // Bound the encoded size before copying or decoding it: a damaged
+    // row must not exhaust memory before the damage path runs.
+    let blob = row.get_ref(4).ok()?.as_blob().ok()?;
+    if blob.len() > MAX_RESTORED_BLOB_BYTES {
+        return None;
+    }
+    let fields = decode_fields(blob).ok()?;
     if fields.len() > super::MAX_FIELDS_PER_SLOT
         || super::fields_byte_estimate(&fields) > super::MAX_BYTES_PER_SLOT
     {

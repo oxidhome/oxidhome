@@ -846,8 +846,14 @@ impl DeviceStateStore {
             *pending_bytes = 0;
             true
         };
-        for (scanned, ((did, _cap), entry)) in
-            inner.entries.range((start, Bound::Unbounded)).enumerate()
+        // Seek past the cursor device by id, not only by the sentinel
+        // capability: a capability sorting after the sentinel must not
+        // put the cursor device on the next page again.
+        for (scanned, ((did, _cap), entry)) in inner
+            .entries
+            .range((start, Bound::Unbounded))
+            .skip_while(|((did, _), _)| Some(did.as_str()) == after_device_id)
+            .enumerate()
         {
             if pending_device != Some(did) {
                 if !commit(&mut pending, &mut pending_bytes) {
@@ -3658,5 +3664,26 @@ mod tests {
         assert_eq!(store.open_scan_position(&tampered), None);
         assert_eq!(store.open_scan_position("zz.zz"), None);
         assert_eq!(store.open_scan_position(""), None);
+    }
+
+    /// PR round 4: a continuation page never repeats the cursor
+    /// device, even for a capability sorting after the sentinel.
+    #[test]
+    fn capped_page_seeks_past_the_cursor_device_by_id() {
+        let store = DeviceStateStore::new();
+        for (d, cap) in [
+            ("dev-a", "\u{10ffff}x"),
+            ("dev-a", "switch"),
+            ("dev-b", "switch"),
+        ] {
+            store.apply_delta(d.into(), "inst".into(), cap.into(), Vec::new(), 0, 0);
+        }
+        let page = store.snapshot_page_capped(Some("dev-a"), 1, usize::MAX, usize::MAX, |_| true);
+        let ids: Vec<_> = page
+            .devices
+            .iter()
+            .map(|d| d[0].device_id.clone())
+            .collect();
+        assert_eq!(ids, ["dev-b"]);
     }
 }
