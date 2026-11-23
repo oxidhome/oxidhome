@@ -310,8 +310,11 @@ impl TestHost {
             config,
             mode,
             supervision: _,
-            secrets: _,
+            secrets,
         } = self.prepare(plugin_dir, options).await?;
+        // Before the guest runs: a start function may store a secret
+        // and then fail the load.
+        self.secrets.add(secrets.iter().map(String::as_str));
         let inner = PluginInstance::load_with_pinned_manifest(
             &self.engine,
             plugin_dir,

@@ -151,7 +151,10 @@ Every snapshot is redacted so it can be committed: host-minted
 `type = "secret"` config values, values under credential-like keys,
 `Bearer` credentials, and `oxh_` tokens are masked as `***` (in
 JSON values too, and in bytes printed as hex); and
-`.redact(text, placeholder)` adds replacements of your own.
+`.redact(text, placeholder)` adds replacements of your own, matched
+against the rendered text. Host-minted ids the harness didn't send
+(a `call-…` id a plugin stored, say) are numbered in the order the
+snapshot prints them.
 
 ## Denying a capability
 

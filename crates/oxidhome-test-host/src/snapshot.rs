@@ -166,9 +166,10 @@ impl SnapshotOptions {
         self
     }
 
-    /// Replace every occurrence of `text` with `placeholder`, before
-    /// the built-in redaction runs — for values the test knows are
-    /// unstable or sensitive.
+    /// Replace every occurrence of `text` with `placeholder` in the
+    /// rendered snapshot, before the built-in redaction runs — for
+    /// values the test knows are unstable or sensitive. Strings print
+    /// escaped, so match a value with quotes or newlines as it prints.
     #[must_use]
     pub fn redact(mut self, text: impl Into<String>, placeholder: impl Into<String>) -> Self {
         let text = text.into();
@@ -753,7 +754,15 @@ const MINTED_HEX_LEN: usize = 32;
 impl<'a> Redactor<'a> {
     fn new(replacements: &'a [(String, String)], secrets: &[String]) -> Self {
         let raw: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
-        let mut quoted: Vec<String> = raw.iter().map(|s| format!("{s:?}")).collect();
+        // `"secret"`, and the same inside an escaped JSON string
+        // (`\"secret\"`, as a `json:` value prints it).
+        let mut quoted: Vec<String> = raw
+            .iter()
+            .flat_map(|s| {
+                let in_json = format!("\"{}\"", json_escape(s)).escape_debug().to_string();
+                [format!("{s:?}"), in_json]
+            })
+            .collect();
         quoted.sort_by_key(|s| std::cmp::Reverse(s.len()));
         // As printed: raw, escaped, inside an escaped JSON string, and
         // as hex bytes.
@@ -773,7 +782,7 @@ impl<'a> Redactor<'a> {
                 // A bytes value cut off mid-secret: its shown prefix.
                 // Only the bytes a value shows can be cut off.
                 let bytes = s.as_bytes();
-                (MIN_CUT_SECRET..bytes.len().min(SHOWN_BYTES))
+                (MIN_CUT_SECRET..=bytes.len().saturating_sub(1).min(SHOWN_BYTES))
                     .map(move |n| format!("{}{TRUNCATED}", hex(&bytes[..n])))
             }))
             .collect();
@@ -794,6 +803,7 @@ impl<'a> Redactor<'a> {
         }
         // Keys and names can be minted ids: order by what the snapshot
         // prints.
+        snapshot.services.sort();
         snapshot.storage.sort();
         snapshot.blobs.sort();
     }
@@ -805,7 +815,12 @@ impl<'a> Redactor<'a> {
         }
         // A string value equal to a secret, however short.
         for quoted in &self.quoted {
-            text = text.replace(quoted.as_str(), "\"***\"");
+            let masked = if quoted.starts_with('\\') {
+                "\\\"***\\\""
+            } else {
+                "\"***\""
+            };
+            text = text.replace(quoted.as_str(), masked);
         }
         let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
         let text = oxidhome_core::redact::scrub_secret_values(&text, &secrets).into_owned();
@@ -903,7 +918,9 @@ pub fn render_value(value: &Value) -> String {
         Value::BoolVal(b) => b.to_string(),
         Value::IntVal(n) => n.to_string(),
         Value::FloatVal(x) => format!("{x:?}"),
-        Value::StringVal(s) => format!("{s:?}"),
+        // A string may hold a JSON document: its structured
+        // credentials are masked as the API masks them.
+        Value::StringVal(s) => format!("{:?}", oxidhome_core::redact::redact_text(s)),
         Value::BytesVal(bytes) => {
             let mut out = String::from("0x");
             for b in bytes.iter().take(SHOWN_BYTES) {
@@ -1228,6 +1245,22 @@ mod tests {
                 &format!("cmd-test cmd-{}0", "ab".repeat(16)),
             ]
         );
+        // A seeded id keeps its number wherever it shows up first.
+        let mut snap = sample();
+        snap.storage = vec![format!("{cmd_a} = 1"), format!("{cmd_b} = 2")];
+        let mut redactor = Redactor::new(&[], &[]);
+        let _ = redactor.minted_ids(&cmd_b);
+        redactor.apply(&mut snap);
+        assert_eq!(snap.storage, ["<cmd-1> = 2", "<cmd-2> = 1"]);
+        assert_eq!(minted_id_at("cmd-", "cmd-"), None);
+        assert_eq!(
+            minted_id_at(&format!("cmd-{}", "AB".repeat(16)), "cmd-"),
+            None
+        );
+    }
+
+    #[test]
+    fn encoded_secrets_are_masked() {
         // Under neutral keys: a secret inside a JSON value, and as bytes.
         let mut snap = sample();
         snap.storage = vec![
@@ -1255,6 +1288,36 @@ mod tests {
         )];
         Redactor::new(&[], &[long]).apply(&mut snap);
         assert_eq!(snap.storage, ["raw = 0x6162***(38 bytes)"]);
+        // A long secret at offset zero, cut at exactly the shown bytes.
+        let long = "k".repeat(40);
+        let mut snap = sample();
+        snap.storage = vec![format!(
+            "raw = {}",
+            render_value(&Value::BytesVal(long.as_bytes().to_vec()))
+        )];
+        Redactor::new(&[], &[long]).apply(&mut snap);
+        assert_eq!(snap.storage, ["raw = 0x***(40 bytes)"]);
+        // A short secret as a whole JSON string; JSON in a string value.
+        let mut snap = sample();
+        snap.storage = vec![
+            format!(
+                "doc = {}",
+                render_value(&Value::JsonVal(r#"{"note":"pw"}"#.into()))
+            ),
+            format!(
+                "text = {}",
+                render_value(&Value::StringVal(
+                    r#"{"key":"password","value":"fixture-value"}"#.into()
+                ))
+            ),
+        ];
+        Redactor::new(&[], &["pw".to_owned()]).apply(&mut snap);
+        assert_eq!(snap.storage[0], r#"doc = json:"{\"note\":\"***\"}""#);
+        assert!(
+            !snap.storage[1].contains("fixture-value"),
+            "{:?}",
+            snap.storage
+        );
         // Structured credentials in JSON, as the API masks them.
         assert_eq!(
             render_value(&Value::JsonVal(
@@ -1267,18 +1330,6 @@ mod tests {
                     oxidhome_core::redact::REDACTED
                 )
             )
-        );
-        // A seeded id keeps its number wherever it shows up first.
-        let mut snap = sample();
-        snap.storage = vec![format!("{cmd_a} = 1"), format!("{cmd_b} = 2")];
-        let mut redactor = Redactor::new(&[], &[]);
-        let _ = redactor.minted_ids(&cmd_b);
-        redactor.apply(&mut snap);
-        assert_eq!(snap.storage, ["<cmd-1> = 2", "<cmd-2> = 1"]);
-        assert_eq!(minted_id_at("cmd-", "cmd-"), None);
-        assert_eq!(
-            minted_id_at(&format!("cmd-{}", "AB".repeat(16)), "cmd-"),
-            None
         );
     }
 

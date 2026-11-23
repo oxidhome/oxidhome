@@ -234,8 +234,9 @@ const DELAY_THRESHOLD: Duration = Duration::from_millis(5);
 pub const VIRTUAL_CLOCK_DEFAULT_START: Duration = Duration::from_hours(490_896);
 
 /// Most epoch increments one [`VirtualClock::advance`] applies (about
-/// 28 hours of watchdog ticks); a longer jump trips every armed
-/// deadline just the same.
+/// 27.8 hours of watchdog ticks), so a jump costs at most that many
+/// atomic adds. A watchdog deadline longer than that needs more than
+/// one advance to trip.
 const MAX_EPOCH_TICKS_PER_ADVANCE: u128 = 1_000_000;
 
 /// A clock that only moves when told to — the test seam behind

@@ -422,10 +422,11 @@ impl EventBus {
     }
 
     /// Refill the publish buckets from `clock` instead of the system
-    /// clock.
+    /// clock. Buckets already made start over, full, on it.
     #[must_use]
     pub fn with_clock(mut self, clock: crate::clock::Clock) -> Self {
         self.clock = clock;
+        self.rate_limiters = Mutex::new(HashMap::new());
         self
     }
 
