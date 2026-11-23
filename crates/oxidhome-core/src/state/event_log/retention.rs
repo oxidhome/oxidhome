@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use super::{EventLog, EventLogError};
 
@@ -119,10 +119,11 @@ impl EventLogRetention {
 }
 
 impl EventLog {
-    /// The id below which `policy` would delete, or `None` when
-    /// nothing is due. Runs on a pooled reader: retention is the only
-    /// deleter and new rows only get higher ids, so a bound computed
-    /// from any recent snapshot is still a prefix bound.
+    /// The last id (inclusive) `policy` would delete, or `None` when
+    /// nothing is due. Runs on a pooled reader: retention only
+    /// deletes id prefixes and new rows only get higher ids, so a
+    /// bound computed from any recent snapshot is still a prefix
+    /// bound.
     pub(super) fn retention_bound(
         &self,
         cutoff_ms: Option<i64>,
@@ -132,30 +133,39 @@ impl EventLog {
             // Age: every row below the first row (by id) received at
             // or after the cutoff — under a clock rollback an
             // old-stamped row above that point waits for the rows
-            // before it (H4).
+            // before it (H4). No such row: everything is due.
             let by_age: Option<i64> = match cutoff_ms {
                 Some(cutoff) => conn.query_row(
                     "SELECT COALESCE( \
-                     (SELECT MIN(id) FROM event_log WHERE received_ms >= ?1), \
-                     (SELECT MAX(id) + 1 FROM event_log))",
+                     (SELECT MIN(id) FROM event_log WHERE received_ms >= ?1) - 1, \
+                     (SELECT MAX(id) FROM event_log))",
                     params![cutoff],
                     |row| row.get(0),
                 )?,
                 None => None,
             };
-            // Rows: keep the `max_rows` highest ids. Retained ids are
-            // dense (H4: `AUTOINCREMENT`, one serialized writer, failed
-            // inserts roll back their id, retention deletes a prefix),
-            // so the bound is arithmetic on the head instead of an
-            // `OFFSET` scan over `max_rows` index entries.
+            // Rows: keep the `max_rows` highest ids. Ids can be sparse
+            // (databases from before migration 16 keep their ids), so
+            // the id span only rules a trim out cheaply; when the span
+            // exceeds the limit the bound is the actual
+            // `max_rows + 1`-th newest id.
             let by_rows: Option<i64> = match max_rows {
                 Some(keep) => {
-                    let head: Option<i64> =
-                        conn.query_row("SELECT MAX(id) FROM event_log", (), |row| row.get(0))?;
                     let keep = i64::try_from(keep).unwrap_or(i64::MAX);
-                    head.and_then(|head| head.checked_sub(keep))
-                        .filter(|last_dropped| *last_dropped > 0)
-                        .map(|last_dropped| last_dropped + 1)
+                    let (lo, hi): (Option<i64>, Option<i64>) =
+                        conn.query_row("SELECT MIN(id), MAX(id) FROM event_log", (), |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })?;
+                    match (lo, hi) {
+                        (Some(lo), Some(hi)) if hi.saturating_sub(lo) >= keep => conn
+                            .query_row(
+                                "SELECT id FROM event_log ORDER BY id DESC LIMIT 1 OFFSET ?1",
+                                params![keep],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .optional()?,
+                        _ => None,
+                    }
                 }
                 None => None,
             };
@@ -163,26 +173,38 @@ impl EventLog {
         })
     }
 
-    /// Delete one chunk of the id prefix below `bound`: the
-    /// [`TRIM_CHUNK_ROWS`] lowest ids at most. One low-priority
-    /// transaction (M6). Returns the rows removed; `0` means the
-    /// prefix below `bound` is gone.
-    fn trim_chunk_below(&self, bound: i64) -> Result<usize, EventLogError> {
+    /// Delete one chunk of the id prefix up to `last` (inclusive):
+    /// the [`TRIM_CHUNK_ROWS`] lowest ids at most. One low-priority
+    /// transaction (M6). `proceed` is checked once the writer is
+    /// held, so a stop requested while this waited for the writer
+    /// skips the delete. Returns the rows removed; `0` means the
+    /// prefix is gone (or the chunk was skipped).
+    fn trim_chunk_through(
+        &self,
+        last: i64,
+        proceed: impl FnOnce() -> bool,
+    ) -> Result<usize, EventLogError> {
         self.db
             .write_low_priority(|conn| -> Result<_, EventLogError> {
+                if !proceed() {
+                    return Ok(0);
+                }
+                // `MIN(id) + chunk - 1` may exceed `i64::MAX`; SQLite
+                // then compares against a REAL, which is still exact
+                // enough to bound the chunk.
                 Ok(conn.execute(
-                    "DELETE FROM event_log WHERE id < \
-                     MIN(?1, (SELECT MIN(id) FROM event_log) + ?2)",
-                    params![bound, TRIM_CHUNK_ROWS],
+                    "DELETE FROM event_log WHERE id <= \
+                     MIN(?1, (SELECT MIN(id) FROM event_log) + (?2 - 1))",
+                    params![last, TRIM_CHUNK_ROWS],
                 )?)
             })
     }
 
-    /// Delete the whole id prefix below `bound`, chunk by chunk.
-    pub(super) fn trim_below(&self, bound: i64) -> Result<usize, EventLogError> {
+    /// Delete the whole id prefix up to `last`, chunk by chunk.
+    pub(super) fn trim_through(&self, last: i64) -> Result<usize, EventLogError> {
         let mut total = 0;
         loop {
-            match self.trim_chunk_below(bound)? {
+            match self.trim_chunk_through(last, || true)? {
                 0 => return Ok(total),
                 n => total += n,
             }
@@ -203,7 +225,7 @@ impl EventLog {
         now_ms: i64,
     ) -> Result<usize, EventLogError> {
         match self.retention_bound(policy.cutoff_ms(now_ms), policy.max_rows)? {
-            Some(bound) => self.trim_below(bound),
+            Some(last) => self.trim_through(last),
             None => Ok(0),
         }
     }
@@ -229,7 +251,12 @@ impl EventLog {
                 () = tokio::time::sleep(policy.first_delay) => {}
                 _ = stop.changed() => return,
             }
-            let mut ticks = tokio::time::interval(policy.interval.max(Duration::from_secs(1)));
+            let interval = if policy.interval.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                policy.interval
+            };
+            let mut ticks = tokio::time::interval(interval);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
@@ -297,13 +324,14 @@ async fn run_pass(
         let log = Arc::clone(log);
         blocking(move || log.retention_bound(policy.cutoff_ms(now_ms), policy.max_rows)).await?
     };
-    let Some(bound) = bound else {
+    let Some(last) = bound else {
         return Ok(0);
     };
     let mut total = 0;
     while !*stop.borrow() {
         let log = Arc::clone(log);
-        match blocking(move || log.trim_chunk_below(bound)).await? {
+        let stop = stop.clone();
+        match blocking(move || log.trim_chunk_through(last, || !*stop.borrow())).await? {
             0 => break,
             n => total += n,
         }
@@ -370,19 +398,73 @@ mod tests {
         for t in 0..rows {
             record(&log, t);
         }
-        let bound = rows + 1;
+        let last = rows;
         assert_eq!(
-            log.trim_chunk_below(bound).expect("chunk"),
+            log.trim_chunk_through(last, || true).expect("chunk"),
             usize::try_from(TRIM_CHUNK_ROWS).expect("fits")
         );
         assert_eq!(oldest(&log), Some(TRIM_CHUNK_ROWS + 1));
         assert_eq!(
-            log.trim_chunk_below(bound).expect("chunk"),
+            log.trim_chunk_through(last, || true).expect("chunk"),
             usize::try_from(TRIM_CHUNK_ROWS).expect("fits")
         );
         assert_eq!(oldest(&log), Some(TRIM_CHUNK_ROWS * 2 + 1));
-        assert_eq!(log.trim_chunk_below(bound).expect("chunk"), 10);
-        assert_eq!(log.trim_chunk_below(bound).expect("chunk"), 0);
+        assert_eq!(log.trim_chunk_through(last, || true).expect("chunk"), 10);
+        assert_eq!(log.trim_chunk_through(last, || true).expect("chunk"), 0);
+        assert_eq!(log.count().expect("count"), 0);
+    }
+
+    /// A chunk whose stop flag flipped while it waited for the writer
+    /// deletes nothing.
+    #[test]
+    fn stopped_chunk_skips_the_delete() {
+        let log = log();
+        for t in 0..5 {
+            record(&log, t);
+        }
+        assert_eq!(log.trim_chunk_through(5, || false).expect("chunk"), 0);
+        assert_eq!(log.count().expect("count"), 5);
+    }
+
+    /// Databases from before migration 16 keep sparse ids: the row
+    /// limit counts rows, not the id span.
+    #[test]
+    fn row_limit_counts_rows_when_ids_are_sparse() {
+        let log = log();
+        for t in 0..10 {
+            record(&log, t);
+        }
+        log.db
+            .write(|c| c.execute("DELETE FROM event_log WHERE id NOT IN (5, 9)", ()))
+            .expect("make sparse");
+        assert_eq!(
+            log.apply_retention(&policy(None, Some(2)), 100)
+                .expect("retention"),
+            0,
+            "two rows under a two-row limit"
+        );
+        assert_eq!(
+            log.apply_retention(&policy(None, Some(1)), 100)
+                .expect("retention"),
+            1
+        );
+        assert_eq!(oldest(&log), Some(9));
+    }
+
+    /// An expired row at the largest row id is still deleted (the
+    /// bound is inclusive, so it never needs `MAX(id) + 1`).
+    #[test]
+    fn age_limit_handles_the_largest_row_id() {
+        let log = log();
+        record(&log, 0);
+        log.db
+            .write(|c| c.execute("UPDATE event_log SET id = ?1", params![i64::MAX]))
+            .expect("max id");
+        assert_eq!(
+            log.apply_retention(&policy(Some(10), None), 1_000)
+                .expect("retention"),
+            1
+        );
         assert_eq!(log.count().expect("count"), 0);
     }
 
@@ -508,7 +590,7 @@ mod tests {
             .spawn_retention(EventLogRetention {
                 max_age: None,
                 max_rows: Some(4),
-                interval: Duration::ZERO,
+                interval: Duration::from_millis(20),
                 first_delay: Duration::ZERO,
             })
             .expect("spawned");
@@ -537,7 +619,8 @@ mod tests {
         for t in 13..20 {
             record(&log, t);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Several configured intervals: a surviving task would trim.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(log.count().expect("count"), 11);
     }
 }

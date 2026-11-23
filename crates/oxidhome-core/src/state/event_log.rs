@@ -530,7 +530,7 @@ impl EventLog {
     /// Forwards any SQL error.
     pub fn trim_older_than(&self, cutoff_ms: i64) -> Result<usize, EventLogError> {
         match self.retention_bound(Some(cutoff_ms), None)? {
-            Some(bound) => self.trim_below(bound),
+            Some(last) => self.trim_through(last),
             None => Ok(0),
         }
     }

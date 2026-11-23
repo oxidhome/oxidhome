@@ -804,61 +804,40 @@ impl BlobStore {
     }
 
     /// Look up a blob row and open the file it points at, as one
-    /// consistent pair.
+    /// consistent pair. Shared by every byte-returning read.
     ///
     /// Blob files are immutable once their row commits, and an
     /// overwrite or delete unlinks the superseded file only after its
-    /// transaction commits (and after it releases the writer). So
-    /// once the file is open, the descriptor pins exactly the bytes
-    /// the row described. The one race is between the lookup and the
-    /// open: a pooled snapshot can predate an overwrite or delete
-    /// whose unlink then runs before the open.
+    /// transaction commits. So once the file is open, the descriptor
+    /// pins exactly the bytes the row described (POSIX
+    /// unlink-while-open). The race is between the lookup and the
+    /// open: a pooled read snapshot can predate an overwrite or
+    /// delete whose unlink then runs before the open, which surfaced
+    /// as a spurious `Io { NotFound }` (M6 follow-up).
     ///
-    /// The lookup runs on a pooled reader first. If the open fails,
-    /// the lookup and the open are repeated under the writer. While
-    /// the writer is held no transaction can supersede the row it
-    /// reads, so that row's file can only be unlinked after a later
-    /// commit, which can't happen before the open: the retry sees the
-    /// current row (or no row, and returns `not_found`), and an open
-    /// that still fails is a real I/O error. Any open error is
-    /// retried, not just `NotFound`, because on Windows opening a
-    /// file that is pending deletion fails with access denied. A
-    /// reader therefore gets the old version, the new version, or
-    /// `NotFound`, never a torn read or a spurious I/O error.
+    /// Both steps therefore run under the writer (ADR-0008: reads
+    /// that must be atomic with a filesystem effect stay on the
+    /// writer). While it is held no transaction can supersede the
+    /// row, so its file can't be unlinked before the open: a reader
+    /// gets the old version, the new version, or `NotFound`, never a
+    /// torn read or a spurious I/O error. Only the lookup and the
+    /// open hold the writer; the bytes are read after it is released.
     fn open_current<T: Send>(
         &self,
         blobs_root: &Path,
         installation_uuid: &str,
         instance_id: &str,
-        lookup: impl Fn(&rusqlite::Connection) -> rusqlite::Result<Option<T>>,
+        lookup: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<Option<T>>,
         id_of: impl Fn(&T) -> &str,
-        not_found: impl Fn() -> BlobError,
+        not_found: impl FnOnce() -> BlobError,
     ) -> Result<(T, std::fs::File), BlobError> {
         let instance_dir = instance_dir_for(blobs_root, installation_uuid, instance_id);
-        let open = |row: &T| -> Result<std::io::Result<std::fs::File>, BlobError> {
-            let path = instance_dir.join(id_of(row));
-            ensure_contained(blobs_root, &path)?;
-            Ok(std::fs::File::open(&path))
-        };
-        let row = self
-            .db
-            .read(|conn| lookup(conn).map_err(BlobError::from))?
-            .ok_or_else(&not_found)?;
-        #[cfg(test)]
-        tests::AFTER_POOLED_LOOKUP.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() {
-                hook();
-            }
-        });
-        if let Ok(file) = open(&row)? {
-            return Ok((row, file));
-        }
         self.db.write(|conn| -> Result<_, BlobError> {
-            let row = lookup(conn)?.ok_or_else(&not_found)?;
-            let file = open(&row)?.map_err(|source| BlobError::Io {
-                path: instance_dir.join(id_of(&row)),
-                source,
-            })?;
+            let row = lookup(conn)?.ok_or_else(not_found)?;
+            let path = instance_dir.join(id_of(&row));
+            ensure_contained(blobs_root, &path)?;
+            let file =
+                std::fs::File::open(&path).map_err(|source| BlobError::Io { path, source })?;
             Ok((row, file))
         })
     }
@@ -1991,9 +1970,9 @@ mod tests {
     /// Lookup/open race: every read of a name that is being
     /// overwritten concurrently returns one complete committed
     /// version (uniform bytes whose length matches the row), never
-    /// `NotFound` or `Io`. Uses a file-backed `Db`, so the lookup
-    /// runs on the read pool and can see a snapshot older than the
-    /// overwrite that unlinked its file.
+    /// `NotFound` or `Io`. Uses a file-backed `Db`, which has a read
+    /// pool: a lookup on a pooled snapshot older than the overwrite
+    /// that unlinked its file is the race `open_current` closes.
     #[test]
     fn reads_during_concurrent_overwrites_are_consistent() {
         let dir = tempdir();
@@ -2043,74 +2022,8 @@ mod tests {
         }
     }
 
-    thread_local! {
-        /// Runs once on this thread between `open_current`'s pooled
-        /// lookup and its open, to force the lookup/open race.
-        pub(super) static AFTER_POOLED_LOOKUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// Deterministic lookup/open race: the pooled lookup sees the
-    /// old row, then an overwrite (or delete) commits and unlinks
-    /// the old file before the open. The read must fall back to the
-    /// writer and return the new bytes (or `NotFound`), not
-    /// `Io { NotFound }`.
-    #[test]
-    fn read_retries_when_file_is_unlinked_after_lookup() {
-        let dir = tempdir();
-        let db = Arc::new(Db::open_file(&dir.path.join("state")).expect("db"));
-        let store = Arc::new(BlobStore::new(db, Some(dir.path.join("blobs"))));
-        store
-            .register_instance(INST_A, "alpha", 4096)
-            .expect("register");
-        let race = |action: Box<dyn FnOnce()>| {
-            AFTER_POOLED_LOOKUP.with(|hook| *hook.borrow_mut() = Some(action));
-        };
-        let overwrite = |store: &Arc<BlobStore>, bytes: &'static [u8]| -> Box<dyn FnOnce()> {
-            let store = Arc::clone(store);
-            Box::new(move || {
-                store
-                    .write(INST_A, "alpha", "k", bytes, Some("text/plain"))
-                    .expect("overwrite");
-            })
-        };
-
-        store.write(INST_A, "alpha", "k", b"v1", None).expect("v1");
-        race(overwrite(&store, b"v2"));
-        assert_eq!(
-            store.read_by_name(INST_A, "alpha", "k").expect("read"),
-            b"v2"
-        );
-
-        race(overwrite(&store, b"v3"));
-        let (info, bytes) = store
-            .read_with_info(INST_A, "alpha", "k", None)
-            .expect("read_with_info");
-        assert_eq!(bytes, b"v3");
-        assert_eq!(info.mime.as_deref(), Some("text/plain"));
-        assert_eq!(info.size_bytes, 2);
-
-        // By id: the overwritten id is gone, so the retry is NotFound.
-        let id = store.get_info(INST_A, "alpha", "k").expect("info").id;
-        race(overwrite(&store, b"v4"));
-        assert!(matches!(
-            store.read(INST_A, "alpha", &id),
-            Err(BlobError::NotFound { .. })
-        ));
-
-        // Delete after lookup: NotFound.
-        let deleter = Arc::clone(&store);
-        race(Box::new(move || {
-            deleter.delete(INST_A, "alpha", "k").expect("delete");
-        }));
-        assert!(matches!(
-            store.read_by_name(INST_A, "alpha", "k"),
-            Err(BlobError::NotFound { .. })
-        ));
-    }
-
-    /// A row whose file is genuinely missing is an I/O error after
-    /// the writer-side retry, not a loop and not `NotFound`.
+    /// A row whose file is genuinely missing is an I/O error, not
+    /// `NotFound`.
     #[test]
     fn missing_file_under_live_row_is_io_error() {
         let (store, dir) = store_with_root();

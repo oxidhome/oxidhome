@@ -313,11 +313,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = engine
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
-    // Stop retention and wait out an in-flight chunk, so no retention
-    // write outlives the state-dir lock released when this returns.
-    if let Some(task) = event_log_retention {
-        task.shutdown().await;
-    }
+    stop_event_log_retention(event_log_retention).await;
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s
@@ -359,6 +355,20 @@ fn spawn_event_log_retention(
         "event log retention",
     );
     engine.event_log().spawn_retention(retention)
+}
+
+/// Stop retention and wait out an in-flight chunk, so no retention
+/// write outlives the state-dir lock released when the caller
+/// returns. Bounded by [`SHUTDOWN_FLUSH_BUDGET`] so a hung disk can't
+/// wedge shutdown.
+async fn stop_event_log_retention(task: Option<RetentionTask>) {
+    if let Some(task) = task
+        && tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, task.shutdown())
+            .await
+            .is_err()
+    {
+        tracing::warn!("event log retention: a chunk was still running at the shutdown deadline");
+    }
 }
 
 /// M4: `oxidhome recover-admin-token [--revoke-all]`. Offline only —
@@ -664,11 +674,7 @@ async fn run_stdio() -> anyhow::Result<()> {
     let _ = engine
         .drain_supervised_instances_with_timeout(SHUTDOWN_REAPER_DRAIN_DEADLINE)
         .await;
-    // Stop retention and wait out an in-flight chunk, so no retention
-    // write outlives the state-dir lock released when this returns.
-    if let Some(task) = event_log_retention {
-        task.shutdown().await;
-    }
+    stop_event_log_retention(event_log_retention).await;
 
     // Flush the log writer before returning so the tail of the
     // session lands in `<state_dir>/oxidhome.db`. Matches the
