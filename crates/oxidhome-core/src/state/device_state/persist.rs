@@ -83,6 +83,11 @@ pub const REVISION_GAP: u64 = 1 << 32;
 /// the renumbering of every restored slot.
 const MAX_RESTORABLE_REVISION: u64 = 1 << 62;
 
+/// Longest persisted device id or capability accepted at restore:
+/// host-minted ids are 20 bytes, and a longer one wouldn't fit a
+/// pagination cursor.
+const MAX_RESTORED_ID_LEN: usize = 256;
+
 /// Skipped ranges kept for cursor checks.
 pub(super) const MAX_HOLES: usize = 16;
 
@@ -248,7 +253,14 @@ impl DeviceStateStore {
                 Arc::new(row),
             );
         }
-        restore_revisions(&mut inner, meta, max_row_revision, damaged);
+        let min_row_revision = inner.entries.values().map(|e| e.global_revision).min();
+        restore_revisions(
+            &mut inner,
+            meta,
+            max_row_revision,
+            min_row_revision,
+            damaged,
+        );
         // Every restored slot gets a revision above the base, so a
         // client polling from any surviving cursor is sent the whole
         // restored projection again. Otherwise a slot whose newer
@@ -478,6 +490,7 @@ fn restore_revisions(
     inner: &mut StoreInner,
     meta: Option<Meta>,
     max_row_revision: u64,
+    min_row_revision: Option<u64>,
     damaged: bool,
 ) {
     // A revision too close to the top of `u64` (a damaged row or
@@ -501,6 +514,12 @@ fn restore_revisions(
                 // Every boot records exactly `(R, R + GAP)`, in order.
                 && m.holes.iter().all(|&(lo, hi)| lo.checked_add(REVISION_GAP) == Some(hi) && hi <= flushed)
                 && m.holes.windows(2).all(|w| w[0].1 <= w[1].0)
+                // Every slot is renumbered above the newest range at
+                // boot, so a row at or below it means the range moved.
+                && m.holes
+                    .last()
+                    .zip(min_row_revision)
+                    .is_none_or(|(&(_, hi), min)| min > hi)
         });
     if let Some(meta) = meta.filter(|_| usable) {
         let base = flushed + REVISION_GAP;
@@ -871,10 +890,21 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
 fn decode_row(row: &rusqlite::Row<'_>) -> Option<DeviceState> {
     let blob: Vec<u8> = row.get(4).ok()?;
     let fields = decode_fields(&blob).ok()?;
+    if fields.len() > super::MAX_FIELDS_PER_SLOT
+        || super::fields_byte_estimate(&fields) > super::MAX_BYTES_PER_SLOT
+    {
+        return None;
+    }
     let quality: String = row.get(9).ok()?;
     let device_id: String = row.get(0).ok()?;
     let capability: String = row.get(1).ok()?;
-    if device_id.is_empty() || capability.is_empty() {
+    // Same bounds as live writes: ids that fit a pagination cursor,
+    // and the per-slot field-count and byte caps.
+    if device_id.is_empty()
+        || capability.is_empty()
+        || device_id.len() > MAX_RESTORED_ID_LEN
+        || capability.len() > MAX_RESTORED_ID_LEN
+    {
         return None;
     }
     Some(DeviceState {
@@ -1416,6 +1446,82 @@ mod tests {
                 .len(),
             n
         );
+        assert!(store.close_persistence());
+    }
+
+    /// PR round 3: a persisted range shifted onto a surviving row, an
+    /// oversized id and a slot over the field cap are all damage.
+    #[test]
+    fn shifted_ranges_and_oversized_rows_are_damage() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        assert!(store.close_persistence());
+        drop(store);
+        // Second boot: one range recorded, dev-a renumbered above it.
+        let store = open(&dir);
+        let epoch = store.epoch();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        let (lo, hi): (i64, i64) = db
+            .read(|c| {
+                c.query_row("SELECT holes_json FROM device_state_meta", [], |r| {
+                    r.get::<_, String>(0)
+                })
+            })
+            .map(|j| {
+                let v: Vec<(i64, i64)> = serde_json::from_str(&j).expect("holes");
+                *v.last().expect("a range")
+            })
+            .expect("meta");
+        let row_rev: i64 = db
+            .read(|c| c.query_row("SELECT global_revision FROM device_state", [], |r| r.get(0)))
+            .expect("row");
+        // Shift the range up so it ends on the surviving row.
+        let shift = row_rev - hi;
+        db.write(|c| {
+            c.execute(
+                "UPDATE device_state_meta SET holes_json = ?1",
+                [format!("[[{},{}]]", lo + shift, hi + shift)],
+            )
+        })
+        .expect("shift range");
+        drop(db);
+        let store = open(&dir);
+        assert_ne!(store.epoch(), epoch, "shifted range must be damage");
+        // Oversized id and too many fields: rows skipped.
+        let big = "x".repeat(MAX_RESTORED_ID_LEN + 1);
+        let many: Vec<KeyValue> = (0..=super::super::MAX_FIELDS_PER_SLOT)
+            .map(|i| KeyValue {
+                key: format!("k{i}"),
+                value: Value::BoolVal(true),
+            })
+            .collect();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        let blob = encode_fields(&many).expect("encode");
+        db.write(|c| {
+            c.execute(
+                "INSERT INTO device_state SELECT ?1, capability, owner_instance, owner_plugin, \
+                 owner_install, fields_blob, global_revision + 1, received_ms, observed_ms, \
+                 source_generation, quality FROM device_state WHERE device_id = 'dev-a'",
+                [&big],
+            )?;
+            c.execute(
+                "INSERT INTO device_state SELECT 'dev-many', capability, owner_instance, \
+                 owner_plugin, owner_install, ?1, global_revision + 2, received_ms, \
+                 observed_ms, source_generation, quality FROM device_state WHERE device_id = 'dev-a'",
+                [&blob],
+            )
+        })
+        .expect("insert bad rows");
+        drop(db);
+        let store = open(&dir);
+        assert!(store.snapshot_capability(&big, "switch").is_none());
+        assert!(store.snapshot_capability("dev-many", "switch").is_none());
+        assert!(store.snapshot_capability("dev-a", "switch").is_some());
         assert!(store.close_persistence());
     }
 }
