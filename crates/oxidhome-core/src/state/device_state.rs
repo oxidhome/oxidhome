@@ -192,10 +192,12 @@ struct StoreInner {
     /// `current_revision()` sees every entry with
     /// `global_revision ≤ N` already in the map.
     global_revision: u64,
-    /// H9 round-6 finding 1: opaque store epoch, minted per
-    /// process. The projection is in-memory only (no `SQLite`
-    /// persistence), so on daemon restart `global_revision`
-    /// resets to 0. A client holding `since_revision = 100`
+    /// H9 round-6 finding 1: opaque store epoch. H2: persisted with
+    /// the projection, so it changes only when the projection is
+    /// discarded (a fresh database, or [`DeviceStateStore::new`]);
+    /// restart continuity is handled by the revision gap and
+    /// `holes`. Pre-H2, when every restart reset
+    /// `global_revision` to 0, a client holding `since_revision = 100`
     /// pre-restart would otherwise silently receive no changes
     /// forever — the new store never reaches 100. The API
     /// returns the epoch on every response; a client that
@@ -400,13 +402,12 @@ impl DeviceStateStore {
         self.inner_read().global_revision
     }
 
-    /// H9 round-6 finding 1: store epoch, opaque nonce that
-    /// changes on every process start. Clients compare the
-    /// value they saw last against the current one; a change
-    /// means the store was reset (daemon restart, since the
-    /// projection isn't persisted) and every previously-held
-    /// `since_revision` cursor is invalid — the client should
-    /// resync from the snapshot.
+    /// H9 round-6 finding 1: store epoch, opaque nonce. Clients
+    /// compare the value they saw last against the current one; a
+    /// change means the projection was discarded and every
+    /// previously-held `since_revision` cursor is invalid — the
+    /// client should resync from the snapshot. H2: a restart of a
+    /// persistent store keeps the epoch.
     ///
     /// Round-7 finding 2: string, not integer — a 128-bit
     /// OS-random nonce so distinct stores collide with
@@ -1150,8 +1151,8 @@ impl DeviceStateStore {
     /// H9 round-6 finding 1: returned as [`DeltaPage`] carrying
     /// `epoch`, `current_revision`, `entries`, and
     /// `reset_required`. When `since_revision > current_revision`
-    /// (typical after a daemon restart drops the in-memory store
-    /// back to 0), `reset_required = true` and `entries` is
+    /// (a cursor from a discarded store, or one restored from an
+    /// older backup), `reset_required = true` and `entries` is
     /// empty — the client must discard its cursor and re-fetch
     /// the snapshot instead of quietly waiting for the store to
     /// catch up (which it never will, because the pre-restart
@@ -1811,11 +1812,11 @@ pub type SharedDeviceStateStore = Arc<DeviceStateStore>;
 /// H9 round-6 finding 1: return of [`DeviceStateStore::deltas_since_with_revision`].
 /// Callers persist `epoch` alongside `current_revision`; any
 /// response whose `epoch` differs from the previously-persisted
-/// value means the store was reset (daemon restart, since the
-/// projection isn't durable), and any response with
+/// value means the projection was discarded, and any response with
 /// `reset_required = true` means the caller's `since_revision`
-/// cursor is above the current store revision (same underlying
-/// cause). Both signals: discard the cursor and resync from
+/// cursor can't be continued (above the current revision, below
+/// the eviction watermark, or inside a revision range skipped at
+/// boot, H2). Both signals: discard the cursor and resync from
 /// [`DeviceStateStore::snapshot_device_with_revision`].
 #[derive(Debug)]
 pub struct DeltaPage {

@@ -439,8 +439,8 @@ struct DeviceStateSnapshot {
     device_id: String,
     /// H9 round-6 finding 1: opaque store epoch. Clients
     /// persist this alongside `revision`; a subsequent response
-    /// carrying a different `epoch` means the daemon restarted
-    /// (the projection is in-memory), the previously-held
+    /// carrying a different `epoch` means the projection was
+    /// discarded (H2: it survives a restart), the previously-held
     /// `revision` cursor is invalid, and the client should
     /// resync by re-fetching this endpoint. Round-7 finding 2:
     /// serialized as a string (128-bit OS-random nonce, hex)
@@ -852,14 +852,13 @@ struct StateChangesParams {
 /// every changed slot's latest value is within the current page —
 /// advance and re-poll.
 ///
-/// H9 round-6 finding 1: `epoch` is the store's opaque
-/// process-scoped nonce; a client that persists the last-seen
-/// epoch and observes a change knows the daemon restarted, the
-/// in-memory projection reset, and its cursor is invalid. As a
-/// belt-and-suspenders check, `reset_required` is `true` when
-/// `since_revision > current_revision` (typical after a
-/// restart drops the store back to 0) — the client discards
-/// its cursor and re-fetches the snapshot.
+/// H9 round-6 finding 1: `epoch` is the store's opaque nonce; a
+/// client that persists the last-seen epoch and observes a change
+/// knows the projection was discarded and its cursor is invalid.
+/// `reset_required` covers the cases the epoch can't (H2: the
+/// epoch survives restarts): a cursor above the current revision,
+/// below the eviction watermark, or inside a revision range a boot
+/// skipped because its writes may not have been flushed.
 #[derive(Serialize)]
 struct StateChangesBody {
     /// See [`DeviceStateSnapshot::epoch`] — 128-bit OS-random
@@ -867,9 +866,9 @@ struct StateChangesBody {
     epoch: String,
     current_revision: u64,
     changes: Vec<DeviceStateEntry>,
-    /// True when the caller's cursor is invalid — either it's
-    /// beyond the store's current revision (typical after a
-    /// daemon restart drops the store back to 0), or it's below
+    /// True when the caller's cursor is invalid — it's beyond the
+    /// store's current revision, inside a revision range a boot
+    /// skipped (H2: changes lost before they were flushed), or below
     /// the store's `evicted_through_revision` watermark (an
     /// evicted stale slot may have been the client's last
     /// chance to observe a `Fresh → Stale` flip). Recovery:
