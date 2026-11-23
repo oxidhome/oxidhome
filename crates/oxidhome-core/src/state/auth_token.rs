@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::TryRng;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -278,17 +278,18 @@ impl TokenStore {
         {
             return t;
         }
-        if touch_last_used(&self.db, token_id, now) {
-            let mut map = self
-                .last_written
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map.len() >= LAST_USED_CACHE_MAX && !map.contains_key(token_id) {
-                map.clear();
-            }
-            map.insert(token_id.to_string(), now);
+        let Some(on_record) = touch_last_used(&self.db, token_id, now) else {
+            return now;
+        };
+        let mut map = self
+            .last_written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() >= LAST_USED_CACHE_MAX && !map.contains_key(token_id) {
+            map.clear();
         }
-        now
+        map.insert(token_id.to_string(), on_record);
+        on_record
     }
 
     /// Mark a token revoked. Idempotent — calling on an already-
@@ -590,28 +591,41 @@ fn derive_id(hash: &[u8; 32]) -> String {
     base64url_no_pad(&hash[..12])
 }
 
-/// Best-effort `last_used_ms = now` write. Failures are logged and
-/// swallowed; the caller has already authenticated. Returns whether
-/// the write succeeded.
-fn touch_last_used(db: &Db, token_id: &str, now: i64) -> bool {
+/// Best-effort `last_used_ms = now` write, re-checked under the
+/// writer so concurrent verifies that all read a stale value write
+/// once, and an older `now` never overwrites a newer value. Returns
+/// the value on record afterwards (`None` if the write failed or the
+/// row is gone). Failures are logged and swallowed; the caller has
+/// already authenticated.
+fn touch_last_used(db: &Db, token_id: &str, now: i64) -> Option<i64> {
     let id_for_db = token_id.to_string();
-    let logged_id = token_id.to_string();
-    match db.write(move |conn| -> Result<(), TokenError> {
-        conn.execute(
-            "UPDATE auth_token SET last_used_ms = ?1 WHERE id = ?2",
-            params![now, id_for_db],
+    match db.write(move |conn| -> Result<Option<i64>, TokenError> {
+        let n = conn.execute(
+            "UPDATE auth_token SET last_used_ms = ?1 \
+             WHERE id = ?2 AND (last_used_ms IS NULL OR last_used_ms <= ?1 - ?3)",
+            params![now, id_for_db, LAST_USED_RESOLUTION_MS],
         )?;
-        Ok(())
+        if n > 0 {
+            return Ok(Some(now));
+        }
+        Ok(conn
+            .query_row(
+                "SELECT last_used_ms FROM auth_token WHERE id = ?1",
+                params![id_for_db],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
     }) {
-        Ok(()) => true,
+        Ok(on_record) => on_record,
         Err(err) => {
             tracing::warn!(
                 target: "auth.token",
-                token_id = %logged_id,
+                token_id = %token_id,
                 error = %err,
                 "failed to bump last_used_ms; verify itself succeeded",
             );
-            false
+            None
         }
     }
 }
@@ -1013,5 +1027,22 @@ mod tests {
         assert_eq!(second, first);
         let row = store.get(&issued.id).unwrap().unwrap();
         assert_eq!(row.last_used_ms, Some(1));
+    }
+
+    /// M6: the write re-checks under the writer, so a verify that
+    /// read a stale value doesn't write once another verify has, and
+    /// an older timestamp never overwrites a newer one.
+    #[test]
+    fn last_used_write_rechecks_under_the_writer() {
+        let db = fresh();
+        let store = TokenStore::new(Arc::clone(&db));
+        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let newer = now_ms();
+        set_last_used(&db, &issued.id, newer);
+        let older = newer - 5_000;
+        assert_eq!(touch_last_used(&db, &issued.id, older), Some(newer));
+        let row = store.get(&issued.id).unwrap().unwrap();
+        assert_eq!(row.last_used_ms, Some(newer));
+        assert_eq!(touch_last_used(&db, "missing", newer), None);
     }
 }

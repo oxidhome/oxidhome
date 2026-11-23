@@ -29,9 +29,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags};
@@ -833,9 +833,11 @@ pub fn schema_version() -> i64 {
 /// reports `SQLITE_BUSY`. Inside one process the writer mutex
 /// already serializes writes, so this mostly covers other
 /// processes on the same file (an online `oxidhome backup`, an
-/// operator's `sqlite3` shell) and WAL-index recovery. Kept below
-/// any request deadline so a stuck lock surfaces as an error
-/// instead of a hang.
+/// operator's `sqlite3` shell) and WAL-index recovery, so a stuck
+/// lock surfaces as an error instead of a hang. It is longer than
+/// the H3 mirror's 2 s write deadline: a publish past that deadline
+/// is delivered in degraded mode while its blocking write keeps
+/// waiting here.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound on read-only connections a file-backed [`Db`]
@@ -917,7 +919,7 @@ pub struct Db {
     /// error messages); `Some(path)` for file-backed instances.
     path: Option<PathBuf>,
     conn: Mutex<Connection>,
-    /// Normal-priority writers currently waiting for `conn`.
+    /// Decides who owns `conn` next (normal before low priority).
     write_gate: WriteGate,
     /// `None` for `:memory:`.
     readers: Option<ReadPool>,
@@ -975,7 +977,10 @@ impl Db {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("creating state dir {}", state_dir.display()))?;
         crate::backup::ensure_no_interrupted_restore(state_dir)?;
-        let path = state_dir.join(DB_FILE_NAME);
+        // Absolute, so readers and the checkpointer (which open later,
+        // possibly after a working-directory change) reach this file.
+        let path = std::path::absolute(state_dir.join(DB_FILE_NAME))
+            .with_context(|| format!("resolving {}", state_dir.display()))?;
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database at {}", path.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
@@ -1163,11 +1168,12 @@ impl Db {
     }
 
     /// [`Self::write`] for work nobody waits on (diagnostic log
-    /// batches, log retention). Before taking the writer mutex it
-    /// waits until no normal-priority writer is queued, for at most
-    /// [`LOW_PRIORITY_MAX_DEFER`]. A normal-priority writer that
-    /// arrives after this call has taken the mutex waits for `f` to
-    /// finish, so `f` should be one bounded transaction.
+    /// batches, log retention). The writer goes to a queued
+    /// normal-priority caller first; this call takes it only when
+    /// no normal-priority caller is waiting, or once it has deferred
+    /// for [`LOW_PRIORITY_MAX_DEFER`]. A normal-priority caller that
+    /// arrives while `f` runs waits for `f` to finish, so `f` should
+    /// be one bounded transaction.
     ///
     /// # Errors
     ///
@@ -1183,31 +1189,35 @@ impl Db {
     where
         R: Send,
     {
-        self.write_gate
-            .defer_to_waiters(self.policy.low_priority_max_defer);
-        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let ticket = self
+            .write_gate
+            .acquire_low(self.policy.low_priority_max_defer);
+        let mut conn = WriterGuard {
+            conn: self.conn.lock().expect("db mutex poisoned"),
+            _ticket: ticket,
+        };
         f(&mut conn)
     }
 
-    /// Writer mutex at normal priority: uncontended takes it
-    /// directly; contended registers as a waiter first so
-    /// low-priority writers defer.
-    fn lock_writer(&self) -> MutexGuard<'_, Connection> {
-        match self.conn.try_lock() {
-            Ok(guard) => return guard,
-            Err(TryLockError::Poisoned(_)) => panic!("db mutex poisoned"),
-            Err(TryLockError::WouldBlock) => {}
+    /// The writer at normal priority.
+    fn lock_writer(&self) -> WriterGuard<'_> {
+        let ticket = self.write_gate.acquire_normal();
+        WriterGuard {
+            conn: self.conn.lock().expect("db mutex poisoned"),
+            _ticket: ticket,
         }
-        let waiter = self.write_gate.enter();
-        let guard = self.conn.lock().expect("db mutex poisoned");
-        drop(waiter);
-        guard
     }
 
-    /// Normal-priority writers currently queued on the writer mutex.
+    /// Normal-priority callers currently queued for the writer.
     #[cfg(test)]
     fn waiting_writers(&self) -> usize {
-        *self.write_gate.waiting.lock().expect("write gate poisoned")
+        self.write_gate.lock_state().normal_waiting
+    }
+
+    /// Low-priority callers currently queued for the writer.
+    #[cfg(test)]
+    fn waiting_low_priority_writers(&self) -> usize {
+        self.write_gate.lock_state().low_waiting
     }
 
     /// Path the database is backed by, or `None` for `:memory:`. Used
@@ -1273,50 +1283,111 @@ fn apply_checkpoint_pragmas(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Counts normal-priority writers waiting on the writer mutex, so
-/// low-priority writers can stand aside.
+/// Admission to the writer (M6). Ownership is decided here, under
+/// one mutex, so a low-priority caller can't slip into the writer
+/// mutex's queue ahead of a normal-priority caller that is already
+/// waiting: on release, queued normal-priority callers always go
+/// first, and low-priority callers go only when none is queued (or
+/// their deferral bound has run out).
 #[derive(Default)]
 struct WriteGate {
-    waiting: Mutex<usize>,
-    idle: Condvar,
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    /// Some caller owns the writer.
+    held: bool,
+    normal_waiting: usize,
+    low_waiting: usize,
 }
 
 impl WriteGate {
-    fn enter(&self) -> WaiterGuard<'_> {
-        *self.waiting.lock().expect("write gate poisoned") += 1;
-        WaiterGuard { gate: self }
+    /// The gate's state is plain counters that are never left
+    /// half-updated, so poisoning (a panic elsewhere while it was
+    /// held) is ignored rather than propagated.
+    fn lock_state(&self) -> MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn defer_to_waiters(&self, max: Duration) {
-        let waiting = self.waiting.lock().expect("write gate poisoned");
-        if *waiting == 0 {
-            return;
+    fn acquire_normal(&self) -> GateTicket<'_> {
+        let mut state = self.lock_state();
+        if state.held {
+            state.normal_waiting += 1;
+            state = self
+                .changed
+                .wait_while(state, |s| s.held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.normal_waiting -= 1;
         }
-        let _unused = self
-            .idle
-            .wait_timeout_while(waiting, max, |n| *n > 0)
-            .expect("write gate poisoned");
+        state.held = true;
+        GateTicket { gate: self }
+    }
+
+    fn acquire_low(&self, max_defer: Duration) -> GateTicket<'_> {
+        let deadline = Instant::now().checked_add(max_defer);
+        let mut state = self.lock_state();
+        state.low_waiting += 1;
+        loop {
+            let now = Instant::now();
+            let expired = deadline.is_some_and(|d| now >= d);
+            if !state.held && (state.normal_waiting == 0 || expired) {
+                break;
+            }
+            state = match deadline {
+                // Free but deferring to a queued normal caller: wake
+                // on the next change or when the deferral runs out.
+                Some(d) if !state.held && !expired => {
+                    self.changed
+                        .wait_timeout(state, d - now)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0
+                }
+                _ => self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            };
+        }
+        state.low_waiting -= 1;
+        state.held = true;
+        GateTicket { gate: self }
     }
 }
 
-/// Decrements the waiter count on drop, including on unwind.
-struct WaiterGuard<'a> {
+/// Ownership of the writer; released on drop, including on unwind.
+struct GateTicket<'a> {
     gate: &'a WriteGate,
 }
 
-impl Drop for WaiterGuard<'_> {
+impl Drop for GateTicket<'_> {
     fn drop(&mut self) {
-        // Never panic in drop: a poisoned gate only means another
-        // waiter panicked; the count is still meaningful.
-        let mut n = self
-            .gate
-            .waiting
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *n -= 1;
-        if *n == 0 {
-            self.gate.idle.notify_all();
-        }
+        self.gate.lock_state().held = false;
+        self.gate.changed.notify_all();
+    }
+}
+
+/// The writer connection plus its admission ticket. Field order
+/// matters: the connection mutex unlocks before the ticket frees
+/// the gate, so the next owner never blocks on the mutex.
+struct WriterGuard<'a> {
+    conn: MutexGuard<'a, Connection>,
+    _ticket: GateTicket<'a>,
+}
+
+impl std::ops::Deref for WriterGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 }
 
@@ -2165,15 +2236,15 @@ mod tests {
     /// writer mid-transaction, (1) a KV read and an event-history
     /// query complete, seeing the pre-batch snapshot, and (2) an
     /// event-log append that queues behind the batch commits before
-    /// the next log batch. Before M6 both reads waited for the
-    /// batch, and the next batch could win the mutex.
+    /// the next log batch, even though that batch queued first.
+    /// Before M6 both reads waited for the batch, and the next batch
+    /// could win the mutex.
     ///
     /// No timing assertions: the batch is held open until the
-    /// reads report back, and ordering is read from a sequence
-    /// counter.
+    /// reads report back, and commit order is observed in the
+    /// database itself.
     #[test]
     fn log_batch_blocks_neither_reads_nor_event_append() {
-        use std::sync::atomic::AtomicUsize;
         use std::sync::mpsc;
 
         use crate::host_impl::plugin::oxidhome::plugin::types::Value as WitValue;
@@ -2238,44 +2309,63 @@ mod tests {
         assert_eq!(history, 1);
         assert_eq!(logs, 0, "the uncommitted batch is invisible to readers");
 
-        // (2) Priority: an event append queues first, then the next
-        // log batch. The append must commit first.
-        let order = Arc::new(AtomicUsize::new(0));
+        // (2) Priority: the next log batch queues first, then an
+        // event append. The append still commits first: the batch,
+        // once it runs, already sees the appended row.
+        let next_batch = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.write_low_priority(|c| -> rusqlite::Result<i64> {
+                    insert_log_rows(c, 1)?;
+                    c.query_row(
+                        "SELECT COUNT(*) FROM event_log WHERE topic = 'control'",
+                        [],
+                        |r| r.get(0),
+                    )
+                })
+                .expect("next batch")
+            })
+        };
+        wait_until("the next log batch to queue on the writer", || {
+            db.waiting_low_priority_writers() == 1
+        });
         let append = {
             let events = Arc::clone(&events);
-            let order = Arc::clone(&order);
             std::thread::spawn(move || {
-                let id = events
+                events
                     .record(2, &custom_event("control"), "alpha", "acme.test")
-                    .expect("append");
-                (id, order.fetch_add(1, Ordering::SeqCst))
+                    .expect("append")
             })
         };
         wait_until("the event append to queue on the writer", || {
             db.waiting_writers() == 1
         });
-        let next_batch = {
-            let db = Arc::clone(&db);
-            let order = Arc::clone(&order);
-            std::thread::spawn(move || {
-                db.write_low_priority(|c| insert_log_rows(c, 1))
-                    .expect("next batch");
-                order.fetch_add(1, Ordering::SeqCst)
-            })
-        };
         release_tx.send(()).expect("release batch");
         batch.join().expect("batch thread").expect("batch commit");
-        let (append_id, append_seq) = append.join().expect("append thread");
-        let batch_seq = next_batch.join().expect("next batch thread");
+        let append_id = append.join().expect("append thread");
+        let control_rows_seen_by_batch = next_batch.join().expect("next batch thread");
         assert!(append_id > 0);
-        assert!(
-            append_seq < batch_seq,
-            "event append (seq {append_seq}) must commit before the next log batch (seq {batch_seq})",
+        assert_eq!(
+            control_rows_seen_by_batch, 1,
+            "the queued event append must commit before the queued log batch",
         );
         let logs: i64 = db
             .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
             .expect("log count");
         assert_eq!(logs, 5_001);
+    }
+
+    /// The low-priority deferral is bounded: once it runs out, a
+    /// low-priority caller takes a free writer even while a
+    /// normal-priority caller is counted as waiting.
+    #[test]
+    fn low_priority_deferral_is_bounded() {
+        let gate = WriteGate::default();
+        gate.lock_state().normal_waiting = 1;
+        let ticket = gate.acquire_low(Duration::ZERO);
+        assert!(gate.lock_state().held);
+        drop(ticket);
+        assert!(!gate.lock_state().held);
     }
 
     /// A read closure sees one snapshot even if a write commits
