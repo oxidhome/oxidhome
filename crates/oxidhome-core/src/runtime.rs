@@ -16,6 +16,7 @@
 pub mod command;
 pub mod contract;
 pub mod dispatcher;
+mod event_read;
 mod instance;
 mod lifecycle;
 mod plugin_stdio;

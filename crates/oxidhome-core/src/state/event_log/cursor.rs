@@ -160,7 +160,7 @@ impl HistoricalEvent {
 /// Exact because retention only deletes an id prefix
 /// ([`EventLog::trim_older_than`]): if the row after the cursor is
 /// present, so is every later row up to the head.
-fn resolve_on(
+pub(super) fn resolve_on(
     conn: &rusqlite::Connection,
     after_id: u64,
 ) -> Result<Result<u64, CursorExpired>, EventLogError> {
@@ -196,7 +196,7 @@ fn resolve_on(
 /// `(head_id, oldest_id)`. The head comes from `sqlite_sequence`
 /// (survives deletes), floored by `MAX(id)` in case the sequence row
 /// is missing.
-fn bounds(conn: &rusqlite::Connection) -> Result<(u64, Option<u64>), EventLogError> {
+pub(super) fn bounds(conn: &rusqlite::Connection) -> Result<(u64, Option<u64>), EventLogError> {
     // Two statements: SQLite answers a lone `MIN` / `MAX` from the
     // primary key, but `SELECT MAX(id), MIN(id)` scans the table.
     let max_id: Option<i64> =

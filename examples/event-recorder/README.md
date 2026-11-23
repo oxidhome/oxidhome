@@ -8,13 +8,24 @@ plugin-side `on-event` dispatch path that
 
 This example exists for the integration test in
 `crates/oxidhome-core/tests/event_dispatch.rs`. It registers no
-devices and keeps no state beyond a count of received events. It
-answers three `recorder` commands: `count` (events seen so far),
-`read-state device=<id>` and `list-state`. The last two read the
-host's device-state projection through the `host-state` import (H2).
-Reading another plugin's devices needs a
-`[[capabilities.reads_state]]` grant, which this manifest leaves out
-on purpose; `crates/oxidhome-test-host/tests/test_host.rs` stages one.
+devices. It keeps a count of received events and, in KV storage, the
+highest event `row-id` it handled. On `init` it subscribes, then
+replays the recorded events after that cursor through
+`host-events::read-events` (`oxidhome_sdk::host::events::History`), so
+a restart catches up on what it missed; `on_event` then skips the
+events the catch-up already handled. If the cursor expired (retention
+pruned the rows after it) it resumes from the history head.
+
+It answers these `recorder` commands: `count` (events seen so far),
+`history` (the catch-up: `caught_up`, `duplicates`, `cursor`,
+`expired`), `read-events after=<id> limit=<n>` (one history page),
+`resubscribe topic=<t>` (narrow the subscription, which also narrows
+what history shows), `subscribe topic=<t>` (add one), `read-state device=<id>` and `list-state`. The
+last two read the host's device-state projection through the
+`host-state` import (H2). Reading another plugin's devices needs a
+`[[capabilities.reads_state]]` grant, and raw bytes in history need
+`reads_event_bytes = true`; this manifest leaves both out on purpose,
+and `crates/oxidhome-test-host/tests/test_host.rs` stages them.
 
 ## Build
 

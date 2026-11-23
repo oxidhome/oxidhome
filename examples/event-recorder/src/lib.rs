@@ -7,6 +7,16 @@
 //! command, so Phase 6's tokio supervisor can prove event delivery
 //! through an [`InstanceHandle`] without scraping logs.
 //!
+//! Event history: the recorder keeps the highest `row-id` it handled
+//! in KV storage. On `init` it subscribes, then replays the recorded
+//! events after that cursor through `host::events::History` (catching
+//! up on what it missed while stopped), and `on_event` skips events the
+//! catch-up already handled. `recorder::history` reports the catch-up;
+//! `recorder::read-events after=<id> limit=<n>` reads one page, and
+//! `recorder::resubscribe topic=<t>` narrows the subscription (which
+//! also narrows what history shows); `recorder::subscribe topic=<t>`
+//! adds one.
+//!
 //! H2: `recorder::read-state device=<id>` and `recorder::list-state`
 //! read the host's device-state projection through `host-state`.
 //! Reading another plugin's devices needs a
@@ -16,20 +26,80 @@
 use oxidhome_sdk::Plugin;
 use oxidhome_sdk::bindings::oxidhome::plugin::devices::{Command, CommandResult};
 use oxidhome_sdk::bindings::oxidhome::plugin::events::{Event, EventPayload};
-use oxidhome_sdk::bindings::oxidhome::plugin::types::{Error, KeyValue, Value};
+use oxidhome_sdk::bindings::oxidhome::plugin::types::{Error, KeyValue, SubscriptionId, Value};
 use oxidhome_sdk::host;
+use oxidhome_sdk::host::events::{Cursor, EventRead, History};
+
+/// KV key holding the last handled row id.
+const CURSOR_KEY: &str = "cursor";
 
 #[derive(Default)]
 struct EventRecorder {
-    /// How many events `on_event` has received this run.
+    /// How many new events `on_event` has received this run.
     count: i64,
+    /// Events `on_event` skipped because the catch-up handled them.
+    duplicates: i64,
+    /// Events replayed from history during `init`.
+    caught_up: i64,
+    /// Whether the saved cursor had expired at `init`.
+    expired: bool,
+    cursor: Cursor,
+    subscriptions: Vec<SubscriptionId>,
+}
+
+impl EventRecorder {
+    /// Save the cursor. Best effort: without a storage grant the
+    /// recorder still works, it just starts over after a restart.
+    fn save_cursor(&self) {
+        let _ = host::storage::set_typed(CURSOR_KEY, &self.cursor.after_id());
+    }
+
+    /// Replay history after the saved cursor, up to the head.
+    fn catch_up(&mut self) -> Result<(), String> {
+        loop {
+            let mut history = History::new(self.cursor.after_id());
+            for event in history.by_ref() {
+                let event = event.map_err(|e| format!("history read failed: {e:?}"))?;
+                if self.cursor.advance(&event) {
+                    self.caught_up += 1;
+                }
+            }
+            if let Some(expired) = history.expired() {
+                oxidhome_sdk::tracing::warn!(
+                    after_id = expired.after_id,
+                    head_id = expired.head_id,
+                    "event-recorder cursor expired; resuming from the head",
+                );
+                self.expired = true;
+                self.cursor = Cursor::new(expired.head_id);
+                break;
+            }
+            self.cursor.skip_to(history.after_id());
+            // Checkpoint each batch, so a restart resumes from here.
+            self.save_cursor();
+            if history.caught_up() {
+                break;
+            }
+        }
+        self.save_cursor();
+        Ok(())
+    }
 }
 
 impl Plugin for EventRecorder {
     fn init(&mut self) -> Result<(), String> {
         let _ = oxidhome_sdk::logging::init();
-        host::subscribe_all().map_err(|e| format!("subscribe failed: {e:?}"))?;
-        oxidhome_sdk::tracing::info!("event-recorder ready");
+        // Subscribe before reading history, so nothing published
+        // during the catch-up is missed; `on_event` drops the overlap.
+        let id = host::subscribe_all().map_err(|e| format!("subscribe failed: {e:?}"))?;
+        self.subscriptions.push(id);
+        let saved = host::storage::get_typed::<u64>(CURSOR_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        self.cursor = Cursor::new(saved);
+        self.catch_up()?;
+        oxidhome_sdk::tracing::info!(caught_up = self.caught_up, "event-recorder ready");
         Ok(())
     }
 
@@ -38,6 +108,13 @@ impl Plugin for EventRecorder {
     }
 
     fn on_event(&mut self, event: Event) {
+        if !self.cursor.advance(&event) {
+            self.duplicates += 1;
+            return;
+        }
+        if event.row_id.is_some() {
+            self.save_cursor();
+        }
         self.count += 1;
         // Render a stable shape on every event so the integration
         // test's log-capture assertion can match deterministically.
@@ -62,6 +139,18 @@ impl Plugin for EventRecorder {
                 key: "count".into(),
                 value: Value::IntVal(self.count),
             }]),
+            ("recorder", "history") => CommandResult::OkWithState(vec![
+                int("caught_up", self.caught_up),
+                int("duplicates", self.duplicates),
+                uint("cursor", self.cursor.after_id()),
+                KeyValue {
+                    key: "expired".into(),
+                    value: Value::BoolVal(self.expired),
+                },
+            ]),
+            ("recorder", "read-events") => read_events(&cmd.args),
+            ("recorder", "resubscribe") => self.resubscribe(&cmd.args, true),
+            ("recorder", "subscribe") => self.resubscribe(&cmd.args, false),
             ("recorder", "read-state") => read_state(&cmd.args),
             ("recorder", "list-state") => {
                 match host::state::list_all(&host::state::StateFilter {
@@ -83,16 +172,99 @@ impl Plugin for EventRecorder {
     }
 }
 
+impl EventRecorder {
+    /// `recorder::resubscribe topic=<t>`: replace every subscription
+    /// with one on `topic` (`replace`); `recorder::subscribe topic=<t>`
+    /// adds one.
+    fn resubscribe(&mut self, args: &[KeyValue], replace: bool) -> CommandResult {
+        let Some(Value::StringVal(topic)) = arg(args, "topic") else {
+            return CommandResult::Err(Error::InvalidArgument("missing `topic` argument".into()));
+        };
+        if replace {
+            for id in self.subscriptions.drain(..) {
+                let _ = host::unsubscribe(id);
+            }
+        }
+        match host::subscribe_topic(topic.clone()) {
+            Ok(id) => {
+                self.subscriptions.push(id);
+                CommandResult::OkWithState(Vec::new())
+            }
+            Err(e) => CommandResult::Err(e),
+        }
+    }
+}
+
+fn arg<'a>(args: &'a [KeyValue], key: &str) -> Option<&'a Value> {
+    args.iter().find(|kv| kv.key == key).map(|kv| &kv.value)
+}
+
+fn int(key: &str, v: i64) -> KeyValue {
+    KeyValue {
+        key: key.into(),
+        value: Value::IntVal(v),
+    }
+}
+
+fn uint(key: &str, v: u64) -> KeyValue {
+    int(key, i64::try_from(v).unwrap_or(i64::MAX))
+}
+
+/// `recorder::read-events after=<id> limit=<n>`: one page of history,
+/// summarized as `ids` (comma-separated row ids), `next_after_id`,
+/// `head_id`, and counts of `bytes` fields and `withheld` markers; or
+/// `expired_head_id` / `expired_oldest_id` for an expired cursor.
+fn read_events(args: &[KeyValue]) -> CommandResult {
+    let num = |key| match arg(args, key) {
+        Some(Value::IntVal(n)) => u64::try_from(*n).unwrap_or(0),
+        _ => 0,
+    };
+    let limit = u32::try_from(num("limit")).unwrap_or(u32::MAX);
+    match host::events::read_after(num("after"), limit) {
+        Ok(EventRead::Page(page)) => {
+            let ids: Vec<String> = page
+                .events
+                .iter()
+                .filter_map(|e| e.row_id)
+                .map(|id| id.to_string())
+                .collect();
+            let (mut bytes, mut withheld) = (0, 0);
+            for event in &page.events {
+                if let EventPayload::StateChanged(sc) = &event.payload {
+                    for kv in &sc.fields {
+                        match &kv.value {
+                            Value::BytesVal(_) => bytes += 1,
+                            Value::JsonVal(j) if j.contains("\"withheld\"") => withheld += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            CommandResult::OkWithState(vec![
+                KeyValue {
+                    key: "ids".into(),
+                    value: Value::StringVal(ids.join(",")),
+                },
+                uint("next_after_id", page.next_after_id),
+                uint("head_id", page.head_id),
+                int("bytes", bytes),
+                int("withheld", withheld),
+            ])
+        }
+        Ok(EventRead::CursorExpired(expired)) => CommandResult::OkWithState(vec![
+            uint("expired_head_id", expired.head_id),
+            uint("expired_oldest_id", expired.oldest_id.unwrap_or(0)),
+        ]),
+        Err(e) => CommandResult::Err(e),
+    }
+}
+
 /// `recorder::read-state device=<id>`: read another device's current
 /// state through the H2 `host-state` import (needs a
 /// `[[capabilities.reads_state]]` grant) and echo it back as
 /// `<capability>.<field>` keys plus `<capability>.quality`.
 fn read_state(args: &[KeyValue]) -> CommandResult {
-    let Some(Value::StringVal(device)) = args
-        .iter()
-        .find(|kv| kv.key == "device")
-        .map(|kv| &kv.value)
-    else {
+    let Some(Value::StringVal(device)) = arg(args, "device") else {
         return CommandResult::Err(Error::InvalidArgument("missing `device` argument".into()));
     };
     let entries = match host::state::get(device) {

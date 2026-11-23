@@ -203,6 +203,15 @@ pub struct CapabilitiesSection {
     /// [`crate::validate::MAX_READS_STATE_GRANTS`].
     #[serde(default)]
     pub reads_state: Vec<StateGrant>,
+    /// Whether `host-events::read-events` returns `bytes-val` fields
+    /// of recorded events as is. `false` (or absent) ⇒ each one is
+    /// replaced by a `json-val` marker `{"withheld":"bytes",
+    /// "size_bytes":N,"required_scope":"reads_event_bytes"}`. Which
+    /// rows the plugin reads at all is decided by
+    /// `subscribes_events` and its live subscriptions, not by this
+    /// flag. The effective value is requested ∧ granted.
+    #[serde(default)]
+    pub reads_event_bytes: bool,
 }
 
 /// H2: one selector inside `[capabilities] reads_state`.

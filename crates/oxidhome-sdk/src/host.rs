@@ -67,6 +67,14 @@ pub mod blobs;
 /// `[capabilities] script_sandboxes`.
 pub mod sandboxes;
 
+/// Event-history reads. Plugin authors call
+/// `oxidhome_sdk::host::events::read_after(after_id, limit)` or iterate
+/// `oxidhome_sdk::host::events::History` to replay the recorded events
+/// their subscriptions match, e.g. to resume `on-event` delivery from
+/// the last `row-id` after a restart. Gated by
+/// `[capabilities] subscribes_events`.
+pub mod events;
+
 /// Device-state reads (H2). Plugin authors call
 /// `oxidhome_sdk::host::state::get(device_id)` or
 /// `oxidhome_sdk::host::state::list_all(&filter)` to read the host's

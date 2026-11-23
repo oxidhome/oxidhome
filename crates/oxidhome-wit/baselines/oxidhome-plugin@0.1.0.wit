@@ -604,11 +604,30 @@ interface host-events {
   use types.{subscription-id, error};
   use events.{event, event-filter};
 
+  record event-page {
+    events: list<event>,
+    next-after-id: u64,
+    head-id: u64,
+  }
+
+  record cursor-expired {
+    after-id: u64,
+    oldest-id: option<u64>,
+    head-id: u64,
+  }
+
+  variant event-read {
+    page(event-page),
+    cursor-expired(cursor-expired),
+  }
+
   publish-event: func(ev: event) -> result<_, error>;
 
   subscribe: func(filter: event-filter) -> result<subscription-id, error>;
 
   unsubscribe: func(id: subscription-id) -> result<_, error>;
+
+  read-events: func(after-id: u64, limit: u32) -> result<event-read, error>;
 }
 
 interface host-config {

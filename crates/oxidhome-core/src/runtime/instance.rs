@@ -1411,7 +1411,7 @@ impl PluginInstance {
             while let Ok(SubscriberMessage::Event {
                 event: ev,
                 skipped_before,
-                ..
+                rows_through,
             }) = sub.receiver.try_recv()
             {
                 // Follow-up review H4 round-2 F1: lag count now
@@ -1432,11 +1432,20 @@ impl PluginInstance {
                 // write per subscription.
                 let ev = Arc::unwrap_or_clone(ev);
                 if sub.matches(&ev) {
-                    events.push(ev);
+                    events.push((rows_through, ev));
                 }
             }
         }
-        events
+        // Each subscription has its own queue, so draining them one
+        // after another can hand over row 12 before row 11. Restore
+        // publish order across subscriptions: publishes are
+        // serialized, `rows_through` is the bus watermark at each
+        // fan-out (an event's own row id, or the last one fanned out
+        // before an event without one), and the sort is stable, so
+        // order within a queue is kept. Plugins resuming from a
+        // `row-id` cursor (`host-events::read-events`) rely on it.
+        events.sort_by_key(|(rows_through, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
+        events.into_iter().map(|(_, ev)| ev).collect()
     }
 
     /// The instance id this state was built with. Currently the plugin's

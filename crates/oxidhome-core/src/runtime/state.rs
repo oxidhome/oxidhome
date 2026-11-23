@@ -1625,6 +1625,14 @@ impl host_events::Host for PluginState {
         }
         Ok(())
     }
+
+    async fn read_events(
+        &mut self,
+        after_id: u64,
+        limit: u32,
+    ) -> Result<host_events::EventRead, WitError> {
+        self.read_events_impl(after_id, limit).await
+    }
 }
 
 // ── Config / storage / logging — see header. ─────────────────────────
@@ -2826,6 +2834,87 @@ mod tests {
             state.subscriptions.is_empty(),
             "denied subscribe must not persist a subscription",
         );
+    }
+
+    /// `read-events` needs `subscribes_events`, like `subscribe`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_read_events_denied_without_capability() {
+        use oxidhome_manifest::CapabilitiesSection;
+        let mut manifest = (*fixture_manifest("no.subscribe")).clone();
+        manifest.capabilities = CapabilitiesSection {
+            subscribes_events: false,
+            ..manifest.capabilities
+        };
+        let mut state = PluginState::new(
+            "alpha",
+            "no.subscribe",
+            Arc::new(manifest),
+            Actor::plugin("alpha"),
+            InstanceConfig::new(),
+            Arc::new(DeviceRegistry::new()),
+            Arc::new(crate::state::DeviceStateStore::new()),
+            Arc::new(EventBus::new()),
+            fresh_kv("alpha", 0),
+            fresh_event_log(),
+            fresh_blobs(),
+            Arc::new(ServiceRegistry::new()),
+            Arc::new(InstanceRegistry::new()),
+        );
+        let err = host_events::Host::read_events(&mut state, 0, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+    }
+
+    /// `read-events` replays recorded events matching the instance's
+    /// subscriptions, each with its row id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_read_events_follows_subscriptions() {
+        let mut state = fresh_state("alpha");
+        let publish = |topic: &str| Event {
+            device: None,
+            timestamp: 0,
+            origin_plugin_id: String::new(),
+            origin_instance_id: String::new(),
+            row_id: None,
+            payload: EventPayload::Custom(events::CustomEvent {
+                topic: topic.into(),
+                payload: "{}".into(),
+            }),
+        };
+        for topic in ["a.one", "b.one", "a.two"] {
+            host_events::Host::publish_event(&mut state, publish(topic))
+                .await
+                .expect("publish");
+        }
+        let page = |read| match read {
+            host_events::EventRead::Page(page) => page,
+            other @ host_events::EventRead::CursorExpired(_) => panic!("expired: {other:?}"),
+        };
+        let unsubscribed = page(
+            host_events::Host::read_events(&mut state, 0, 0)
+                .await
+                .expect("read"),
+        );
+        assert!(unsubscribed.events.is_empty());
+        assert_eq!(unsubscribed.next_after_id, unsubscribed.head_id);
+        host_events::Host::subscribe(
+            &mut state,
+            EventFilter {
+                device: None,
+                topic: Some("a.".into()),
+            },
+        )
+        .await
+        .expect("subscribe");
+        let read = page(
+            host_events::Host::read_events(&mut state, 0, 0)
+                .await
+                .expect("read"),
+        );
+        let ids: Vec<Option<u64>> = read.events.iter().map(|e| e.row_id).collect();
+        assert_eq!(ids, vec![Some(1), Some(3)]);
+        assert_eq!((read.next_after_id, read.head_id), (3, 3));
     }
 
     #[tokio::test(flavor = "current_thread")]
