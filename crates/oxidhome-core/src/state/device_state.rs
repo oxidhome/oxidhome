@@ -1132,10 +1132,15 @@ impl DeviceStateStore {
     /// authenticated. Format: `<nonce hex><ciphertext hex>.<mac hex>`.
     #[must_use]
     pub fn seal_scan_position(&self, device_id: &str) -> String {
-        let mut nonce = [0u8; 16];
-        rand::rngs::SysRng
-            .try_fill_bytes(&mut nonce)
-            .expect("system RNG must be available");
+        let random = || {
+            rand::rngs::SysRng
+                .try_next_u64()
+                .expect("system RNG must be available")
+        };
+        let nonce: Vec<u8> = [random(), random()]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         let secret = self.inner_read().cursor_secret;
         let ct = position_keystream_xor(&secret, &nonce, device_id.as_bytes());
         let mac = position_mac(&secret, &nonce, &ct);
