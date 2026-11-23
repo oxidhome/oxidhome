@@ -89,6 +89,12 @@ the decision.
   sandbox namespaces: it needs no new accounting, and with it the live-sandbox limit bounds a plugin's stored data
   (at most `script_sandboxes` live namespaces, plus those its parent stopped without removing). Its device-state
   entries stay, `stale`, under the projection's stale cap.
+- The purge waits for any KV or blob operation still running for the sandbox (a stop cancels a guest call blocked
+  past its grace period, but the blocking storage write it started runs on), for up to 5 s. It is announced by a
+  `sandbox_removal` row (migration 21) written before it starts and deleted once it succeeds; while the row exists the
+  `local-id` can't be started again (`unavailable`). A purge that fails, or that a shutdown or crash cuts off, keeps its
+  row and runs again at the next boot, before any plugin; uninstalling the plugin clears the rows with the rest of its
+  storage.
 
 ### Identity
 

@@ -475,35 +475,64 @@ impl AuditLog {
         domain_error: Option<&str>,
         command: Option<(&str, &str)>,
     ) -> Result<(), AuditLogError> {
-        let (command_id, command_outcome) = command.unzip();
         let finalized_ms = self.clock.now_unix_ms();
-        let rows = self.db.write(|conn| -> Result<usize, AuditLogError> {
-            #[allow(clippy::cast_possible_wrap)]
-            let id_i = id as i64;
-            Ok(conn.execute(
-                "UPDATE audit_event \
-                 SET finalized_ms = ?1, status = ?2, decision = ?3, required_scope = ?4, \
-                     execution_outcome = ?5, domain_error = ?6, \
-                     command_id = COALESCE(?8, command_id), \
-                     command_outcome = COALESCE(?9, command_outcome) \
-                 WHERE id = ?7",
-                params![
-                    finalized_ms,
-                    i64::from(status),
-                    decision,
-                    required_scope,
-                    execution_outcome,
-                    scrub_opt(domain_error),
-                    id_i,
-                    command_id,
-                    command_outcome,
-                ],
-            )?)
+        let rows = self.db.write(|conn| {
+            Self::finalize_row(
+                conn,
+                finalized_ms,
+                id,
+                status,
+                decision,
+                required_scope,
+                execution_outcome,
+                domain_error,
+                command,
+            )
         })?;
         if rows == 0 {
             return Err(AuditLogError::NotFound(id));
         }
         Ok(())
+    }
+
+    /// The UPDATE behind [`Self::finalize_with_command`], on a
+    /// connection (or transaction) the caller already holds, stamped
+    /// `finalized_ms`. Returns the rows changed (0 when `id` is gone).
+    /// The H5 command journal uses it for the hop rows it finalizes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_row(
+        conn: &rusqlite::Connection,
+        finalized_ms: i64,
+        id: u64,
+        status: u16,
+        decision: &str,
+        required_scope: Option<&str>,
+        execution_outcome: Option<&str>,
+        domain_error: Option<&str>,
+        command: Option<(&str, &str)>,
+    ) -> Result<usize, AuditLogError> {
+        let (command_id, command_outcome) = command.unzip();
+        #[allow(clippy::cast_possible_wrap)]
+        let id_i = id as i64;
+        Ok(conn.execute(
+            "UPDATE audit_event \
+             SET finalized_ms = ?1, status = ?2, decision = ?3, required_scope = ?4, \
+                 execution_outcome = ?5, domain_error = ?6, \
+                 command_id = COALESCE(?8, command_id), \
+                 command_outcome = COALESCE(?9, command_outcome) \
+             WHERE id = ?7",
+            params![
+                finalized_ms,
+                i64::from(status),
+                decision,
+                required_scope,
+                execution_outcome,
+                scrub_opt(domain_error),
+                id_i,
+                command_id,
+                command_outcome,
+            ],
+        )?)
     }
 
     /// Single-shot write for outcomes known at insert time — the

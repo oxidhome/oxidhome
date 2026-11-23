@@ -21,7 +21,7 @@
 //!   effective capabilities; `[capabilities] script_sandboxes` bounds
 //!   how many one parent may run.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,7 @@ use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
 use super::instance::{ComponentCache, LoadMode};
 use super::lifecycle::{InstanceHandle, InstanceState, SupervisorTuning};
 use super::registry::RegistryError;
+use super::sandbox_purge::Removal;
 use super::state::PluginState;
 
 /// Separator between the parent instance id and the script's
@@ -182,9 +183,60 @@ impl Entry {
 pub struct SandboxRegistry {
     inner: Mutex<HashMap<String, BTreeMap<String, Entry>>>,
     generation: AtomicU64,
+    /// Removed sandboxes whose storage purge hasn't succeeded; their
+    /// instance ids can't be started again (see `sandbox_purge`).
+    /// Locked after `inner` when both are held.
+    removals: Mutex<HashSet<Removal>>,
 }
 
 impl SandboxRegistry {
+    /// A registry whose `removals` ids are blocked until their purge
+    /// succeeds.
+    pub(crate) fn with_pending_removals(removals: HashSet<Removal>) -> Self {
+        Self {
+            removals: Mutex::new(removals),
+            ..Self::default()
+        }
+    }
+
+    fn removals(&self) -> std::sync::MutexGuard<'_, HashSet<Removal>> {
+        self.removals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Block `removal`'s instance id until [`Self::unblock_removal`].
+    pub(crate) fn block_removal(&self, removal: Removal) {
+        self.removals().insert(removal);
+    }
+
+    /// The purge of `removal` succeeded.
+    pub(crate) fn unblock_removal(&self, removal: &Removal) {
+        self.removals().remove(removal);
+    }
+
+    /// An uninstall purged every sandbox of `installation_uuid`.
+    pub(crate) fn forget_removals_of(&self, installation_uuid: &str) {
+        self.removals()
+            .retain(|(uuid, _)| uuid != installation_uuid);
+    }
+
+    fn refuse_while_purging(&self, local_id: &str, instance_id: &str) -> Result<(), WitError> {
+        if self.removal_pending(instance_id) {
+            return Err(WitError::Unavailable(format!(
+                "sandbox `{local_id}` was removed and its storage is still being purged; retry \
+                 later (a failed purge is retried when the host restarts)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether a purge of `instance_id`'s storage is still pending.
+    #[must_use]
+    pub fn removal_pending(&self, instance_id: &str) -> bool {
+        self.removals().iter().any(|(_, id)| id == instance_id)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, BTreeMap<String, Entry>>> {
         self.inner
             .lock()
@@ -317,6 +369,11 @@ impl Engine {
         }
         let registry = self.sandboxes();
         let mut guard = registry.lock();
+        // A removed sandbox's id stays taken until its storage is
+        // purged, so a new one can't inherit the old rows.
+        if !guard.get(parent).is_some_and(|c| c.contains_key(&local_id)) {
+            registry.refuse_while_purging(&local_id, &instance_id)?;
+        }
         let children = guard.entry(parent.to_owned()).or_default();
         if let Some(existing) = children.get(&local_id) {
             return if !existing.is_live() {

@@ -25,6 +25,7 @@ mod network;
 mod plugin_stdio;
 mod registry;
 pub mod sandbox;
+mod sandbox_purge;
 mod schema;
 mod state;
 mod state_read;
@@ -101,6 +102,9 @@ pub struct Engine {
     /// H6 slice 2: rate limits and `warn` audit rows for allowed
     /// sensitive actions, shared by every transport.
     sensitive: Arc<crate::auth::sensitive::SensitiveGuard>,
+    /// ADR-0001: KV / blob operations in flight per instance, which a
+    /// removed sandbox's purge waits out.
+    storage_ops: Arc<sandbox_purge::StorageOps>,
     auth_tokens: Arc<crate::state::TokenStore>,
     installed_plugins: Arc<InstalledPluginRegistry>,
     /// H2 round-2 F1: per-`plugin_id` async mutex used by both API
@@ -454,23 +458,30 @@ impl Engine {
         let sensitive = Arc::new(crate::auth::sensitive::SensitiveGuard::new(Arc::clone(
             &audit_log,
         )));
+        let kv = Arc::new(KvStore::new(Arc::clone(&db)));
+        let blobs = Arc::new(BlobStore::new(Arc::clone(&db), blobs_root));
+        // ADR-0001: finish the sandbox purges a previous process left
+        // unfinished, before any plugin runs; the ones that fail again
+        // keep their ids blocked.
+        let removals = sandbox_purge::resume(&db, &kv, &blobs);
         Ok(Self {
             inner,
             pending_commands,
             sensitive,
+            storage_ops: Arc::default(),
             devices: Arc::new(DeviceRegistry::with_meta(Arc::new(device_meta))),
             device_state,
             events,
-            kv: Arc::new(KvStore::new(Arc::clone(&db))),
+            kv,
             event_log,
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
             audit_log,
             dashboards: Arc::new(crate::state::DashboardStore::new(Arc::clone(&db))),
             auth_tokens: Arc::new(crate::state::TokenStore::new(Arc::clone(&db))),
-            blobs: Arc::new(BlobStore::new(Arc::clone(&db), blobs_root)),
+            blobs,
             services: Arc::new(ServiceRegistry::new()),
             instances: Arc::new(InstanceRegistry::new()),
-            sandboxes: Arc::new(SandboxRegistry::default()),
+            sandboxes: Arc::new(SandboxRegistry::with_pending_removals(removals)),
             db,
             installed_plugins: Arc::new(installed_plugins),
             plugin_lifecycle_locks: Arc::new(std::sync::Mutex::new(
@@ -644,6 +655,11 @@ impl Engine {
         Arc::clone(&self.services)
     }
 
+    /// ADR-0001: the KV / blob operations in flight per instance.
+    pub(crate) fn storage_ops(&self) -> Arc<sandbox_purge::StorageOps> {
+        Arc::clone(&self.storage_ops)
+    }
+
     /// H5: the table of `accepted` device commands awaiting
     /// `complete-command`. Shared with every plugin instance.
     #[must_use]
@@ -775,6 +791,14 @@ impl Engine {
                     "H2 blob purge failed for install {uuid}: {err}"
                 )))
             })?;
+            // ADR-0001: the purges above covered every removed
+            // sandbox's storage too.
+            sandbox_purge::forget_installation(&self.db, uuid).map_err(|err| {
+                crate::state::UninstallError::Io(std::io::Error::other(format!(
+                    "clearing sandbox removal markers for install {uuid} failed: {err}"
+                )))
+            })?;
+            self.sandboxes.forget_removals_of(uuid);
         }
         // Tombstone the registry row last. Ordering matters: a
         // crash between purge success and tombstone leaves the
@@ -1411,8 +1435,13 @@ impl Engine {
     /// under its instance id: its KV and blob storage (purged when the
     /// parent stops it with `stop-sandbox`, rather than counted against
     /// a per-plugin budget), its device-state generation and its
-    /// publish rate limiter. A failed purge is logged; the rows then
-    /// stay until the plugin is uninstalled.
+    /// publish rate limiter.
+    ///
+    /// The id stays blocked for `start-sandbox` until the purge has
+    /// succeeded. The purge first waits out any storage operation a
+    /// cancelled call left running, and is announced by a persisted
+    /// marker, so one that fails or is cut off (shutdown, crash) runs
+    /// again at the next boot.
     async fn retire_sandbox_instance(&self, instance_id: &str, installation_uuid: Option<&str>) {
         self.device_state.forget_instance(instance_id);
         self.events.forget_instance(instance_id);
@@ -1421,26 +1450,50 @@ impl Engine {
         let Some(installation_uuid) = installation_uuid else {
             return;
         };
-        let kv = Arc::clone(&self.kv);
-        let blobs = Arc::clone(&self.blobs);
-        let uuid = installation_uuid.to_owned();
-        let id = instance_id.to_owned();
-        let purged = tokio::task::spawn_blocking(move || {
-            (
-                kv.purge_instance(&uuid, &id),
-                blobs.purge_instance(&uuid, &id),
-            )
-        })
-        .await;
+        let removal = (installation_uuid.to_owned(), instance_id.to_owned());
+        // Before the registry entry goes: a start that finds the entry
+        // gone finds the block.
+        self.sandboxes.block_removal(removal.clone());
+        let db = Arc::clone(&self.db);
+        let (uuid, id) = removal.clone();
+        let marked =
+            tokio::task::spawn_blocking(move || sandbox_purge::mark(&db, &uuid, &id)).await;
+        if !matches!(marked, Ok(Ok(()))) {
+            // Purged below all the same; only a failure there loses
+            // the block at the next boot.
+            tracing::error!(instance_id, result = ?marked, "persisting the sandbox removal marker failed");
+        }
+        if !self
+            .storage_ops
+            .wait_idle(instance_id, sandbox_purge::STORAGE_OP_DRAIN)
+            .await
+        {
+            tracing::error!(
+                instance_id,
+                "a storage operation of a removed script sandbox is still running; its \
+                 purge runs at the next start",
+            );
+            return;
+        }
+        let (db, kv, blobs) = (
+            Arc::clone(&self.db),
+            Arc::clone(&self.kv),
+            Arc::clone(&self.blobs),
+        );
+        let (uuid, id) = removal.clone();
+        let purged =
+            tokio::task::spawn_blocking(move || sandbox_purge::purge(&db, &kv, &blobs, &uuid, &id))
+                .await;
         match purged {
-            Ok((Ok(_), Ok(_))) => {
+            Ok(Ok(())) => {
+                self.sandboxes.unblock_removal(&removal);
                 tracing::info!(instance_id, "removed script sandbox's storage purged");
             }
-            Ok((kv, blobs)) => tracing::error!(
+            Ok(Err(err)) => tracing::error!(
                 instance_id,
-                kv_error = ?kv.err(),
-                blob_error = ?blobs.err(),
-                "purging a removed script sandbox's storage failed; it stays until uninstall",
+                error = %err,
+                "purging a removed script sandbox's storage failed; its id stays blocked \
+                 and the purge runs again at the next start",
             ),
             Err(join) => tracing::error!(instance_id, error = %join, "storage purge task failed"),
         }

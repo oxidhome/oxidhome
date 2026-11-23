@@ -612,3 +612,166 @@ async fn cancelled_service_caller_finalizes_its_hop_row() {
         InstanceState::Failed { .. }
     ));
 }
+
+/// H5: a service call withdrawn while it waits in the callee's queue
+/// never runs, even once the callee gets to it. The `hang` plugin's
+/// `gate` phase holds the callee in `hold` until the test releases it;
+/// a `mark` call queued behind it times out (`unavailable`, it did not
+/// run), and after the release the callee dequeues it, refuses it and
+/// goes on serving: its run counter stays unset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // one linear end-to-end narrative
+async fn a_withdrawn_queued_service_call_never_runs() {
+    let _wasm = support::build_example("hang", "hang.wasm");
+    let dir = support::workspace_root().join("examples").join("hang");
+    let engine = Engine::new().expect("engine");
+    let overrides: toml::Value = toml::from_str("phase = \"gate\"").unwrap();
+    let handle = engine
+        .start_instance_with_tuning(
+            dir,
+            "gate",
+            Some(overrides),
+            LoadMode::Dev,
+            SupervisorTuning {
+                watchdog: Duration::from_secs(30),
+                max_restarts: 0,
+                ..SupervisorTuning::default()
+            },
+        )
+        .await
+        .expect("start");
+    handle.wait_for_running().await.expect("running");
+    let uuid = handle.installation_uuid().expect("loaded").to_owned();
+    let service = engine.services().list()[0].id.clone();
+    let grants = [oxidhome_manifest::ServiceGrant {
+        plugin: "example.hang".into(),
+        instance: "*".into(),
+        service: "spinner".into(),
+        commands: vec!["*".into()],
+        caller_instance: "*".into(),
+    }];
+    let call = |command: &'static str, deadline: Duration| {
+        let engine = engine.clone();
+        let service = service.clone();
+        let root = api_root().with_deadline(Some(tokio::time::Instant::now() + deadline));
+        let grants = grants.clone();
+        tokio::spawn(async move {
+            dispatcher::call_service_from_host_in(
+                &engine,
+                root,
+                "test-driver",
+                &grants,
+                &grants,
+                service,
+                command,
+                Vec::new(),
+            )
+            .await
+        })
+    };
+    let runs = || {
+        engine
+            .kv()
+            .get(&uuid, "gate", "runs")
+            .expect("kv")
+            .map(|v| match v {
+                Value::IntVal(n) => n,
+                other => panic!("runs is {other:?}"),
+            })
+    };
+
+    let hold = call("hold", Duration::from_secs(20));
+    // Let the callee enter `hold`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while engine.services().active_call_count(&service) < 1 {
+        assert!(tokio::time::Instant::now() < deadline, "hold never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let queued = call("mark", Duration::from_millis(300));
+    match queued.await.expect("join") {
+        Err(WitError::Unavailable(message)) => assert!(
+            message.contains("before the callee started it; it did not run"),
+            "{message}"
+        ),
+        other => panic!("expected unavailable, got {other:?}"),
+    }
+
+    // Release `hold`; the callee then dequeues the withdrawn `mark`.
+    engine
+        .kv()
+        .set(&uuid, "gate", "release", Value::BoolVal(true))
+        .expect("release");
+    assert!(matches!(hold.await.expect("join"), Ok(CommandResult::Ok)));
+    // A call queued after it is served, so the withdrawn one was
+    // dequeued (and refused) by now.
+    assert!(matches!(
+        call("hold", Duration::from_secs(10)).await.expect("join"),
+        Ok(CommandResult::Ok)
+    ));
+    assert_eq!(runs(), None, "the withdrawn call ran");
+    assert_eq!(engine.services().active_call_count(&service), 0);
+
+    // The fixture does count a `mark` that runs.
+    assert!(matches!(
+        call("mark", Duration::from_secs(10)).await.expect("join"),
+        Ok(CommandResult::Ok)
+    ));
+    assert_eq!(runs(), Some(1));
+
+    // A result that arrives after the caller stopped waiting (it heard
+    // `unknown`) is audited as a late-result row of the same call.
+    engine
+        .kv()
+        .delete(&uuid, "gate", "release")
+        .expect("re-arm");
+    let root = api_root().with_deadline(Some(
+        tokio::time::Instant::now() + Duration::from_millis(500),
+    ));
+    let call_id = root.call_id().to_owned();
+    let late = dispatcher::call_service_from_host_in(
+        &engine,
+        root,
+        "test-driver",
+        &grants,
+        &grants,
+        service.clone(),
+        "hold",
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        matches!(late, Ok(CommandResult::Unknown(_))),
+        "got {late:?}"
+    );
+    engine
+        .kv()
+        .set(&uuid, "gate", "release", Value::BoolVal(true))
+        .expect("release");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let row = loop {
+        let rows = engine
+            .audit_log()
+            .query(
+                &AuditQuery {
+                    call_id: Some(call_id.clone()),
+                    ..AuditQuery::default()
+                },
+                10,
+            )
+            .expect("audit");
+        if let Some(row) = rows
+            .into_iter()
+            .find(|r| r.method == dispatcher::SERVICE_CALL_RESULT_AUDIT_METHOD)
+        {
+            break row;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no late-result row");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(row.command_outcome.as_deref(), Some("completed"));
+    assert_eq!(row.execution_outcome.as_deref(), Some("success"));
+    assert_eq!(row.path, "service.call/example.hang/gate/spinner/hold");
+
+    handle.stop().await.expect("stop");
+}

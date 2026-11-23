@@ -45,7 +45,8 @@ use crate::host_impl::plugin::oxidhome::plugin::types::{
 use crate::state::CallGuard;
 
 use super::command::{
-    AbandonOnDrop, CommandOutcome, CommandReport, DispatchTicket, PendingCommands, mint_command_id,
+    CommandOutcome, CommandReport, DispatchTicket, PendingCommands, ReplyGuard, UnreadReply,
+    mint_command_id,
 };
 use super::instance::{ComponentCache, InitError, PluginInstance, SupervisedLoad};
 use super::sandbox::{SandboxLauncher, SandboxRole, SandboxScript};
@@ -266,7 +267,7 @@ impl SharedCallGuard {
 
 /// Releases the [`SharedCallGuard`] of a service call that never
 /// started once its caller stops waiting. Declared before the
-/// call's [`AbandonOnDrop`] so it drops after the ticket is settled.
+/// call's [`ReplyGuard`] so it drops after the ticket is settled.
 struct ReleaseUnlessStarted {
     ticket: DispatchTicket,
     guard: SharedCallGuard,
@@ -339,6 +340,10 @@ pub struct InstanceHandle {
     reaped: Arc<watch::Sender<bool>>,
     /// ADR-0001: for a script sandbox, the script it runs.
     sandbox: Option<Arc<SandboxScript>>,
+    /// H5: the engine's pending-command table, whose journal records a
+    /// reply this handle's caller dropped without reading (see
+    /// [`ReplyGuard`]). `None` for test handles.
+    pending: Option<Arc<PendingCommands>>,
 }
 
 impl InstanceHandle {
@@ -358,6 +363,7 @@ impl InstanceHandle {
             stop: Arc::new(watch::Sender::new(false)),
             reaped: Arc::new(watch::Sender::new(false)),
             sandbox: None,
+            pending: None,
         }
     }
 
@@ -399,6 +405,7 @@ impl InstanceHandle {
             stop: Arc::new(watch::Sender::new(false)),
             reaped: Arc::new(watch::Sender::new(false)),
             sandbox: None,
+            pending: None,
         }
     }
 
@@ -416,6 +423,21 @@ impl InstanceHandle {
             stop: Arc::new(watch::Sender::new(false)),
             reaped: Arc::new(watch::Sender::new(false)),
             sandbox: None,
+            pending: None,
+        }
+    }
+
+    /// [`Self::with_control_for_test`] whose dropped replies are
+    /// recorded through `pending`'s journal.
+    #[cfg(test)]
+    fn with_pending_for_test(
+        instance_id: &str,
+        control: mpsc::Sender<ControlCommand>,
+        pending: Arc<PendingCommands>,
+    ) -> Self {
+        Self {
+            pending: Some(pending),
+            ..Self::with_control_for_test(instance_id, control)
         }
     }
 
@@ -434,6 +456,7 @@ impl InstanceHandle {
             stop: Arc::new(watch::Sender::new(false)),
             reaped: Arc::new(watch::Sender::new(false)),
             sandbox: None,
+            pending: None,
         }
     }
 
@@ -618,11 +641,11 @@ impl InstanceHandle {
         admitted: SensitiveSet,
     ) -> CommandOutcome {
         let ticket = DispatchTicket::default();
-        // Declared before `_withdraw` so a dropped caller withdraws the
-        // ticket before its reply channel closes: the supervisor can't
-        // claim the command for a receiver that is already gone.
-        let (reply, mut rx) = oneshot::channel();
-        let _withdraw = AbandonOnDrop(ticket.clone());
+        let (reply, rx) = oneshot::channel();
+        // Dropping the caller withdraws a still-queued command and
+        // records a reply it never read.
+        let unread = self.unread_command_reply(&ctx, &cmd.id, &device);
+        let mut rx = ReplyGuard::new(rx, ticket.clone(), unread);
         let deadline = ctx.deadline();
         let call_id = ctx.call_id().to_owned();
         let timed_out = || CommandOutcome::TimedOut {
@@ -657,7 +680,7 @@ impl InstanceHandle {
             };
         }
         let received = if let Some(d) = deadline {
-            let Ok(received) = tokio::time::timeout_at(d, &mut rx).await else {
+            let Ok(received) = tokio::time::timeout_at(d, &mut *rx).await else {
                 if ticket.try_withdraw() {
                     return timed_out();
                 }
@@ -676,7 +699,7 @@ impl InstanceHandle {
             };
             received
         } else {
-            (&mut rx).await
+            (&mut *rx).await
         };
         received.unwrap_or_else(|_| {
             if ticket.started() {
@@ -695,6 +718,61 @@ impl InstanceHandle {
                 }
             }
         })
+    }
+
+    /// What records a device-command reply the caller dropped without
+    /// reading: its `COMMAND` row, as the supervisor writes one for a
+    /// reply it couldn't send. A late `accepted` is skipped: the
+    /// pending entry records the terminal outcome.
+    fn unread_command_reply(
+        &self,
+        ctx: &InvocationContext,
+        command_id: &str,
+        device: &DeviceId,
+    ) -> Option<UnreadReply<CommandOutcome>> {
+        let pending = Arc::clone(self.pending.as_ref()?);
+        if !ctx.root().is_external() {
+            return None;
+        }
+        let ctx = ctx.clone();
+        let command_id = command_id.to_owned();
+        let device = device.clone();
+        let instance_id = Arc::clone(&self.instance_id);
+        Some(Box::new(move |outcome, ticket| {
+            if matches!(outcome, CommandOutcome::Accepted) {
+                return;
+            }
+            // As the supervisor records it: a result under the
+            // executing instance, a refusal under the caller's context.
+            let ctx = if ticket.started() {
+                ctx.entering(&instance_id)
+            } else {
+                ctx
+            };
+            pending.record_resolution(&ctx, &command_id, &device, &outcome);
+        }))
+    }
+
+    /// What records a service-call result the caller dropped without
+    /// reading: a late-result row, as the supervisor writes one for a
+    /// result it couldn't send. A refusal (the call never ran) needs
+    /// none; the hop row says so.
+    fn unread_service_reply(
+        &self,
+        ctx: &InvocationContext,
+        command: &str,
+    ) -> Option<UnreadReply<anyhow::Result<CommandResult>>> {
+        let pending = Arc::clone(self.pending.as_ref()?);
+        if !ctx.root().is_external() {
+            return None;
+        }
+        let ctx = ctx.clone();
+        let command = command.to_owned();
+        Some(Box::new(move |reply, _| {
+            if let Ok(result) = reply {
+                record_late_service_result(&pending, &ctx, &command, &result);
+            }
+        }))
     }
 
     /// Run the plugin's `execute-service-command` on `service`. Used
@@ -733,16 +811,16 @@ impl InstanceHandle {
         wait_until: Instant,
     ) -> ServiceCallOutcome {
         let guard = SharedCallGuard::new(guard);
-        // Drop order: `_withdraw` settles the ticket, then `_release`
-        // frees the guard of a call that will never start, then the
-        // reply channel closes (so the supervisor can't claim the call
-        // for a receiver that is already gone).
-        let (reply, mut rx) = oneshot::channel();
+        let unread = self.unread_service_reply(&ctx, &command);
+        // Drop order: `rx` settles the ticket (and records a result
+        // nobody read), then `_release` frees the guard of a call that
+        // will never start.
+        let (reply, rx) = oneshot::channel();
         let _release = ReleaseUnlessStarted {
             ticket: ticket.clone(),
             guard: guard.clone(),
         };
-        let _withdraw = AbandonOnDrop(ticket.clone());
+        let mut rx = ReplyGuard::new(rx, ticket.clone(), unread);
         // If the send fails (control channel closed), `_release` drops
         // the `CallGuard` → refcount decrements cleanly even on the
         // supervisor-gone path.
@@ -766,7 +844,7 @@ impl InstanceHandle {
             // Never enqueued.
             Err(_) => return ServiceCallOutcome::TimedOut,
         }
-        let Ok(received) = tokio::time::timeout_at(wait_until, &mut rx).await else {
+        let Ok(received) = tokio::time::timeout_at(wait_until, &mut *rx).await else {
             if ticket.try_withdraw() {
                 return ServiceCallOutcome::TimedOut;
             }
@@ -1131,6 +1209,7 @@ pub(crate) fn spawn_supervisor(
         stop: Arc::new(stop_tx),
         reaped: Arc::new(watch::Sender::new(false)),
         sandbox: child_script,
+        pending: Some(engine.pending_commands()),
     };
     tokio::spawn(run_supervisor(
         engine,
@@ -1678,7 +1757,7 @@ async fn run_one_lifecycle(
         return shutdown_before_serving(instance, state_tx, instance_id).await;
     }
     // Deliver anything the plugin's subscriptions buffered during init.
-    match guest_call(stop, instance.drain_events()).await {
+    match drain_events(&mut instance, stop).await {
         None => return stop_after_cancel(instance, instance_id),
         Some(Ok(_)) => {}
         Some(Err(e)) => {
@@ -1792,6 +1871,21 @@ enum Wakeup {
     Event,
 }
 
+/// Deliver the plugin's pending events as a [`guest_call`]. A stop
+/// requested meanwhile ends the drain before the next delivery, not
+/// only before the next drain.
+async fn drain_events(
+    instance: &mut PluginInstance,
+    stop: &mut watch::Receiver<bool>,
+) -> Option<anyhow::Result<usize>> {
+    let stop_flag = stop.clone();
+    guest_call(
+        stop,
+        instance.drain_events_until(|| stop_is_requested(&stop_flag)),
+    )
+    .await
+}
+
 /// The steady-state `select!` loop — see the module docs.
 async fn serve_loop(
     instance: &mut PluginInstance,
@@ -1843,7 +1937,7 @@ async fn serve_loop(
             // A stop requested meanwhile goes straight to shutdown,
             // without entering new event handlers.
             Ok(LoopAction::Continue) if stop_is_requested(stop) => {}
-            Ok(LoopAction::Continue) => match guest_call(stop, instance.drain_events()).await {
+            Ok(LoopAction::Continue) => match drain_events(instance, stop).await {
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),
                 None => return ServeOutcome::Cancelled,
@@ -1973,20 +2067,17 @@ fn refuse_unserved(ctrl: ControlCommand, instance_id: &str, why: &str, pending: 
 }
 
 /// Reply with the refusal of a command that never ran, and record it
-/// as its `COMMAND` row when nobody will read the reply: the caller was
-/// dropped (even if the send landed before its receiver closed), or
-/// the send failed. A caller that withdrew at its own deadline reported
-/// `timed_out` itself.
+/// as its `COMMAND` row when the send fails: the caller is gone and
+/// never reads it. A refusal the send delivered but the caller then
+/// dropped unread is recorded by the caller's [`ReplyGuard`]; a caller
+/// that withdrew at its own deadline reported `timed_out` itself.
 fn record_refusal(
     ticket: &DispatchTicket,
     reply: oneshot::Sender<CommandOutcome>,
     refused: CommandOutcome,
     record: impl FnOnce(&CommandOutcome),
 ) {
-    if ticket.disconnected() {
-        record(&refused);
-        let _ = reply.send(refused);
-    } else if let Err(outcome) = reply.send(refused)
+    if let Err(outcome) = reply.send(refused)
         && !ticket.withdrawn_by_caller()
     {
         record(&outcome);
@@ -2019,6 +2110,49 @@ fn dispatch_refusal(
             decision.obligations.sensitive.to_csv()
         )
     })
+}
+
+/// Reply with the outcome of a command the plugin was entered for, and
+/// record it as a late `COMMAND` row when the send fails: the caller
+/// stopped waiting (deadline or disconnect) and reported
+/// `outcome_unknown`, or nothing. A late `accepted` is skipped: the
+/// pending entry records the terminal outcome.
+fn reply_command_outcome(
+    reply: oneshot::Sender<CommandOutcome>,
+    outcome: CommandOutcome,
+    record: impl FnOnce(&CommandOutcome),
+) {
+    if let Err(outcome) = reply.send(outcome)
+        && !matches!(outcome, CommandOutcome::Accepted)
+    {
+        record(&outcome);
+    }
+}
+
+/// Reply with the result of a service call the callee was entered
+/// for, and record it as a late-result row when the send fails: the
+/// caller stopped waiting and its hop row says `unknown`.
+fn reply_service_result(
+    reply: oneshot::Sender<anyhow::Result<CommandResult>>,
+    result: CommandResult,
+    record: impl FnOnce(&CommandResult),
+) {
+    if let Err(Ok(result)) = reply.send(Ok(result)) {
+        record(&result);
+    }
+}
+
+/// Queue the late-result row of a service call whose caller never read
+/// the result (externally-rooted invocations only).
+fn record_late_service_result(
+    pending: &PendingCommands,
+    ctx: &InvocationContext,
+    command: &str,
+    result: &CommandResult,
+) {
+    if let Some(entry) = super::dispatcher::late_result_entry(ctx, command, result) {
+        pending.record_entry(entry);
+    }
 }
 
 /// `ControlCommand::Execute`: run one device command and reply with
@@ -2145,18 +2279,11 @@ async fn run_execute(
             )
         }
     };
-    if let Err(outcome) = reply.send(outcome)
-        && !matches!(outcome, CommandOutcome::Accepted)
-    {
-        // The caller stopped waiting (deadline or disconnect)
-        // after the plugin was entered and reported
-        // `outcome_unknown`; record how the command really
-        // ended. A late `accepted` is skipped: the pending entry
-        // records the terminal outcome.
+    reply_command_outcome(reply, outcome, |outcome| {
         if let Some(pending) = instance.pending_commands() {
-            pending.record_resolution(&entered_ctx, &command_id, &device_id, &outcome);
+            pending.record_resolution(&entered_ctx, &command_id, &device_id, outcome);
         }
-    }
+    });
     match (result_cancelled, trap) {
         (true, _) => Ok(LoopAction::Cancelled),
         (false, None) => Ok(LoopAction::Continue),
@@ -2245,6 +2372,15 @@ async fn handle_control(
             }
             // Started: the caller no longer releases it.
             let guard = guard.take();
+            // For a late-result row, should the caller stop waiting.
+            let late_ctx = ctx.clone();
+            let late_command = command.clone();
+            let pending = instance.pending_commands();
+            let record = |result: &CommandResult| {
+                if let Some(pending) = &pending {
+                    record_late_service_result(pending, &late_ctx, &late_command, result);
+                }
+            };
             let outcome = guest_call(
                 stop,
                 invocation::CURRENT.scope(
@@ -2258,21 +2394,21 @@ async fn handle_control(
                 // A stop cancelled the call after the callee was
                 // entered (H5: it may have acted).
                 None => {
-                    let _ = reply.send(Ok(CommandResult::Unknown(format!(
-                        "instance `{instance_id}` was stopped during execute-service-command; \
-                         the call may have taken effect",
-                    ))));
+                    reply_service_result(
+                        reply,
+                        CommandResult::Unknown(format!(
+                            "instance `{instance_id}` was stopped during \
+                             execute-service-command; the call may have taken effect",
+                        )),
+                        record,
+                    );
                     Ok(LoopAction::Cancelled)
                 }
+                // A result the caller no longer waits for (its wait
+                // ended mid-call and its hop row says `unknown`) is
+                // recorded as a late-result row.
                 Some(Ok(result)) => {
-                    if reply.send(Ok(result)).is_err() {
-                        // The caller's wait ended mid-call and it
-                        // reported `unknown`; its hop row says so.
-                        tracing::debug!(
-                            instance_id = %instance_id,
-                            "execute-service-command finished after the caller stopped waiting",
-                        );
-                    }
+                    reply_service_result(reply, result, record);
                     Ok(LoopAction::Continue)
                 }
                 // H5: the callee was entered, so whatever it did may
@@ -2286,10 +2422,14 @@ async fn handle_control(
                         error = %format!("{trap:#}"),
                         "execute-service-command trapped; call outcome unknown",
                     );
-                    let _ = reply.send(Ok(CommandResult::Unknown(format!(
-                        "instance `{instance_id}` crashed during execute-service-command; \
-                         the call may have taken effect",
-                    ))));
+                    reply_service_result(
+                        reply,
+                        CommandResult::Unknown(format!(
+                            "instance `{instance_id}` crashed during execute-service-command; \
+                             the call may have taken effect",
+                        )),
+                        record,
+                    );
                     Err(trap)
                 }
             }
@@ -2358,44 +2498,291 @@ mod tests {
         assert_eq!(dispatch_refusal(&host, &lock, none), None);
     }
 
-    /// A refusal racing a dropped caller: the ticket says the caller
-    /// is gone but its receiver is still open, so the send succeeds.
-    /// The refusal is still recorded, exactly once.
-    #[tokio::test]
-    async fn refusal_of_a_disconnected_caller_is_recorded_even_if_the_send_lands() {
-        use crate::state::{AuditLog, AuditQuery, Db};
+    /// The journal-backed table and ledger the ordering tests read.
+    fn journaled() -> (Arc<crate::state::AuditLog>, Arc<PendingCommands>) {
+        use crate::state::{AuditLog, Db};
         let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
-        let pending = PendingCommands::new(Some(Arc::clone(&audit))).unwrap();
-        let ticket = DispatchTicket::default();
-        let (reply, _rx) = oneshot::channel();
-        assert!(ticket.try_disconnect());
-        refuse_unserved(
-            ControlCommand::Execute {
-                ctx: api_ctx(),
-                device: "dev-1".into(),
-                cmd: Command {
-                    id: "cmd-race".into(),
+        let pending = Arc::new(PendingCommands::new(Some(Arc::clone(&audit))).unwrap());
+        (audit, pending)
+    }
+
+    /// The rows with `method`, once the journal drained.
+    fn rows_of(
+        audit: &crate::state::AuditLog,
+        pending: &PendingCommands,
+        method: &str,
+    ) -> Vec<crate::state::AuditEntry> {
+        assert!(pending.flush_journal(Duration::from_secs(5)));
+        audit
+            .query(&crate::state::AuditQuery::default(), 100)
+            .expect("query")
+            .into_iter()
+            .filter(|r| r.method == method)
+            .collect()
+    }
+
+    /// Poll `fut` once.
+    async fn poll_once<F: std::future::Future + Unpin>(fut: &mut F) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *fut).poll(cx)))
+            .await
+    }
+
+    /// One step of a supervisor or a caller, in the order a test plays
+    /// them.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// `refuse_unserved`: decide and send the refusal.
+        Refuse,
+        /// The refusal decision (`try_refuse`) alone.
+        DecideRefusal,
+        /// Send the refusal decided by `DecideRefusal`.
+        SendRefusal,
+        /// Enter the plugin (`try_start`).
+        Start,
+        /// Send the started command's result.
+        SendResult,
+        /// Drop the waiting caller without reading the reply.
+        DropCaller,
+        /// Let the caller read its reply.
+        ReadReply,
+    }
+
+    /// Play `steps` for one device command and return its `COMMAND`
+    /// rows and whatever the caller read.
+    async fn play_command(
+        steps: &[Step],
+    ) -> (Vec<crate::state::AuditEntry>, Option<CommandReport>) {
+        let (audit, pending) = journaled();
+        let (control, mut rx) = mpsc::channel(4);
+        let handle = InstanceHandle::with_pending_for_test("inst-a", control, Arc::clone(&pending));
+        let mut caller = Some(Box::pin(handle.execute_command_in(
+            api_ctx(),
+            "dev-1".into(),
+            Command {
+                id: String::new(),
+                capability: "switch".into(),
+                action: "toggle".into(),
+                args: Vec::new(),
+            },
+        )));
+        assert!(
+            poll_once(caller.as_mut().unwrap()).await.is_pending(),
+            "queued"
+        );
+        let mut ctrl = rx.try_recv().ok();
+        let mut decided: Option<(ControlCommand, CommandOutcome)> = None;
+        let mut read = None;
+        for step in steps {
+            match step {
+                Step::Refuse => {
+                    refuse_unserved(ctrl.take().unwrap(), "inst-a", "is stopping", &pending);
+                }
+                Step::DecideRefusal => {
+                    let Some(ControlCommand::Execute { ticket, .. }) = &ctrl else {
+                        panic!("no command")
+                    };
+                    let caller_gone = ticket.try_refuse().expect("never started");
+                    let refused = if caller_gone {
+                        CommandOutcome::TimedOut {
+                            message: "gone".into(),
+                        }
+                    } else {
+                        CommandOutcome::Rejected {
+                            error: WitError::Unavailable("refused".into()),
+                        }
+                    };
+                    decided = Some((ctrl.take().unwrap(), refused));
+                }
+                Step::SendRefusal => {
+                    let (
+                        ControlCommand::Execute {
+                            ctx,
+                            device,
+                            cmd,
+                            ticket,
+                            reply,
+                            ..
+                        },
+                        refused,
+                    ) = decided.take().unwrap()
+                    else {
+                        panic!("no command")
+                    };
+                    record_refusal(&ticket, reply, refused, |outcome| {
+                        pending.record_resolution(&ctx, &cmd.id, &device, outcome);
+                    });
+                }
+                Step::Start => {
+                    let Some(ControlCommand::Execute { ticket, .. }) = &ctrl else {
+                        panic!("no command")
+                    };
+                    assert!(ticket.try_start());
+                }
+                Step::SendResult => {
+                    let Some(ControlCommand::Execute {
+                        ctx,
+                        device,
+                        cmd,
+                        reply,
+                        ..
+                    }) = ctrl.take()
+                    else {
+                        panic!("no command")
+                    };
+                    let ctx = ctx.entering("inst-a");
+                    reply_command_outcome(
+                        reply,
+                        CommandOutcome::Completed { state: None },
+                        |outcome| pending.record_resolution(&ctx, &cmd.id, &device, outcome),
+                    );
+                }
+                Step::DropCaller => drop(caller.take()),
+                Step::ReadReply => read = Some(caller.take().unwrap().await),
+            }
+        }
+        (rows_of(&audit, &pending, "COMMAND"), read)
+    }
+
+    /// H5 reply guard: a reply nobody reads is recorded exactly once,
+    /// in every order of the supervisor's send and the caller's drop.
+    #[tokio::test]
+    async fn an_unread_command_reply_is_recorded_exactly_once_in_every_order() {
+        use Step::{DecideRefusal, DropCaller, ReadReply, Refuse, SendRefusal, SendResult, Start};
+        let cases: &[(&[Step], Option<&str>)] = &[
+            // Refused while the caller waits; dropped before reading.
+            (&[Refuse, DropCaller], Some("rejected")),
+            // Dropped first; the refusal's send fails.
+            (&[DropCaller, Refuse], Some("timed_out")),
+            // Refusal decided, caller dropped, then the send fails.
+            (&[DecideRefusal, DropCaller, SendRefusal], Some("rejected")),
+            // Late result sent, then the caller dropped unread.
+            (&[Start, SendResult, DropCaller], Some("completed")),
+            // Caller dropped mid-call; the result's send fails.
+            (&[Start, DropCaller, SendResult], Some("completed")),
+            // A reply the caller read is its own row, not a `COMMAND`.
+            (&[Refuse, ReadReply], None),
+            (&[Start, SendResult, ReadReply], None),
+        ];
+        for (steps, want) in cases {
+            let (rows, _) = play_command(steps).await;
+            let got: Vec<_> = rows.iter().map(|r| r.command_outcome.as_deref()).collect();
+            match want {
+                Some(want) => assert_eq!(got, [Some(*want)], "{steps:?}"),
+                None => assert!(got.is_empty(), "{steps:?}: {got:?}"),
+            }
+        }
+        // A late result is recorded under the executing instance.
+        let (rows, _) = play_command(&[Start, SendResult, DropCaller]).await;
+        let inv: serde_json::Value =
+            serde_json::from_str(rows[0].invocation.as_deref().unwrap()).unwrap();
+        assert_eq!(inv["current"], "inst-a", "{inv}");
+    }
+
+    /// A caller that withdrew at its own deadline reported `timed_out`
+    /// itself: the refusal that follows writes no `COMMAND` row.
+    #[tokio::test]
+    async fn a_refusal_after_the_callers_deadline_is_not_recorded_again() {
+        let (audit, pending) = journaled();
+        let (control, mut rx) = mpsc::channel(4);
+        let handle = InstanceHandle::with_pending_for_test("inst-a", control, Arc::clone(&pending));
+        let ctx = api_ctx().with_deadline(Some(Instant::now() + Duration::from_millis(20)));
+        let report = handle
+            .execute_command_in(
+                ctx,
+                "dev-1".into(),
+                Command {
+                    id: String::new(),
                     capability: "switch".into(),
                     action: "toggle".into(),
                     args: Vec::new(),
                 },
-                admitted: SensitiveSet::empty(),
-                ticket,
-                reply,
-            },
-            "inst-a",
-            "stopped before running it",
+            )
+            .await;
+        assert_eq!(report.outcome.as_str(), "timed_out");
+        refuse_unserved(rx.try_recv().unwrap(), "inst-a", "is stopping", &pending);
+        assert_eq!(rows_of(&audit, &pending, "COMMAND"), []);
+    }
+
+    /// Play a service call to `inst-a`: the supervisor starts it, and
+    /// the result is sent before or after the caller is dropped.
+    async fn play_service(send_first: bool) -> Vec<crate::state::AuditEntry> {
+        use crate::auth::invocation::DelegationHop;
+        use crate::host_impl::plugin::oxidhome::plugin::services::ServiceInfo;
+        let (audit, pending) = journaled();
+        let services = Arc::new(crate::state::ServiceRegistry::new());
+        let service = services
+            .register(
+                "inst-a".into(),
+                "test.plugin".into(),
+                ServiceInfo {
+                    local_id: "svc".into(),
+                    name: "svc".into(),
+                    metadata: Vec::new(),
+                    commands: Vec::new(),
+                },
+            )
+            .expect("register");
+        let (control, mut rx) = mpsc::channel(4);
+        let handle = InstanceHandle::with_pending_for_test("inst-a", control, Arc::clone(&pending));
+        let ctx = api_ctx().delegate(DelegationHop {
+            caller_instance: "caller".into(),
+            target_plugin: "test.plugin".into(),
+            target_instance: "inst-a".into(),
+            target_service: "svc".into(),
+        });
+        let mut caller = Box::pin(handle.execute_service_command(
+            ctx,
+            services.acquire_call(&service).expect("acquire"),
+            service.clone(),
+            "go".into(),
+            Vec::new(),
+            DispatchTicket::default(),
+            Instant::now() + Duration::from_secs(5),
+        ));
+        assert!(poll_once(&mut caller).await.is_pending(), "queued");
+        let Ok(ControlCommand::ExecuteService {
+            ctx,
+            command,
+            ticket,
+            reply,
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("no call")
+        };
+        assert!(ticket.try_start());
+        let send = |reply| {
+            reply_service_result(reply, CommandResult::Ok, |result| {
+                record_late_service_result(&pending, &ctx, &command, result);
+            });
+        };
+        if send_first {
+            send(reply);
+            drop(caller);
+        } else {
+            drop(caller);
+            send(reply);
+        }
+        rows_of(
+            &audit,
             &pending,
-        );
-        assert!(pending.flush_journal(Duration::from_secs(5)));
-        let rows: Vec<_> = audit
-            .query(&AuditQuery::default(), 10)
-            .expect("query")
-            .into_iter()
-            .filter(|r| r.command_id.as_deref() == Some("cmd-race"))
-            .collect();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0].command_outcome.as_deref(), Some("timed_out"));
+            super::super::dispatcher::SERVICE_CALL_RESULT_AUDIT_METHOD,
+        )
+    }
+
+    /// A service-call result nobody reads gets one late-result row,
+    /// whether it was sent before or after the caller was dropped.
+    #[tokio::test]
+    async fn an_unread_service_result_is_recorded_exactly_once_in_either_order() {
+        for send_first in [true, false] {
+            let rows = play_service(send_first).await;
+            assert_eq!(rows.len(), 1, "send_first={send_first}: {rows:?}");
+            let row = &rows[0];
+            assert_eq!(row.path, "service.call/test.plugin/inst-a/svc/go");
+            assert_eq!(row.execution_outcome.as_deref(), Some("success"));
+            assert_eq!(row.command_outcome.as_deref(), Some("completed"));
+            assert_eq!(row.token_id, "tok-1");
+        }
     }
 
     /// A service call whose supervisor drops the reply: `NotRun` while

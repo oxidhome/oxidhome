@@ -729,6 +729,62 @@ async fn removed_script_storage_is_purged() {
     );
 }
 
+/// A removed sandbox whose storage purge fails keeps its id blocked
+/// (a new script under it would inherit the old rows), and the purge
+/// runs again at the next start, which frees the id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_purge_blocks_the_id_until_a_restart_finishes_it() {
+    let state = support::tempdir("sandbox-purge-retry");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let manager = start_manager(&engine, LoadMode::Dev).await;
+    let svc_a = load(&engine, "a", "save store\n").await;
+    let outcome = call(&engine, svc_a, "save", Vec::new()).await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    let uuid = manager.installation_uuid().expect("loaded").to_owned();
+
+    // The purge of `main~a`'s KV rows fails.
+    let db = rusqlite::Connection::open(state.path().join(oxidhome_core::state::db::DB_FILE_NAME))
+        .expect("open db");
+    db.execute_batch(
+        "CREATE TRIGGER keep_kv BEFORE DELETE ON kv WHEN OLD.instance_id = 'main~a' \
+         BEGIN SELECT RAISE(ABORT, 'purge fails'); END",
+    )
+    .expect("trigger");
+    let scripts = service_of(&engine, MANAGER, "scripts").await;
+    let outcome = call(&engine, scripts.clone(), "unload", vec![string("id", "a")]).await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    wait_gone(&engine, "main~a").await;
+    let kv = engine.kv();
+    assert!(kv.usage(&uuid, "main~a").expect("usage").is_some());
+    assert!(engine.sandboxes().removal_pending("main~a"));
+    // The id stays taken.
+    let reply = call(
+        &engine,
+        scripts,
+        "load",
+        vec![string("id", "a"), string("source", "save store\n")],
+    )
+    .await;
+    assert!(
+        matches!(&reply, Ok(CommandResult::Err(Error::Unavailable(m))) if m.contains("purged"))
+            || matches!(&reply, Err(Error::Unavailable(m)) if m.contains("purged")),
+        "got {reply:?}"
+    );
+    manager.stop().await.expect("stop manager");
+    engine.drain_supervised_instances().await;
+
+    // The next start finishes the purge and frees the id.
+    db.execute_batch("DROP TRIGGER keep_kv")
+        .expect("drop trigger");
+    drop(engine);
+    let engine = Engine::with_state_dir(state.path()).expect("restarted engine");
+    assert_eq!(engine.kv().usage(&uuid, "main~a").expect("usage"), None);
+    assert!(!engine.sandboxes().removal_pending("main~a"));
+    let manager = start_manager(&engine, LoadMode::Dev).await;
+    load(&engine, "a", "pong ok\n").await;
+    manager.stop().await.expect("stop manager");
+}
+
 /// Sandboxes don't nest: `start-sandbox` from inside one is
 /// `permission-denied`.
 #[tokio::test(flavor = "multi_thread")]

@@ -97,6 +97,12 @@
 //! as API requests and fail closed if the intent cannot be written;
 //! grant refusals are single-shot `deny` rows. Host-origin chains
 //! (`init`, `tick`, `on-event`) are traced but not audited.
+//!
+//! The finalize goes through the H5 command journal (it can come from a
+//! `Drop` when the caller is cancelled, and the journal is drained at
+//! shutdown). A result that reaches the callee's supervisor after the
+//! caller stopped waiting (the hop row then says `unknown`) is recorded
+//! as a [`SERVICE_CALL_RESULT_AUDIT_METHOD`] row sharing the `call_id`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,7 +114,8 @@ use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, ServiceId};
 use crate::state::{AuditEntry, AuditLog, ServiceRegistry};
 
-use super::command::DispatchTicket;
+use super::command::{DispatchTicket, PendingCommands};
+use super::command_journal::Finalize;
 use super::lifecycle::ServiceCallOutcome;
 use super::registry::InstanceRegistry;
 
@@ -137,6 +144,12 @@ pub(crate) const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Audit `method` for a delegated `call-service` hop.
 pub const SERVICE_CALL_AUDIT_METHOD: &str = "CALL";
 
+/// Audit `method` of the row that records a service call's result when
+/// it arrived after the caller stopped waiting (its hop row says
+/// `unknown`). Same `path` and `call_id` as the hop row; the result is
+/// in `execution_outcome`, `domain_error` and `command_outcome`.
+pub const SERVICE_CALL_RESULT_AUDIT_METHOD: &str = "CALL_RESULT";
+
 /// Public test-only entry point. The `host-services::call-service`
 /// path runs from inside a wasm `execute-service-command`; an
 /// integration test that wants to drive the dispatcher from the
@@ -159,10 +172,12 @@ pub async fn call_service_from_host(
     let services = engine.services();
     let instances = engine.instances();
     let audit = engine.audit_log();
+    let pending = engine.pending_commands();
     call_service(
         &services,
         &instances,
         Some(&audit),
+        Some(&pending),
         caller_instance.into(),
         caller_requested_grants,
         caller_granted_grants,
@@ -226,12 +241,15 @@ pub async fn call_service_from_host_in(
 /// instance's supervisor via `instances`.
 ///
 /// `audit` receives one row per hop of an externally-rooted invocation
-/// (H6); `None` disables hop auditing (unit tests only).
+/// (H6); `None` disables hop auditing (unit tests only). `journal` (the
+/// engine's pending-command table) finalizes the hop rows; without one
+/// the finalize is a detached blocking write.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn call_service(
     services: &Arc<ServiceRegistry>,
     instances: &Arc<InstanceRegistry>,
     audit: Option<&Arc<AuditLog>>,
+    journal: Option<&Arc<PendingCommands>>,
     caller_instance: String,
     caller_requested_grants: &[ServiceGrant],
     caller_granted_grants: &[ServiceGrant],
@@ -301,7 +319,7 @@ pub(crate) async fn call_service(
     });
     let hop_audit = audit
         .filter(|_| callee_ctx.root().is_external())
-        .map(|log| HopAudit::new(Arc::clone(log), &callee_ctx, &command));
+        .map(|log| HopAudit::new(Arc::clone(log), journal.cloned(), &callee_ctx, &command));
 
     // H6: refuse work the root has already given up on — before the
     // grant gate, so an expired invocation can't queue deny-row
@@ -553,30 +571,95 @@ impl Drop for HopFinalizer {
     }
 }
 
+/// `path` of a hop's audit rows: `service.call/<plugin>/<instance>/
+/// <service>/<command>`, from the callee context's last hop. Every
+/// segment is capped: command names come from wasm and service
+/// `local-id`s from `register-service`, neither otherwise
+/// length-bounded.
+fn hop_path(callee_ctx: &InvocationContext, command: &str) -> Option<String> {
+    let hop = callee_ctx.chain().last()?;
+    Some(format!(
+        "service.call/{}/{}/{}/{}",
+        invocation::audit_cap(&hop.target_plugin),
+        invocation::audit_cap(&hop.target_instance),
+        invocation::audit_cap(&hop.target_service),
+        invocation::audit_cap(command),
+    ))
+}
+
+/// The [`SERVICE_CALL_RESULT_AUDIT_METHOD`] row for a service call's
+/// `result` that reached the callee's supervisor after the caller
+/// stopped waiting. `None` for host-origin invocations, which stay out
+/// of the ledger as their hops do.
+pub(crate) fn late_result_entry(
+    callee_ctx: &InvocationContext,
+    command: &str,
+    result: &CommandResult,
+) -> Option<AuditEntry> {
+    let root = callee_ctx.root();
+    if !root.is_external() {
+        return None;
+    }
+    let path = hop_path(callee_ctx, command)?;
+    let (execution_outcome, domain_error) = result_columns(result);
+    // The H5 outcome names, as on `COMMAND` rows.
+    let outcome = match result {
+        CommandResult::Ok | CommandResult::OkWithState(_) => "completed",
+        CommandResult::Err(_) => "rejected",
+        CommandResult::Unknown(_) | CommandResult::Accepted => "outcome_unknown",
+    };
+    Some(AuditEntry {
+        id: 0,
+        intent_ms: 0,
+        finalized_ms: None,
+        token_id: root.audit_token_id().to_owned(),
+        actor_kind: root.kind().as_str().to_owned(),
+        method: SERVICE_CALL_RESULT_AUDIT_METHOD.to_owned(),
+        path,
+        status: 200,
+        decision: "allow".into(),
+        required_scope: None,
+        execution_outcome: execution_outcome.map(str::to_owned),
+        domain_error: domain_error.map(str::to_owned),
+        credential_fp: None,
+        call_id: Some(callee_ctx.call_id().to_owned()),
+        invocation: Some(callee_ctx.audit_json()),
+        command_id: None,
+        level: None,
+        command_outcome: Some(outcome.to_owned()),
+    })
+}
+
+/// `execution_outcome` / `domain_error` of a callee's reply.
+fn result_columns(result: &CommandResult) -> (Option<&'static str>, Option<&'static str>) {
+    match result {
+        CommandResult::Ok | CommandResult::OkWithState(_) => (Some("success"), None),
+        CommandResult::Err(err) => (Some("failed"), Some(crate::api::wit_error_kind(err))),
+        // H5: the callee may have acted; neither success nor a
+        // refusal. (`accepted` never reaches here — the callee's
+        // instance turns it into `unknown`.)
+        CommandResult::Unknown(_) | CommandResult::Accepted => (None, None),
+    }
+}
+
 /// Audit writer for one delegated hop (H6). Built only for
 /// externally-rooted invocations.
 struct HopAudit {
     log: Arc<AuditLog>,
+    /// Finalizes the row (see the module docs); `None` in unit tests.
+    journal: Option<Arc<PendingCommands>>,
     entry: AuditEntry,
 }
 
 impl HopAudit {
-    fn new(log: Arc<AuditLog>, callee_ctx: &InvocationContext, command: &str) -> Self {
+    fn new(
+        log: Arc<AuditLog>,
+        journal: Option<Arc<PendingCommands>>,
+        callee_ctx: &InvocationContext,
+        command: &str,
+    ) -> Self {
         let root = callee_ctx.root();
-        let hop = callee_ctx
-            .chain()
-            .last()
-            .expect("delegate() always appends a hop");
-        // Every segment is capped: command names come from wasm and
-        // service `local-id`s from `register-service`, neither
-        // otherwise length-bounded.
-        let path = format!(
-            "service.call/{}/{}/{}/{}",
-            invocation::audit_cap(&hop.target_plugin),
-            invocation::audit_cap(&hop.target_instance),
-            invocation::audit_cap(&hop.target_service),
-            invocation::audit_cap(command),
-        );
+        let path = hop_path(callee_ctx, command).expect("delegate() always appends a hop");
         let entry = AuditEntry {
             id: 0,
             intent_ms: 0,
@@ -598,7 +681,11 @@ impl HopAudit {
 
             level: None,
         };
-        Self { log, entry }
+        Self {
+            log,
+            journal,
+            entry,
+        }
     }
 
     /// Single-shot `deny` row. Awaited (up to `wait_until`) rather than
@@ -607,7 +694,7 @@ impl HopAudit {
     /// writes without bound. The refusal itself never depends on the
     /// write.
     async fn record_denied(self, wait_until: tokio::time::Instant) {
-        let Self { log, mut entry } = self;
+        let Self { log, mut entry, .. } = self;
         entry.status = 403;
         entry.decision = "deny".into();
         entry.required_scope = Some("consumes_services".into());
@@ -636,36 +723,42 @@ impl HopAudit {
         }
     }
 
-    /// Best-effort finalize, detached so the caller's supervisor isn't
-    /// held on the ledger after the hop finished (the intent row is
-    /// already the durable evidence).
+    /// Finalize the intent row without holding the caller's supervisor
+    /// on the ledger (the intent row is already the durable evidence):
+    /// queued on the command journal, which a runtime teardown can't
+    /// cancel and shutdown drains. Also reached from
+    /// `HopFinalizer::drop`.
     fn finalize(self, id: u64, outcome: &Result<CommandResult, WitError>) {
-        let (status, decision, execution_outcome, domain_error): (u16, &str, _, _) = match outcome {
-            Ok(CommandResult::Ok | CommandResult::OkWithState(_)) => {
-                (200, "allow", Some("success"), None)
-            }
-            Ok(CommandResult::Err(err)) => (
-                200,
-                "allow",
-                Some("failed"),
-                Some(crate::api::wit_error_kind(err)),
-            ),
-            // H5: the callee may have acted; neither success nor a
-            // refusal. (`accepted` never reaches here — the callee's
-            // instance turns it into `unknown`.)
-            Ok(CommandResult::Unknown(_) | CommandResult::Accepted) => (200, "allow", None, None),
-            Err(_) => (503, "error", None, None),
+        let (status, decision, (execution_outcome, domain_error)) = match outcome {
+            Ok(result) => (200, "allow", result_columns(result)),
+            Err(_) => (503, "error", (None, None)),
         };
+        let finalize = Finalize {
+            id,
+            status,
+            decision,
+            execution_outcome,
+            domain_error,
+        };
+        if let Some(journal) = self.journal.filter(|j| j.has_journal()) {
+            // A closed or full journal leaves the row `pending` (logged).
+            let _ = journal.finalize_audit_row(finalize);
+            return;
+        }
+        // No journal (unit tests): a detached blocking write.
         let log = self.log;
         let write = move || {
-            if let Err(err) =
-                log.finalize(id, status, decision, None, execution_outcome, domain_error)
-            {
+            if let Err(err) = log.finalize(
+                id,
+                finalize.status,
+                finalize.decision,
+                None,
+                finalize.execution_outcome,
+                finalize.domain_error,
+            ) {
                 tracing::error!(target: "host.audit", error = %err, id, "service-call finalize failed");
             }
         };
-        // Also reached from `HopFinalizer::drop`, possibly while the
-        // runtime shuts down: write inline when there is no runtime.
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => drop(rt.spawn_blocking(write)),
             Err(_) => write(),
@@ -762,6 +855,7 @@ mod tests {
             &services,
             &instances,
             None,
+            None,
             "alpha".into(),
             &grants,
             &grants,
@@ -811,6 +905,7 @@ mod tests {
                     &services,
                     &instances,
                     None,
+                    None,
                     "beta".into(),
                     &grants,
                     &grants,
@@ -851,6 +946,7 @@ mod tests {
             &services,
             &instances,
             None,
+            None,
             "alpha".into(),
             &[],
             &[],
@@ -876,6 +972,7 @@ mod tests {
             &services,
             &instances,
             None,
+            None,
             "alpha".into(),
             &wrong_command,
             &wrong_command,
@@ -899,6 +996,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             None,
             "alpha".into(),
             &wrong_instance,
@@ -924,6 +1022,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             None,
             "alpha".into(),
             &wrong_service,
@@ -964,6 +1063,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             None,
             "alpha".into(),
             &grants,
@@ -1006,6 +1106,7 @@ mod tests {
                 call_service(
                     &services,
                     &instances,
+                    None,
                     None,
                     "gamma".into(),
                     &grants,
@@ -1069,6 +1170,7 @@ mod tests {
             &services,
             &instances,
             None,
+            None,
             "alpha".into(),
             &requested_wildcard,
             &granted_get,
@@ -1083,6 +1185,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             None,
             "alpha".into(),
             &requested_wildcard,
@@ -1116,6 +1219,7 @@ mod tests {
         let err = call_service(
             &services,
             &instances,
+            None,
             None,
             "alpha".into(),
             &requested_get_only,
@@ -1162,6 +1266,7 @@ mod tests {
                     &services,
                     &instances,
                     None,
+                    None,
                     "alpha".into(),
                     &grants,
                     &grants,
@@ -1200,6 +1305,7 @@ mod tests {
             &services,
             &instances,
             Some(&audit),
+            None,
             "alpha".into(),
             &[],
             &[],
@@ -1223,6 +1329,7 @@ mod tests {
                     &services,
                     &instances,
                     Some(&audit),
+                    None,
                     "alpha".into(),
                     &[],
                     &[],

@@ -30,6 +30,15 @@
 //! the persists admitted under it, so the queue stays below about twice
 //! the bound.
 //!
+//! It also **finalizes** two-phase audit rows whose intent was written
+//! synchronously but whose outcome can arrive from a `Drop` (the H6
+//! `call-service` hop row of a cancelled caller): queued like the rest,
+//! so the write can't be lost to a blocking task cancelled with the
+//! runtime, and drained by the shutdown close. Each one belongs to a
+//! hop whose intent row was written first, so they are bounded by the
+//! hops in flight; past twice [`MAX_JOURNAL_QUEUE`] one is dropped and
+//! its row stays `pending`, as after a crash.
+//!
 //! At boot, `reconcile` resolves every surviving row to
 //! `outcome_unknown` (`domain_error` = `daemon_restart`, or `expired`
 //! when its expiry had already passed) before any plugin runs.
@@ -86,6 +95,18 @@ enum Job {
         /// The persisted row to delete with it.
         forget: Option<String>,
     },
+    Finalize(Finalize),
+}
+
+/// Phase 2 of a two-phase audit row (an H6 hop): its outcome, stamped
+/// onto the intent row `id` (see [`AuditLog::finalize`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Finalize {
+    pub(crate) id: u64,
+    pub(crate) status: u16,
+    pub(crate) decision: &'static str,
+    pub(crate) execution_outcome: Option<&'static str>,
+    pub(crate) domain_error: Option<&'static str>,
 }
 
 /// How long a batch that fails while closing is retried.
@@ -201,6 +222,27 @@ impl CommandJournal {
         self.shared.work.notify_one();
     }
 
+    /// Queue the outcome of a two-phase audit row. `false` when the
+    /// journal is closed or holds twice [`MAX_JOURNAL_QUEUE`] jobs: the
+    /// row then stays `pending`.
+    pub(crate) fn finalize(&self, finalize: Finalize) -> bool {
+        let mut q = self.shared.lock();
+        if q.closed || q.jobs.len() >= 2 * MAX_JOURNAL_QUEUE {
+            q.dropped += 1;
+            tracing::warn!(
+                target: "host.audit",
+                id = finalize.id,
+                closed = q.closed,
+                "audit finalize not queued; the row stays pending",
+            );
+            return false;
+        }
+        q.jobs.push_back(Job::Finalize(finalize));
+        drop(q);
+        self.shared.work.notify_one();
+        true
+    }
+
     /// Wait up to `timeout` for every queued job to be written. `true`
     /// when the queue drained and no admitted job was ever lost.
     pub(crate) fn flush(&self, timeout: Duration) -> bool {
@@ -311,7 +353,7 @@ fn run(shared: &Shared, db: &Db) {
             shared.lock().lost += batch.len() as u64;
             unwritten.extend(batch.iter().filter_map(|job| match job {
                 Job::Persist(row) => Some(row.command_id.clone()),
-                Job::Resolve { .. } => None,
+                Job::Resolve { .. } | Job::Finalize(_) => None,
             }));
             break;
         }
@@ -432,6 +474,24 @@ fn write_batch(db: &Db, batch: &[Job], unwritten: &HashSet<String>) -> Result<()
                         }
                     }
                     AuditLog::insert_completed_row(&tx, now, entry)?;
+                }
+                Job::Finalize(f) => {
+                    let rows = AuditLog::finalize_row(
+                        &tx,
+                        now,
+                        f.id,
+                        f.status,
+                        f.decision,
+                        None,
+                        f.execution_outcome,
+                        f.domain_error,
+                        None,
+                    )?;
+                    // Retention took the row: nothing to stamp, and
+                    // failing the batch would only retry forever.
+                    if rows == 0 {
+                        tracing::warn!(target: "host.audit", id = f.id, "audit row to finalize is gone");
+                    }
                 }
             }
         }
@@ -846,6 +906,34 @@ mod tests {
                 .iter()
                 .any(|r| r.command_id.as_deref() == Some("cmd-y"))
         );
+    }
+
+    #[test]
+    fn finalizes_are_written_in_order_and_drained_by_close() {
+        let db = db();
+        let log = AuditLog::new(Arc::clone(&db));
+        let mut intent = entry("cmd-a");
+        intent.method = "CALL".into();
+        let id = log.record_intent(&intent).expect("intent");
+        let journal = CommandJournal::start(Arc::clone(&db)).expect("journal");
+        let finalize = |id| Finalize {
+            id,
+            status: 503,
+            decision: "error",
+            execution_outcome: None,
+            domain_error: None,
+        };
+        // A row that is gone (retention) doesn't hold up the batch.
+        assert!(journal.finalize(finalize(id + 100)));
+        assert!(journal.finalize(finalize(id)));
+        assert!(journal.close(Duration::from_secs(5)));
+        let rows = log.query(&AuditQuery::default(), 10).expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].decision, "error");
+        assert_eq!(rows[0].status, 503);
+        assert!(rows[0].finalized_ms.is_some());
+        // Closed: refused, the row would stay `pending`.
+        assert!(!journal.finalize(finalize(id)));
     }
 
     #[test]

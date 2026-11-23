@@ -314,6 +314,7 @@ use crate::host_impl::plugin::oxidhome::plugin::{
     types::{DeviceId, Error as WitError, KeyValue, ServiceId, SubscriptionId, Value as WitValue},
 };
 use crate::runtime::registry::InstanceRegistry;
+use crate::runtime::sandbox_purge::{StorageOpGuard, StorageOps};
 use crate::state::{
     DeviceRegistry, EventBus, EventSubscription, MAX_CAPABILITIES_PER_DEVICE, ServiceRegistry,
 };
@@ -436,6 +437,10 @@ pub struct PluginState {
     /// by `host-devices::complete-command`. `None` for low-level test
     /// states; the loader sets it via [`Self::with_pending_commands`].
     pub pending_commands: Option<Arc<super::PendingCommands>>,
+    /// ADR-0001: the engine's count of KV / blob operations in flight
+    /// per instance. `None` for low-level test states; the loader sets
+    /// it via [`Self::with_storage_ops`].
+    pub(crate) storage_ops: Option<Arc<StorageOps>>,
     /// Per-instance wake `Notify` — C2d wake-isolation. Signaled by
     /// the [`EventBus`] every time a published event matches one
     /// of this plugin's active subscription filters. The
@@ -564,6 +569,7 @@ impl PluginState {
             instances,
             audit_log: None,
             pending_commands: None,
+            storage_ops: None,
             subscriptions: Vec::new(),
             manifest,
             actor,
@@ -640,6 +646,20 @@ impl PluginState {
     pub fn with_pending_commands(mut self, pending: Arc<super::PendingCommands>) -> Self {
         self.pending_commands = Some(pending);
         self
+    }
+
+    /// Attach the engine's storage-operation count (ADR-0001).
+    #[must_use]
+    pub(crate) fn with_storage_ops(mut self, ops: Arc<StorageOps>) -> Self {
+        self.storage_ops = Some(ops);
+        self
+    }
+
+    /// Count one KV / blob operation of this instance as in flight.
+    fn storage_op(&self) -> Option<StorageOpGuard> {
+        self.storage_ops
+            .as_ref()
+            .map(|ops| ops.enter(&self.instance_id))
     }
 }
 
@@ -1386,6 +1406,7 @@ impl host_services::Host for PluginState {
             &self.services,
             &self.instances,
             self.audit_log.as_ref(),
+            self.pending_commands.as_ref(),
             self.instance_id.clone(),
             &self.consumes_services_requested,
             &self.granted_capabilities.consumes_services,
@@ -1952,12 +1973,21 @@ fn kv_error_to_wit(err: crate::state::KvError) -> WitError {
 /// `spawn_blocking`. The op runs on a dedicated blocking thread (the
 /// store itself is sync), and panics inside it bubble out as
 /// `Error::Internal`.
-async fn kv_op<R, F>(f: F) -> Result<R, WitError>
+///
+/// `op` counts the operation as in flight until it finishes on the
+/// blocking thread, even if the guest call is cancelled meanwhile (a
+/// removed sandbox's purge waits for it).
+async fn kv_op<R, F>(op: Option<StorageOpGuard>, f: F) -> Result<R, WitError>
 where
     R: Send + 'static,
     F: FnOnce() -> Result<R, crate::state::KvError> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    match tokio::task::spawn_blocking(move || {
+        let _op = op;
+        f()
+    })
+    .await
+    {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(kv_error_to_wit(e)),
         Err(join) => Err(WitError::Internal(format!(
@@ -1972,7 +2002,10 @@ impl storage::Host for PluginState {
         let kv = Arc::clone(&self.kv);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        kv_op(move || kv.get(&installation_uuid, &instance_id, &key)).await
+        kv_op(self.storage_op(), move || {
+            kv.get(&installation_uuid, &instance_id, &key)
+        })
+        .await
     }
 
     async fn set(&mut self, key: String, val: WitValue) -> Result<(), WitError> {
@@ -2006,7 +2039,10 @@ impl storage::Host for PluginState {
         let kv = Arc::clone(&self.kv);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        kv_op(move || kv.set(&installation_uuid, &instance_id, &key, val)).await
+        kv_op(self.storage_op(), move || {
+            kv.set(&installation_uuid, &instance_id, &key, val)
+        })
+        .await
     }
 
     async fn delete(&mut self, key: String) -> Result<(), WitError> {
@@ -2014,7 +2050,10 @@ impl storage::Host for PluginState {
         let kv = Arc::clone(&self.kv);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        kv_op(move || kv.delete(&installation_uuid, &instance_id, &key)).await
+        kv_op(self.storage_op(), move || {
+            kv.delete(&installation_uuid, &instance_id, &key)
+        })
+        .await
     }
 
     async fn list_keys(&mut self, prefix: String) -> Result<Vec<String>, WitError> {
@@ -2022,7 +2061,10 @@ impl storage::Host for PluginState {
         let kv = Arc::clone(&self.kv);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        kv_op(move || kv.list_keys(&installation_uuid, &instance_id, &prefix)).await
+        kv_op(self.storage_op(), move || {
+            kv.list_keys(&installation_uuid, &instance_id, &prefix)
+        })
+        .await
     }
 }
 
@@ -2109,12 +2151,18 @@ fn blob_error_to_wit(err: crate::state::BlobError) -> WitError {
     }
 }
 
-async fn blob_op<R, F>(f: F) -> Result<R, WitError>
+/// As [`kv_op`], for the blob store.
+async fn blob_op<R, F>(op: Option<StorageOpGuard>, f: F) -> Result<R, WitError>
 where
     R: Send + 'static,
     F: FnOnce() -> Result<R, crate::state::BlobError> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    match tokio::task::spawn_blocking(move || {
+        let _op = op;
+        f()
+    })
+    .await
+    {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(blob_error_to_wit(e)),
         Err(join) => Err(WitError::Internal(format!(
@@ -2170,7 +2218,7 @@ impl blob_store::Host for PluginState {
         let blobs = Arc::clone(&self.blobs);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || {
+        blob_op(self.storage_op(), move || {
             blobs.write(
                 &installation_uuid,
                 &instance_id,
@@ -2187,7 +2235,10 @@ impl blob_store::Host for PluginState {
         let blobs = Arc::clone(&self.blobs);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.read(&installation_uuid, &instance_id, &id)).await
+        blob_op(self.storage_op(), move || {
+            blobs.read(&installation_uuid, &instance_id, &id)
+        })
+        .await
     }
 
     async fn read_by_name(&mut self, name: String) -> Result<Vec<u8>, WitError> {
@@ -2195,7 +2246,10 @@ impl blob_store::Host for PluginState {
         let blobs = Arc::clone(&self.blobs);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.read_by_name(&installation_uuid, &instance_id, &name)).await
+        blob_op(self.storage_op(), move || {
+            blobs.read_by_name(&installation_uuid, &instance_id, &name)
+        })
+        .await
     }
 
     async fn get_info(&mut self, name: String) -> Result<WitBlobInfo, WitError> {
@@ -2203,9 +2257,11 @@ impl blob_store::Host for PluginState {
         let blobs = Arc::clone(&self.blobs);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.get_info(&installation_uuid, &instance_id, &name))
-            .await
-            .map(blob_info_to_wit)
+        blob_op(self.storage_op(), move || {
+            blobs.get_info(&installation_uuid, &instance_id, &name)
+        })
+        .await
+        .map(blob_info_to_wit)
     }
 
     async fn delete(&mut self, name: String) -> Result<(), WitError> {
@@ -2213,7 +2269,10 @@ impl blob_store::Host for PluginState {
         let blobs = Arc::clone(&self.blobs);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        blob_op(move || blobs.delete(&installation_uuid, &instance_id, &name)).await
+        blob_op(self.storage_op(), move || {
+            blobs.delete(&installation_uuid, &instance_id, &name)
+        })
+        .await
     }
 
     async fn list_blobs(&mut self, prefix: String) -> Result<Vec<WitBlobInfo>, WitError> {
@@ -2221,8 +2280,10 @@ impl blob_store::Host for PluginState {
         let blobs = Arc::clone(&self.blobs);
         let installation_uuid = Arc::clone(&self.installation_uuid);
         let instance_id = self.instance_id.clone();
-        let rows =
-            blob_op(move || blobs.list_blobs(&installation_uuid, &instance_id, &prefix)).await?;
+        let rows = blob_op(self.storage_op(), move || {
+            blobs.list_blobs(&installation_uuid, &instance_id, &prefix)
+        })
+        .await?;
         Ok(rows.into_iter().map(blob_info_to_wit).collect())
     }
 }

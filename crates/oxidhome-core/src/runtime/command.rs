@@ -35,11 +35,19 @@
 //! `queued → abandoned` when it stops waiting. Exactly one side wins,
 //! so `timed_out` is only ever reported for a command the plugin will
 //! never see.
+//!
+//! A reply nobody reads (a refusal, or a result that arrives after the
+//! caller stopped waiting) gets exactly one `COMMAND` row, whatever the
+//! order: the supervisor records it only when its send fails, and the
+//! caller's `ReplyGuard` closes the receiver when it is dropped and
+//! records a reply that was sent before the close but never read.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+
+use tokio::sync::oneshot;
 
 use crate::auth::invocation::{InvocationContext, audit_cap, mint_prefixed_id};
 use crate::clock::Clock;
@@ -47,7 +55,7 @@ use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue};
 use crate::state::{AuditEntry, AuditLog};
 
-use super::command_journal::{CommandJournal, PendingRow, REASON_EXPIRED};
+use super::command_journal::{CommandJournal, Finalize, PendingRow, REASON_EXPIRED};
 
 /// Prefix of every host-minted command id.
 pub const COMMAND_ID_PREFIX: &str = "cmd-";
@@ -207,9 +215,9 @@ const WITHDRAWN: u8 = 3;
 /// The supervisor holds the ticket while it reads the clock; it
 /// resolves to `STARTED` or `ABANDONED` without any await in between.
 const CLAIMING: u8 = 4;
-/// Abandoned by a caller that was dropped (disconnect): nobody reads a
-/// reply, so whoever refuses the command records its outcome, even if
-/// the reply send happens to succeed before the receiver is gone.
+/// Abandoned by a caller that was dropped (disconnect): a refusal is
+/// `timed_out`, and is recorded by whichever side ends up holding it
+/// (see [`ReplyGuard`]).
 const DISCONNECTED: u8 = 5;
 
 /// Shared between the caller waiting on a command and the supervisor
@@ -299,12 +307,6 @@ impl DispatchTicket {
         self.0.load(Ordering::Acquire) == WITHDRAWN
     }
 
-    /// Whether a dropped caller withdrew the command: its refusal must
-    /// be recorded, since no reply will be read.
-    pub(crate) fn disconnected(&self) -> bool {
-        self.0.load(Ordering::Acquire) == DISCONNECTED
-    }
-
     /// Supervisor teardown: refuse a still-queued command. `None` if
     /// the plugin was entered; `Some(true)` if the caller had already
     /// gone (disconnect or deadline) before the refusal, `Some(false)`
@@ -330,14 +332,63 @@ impl DispatchTicket {
     }
 }
 
-/// Withdraws a still-queued command when the waiting caller is dropped
-/// (client disconnect): a command nobody waits for any more must not
-/// actuate a device later.
-pub(crate) struct AbandonOnDrop(pub(crate) DispatchTicket);
+/// Records a reply the caller never read; see [`ReplyGuard`]. Gets the
+/// ticket to tell a refusal from a result of a started command.
+pub(crate) type UnreadReply<T> = Box<dyn FnOnce(T, &DispatchTicket) + Send>;
 
-impl Drop for AbandonOnDrop {
+/// The caller's end of a dispatched command or service call: the reply
+/// receiver, plus what to do with a reply nobody read.
+///
+/// On drop it withdraws a still-queued command (a command nobody waits
+/// for any more must not actuate a device later), closes the receiver
+/// and takes any reply sent before the close. That reply was never
+/// read, so `unread` records it, unless the caller already reported the
+/// command `timed_out` at its own deadline. The supervisor records a
+/// reply only when its send fails, so a reply nobody reads is recorded
+/// exactly once, whichever side gets there first. A reply the caller
+/// did read is gone from the receiver and is not recorded again.
+pub(crate) struct ReplyGuard<T> {
+    rx: oneshot::Receiver<T>,
+    ticket: DispatchTicket,
+    unread: Option<UnreadReply<T>>,
+}
+
+impl<T> ReplyGuard<T> {
+    pub(crate) fn new(
+        rx: oneshot::Receiver<T>,
+        ticket: DispatchTicket,
+        unread: Option<UnreadReply<T>>,
+    ) -> Self {
+        Self { rx, ticket, unread }
+    }
+}
+
+impl<T> std::ops::Deref for ReplyGuard<T> {
+    type Target = oneshot::Receiver<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.rx
+    }
+}
+
+impl<T> std::ops::DerefMut for ReplyGuard<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rx
+    }
+}
+
+impl<T> Drop for ReplyGuard<T> {
     fn drop(&mut self) {
-        let _ = self.0.try_disconnect();
+        // Settle the ticket before the receiver closes, so the
+        // supervisor can't claim a command for a receiver that is gone.
+        let _ = self.ticket.try_disconnect();
+        // From here a send fails, and the supervisor records it.
+        self.rx.close();
+        if let Ok(reply) = self.rx.try_recv()
+            && !self.ticket.withdrawn_by_caller()
+            && let Some(unread) = self.unread.take()
+        {
+            unread(reply, &self.ticket);
+        }
     }
 }
 
@@ -719,6 +770,28 @@ impl PendingCommands {
         ) {
             journal.resolve(entry, None);
         }
+    }
+
+    /// Queue an audit row that is not a command resolution (a late
+    /// service-call result) on the journal, so it is written in order
+    /// and drained at shutdown. Never blocks; a full journal drops it.
+    pub(crate) fn record_entry(&self, entry: AuditEntry) {
+        if let Some(journal) = &self.journal {
+            journal.resolve(entry, None);
+        }
+    }
+
+    /// Queue the outcome of a two-phase audit row (an H6 hop) on the
+    /// journal. `false` when there is no journal, or it is closed or
+    /// full (the row then stays `pending`).
+    pub(crate) fn finalize_audit_row(&self, finalize: Finalize) -> bool {
+        self.journal.as_ref().is_some_and(|j| j.finalize(finalize))
+    }
+
+    /// Whether audit rows go through a journal (the engine's table;
+    /// not the bare tables unit tests build).
+    pub(crate) fn has_journal(&self) -> bool {
+        self.journal.is_some()
     }
 
     /// Expire every pending command of `owner_instance` as
@@ -1104,12 +1177,51 @@ mod tests {
     }
 
     #[test]
-    fn abandon_on_drop_withdraws_a_queued_command() {
+    fn a_dropped_reply_guard_withdraws_a_queued_command() {
         let t = DispatchTicket::default();
-        drop(AbandonOnDrop(t.clone()));
+        let (_reply, rx) = oneshot::channel::<()>();
+        drop(ReplyGuard::new(rx, t.clone(), None));
         assert!(!t.try_start());
-        assert!(t.disconnected());
-        assert_eq!(t.try_refuse(), Some(true));
+        assert_eq!(t.try_refuse(), Some(true), "the caller is gone");
+    }
+
+    #[test]
+    fn a_reply_guard_records_only_an_unread_reply() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let guard = |rx, t: &DispatchTicket| {
+            let recorded = Arc::clone(&recorded);
+            ReplyGuard::new(
+                rx,
+                t.clone(),
+                Some(Box::new(move |v: u8, _: &DispatchTicket| {
+                    recorded.lock().unwrap().push(v);
+                })),
+            )
+        };
+        // Sent, never read: recorded once.
+        let t = DispatchTicket::default();
+        let (reply, rx) = oneshot::channel();
+        let g = guard(rx, &t);
+        reply.send(1).unwrap();
+        drop(g);
+        // Read: not recorded.
+        let (reply, rx) = oneshot::channel();
+        let mut g = guard(rx, &t);
+        reply.send(2).unwrap();
+        assert_eq!(g.try_recv().unwrap(), 2);
+        drop(g);
+        // Sent after the drop: the send fails, the sender records it.
+        let (reply, rx) = oneshot::channel();
+        drop(guard(rx, &t));
+        assert_eq!(reply.send(3), Err(3));
+        // Withdrawn at the caller's deadline: the caller reported it.
+        let t = DispatchTicket::default();
+        let (reply, rx) = oneshot::channel();
+        let g = guard(rx, &t);
+        assert!(t.try_withdraw());
+        reply.send(4).unwrap();
+        drop(g);
+        assert_eq!(*recorded.lock().unwrap(), [1]);
     }
 
     fn host_ctx() -> InvocationContext {

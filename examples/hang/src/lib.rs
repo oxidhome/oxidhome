@@ -19,6 +19,12 @@
 //!   fixture for a stop cancelling the call instead;
 //! - `"shutdown-sleep"` — `on-shutdown` blocks in a WASI `sleep` for an
 //!   hour; the fixture for the host bounding `on-shutdown`.
+//! - `"gate"` — `init` registers the `spinner` service with a
+//!   releasable `hold` command, which waits until the KV key `release`
+//!   is set (the test sets it from the host side), and `mark`, which
+//!   counts its runs in the KV key `runs`. The H5 fixture for a call
+//!   withdrawn while queued behind `hold`: once released, the callee
+//!   dequeues it and must not run it.
 //!
 //! It's the fixture for the liveness-watchdog tests: the host must be
 //! able to interrupt the wedged call (`Trap::Interrupt`) so the
@@ -26,7 +32,7 @@
 
 use oxidhome_sdk::bindings::oxidhome::plugin::capabilities::CapabilitySpec;
 use oxidhome_sdk::bindings::oxidhome::plugin::devices::{Command, CommandResult};
-use oxidhome_sdk::bindings::oxidhome::plugin::types::KeyValue;
+use oxidhome_sdk::bindings::oxidhome::plugin::types::{KeyValue, Value};
 use oxidhome_sdk::{CommandSpec, Device, Plugin, Service, host};
 
 #[derive(Default)]
@@ -72,6 +78,14 @@ impl Plugin for Hang {
                 )
                 .map_err(|e| format!("register-service failed: {e:?}"))?;
             }
+            "gate" => {
+                host::register_service(
+                    Service::new("spinner", "spinner")
+                        .command(CommandSpec::new("hold"))
+                        .command(CommandSpec::new("mark")),
+                )
+                .map_err(|e| format!("register-service failed: {e:?}"))?;
+            }
             _ => {}
         }
         oxidhome_sdk::tracing::info!("hang ready — will spin on first tick");
@@ -93,10 +107,33 @@ impl Plugin for Hang {
     fn execute_service_command(
         &mut self,
         _service: String,
-        _command: String,
+        command: String,
         _args: Vec<KeyValue>,
     ) -> CommandResult {
-        spin();
+        if cfg_phase() != "gate" {
+            spin();
+        }
+        match command.as_str() {
+            "hold" => {
+                // Polls between short host sleeps: released by the
+                // host, still bounded by the watchdog.
+                while !matches!(host::storage::get("release"), Ok(Some(_))) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                CommandResult::Ok
+            }
+            "mark" => {
+                let runs = match host::storage::get("runs") {
+                    Ok(Some(Value::IntVal(n))) => n,
+                    _ => 0,
+                };
+                match host::storage::set("runs", &Value::IntVal(runs + 1)) {
+                    Ok(()) => CommandResult::Ok,
+                    Err(e) => CommandResult::Err(e),
+                }
+            }
+            _ => spin(),
+        }
     }
 
     fn shutdown(&mut self) {

@@ -106,5 +106,25 @@ have no audit row to complete.
   callee started, a missed deadline or a lost supervisor answers `ok(unknown(..))`, as a trap already did. The WIT
   contract is unchanged; the H6 hop row is finalized `allow` with no execution outcome for `unknown`, and `error` /
   503 for a call that did not run. A caller cancelled mid-call (its future dropped) gets the same split from the
-  ticket, so its hop row doesn't stay `pending` (short of a runtime torn down before the finalize is written), and a withdrawn queued call releases its in-flight refcount at once.
+  ticket, so its hop row doesn't stay `pending`, and a withdrawn queued call releases its in-flight refcount at once.
+
+### Unread replies and hop finalizes
+
+Shipped in the second H5 follow-up PR.
+
+- **Exactly one row for a reply nobody reads.** The caller's end of a device command or service call is a reply
+  guard. When the caller is dropped it withdraws a still-queued command, closes its receiver and takes any reply the
+  supervisor had already sent, which it records, since nobody read it. The supervisor records a refusal or a late
+  result only when its send fails. Either the send lands before the close (the guard records it) or it fails (the
+  supervisor does), so a refusal or late result nobody reads gets exactly one `COMMAND` row in every order. A caller
+  that withdrew at its own deadline reported `timed_out` itself, and a late `accepted` is left to its pending entry.
+- **Late service results.** A service call's result that reaches the callee's supervisor after the caller stopped
+  waiting (its hop row says `unknown`) is recorded the same way, as a `CALL_RESULT` row with the hop's `path` and
+  `call_id`, the result's `execution_outcome` / `domain_error`, and `command_outcome` `completed`, `rejected` or
+  `outcome_unknown`. A refusal of a call that never ran needs none: the hop row says so.
+- **Hop finalizes go through the command journal.** The H6 hop row's finalize, which a cancelled caller issues from a
+  `Drop`, is queued on the command journal instead of a blocking task, so a runtime torn down mid-call can't cancel
+  it, and shutdown drains it with the rest. Finalizes are bounded by the hops in flight (each one's intent row was
+  written first); past twice the queue bound, or after the journal closed, one is dropped and its row stays
+  `pending`, as after a crash.
 

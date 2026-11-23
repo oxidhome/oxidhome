@@ -933,6 +933,19 @@ const MIGRATIONS: &[&str] = &[
        AND json_extract(payload_blob, '$.v.capability') = 'video-stream'
      GROUP BY device_id;
     ",
+    // 22 — ADR-0001 follow-up: a removed script sandbox's storage purge
+    // is announced here before it starts and the row deleted once it
+    // succeeded. While a row exists the sandbox id can't be reused; a
+    // purge a failure, shutdown or crash left unfinished runs again at
+    // the next boot.
+    "
+    CREATE TABLE sandbox_removal (
+        installation_uuid TEXT NOT NULL,
+        instance_id       TEXT NOT NULL,
+        created_ms        INTEGER NOT NULL,
+        PRIMARY KEY (installation_uuid, instance_id)
+    ) WITHOUT ROWID;
+    ",
 ];
 
 /// File name of the host database inside the state dir.
@@ -2126,6 +2139,8 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 22: sandbox removal markers.
+                    DROP TABLE sandbox_removal;
                     -- 21 (H6 slice 2): owner flag, audit level,
                     -- device categories.
                     DROP TABLE device_meta;

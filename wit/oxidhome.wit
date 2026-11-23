@@ -1294,9 +1294,21 @@ interface host-services {
   /// plugin-local code; scripting plugins run each script in its own
   /// sandbox (`host-sandboxes`), so scripts call each other here.
   ///
-  /// If the callee traps after the call reached it, the result is
-  /// `command-result::unknown` (it may have acted); a call that never
-  /// reached it is `unavailable`.
+  /// **Queued vs started.** The call waits in the callee instance's
+  /// queue until that instance is free, and is then started. The
+  /// outcome of a call that doesn't finish normally depends on which
+  /// side of that line it ended on:
+  ///
+  /// - **Still queued.** If the timeout passes, or the callee stops,
+  ///   restarts or refuses the call, before it started, the call did
+  ///   not run and never will: the result is `err(unavailable)`, and
+  ///   retrying is safe.
+  /// - **Started.** If the callee traps, is stopped, or the timeout
+  ///   passes after it started the call, the result is
+  ///   `ok(command-result::unknown)`: the callee may have acted, so
+  ///   read its state before retrying. A reply the callee produces
+  ///   after the caller stopped waiting is recorded in the host's
+  ///   audit trail, not returned.
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
   /// (no matching entry in the caller's `consumes_services`
@@ -1305,7 +1317,7 @@ interface host-services {
   /// declare, or `args` that violate its `params` schema);
   /// `internal` (the callee's `ok-with-state` reply violates the
   /// command's `returns` schema); `unavailable` (owner not
-  /// running, or the call timed out).
+  /// running, or the call ended before the callee started it).
   call-service: func(
     target: service-id,
     command: string,
