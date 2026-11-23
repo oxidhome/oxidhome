@@ -398,8 +398,10 @@ impl EventBus {
     /// mirror write and fan-out), so every recorded event with a row
     /// id at or below the returned watermark was fanned out before
     /// this subscription existed, and every event fanned out later
-    /// is in its queue. The gate wait is bounded by one mirror write
-    /// deadline. Never reads the database under the gate.
+    /// is in its queue. The wait is not bounded here: each publisher
+    /// already queued on the gate holds it for up to one mirror write
+    /// deadline while the mirror is healthy, and none while it is
+    /// degraded. Never reads the database under the gate.
     pub async fn subscribe_at_head(
         &self,
         filter: EventFilter,

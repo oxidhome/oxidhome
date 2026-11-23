@@ -222,7 +222,18 @@ impl EventTail {
             let fanned_out = self.watermark.get();
             let message = match self.subscription.receiver.try_recv() {
                 Ok(message) => Some(message),
-                Err(TryRecvError::Disconnected) => None,
+                // The bus is gone, but recorded rows it fanned out may
+                // have been dropped from the queue: replay them before
+                // ending.
+                Err(TryRecvError::Disconnected) => {
+                    if let Mode::Cursor { cursor } = self.mode
+                        && fanned_out > cursor
+                    {
+                        self.replay_through = fanned_out;
+                        continue;
+                    }
+                    None
+                }
                 Err(TryRecvError::Empty) => {
                     if let Mode::Cursor { cursor } = self.mode
                         && fanned_out > cursor
@@ -230,7 +241,12 @@ impl EventTail {
                         self.replay_through = fanned_out;
                         continue;
                     }
-                    self.subscription.receiver.recv().await
+                    match self.subscription.receiver.recv().await {
+                        Some(message) => Some(message),
+                        // Closed while waiting: take the
+                        // `Disconnected` path above.
+                        None => continue,
+                    }
                 }
             };
             match message {
@@ -685,6 +701,24 @@ mod tests {
         for want in 1..=3 {
             assert_eq!(next_id(&mut tail).await, want);
         }
+    }
+
+    /// Rows dropped from the queue are still replayed when the bus
+    /// shuts down before the tail drains.
+    #[tokio::test]
+    async fn dropped_rows_are_replayed_before_a_shutdown_ends_the_tail() {
+        let (bus, log) = setup();
+        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(0), "test")
+            .await
+            .expect("open");
+        for n in 1..=300 {
+            publish_recorded(&bus, &log, n).await;
+        }
+        drop(bus);
+        for want in 1..=300 {
+            assert_eq!(next_id(&mut tail).await, want);
+        }
+        assert!(next_item(&mut tail).await.is_none());
     }
 
     /// Dropping the last bus owner ends an idle tail in both modes.

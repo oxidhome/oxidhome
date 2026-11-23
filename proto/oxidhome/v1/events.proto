@@ -61,9 +61,9 @@ message TailEventsResponse {
     Lagged lagged = 2;
     // H4: `after_id` (or a row this stream still had to replay)
     // is no longer in history. Always the last message: the stream
-    // ends after it. Reopen with `after_id = head_id`, then read a
-    // snapshot (device state endpoints), then apply the streamed
-    // events on top of it in order.
+    // ends after it. Reopen with `after_id = head_id`, then rebuild
+    // device state from the state snapshot and its revision cursor
+    // (`/api/v1/devices/state`, then `/state/changes`).
     CursorExpired cursor_expired = 3;
   }
 }

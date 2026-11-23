@@ -2452,8 +2452,9 @@ fn js_string_escape(input: &str) -> String {
 ///   itself;
 /// - `{"cursor_expired": {"after_id", "oldest_id", "head_id"}}` —
 ///   the cursor can't be resumed without a gap; the server then
-///   closes the socket. Reopen with `after_id = head_id`, then read
-///   a snapshot, then apply the streamed events in order.
+///   closes the socket. Reopen with `after_id = head_id`, then
+///   rebuild device state from the state snapshot and its revision
+///   cursor.
 ///
 /// With `after_id` the stream delivers every history row with
 /// `id > after_id` exactly once and in id order, then continues live.

@@ -20,8 +20,8 @@ use crate::host_impl::plugin::oxidhome::plugin::events::Event;
 /// A cursor that can't be resumed without a gap: rows after it were
 /// pruned by retention, or it is ahead of history (e.g. after a
 /// restore from an older backup). The client reopens with
-/// `after_id = head_id`, then reads a state snapshot, then applies the
-/// streamed events in order.
+/// `after_id = head_id`, then rebuilds device state from the state
+/// snapshot and its revision cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CursorExpired {
     /// The cursor that couldn't be honored.
