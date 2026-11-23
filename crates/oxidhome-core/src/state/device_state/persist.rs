@@ -467,7 +467,15 @@ fn restore_revisions(
     let flushed = meta
         .as_ref()
         .map_or(max_row_revision, |m| m.revision.max(max_row_revision));
-    let usable = flushed <= MAX_RESTORABLE_REVISION;
+    // Holes must lie at or below the flushed revision and the
+    // watermark at or below the new base (a backup restore raises it
+    // to exactly that); anything else is damage, since a watermark
+    // above the base would reset every future cursor.
+    let usable = flushed <= MAX_RESTORABLE_REVISION
+        && meta.as_ref().is_none_or(|m| {
+            m.evicted_through <= flushed.saturating_add(REVISION_GAP)
+                && m.holes.iter().all(|&(lo, hi)| lo < hi && hi <= flushed)
+        });
     if let Some(meta) = meta.filter(|_| usable) {
         let base = flushed + REVISION_GAP;
         inner.epoch = meta.epoch;
@@ -848,7 +856,10 @@ fn decode_row(row: &rusqlite::Row<'_>) -> Option<DeviceState> {
         global_revision: to_u64(row.get(5).ok()?),
         received_ms: row.get(6).ok()?,
         observed_ms: to_u64(row.get(7).ok()?),
-        source_generation: to_u64(row.get(8).ok()?),
+        // A generation near `u64::MAX` would overflow the owner's
+        // next restart: damage.
+        source_generation: Some(to_u64(row.get(8).ok()?))
+            .filter(|g| *g <= MAX_RESTORABLE_REVISION)?,
         quality: if quality == "fresh" {
             StateQuality::Fresh
         } else {
@@ -1294,6 +1305,7 @@ mod tests {
         for corrupt in [
             "UPDATE device_state_meta SET holes_json = x'00'",
             "UPDATE device_state_meta SET revision = -1",
+            "UPDATE device_state_meta SET evicted_through = -1",
         ] {
             let dir = tempdir();
             let store = open(&dir);
@@ -1310,5 +1322,30 @@ mod tests {
             assert!(store.snapshot_capability("dev-a", "switch").is_some());
             assert!(store.close_persistence());
         }
+    }
+
+    /// Round-5: a row with an out-of-range generation is dropped as
+    /// damage instead of seeding an overflowing counter.
+    #[test]
+    fn a_row_with_a_huge_generation_is_skipped() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        put(&store, "dev-b", true);
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| {
+            c.execute(
+                "UPDATE device_state SET source_generation = -1 WHERE device_id = 'dev-b'",
+                [],
+            )
+        })
+        .expect("corrupt a row");
+        drop(db);
+        let store = open(&dir);
+        assert!(store.snapshot_capability("dev-b", "switch").is_none());
+        assert!(store.snapshot_capability("dev-a", "switch").is_some());
+        assert!(store.close_persistence());
     }
 }
