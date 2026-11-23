@@ -851,7 +851,7 @@ async fn command_accepted_then_expired() {
         matches!(report.outcome, CommandOutcome::Accepted),
         "{report:?}"
     );
-    assert_eq!(pending.len(), 1);
+    // No `len() == 1` check here: the short TTL may already have fired.
     eventually("the pending command to expire", || pending.is_empty()).await;
 
     pending.set_ttl(Duration::from_mins(5));

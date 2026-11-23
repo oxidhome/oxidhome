@@ -1037,7 +1037,7 @@ impl PluginInstance {
         .instrument(span)
         .await?;
         let mut result = result;
-        crate::redact::scrub_command_error(
+        super::command::scrub_and_cap_reply(
             &mut result,
             &crate::redact::config_secrets(&self.store.data().config),
         );
@@ -1115,7 +1115,7 @@ impl PluginInstance {
         .instrument(span)
         .await?;
         let mut result = result;
-        crate::redact::scrub_command_error(
+        super::command::scrub_and_cap_reply(
             &mut result,
             &crate::redact::config_secrets(&self.store.data().config),
         );

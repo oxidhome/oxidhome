@@ -2,7 +2,7 @@
 
 > **Status:** Initial architectural design document — captures the design decisions that shape the codebase. The implementation is in active development; sections explicitly settled, re-scoped, or superseded as the code progresses are flagged inline.
 
-> **Decision records.** Settled cross-cutting decisions, and accepted decisions not implemented yet, are recorded as ADRs in [`docs/adr/`](docs/adr/README.md). Accepted but not yet implemented: one sandbox per script for same-instance script calls ([ADR-0001](docs/adr/0001-one-sandbox-per-script.md)), in-process native media and inference with strict input validation ([ADR-0002](docs/adr/0002-in-process-native-media-and-inference.md)), and explicit command outcome states ([ADR-0003](docs/adr/0003-explicit-command-outcomes.md)).
+> **Decision records.** Settled cross-cutting decisions, and accepted decisions not implemented yet, are recorded as ADRs in [`docs/adr/`](docs/adr/README.md). Accepted but not yet implemented: one sandbox per script for same-instance script calls ([ADR-0001](docs/adr/0001-one-sandbox-per-script.md)) and in-process native media and inference with strict input validation ([ADR-0002](docs/adr/0002-in-process-native-media-and-inference.md)). Explicit command outcome states ([ADR-0003](docs/adr/0003-explicit-command-outcomes.md)) are implemented; see [Command outcomes (H5)](#command-outcomes-h5).
 
 ## Mission
 

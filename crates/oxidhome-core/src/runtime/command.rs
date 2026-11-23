@@ -594,10 +594,38 @@ pub const MAX_PLUGIN_MESSAGE_BYTES: usize = 4 * 1024;
 /// Cap plugin-supplied text at [`MAX_PLUGIN_MESSAGE_BYTES`] before any
 /// transport copies or encodes it.
 pub(crate) fn cap_plugin_text(m: String) -> String {
-    if m.len() <= MAX_PLUGIN_MESSAGE_BYTES {
+    cap_text_at(m, MAX_PLUGIN_MESSAGE_BYTES)
+}
+
+/// M7 + H5: bound a plugin reply's `err` / `unknown` text, then scrub
+/// the instance's secret values from it. Capping first (with room for
+/// the longest secret, so one straddling the final cut is still whole
+/// and gets scrubbed) keeps the scrubber from copying a guest-sized
+/// message.
+pub(crate) fn scrub_and_cap_reply(result: &mut CommandResult, secrets: &[&str]) {
+    let window = secrets.iter().map(|s| s.len()).max().unwrap_or(0);
+    let limit = MAX_PLUGIN_MESSAGE_BYTES.saturating_add(window);
+    match result {
+        CommandResult::Err(
+            WitError::NotFound(m)
+            | WitError::InvalidArgument(m)
+            | WitError::PermissionDenied(m)
+            | WitError::Unavailable(m)
+            | WitError::Internal(m),
+        )
+        | CommandResult::Unknown(m) => {
+            *m = cap_text_at(std::mem::take(m), limit);
+        }
+        _ => {}
+    }
+    crate::redact::scrub_command_error(result, secrets);
+}
+
+fn cap_text_at(m: String, limit: usize) -> String {
+    if m.len() <= limit {
         return m;
     }
-    let mut cap = MAX_PLUGIN_MESSAGE_BYTES;
+    let mut cap = limit;
     while !m.is_char_boundary(cap) {
         cap -= 1;
     }
@@ -866,7 +894,25 @@ mod tests {
 
 #[cfg(test)]
 mod message_cap_tests {
-    use super::{MAX_PLUGIN_MESSAGE_BYTES, cap_plugin_text};
+    use super::{CommandResult, MAX_PLUGIN_MESSAGE_BYTES, cap_plugin_text, scrub_and_cap_reply};
+
+    #[test]
+    fn secret_straddling_the_cap_is_scrubbed_and_text_bounded() {
+        let secret = "hunter2-very-secret";
+        // The secret starts 4 bytes before the cut.
+        let mut text = "x".repeat(MAX_PLUGIN_MESSAGE_BYTES - 4);
+        text.push_str(secret);
+        text.push_str(&"y".repeat(1 << 20));
+        let mut reply = CommandResult::Unknown(text);
+        scrub_and_cap_reply(&mut reply, &[secret]);
+        let CommandResult::Unknown(out) = reply else {
+            panic!("variant kept")
+        };
+        assert!(!out.contains("hunter2"), "secret prefix leaked");
+        assert!(out.len() < MAX_PLUGIN_MESSAGE_BYTES + 128, "{}", out.len());
+        let out = cap_plugin_text(out);
+        assert!(!out.contains("hunter2"));
+    }
 
     #[test]
     fn passes_through_short_messages_unchanged() {

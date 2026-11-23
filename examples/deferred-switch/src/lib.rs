@@ -102,9 +102,16 @@ impl Plugin for DeferredSwitch {
                 key: "state".to_string(),
                 value: Value::BoolVal(target),
             }];
-            if let Err(e) = host::complete_command(&command_id, &CommandResult::OkWithState(fields)) {
-                // `not-found`: the host already expired the command.
+            if let Err(e) =
+                host::complete_command(&command_id, &CommandResult::OkWithState(fields.clone()))
+            {
+                // `not-found`: the host expired the command (or never
+                // tracked it). The switch moved anyway, so publish the
+                // state for anyone reading it before retrying.
                 oxidhome_sdk::tracing::warn!("complete_command {command_id} failed: {e:?}");
+                if let Some(device) = self.device_id.clone() {
+                    let _ = host::publish_state_change(device, "switch", fields);
+                }
             }
         }
     }

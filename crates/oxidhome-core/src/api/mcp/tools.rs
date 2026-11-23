@@ -1077,15 +1077,18 @@ impl ToolOutcome {
                 )]),
             }),
             Self::Command {
-                value,
-                is_error: false,
+                mut value,
+                is_error,
                 ..
-            } => Ok(CallToolResult::structured(value)),
-            Self::Command {
-                value,
-                is_error: true,
-                ..
-            } => Ok(CallToolResult::structured_error(value)),
+            } => {
+                // M7: same credential masking as `Ok` / `ExecErr`.
+                crate::redact::redact_json(&mut value);
+                Ok(if is_error {
+                    CallToolResult::structured_error(value)
+                } else {
+                    CallToolResult::structured(value)
+                })
+            }
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
             Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
