@@ -985,14 +985,14 @@ impl Db {
         // or a symlinked state dir being retargeted.
         let state_dir = std::fs::canonicalize(state_dir)
             .with_context(|| format!("resolving state dir {}", state_dir.display()))?;
-        let mut path = state_dir.join(DB_FILE_NAME);
-        if path.exists() {
-            // A symlinked database file: pin its target too.
-            path = std::fs::canonicalize(&path)
-                .with_context(|| format!("resolving {}", path.display()))?;
-        }
+        let path = state_dir.join(DB_FILE_NAME);
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database at {}", path.display()))?;
+        // The file exists now (the writer created it if needed), so a
+        // symlinked database file, even one that was dangling, can be
+        // pinned to the target the writer opened.
+        let path = std::fs::canonicalize(&path)
+            .with_context(|| format!("resolving {}", path.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("setting busy_timeout")?;
         // WAL: many concurrent readers + one writer, plus crash safety
@@ -2501,6 +2501,9 @@ mod tests {
         let snap_dir = tempdir_for_test();
         let snap = snap_dir.path().join("snap.db");
         wait_until("a checkpoint of the seeded rows", || {
+            if db.checkpoints_run() == 0 {
+                return false;
+            }
             if std::fs::copy(&main_file, &snap).is_err() {
                 return false;
             }
@@ -2512,7 +2515,6 @@ mod tests {
             }
             matches!(count, Ok(100))
         });
-        assert!(db.checkpoints_run() >= 1);
         let worker = Arc::downgrade(
             &db.checkpointer
                 .as_ref()
@@ -2530,6 +2532,33 @@ mod tests {
             .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
             .expect("count");
         assert_eq!(n, 100);
+    }
+
+    /// A dangling `oxidhome.db` symlink: the writer creates its
+    /// target, and later reader opens follow the writer even after
+    /// the link is retargeted.
+    #[cfg(unix)]
+    #[test]
+    fn readers_follow_the_file_the_writer_opened() {
+        let dir = tempdir_for_test();
+        let targets = tempdir_for_test();
+        let first = targets.path().join("first.db");
+        let link = dir.path().join(DB_FILE_NAME);
+        std::os::unix::fs::symlink(&first, &link).expect("dangling link");
+        let db = Db::open_file(dir.path()).expect("open");
+        db.write(|c| insert_log_rows(c, 2)).expect("insert");
+        // Retarget the link at a different, valid database.
+        let other = Db::open_file(targets.path()).expect("other db");
+        drop(other);
+        std::fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink(targets.path().join(DB_FILE_NAME), &link).expect("relink");
+        let n: i64 = db
+            .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(
+            n, 2,
+            "the reader must open the writer's file, not the new link target"
+        );
     }
 
     /// Tiny tempdir helper — same shape as the one in the

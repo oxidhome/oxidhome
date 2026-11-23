@@ -47,7 +47,7 @@ paths still raise the writer to `synchronous = FULL` for their transaction.
 ## Consequences
 
 While normal-priority callers are queued, consecutive low-priority transactions always have a normal-priority one
-between them, so a normal-priority write waits through at most one low-priority transaction per normal-priority caller
-ahead of it (plus one already running). A slow disk still slows every writer, and the H3 bus gate still serializes
+between them. That is a per-class guarantee: admission within the normal class is not FIFO, so an individual
+normal-priority write has no fixed bound on the transactions that run ahead of it. A slow disk still slows every writer, and the H3 bus gate still serializes
 publishers behind one mirror write. Reads that need to be atomic with a later filesystem effect (the blob open) must
 stay on the writer. Each file-backed `Db` holds up to six connections and one extra thread.
