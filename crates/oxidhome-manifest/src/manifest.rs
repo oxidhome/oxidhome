@@ -184,6 +184,15 @@ pub struct CapabilitiesSection {
     /// declared in the manifest and reviewable at install time.
     #[serde(default)]
     pub subscribes_events: bool,
+    /// ADR-0001: how many script sandboxes one instance of this plugin
+    /// may run at once through `host-sandboxes::start-sandbox`. Each
+    /// sandbox is a child instance with its own `Store`, so this also
+    /// bounds the plugin's aggregate memory under the per-`Store`
+    /// ceilings. `0` (or absent) ⇒ `start-sandbox` returns
+    /// `permission-denied`. Capped at
+    /// [`crate::validate::MAX_SCRIPT_SANDBOXES`].
+    #[serde(default)]
+    pub script_sandboxes: u32,
 }
 
 /// H10: one resource selector inside `[capabilities] consumes_services`.

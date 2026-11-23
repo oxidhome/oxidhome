@@ -13,10 +13,11 @@ use oxidhome_manifest::{CapabilitiesSection, ServiceGrant};
 /// one an operator could actually issue for this manifest.
 ///
 /// Set-shaped fields must be subsets, quotas must not exceed the
-/// request, `subscribes_events` may only be granted when requested,
-/// and each `consumes_services` entry must be covered by some
-/// requested entry (same plugin and service, a selector no wider than
-/// the requested one, commands drawn from the requested list).
+/// request (nor may `script_sandboxes`), `subscribes_events` may only
+/// be granted when requested, and each `consumes_services` entry must
+/// be covered by some requested entry (same plugin and service, a
+/// selector no wider than the requested one, commands drawn from the
+/// requested list).
 #[must_use]
 pub fn grant_excess(requested: &CapabilitiesSection, granted: &CapabilitiesSection) -> Vec<String> {
     let mut excess = Vec::new();
@@ -57,6 +58,12 @@ pub fn grant_excess(requested: &CapabilitiesSection, granted: &CapabilitiesSecti
     }
     if granted.subscribes_events && !requested.subscribes_events {
         excess.push("subscribes_events is not requested".to_owned());
+    }
+    if granted.script_sandboxes > requested.script_sandboxes {
+        excess.push(format!(
+            "script_sandboxes {} exceeds the requested {}",
+            granted.script_sandboxes, requested.script_sandboxes
+        ));
     }
     excess
 }
@@ -109,6 +116,7 @@ mod tests {
             declares_services: vec!["svc".into()],
             consumes_services: vec![svc("*", &["get", "increment"], "*")],
             subscribes_events: true,
+            script_sandboxes: 2,
         }
     }
 
@@ -133,7 +141,7 @@ mod tests {
         let req = CapabilitiesSection::default();
         let wide = requested();
         let excess = grant_excess(&req, &wide);
-        assert_eq!(excess.len(), 7, "{excess:?}");
+        assert_eq!(excess.len(), 8, "{excess:?}");
     }
 
     #[test]

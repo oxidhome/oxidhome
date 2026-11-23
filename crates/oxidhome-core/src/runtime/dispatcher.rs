@@ -56,11 +56,13 @@
 //!    channel close).
 //!
 //! **Instance granularity, not service**: same-instance peer services
-//! (e.g. two scripts inside a scripting plugin) are not supported by
-//! `host-services::call-service` — dispatching to a supervisor
-//! already parked on the same call chain is deadlock-by-construction.
-//! Plugins colocating services in one instance dispatch between them
-//! in plugin-local code. H10 upgraded the caller==target case from a
+//! are not supported by `host-services::call-service` — dispatching
+//! to a supervisor already parked on the same call chain is
+//! deadlock-by-construction. Plugins colocating services in one
+//! instance dispatch between them in plugin-local code. Scripting
+//! plugins run each script in its own sandbox instance
+//! ([`super::sandbox`], ADR-0001), so two scripts of one plugin are
+//! two instances here and their calls take this path like any other. H10 upgraded the caller==target case from a
 //! generic "recursion detected" to a documented `same-instance
 //! dispatch is not supported` error, distinct from the multi-hop
 //! A→B→…→A `cycle detected` message.

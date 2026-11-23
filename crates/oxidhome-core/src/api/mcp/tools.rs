@@ -2686,7 +2686,7 @@ fn plugins_start_schema() -> serde_json::Map<String, JsonValue> {
             "instance_id": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Optional: instance id to run under. Defaults to `plugin_id`. Must be a safe filesystem segment (no `/`, `..`, absolute paths, or leading dots).",
+                "description": "Optional: instance id to run under. Defaults to `plugin_id`. Must be a safe filesystem segment (no `/`, `..`, absolute paths, or leading dots) without `~`, which is reserved for script sandboxes.",
             },
             "config_overrides": {
                 "type": "object",
@@ -2800,9 +2800,10 @@ async fn plugins_start_call(
     // escapes it, `\0` truncates on POSIX. Also rejected:
     // empty and leading-`.` (collides with blob-store `.tmp`
     // staging).
-    if !crate::state::is_safe_instance_id(&instance_id) {
+    if !crate::runtime::is_operator_instance_id(&instance_id) {
         return ToolOutcome::InvalidParams(format!(
-            "`instance_id` `{instance_id}` is not a safe filesystem segment"
+            "`instance_id` `{instance_id}` is not a safe filesystem segment or uses the \
+             reserved `~`"
         ));
     }
 

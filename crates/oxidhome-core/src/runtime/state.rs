@@ -462,6 +462,10 @@ pub struct PluginState {
     /// Shared with the instance's stdout / stderr sinks
     /// (`runtime::plugin_stdio`), so WASI output spends the same budget.
     pub log_rate: Arc<std::sync::Mutex<LogRateBucket>>,
+    /// ADR-0001: whether this instance may start script sandboxes, or
+    /// is one. Set by the supervisor after load; `None` for instances
+    /// driven without a supervisor.
+    pub(crate) sandbox: Option<super::sandbox::SandboxRole>,
 }
 
 impl PluginState {
@@ -545,6 +549,7 @@ impl PluginState {
             wake: Arc::new(tokio::sync::Notify::new()),
             limits,
             log_rate,
+            sandbox: None,
         }
     }
 

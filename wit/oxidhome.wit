@@ -1183,7 +1183,12 @@ interface host-services {
   /// the caller — deadlock by construction. The host rejects such
   /// calls up-front with `invalid-argument`. Plugins that colocate
   /// multiple services in one instance dispatch between them in
-  /// plugin-local code.
+  /// plugin-local code; scripting plugins run each script in its own
+  /// sandbox (`host-sandboxes`), so scripts call each other here.
+  ///
+  /// If the callee traps after the call reached it, the result is
+  /// `command-result::unknown` (it may have acted); a call that never
+  /// reached it is `unavailable`.
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
   /// (no matching entry in the caller's `consumes_services`
@@ -1198,6 +1203,63 @@ interface host-services {
     command: string,
     args: list<key-value>,
   ) -> result<command-result, error>;
+}
+
+/// One sandbox per script (ADR-0001). A scripting plugin runs each user
+/// script in its own child instance: same component, same manifest, its
+/// own Wasmtime store and supervisor. Script-to-script calls are then
+/// ordinary cross-instance `host-services::call-service` calls, with the
+/// host's grants, deadlines, cycle checks and audit.
+///
+/// Gated by the manifest's `[capabilities] script_sandboxes` (the number
+/// of sandboxes one instance may run at once; `0` refuses
+/// `start-sandbox` with `permission-denied`). Sandboxes don't nest.
+interface host-sandboxes {
+  use types.{error};
+
+  /// A live sandbox.
+  record sandbox-info {
+    /// The script's id, unique within its parent instance: 1-64 bytes
+    /// of `[a-z0-9_-]`, starting with a letter or digit.
+    local-id: string,
+    /// The sandbox's instance id, `<parent-instance>~<local-id>`. This
+    /// is the id other plugins resolve its services under and that
+    /// `consumes_services` grants match.
+    instance-id: string,
+    /// The instance that started the sandbox.
+    parent-instance: string,
+  }
+
+  /// What a sandbox runs, as returned by `current-sandbox`.
+  record sandbox-script {
+    info: sandbox-info,
+    /// The source passed to `start-sandbox`.
+    source: string,
+  }
+
+  /// Start a sandbox running `source` and return its instance id. The
+  /// call returns once the sandbox's supervisor is spawned; its `init`
+  /// runs afterwards. Starting a live `local-id` again with the same
+  /// source returns the existing instance id.
+  ///
+  /// Errors: `permission-denied` (`script_sandboxes` is 0 or the caller
+  /// is itself a sandbox); `invalid-argument` (bad `local-id`, source
+  /// over 64 KiB, the resulting instance id too long, or a live
+  /// `local-id` with different source); `unavailable` (the instance's
+  /// sandbox limit is reached, a previous sandbox with this `local-id`
+  /// is still stopping, the host is shutting down, or this instance
+  /// isn't supervised).
+  start-sandbox: func(local-id: string, source: string) -> result<string, error>;
+
+  /// Stop a sandbox this instance started. It leaves the list at once
+  /// and stops in the background. Errors: `not-found`.
+  stop-sandbox: func(local-id: string) -> result<_, error>;
+
+  /// The sandboxes this instance started that are still live.
+  list-sandboxes: func() -> list<sandbox-info>;
+
+  /// Inside a sandbox: the script it runs. `none` in any other instance.
+  current-sandbox: func() -> option<sandbox-script>;
 }
 
 /// Event bus pub/sub. Subscribed events are delivered via the plugin's
@@ -1253,6 +1315,7 @@ world plugin {
   import host-events;
   import host-config;
   import host-services;
+  import host-sandboxes;
   import storage;
   import blob-store;
   import logging;

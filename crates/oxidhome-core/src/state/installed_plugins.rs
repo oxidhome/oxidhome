@@ -503,7 +503,8 @@ fn read_no_follow_within_bounded(
 ///
 /// Set-shaped fields (`network`, `declares_devices`,
 /// `declares_services`) intersect on equality; quotas take the
-/// minimum; `subscribes_events` is a boolean AND.
+/// minimum (so does `script_sandboxes`); `subscribes_events` is a
+/// boolean AND.
 ///
 /// **`consumes_services` is NOT intersected here** (H10 round-4).
 /// The requested × granted cross-product grows O(N²) in narrowed
@@ -536,6 +537,7 @@ pub fn effective_capabilities(
         // requested list is applied separately at dispatch time.
         consumes_services: granted.consumes_services.clone(),
         subscribes_events: requested.subscribes_events && granted.subscribes_events,
+        script_sandboxes: requested.script_sandboxes.min(granted.script_sandboxes),
     }
 }
 

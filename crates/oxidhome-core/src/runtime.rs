@@ -20,6 +20,7 @@ mod instance;
 mod lifecycle;
 mod plugin_stdio;
 mod registry;
+pub mod sandbox;
 mod schema;
 mod state;
 pub(crate) mod watchdog;
@@ -30,6 +31,7 @@ pub use lifecycle::{
     InstanceHandle, InstanceState, SupervisorTuning, supervise, supervise_with_tuning,
 };
 pub use registry::{InstanceRegistry, RegistryError};
+pub use sandbox::{SANDBOX_SEPARATOR, SandboxRegistry, sandbox_instance_id};
 pub use state::PluginState;
 pub(crate) use state::capability_name;
 
@@ -85,6 +87,8 @@ pub struct Engine {
     blobs: Arc<BlobStore>,
     services: Arc<ServiceRegistry>,
     instances: Arc<InstanceRegistry>,
+    /// ADR-0001: live script sandboxes per parent instance.
+    sandboxes: Arc<SandboxRegistry>,
     /// H5: accepted-but-unfinished device commands.
     pending_commands: Arc<PendingCommands>,
     auth_tokens: Arc<crate::state::TokenStore>,
@@ -400,6 +404,7 @@ impl Engine {
             blobs: Arc::new(BlobStore::new(Arc::clone(&db), blobs_root)),
             services: Arc::new(ServiceRegistry::new()),
             instances: Arc::new(InstanceRegistry::new()),
+            sandboxes: Arc::new(SandboxRegistry::default()),
             db,
             installed_plugins: Arc::new(installed_plugins),
             plugin_lifecycle_locks: Arc::new(std::sync::Mutex::new(
@@ -811,6 +816,14 @@ impl Engine {
                  (reserved wildcard, path separator, empty, or too long)"
             ));
         }
+        // ADR-0001: `~` joins a script sandbox's parent instance id
+        // and its local-id; only the host mints such ids.
+        if !is_operator_instance_id(&instance_id) {
+            return Err(anyhow!(
+                "instance-id `{instance_id}` is not permitted: `{SANDBOX_SEPARATOR}` is \
+                 reserved for script sandbox instance ids"
+            ));
+        }
         // Pre-flight: parse + validate the manifest so we
         // know the plugin id + singleton flag before
         // spawning. Phase 6 leftover TOCTOU fix + round-2
@@ -868,74 +881,22 @@ impl Engine {
         // factory keeps it strictly ordered after the supervisor
         // spawn, so the reaper can't miss the first `watch` notify.
         let engine_for_spawn = self.clone();
-        let engine_for_reaper = self.clone();
-        let registry = Arc::clone(&self.instances);
         let plugin_dir_for_spawn = plugin_dir;
         let instance_id_for_spawn = instance_id.clone();
         let plugin_id_for_spawn = plugin_id.clone();
-        let plugin_id_for_reaper = plugin_id.clone();
-        let instance_id_for_reaper = instance_id.clone();
-        let reapers_for_spawn = Arc::clone(&self.reapers);
-        let reaper_gen_counter = Arc::clone(&self.reaper_gen);
         self.instances
-            .register(instance_id, plugin_id, singleton, || {
+            .register(instance_id, plugin_id.clone(), singleton, || {
                 let handle = crate::runtime::lifecycle::supervise_with_tuning_mode_and_pin(
                     engine_for_spawn,
                     plugin_dir_for_spawn,
-                    instance_id_for_spawn,
+                    instance_id_for_spawn.clone(),
                     plugin_id_for_spawn,
                     overrides,
                     mode,
                     tuning,
                     pinned_manifest,
                 );
-                let reaper_handle = handle.clone();
-                let reapers_for_reaper = Arc::clone(&reapers_for_spawn);
-                let reaper_key: Arc<str> = Arc::from(instance_id_for_reaper.as_str());
-                let reaper_key_for_task = Arc::clone(&reaper_key);
-                // Round-2 F2: mint a monotonic generation
-                // for THIS reaper spawn. The reaper carries
-                // the gen with it and only removes its
-                // tracker entry if the map's stored gen
-                // still matches — so a fresh start that
-                // reuses the same `instance_id` (after the
-                // registry unregister a moment ago) can't
-                // have its brand-new tracker entry
-                // silently clobbered by the old reaper's
-                // key-only remove.
-                let my_gen = reaper_gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let reaper_join = tokio::spawn(async move {
-                    let _ = reaper_handle.wait_terminal().await;
-                    // Drop any device/service registry entries the
-                    // instance left behind. The supervisor sweeps at
-                    // the top of every load attempt; this is the
-                    // final post-terminal cleanup so a Stopped /
-                    // Failed instance leaves nothing behind.
-                    engine_for_reaper.release_instance_state(&instance_id_for_reaper);
-                    registry.unregister(&instance_id_for_reaper, &plugin_id_for_reaper);
-                    // Round-2 F2: conditional remove —
-                    // don't yank a replacement reaper's
-                    // entry that happens to share the same
-                    // `instance_id`.
-                    if let Ok(mut guard) = reapers_for_reaper.lock()
-                        && let std::collections::hash_map::Entry::Occupied(entry) =
-                            guard.entry(reaper_key_for_task)
-                        && entry.get().0 == my_gen
-                    {
-                        entry.remove();
-                    }
-                });
-                // Track the reaper handle keyed by `(gen,
-                // JoinHandle)`. If a same-instance entry is
-                // somehow already present, its
-                // JoinHandle is dropped — that detaches the
-                // old reaper but leaves its work scheduled;
-                // the conditional remove above still keys off
-                // gen, so the drop doesn't race the fresh
-                // reaper's cleanup.
-                if let Ok(mut guard) = reapers_for_spawn.lock() {
-                    guard.insert(reaper_key, (my_gen, reaper_join));
-                }
+                self.spawn_tracked_reaper(&handle, instance_id_for_spawn, plugin_id, None);
                 handle
             })
             .map_err(|err| match err {
@@ -1221,6 +1182,106 @@ impl Engine {
         report
     }
 
+    /// Spawn the reaper for a freshly supervised instance and track its
+    /// `JoinHandle` for [`Self::drain_supervised_instances`]. Once the
+    /// instance reaches a terminal state the reaper drops its sandbox
+    /// entry (for a sandbox, `slot`), stops the sandboxes it started
+    /// (ADR-0001), releases its registry state and unregisters it.
+    ///
+    /// Runs inside the instance registry's `register` factory, so it
+    /// must not block.
+    fn spawn_tracked_reaper(
+        &self,
+        handle: &InstanceHandle,
+        instance_id: String,
+        plugin_id: String,
+        slot: Option<sandbox::SandboxSlot>,
+    ) {
+        let engine = self.clone();
+        let reaper_handle = handle.clone();
+        let reapers = Arc::clone(&self.reapers);
+        let reaper_key: Arc<str> = Arc::from(instance_id.as_str());
+        let reaper_key_for_task = Arc::clone(&reaper_key);
+        // Round-2 F2: mint a monotonic generation for THIS reaper
+        // spawn. The reaper only removes its tracker entry if the
+        // map's stored gen still matches — so a fresh start that
+        // reuses the same `instance_id` can't have its brand-new
+        // tracker entry clobbered by the old reaper's key-only remove.
+        let my_gen = self
+            .reaper_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reaper_join = tokio::spawn(async move {
+            let _ = reaper_handle.wait_terminal().await;
+            // A dead sandbox leaves its parent's list first, so a
+            // restart of the same `local-id` sees "still stopping"
+            // (retryable) rather than a stale live entry.
+            if let Some(slot) = slot {
+                engine
+                    .sandboxes
+                    .remove_if_current(&slot.parent, &slot.local_id, slot.generation);
+            }
+            engine.stop_sandboxes_of(&instance_id);
+            // Drop any device/service registry entries the instance
+            // left behind. The supervisor sweeps at the top of every
+            // load attempt; this is the final post-terminal cleanup so
+            // a Stopped / Failed instance leaves nothing behind.
+            engine.release_instance_state(&instance_id);
+            engine.instances.unregister(&instance_id, &plugin_id);
+            if let Ok(mut guard) = reapers.lock()
+                && let std::collections::hash_map::Entry::Occupied(entry) =
+                    guard.entry(reaper_key_for_task)
+                && entry.get().0 == my_gen
+            {
+                entry.remove();
+            }
+        });
+        // If a same-instance entry is somehow already present, its
+        // JoinHandle is dropped — that detaches the old reaper but
+        // leaves its work scheduled; the conditional remove above
+        // still keys off gen, so the drop doesn't race the fresh
+        // reaper's cleanup.
+        if let Ok(mut guard) = self.reapers.lock() {
+            guard.insert(reaper_key, (my_gen, reaper_join));
+        }
+    }
+
+    /// ADR-0001: spawn the supervisor for one script sandbox, a child
+    /// of the instance `launcher` belongs to. Bypasses the singleton
+    /// rules (a sandbox is part of its parent) but not the duplicate-id
+    /// or shutdown gates.
+    pub(crate) fn spawn_sandbox_supervisor(
+        &self,
+        launcher: &sandbox::SandboxLauncher,
+        plugin_id: &str,
+        script: Arc<sandbox::SandboxScript>,
+        slot: sandbox::SandboxSlot,
+    ) -> Result<InstanceHandle, RegistryError> {
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(RegistryError::ShuttingDown);
+        }
+        let instance_id = script.instance_id.clone();
+        self.instances.register_child(instance_id.clone(), || {
+            let handle = lifecycle::supervise_sandbox(
+                self.clone(),
+                launcher,
+                instance_id.clone(),
+                plugin_id.to_owned(),
+                script,
+            );
+            self.spawn_tracked_reaper(&handle, instance_id, plugin_id.to_owned(), Some(slot));
+            handle
+        })
+    }
+
+    /// ADR-0001: the live script sandboxes, per parent instance.
+    #[must_use]
+    pub fn sandboxes(&self) -> Arc<SandboxRegistry> {
+        Arc::clone(&self.sandboxes)
+    }
+
     /// Post-terminal cleanup for one instance: drop the device and
     /// service registry entries it owns and mark its device-state
     /// projection `Stale`. The supervisor's reaper runs this once an
@@ -1251,6 +1312,15 @@ impl Engine {
     pub fn instance(&self, instance_id: &str) -> Option<InstanceHandle> {
         self.instances.get(instance_id)
     }
+}
+
+/// Whether an operator may start an instance under `instance_id`: a
+/// safe instance id ([`crate::state::is_safe_instance_id`]) without
+/// [`SANDBOX_SEPARATOR`], which only host-minted script sandbox ids
+/// carry (ADR-0001).
+#[must_use]
+pub fn is_operator_instance_id(instance_id: &str) -> bool {
+    crate::state::is_safe_instance_id(instance_id) && !instance_id.contains(SANDBOX_SEPARATOR)
 }
 
 /// Migration 14 is the H2 rekey that dropped the legacy

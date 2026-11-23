@@ -1,0 +1,39 @@
+manifest_version = 1
+
+[plugin]
+id = "example.script-host"
+name = "Script Host"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "A toy scripting plugin that runs each script in its own sandbox (ADR-0001)."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/script-host"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "service", "script", "sandbox"]
+world = "plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+singleton = false
+wasm = "target/wasm32-wasip2/debug/script_host.wasm"
+# A crashing script restarts on its own; so does the manager.
+restart = "on-trap"
+
+[capabilities]
+# `scripts` is the manager service of the instance the operator starts;
+# every sandbox registers one `script` service.
+declares_services = ["scripts", "script"]
+# Each instance may run up to 8 script sandboxes at once.
+script_sandboxes = 8
+# The manager keeps loaded scripts in KV so its next life re-adopts
+# them (and a daemon restart re-creates them).
+storage_quota_kb = 256
+
+# Let scripts call each other. Every script registers the service
+# `script` in its own sandbox instance (`<manager>~<script>`), so one
+# grant covers them; an operator narrows the granted copy per script
+# with exact `instance` / `caller_instance` values.
+[[capabilities.consumes_services]]
+plugin   = "example.script-host"
+instance = "*"
+service  = "script"
+commands = ["*"]

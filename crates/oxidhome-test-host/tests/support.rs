@@ -33,6 +33,7 @@ pub const SNAPSHOT_SAVER: (&str, &str) = ("snapshot-saver", "snapshot_saver.wasm
 pub const CRASHER: (&str, &str) = ("crasher", "crasher.wasm");
 pub const HANG: (&str, &str) = ("hang", "hang.wasm");
 pub const DEFERRED_SWITCH: (&str, &str) = ("deferred-switch", "deferred_switch.wasm");
+pub const SCRIPT_HOST: (&str, &str) = ("script-host", "script_host.wasm");
 
 /// Build `examples/<dir>` for `wasm32-wasip2` (once per test binary)
 /// and return the artifact path.

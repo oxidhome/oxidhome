@@ -197,6 +197,31 @@ impl InstanceRegistry {
         Ok(handle)
     }
 
+    /// ADR-0001: register a script sandbox. Same shutdown gate and
+    /// duplicate-id check as [`Self::register`], but no singleton rules:
+    /// a sandbox is part of its parent instance, which already holds
+    /// any singleton slot. `factory` runs under the registry lock and
+    /// must not block.
+    pub(crate) fn register_child<F>(
+        &self,
+        instance_id: String,
+        factory: F,
+    ) -> Result<InstanceHandle, RegistryError>
+    where
+        F: FnOnce() -> InstanceHandle,
+    {
+        let mut guard = self.inner.lock().expect("instance registry mutex poisoned");
+        if guard.shutting_down {
+            return Err(RegistryError::ShuttingDown);
+        }
+        if guard.instances.contains_key(&instance_id) {
+            return Err(RegistryError::DuplicateInstanceId { instance_id });
+        }
+        let handle = factory();
+        guard.instances.insert(instance_id, handle.clone());
+        Ok(handle)
+    }
+
     /// Remove an entry once its supervisor reaches a terminal state.
     /// Frees the singleton slot iff *this* instance still owns it
     /// (paranoia against a future race where the slot was already

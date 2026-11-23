@@ -1637,7 +1637,7 @@ async fn start_plugin_instance(
     // under `Path::join`, `..` escapes it, `\0` truncates on
     // POSIX. Also rejected: empty and leading-`.` which collide
     // with the blob-store `.tmp` staging convention.
-    if !crate::state::is_safe_instance_id(&instance_id) {
+    if !crate::runtime::is_operator_instance_id(&instance_id) {
         return Err(PluginLifecycleError::BadInstanceId(instance_id));
     }
     // H2 round-2 F1: serialize against a concurrent uninstall

@@ -60,6 +60,13 @@ pub mod storage;
 /// without buffering end-to-end.
 pub mod blobs;
 
+/// One sandbox per script (ADR-0001). A scripting plugin starts each
+/// user script in its own child instance with
+/// `oxidhome_sdk::host::sandboxes::start`, and the sandboxed instance
+/// reads its script with `current`. Gated by
+/// `[capabilities] script_sandboxes`.
+pub mod sandboxes;
+
 // ── Devices ──────────────────────────────────────────────────────────
 
 /// Register a device with the host. Accepts either a
@@ -224,7 +231,11 @@ pub fn resolve_service(
 /// returns [`Error::InvalidArgument`] with the message
 /// `same-instance dispatch is not supported`. Plugins colocating
 /// multiple services in one instance dispatch between them in
-/// plugin-local code.
+/// plugin-local code; scripting plugins run each script in its own
+/// [`sandboxes`] instance instead, so scripts call each other here.
+///
+/// A callee that traps after the call reached it yields
+/// `Ok(CommandResult::Unknown(..))`: it may have acted.
 ///
 /// # Errors
 ///

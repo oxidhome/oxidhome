@@ -391,7 +391,7 @@ impl TestHost {
         } = options;
         let reservation = match instance_id {
             Some(id) => {
-                if !oxidhome_core::state::is_safe_instance_id(&id) {
+                if !oxidhome_core::runtime::is_operator_instance_id(&id) {
                     return Err(TestHostError::InvalidInstanceId(id));
                 }
                 Reservation::claim(&self.engine, &self.live, id)?

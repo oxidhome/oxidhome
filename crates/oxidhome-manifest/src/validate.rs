@@ -66,6 +66,12 @@ pub enum ValidationError {
     TooManyConsumesServicesGrants { count: usize, max: usize },
 
     #[error(
+        "capabilities.script_sandboxes is {count}; the cap is {max}. Each sandbox \
+         is a separate store with its own memory ceiling."
+    )]
+    TooManyScriptSandboxes { count: u32, max: u32 },
+
+    #[error(
         "capabilities.consumes_services[{index}].commands has {count} entries; \
          the cap is {max}. Use `[\"*\"]` to authorize every command instead of \
          enumerating them past the cap."
@@ -324,6 +330,11 @@ pub const MIN_TICK_INTERVAL_MS: u64 = 10;
 /// non-DoS-able from the manifest side.
 pub const MAX_CONSUMES_SERVICES_GRANTS: usize = 128;
 
+/// ADR-0001: cap on `capabilities.script_sandboxes`. Every sandbox
+/// is a full `Store` with its own memory ceiling, so the cap bounds
+/// one scripting-plugin instance's aggregate footprint.
+pub const MAX_SCRIPT_SANDBOXES: u32 = 64;
+
 /// H9 round-14 finding 2: cap on
 /// `capabilities.declares_devices` — the list of
 /// capabilities this plugin is authorized to publish on
@@ -418,6 +429,12 @@ pub fn check_capability_limits(
         errors.push(ValidationError::TooManyConsumesServicesGrants {
             count: caps.consumes_services.len(),
             max: MAX_CONSUMES_SERVICES_GRANTS,
+        });
+    }
+    if caps.script_sandboxes > MAX_SCRIPT_SANDBOXES {
+        errors.push(ValidationError::TooManyScriptSandboxes {
+            count: caps.script_sandboxes,
+            max: MAX_SCRIPT_SANDBOXES,
         });
     }
     for (index, grant) in caps.consumes_services.iter().enumerate() {
@@ -1297,6 +1314,21 @@ mod tests {
             e,
             ValidationError::TooManyConsumesServicesGrants { count, max }
                 if *max == MAX_CONSUMES_SERVICES_GRANTS && *count == MAX_CONSUMES_SERVICES_GRANTS + 1
+        )));
+    }
+
+    /// ADR-0001: `script_sandboxes` is capped; the cap itself passes.
+    #[test]
+    fn script_sandboxes_reject_over_cap() {
+        let mut m = ok_manifest();
+        m.capabilities.script_sandboxes = MAX_SCRIPT_SANDBOXES;
+        assert!(validate(&m).is_ok());
+        m.capabilities.script_sandboxes = MAX_SCRIPT_SANDBOXES + 1;
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::TooManyScriptSandboxes { count, max }
+                if *max == MAX_SCRIPT_SANDBOXES && *count == MAX_SCRIPT_SANDBOXES + 1
         )));
     }
 
