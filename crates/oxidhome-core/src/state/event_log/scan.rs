@@ -166,24 +166,43 @@ fn decode_row(
     id: u64,
     bad: &mut BadRows,
 ) -> Result<Option<Event>, EventLogError> {
-    let blob: Vec<u8> = row.get(6)?;
-    match serde_json::from_slice::<StoredEventPayload>(&blob) {
-        Ok(stored) => Ok(Some(Event {
+    let decoded = (|| -> Result<Result<Event, String>, rusqlite::Error> {
+        let stored = match row.get_ref(6)? {
+            rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b) => {
+                serde_json::from_slice::<StoredEventPayload>(b)
+            }
+            other => return Ok(Err(format!("payload_blob is {:?}", other.data_type()))),
+        };
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(err) => return Ok(Err(err.to_string())),
+        };
+        Ok(Ok(Event {
             device: row.get(2)?,
             timestamp: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
             origin_plugin_id: row.get(4)?,
             origin_instance_id: row.get(3)?,
             row_id: Some(id),
             payload: stored.into_wit(),
-        })),
-        Err(err) => {
-            bad.count += 1;
-            if bad.first.is_none() {
-                bad.first = Some((id, err.to_string()));
-            }
-            Ok(None)
-        }
+        }))
+    })();
+    let error = match decoded {
+        Ok(Ok(event)) => return Ok(Some(event)),
+        Ok(Err(error)) => error,
+        // A column of the wrong type is this row's problem, not the
+        // statement's: skip the row like a bad payload.
+        Err(
+            err @ (rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)),
+        ) => err.to_string(),
+        Err(err) => return Err(err.into()),
+    };
+    bad.count += 1;
+    if bad.first.is_none() {
+        bad.first = Some((id, error));
     }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -350,6 +369,21 @@ mod tests {
             .expect("scan")
             .expect("cursor");
         assert_eq!(ids(&page), vec![1, 3]);
+        assert_eq!(page.next_after_id, 3);
+        // A column of the wrong type is skipped the same way.
+        log.db
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE event_log SET payload_blob = 42, device_id = x'00' WHERE id = 3",
+                    (),
+                )
+            })
+            .expect("corrupt");
+        let page = log
+            .scan_after_cursor(0, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![1]);
         assert_eq!(page.next_after_id, 3);
     }
 

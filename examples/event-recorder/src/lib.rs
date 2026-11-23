@@ -188,6 +188,14 @@ impl EventRecorder {
     }
 }
 
+/// Whether `json` is exactly the host's withheld-bytes marker,
+/// `{"withheld":"bytes","size_bytes":N,"required_scope":"reads_event_bytes"}`.
+fn is_withheld_marker(json: &str) -> bool {
+    json.strip_prefix("{\"withheld\":\"bytes\",\"size_bytes\":")
+        .and_then(|rest| rest.strip_suffix(",\"required_scope\":\"reads_event_bytes\"}"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Log one handled event (live or replayed) in a stable shape, so the
 /// integration test's log-capture assertion can match it.
 fn log_event(event: &Event, seen: i64) {
@@ -245,12 +253,7 @@ fn read_events(args: &[KeyValue]) -> CommandResult {
                     for kv in &sc.fields {
                         match &kv.value {
                             Value::BytesVal(_) => bytes += 1,
-                            Value::JsonVal(j)
-                                if j.starts_with("{\"withheld\":\"bytes\",")
-                                    && j.ends_with("\"required_scope\":\"reads_event_bytes\"}") =>
-                            {
-                                withheld += 1;
-                            }
+                            Value::JsonVal(j) if is_withheld_marker(j) => withheld += 1,
                             _ => {}
                         }
                     }

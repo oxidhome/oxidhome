@@ -4,6 +4,7 @@
 //! carries its declared identity, capabilities, and resolved
 //! per-instance config.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -1401,8 +1402,10 @@ impl PluginInstance {
         // fan-out (it is in every matching queue); later ones may not
         // have yet.
         let cutoff = state.events.row_watermark().get();
-        let mut events = Vec::new();
+        // One FIFO run per subscription, merged below.
+        let mut runs: Vec<VecDeque<(u64, Event)>> = Vec::new();
         for sub in &mut state.subscriptions {
+            let mut events = VecDeque::new();
             // A held event goes first; while it is still above the
             // cutoff, the rest of its queue waits behind it (FIFO).
             if let Some((rows_through, ev)) = sub.held.take() {
@@ -1410,7 +1413,7 @@ impl PluginInstance {
                     sub.held = Some((rows_through, ev));
                     continue;
                 }
-                events.push((rows_through, ev));
+                events.push_back((rows_through, ev));
             }
             // Take at most what is queued now, so publishers refilling
             // the queue can't keep this drain going.
@@ -1465,7 +1468,10 @@ impl PluginInstance {
                     sub.held = Some((rows_through, ev));
                     break;
                 }
-                events.push((rows_through, ev));
+                events.push_back((rows_through, ev));
+            }
+            if !events.is_empty() {
+                runs.push(events);
             }
         }
         // Each subscription has its own queue, so draining them one
@@ -1475,11 +1481,12 @@ impl PluginInstance {
         // `rows_through` is the bus watermark at each fan-out (an
         // event's own row id, or the last one fanned out before an
         // event without one), and recorded events above the cutoff
-        // are held (above). The sort is stable, so order within a
-        // queue is kept. (Two events without a row id on different
-        // queues share a key and keep drain order.)
-        events.sort_by_key(|(rows_through, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
-        events.into_iter().map(|(_, ev)| ev).collect()
+        // are held (above). The queues are merged by their front
+        // entries, so no event overtakes an earlier one from its own
+        // queue (an unserialized event without a row id can carry a
+        // key above a later recorded one). Ties keep subscription
+        // order.
+        merge_queues(runs)
     }
 
     /// The instance id this state was built with. Currently the plugin's
@@ -1684,6 +1691,76 @@ pub(crate) fn project_command_state(
         );
     }
     CommandResult::OkWithState(canonical)
+}
+
+/// Merge per-subscription FIFO runs of `(rows_through, event)` by
+/// their front entries' `(rows_through, row-id)` (no row id sorts
+/// last), so no event overtakes an earlier one from its own run. Ties
+/// keep run order.
+fn merge_queues(mut queues: Vec<VecDeque<(u64, Event)>>) -> Vec<Event> {
+    let key = |(rows_through, ev): &(u64, Event)| (*rows_through, ev.row_id.unwrap_or(u64::MAX));
+    let mut merged = Vec::with_capacity(queues.iter().map(VecDeque::len).sum());
+    while let Some(next) = queues
+        .iter()
+        .enumerate()
+        .filter_map(|(i, q)| q.front().map(|front| (key(front), i)))
+        .min()
+        .map(|(_, i)| i)
+    {
+        if let Some((_, ev)) = queues[next].pop_front() {
+            merged.push(ev);
+        }
+    }
+    merged
+}
+
+#[cfg(test)]
+mod merge_queues_tests {
+    use super::*;
+    use crate::host_impl::plugin::oxidhome::plugin::events::{CustomEvent, EventPayload};
+
+    fn ev(topic: &str, row_id: Option<u64>) -> Event {
+        Event {
+            device: None,
+            timestamp: 0,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: topic.into(),
+                payload: String::new(),
+            }),
+            origin_plugin_id: "p".into(),
+            origin_instance_id: "i".into(),
+            row_id,
+        }
+    }
+
+    fn topics(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match &e.payload {
+                EventPayload::Custom(c) => c.topic.clone(),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merges_by_row_id_across_queues() {
+        let a = VecDeque::from([(10, ev("a10", Some(10))), (12, ev("a12", Some(12)))]);
+        let b = VecDeque::from([(11, ev("b11", Some(11))), (12, ev("b-live", None))]);
+        assert_eq!(
+            topics(&merge_queues(vec![a, b])),
+            ["a10", "b11", "a12", "b-live"]
+        );
+    }
+
+    #[test]
+    fn never_reorders_within_a_queue() {
+        // A rowless event stamped with a watermark its recorded
+        // successor hadn't enqueued yet still goes first.
+        let a = VecDeque::from([(11, ev("live", None)), (11, ev("row11", Some(11)))]);
+        let b = VecDeque::from([(11, ev("b11", Some(11)))]);
+        assert_eq!(topics(&merge_queues(vec![a, b])), ["b11", "live", "row11"]);
+    }
 }
 
 #[cfg(test)]
