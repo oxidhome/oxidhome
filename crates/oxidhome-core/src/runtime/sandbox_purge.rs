@@ -146,6 +146,17 @@ pub(crate) fn mark(db: &Db, installation_uuid: &str, instance_id: &str) -> rusql
     })
 }
 
+/// Where the reaper finds the removal marker `stop-sandbox` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkerState {
+    Persisted,
+    /// The write failed (or there was none): the reaper writes it.
+    Failed,
+    /// Still being written past [`STORAGE_OP_DRAIN`] (a stalled
+    /// database writer): it lands later, and the next boot purges.
+    Writing,
+}
+
 /// What `stop-sandbox` tells the reaper once it has tried to persist a
 /// removal: the installation the sandbox's storage belongs to, and
 /// whether the marker committed.

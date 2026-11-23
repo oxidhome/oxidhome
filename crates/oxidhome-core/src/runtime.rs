@@ -1362,15 +1362,28 @@ impl Engine {
                 // waits for it here, so the marker can't land after the
                 // purge. A dropped sender (runtime teardown) doesn't
                 // hold this up.
-                let marked = marked
-                    .wait_for(Option::is_some)
-                    .await
-                    .ok()
-                    .and_then(|m| m.clone());
+                // Bounded, so a stalled database writer can't hold this
+                // reaper (and its parent's) forever.
+                let (marked, state) = match tokio::time::timeout(
+                    sandbox_purge::STORAGE_OP_DRAIN,
+                    marked.wait_for(Option::is_some),
+                )
+                .await
+                {
+                    Err(_) => (None, sandbox_purge::MarkerState::Writing),
+                    Ok(seen) => {
+                        let marked = seen.ok().and_then(|m| m.clone());
+                        let state = if marked.as_ref().is_some_and(|m| m.persisted) {
+                            sandbox_purge::MarkerState::Persisted
+                        } else {
+                            sandbox_purge::MarkerState::Failed
+                        };
+                        (marked, state)
+                    }
+                };
                 // The installation `stop-sandbox` marked under; else the
                 // sandbox's own, or (removed before it finished loading)
                 // its parent's.
-                let persisted = marked.as_ref().is_some_and(|m| m.persisted);
                 let installation = marked
                     .map(|m| m.installation_uuid)
                     .or_else(|| reaper_handle.installation_uuid().map(str::to_owned))
@@ -1381,7 +1394,7 @@ impl Engine {
                             .and_then(|parent| parent.installation_uuid().map(str::to_owned))
                     });
                 engine
-                    .retire_sandbox_instance(&instance_id, installation.as_deref(), persisted)
+                    .retire_sandbox_instance(&instance_id, installation.as_deref(), state)
                     .await;
             }
             engine.instances.unregister(&instance_id, &plugin_id);
@@ -1459,7 +1472,7 @@ impl Engine {
         &self,
         instance_id: &str,
         installation_uuid: Option<&str>,
-        marked: bool,
+        marker: sandbox_purge::MarkerState,
     ) {
         self.device_state.forget_instance(instance_id);
         self.events.forget_instance(instance_id);
@@ -1472,17 +1485,25 @@ impl Engine {
         // Before the registry entry goes: a start that finds the entry
         // gone finds the block.
         self.sandboxes.block_removal(removal.clone());
+        if marker == sandbox_purge::MarkerState::Writing {
+            tracing::error!(
+                instance_id,
+                "the removal marker of a script sandbox is still being written; its id stays \
+                 blocked and its purge runs at the next start",
+            );
+            return;
+        }
         // `stop-sandbox` already persisted the marker; retried here only
         // if that failed.
-        if !marked {
+        if marker == sandbox_purge::MarkerState::Failed {
             let db = Arc::clone(&self.db);
             let (uuid, id) = removal.clone();
-            let marked =
+            let written =
                 tokio::task::spawn_blocking(move || sandbox_purge::mark(&db, &uuid, &id)).await;
-            if !matches!(marked, Ok(Ok(()))) {
+            if !matches!(written, Ok(Ok(()))) {
                 // Purged below all the same; only a failure there
                 // loses the block at the next boot.
-                tracing::error!(instance_id, result = ?marked, "persisting the sandbox removal marker failed");
+                tracing::error!(instance_id, result = ?written, "persisting the sandbox removal marker failed");
             }
         }
         if !self

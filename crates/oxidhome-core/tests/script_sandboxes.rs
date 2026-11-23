@@ -751,6 +751,7 @@ async fn a_failed_purge_blocks_the_id_until_a_restart_finishes_it() {
     )
     .expect("trigger");
     let scripts = service_of(&engine, MANAGER, "scripts").await;
+    let child = engine.instance("main~a").expect("sandbox running");
     let outcome = call(&engine, scripts.clone(), "unload", vec![string("id", "a")]).await;
     assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
     // The removal is on disk once `stop-sandbox` returns, before the
@@ -763,7 +764,8 @@ async fn a_failed_purge_blocks_the_id_until_a_restart_finishes_it() {
         )
         .expect("marker");
     assert_eq!(marked, 1);
-    wait_gone(&engine, "main~a").await;
+    // Reaped, so out of the parent's list too (not "still stopping").
+    child.wait_reaped().await;
     let kv = engine.kv();
     assert!(kv.usage(&uuid, "main~a").expect("usage").is_some());
     assert!(engine.sandboxes().removal_pending("main~a"));
