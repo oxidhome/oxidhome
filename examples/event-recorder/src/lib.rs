@@ -245,7 +245,12 @@ fn read_events(args: &[KeyValue]) -> CommandResult {
                     for kv in &sc.fields {
                         match &kv.value {
                             Value::BytesVal(_) => bytes += 1,
-                            Value::JsonVal(j) if j.contains("\"withheld\"") => withheld += 1,
+                            Value::JsonVal(j)
+                                if j.starts_with("{\"withheld\":\"bytes\",")
+                                    && j.ends_with("\"required_scope\":\"reads_event_bytes\"}") =>
+                            {
+                                withheld += 1;
+                            }
                             _ => {}
                         }
                     }

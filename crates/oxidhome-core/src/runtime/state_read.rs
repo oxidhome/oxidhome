@@ -185,7 +185,7 @@ pub(crate) fn deny_audit_queue() -> Option<&'static std::sync::mpsc::SyncSender<
             .name("state-deny-audit".into())
             .spawn(move || deny_audit_worker(&rx, &DENY_AUDIT_DROPPED))
             .map_err(|err| {
-                tracing::error!(target: "host.audit", error = %err, "state-read audit worker not started");
+                tracing::error!(target: "host.audit", error = %err, "plugin-read audit worker not started");
             })
             .ok()
             .map(|_| tx)
@@ -200,7 +200,7 @@ fn deny_audit_worker(
     while let Ok(job) = rx.recv() {
         let lost = dropped.swap(0, std::sync::atomic::Ordering::Relaxed);
         if lost > 0 {
-            tracing::warn!(target: "host.audit", lost, "state-read deny rows dropped: queue full");
+            tracing::warn!(target: "host.audit", lost, "plugin-read deny rows dropped: queue full");
         }
         let (method, path, scope) = match &job.read {
             DeniedRead::State { device } => {
@@ -257,7 +257,7 @@ fn deny_audit_worker(
             command_outcome: None,
         };
         if let Err(err) = job.log.record_completed(&entry) {
-            tracing::error!(target: "host.audit", error = %err, "state-read deny row failed");
+            tracing::error!(target: "host.audit", method, error = %err, "plugin-read deny row failed");
         }
     }
 }

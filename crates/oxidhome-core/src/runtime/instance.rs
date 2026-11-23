@@ -1464,12 +1464,17 @@ impl PluginInstance {
         // kept. (Two events without a row id on different queues
         // share a key and keep drain order.)
         events.sort_by_key(|(rows_through, _, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
-        let split = events.partition_point(|(rows_through, _, _)| *rows_through <= cutoff);
-        // No self-wake needed: the publisher raises the watermark
-        // and only then signals the matching wakes (`notify_one`
-        // keeps a permit), so a later drain follows.
-        self.deferred_events = events.split_off(split);
-        events.into_iter().map(|(_, _, ev)| ev).collect()
+        // Only recorded events are held, so only their order is
+        // guaranteed. No self-wake is needed: a held event's own
+        // publisher raises the watermark and only then signals the
+        // wakes matching it (`notify_one` keeps a permit), so a later
+        // drain follows. An event without a row id can't be held:
+        // nothing would wake the plugin for it.
+        let (held, ready): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|(rows_through, _, ev)| *rows_through > cutoff && ev.row_id.is_some());
+        self.deferred_events = held;
+        ready.into_iter().map(|(_, _, ev)| ev).collect()
     }
 
     /// The instance id this state was built with. Currently the plugin's

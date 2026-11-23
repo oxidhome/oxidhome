@@ -88,9 +88,18 @@ impl EventLog {
             ])?;
             let mut scanned = 0;
             let mut bad = BadRows::default();
+            let mut hole = false;
             while let Some(row) = rows.next()? {
                 scanned += 1;
                 let id = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
+                if id != pos + 1 {
+                    // A hole inside history (left by pre-H4 retention,
+                    // which deleted by time): stop before it, so the
+                    // next read from `pos` reports `cursor-expired`
+                    // instead of silently crossing it.
+                    hole = true;
+                    break;
+                }
                 // An undecodable row is skipped (and logged once per
                 // scan) rather than failing every read that reaches it.
                 if let Some(mut event) = decode_row(row, id, &mut bad)? {
@@ -118,7 +127,7 @@ impl EventLog {
                 }
                 pos = id;
             }
-            if scanned < scan_budget {
+            if !hole && scanned < scan_budget {
                 // Nothing after `pos` in this snapshot: every row up
                 // to the snapshot's head has been seen.
                 pos = pos.max(head_id);
@@ -290,6 +299,25 @@ mod tests {
             .expect("cursor");
         assert!(page.events.is_empty());
         assert_eq!(page.next_after_id, 130);
+    }
+
+    #[test]
+    fn an_interior_hole_ends_the_page_and_then_expires() {
+        let log = log_with(5);
+        log.db
+            .write(|conn| conn.execute("DELETE FROM event_log WHERE id = 3", ()))
+            .expect("delete");
+        let page = log
+            .scan_after_cursor(1, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![2]);
+        assert_eq!(page.next_after_id, 2);
+        assert!(
+            log.scan_after_cursor(2, 10, |_| ScanStep::Take)
+                .expect("scan")
+                .is_err()
+        );
     }
 
     #[test]
