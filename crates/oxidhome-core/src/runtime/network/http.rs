@@ -31,6 +31,7 @@ use wasmtime_wasi_http::RequestOptions as RequestOptionsResource;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::outgoing_handler;
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode as HttpErrorCode;
+use wasmtime_wasi_http::p2::body::HostFutureTrailers;
 use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, HostOutgoingRequest};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
@@ -65,6 +66,13 @@ pub(super) fn add_to_linker(
                 Option<Resource<RequestOptionsResource>>,
             )| {
                 let mut view = store.data_mut().http();
+                // WIT: no path-with-query means an empty one; upstream
+                // would fail to build the URI without a path.
+                if let Ok(req) = view.table.get_mut(&request)
+                    && req.path_with_query.is_none()
+                {
+                    req.path_with_query = Some("/".to_owned());
+                }
                 let options_rep = options.as_ref().map(Resource::rep);
                 let result = outgoing_handler::Host::handle(&mut view, request, options);
                 if let Some(rep) = options_rep {
@@ -128,6 +136,24 @@ fn limit_request_setters(
             Ok((
                 wasmtime_wasi_http::p2::bindings::http::types::HostFutureIncomingResponse::get(
                     &mut view, response,
+                )?,
+            ))
+        },
+    )?;
+    // Same for `future-trailers.get`.
+    types.func_wrap(
+        "[method]future-trailers.get",
+        |mut store: Store<'_>, (trailers,): (Resource<HostFutureTrailers>,)| {
+            use futures_util::FutureExt as _;
+            use wasmtime_wasi::p2::Pollable as _;
+            let mut view = store.data_mut().http();
+            let entry = view.table.get_mut(&trailers)?;
+            if matches!(entry, HostFutureTrailers::Waiting(_)) {
+                let _ = entry.ready().now_or_never();
+            }
+            Ok((
+                wasmtime_wasi_http::p2::bindings::http::types::HostFutureTrailers::get(
+                    &mut view, trailers,
                 )?,
             ))
         },
@@ -284,9 +310,8 @@ async fn checked_addresses(
 /// never a fresh lookup.
 async fn connect_any(
     addrs: Vec<SocketAddr>,
-    connect_timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<tokio::net::TcpStream, Error> {
-    let deadline = tokio::time::Instant::now() + connect_timeout;
     let mut last_error = None;
     let count = addrs.len();
     for (i, addr) in addrs.into_iter().enumerate() {
@@ -359,7 +384,22 @@ async fn send(
     let permit = Arc::clone(&policy.http_requests)
         .try_acquire_owned()
         .map_err(|_| Error::ConnectionLimitReached)?;
-    let addrs = checked_addresses(&policy, using, &target, &host, port).await?;
+    let options = options.unwrap_or_default();
+    let connect_timeout = options.connect_timeout.unwrap_or(CONNECT_TIMEOUT);
+    let first_byte_timeout = options.first_byte_timeout.unwrap_or(FIRST_BYTE_TIMEOUT);
+    let between_bytes_timeout = options
+        .between_bytes_timeout
+        .unwrap_or(BETWEEN_BYTES_TIMEOUT)
+        .max(Duration::from_millis(1));
+    // One connect deadline covers the lookup, every address tried and
+    // the HTTP handshake.
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let addrs = tokio::time::timeout_at(
+        deadline,
+        checked_addresses(&policy, using, &target, &host, port),
+    )
+    .await
+    .map_err(|_| Error::ConnectionTimeout)??;
     if tls {
         // Checked first, so a target the rules don't allow is refused
         // (and audited) as such.
@@ -368,17 +408,9 @@ async fn send(
         )));
     }
 
-    let options = options.unwrap_or_default();
-    let connect_timeout = options.connect_timeout.unwrap_or(CONNECT_TIMEOUT);
-    let first_byte_timeout = options.first_byte_timeout.unwrap_or(FIRST_BYTE_TIMEOUT);
-    let between_bytes_timeout = options
-        .between_bytes_timeout
-        .unwrap_or(BETWEEN_BYTES_TIMEOUT)
-        .max(Duration::from_millis(1));
-
-    let stream = connect_any(addrs, connect_timeout).await?;
-    let (mut sender, conn) = tokio::time::timeout(
-        connect_timeout,
+    let stream = connect_any(addrs, deadline).await?;
+    let (mut sender, conn) = tokio::time::timeout_at(
+        deadline,
         hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(stream)),
     )
     .await

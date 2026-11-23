@@ -87,7 +87,8 @@ pub(crate) fn check_world_exports(
         .any(|(name, item)| {
             name.starts_with(STREAMING_EXPORT)
                 && matches!(item.ty, wasmtime::component::types::ComponentItem::ComponentInstance(instance)
-                    if instance.exports(engine).any(|(f, _)| f == "setup-pipeline"))
+                    if instance.exports(engine).any(|(f, item)| f == "setup-pipeline"
+                        && matches!(item.ty, wasmtime::component::types::ComponentItem::ComponentFunc(_))))
         });
     anyhow::ensure!(
         exports_streaming,

@@ -144,7 +144,8 @@ fn http(url: &str) -> Result<String, String> {
 /// would).
 fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), String> {
     let (scheme, rest) = url.split_once("://").ok_or("no scheme")?;
-    let (authority, path) = rest.find('/').map_or((rest, "/"), |i| rest.split_at(i));
+    // No `/` after the authority: leave the path unset (`none`).
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
     let scheme = match scheme {
         "http" => Scheme::Http,
         "https" => Scheme::Https,
@@ -156,9 +157,11 @@ fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), St
     request
         .set_authority(Some(authority))
         .map_err(|()| "authority")?;
-    request
-        .set_path_with_query(Some(path))
-        .map_err(|()| "path")?;
+    if !path.is_empty() {
+        request
+            .set_path_with_query(Some(path))
+            .map_err(|()| "path")?;
+    }
     let body = request.body().map_err(|()| "body")?;
     OutgoingBody::finish(body, None).map_err(|e| format!("{e:?}"))?;
 
@@ -206,6 +209,18 @@ fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), St
         }
     }
     drop(stream);
-    let _ = IncomingBody::finish(incoming);
+    let trailers = IncomingBody::finish(incoming);
+    if !block {
+        // Polled like the response: `get` until it answers.
+        let deadline = Instant::now() + POLL_WAIT;
+        loop {
+            match trailers.get() {
+                Some(Ok(Ok(_))) => break,
+                Some(other) => return Err(format!("trailers: {other:?}")),
+                None if Instant::now() > deadline => return Err("trailers not ready".into()),
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
     Ok((status, location, body))
 }

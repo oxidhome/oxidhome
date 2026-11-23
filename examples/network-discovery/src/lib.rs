@@ -94,11 +94,9 @@ fn drain_socket(socket: &UdpSocket, buf: &mut [u8]) -> i64 {
         match socket.recv_from(buf) {
             Ok((n, from)) => {
                 let payload = String::from_utf8_lossy(&buf[..n]);
-                replies += 1;
-                if let Err(e) =
-                    host::publish_custom_event(None, REPLY_TOPIC, format!("{from} {payload}"))
-                {
-                    oxidhome_sdk::tracing::warn!(error = ?e, "publishing a reply failed");
+                match host::publish_custom_event(None, REPLY_TOPIC, format!("{from} {payload}")) {
+                    Ok(()) => replies += 1,
+                    Err(e) => oxidhome_sdk::tracing::warn!(error = ?e, "publishing a reply failed"),
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,

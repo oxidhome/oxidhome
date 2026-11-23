@@ -430,6 +430,8 @@ async fn http_requests_are_checked_on_every_hop() {
             // A plugin that only calls `get` (no pollable) gets its
             // response too.
             format!("httppoll http://127.0.0.1:{}/ok", allowed.port()),
+            // No path set at all: sent as `/`.
+            format!("http http://127.0.0.1:{}", allowed.port()),
             // The plugin follows the 302 itself; the second hop is a new
             // request, refused like any other.
             format!("http http://127.0.0.1:{}/redirect", allowed.port()),
@@ -449,13 +451,14 @@ async fn http_requests_are_checked_on_every_hop() {
     .await;
     assert_eq!(results[0], "ok:200:hello");
     assert_eq!(results[1], "ok:200:hello");
-    assert_eq!(results[2], "err:ErrorCode::HttpRequestDenied");
+    assert_eq!(results[2], "ok:200:hello");
     assert_eq!(results[3], "err:ErrorCode::HttpRequestDenied");
     assert_eq!(results[4], "err:ErrorCode::HttpRequestDenied");
-    assert!(results[5].starts_with("err:"), "{results:?}");
-    assert_eq!(results[6], "err:path");
-    // Only the two `/ok` requests and the redirecting hop reached it.
-    assert_eq!(allowed.accepted(), 3);
+    assert_eq!(results[5], "err:ErrorCode::HttpRequestDenied");
+    assert!(results[6].starts_with("err:"), "{results:?}");
+    assert_eq!(results[7], "err:path");
+    // Only the three allowed requests and the redirecting hop reached it.
+    assert_eq!(allowed.accepted(), 4);
     assert_eq!(
         forbidden.accepted(),
         0,
