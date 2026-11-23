@@ -938,6 +938,41 @@ pub struct Db {
     pre_open_user_version: i64,
 }
 
+/// The full pathname `SQLite` resolved for the `main` database of
+/// `conn`, read as raw bytes from `PRAGMA database_list`.
+/// `Connection::path()` returns `None` for a non-UTF-8 path, and
+/// re-resolving the name ourselves would race a symlink retargeted
+/// after the open, so the bytes are taken as they are (Unix paths
+/// are arbitrary bytes). Elsewhere a path must be UTF-8.
+fn opened_main_path(conn: &Connection) -> anyhow::Result<PathBuf> {
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            (),
+            |row| match row.get_ref(0)? {
+                rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => {
+                    Ok(b.to_vec())
+                }
+                _ => Ok(Vec::new()),
+            },
+        )
+        .context("reading the main database path")?;
+    anyhow::ensure!(
+        !bytes.is_empty(),
+        "SQLite reported no file path for the main database"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        let s = String::from_utf8(bytes).context("database path is not valid UTF-8")?;
+        Ok(PathBuf::from(s))
+    }
+}
+
 impl Db {
     /// Open an in-memory database. Each call returns its own database
     /// — no shared state. Used by [`crate::Engine::new`] for the
@@ -991,13 +1026,8 @@ impl Db {
         // Pin every later connection to the file the writer actually
         // opened: `SQLite` reports the full pathname it resolved
         // (symlinks included), so a link retargeted during or after
-        // startup can't split readers from the writer. Fall back to
-        // resolving the name ourselves if the path isn't UTF-8.
-        let path = match conn.path().filter(|p| !p.is_empty()) {
-            Some(opened) => PathBuf::from(opened),
-            None => std::fs::canonicalize(&path)
-                .with_context(|| format!("resolving {}", path.display()))?,
-        };
+        // startup can't split readers from the writer.
+        let path = opened_main_path(&conn)?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("setting busy_timeout")?;
         // WAL: many concurrent readers + one writer, plus crash safety
@@ -2562,6 +2592,54 @@ mod tests {
             .expect("count");
         assert_eq!(
             n, 2,
+            "the reader must open the writer's file, not the new link target"
+        );
+    }
+
+    /// The writer's path comes from `PRAGMA database_list`, so it
+    /// matches what `rusqlite` reports for a UTF-8 path.
+    #[test]
+    fn opened_main_path_matches_connection_path() {
+        let dir = tempdir_for_test();
+        let file = std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .join(DB_FILE_NAME);
+        let conn = Connection::open(&file).expect("open");
+        let opened = opened_main_path(&conn).expect("path");
+        assert_eq!(opened.to_str(), conn.path());
+        assert_eq!(opened, file);
+        let mem = Connection::open_in_memory().expect("memory");
+        assert!(opened_main_path(&mem).is_err(), "`:memory:` has no file");
+    }
+
+    /// M6 follow-up: a non-UTF-8 state dir still pins readers to the
+    /// writer's file (the bytes come from `PRAGMA database_list`
+    /// instead of a re-resolve). Skipped where the filesystem refuses
+    /// non-UTF-8 names (APFS).
+    #[cfg(unix)]
+    #[test]
+    fn readers_follow_the_writer_under_a_non_utf8_state_dir() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let base = tempdir_for_test();
+        let dir = base
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"state-\xff\xfe"));
+        if std::fs::create_dir(&dir).is_err() {
+            return;
+        }
+        let targets = tempdir_for_test();
+        let link = dir.join(DB_FILE_NAME);
+        std::os::unix::fs::symlink(targets.path().join("first.db"), &link).expect("dangling link");
+        let db = Db::open_file(&dir).expect("open");
+        db.write(|c| insert_log_rows(c, 3)).expect("insert");
+        drop(Db::open_file(targets.path()).expect("other db"));
+        std::fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink(targets.path().join(DB_FILE_NAME), &link).expect("relink");
+        let n: i64 = db
+            .read(|c| c.query_row("SELECT COUNT(*) FROM log_event", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(
+            n, 3,
             "the reader must open the writer's file, not the new link target"
         );
     }
