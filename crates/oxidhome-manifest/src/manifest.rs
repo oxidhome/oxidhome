@@ -197,8 +197,8 @@ pub struct CapabilitiesSection {
     /// plugin may read through `host-state::get-state` /
     /// `list-state`, beyond its own devices (always readable). Empty
     /// / absent ⇒ every read of another instance's device is refused
-    /// (`get-state` returns `permission-denied`, `list-state` leaves
-    /// it out). See [`StateGrant`]. The effective grant is the
+    /// (`get-state` returns `not-found`, the same as for an unknown
+    /// device; `list-state` leaves it out). See [`StateGrant`]. The effective grant is the
     /// requested ∩ granted lists (equal entries), capped at
     /// [`crate::validate::MAX_READS_STATE_GRANTS`].
     #[serde(default)]

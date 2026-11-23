@@ -156,7 +156,7 @@ pub(super) struct Dirty {
 
 impl Dirty {
     pub(super) fn touch(&mut self, key: &Key) {
-        if !self.rewrite_all {
+        if !self.rewrite_all && !self.keys.contains(key) {
             if self.keys.len() >= MAX_DIRTY_KEYS {
                 self.rewrite_all = true;
                 self.keys.clear();
@@ -276,8 +276,27 @@ impl DeviceStateStore {
         }
         // Restored values are unconfirmed until the owner republishes.
         let now = crate::state::event_log::now_unix_ms();
-        let flipped =
-            Self::stale_where_locked(&mut inner, now, |_, e| e.quality == StateQuality::Fresh);
+        // Flipped here rather than through `stale_where_locked`: that
+        // enforces the runtime stale cap, which would evict (and the
+        // boot flush delete) persisted slots on a big install. The cap
+        // applies again from the next runtime stale transition.
+        let fresh_keys: Vec<Key> = inner
+            .entries
+            .iter()
+            .filter(|(_, e)| e.quality == StateQuality::Fresh)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &fresh_keys {
+            let global_revision = inner.next_revision();
+            if let Some(entry) = inner.entries.get_mut(key) {
+                let e = Arc::make_mut(entry);
+                e.global_revision = global_revision;
+                e.received_ms = now;
+                e.quality = StateQuality::Stale;
+            }
+            inner.touch(key);
+        }
+        let flipped = fresh_keys.len();
         // A first boot (no meta row) still writes the meta row now, so
         // the epoch is durable before any client sees it.
         inner.dirty.as_mut().expect("set above").signal.notify();
@@ -471,9 +490,14 @@ fn restore_revisions(
     // watermark at or below the new base (a backup restore raises it
     // to exactly that); anything else is damage, since a watermark
     // above the base would reset every future cursor.
+    // A row newer than the meta revision can't come from a consistent
+    // flush (both are written in one transaction), and an epoch the
+    // cursor format can't carry would break pagination: damage too.
     let usable = flushed <= MAX_RESTORABLE_REVISION
         && meta.as_ref().is_none_or(|m| {
-            m.evicted_through <= flushed.saturating_add(REVISION_GAP)
+            m.revision >= max_row_revision
+                && super::is_valid_epoch(&m.epoch)
+                && m.evicted_through <= flushed.saturating_add(REVISION_GAP)
                 && m.holes.iter().all(|&(lo, hi)| lo < hi && hi <= flushed)
         });
     if let Some(meta) = meta.filter(|_| usable) {
@@ -860,10 +884,10 @@ fn decode_row(row: &rusqlite::Row<'_>) -> Option<DeviceState> {
         // next restart: damage.
         source_generation: Some(to_u64(row.get(8).ok()?))
             .filter(|g| *g <= MAX_RESTORABLE_REVISION)?,
-        quality: if quality == "fresh" {
-            StateQuality::Fresh
-        } else {
-            StateQuality::Stale
+        quality: match quality.as_str() {
+            "fresh" => StateQuality::Fresh,
+            "stale" => StateQuality::Stale,
+            _ => return None,
         },
     })
 }
@@ -1306,6 +1330,8 @@ mod tests {
             "UPDATE device_state_meta SET holes_json = x'00'",
             "UPDATE device_state_meta SET revision = -1",
             "UPDATE device_state_meta SET evicted_through = -1",
+            "UPDATE device_state_meta SET epoch = ''",
+            "UPDATE device_state_meta SET revision = 0",
         ] {
             let dir = tempdir();
             let store = open(&dir);
@@ -1346,6 +1372,39 @@ mod tests {
         let store = open(&dir);
         assert!(store.snapshot_capability("dev-b", "switch").is_none());
         assert!(store.snapshot_capability("dev-a", "switch").is_some());
+        assert!(store.close_persistence());
+    }
+
+    /// PR round 1: restoring more fresh slots than the runtime stale
+    /// cap keeps every one of them (and on disk).
+    #[test]
+    fn restore_keeps_more_slots_than_the_stale_cap() {
+        let dir = tempdir();
+        let store = open(&dir);
+        let n = super::super::MAX_STALE_ENTRIES + 3;
+        for i in 0..n {
+            put(&store, &format!("dev-{i:05}"), true);
+        }
+        assert!(store.close_persistence());
+        drop(store);
+        let store = open(&dir);
+        assert_eq!(
+            store
+                .snapshot_page_capped(None, usize::MAX, usize::MAX, usize::MAX, |_| true)
+                .devices
+                .len(),
+            n
+        );
+        assert!(store.close_persistence());
+        drop(store);
+        let store = open(&dir);
+        assert_eq!(
+            store
+                .snapshot_page_capped(None, usize::MAX, usize::MAX, usize::MAX, |_| true)
+                .devices
+                .len(),
+            n
+        );
         assert!(store.close_persistence());
     }
 }

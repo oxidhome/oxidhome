@@ -326,6 +326,14 @@ fn mint_cursor_secret() -> [u8; 32] {
 /// string. String encoding sidesteps JavaScript's 2⁵³ integer
 /// precision limit; hex is the same shape as
 /// `installed_plugins::mint_installation_uuid`.
+/// H2: whether a persisted epoch has the shape [`mint_epoch`] gives
+/// (the pagination cursor splits on `.`).
+fn is_valid_epoch(epoch: &str) -> bool {
+    epoch.strip_prefix("epoch-").is_some_and(|hex| {
+        !hex.is_empty() && hex.len() <= 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
 fn mint_epoch() -> String {
     let mut bytes = [0u8; 16];
     // `SysRng::try_fill_bytes` returns `Result<(), Infallible>` on
@@ -715,12 +723,14 @@ impl DeviceStateStore {
         device_id: &str,
     ) -> (String, u64, Vec<Arc<DeviceState>>) {
         let inner = self.inner_read();
-        // H2: range scan over the device's keys instead of the whole map.
+        // H2: range scan over the device's keys instead of the whole
+        // map. Bounded by the device id itself, not a sentinel
+        // capability, so no capability name can sort past the end.
         let lo = (device_id.to_string(), String::new());
-        let hi = (device_id.to_string(), MAX_CAP_SENTINEL.to_string());
         let entries: Vec<Arc<DeviceState>> = inner
             .entries
-            .range(lo..=hi)
+            .range(lo..)
+            .take_while(|((did, _), _)| did == device_id)
             .map(|(_, meta)| Arc::clone(meta))
             .collect();
         (inner.epoch.clone(), inner.global_revision, entries)
