@@ -76,7 +76,7 @@ libc = "0.2.189"
 # runtime/build graph keeps one copy and decoding understands what
 # bindgen embeds. (The dev-only `dummy-module` / `semver-check` features
 # add `wat` and a newer `wasmparser` to test builds.)
-wit-parser = { version = "=0.259.0", default-features = false, features = ["std", "decoding"] }
+wit-parser = { version = "=0.261.0", default-features = false, features = ["std", "decoding"] }
 wit-component = { version = "=0.259.0", default-features = false }
 anyhow = "1.0.102"
 ipnet = { version = "2.12.0", default-features = false, features = ["serde", "std"] }

@@ -1529,7 +1529,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wit-component 0.259.0",
- "wit-parser 0.259.0",
+ "wit-parser 0.261.0",
 ]
 
 [[package]]
@@ -1582,7 +1582,7 @@ dependencies = [
  "semver",
  "wit-bindgen 0.62.0",
  "wit-component 0.259.0",
- "wit-parser 0.259.0",
+ "wit-parser 0.261.0",
 ]
 
 [[package]]
