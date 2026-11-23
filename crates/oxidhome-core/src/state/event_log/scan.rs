@@ -25,6 +25,8 @@ pub enum ScanStep {
     /// with it. Treated as [`Self::Take`] while the page is empty, so
     /// every scan that finds a row makes progress.
     Full,
+    /// Keep the row and stop right after it (the page just filled).
+    TakeLast,
 }
 
 /// One [`EventLog::scan_after_cursor`] result.
@@ -46,11 +48,14 @@ impl EventLog {
     /// cursor check and every read share one `Db::read` closure, so
     /// they see one snapshot and a concurrent prune can't fall
     /// between them. `step` may rewrite the event it keeps (e.g. to
-    /// withhold bytes). An expired cursor is the inner `Err`.
+    /// withhold bytes). A row whose payload doesn't decode is skipped
+    /// (the cursor moves past it) and logged once per scan, so it
+    /// can't block every reader behind it. An expired cursor is the
+    /// inner `Err`.
     ///
     /// # Errors
     ///
-    /// Forwards any SQL or decode error.
+    /// Forwards any SQL error.
     pub fn scan_after_cursor(
         &self,
         after_id: u64,
@@ -95,6 +100,15 @@ impl EventLog {
                             return Ok(Ok(ScanPage {
                                 events,
                                 next_after_id: pos,
+                                head_id,
+                            }));
+                        }
+                        ScanStep::TakeLast => {
+                            events.push(event);
+                            bad.log();
+                            return Ok(Ok(ScanPage {
+                                events,
+                                next_after_id: id,
                                 head_id,
                             }));
                         }

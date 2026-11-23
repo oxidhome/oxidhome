@@ -62,6 +62,7 @@ impl EventRecorder {
                 let event = event.map_err(|e| format!("history read failed: {e:?}"))?;
                 if self.cursor.advance(&event) {
                     self.caught_up += 1;
+                    log_event(&event, self.count + self.caught_up);
                 }
             }
             if let Some(expired) = history.expired() {
@@ -117,21 +118,7 @@ impl Plugin for EventRecorder {
             return;
         }
         self.count += 1;
-        // Render a stable shape on every event so the integration
-        // test's log-capture assertion can match deterministically.
-        let topic = match &event.payload {
-            EventPayload::StateChanged(sc) => sc.capability.clone(),
-            EventPayload::Button(_) => "button".to_string(),
-            EventPayload::Inference(_) => "inference".to_string(),
-            EventPayload::Custom(c) => c.topic.clone(),
-        };
-        let device = event.device.as_deref().unwrap_or("<no-device>");
-        oxidhome_sdk::tracing::info!(
-            topic = %topic,
-            device = %device,
-            count = self.count,
-            "event-recorder received event",
-        );
+        log_event(&event, self.count);
         // Checkpoint only once the event is handled, so a crash before
         // this point replays it rather than skipping it.
         if event.row_id.is_some() {
@@ -199,6 +186,24 @@ impl EventRecorder {
             Err(e) => CommandResult::Err(e),
         }
     }
+}
+
+/// Log one handled event (live or replayed) in a stable shape, so the
+/// integration test's log-capture assertion can match it.
+fn log_event(event: &Event, seen: i64) {
+    let topic = match &event.payload {
+        EventPayload::StateChanged(sc) => sc.capability.clone(),
+        EventPayload::Button(_) => "button".to_string(),
+        EventPayload::Inference(_) => "inference".to_string(),
+        EventPayload::Custom(c) => c.topic.clone(),
+    };
+    let device = event.device.as_deref().unwrap_or("<no-device>");
+    oxidhome_sdk::tracing::info!(
+        topic = %topic,
+        device = %device,
+        count = seen,
+        "event-recorder received event",
+    );
 }
 
 fn arg<'a>(args: &'a [KeyValue], key: &str) -> Option<&'a Value> {

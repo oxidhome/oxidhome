@@ -129,7 +129,12 @@ fn read_page(
         }
         taken += 1;
         size += len;
-        ScanStep::Take
+        if taken >= limit {
+            // Stop here rather than decode more rows only to skip them.
+            ScanStep::TakeLast
+        } else {
+            ScanStep::Take
+        }
     })
 }
 
@@ -348,6 +353,9 @@ mod tests {
         assert_eq!(ids(&p), vec![2, 4]);
         // The cursor moves past invisible rows.
         assert_eq!(p.next_after_id, 4);
+        // A page that fills stops at its last event.
+        let p = page(&log, 0, 1, &[topic("automation.")], true);
+        assert_eq!((ids(&p), p.next_after_id), (vec![1], 1));
     }
 
     #[test]

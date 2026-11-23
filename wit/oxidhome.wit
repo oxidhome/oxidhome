@@ -1312,7 +1312,9 @@ interface host-events {
   /// current subscriptions, plus host gap markers (topic
   /// `host.event_log.gap`), which every reader sees. `0` starts at
   /// the oldest retained row. Rows matching no current subscription
-  /// are skipped without saying why, so subscribe before reading.
+  /// are skipped without saying why, so subscribe before reading. A
+  /// recorded row the host can no longer decode is skipped too (and
+  /// logged on the host).
   ///
   /// Needs `capabilities.subscribes_events`; without it the call is
   /// `permission-denied`. `bytes-val` fields are replaced by a

@@ -1465,12 +1465,10 @@ impl PluginInstance {
         // share a key and keep drain order.)
         events.sort_by_key(|(rows_through, _, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
         let split = events.partition_point(|(rows_through, _, _)| *rows_through <= cutoff);
+        // No self-wake needed: the publisher raises the watermark
+        // and only then signals the matching wakes (`notify_one`
+        // keeps a permit), so a later drain follows.
         self.deferred_events = events.split_off(split);
-        if !self.deferred_events.is_empty() {
-            // Make sure a later drain picks them up even if their
-            // wake was consumed by this one.
-            state.wake.notify_one();
-        }
         events.into_iter().map(|(_, _, ev)| ev).collect()
     }
 
