@@ -246,6 +246,21 @@ async fn script_calls_sibling_through_host_dispatch_with_audited_chain() {
     assert_eq!(inner["chain"][1]["instance"], "main~b");
     assert_eq!(inner["current"], "main~b");
 
+    // A script the sandbox couldn't run is refused before it's saved.
+    let scripts = service_of(&engine, MANAGER, "scripts").await;
+    let outcome = call(
+        &engine,
+        scripts,
+        "load",
+        vec![string("id", "bad"), string("source", "bad.name ok\n")],
+    )
+    .await;
+    assert!(
+        matches!(outcome, Ok(CommandResult::Err(Error::InvalidArgument(_)))),
+        "got {outcome:?}"
+    );
+    assert!(engine.instance("main~bad").is_none());
+
     // `~` is reserved for sandboxes: an operator can't take that id.
     let err = engine
         .start_instance(plugin_dir(), "main~c", None)
@@ -479,7 +494,12 @@ async fn sandbox_limit_counts_stopping_sandboxes() {
         let svc_a = svc_a.clone();
         async move { call(&engine, svc_a, "hold", Vec::new()).await }
     });
+    let deadline = Instant::now() + Duration::from_secs(10);
     while engine.services().active_call_count(&svc_a) == 0 {
+        assert!(
+            !held.is_finished() && Instant::now() < deadline,
+            "the hold call never started"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     // Let the call reach `a`'s supervisor ahead of the stop.

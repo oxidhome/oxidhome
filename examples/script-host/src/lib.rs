@@ -63,7 +63,24 @@ struct ScriptHost {
     role: Option<Role>,
 }
 
+/// The host's `start-sandbox` source limit.
+const MAX_SOURCE_BYTES: usize = 64 * 1024;
+/// The host's limits on a service's commands (`register-service`).
+const MAX_COMMANDS: usize = 64;
+const MAX_COMMAND_NAME: usize = 64;
+
+fn is_command_name(name: &str) -> bool {
+    name.len() <= MAX_COMMAND_NAME
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn parse(source: &str) -> Result<BTreeMap<String, Action>, String> {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(format!("script is over {MAX_SOURCE_BYTES} bytes"));
+    }
     let mut commands = BTreeMap::new();
     for (n, line) in source.lines().enumerate() {
         let line = line.trim();
@@ -84,7 +101,18 @@ fn parse(source: &str) -> Result<BTreeMap<String, Action>, String> {
             },
             _ => return Err(format!("line {}: cannot parse `{line}`", n + 1)),
         };
+        if !is_command_name(words[0]) {
+            return Err(format!(
+                "line {}: command `{}` must be 1-{MAX_COMMAND_NAME} characters of \
+                 [A-Za-z0-9_-], starting with a letter or digit",
+                n + 1,
+                words[0],
+            ));
+        }
         commands.insert(words[0].to_owned(), action);
+        if commands.len() > MAX_COMMANDS {
+            return Err(format!("more than {MAX_COMMANDS} commands"));
+        }
     }
     Ok(commands)
 }
