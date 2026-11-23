@@ -576,7 +576,7 @@ impl Kind<'_> {
 }
 
 /// Output of routing a URI without any I/O — carries the
-/// family label + scope requirement + dispatch kind, or a
+/// family label + required action + dispatch kind, or a
 /// terminal outcome the caller must return without dispatch
 /// (scheme mismatch, malformed blob URI, unknown authority).
 ///
@@ -589,7 +589,7 @@ impl Kind<'_> {
 enum Route<'a> {
     Dispatch {
         family: &'static str,
-        required: Action,
+        action: Action,
         kind: Kind<'a>,
     },
     Terminal {
@@ -630,7 +630,7 @@ fn resolve_route(uri: &str) -> Route<'_> {
     match (family_seg, id_seg) {
         ("devices", None) => Route::Dispatch {
             family: "devices",
-            required: Action::DeviceList,
+            action: Action::DeviceList,
             kind: Kind::DevicesList,
         },
         ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => Route::Dispatch {
@@ -650,32 +650,32 @@ fn resolve_route(uri: &str) -> Route<'_> {
             // withholding it from `devices:list` tokens
             // was the opposite of the intended
             // boundary — round-3 F1 fix).
-            required: Action::DeviceList,
+            action: Action::DeviceList,
             kind: Kind::DevicesDetail(id),
         },
         ("plugins", None) => Route::Dispatch {
             family: "plugins",
-            required: Action::PluginRead,
+            action: Action::PluginRead,
             kind: Kind::PluginsList,
         },
         ("plugins", Some(id)) if !id.is_empty() && !id.contains('/') => Route::Dispatch {
             family: "plugins.detail",
-            required: Action::PluginRead,
+            action: Action::PluginRead,
             kind: Kind::PluginsDetail(id),
         },
         ("events", None) => Route::Dispatch {
             family: "events",
-            required: Action::EventRead,
+            action: Action::EventRead,
             kind: Kind::Events,
         },
         ("logs", None) => Route::Dispatch {
             family: "logs",
-            required: Action::HostLogs,
+            action: Action::HostLogs,
             kind: Kind::Logs,
         },
         ("status", None) => Route::Dispatch {
             family: "status",
-            required: Action::HostStatus,
+            action: Action::HostStatus,
             kind: Kind::Status,
         },
         // Host configuration: operational metadata next to
@@ -684,7 +684,7 @@ fn resolve_route(uri: &str) -> Route<'_> {
         // a new scope.
         ("config", None) => Route::Dispatch {
             family: "config",
-            required: Action::HostStatus,
+            action: Action::HostStatus,
             kind: Kind::Config,
         },
         // Blobs URI: `oxidhome://blobs/<instance_id>/<name>`.
@@ -696,7 +696,7 @@ fn resolve_route(uri: &str) -> Route<'_> {
         ("blobs", Some(tail)) => match tail.split_once('/') {
             Some((instance, name)) if !instance.is_empty() && !name.is_empty() => Route::Dispatch {
                 family: "blobs",
-                required: Action::BlobRead,
+                action: Action::BlobRead,
                 kind: Kind::Blob(instance, name),
             },
             _ => Route::Terminal {
@@ -723,8 +723,8 @@ fn route_family(uri: &str) -> &'static str {
     }
 }
 
-/// Route a URI to its family, check the family's required
-/// scope against the actor, and build the body if allowed.
+/// Route a URI to its family, authorize the family's action
+/// for the root, and build the body if allowed.
 /// Async because the events / logs families hit the shared
 /// `SQLite` mutex and must run under `spawn_blocking` to keep
 /// the tokio worker free (round-1 F1 on PR #121).
@@ -741,16 +741,16 @@ async fn read_inner(
         .and_then(|rest| rest.split_once('?'))
         .map_or("", |(_, q)| q);
 
-    let (family, required, kind) = match resolve_route(uri) {
+    let (family, action, kind) = match resolve_route(uri) {
         Route::Dispatch {
             family,
-            required,
+            action,
             kind,
-        } => (family, required, kind),
+        } => (family, action, kind),
         Route::Terminal { family, outcome } => return (family, outcome),
     };
 
-    if let Err(required) = authorize(ctx, required, &kind.resource()).into_result() {
+    if let Err(required) = authorize(ctx, action, &kind.resource()).into_result() {
         return (family, ReadOutcome::Denied { required });
     }
 

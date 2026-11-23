@@ -354,10 +354,12 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, ExecuteCommandRequest>,
     ) -> ServiceResult<impl Encodable<ExecuteCommandResponse> + Send + use<'a>> {
+        // Collection pre-check before the request is copied, then
+        // H6: `device.command` on the addressed device — the token's
+        // per-device allowlist, shared with REST and MCP — before the
+        // lookup so a refused token can't probe ids.
+        require_connect(&ctx, Action::DeviceCommand, &Resource::devices())?;
         let req = request.to_owned_message();
-        // H6: `device.command` on the addressed device — the scope and
-        // the token's per-device allowlist, shared with REST and MCP —
-        // before the lookup so a refused token can't probe ids.
         require_connect(
             &ctx,
             Action::DeviceCommand,
@@ -428,6 +430,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, GetDeviceStateRequest>,
     ) -> ServiceResult<impl Encodable<GetDeviceStateResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::DeviceRead, &Resource::devices())?;
         let device_id = request.to_owned_message().device_id;
         require_connect(
             &ctx,
@@ -821,6 +824,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, StartPluginRequest>,
     ) -> ServiceResult<impl Encodable<StartPluginResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::InstanceStart, &Resource::instances())?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -910,6 +914,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, StopPluginRequest>,
     ) -> ServiceResult<impl Encodable<StopPluginResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::InstanceStop, &Resource::instances())?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -955,6 +960,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, UninstallPluginRequest>,
     ) -> ServiceResult<impl Encodable<UninstallPluginResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PluginUninstall, &Resource::plugins())?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,

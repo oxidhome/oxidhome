@@ -475,8 +475,9 @@ impl Authority {
     }
 }
 
-/// Why a decision came out the way it did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a decision came out the way it did. Not `Copy`: later slices
+/// add reasons that carry owned data (the deny entry that matched).
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reason {
     /// Allowed: the token holds `scope` (or the wildcard) and no
@@ -512,11 +513,11 @@ impl Reason {
     /// column: the missing scope, the constraint sentinel, or
     /// [`NO_PERMIT_LABEL`]. `None` for an allow.
     #[must_use]
-    pub fn audit_label(self) -> Option<&'static str> {
+    pub fn audit_label(&self) -> Option<&'static str> {
         match self {
             Reason::Scope { .. } => None,
-            Reason::MissingScope { scope } => Some(scope),
-            Reason::Constraint { sentinel, .. } => Some(sentinel),
+            Reason::MissingScope { scope } => Some(*scope),
+            Reason::Constraint { sentinel, .. } => Some(*sentinel),
             Reason::NoPermit => Some(NO_PERMIT_LABEL),
         }
     }
@@ -555,7 +556,7 @@ pub struct Obligations {
 }
 
 /// The outcome of [`authorize`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     /// `true` to proceed.
     pub allow: bool,

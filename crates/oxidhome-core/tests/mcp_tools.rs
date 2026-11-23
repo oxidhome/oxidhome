@@ -3826,3 +3826,60 @@ async fn tool_denials_record_scope_and_constraint_sentinels() {
     let row = deny_for("mcp.tool.plugins.list");
     assert_eq!(row.required_scope.as_deref(), Some("plugins:list"));
 }
+
+/// The `plugins.show` allowlist narrows the `plugins.show` tool only:
+/// the `oxidhome://plugins/{id}` resource read has always been gated by
+/// the flat `plugins:list` scope, and still is. Pins the resource the
+/// production handler authorizes, which the parity table can't see.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_show_allowlist_does_not_narrow_the_plugin_resource() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "show-allowlist",
+        r#"{"plugins.show":{"plugins":["acme.*"]}}"#,
+    );
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let tool = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.show", "arguments": {"plugin_id": "outside.p"}}),
+    )
+    .await;
+    assert_eq!(tool["error"]["code"], -32001, "{tool}");
+
+    let read = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://plugins/outside.p"}),
+    )
+    .await;
+    assert_ne!(read["error"]["code"], -32001, "{read}");
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let tool_row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.plugins.show")
+        .expect("tool row");
+    assert_eq!(
+        tool_row.required_scope.as_deref(),
+        Some("constraint:plugins.show:plugins")
+    );
+    let read_row = rows
+        .iter()
+        .find(|r| r.path == "mcp.resource.plugins.detail")
+        .expect("resource row");
+    // Authorized, then not found: a 404 row with no `required_scope`.
+    assert_eq!(read_row.status, 404, "{read_row:?}");
+    assert!(read_row.required_scope.is_none(), "{read_row:?}");
+}
