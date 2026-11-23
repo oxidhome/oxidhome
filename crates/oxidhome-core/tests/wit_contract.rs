@@ -45,7 +45,7 @@ fn plugin_world(resolve: &Resolve, pkg: PackageId) -> WorldId {
 /// A component with exactly the shape of `world`.
 fn synthesize(resolve: &Resolve, world: WorldId) -> Vec<u8> {
     let mut module = dummy_module(resolve, world, ManglingAndAbi::Standard32);
-    embed_component_metadata(&mut module, resolve, world, StringEncoding::UTF8)
+    embed_component_metadata(&mut module, resolve, world, StringEncoding::UTF8, false)
         .expect("embed component-type metadata");
     ComponentEncoder::default()
         .module(&module)

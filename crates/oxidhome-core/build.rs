@@ -22,7 +22,9 @@ fn main() {
     for path in sources.paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    let encoded = wit_component::encode(&resolve, pkg)
+    // `false`: keep full-version interface names (e.g. `@0.1.0`), matching
+    // what `wit-bindgen` embeds in guests; canonical `@0.1` names are opt-in.
+    let encoded = wit_component::encode(&resolve, pkg, false)
         .unwrap_or_else(|e| panic!("encoding the oxidhome:plugin WIT package: {e:?}"));
 
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets it"))
