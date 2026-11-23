@@ -1187,10 +1187,10 @@ impl Engine {
 
     /// Spawn the reaper for a freshly supervised instance and track its
     /// `JoinHandle` for [`Self::drain_supervised_instances`]. Once the
-    /// instance reaches a terminal state the reaper stops the sandboxes
-    /// it started and waits for them (ADR-0001), releases its registry
-    /// state, unregisters it and, for a sandbox, drops its entry in the
-    /// parent's list (`slot`).
+    /// instance reaches a terminal state the reaper releases its registry
+    /// state, stops the sandboxes it started and waits for them
+    /// (ADR-0001), unregisters it and, for a sandbox, drops its entry in
+    /// the parent's list (`slot`).
     ///
     /// Runs inside the instance registry's `register` factory, so it
     /// must not block.
@@ -1216,18 +1216,19 @@ impl Engine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let reaper_join = tokio::spawn(async move {
             let _ = reaper_handle.wait_terminal().await;
-            // ADR-0001: a parent is gone only once its sandboxes are,
-            // so stopping it (or uninstalling right after) never
-            // leaves a child running. Children already stopping count.
-            engine.stop_sandboxes_of(&instance_id);
-            while engine.sandboxes.has_children(&instance_id) {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
             // Drop any device/service registry entries the instance
             // left behind. The supervisor sweeps at the top of every
             // load attempt; this is the final post-terminal cleanup so
             // a Stopped / Failed instance leaves nothing behind.
             engine.release_instance_state(&instance_id);
+            // ADR-0001: a parent leaves the instance registry only once
+            // its sandboxes have, so stopping it (or uninstalling right
+            // after) never leaves a child running. Children already
+            // stopping count.
+            engine.stop_sandboxes_of(&instance_id);
+            while engine.sandboxes.has_children(&instance_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
             engine.instances.unregister(&instance_id, &plugin_id);
             // A sandbox leaves its parent's registry last: until then
             // (it's terminal, so not live) a same-`local-id` start

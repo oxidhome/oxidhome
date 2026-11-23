@@ -1921,7 +1921,11 @@ impl IntoResponse for PluginLifecycleError {
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "bad_instance_id",
-                    "reason": format!("instance_id {id:?} is unsafe for use as a filesystem segment"),
+                    "reason": format!(
+                        "instance_id {id:?} is unsafe for use as a filesystem segment, \
+                         or contains `{}` (reserved for script sandboxes)",
+                        crate::runtime::SANDBOX_SEPARATOR,
+                    ),
                 })),
             )
                 .into_response(),

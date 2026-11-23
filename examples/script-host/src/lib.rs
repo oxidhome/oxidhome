@@ -111,9 +111,19 @@ fn scan(pending: &mut BTreeMap<String, String>) -> bool {
     };
     match read() {
         Ok(saved) => {
+            // A sandbox whose script isn't saved any more was unloaded
+            // by a previous life that crashed before stopping it.
+            for sandbox in host::sandboxes::list() {
+                if !saved.iter().any(|(id, _)| *id == sandbox.local_id) {
+                    let _ = host::sandboxes::stop(&sandbox.local_id);
+                }
+            }
             pending.extend(saved);
             true
         }
+        // No storage grant: nothing was ever saved, and retrying won't
+        // change that.
+        Err(Error::PermissionDenied(_)) => true,
         Err(e) => {
             oxidhome_sdk::tracing::warn!(error = ?e, "reading saved scripts failed; retrying");
             false

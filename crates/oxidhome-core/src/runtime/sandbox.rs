@@ -236,7 +236,7 @@ impl SandboxRegistry {
     fn take_child(&self, parent: &str, local_id: &str) -> Option<InstanceHandle> {
         let mut guard = self.lock();
         let entry = guard.get_mut(parent)?.get_mut(local_id)?;
-        if entry.stopping {
+        if !entry.is_live() {
             return None;
         }
         entry.stopping = true;
@@ -522,6 +522,7 @@ mod tests {
             .expect("entry")
             .handle = InstanceHandle::for_registry_test("main~a", "p");
         assert_eq!(registry.list("main"), Vec::<(String, String)>::new());
+        assert!(registry.take_child("main", "a").is_none());
         assert!(registry.has_children("main"));
     }
 
