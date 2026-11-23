@@ -463,7 +463,8 @@ impl Engine {
         // ADR-0001: finish the sandbox purges a previous process left
         // unfinished, before any plugin runs; the ones that fail again
         // keep their ids blocked.
-        let removals = sandbox_purge::resume(&db, &kv, &blobs);
+        let removals = sandbox_purge::resume(&db, &kv, &blobs)
+            .context("reading the pending script sandbox purges")?;
         Ok(Self {
             inner,
             pending_commands,
@@ -1354,8 +1355,14 @@ impl Engine {
             // its id can't be started again until the entry below is
             // removed, so nothing writes under it meanwhile.
             if let Some(slot) = &slot
-                && engine.sandboxes.is_retired(slot)
+                && let Some(mut marked) = engine.sandboxes.retirement(slot)
             {
+                // `stop-sandbox` persists the removal marker before it
+                // stops the sandbox; one stopped another way meanwhile
+                // waits for it here, so the marker can't land after the
+                // purge. A dropped sender (runtime teardown) doesn't
+                // hold this up.
+                let _ = marked.wait_for(|done| *done).await;
                 // A sandbox removed before it finished loading has no
                 // installation of its own yet; it runs its parent's.
                 let installation = reaper_handle

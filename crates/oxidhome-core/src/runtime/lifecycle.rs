@@ -48,6 +48,7 @@ use super::command::{
     CommandOutcome, CommandReport, DispatchTicket, PendingCommands, ReplyGuard, UnreadReply,
     mint_command_id,
 };
+use super::dispatcher::ResultCheck;
 use super::instance::{ComponentCache, InitError, PluginInstance, SupervisedLoad};
 use super::sandbox::{SandboxLauncher, SandboxRole, SandboxScript};
 
@@ -229,6 +230,8 @@ enum ControlCommand {
         service: ServiceId,
         command: String,
         args: Vec<KeyValue>,
+        /// Checks a result nobody reads before it is recorded.
+        check: ResultCheck,
         ticket: DispatchTicket,
         reply: oneshot::Sender<anyhow::Result<CommandResult>>,
     },
@@ -761,6 +764,7 @@ impl InstanceHandle {
         &self,
         ctx: &InvocationContext,
         command: &str,
+        check: &ResultCheck,
     ) -> Option<UnreadReply<anyhow::Result<CommandResult>>> {
         let pending = Arc::clone(self.pending.as_ref()?);
         if !ctx.root().is_external() {
@@ -768,9 +772,10 @@ impl InstanceHandle {
         }
         let ctx = ctx.clone();
         let command = command.to_owned();
+        let check = check.clone();
         Some(Box::new(move |reply, _| {
             if let Ok(result) = reply {
-                record_late_service_result(&pending, &ctx, &command, &result);
+                record_late_service_result(&pending, &ctx, &command, &check, result);
             }
         }))
     }
@@ -807,11 +812,12 @@ impl InstanceHandle {
         service: ServiceId,
         command: String,
         args: Vec<KeyValue>,
+        check: ResultCheck,
         ticket: DispatchTicket,
         wait_until: Instant,
     ) -> ServiceCallOutcome {
         let guard = SharedCallGuard::new(guard);
-        let unread = self.unread_service_reply(&ctx, &command);
+        let unread = self.unread_service_reply(&ctx, &command, &check);
         // Drop order: `rx` settles the ticket (and records a result
         // nobody read), then `_release` frees the guard of a call that
         // will never start.
@@ -830,6 +836,7 @@ impl InstanceHandle {
             service,
             command,
             args,
+            check,
             ticket: ticket.clone(),
             reply,
         });
@@ -2135,10 +2142,25 @@ fn reply_command_outcome(
 fn reply_service_result(
     reply: oneshot::Sender<anyhow::Result<CommandResult>>,
     result: CommandResult,
-    record: impl FnOnce(&CommandResult),
+    record: impl FnOnce(CommandResult),
 ) {
     if let Err(Ok(result)) = reply.send(Ok(result)) {
-        record(&result);
+        record(result);
+    }
+}
+
+/// What records a service-call result the supervisor couldn't send.
+fn late_service_recorder(
+    pending: Option<Arc<PendingCommands>>,
+    ctx: &InvocationContext,
+    command: &str,
+    check: ResultCheck,
+) -> impl FnOnce(CommandResult) + use<> {
+    let (ctx, command) = (ctx.clone(), command.to_owned());
+    move |result| {
+        if let Some(pending) = pending {
+            record_late_service_result(&pending, &ctx, &command, &check, result);
+        }
     }
 }
 
@@ -2148,9 +2170,11 @@ fn record_late_service_result(
     pending: &PendingCommands,
     ctx: &InvocationContext,
     command: &str,
-    result: &CommandResult,
+    check: &ResultCheck,
+    result: CommandResult,
 ) {
-    if let Some(entry) = super::dispatcher::late_result_entry(ctx, command, result) {
+    let result = check.apply(result);
+    if let Some(entry) = super::dispatcher::late_result_entry(ctx, command, &result) {
         pending.record_entry(entry);
     }
 }
@@ -2336,6 +2360,7 @@ async fn handle_control(
             service,
             command,
             args,
+            check,
             ticket,
             reply,
         }) => {
@@ -2373,14 +2398,7 @@ async fn handle_control(
             // Started: the caller no longer releases it.
             let guard = guard.take();
             // For a late-result row, should the caller stop waiting.
-            let late_ctx = ctx.clone();
-            let late_command = command.clone();
-            let pending = instance.pending_commands();
-            let record = |result: &CommandResult| {
-                if let Some(pending) = &pending {
-                    record_late_service_result(pending, &late_ctx, &late_command, result);
-                }
-            };
+            let record = late_service_recorder(instance.pending_commands(), &ctx, &command, check);
             let outcome = guest_call(
                 stop,
                 invocation::CURRENT.scope(
@@ -2522,6 +2540,10 @@ mod tests {
     }
 
     /// Poll `fut` once.
+    fn no_check() -> ResultCheck {
+        ResultCheck::new(|result| result)
+    }
+
     async fn poll_once<F: std::future::Future + Unpin>(fut: &mut F) -> std::task::Poll<F::Output> {
         std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *fut).poll(cx)))
             .await
@@ -2736,6 +2758,7 @@ mod tests {
             service.clone(),
             "go".into(),
             Vec::new(),
+            no_check(),
             DispatchTicket::default(),
             Instant::now() + Duration::from_secs(5),
         ));
@@ -2753,7 +2776,7 @@ mod tests {
         assert!(ticket.try_start());
         let send = |reply| {
             reply_service_result(reply, CommandResult::Ok, |result| {
-                record_late_service_result(&pending, &ctx, &command, result);
+                record_late_service_result(&pending, &ctx, &command, &no_check(), result);
             });
         };
         if send_first {
@@ -2783,6 +2806,30 @@ mod tests {
             assert_eq!(row.command_outcome.as_deref(), Some("completed"));
             assert_eq!(row.token_id, "tok-1");
         }
+    }
+
+    /// A late result is checked against the command's `returns` as an
+    /// on-time one is: one that breaks it is recorded as `internal`.
+    #[test]
+    fn a_late_result_is_recorded_after_its_schema_check() {
+        let (audit, pending) = journaled();
+        let ctx = api_ctx().delegate(crate::auth::invocation::DelegationHop {
+            caller_instance: "caller".into(),
+            target_plugin: "test.plugin".into(),
+            target_instance: "inst-a".into(),
+            target_service: "svc".into(),
+        });
+        let broken = ResultCheck::new(|_| CommandResult::Err(WitError::Internal("schema".into())));
+        record_late_service_result(&pending, &ctx, "go", &broken, CommandResult::Ok);
+        let rows = rows_of(
+            &audit,
+            &pending,
+            super::super::dispatcher::SERVICE_CALL_RESULT_AUDIT_METHOD,
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].execution_outcome.as_deref(), Some("failed"));
+        assert_eq!(rows[0].domain_error.as_deref(), Some("internal"));
+        assert_eq!(rows[0].command_outcome.as_deref(), Some("rejected"));
     }
 
     /// A service call whose supervisor drops the reply: `NotRun` while
@@ -2823,6 +2870,7 @@ mod tests {
                     service.clone(),
                     "go".into(),
                     Vec::new(),
+                    no_check(),
                     DispatchTicket::default(),
                     Instant::now() + Duration::from_secs(5),
                 )

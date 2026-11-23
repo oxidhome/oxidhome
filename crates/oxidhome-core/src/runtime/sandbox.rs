@@ -158,11 +158,14 @@ struct Entry {
     /// loop can't pile up stores that are still loading or shutting
     /// down.
     stopping: bool,
-    /// Its parent removed it (`stop-sandbox`): the reaper purges its
-    /// storage and per-instance bookkeeping. A sandbox stopped any
-    /// other way (its parent stopping, an operator, shutdown) keeps
-    /// them for the parent to re-create it.
-    retire: bool,
+    /// `Some` once its parent removed it (`stop-sandbox`): the reaper
+    /// purges its storage and per-instance bookkeeping. It turns `true`
+    /// once `stop-sandbox` has persisted the removal marker (or given
+    /// up), and the reaper waits for that, so the marker can't land
+    /// after the purge deleted it. A sandbox stopped any other way (its
+    /// parent stopping, an operator, shutdown) keeps them for the
+    /// parent to re-create it.
+    retire: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl Entry {
@@ -229,6 +232,17 @@ impl SandboxRegistry {
             )));
         }
         Ok(())
+    }
+
+    /// How many of `parent`'s removed sandboxes, no longer in
+    /// `children`, still await their purge.
+    fn purges_pending_of(&self, parent: &str, children: &BTreeMap<String, Entry>) -> usize {
+        let prefix = format!("{parent}{SANDBOX_SEPARATOR}");
+        self.removals()
+            .iter()
+            .filter_map(|(_, id)| id.strip_prefix(&prefix))
+            .filter(|local_id| !children.contains_key(*local_id))
+            .count()
     }
 
     /// Whether a purge of `instance_id`'s storage is still pending.
@@ -306,25 +320,36 @@ impl SandboxRegistry {
     }
 
     /// `stop-sandbox`: mark one live sandbox stopping and retired, and
-    /// return its handle.
-    fn take_child(&self, parent: &str, local_id: &str) -> Option<InstanceHandle> {
+    /// return its handle and the sender that reports its removal
+    /// marker persisted (see [`Entry::retire`]).
+    fn take_child(
+        &self,
+        parent: &str,
+        local_id: &str,
+    ) -> Option<(InstanceHandle, tokio::sync::watch::Sender<bool>)> {
         let mut guard = self.lock();
         let entry = guard.get_mut(parent)?.get_mut(local_id)?;
         if !entry.is_live() {
             return None;
         }
+        let (marked, rx) = tokio::sync::watch::channel(false);
         entry.stopping = true;
-        entry.retire = true;
-        Some(entry.handle.clone())
+        entry.retire = Some(rx);
+        Some((entry.handle.clone(), marked))
     }
 
-    /// Reaper hook: whether the sandbox in `slot` was removed by its
-    /// parent (see [`Entry::retire`]).
-    pub(crate) fn is_retired(&self, slot: &SandboxSlot) -> bool {
+    /// Reaper hook: if the sandbox in `slot` was removed by its parent,
+    /// what reports its removal marker persisted (see
+    /// [`Entry::retire`]).
+    pub(crate) fn retirement(
+        &self,
+        slot: &SandboxSlot,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
         self.lock()
             .get(&slot.parent)
             .and_then(|children| children.get(&slot.local_id))
-            .is_some_and(|e| e.generation == slot.generation && e.retire)
+            .filter(|e| e.generation == slot.generation)
+            .and_then(|e| e.retire.clone())
     }
 }
 
@@ -388,11 +413,14 @@ impl Engine {
                 )))
             };
         }
-        if children.len() >= limit as usize {
+        // A removed sandbox whose purge hasn't succeeded still holds
+        // its storage, so it still counts.
+        let held = children.len() + registry.purges_pending_of(parent, children);
+        if held >= limit as usize {
             let err = WitError::Unavailable(format!(
-                "instance `{parent}` already has {} sandboxes running or stopping; \
-                 the limit (capabilities.script_sandboxes) is {limit}",
-                children.len(),
+                "instance `{parent}` already has {held} sandboxes running, stopping or \
+                 awaiting their storage purge; the limit (capabilities.script_sandboxes) is \
+                 {limit}",
             ));
             if children.is_empty() {
                 guard.remove(parent);
@@ -447,7 +475,7 @@ impl Engine {
                 handle,
                 generation,
                 stopping: false,
-                retire: false,
+                retire: None,
             },
         );
         Ok(instance_id)
@@ -520,7 +548,7 @@ impl host_sandboxes::Host for PluginState {
 
     async fn stop_sandbox(&mut self, local_id: String) -> Result<(), WitError> {
         let launcher = Arc::clone(self.sandbox_launcher()?);
-        let handle = launcher
+        let (handle, marked) = launcher
             .engine
             .sandboxes()
             .take_child(&self.instance_id, &local_id)
@@ -535,10 +563,42 @@ impl host_sandboxes::Host for PluginState {
             instance_id = %handle.instance_id(),
             "script sandbox stopping",
         );
+        // The removal is persisted before this returns and before the
+        // sandbox stops, so a crash or a shutdown before its reaper's
+        // purge still purges at the next boot. The work runs in its own
+        // task, so a cancelled guest call can't leave the sandbox marked
+        // stopping but never stopped.
+        let db = Arc::clone(&launcher.engine.db);
+        let uuid = self.installation_uuid.to_string();
+        let (persisted_tx, persisted) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            let id = handle.instance_id().to_owned();
+            let write = tokio::task::spawn_blocking(move || {
+                super::sandbox_purge::mark(&db, &uuid, &id).map_err(|err| err.to_string())
+            })
+            .await
+            .unwrap_or_else(|join| Err(join.to_string()));
+            marked.send_replace(true);
+            let _ = persisted_tx.send(write);
             let _ = handle.stop().await;
         });
-        Ok(())
+        match persisted.await {
+            Ok(Ok(())) => Ok(()),
+            // The sandbox is stopping and its storage is purged all the
+            // same; only a crash before that purge would leave it.
+            Ok(Err(err)) => {
+                tracing::error!(
+                    parent_instance = %self.instance_id,
+                    local_id = %local_id,
+                    error = %err,
+                    "persisting the sandbox removal marker failed",
+                );
+                Ok(())
+            }
+            Err(_) => Err(WitError::Internal(
+                "the sandbox stop task ended before persisting its removal".into(),
+            )),
+        }
     }
 
     async fn list_sandboxes(&mut self) -> Vec<SandboxInfo> {
@@ -597,7 +657,7 @@ mod tests {
                     handle: InstanceHandle::running_for_test(&instance_id, "p"),
                     generation,
                     stopping: false,
-                    retire: false,
+                    retire: None,
                 },
             );
         generation
@@ -620,6 +680,22 @@ mod tests {
         assert_eq!(registry.list("main"), Vec::<(String, String)>::new());
         assert!(registry.take_child("main", "a").is_none());
         assert!(registry.has_children("main"));
+    }
+
+    /// A removed sandbox still awaiting its purge counts against its
+    /// parent's limit once its entry is gone, and only once.
+    #[test]
+    fn pending_purges_count_against_their_parent() {
+        let registry = SandboxRegistry::with_pending_removals(HashSet::from([
+            ("u".to_owned(), "main~a".to_owned()),
+            ("u".to_owned(), "main~gone".to_owned()),
+            ("u".to_owned(), "other~b".to_owned()),
+        ]));
+        entry(&registry, "main", "a");
+        let guard = registry.lock();
+        assert_eq!(registry.purges_pending_of("main", &guard["main"]), 1);
+        assert_eq!(registry.purges_pending_of("other", &BTreeMap::new()), 1);
+        assert_eq!(registry.purges_pending_of("none", &BTreeMap::new()), 0);
     }
 
     #[test]

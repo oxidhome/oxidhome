@@ -168,17 +168,14 @@ pub(crate) fn purge(
 }
 
 /// Boot: run every purge a previous process left unfinished. Returns
-/// the removals still pending (their ids stay blocked).
-pub(crate) fn resume(db: &Db, kv: &KvStore, blobs: &BlobStore) -> HashSet<Removal> {
-    let removals = match pending(db) {
-        Ok(removals) => removals,
-        Err(err) => {
-            // Nothing is known to block; the purge runs again at the
-            // next boot that can read the markers.
-            tracing::error!(error = %err, "reading pending sandbox purges failed");
-            return HashSet::new();
-        }
-    };
+/// the removals still pending (their ids stay blocked); markers that
+/// can't be read fail the boot rather than free their ids.
+pub(crate) fn resume(
+    db: &Db,
+    kv: &KvStore,
+    blobs: &BlobStore,
+) -> rusqlite::Result<HashSet<Removal>> {
+    let removals = pending(db)?;
     let mut left = HashSet::new();
     for (uuid, id) in removals {
         match purge(db, kv, blobs, &uuid, &id) {
@@ -196,7 +193,7 @@ pub(crate) fn resume(db: &Db, kv: &KvStore, blobs: &BlobStore) -> HashSet<Remova
             }
         }
     }
-    left
+    Ok(left)
 }
 
 #[cfg(test)]
@@ -232,7 +229,7 @@ mod tests {
         // The blob store refuses an unsafe id: the purge fails and the
         // marker stays.
         mark(&db, "inst-u", "../x").unwrap();
-        let left = resume(&db, &kv, &blobs);
+        let left = resume(&db, &kv, &blobs).unwrap();
         assert_eq!(left, HashSet::from([("inst-u".into(), "../x".into())]));
         assert_eq!(pending(&db).unwrap(), [("inst-u".into(), "../x".into())]);
         forget_installation(&db, "inst-u").unwrap();

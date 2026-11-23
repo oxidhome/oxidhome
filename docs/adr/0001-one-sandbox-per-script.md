@@ -91,10 +91,11 @@ the decision.
   entries stay, `stale`, under the projection's stale cap.
 - The purge waits for any KV or blob operation still running for the sandbox (a stop cancels a guest call blocked
   past its grace period, but the blocking storage write it started runs on), for up to 5 s. It is announced by a
-  `sandbox_removal` row (migration 21) written before it starts and deleted once it succeeds; while the row exists the
-  `local-id` can't be started again (`unavailable`). A purge that fails, or that a shutdown or crash cuts off, keeps its
-  row and runs again at the next boot, before any plugin; uninstalling the plugin clears the rows with the rest of its
-  storage.
+  `sandbox_removal` row (migration 21) that `stop-sandbox` writes before it returns and the purge deletes once it
+  succeeds; while the row exists the `local-id` can't be started again (`unavailable`) and the removed sandbox still
+  counts against `script_sandboxes`. A purge that fails, or that a shutdown or crash cuts off, keeps its row and runs
+  again at the next boot, before any plugin (a boot that can't read the rows fails); uninstalling the plugin clears
+  the rows with the rest of its storage.
 
 ### Identity
 

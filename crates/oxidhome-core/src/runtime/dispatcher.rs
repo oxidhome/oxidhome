@@ -490,6 +490,13 @@ pub(crate) async fn call_service(
             //    in the callee's queue (it never runs: `unavailable`,
             //    safe to retry) from one the callee had started (it
             //    may have acted: `unknown`).
+            let check = {
+                let (target, spec) = (target.clone(), command_spec.clone());
+                ResultCheck::new(move |result| {
+                    super::schema::check_result(&target, &spec, result)
+                        .unwrap_or_else(CommandResult::Err)
+                })
+            };
             let outcome = target_handle
                 .execute_service_command(
                     callee_ctx,
@@ -497,6 +504,7 @@ pub(crate) async fn call_service(
                     target.clone(),
                     command,
                     args,
+                    check,
                     ticket,
                     wait_until,
                 )
@@ -585,6 +593,30 @@ fn hop_path(callee_ctx: &InvocationContext, command: &str) -> Option<String> {
         invocation::audit_cap(&hop.target_service),
         invocation::audit_cap(command),
     ))
+}
+
+/// M2's `returns` check of a service call's reply, carried with the
+/// call so a late result is checked as an on-time one is: a reply that
+/// breaks the schema becomes `err(internal)`.
+#[derive(Clone)]
+pub(crate) struct ResultCheck(Arc<dyn Fn(CommandResult) -> CommandResult + Send + Sync>);
+
+impl ResultCheck {
+    pub(crate) fn new(
+        check: impl Fn(CommandResult) -> CommandResult + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(check))
+    }
+
+    pub(crate) fn apply(&self, result: CommandResult) -> CommandResult {
+        (self.0)(result)
+    }
+}
+
+impl std::fmt::Debug for ResultCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResultCheck")
+    }
 }
 
 /// The [`SERVICE_CALL_RESULT_AUDIT_METHOD`] row for a service call's
