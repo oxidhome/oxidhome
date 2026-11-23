@@ -107,6 +107,14 @@ pub enum TestHostError {
     /// Reading the audit ledger failed.
     #[error("reading the audit ledger")]
     Audit(#[from] oxidhome_core::state::AuditLogError),
+    /// Rows the host writes in the background didn't reach the audit
+    /// ledger in time, so an audit snapshot would be partial.
+    #[error("the {writer} did not drain into the audit ledger in time")]
+    AuditBacklog {
+        /// Which background writer: the refused-read audit or the
+        /// command journal.
+        writer: &'static str,
+    },
     /// A virtual-clock operation on a host built with
     /// [`crate::TestHost::new`], which runs on the real clock.
     #[error(

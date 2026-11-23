@@ -119,7 +119,9 @@ counter.stop().await?;
 time. Both wait for the timers' owners — a supervised tick, a command
 expiry — not for what those publish: an event a tick sends to another
 instance's `on-event` may still be in flight, so wait for that effect
-itself. Advance a clock from one task at a time, and use a
+itself; likewise a tick that traps — wait for the restart or the
+terminal state. Timers due at the same instant fire together, in no
+set order. Advance a clock from one task at a time, and use a
 multi-thread runtime when a plugin call may hang (a spinning guest
 holds its worker thread). A plugin call that never returns keeps `advance` waiting, so to
 move time past the watchdog, jump the clock itself:
@@ -138,8 +140,9 @@ five:
   `accepted (resolved)`, `timed_out`, `outcome_unknown`);
 - `.audit()` — the audit rows rooted at the instance, e.g. a refused
   `get-state` (it waits for rows the host writes in the background);
-- `.times()` — `@+1.500s` stamps on events, device state, and audit
-  rows, relative to the virtual clock (`@?` on the real clock).
+- `.times()` — `@+1.500s` stamps on events and device state, relative
+  to the virtual clock (`@?` on the real clock). Audit rows stay
+  unstamped: the host writes some of them in the background.
 
 Every snapshot is redacted so it can be committed: host-minted
 `cmd-…` / `call-…` ids become `<cmd-1>`, `<call-1>`, …; the instance's

@@ -237,7 +237,9 @@ impl TestHost {
     /// "The work a timer triggers" is its owner's: a supervised tick
     /// counts as done once the supervisor waits for its next tick. An
     /// event that tick published may still be on its way to another
-    /// instance's `on-event`; wait for that effect itself. Advance one
+    /// instance's `on-event`, or a tick that trapped may still be
+    /// failing its instance; wait for that effect itself. Timers due
+    /// at the same instant fire together, in no set order. Advance one
     /// clock from one task at a time (concurrent steps interleave), on
     /// a multi-thread runtime if a plugin call may hang: a spinning
     /// guest holds its worker thread.

@@ -156,9 +156,10 @@ impl SnapshotOptions {
         self
     }
 
-    /// Stamp events, device-state lines, and audit rows with the host
-    /// time they were recorded at, relative to the virtual clock's
-    /// start: `@+1.500s`. On a real-clock host every stamp is `@?`.
+    /// Stamp events and device-state lines with the host time they
+    /// were recorded at, relative to the virtual clock's start:
+    /// `@+1.500s`. On a real-clock host every stamp is `@?`. Audit rows
+    /// stay unstamped: the host writes some in the background.
     #[must_use]
     pub fn times(mut self) -> Self {
         self.times = true;
@@ -500,11 +501,21 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    // A reused id is pending at most for its latest acceptance.
+    let latest: HashMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.command_id.as_str(), i))
+        .collect();
     records
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
             let detail = match &r.outcome {
-                CommandOutcome::Accepted if pending.is_pending(&r.command_id) => {
+                CommandOutcome::Accepted
+                    if latest.get(r.command_id.as_str()) == Some(&i)
+                        && pending.is_pending(&r.command_id) =>
+                {
                     " (pending)".to_owned()
                 }
                 CommandOutcome::Accepted => " (resolved)".to_owned(),
@@ -530,13 +541,22 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
 
 fn render_audit(instance: &InstanceRef<'_>) -> Result<Vec<String>, TestHostError> {
     // Rows the host writes off the call path: refused reads (H2) and
-    // command resolutions (H5). Best effort — a row still queued after
-    // the wait shows up in a later snapshot.
-    let _ = instance.engine.drain_state_read_audit(AUDIT_FLUSH);
-    let _ = instance
+    // command resolutions (H5). A writer that doesn't drain fails the
+    // capture rather than return a partial ledger.
+    if !instance.engine.drain_state_read_audit(AUDIT_FLUSH) {
+        return Err(TestHostError::AuditBacklog {
+            writer: "refused-read audit",
+        });
+    }
+    if !instance
         .engine
         .pending_commands()
-        .flush_journal(AUDIT_FLUSH);
+        .flush_journal(AUDIT_FLUSH)
+    {
+        return Err(TestHostError::AuditBacklog {
+            writer: "command journal",
+        });
+    }
     let query = AuditQuery {
         token_id: Some(instance.instance_id.to_owned()),
         ..AuditQuery::default()
@@ -607,9 +627,23 @@ impl<'a> Redactor<'a> {
         let raw: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
         let mut quoted: Vec<String> = raw.iter().map(|s| format!("{s:?}")).collect();
         quoted.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        // As printed: raw, escaped, inside an escaped JSON string, and
+        // as hex bytes.
         let mut secrets: Vec<String> = raw
             .iter()
-            .flat_map(|s| [(*s).clone(), s.escape_debug().to_string()])
+            .flat_map(|s| {
+                let json = json_escape(s);
+                [
+                    (*s).clone(),
+                    s.escape_debug().to_string(),
+                    json.escape_debug().to_string(),
+                    json,
+                    s.bytes().fold(String::new(), |mut hex, b| {
+                        let _ = write!(hex, "{b:02x}");
+                        hex
+                    }),
+                ]
+            })
             .collect();
         secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         secrets.dedup();
@@ -626,8 +660,10 @@ impl<'a> Redactor<'a> {
         for line in snapshot.lines_mut() {
             *line = self.line(line);
         }
-        // Keys can be minted ids: order by what the snapshot prints.
+        // Keys and names can be minted ids: order by what the snapshot
+        // prints.
         snapshot.storage.sort();
+        snapshot.blobs.sort();
     }
 
     fn line(&mut self, line: &str) -> String {
@@ -668,6 +704,25 @@ impl<'a> Redactor<'a> {
         }
         out
     }
+}
+
+/// `text` escaped as inside a JSON string.
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The minted id `prefix` + 32 lowercase hex digits at the start of
@@ -1007,6 +1062,24 @@ mod tests {
                 &format!("cmd-test cmd-{}0", "ab".repeat(16)),
             ]
         );
+        // Under neutral keys: a secret inside a JSON value, and as bytes.
+        let mut snap = sample();
+        snap.storage = vec![
+            format!(
+                "doc = {}",
+                render_value(&Value::JsonVal("{\"k\": \"p\\\"ass-word\"}".into()))
+            ),
+            format!(
+                "raw = {}",
+                render_value(&Value::BytesVal(b"hunter2-long".to_vec()))
+            ),
+        ];
+        Redactor::new(&[], &["p\"ass-word".to_owned(), "hunter2-long".to_owned()]).apply(&mut snap);
+        assert_eq!(
+            snap.storage,
+            ["doc = json:\"{\\\"k\\\": \\\"***\\\"}\"", "raw = 0x***"]
+        );
+        assert_eq!(json_escape("a\"b\\c\n\u{1}"), "a\\\"b\\\\c\\n\\u0001");
         // A seeded id keeps its number wherever it shows up first.
         let mut snap = sample();
         snap.storage = vec![format!("{cmd_a} = 1"), format!("{cmd_b} = 2")];

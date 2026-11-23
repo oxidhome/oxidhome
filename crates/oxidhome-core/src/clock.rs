@@ -23,9 +23,10 @@
 //! watchdog, and every recorded timestamp are deterministic.
 //!
 //! Not on the clock: KV and blob write times, log-store and
-//! command-journal row times, request and call-service deadlines (H6
-//! invocation deadlines), restart backoff, and shutdown grace periods.
-//! They keep reading real time under a virtual clock too.
+//! command-journal row times (with the journal's `COMMAND` audit
+//! rows), request and call-service deadlines (H6 invocation
+//! deadlines), restart backoff, and shutdown grace periods. They keep
+//! reading real time under a virtual clock too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
