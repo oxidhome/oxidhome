@@ -285,7 +285,8 @@ impl EventLog {
     }
 }
 
-/// [`EventLog::query`] on an already-locked connection.
+/// [`EventLog::query`] on a connection the caller already holds
+/// (one `Db::read` snapshot).
 fn query_on(
     conn: &rusqlite::Connection,
     filter: &EventQuery,
@@ -518,15 +519,22 @@ impl EventLog {
     /// prefix means a pruned range is always `1..=k`, so checking the
     /// row right after a cursor (`EventLog::resolve_cursor`) proves
     /// nothing after it is missing.
+    ///
+    /// M6: retention is maintenance nobody waits on, so it runs at low
+    /// priority and yields to queued event appends, audit and KV
+    /// writes. It stays one statement: a single prefix `DELETE` keeps
+    /// the H4 invariant trivially (no reader snapshot sees a partly
+    /// applied trim).
     pub fn trim_older_than(&self, cutoff_ms: i64) -> Result<usize, EventLogError> {
-        self.db.write(|conn| -> Result<_, EventLogError> {
-            Ok(conn.execute(
-                "DELETE FROM event_log WHERE id < COALESCE( \
+        self.db
+            .write_low_priority(|conn| -> Result<_, EventLogError> {
+                Ok(conn.execute(
+                    "DELETE FROM event_log WHERE id < COALESCE( \
                      (SELECT MIN(id) FROM event_log WHERE received_ms >= ?1), \
                      (SELECT MAX(id) + 1 FROM event_log))",
-                params![cutoff_ms],
-            )?)
-        })
+                    params![cutoff_ms],
+                )?)
+            })
     }
 
     /// Total row count. Mostly for tests + future status endpoints.

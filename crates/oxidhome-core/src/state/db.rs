@@ -899,7 +899,7 @@ impl Default for ConnectionPolicy {
 ///   another in-process writer and commit order is mutex order.
 ///   [`Self::write`] is normal priority (events, KV, audit, tokens,
 ///   registry, dashboards); [`Self::write_low_priority`] (diagnostic
-///   log batches, log retention) yields to any normal-priority
+///   log batches, log and event-log retention) yields to any normal-priority
 ///   writer already waiting, for at most
 ///   [`LOW_PRIORITY_MAX_DEFER`].
 /// - **Readers.** File-backed databases open up to

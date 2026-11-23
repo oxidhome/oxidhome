@@ -63,9 +63,10 @@ impl EventLog {
     }
 
     /// [`Self::query`] for a cursor reader: the query and the
-    /// [`Self::resolve_cursor`] check on `filter.after_id` run under
-    /// one connection lock, so a concurrent prune can't fall between
-    /// them. An expired cursor is the inner `Err`.
+    /// [`Self::resolve_cursor`] check on `filter.after_id` run in
+    /// one `Db::read` closure, i.e. one read transaction on one
+    /// pooled connection, so both see the same snapshot and a
+    /// concurrent prune can't fall between them. An expired cursor is the inner `Err`.
     ///
     /// # Errors
     ///
@@ -154,7 +155,8 @@ impl HistoricalEvent {
     }
 }
 
-/// [`EventLog::resolve_cursor`] on an already-locked connection.
+/// [`EventLog::resolve_cursor`] on a connection the caller already
+/// holds (one `Db::read` snapshot).
 /// Exact because retention only deletes an id prefix
 /// ([`EventLog::trim_older_than`]): if the row after the cursor is
 /// present, so is every later row up to the head.
