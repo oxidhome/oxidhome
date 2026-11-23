@@ -50,7 +50,7 @@ oxidhome-wit = { path = "crates/oxidhome-wit" }
 # `wasmtime-wasi-http` joins this list in Phase 8 when streaming plugins
 # need outgoing HTTP. Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli,
 # random, …) so libstd-pulled WASI imports resolve.
-wasmtime = { version = "=48.0.10", default-features = false, features = [
+wasmtime = { version = "=50.0.3", default-features = false, features = [
   "runtime",
   "component-model",
   "async",
@@ -60,7 +60,7 @@ wasmtime = { version = "=48.0.10", default-features = false, features = [
   # the host-runtime `?` plumbing keeps working with `anyhow::Result`.
   "anyhow",
 ] }
-wasmtime-wasi = { version = "=48.0.10", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "=50.0.3", default-features = false, features = ["p2"] }
 # Pinned to an exact version. Cross-crate ABI surfaces are sensitive — a
 # silent minor bump in bindgen output could break either side. Bumps land
 # as deliberate PRs that re-run both bindgens. See the exact-pinning
