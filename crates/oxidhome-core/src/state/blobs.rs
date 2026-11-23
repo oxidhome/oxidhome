@@ -623,7 +623,7 @@ impl BlobStore {
     /// Read bytes by id.
     ///
     /// The bytes always belong to a version of the blob that was
-    /// committed under this id (see [`Self::open_current`]).
+    /// committed under this id (see `open_current`).
     ///
     /// # Errors
     ///
@@ -677,7 +677,7 @@ impl BlobStore {
     /// The bytes are the complete contents of one committed version
     /// of the blob: a concurrent overwrite or delete yields either
     /// the old bytes, the new bytes, or `NotFound`, never a mix or
-    /// a spurious I/O error (see [`Self::open_current`]).
+    /// a spurious I/O error (see `open_current`).
     ///
     /// # Errors
     ///
@@ -721,7 +721,7 @@ impl BlobStore {
 
     /// Atomic "metadata + bytes" fetch by user-chosen name.
     /// The blob-index row is decoded and the file it points at
-    /// is opened as one consistent pair (see [`Self::open_current`]),
+    /// is opened as one consistent pair (see `open_current`),
     /// so the bytes returned are the bytes the [`BlobInfo`]
     /// describes, and both belong to the same version of that blob.
     ///

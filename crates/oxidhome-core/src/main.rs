@@ -232,17 +232,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // H4 / M6 follow-up: periodic event-log retention (age and row
-    // limits from `$OXIDHOME_EVENT_LOG_RETENTION_DAYS` /
-    // `$OXIDHOME_EVENT_LOG_MAX_ROWS`). Low-priority, chunked, id
-    // prefix only. The handle is held so the task lives as long as
-    // the daemon; runtime teardown stops it between chunks.
-    tracing::info!(
-        max_age_days = retention.max_age.map(|a| a.as_secs() / 86_400),
-        max_rows = retention.max_rows,
-        "event log retention",
-    );
-    let _event_log_retention = engine.event_log().spawn_retention(retention);
+    let _event_log_retention = spawn_event_log_retention(&engine, retention);
 
     // Bind the listener; log the actual bound address (matters
     // when `$OXIDHOME_BIND` ends in `:0` for ephemeral-port
@@ -347,6 +337,23 @@ async fn main() -> anyhow::Result<()> {
         return Err(err);
     }
     Ok(())
+}
+
+/// H4 / M6 follow-up: periodic event-log retention (age and row
+/// limits from `$OXIDHOME_EVENT_LOG_RETENTION_DAYS` /
+/// `$OXIDHOME_EVENT_LOG_MAX_ROWS`). Low-priority, chunked, id prefix
+/// only. The caller holds the handle for the daemon's lifetime;
+/// runtime teardown stops the task between chunks.
+fn spawn_event_log_retention(
+    engine: &Engine,
+    retention: EventLogRetention,
+) -> Option<tokio::task::JoinHandle<()>> {
+    tracing::info!(
+        max_age_days = retention.max_age.map(|a| a.as_secs() / 86_400),
+        max_rows = retention.max_rows,
+        "event log retention",
+    );
+    engine.event_log().spawn_retention(retention)
 }
 
 /// M4: `oxidhome recover-admin-token [--revoke-all]`. Offline only —

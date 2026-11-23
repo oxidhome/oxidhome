@@ -24,13 +24,13 @@ use super::{EventLog, EventLogError};
 pub(super) const TRIM_CHUNK_ROWS: i64 = 2048;
 
 /// Default maximum event age: 30 days.
-pub const DEFAULT_EVENT_LOG_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const DEFAULT_EVENT_LOG_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 
 /// Default maximum row count kept in `event_log`.
 pub const DEFAULT_EVENT_LOG_MAX_ROWS: u64 = 1_000_000;
 
 /// How often the retention task runs.
-pub const DEFAULT_EVENT_LOG_RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const DEFAULT_EVENT_LOG_RETENTION_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Delay before the first pass, so retention doesn't compete with
 /// boot (migrations, plugin starts).
@@ -442,7 +442,7 @@ mod tests {
             (ENV_EVENT_LOG_MAX_ROWS, " 0 "),
         ]))
         .expect("parse");
-        assert_eq!(p.max_age, Some(Duration::from_secs(7 * 86_400)));
+        assert_eq!(p.max_age, Some(Duration::from_hours(7 * 24)));
         assert_eq!(p.max_rows, None);
         let p = EventLogRetention::from_lookup(env(&[(ENV_EVENT_LOG_RETENTION_DAYS, "0")]))
             .expect("parse");
