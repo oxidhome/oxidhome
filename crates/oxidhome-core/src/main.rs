@@ -70,6 +70,7 @@ use oxidhome_core::api::{
     recover_admin_token_offline, serve,
 };
 use oxidhome_core::exclusive_lock::acquire_state_dir_lock;
+use oxidhome_core::state::EventLogRetention;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -147,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state_dir = resolve_state_dir()?;
+    let retention = EventLogRetention::from_env()?;
     // Round-1 P1 on PR #143: enforce single-process ownership of
     // the state dir. `Engine`'s in-memory registries (device,
     // instance, event, service, per-plugin lifecycle locks) are
@@ -229,6 +231,18 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // H4 / M6 follow-up: periodic event-log retention (age and row
+    // limits from `$OXIDHOME_EVENT_LOG_RETENTION_DAYS` /
+    // `$OXIDHOME_EVENT_LOG_MAX_ROWS`). Low-priority, chunked, id
+    // prefix only. The handle is held so the task lives as long as
+    // the daemon; runtime teardown stops it between chunks.
+    tracing::info!(
+        max_age_days = retention.max_age.map(|a| a.as_secs() / 86_400),
+        max_rows = retention.max_rows,
+        "event log retention",
+    );
+    let _event_log_retention = engine.event_log().spawn_retention(retention);
 
     // Bind the listener; log the actual bound address (matters
     // when `$OXIDHOME_BIND` ends in `:0` for ephemeral-port
