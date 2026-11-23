@@ -919,7 +919,7 @@ fn devices_list(engine: &Engine) -> ReadOutcome {
             device_id: meta.id.clone(),
             owner_instance: meta.owner_instance.clone(),
             name: meta.info.name.clone(),
-            class: engine.devices().class_of(&meta.id).into(),
+            class: engine.devices().class_of_meta(&meta).into(),
         })
         .collect();
     encode(&DeviceListBody { devices }, "devices list")
@@ -959,7 +959,7 @@ fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
             .iter()
             .map(crate::runtime::capability_name)
             .collect(),
-        class: engine.devices().class_of(&meta.id).into(),
+        class: engine.devices().class_of_meta(&meta).into(),
     };
     encode(&detail, "device detail")
 }

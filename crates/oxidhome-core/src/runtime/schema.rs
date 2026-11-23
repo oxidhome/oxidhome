@@ -225,9 +225,11 @@ pub(crate) fn check_state_fields(
     // The typed sensitive capabilities: `state` keeps its documented
     // shape on every update (partial deltas without it are fine).
     let state_ok = |ok: &dyn Fn(&Value) -> bool, what: &str| -> Result<(), String> {
-        match fields.iter().find(|kv| kv.key == "state") {
-            Some(kv) if !ok(&kv.value) => Err(format!("{capability} `state` must be {what}")),
-            _ => Ok(()),
+        // Every occurrence: the projection keeps the last duplicate.
+        if fields.iter().any(|kv| kv.key == "state" && !ok(&kv.value)) {
+            Err(format!("{capability} `state` must be {what}"))
+        } else {
+            Ok(())
         }
     };
     let one_of = |names: &'static [&'static str]| move |v: &Value| matches!(v, Value::StringVal(s) if names.contains(&s.as_str()));
@@ -1028,6 +1030,12 @@ mod tests {
         assert!(
             check_state_fields(&info, "lock", &[]).is_ok(),
             "partial delta"
+        );
+        let mut dup = st(Value::StringVal("locked".into()));
+        dup.extend(st(Value::BoolVal(false)));
+        assert!(
+            check_state_fields(&info, "lock", &dup).is_err(),
+            "every duplicate"
         );
         // Dropping the support invalidates the projected position.
         assert!(opener_position_dropped(&with, &info));

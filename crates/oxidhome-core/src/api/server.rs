@@ -471,7 +471,7 @@ async fn list_devices(
         .list()
         .into_iter()
         .map(|meta| {
-            let class = WireDeviceClass::from(state.engine.devices().class_of(&meta.id));
+            let class = WireDeviceClass::from(state.engine.devices().class_of_meta(&meta));
             DeviceSummary {
                 device_id: meta.id.clone(),
                 owner_instance: meta.owner_instance.clone(),

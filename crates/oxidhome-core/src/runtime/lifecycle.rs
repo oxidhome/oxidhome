@@ -2037,7 +2037,9 @@ async fn run_execute(
     if let Some(why) = refusal
         && let Some(caller_gone) = ticket.try_refuse()
     {
-        let refused = if caller_gone {
+        // As `refuse_unserved`: a caller gone or past its deadline
+        // gets `timed_out` (it may already be reporting that itself).
+        let refused = if caller_gone || ctx.is_expired() {
             CommandOutcome::TimedOut {
                 message: format!("instance `{instance_id}`: {why}; the command did not run"),
             }

@@ -202,6 +202,19 @@ impl DeviceRegistry {
         row.apply(derived)
     }
 
+    /// The class of `meta` (a registration already read), widened by
+    /// its stored floor and override: one registration per answer, so
+    /// a listing can't pair one registration's capabilities with
+    /// another's class.
+    #[must_use]
+    pub fn class_of_meta(&self, meta: &DeviceMeta) -> DeviceClass {
+        let derived = DeviceClass::derive(&meta.info.capabilities);
+        match self.meta.get(&meta.id) {
+            Some(row) => row.apply(derived),
+            None => derived,
+        }
+    }
+
     /// The authorization resource for device `id`, with its class.
     #[must_use]
     pub fn resource(&self, id: &str) -> Resource {

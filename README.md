@@ -44,8 +44,9 @@ share one axum listener, so a household hub only exposes one endpoint.
   token, the owner, holds every category. Grant one offline with
   `oxidhome token grant-sensitive <token-id> <lock|opener|alarm|camera>
   [--device <dev-id>]...` (`oxidhome token list` shows tokens and grants);
-  allowed sensitive actions are rate limited and audited at `warn`
-  (`GET /api/v1/audit?level=warn`). The daemon warns at startup about
+  allowed sensitive actions are audited at `warn`
+  (`GET /api/v1/audit?level=warn`) and, except for the owner's, rate
+  limited per token and category. The daemon warns at startup about
   wildcard tokens that lost this access. `oxidhome mcp-stdio` reaches a
   sensitive category only with `--allow-sensitive <category>`. The owner can
   raise a device's category with `PUT /api/v1/devices/{id}/category`

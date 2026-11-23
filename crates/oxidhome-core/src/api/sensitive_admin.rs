@@ -187,14 +187,35 @@ fn check_devices(devices: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("at most {MAX_DEVICE_PATTERNS} --device patterns");
     }
     for d in devices {
-        if d.is_empty() || d == "*" || d.len() > MAX_DEVICE_PATTERN_LEN {
+        let ok = match d.strip_suffix('*') {
+            // A prefix of some `dev-<16 hex>` id.
+            Some(prefix) => {
+                !prefix.is_empty()
+                    && prefix.len() < "dev-0123456789abcdef".len()
+                    && could_prefix_device_id(prefix)
+            }
+            None => crate::state::is_device_id(d),
+        };
+        if !ok || d.len() > MAX_DEVICE_PATTERN_LEN {
             anyhow::bail!(
-                "device pattern {d:?} must be a device id or `prefix*`, 1 to \
-                 {MAX_DEVICE_PATTERN_LEN} bytes (omit --device to grant every device)"
+                "device pattern {d:?} must be a device id (dev-<16 hex>) or a `prefix*` of one \
+                 (omit --device to grant every device)"
             );
         }
     }
     Ok(())
+}
+
+/// `true` when `prefix` could start a `dev-<16 lowercase hex>` id.
+fn could_prefix_device_id(prefix: &str) -> bool {
+    let template = "dev-";
+    if prefix.len() <= template.len() {
+        return template.starts_with(prefix);
+    }
+    prefix.starts_with(template)
+        && prefix[template.len()..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `policy` with `category` granted: on every device (`devices` empty)
@@ -495,6 +516,11 @@ mod tests {
             )
             .is_err()
         );
+        // A truncated literal can never match; its prefix form can.
+        let lock = SensitiveCategory::Lock;
+        assert!(grant_sensitive(&tokens, &audit, &t.id, lock, &["dev-ab12".into()]).is_err());
+        assert!(grant_sensitive(&tokens, &audit, &t.id, lock, &["dev-ab12*".into()]).is_ok());
+        assert!(grant_sensitive(&tokens, &audit, &t.id, lock, &["dev-XY*".into()]).is_err());
         tokens.revoke(&t.id).unwrap();
         assert!(grant_sensitive(&tokens, &audit, &t.id, SensitiveCategory::Lock, &[]).is_err());
         let bad = tokens.create("bad", b"not json").unwrap();

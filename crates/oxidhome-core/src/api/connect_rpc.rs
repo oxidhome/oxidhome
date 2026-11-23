@@ -362,7 +362,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .into_iter()
             .map(|meta| {
                 // One read, so `category` and `sensitive` agree.
-                let class = self.engine.devices().class_of(&meta.id);
+                let class = self.engine.devices().class_of_meta(&meta);
                 Device {
                     device_id: meta.id.clone(),
                     owner_instance: meta.owner_instance.clone(),
