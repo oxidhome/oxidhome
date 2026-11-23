@@ -176,9 +176,12 @@ pub(super) fn list_resources() -> Vec<Resource> {
             .with_title("Host configuration")
             .with_description(
                 "JSON snapshot of the daemon's effective configuration: run mode, state \
-                 directory, listen address, event-log retention, stdout log filter and the \
-                 MCP mount's limits. Each setting is `{value, source, env?}` where `source` \
-                 is `default`, `env` or `flag` and `env` names the overriding variable. \
+                 directory, listen address, event-log retention, stdout log filter (span field \
+                 values masked) and the MCP mount's limits. Each setting is \
+                 `{value, source, env?}` where `source` is `default`, `env` or `flag` and \
+                 `env` names the overriding variable; `daemon.mode` and \
+                 `daemon.listen_addr` (the bound address) are plain values, and `daemon` \
+                 is `null` when the process published no snapshot. \
                  Also carries `version`, `sdk_version`, `min_supported_sdk_version` and \
                  `wit_version`. No secrets; per-instance plugin config is on \
                  `oxidhome://plugins/{id}`. Mirrors `GET /api/v1/config`.",

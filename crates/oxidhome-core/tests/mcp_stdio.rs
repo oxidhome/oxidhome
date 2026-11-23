@@ -186,3 +186,94 @@ async fn stdio_ambient_actor_has_wildcard_scope() {
         .expect("server task join");
     joined.expect("serve_stdio_over returned Err");
 }
+
+/// The real `mcp-stdio` binary publishes its resolved settings, so
+/// `oxidhome://config` reports this run (mode, env-sourced state dir)
+/// instead of `"daemon": null`.
+#[test]
+fn stdio_binary_serves_its_config_snapshot() {
+    use std::io::{BufRead as _, Write as _};
+    use std::process::{Command, Stdio};
+
+    let state_dir = std::env::temp_dir().join(format!(
+        "oxidhome-mcpcfg-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxidhome-core"))
+        .arg("mcp-stdio")
+        .env("OXIDHOME_STATE_DIR", &state_dir)
+        .env_remove("OXIDHOME_EVENT_LOG_MAX_ROWS")
+        .env_remove("OXIDHOME_EVENT_LOG_RETENTION_DAYS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn oxidhome mcp-stdio");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    // Read lines on a thread so a hung child fails the test on a
+    // deadline instead of blocking it.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut send = |payload: Value| {
+        let mut bytes = serde_json::to_vec(&payload).expect("serialize");
+        bytes.push(b'\n');
+        stdin.write_all(&bytes).expect("write");
+        stdin.flush().expect("flush");
+    };
+    let recv_id = |id: u64| -> Value {
+        loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("timed out waiting for mcp-stdio");
+            let value: Value = serde_json::from_str(&line).expect("JSON line");
+            if value["id"] == id {
+                return value;
+            }
+        }
+    };
+
+    send(initialize_body());
+    let _ = recv_id(1);
+    send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "resources/read",
+        "params": {"uri": "oxidhome://config"},
+    }));
+    let response = recv_id(2);
+    drop(send);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&state_dir);
+
+    let text = response["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content: {response}"));
+    let body: Value = serde_json::from_str(text).expect("config JSON");
+    let daemon = &body["daemon"];
+    assert_eq!(daemon["mode"], "mcp-stdio", "got {body}");
+    assert_eq!(daemon["state_dir"]["source"], "env");
+    assert_eq!(
+        daemon["state_dir"]["value"],
+        state_dir.to_string_lossy().as_ref()
+    );
+    assert!(daemon.get("bind").is_none(), "stdio has no listener");
+    assert_eq!(
+        daemon["event_log_retention"]["max_rows"]["source"],
+        "default"
+    );
+}

@@ -199,10 +199,12 @@ pub(crate) const DASHBOARDS_WRITE: Scope = Scope::new("dashboards:write");
 
 /// Phase 14.2c: `status:read` — see MCP `oxidhome://status`.
 /// Read-only host status snapshot (version, DB reachability,
-/// counts). No REST equivalent today; the resource was added
-/// for LLM agents that need a "is the hub up and how big is
-/// it" surface without pulling the full plugins/instances/
-/// devices lists.
+/// counts), added for LLM agents that need a "is the hub up
+/// and how big is it" surface without pulling the full
+/// plugins/instances/devices lists. Also gates the daemon's
+/// effective configuration (MCP `oxidhome://config`, REST
+/// `GET /api/v1/config`): the same kind of operational
+/// metadata (paths, listen address, limits), no secrets.
 pub(crate) const STATUS_READ: Scope = Scope::new("status:read");
 
 /// Phase 14.2c: `blobs:read` — see MCP

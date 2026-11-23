@@ -25,7 +25,7 @@
 //! name is masked like anywhere else.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -141,7 +141,9 @@ impl RetentionView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DaemonConfig {
     mode: DaemonMode,
-    state_dir: Setting<PathBuf>,
+    /// Lossy UTF-8: the daemon accepts any OS path, JSON can't carry
+    /// every one.
+    state_dir: Setting<String>,
     /// Configured listen address. HTTP mode only.
     #[serde(skip_serializing_if = "Option::is_none")]
     bind: Option<Setting<SocketAddr>>,
@@ -150,7 +152,7 @@ pub struct DaemonConfig {
     listen_addr: Option<SocketAddr>,
     /// Plugin directory passed on argv (dev-time start).
     #[serde(skip_serializing_if = "Option::is_none")]
-    dev_plugin_dir: Option<Setting<PathBuf>>,
+    dev_plugin_dir: Option<Setting<String>>,
     log_filter: Setting<String>,
     event_log_retention: RetentionView,
 }
@@ -164,7 +166,7 @@ impl DaemonConfig {
     pub fn resolve(mode: DaemonMode, state_dir: &Path, retention: &EventLogRetention) -> Self {
         Self {
             mode,
-            state_dir: Setting::from_env(state_dir.to_path_buf(), ENV_STATE_DIR),
+            state_dir: Setting::from_env(lossy(state_dir), ENV_STATE_DIR),
             bind: None,
             listen_addr: None,
             dev_plugin_dir: None,
@@ -176,7 +178,18 @@ impl DaemonConfig {
     /// Record the configured and the bound API address.
     #[must_use]
     pub fn with_listener(mut self, configured: SocketAddr, bound: SocketAddr) -> Self {
-        self.bind = Some(Setting::from_env(configured, ENV_BIND));
+        // `main.rs` reads the variable with `env::var`, so a
+        // non-Unicode value falls back to the default there.
+        let source = if std::env::var(ENV_BIND).is_ok() {
+            ConfigSource::Env
+        } else {
+            ConfigSource::Default
+        };
+        self.bind = Some(Setting {
+            value: configured,
+            source,
+            env: Some(ENV_BIND),
+        });
         self.listen_addr = Some(bound);
         self
     }
@@ -185,12 +198,16 @@ impl DaemonConfig {
     #[must_use]
     pub fn with_dev_plugin_dir(mut self, dir: &Path) -> Self {
         self.dev_plugin_dir = Some(Setting {
-            value: dir.to_path_buf(),
+            value: lossy(dir),
             source: ConfigSource::Flag,
             env: None,
         });
         self
     }
+}
+
+fn lossy(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 /// The filter `main.rs` hands `EnvFilter`: `RUST_LOG` when it parses,
@@ -202,7 +219,7 @@ fn effective_log_filter() -> Setting<String> {
         .filter(|raw| tracing_subscriber::EnvFilter::try_new(raw).is_ok());
     match from_env {
         Some(raw) => Setting {
-            value: raw,
+            value: mask_span_fields(&raw),
             source: ConfigSource::Env,
             env: Some(ENV_LOG_FILTER),
         },
@@ -212,6 +229,38 @@ fn effective_log_filter() -> Setting<String> {
             env: Some(ENV_LOG_FILTER),
         },
     }
+}
+
+/// Replace the field-value part of every span directive
+/// (`target[span{field=value}]=level`) with `***`. Field filters can
+/// match on arbitrary values, credentials included, and the key-based
+/// M7 rules don't see inside a directive string. Targets and levels
+/// stay readable.
+fn mask_span_fields(filter: &str) -> String {
+    let mut out = String::with_capacity(filter.len());
+    let mut depth = 0usize;
+    for c in filter.chars() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    out.push_str("{***");
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push('}');
+                }
+            }
+            _ if depth > 0 => {}
+            _ => out.push(c),
+        }
+    }
+    if depth > 0 {
+        out.push('}');
+    }
+    out
 }
 
 static DAEMON_CONFIG: OnceLock<DaemonConfig> = OnceLock::new();
@@ -330,7 +379,7 @@ mod tests {
         DaemonConfig {
             mode: DaemonMode::Http,
             state_dir: Setting {
-                value: PathBuf::from("/var/lib/oxidhome"),
+                value: "/var/lib/oxidhome".to_owned(),
                 source: ConfigSource::Env,
                 env: Some(ENV_STATE_DIR),
             },
@@ -391,6 +440,30 @@ mod tests {
     }
 
     #[test]
+    fn span_field_values_are_masked() {
+        assert_eq!(
+            mask_span_fields("info,oxidhome=debug"),
+            "info,oxidhome=debug"
+        );
+        assert_eq!(
+            mask_span_fields("warn,[request{url=https://alice:pw@hub/}]=debug"),
+            "warn,[request{***}]=debug",
+        );
+        assert_eq!(mask_span_fields("x[s{a={b}}]=trace"), "x[s{***}]=trace");
+        assert_eq!(mask_span_fields("x[s{unterminated"), "x[s{***}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_state_dir_still_serializes() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = Path::new(std::ffi::OsStr::from_bytes(b"/srv/\xff/state"));
+        let cfg = DaemonConfig::resolve(DaemonMode::McpStdio, dir, &EventLogRetention::default());
+        let json = serde_json::to_value(config_body_for(Some(&cfg))).unwrap();
+        assert!(json["daemon"]["state_dir"]["value"].is_string());
+    }
+
+    #[test]
     fn dev_plugin_dir_is_a_flag() {
         let cfg = sample().with_dev_plugin_dir(Path::new("/tmp/plugin"));
         let json = serde_json::to_value(&cfg).unwrap();
@@ -403,7 +476,7 @@ mod tests {
     #[test]
     fn rest_body_is_redacted() {
         let mut daemon = sample();
-        daemon.state_dir.value = PathBuf::from("/srv/password=hunter2/state");
+        daemon.state_dir.value = "/srv/password=hunter2/state".to_owned();
         let value = redacted(&config_body_for(Some(&daemon)));
         let dir = value["daemon"]["state_dir"]["value"].as_str().unwrap();
         assert!(!dir.contains("hunter2"), "secret survived: {dir}");
