@@ -1680,7 +1680,7 @@ async fn events_history_call(
     let event_log = engine.event_log();
     let join = tokio::task::spawn_blocking(move || {
         let _guard = query_permit;
-        query_checking_cursor(&event_log, &event_query, limit_usize)
+        event_log.query_after_cursor(&event_query, limit_usize)
     })
     .await;
     let rows = match join {
@@ -1712,27 +1712,6 @@ async fn events_history_call(
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
         EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
     }
-}
-
-/// H4: run an event query and check that its `after_id` cursor (if
-/// any) is still resumable. An expired cursor is the inner `Err`.
-/// The check runs after the query: rows pruned before the query ran
-/// are seen by it, rows pruned later didn't affect the result.
-fn query_checking_cursor(
-    event_log: &crate::state::EventLog,
-    query: &crate::state::EventQuery,
-    limit: usize,
-) -> Result<
-    Result<Vec<crate::state::HistoricalEvent>, crate::state::CursorExpired>,
-    crate::state::EventLogError,
-> {
-    let rows = event_log.query(query, limit)?;
-    if let Some(after_id) = query.after_id
-        && let Err(expired) = event_log.resolve_cursor(after_id)?
-    {
-        return Ok(Err(expired));
-    }
-    Ok(Ok(rows))
 }
 
 /// H4: `after_id` was pruned by retention (or is ahead of history).
@@ -2044,7 +2023,7 @@ async fn events_subscribe_call(
             let event_log = engine_for_queries.event_log();
             Ok(tokio::task::spawn_blocking(move || {
                 let _guard = query_permit;
-                query_checking_cursor(&event_log, &event_query, limit_usize)
+                event_log.query_after_cursor(&event_query, limit_usize)
             }))
         };
 

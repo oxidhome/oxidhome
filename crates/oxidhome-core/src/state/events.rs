@@ -85,9 +85,17 @@ pub enum SubscriberMessage {
     /// [`EventBus::publish`] (host-side simulators, in-process
     /// tests) — that path skips the durable log — or when the H3
     /// event-log mirror was degraded and the event isn't in history.
+    ///
+    /// H4: `rows_through` is the bus's fanned-out row-id watermark
+    /// when this message was enqueued — every recorded event with a
+    /// row id up to it was fanned out no later than this one. A
+    /// cursor tail that sees it above its cursor knows rows were
+    /// dropped ahead of this event and replays them from history
+    /// first, even when this event carries no row id itself.
     Event {
         event: Arc<Event>,
         skipped_before: u64,
+        rows_through: u64,
     },
 }
 
@@ -354,6 +362,15 @@ impl EventBus {
         self.last_row_id.fetch_max(head, Ordering::AcqRel);
     }
 
+    /// H4: highest row id fanned out so far (or the boot-time
+    /// history head). Every recorded event up to it has been handed
+    /// to the subscriber queues, or is being handed to them right now
+    /// by a publish that already passed this point.
+    #[must_use]
+    pub fn fanned_out_row_id(&self) -> u64 {
+        self.last_row_id.load(Ordering::Acquire)
+    }
+
     /// H4: subscribe and snapshot the fanned-out row-id watermark
     /// atomically with respect to recorded publishes. Holds the
     /// `publish_sequence` gate (the one `publish_event` holds across
@@ -424,6 +441,7 @@ impl EventBus {
         if let Some(id) = event_id {
             self.last_row_id.fetch_max(id, Ordering::AcqRel);
         }
+        let rows_through = self.last_row_id.load(Ordering::Acquire);
         // C2e review F1: wrap the event once in an `Arc` so
         // per-subscriber fan-out is a ref-count bump, not a full
         // clone per queue slot. With unbounded custom-event
@@ -509,6 +527,7 @@ impl EventBus {
             match sub.sender.try_send(SubscriberMessage::Event {
                 event: Arc::clone(&event),
                 skipped_before: claimed,
+                rows_through,
             }) {
                 Ok(()) => delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1199,6 +1218,7 @@ mod tests {
             while let Ok(SubscriberMessage::Event {
                 event: _,
                 skipped_before,
+                ..
             }) = fast.receiver.try_recv()
             {
                 assert_eq!(
@@ -1255,6 +1275,7 @@ mod tests {
         while let Ok(SubscriberMessage::Event {
             event: _,
             skipped_before,
+            ..
         }) = sub.receiver.try_recv()
         {
             assert_eq!(skipped_before, 0, "pre-overflow event carried lag hint");
@@ -1270,6 +1291,7 @@ mod tests {
             SubscriberMessage::Event {
                 skipped_before,
                 event,
+                ..
             } => {
                 assert_eq!(
                     skipped_before, overflow,

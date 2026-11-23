@@ -5,9 +5,11 @@
 //! serialized writer connection and a failed insert rolls its id
 //! back with its transaction, **dense** — the rows committed at any
 //! moment are exactly `1..=head` minus the ones retention deleted.
-//! So a missing id in a range a reader expects to be complete is
-//! proof that rows were pruned, which is what lets a cursor stream
-//! detect an expired cursor instead of silently skipping rows.
+//! Retention ([`EventLog::trim_older_than`]) only deletes an id
+//! prefix, so the row right after a cursor decides whether the cursor
+//! is still resumable, and a missing id in a range a reader expects to
+//! be complete proves rows were pruned. That is what lets readers
+//! report an expired cursor instead of silently skipping rows.
 
 use rusqlite::OptionalExtension as _;
 use serde::Serialize;
@@ -56,34 +58,29 @@ impl EventLog {
         &self,
         after_id: u64,
     ) -> Result<Result<u64, CursorExpired>, EventLogError> {
-        self.db.read(|conn| -> Result<_, EventLogError> {
-            let (head_id, oldest_id) = bounds(conn)?;
-            if after_id == 0 {
-                return Ok(Ok(oldest_id.map_or(head_id, |oldest| oldest - 1)));
-            }
-            let expired = CursorExpired {
-                after_id,
-                oldest_id,
-                head_id,
-            };
-            if after_id > head_id {
+        self.db.read(|conn| resolve_on(conn, after_id))
+    }
+
+    /// [`Self::query`] for a cursor reader: the query and the
+    /// [`Self::resolve_cursor`] check on `filter.after_id` run under
+    /// one connection lock, so a concurrent prune can't fall between
+    /// them. An expired cursor is the inner `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any SQL or decode error.
+    pub fn query_after_cursor(
+        &self,
+        filter: &EventQuery,
+        limit: usize,
+    ) -> Result<Result<Vec<HistoricalEvent>, CursorExpired>, EventLogError> {
+        self.db.read(|conn| {
+            if let Some(after_id) = filter.after_id
+                && let Err(expired) = resolve_on(conn, after_id)?
+            {
                 return Ok(Err(expired));
             }
-            if after_id == head_id {
-                return Ok(Ok(after_id));
-            }
-            let next: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM event_log WHERE id = ?1",
-                    [to_sql_id(after_id + 1)],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            Ok(if next.is_some() {
-                Ok(after_id)
-            } else {
-                Err(expired)
-            })
+            super::query_on(conn, filter, limit).map(Ok)
         })
     }
 
@@ -123,7 +120,8 @@ impl EventLog {
         let rows = self.query(
             &EventQuery {
                 after_id: Some(after),
-                before_id: Some(through.saturating_add(1)),
+                // `id < i64::MAX` would drop SQLite's largest id.
+                before_id: (through < SQL_ID_MAX).then(|| through + 1),
                 order: EventOrder::Asc,
                 ..EventQuery::default()
             },
@@ -155,14 +153,53 @@ impl HistoricalEvent {
     }
 }
 
+/// [`EventLog::resolve_cursor`] on an already-locked connection.
+/// Exact because retention only deletes an id prefix
+/// ([`EventLog::trim_older_than`]): if the row after the cursor is
+/// present, so is every later row up to the head.
+fn resolve_on(
+    conn: &rusqlite::Connection,
+    after_id: u64,
+) -> Result<Result<u64, CursorExpired>, EventLogError> {
+    let (head_id, oldest_id) = bounds(conn)?;
+    if after_id == 0 {
+        return Ok(Ok(oldest_id.map_or(head_id, |oldest| oldest - 1)));
+    }
+    let expired = CursorExpired {
+        after_id,
+        oldest_id,
+        head_id,
+    };
+    if after_id > head_id {
+        return Ok(Err(expired));
+    }
+    if after_id == head_id {
+        return Ok(Ok(after_id));
+    }
+    let next: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM event_log WHERE id = ?1",
+            [to_sql_id(after_id + 1)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(if next.is_some() {
+        Ok(after_id)
+    } else {
+        Err(expired)
+    })
+}
+
 /// `(head_id, oldest_id)`. The head comes from `sqlite_sequence`
 /// (survives deletes), floored by `MAX(id)` in case the sequence row
 /// is missing.
 fn bounds(conn: &rusqlite::Connection) -> Result<(u64, Option<u64>), EventLogError> {
-    let (max_id, min_id): (Option<i64>, Option<i64>) =
-        conn.query_row("SELECT MAX(id), MIN(id) FROM event_log", (), |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+    // Two statements: SQLite answers a lone `MIN` / `MAX` from the
+    // primary key, but `SELECT MAX(id), MIN(id)` scans the table.
+    let max_id: Option<i64> =
+        conn.query_row("SELECT MAX(id) FROM event_log", (), |row| row.get(0))?;
+    let min_id: Option<i64> =
+        conn.query_row("SELECT MIN(id) FROM event_log", (), |row| row.get(0))?;
     let seq: Option<i64> = conn
         .query_row(
             "SELECT seq FROM sqlite_sequence WHERE name = 'event_log'",
@@ -173,6 +210,10 @@ fn bounds(conn: &rusqlite::Connection) -> Result<(u64, Option<u64>), EventLogErr
     let head = seq.unwrap_or(0).max(max_id.unwrap_or(0));
     Ok((from_sql_id(head), min_id.map(from_sql_id)))
 }
+
+/// Largest row id `SQLite` can assign.
+#[allow(clippy::cast_sign_loss)]
+const SQL_ID_MAX: u64 = i64::MAX as u64;
 
 fn from_sql_id(id: i64) -> u64 {
     u64::try_from(id).unwrap_or(0)

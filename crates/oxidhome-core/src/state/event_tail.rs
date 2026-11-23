@@ -28,18 +28,27 @@
 //!   committed late), so the stream reads `(cursor, id)` from
 //!   history first and then delivers the held event;
 //! - an event without a row id (H3 degraded mirror, host simulators)
-//!   is delivered in place and leaves the cursor alone. It was
-//!   published after every replayed row, so delivery order still
-//!   matches publish order, and an H3 gap marker (a row like any
-//!   other) still arrives before the next row-id event.
+//!   leaves the cursor alone. Each queued message carries the bus
+//!   watermark at its fan-out (`rows_through`); if that is above the
+//!   cursor, rows fanned out ahead of the event were dropped, and the
+//!   stream replays them before delivering it. Delivery order
+//!   therefore matches publish order, and an H3 gap marker (a row
+//!   like any other) still arrives before the recovery event.
+//! - when the queue is empty and the bus watermark is above the
+//!   cursor, rows dropped at the end of a burst are replayed without
+//!   waiting for another publish. A row committed without any fan-out
+//!   (cancelled publish) is picked up when the next row-id event
+//!   arrives.
 //!
-//! Row ids are dense (see `event_log::cursor`), so a replay range that
-//! comes back short means retention pruned rows the stream still owed:
-//! the stream emits [`TailItem::CursorExpired`] and ends rather than
-//! skip them. A row that commits late after its event went out live
-//! without an id is delivered again from history with its id; that is
-//! the one duplicate the cursor protocol allows, and it can only follow
-//! an H3 write timeout.
+//! Row ids are dense and retention only deletes an id prefix (see
+//! `event_log::cursor`), so a replay range that comes back short
+//! means retention pruned rows the stream still owed: the stream
+//! emits [`TailItem::CursorExpired`] and ends rather than skip them.
+//! A row that commits late after its event went out live without an
+//! id is delivered again from history with its id (just before the
+//! next row-id event, e.g. the recovery gap marker); that is the one
+//! duplicate the cursor protocol allows, and it can only follow an H3
+//! write timeout.
 //!
 //! History reads run on the blocking pool with a bounded number in
 //! flight and a deadline, so a hung disk ends the stream with
@@ -50,13 +59,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::error::TryRecvError;
 
 use super::event_log::{CursorExpired, EventLog, EventLogError, HistoricalEvent};
 use super::events::{EventBus, EventSubscription, SubscriberMessage};
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventFilter};
 
-/// Rows per history read while replaying.
-const REPLAY_PAGE: usize = 256;
+/// Rows per history read while replaying. Small, because a stalled
+/// client keeps one decoded page buffered (custom payloads can be
+/// large).
+const REPLAY_PAGE: usize = 32;
 
 /// History reads (across every tail) allowed in flight at once.
 const MAX_CONCURRENT_READS: usize = 8;
@@ -102,6 +114,7 @@ enum Mode {
 /// A live (or cursor-resumed) event stream. See the module docs.
 pub struct EventTail {
     subscription: EventSubscription,
+    bus: Arc<EventBus>,
     log: Arc<EventLog>,
     mode: Mode,
     /// Cursor mode: replay history through this row id before taking
@@ -126,7 +139,7 @@ impl EventTail {
     /// An expired cursor is not an error: the stream yields a single
     /// [`TailItem::CursorExpired`].
     pub async fn open(
-        bus: &EventBus,
+        bus: Arc<EventBus>,
         log: Arc<EventLog>,
         after_id: Option<u64>,
         label: &str,
@@ -135,9 +148,16 @@ impl EventTail {
             device: None,
             topic: None,
         };
-        let (subscription, fanned_out) = bus.subscribe_at_head(filter, label).await;
+        // Only a cursor needs the watermark, and with it the publish
+        // gate; a live-only open never waits behind a disk write.
+        let (subscription, fanned_out) = if after_id.is_some() {
+            bus.subscribe_at_head(filter, label).await
+        } else {
+            (bus.subscribe_labeled(filter, label), 0)
+        };
         let mut tail = Self {
             subscription,
+            bus,
             log,
             mode: Mode::Live { last_row_id: None },
             replay_through: 0,
@@ -188,11 +208,32 @@ impl EventTail {
                     continue;
                 }
             }
-            match self.subscription.receiver.recv().await {
+            let message = match self.subscription.receiver.try_recv() {
+                Ok(message) => Some(message),
+                Err(TryRecvError::Disconnected) => None,
+                Err(TryRecvError::Empty) => {
+                    // Queue drained: every event published before the
+                    // watermark read below was consumed or dropped, so
+                    // rows up to it can be replayed without overtaking
+                    // anything still queued. This is what recovers rows
+                    // dropped at the tail of a burst with no publish
+                    // after it.
+                    if let Mode::Cursor { cursor } = self.mode {
+                        let fanned_out = self.bus.fanned_out_row_id();
+                        if fanned_out > cursor {
+                            self.replay_through = fanned_out;
+                            continue;
+                        }
+                    }
+                    self.subscription.receiver.recv().await
+                }
+            };
+            match message {
                 Some(SubscriberMessage::Event {
                     event,
                     skipped_before,
-                }) => self.accept(event, skipped_before),
+                    rows_through,
+                }) => self.accept(event, skipped_before, rows_through),
                 None => self.finished = true,
             }
         }
@@ -215,7 +256,7 @@ impl EventTail {
         Ok(())
     }
 
-    fn accept(&mut self, event: Arc<Event>, skipped_before: u64) {
+    fn accept(&mut self, event: Arc<Event>, skipped_before: u64, rows_through: u64) {
         if skipped_before > 0 {
             let resume_after_id = match self.mode {
                 Mode::Live { last_row_id } => last_row_id,
@@ -226,13 +267,25 @@ impl EventTail {
                 resume_after_id,
             });
         }
-        match (self.mode, event.row_id) {
-            (Mode::Cursor { cursor }, Some(id)) if id <= cursor => {}
-            (Mode::Cursor { cursor }, Some(id)) if id > cursor + 1 => {
-                self.replay_through = id - 1;
-                self.held = Some(event);
-            }
-            _ => self.deliver(event),
+        let Mode::Cursor { cursor } = self.mode else {
+            self.deliver(event);
+            return;
+        };
+        // Rows that must reach the client before this event: those
+        // below its own row id, or, for an event without one, every
+        // row fanned out ahead of it (`rows_through`). Rows beyond the
+        // cursor there were dropped from the queue or never fanned
+        // out, so read them from history first.
+        let before = match event.row_id {
+            Some(id) if id <= cursor => return,
+            Some(id) => id - 1,
+            None => rows_through,
+        };
+        if before > cursor {
+            self.replay_through = before;
+            self.held = Some(event);
+        } else {
+            self.deliver(event);
         }
     }
 
@@ -347,7 +400,7 @@ mod tests {
         for n in 1..=600 {
             publish_recorded(&bus, &log, n).await;
         }
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(100), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(100), "test")
             .await
             .expect("open");
         // Published after the subscription, before any replay read.
@@ -385,7 +438,7 @@ mod tests {
         for n in 1..=3 {
             publish_recorded(&bus, &log, n).await;
         }
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(3), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(3), "test")
             .await
             .expect("open");
         // A stale re-fan-out of an already-covered row.
@@ -403,7 +456,7 @@ mod tests {
         for n in 1..=2 {
             publish_recorded(&bus, &log, n).await;
         }
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(0), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(0), "test")
             .await
             .expect("open");
         bus.publish(event(100));
@@ -427,7 +480,7 @@ mod tests {
             publish_recorded(&bus, &log, n).await;
         }
         log.trim_older_than(4).expect("trim");
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(1), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(1), "test")
             .await
             .expect("open");
         match next_item(&mut tail).await {
@@ -448,7 +501,7 @@ mod tests {
     async fn cursor_ahead_of_history_expires() {
         let (bus, log) = setup();
         publish_recorded(&bus, &log, 1).await;
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(7), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(7), "test")
             .await
             .expect("open");
         assert!(matches!(
@@ -470,7 +523,7 @@ mod tests {
         for n in 1..=10 {
             publish_recorded(&bus, &log, n).await;
         }
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(2), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(2), "test")
             .await
             .expect("open");
         log.trim_older_than(6).expect("trim");
@@ -488,21 +541,41 @@ mod tests {
         assert!(next_item(&mut tail).await.is_none());
     }
 
-    /// A cursor stream that overflows its queue reports the lag with
-    /// its resume point, then re-reads the dropped rows from history.
+    /// Rows dropped at the end of a burst are replayed as soon as the
+    /// queue drains, without waiting for another publish.
     #[tokio::test]
-    async fn cursor_stream_recovers_lagged_events_from_history() {
+    async fn cursor_stream_recovers_a_dropped_burst_tail_without_another_publish() {
         let (bus, log) = setup();
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(0), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(0), "test")
             .await
             .expect("open");
         for n in 1..=300 {
             publish_recorded(&bus, &log, n).await;
         }
-        for want in 1..=256 {
+        for want in 1..=300 {
             assert_eq!(next_id(&mut tail).await, want);
         }
-        publish_recorded(&bus, &log, 301).await;
+    }
+
+    /// An event without a row id that follows dropped rows waits for
+    /// them: the lag notice (with its resume point), the dropped rows
+    /// from history, then the event.
+    #[tokio::test]
+    async fn row_id_less_event_after_a_drop_waits_for_the_dropped_rows() {
+        let (bus, log) = setup();
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(0), "test")
+            .await
+            .expect("open");
+        for n in 1..=300 {
+            publish_recorded(&bus, &log, n).await;
+        }
+        // Leave row 256 queued so the next read doesn't find the
+        // queue empty, then publish an event without a row id.
+        for want in 1..=255 {
+            assert_eq!(next_id(&mut tail).await, want);
+        }
+        bus.publish(event(1000));
+        assert_eq!(next_id(&mut tail).await, 256);
         match next_item(&mut tail).await {
             Some(TailItem::Lagged {
                 skipped,
@@ -513,8 +586,15 @@ mod tests {
             }
             other => panic!("expected lagged, got {other:?}"),
         }
-        for want in 257..=301 {
+        for want in 257..=300 {
             assert_eq!(next_id(&mut tail).await, want);
+        }
+        match next_item(&mut tail).await {
+            Some(TailItem::Event(ev)) => {
+                assert_eq!(ev.row_id, None);
+                assert_eq!(ev.timestamp, 1000);
+            }
+            other => panic!("expected the row-id-less event, got {other:?}"),
         }
     }
 
@@ -522,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn live_lag_notice_carries_the_resume_cursor() {
         let (bus, log) = setup();
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), None, "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), None, "test")
             .await
             .expect("open");
         for n in 1..=300 {
@@ -552,7 +632,7 @@ mod tests {
                 .expect("record");
         }
         bus.note_history_head(log.head_id().expect("head"));
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(1), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(1), "test")
             .await
             .expect("open");
         assert_eq!(next_id(&mut tail).await, 2);
@@ -566,13 +646,37 @@ mod tests {
     #[tokio::test]
     async fn unfanned_rows_are_filled_from_history() {
         let (bus, log) = setup();
-        let mut tail = EventTail::open(&bus, Arc::clone(&log), Some(0), "test")
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(0), "test")
             .await
             .expect("open");
         publish_recorded(&bus, &log, 1).await;
         log.record(2, &event(2), "inst", "example.test")
             .expect("record");
         publish_recorded(&bus, &log, 3).await;
+        for want in 1..=3 {
+            assert_eq!(next_id(&mut tail).await, want);
+        }
+    }
+
+    /// H3 late commit: event A goes out live without an id, its timed-out
+    /// write commits later as row 1, then recovery fans out the gap
+    /// marker (2) and the recovery event (3). The cursor stream sees
+    /// A, then A again with its id, then the marker, then recovery.
+    #[tokio::test]
+    async fn late_committed_row_is_replayed_before_the_gap_marker() {
+        let (bus, log) = setup();
+        let mut tail = EventTail::open(Arc::clone(&bus), Arc::clone(&log), Some(0), "test")
+            .await
+            .expect("open");
+        bus.publish(event(1));
+        log.record(1, &event(1), "inst", "example.test")
+            .expect("late commit");
+        publish_recorded(&bus, &log, 2).await;
+        publish_recorded(&bus, &log, 3).await;
+        match next_item(&mut tail).await {
+            Some(TailItem::Event(ev)) => assert_eq!(ev.row_id, None),
+            other => panic!("expected A without an id, got {other:?}"),
+        }
         for want in 1..=3 {
             assert_eq!(next_id(&mut tail).await, want);
         }

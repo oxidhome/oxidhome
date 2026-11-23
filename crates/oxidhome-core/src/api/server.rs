@@ -29,8 +29,8 @@ use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
 use crate::runtime::{CommandOutcome, CommandReport};
 use crate::state::{
-    AuditQuery, EventLog, EventLogError, EventQuery, HistoricalEvent, HistoricalLogEvent,
-    InstallError, LogLevel, LogQuery, LogStore, LogValue, TopicMatch, UninstallError,
+    AuditQuery, EventLogError, EventQuery, HistoricalEvent, HistoricalLogEvent, InstallError,
+    LogLevel, LogQuery, LogStore, LogValue, TopicMatch, UninstallError,
 };
 
 use super::auth::{AuthState, require_token};
@@ -2493,7 +2493,7 @@ async fn tail_events(
     // published in between. `EventTail::open` subscribes (and, with
     // a cursor, resolves it against history) before returning.
     let tail = match crate::state::EventTail::open(
-        &state.engine.events(),
+        state.engine.events(),
         state.engine.event_log(),
         params.after_id,
         "http-tail",
@@ -2519,12 +2519,29 @@ struct TailParams {
     after_id: Option<u64>,
 }
 
-async fn tail_events_loop(mut socket: WebSocket, mut tail: crate::state::EventTail) {
+/// One [`crate::state::EventTail::next`] step that owns the tail, so
+/// the WebSocket loop can keep the same step running across client
+/// frames.
+async fn tail_step(
+    mut tail: crate::state::EventTail,
+) -> (
+    crate::state::EventTail,
+    Result<Option<crate::state::TailItem>, crate::state::TailError>,
+) {
+    let item = tail.next().await;
+    (tail, item)
+}
+
+async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail) {
     use crate::state::TailItem;
     use axum::extract::ws::{CloseFrame, Message};
     // C2e: per-subscriber mpsc queue. The tail ends when the bus
     // drops (engine shutdown). Drops due to a slow WebSocket happen
     // *for this subscriber only*.
+    //
+    // The pending step survives client frames: a Ping must not
+    // restart a history read that is already running.
+    let mut step = Box::pin(tail_step(tail));
     loop {
         // Select between the tail (events to push) and the socket
         // (client frames + disconnects). Polling `socket.recv()`
@@ -2532,15 +2549,16 @@ async fn tail_events_loop(mut socket: WebSocket, mut tail: crate::state::EventTa
         // auto-Pong on client Ping, Close handling — and what
         // notices a client disconnect *promptly* on quiet event
         // buses rather than waiting for the next publish to find
-        // a dead send target. `EventTail::next` is cancel-safe.
+        // a dead send target.
         tokio::select! {
-            item = tail.next() => {
+            (tail, item) = &mut step => {
+                step = Box::pin(tail_step(tail));
                 let text = match item {
                     Ok(Some(TailItem::Event(event))) => {
-                        let Ok(text) = serde_json::to_string(&WireEvent::from_host(&event)) else {
-                            continue;
-                        };
-                        text
+                        match serde_json::to_string(&WireEvent::from_host(&event)) {
+                            Ok(text) => text,
+                            Err(_) => continue,
+                        }
                     }
                     Ok(Some(TailItem::Lagged { skipped, resume_after_id })) => {
                         let mut frame = serde_json::json!({ "lagged": skipped });
@@ -2984,18 +3002,16 @@ async fn query_events(
         before_id: params.before_id,
         order: crate::state::EventOrder::Desc,
     };
+    // H4: the query and the `after_id` check share one connection
+    // lock, so a pruned (or future) cursor is reported, not skipped.
+    // Off the async workers: both hold the shared database mutex.
     let event_log = state.engine.event_log();
-    let rows = run_events_query(&event_log, &query, limit).map_err(EventsError::Storage)?;
-    // H4: a pruned (or future) `after_id` is reported, not skipped.
-    // Checked after the query: rows pruned before it ran are seen by
-    // this check, rows pruned after it ran didn't affect the result.
-    if let Some(after_id) = query.after_id
-        && let Err(expired) = event_log
-            .resolve_cursor(after_id)
-            .map_err(EventsError::Storage)?
-    {
-        return Err(EventsError::CursorExpired(expired));
-    }
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let rows = tokio::task::spawn_blocking(move || event_log.query_after_cursor(&query, limit))
+        .await
+        .map_err(|_| EventsError::Join)?
+        .map_err(EventsError::Storage)?
+        .map_err(EventsError::CursorExpired)?;
     let events = rows
         .into_iter()
         .map(|row| WireHistoricalEvent::from_row(row, can_read_blobs(&actor)))
@@ -3003,18 +3019,10 @@ async fn query_events(
     Ok(Json(EventsBody { events }))
 }
 
-fn run_events_query(
-    store: &EventLog,
-    query: &EventQuery,
-    limit: u32,
-) -> Result<Vec<HistoricalEvent>, EventLogError> {
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    store.query(query, limit)
-}
-
 enum EventsError {
     Scope(ScopeDenied),
     Storage(EventLogError),
+    Join,
     CursorExpired(crate::state::CursorExpired),
 }
 
@@ -3024,6 +3032,10 @@ impl IntoResponse for EventsError {
             EventsError::Scope(s) => s.into_response(),
             EventsError::Storage(err) => {
                 tracing::error!(target: "api.events", error = %err, "events query failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+            EventsError::Join => {
+                tracing::error!(target: "api.events", "events query task failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
             }
             // Same body as the tail's `cursor_expired` frame.
