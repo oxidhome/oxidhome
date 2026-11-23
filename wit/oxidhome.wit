@@ -1368,15 +1368,18 @@ interface host-sandboxes {
   /// over 64 KiB, the resulting instance id too long, or a live
   /// `local-id` with different source); `unavailable` (the instance's
   /// sandbox limit is reached, a previous sandbox with this `local-id`
-  /// is still stopping, the host is shutting down, or this instance
-  /// isn't supervised).
+  /// is still stopping or its storage is still being purged, the host
+  /// is shutting down, or this instance isn't supervised).
   start-sandbox: func(local-id: string, source: string) -> result<string, error>;
 
-  /// Stop a sandbox this instance started. It leaves the list at once
-  /// and stops in the background; until it has stopped it still counts
-  /// against `script_sandboxes`. Errors: `not-found`;
-  /// `permission-denied` inside a sandbox; `unavailable` in an instance
-  /// the host doesn't supervise.
+  /// Stop a sandbox this instance started and remove it: its storage
+  /// is purged. It leaves the list at once and stops in the
+  /// background; until its storage is purged it still counts against
+  /// `script_sandboxes` and its `local-id` can't be started again.
+  /// Errors: `not-found`; `permission-denied` inside a sandbox;
+  /// `unavailable` in an instance the host doesn't supervise;
+  /// `internal` if the removal couldn't be recorded (the sandbox still
+  /// stops).
   stop-sandbox: func(local-id: string) -> result<_, error>;
 
   /// The sandboxes this instance started that are still live.

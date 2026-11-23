@@ -345,8 +345,10 @@ pub struct InstanceHandle {
     sandbox: Option<Arc<SandboxScript>>,
     /// H5: the engine's pending-command table, whose journal records a
     /// reply this handle's caller dropped without reading (see
-    /// [`ReplyGuard`]). `None` for test handles.
-    pending: Option<Arc<PendingCommands>>,
+    /// [`ReplyGuard`]). `None` for test handles. Weak, so a handle kept
+    /// after its engine is gone doesn't keep the journal running; a
+    /// reply guard holds it only while its reply is outstanding.
+    pending: Option<std::sync::Weak<PendingCommands>>,
 }
 
 impl InstanceHandle {
@@ -436,10 +438,10 @@ impl InstanceHandle {
     fn with_pending_for_test(
         instance_id: &str,
         control: mpsc::Sender<ControlCommand>,
-        pending: Arc<PendingCommands>,
+        pending: &Arc<PendingCommands>,
     ) -> Self {
         Self {
-            pending: Some(pending),
+            pending: Some(Arc::downgrade(pending)),
             ..Self::with_control_for_test(instance_id, control)
         }
     }
@@ -733,7 +735,7 @@ impl InstanceHandle {
         command_id: &str,
         device: &DeviceId,
     ) -> Option<UnreadReply<CommandOutcome>> {
-        let pending = Arc::clone(self.pending.as_ref()?);
+        let pending = self.pending.as_ref()?.upgrade()?;
         if !ctx.root().is_external() {
             return None;
         }
@@ -766,7 +768,7 @@ impl InstanceHandle {
         command: &str,
         check: &ResultCheck,
     ) -> Option<UnreadReply<anyhow::Result<CommandResult>>> {
-        let pending = Arc::clone(self.pending.as_ref()?);
+        let pending = self.pending.as_ref()?.upgrade()?;
         if !ctx.root().is_external() {
             return None;
         }
@@ -1216,7 +1218,7 @@ pub(crate) fn spawn_supervisor(
         stop: Arc::new(stop_tx),
         reaped: Arc::new(watch::Sender::new(false)),
         sandbox: child_script,
-        pending: Some(engine.pending_commands()),
+        pending: Some(Arc::downgrade(&engine.pending_commands())),
     };
     tokio::spawn(run_supervisor(
         engine,
@@ -2576,7 +2578,7 @@ mod tests {
     ) -> (Vec<crate::state::AuditEntry>, Option<CommandReport>) {
         let (audit, pending) = journaled();
         let (control, mut rx) = mpsc::channel(4);
-        let handle = InstanceHandle::with_pending_for_test("inst-a", control, Arc::clone(&pending));
+        let handle = InstanceHandle::with_pending_for_test("inst-a", control, &pending);
         let mut caller = Some(Box::pin(handle.execute_command_in(
             api_ctx(),
             "dev-1".into(),
@@ -2706,7 +2708,7 @@ mod tests {
     async fn a_refusal_after_the_callers_deadline_is_not_recorded_again() {
         let (audit, pending) = journaled();
         let (control, mut rx) = mpsc::channel(4);
-        let handle = InstanceHandle::with_pending_for_test("inst-a", control, Arc::clone(&pending));
+        let handle = InstanceHandle::with_pending_for_test("inst-a", control, &pending);
         let ctx = api_ctx().with_deadline(Some(Instant::now() + Duration::from_millis(20)));
         let report = handle
             .execute_command_in(
@@ -2745,7 +2747,7 @@ mod tests {
             )
             .expect("register");
         let (control, mut rx) = mpsc::channel(4);
-        let handle = InstanceHandle::with_pending_for_test("inst-a", control, Arc::clone(&pending));
+        let handle = InstanceHandle::with_pending_for_test("inst-a", control, &pending);
         let ctx = api_ctx().delegate(DelegationHop {
             caller_instance: "caller".into(),
             target_plugin: "test.plugin".into(),

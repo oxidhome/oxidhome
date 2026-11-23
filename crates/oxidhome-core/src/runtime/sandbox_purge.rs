@@ -78,7 +78,11 @@ impl StorageOps {
             if self.in_flight(instance_id) == 0 {
                 return true;
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            // Other instances' operations wake this too; they can't
+            // stretch the bound.
+            if tokio::time::Instant::now() >= deadline
+                || tokio::time::timeout_at(deadline, notified).await.is_err()
+            {
                 return self.in_flight(instance_id) == 0;
             }
         }
