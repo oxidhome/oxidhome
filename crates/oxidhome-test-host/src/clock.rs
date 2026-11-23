@@ -11,33 +11,17 @@ use crate::TestHostError;
 /// gives up with [`TestHostError::ClockStalled`].
 pub(crate) const SETTLE_LIMIT: Duration = Duration::from_secs(30);
 
-/// Wait until the work the clock's current time triggered has been
-/// picked up: every due timer fired and every tick interval that
-/// fired is waited on again (see [`VirtualClock::is_settled`]). When a
-/// one-shot timer fired, also give its task a moment to run the code
-/// after it.
+/// Wait until the work the clock's current time triggered is done:
+/// every due timer fired, every tick interval that fired is waited on
+/// again, and every sleep that fired was dropped (see
+/// [`VirtualClock::is_settled`]).
 pub(crate) async fn settle(clock: &VirtualClock) -> Result<(), TestHostError> {
-    let deadline = tokio::time::Instant::now() + SETTLE_LIMIT;
-    loop {
-        if tokio::time::timeout_at(deadline, clock.settled())
-            .await
-            .is_err()
-        {
-            return Err(TestHostError::ClockStalled {
-                elapsed: clock.elapsed(),
-                limit: SETTLE_LIMIT,
-            });
-        }
-        if clock.take_fired() == 0 {
-            return Ok(());
-        }
-        // The task that awaited the timer runs on in the same poll;
-        // let it (and anything it woke) finish, then check again.
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    tokio::time::timeout(SETTLE_LIMIT, clock.settled())
+        .await
+        .map_err(|_| TestHostError::ClockStalled {
+            elapsed: clock.elapsed(),
+            limit: SETTLE_LIMIT,
+        })
 }
 
 /// Fire, in order, every timer due at or before `until` (time since

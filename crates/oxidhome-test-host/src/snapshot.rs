@@ -1,10 +1,11 @@
 //! [`Snapshot`] — a compact, deterministic text rendering of what one
 //! instance left in the host, for whole-state assertions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
 use oxidhome_core::state::{AuditEntry, AuditQuery, StateQuality};
@@ -194,6 +195,24 @@ const AUDIT_FLUSH: Duration = Duration::from_secs(10);
 /// Upper bound on the audit rows one snapshot reads.
 const AUDIT_ROWS: usize = 100_000;
 
+/// Every secret config value of every instance loaded on one host.
+/// Snapshots mask them all: an instance id's stored data and events
+/// outlive a reload with a rotated secret.
+#[derive(Debug, Default)]
+pub(crate) struct Secrets(Mutex<BTreeSet<String>>);
+
+impl Secrets {
+    pub(crate) fn add<'s>(&self, values: impl IntoIterator<Item = &'s str>) {
+        let mut set = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        set.extend(values.into_iter().map(str::to_owned));
+    }
+
+    fn all(&self) -> Vec<String> {
+        let set = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        set.iter().cloned().collect()
+    }
+}
+
 impl Snapshot {
     pub(crate) fn capture(
         instance: &InstanceRef<'_>,
@@ -247,7 +266,7 @@ impl Snapshot {
             let value = view
                 .get(&key)?
                 .map_or_else(|| "<removed>".to_owned(), |v| render_value(&v));
-            storage.push(format!("{} = {value}", tok(&key)));
+            storage.push(format!("{} = {}", tok(&key), masked(&key, value)));
         }
         let blobs = instance
             .blobs()?
@@ -266,7 +285,7 @@ impl Snapshot {
             .then(|| render_device_state(instance, &stamp));
         let commands = options.commands.then(|| render_commands(instance));
         let audit = if options.audit {
-            Some(render_audit(instance, &stamp)?)
+            Some(render_audit(instance)?)
         } else {
             None
         };
@@ -280,7 +299,19 @@ impl Snapshot {
             commands,
             audit,
         };
-        Redactor::new(&options.redactions, instance.secrets).apply(&mut snapshot);
+        let secrets = instance.secrets.all();
+        let mut redactor = Redactor::new(&options.redactions, &secrets);
+        // Number the commands' ids in the order they were sent, not in
+        // the order the snapshot happens to print them.
+        for record in instance
+            .commands
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = redactor.minted_ids(&record.command_id);
+        }
+        redactor.apply(&mut snapshot);
         Ok(snapshot)
     }
 
@@ -429,10 +460,13 @@ impl Stamp {
 }
 
 fn render_device_state(instance: &InstanceRef<'_>, stamp: &Stamp) -> Vec<String> {
-    let mut entries: Vec<_> = instance
+    // The whole projection: unlike a delta read, it doesn't come back
+    // empty once eviction moved the store's watermark.
+    let (_, _, all) = instance
         .engine
         .device_state()
-        .deltas_since(0, usize::MAX)
+        .snapshot_page_with_revision(None, usize::MAX);
+    let mut entries: Vec<_> = all
         .into_iter()
         .filter(|e| e.owner_instance == instance.instance_id)
         .collect();
@@ -494,7 +528,7 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
         .collect()
 }
 
-fn render_audit(instance: &InstanceRef<'_>, stamp: &Stamp) -> Result<Vec<String>, TestHostError> {
+fn render_audit(instance: &InstanceRef<'_>) -> Result<Vec<String>, TestHostError> {
     // Rows the host writes off the call path: refused reads (H2) and
     // command resolutions (H5). Best effort — a row still queued after
     // the wait shows up in a later snapshot.
@@ -509,10 +543,12 @@ fn render_audit(instance: &InstanceRef<'_>, stamp: &Stamp) -> Result<Vec<String>
     };
     let mut rows = instance.engine.audit_log().query(&query, AUDIT_ROWS)?;
     rows.sort_by_key(|r| r.id);
-    Ok(rows.iter().map(|r| render_audit_row(r, stamp)).collect())
+    Ok(rows.iter().map(render_audit_row).collect())
 }
 
-fn render_audit_row(row: &AuditEntry, stamp: &Stamp) -> String {
+/// One audit row. Never stamped: a row the host writes in the
+/// background takes its time when written, not when the call ran.
+fn render_audit_row(row: &AuditEntry) -> String {
     let mut line = format!(
         "{} {} {} {}",
         tok(&row.decision),
@@ -532,7 +568,6 @@ fn render_audit_row(row: &AuditEntry, stamp: &Stamp) -> String {
     if let Some(error) = &row.domain_error {
         let _ = write!(line, " error={error:?}");
     }
-    line.push_str(&stamp.at(row.intent_ms));
     line
 }
 
@@ -551,7 +586,9 @@ fn render_error(error: &WitError) -> String {
 /// "Stable and redacted").
 struct Redactor<'a> {
     replacements: &'a [(String, String)],
-    secrets: Vec<&'a str>,
+    /// Every secret, and its escaped form where escaping changes it
+    /// (a snapshot prints strings escaped), longest first.
+    secrets: Vec<String>,
     /// Quoted renderings (`"…"`, as [`render_value`] prints a string)
     /// of every secret, longest first.
     quoted: Vec<String>,
@@ -566,14 +603,16 @@ const MINTED_PREFIXES: [&str; 2] = ["cmd-", "call-"];
 const MINTED_HEX_LEN: usize = 32;
 
 impl<'a> Redactor<'a> {
-    fn new(replacements: &'a [(String, String)], secrets: &'a [String]) -> Self {
-        let mut secrets: Vec<&str> = secrets
+    fn new(replacements: &'a [(String, String)], secrets: &[String]) -> Self {
+        let raw: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
+        let mut quoted: Vec<String> = raw.iter().map(|s| format!("{s:?}")).collect();
+        quoted.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        let mut secrets: Vec<String> = raw
             .iter()
-            .map(String::as_str)
-            .filter(|s| !s.is_empty())
+            .flat_map(|s| [(*s).clone(), s.escape_debug().to_string()])
             .collect();
         secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        let quoted = secrets.iter().map(|s| format!("{s:?}")).collect();
+        secrets.dedup();
         Self {
             replacements,
             secrets,
@@ -587,6 +626,8 @@ impl<'a> Redactor<'a> {
         for line in snapshot.lines_mut() {
             *line = self.line(line);
         }
+        // Keys can be minted ids: order by what the snapshot prints.
+        snapshot.storage.sort();
     }
 
     fn line(&mut self, line: &str) -> String {
@@ -598,7 +639,8 @@ impl<'a> Redactor<'a> {
         for quoted in &self.quoted {
             text = text.replace(quoted.as_str(), "\"***\"");
         }
-        let text = oxidhome_core::redact::scrub_secret_values(&text, &self.secrets).into_owned();
+        let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        let text = oxidhome_core::redact::scrub_secret_values(&text, &secrets).into_owned();
         let text = oxidhome_core::redact::scrub_text(&text).into_owned();
         self.minted_ids(&text)
     }
@@ -699,6 +741,17 @@ fn tok_allowing(text: &str, extra: &str) -> String {
     }
 }
 
+/// `value` (rendered), or `"***"` under a credential-like `key`
+/// whatever its type — the text scrubber can't tell a JSON or bytes
+/// rendering's value apart from its type tag.
+fn masked(key: &str, value: String) -> String {
+    if oxidhome_core::redact::is_sensitive_key(key) {
+        "\"***\"".to_owned()
+    } else {
+        value
+    }
+}
+
 /// Trailing free text (an event payload, a blob mime type): escaped
 /// onto one line.
 fn esc(text: &str) -> String {
@@ -708,7 +761,13 @@ fn esc(text: &str) -> String {
 fn render_fields(fields: &[KeyValue]) -> String {
     let parts: Vec<String> = fields
         .iter()
-        .map(|kv| format!("{}={}", tok(&kv.key), render_value(&kv.value)))
+        .map(|kv| {
+            format!(
+                "{}={}",
+                tok(&kv.key),
+                masked(&kv.key, render_value(&kv.value))
+            )
+        })
         .collect();
     format!("{{{}}}", parts.join(", "))
 }
@@ -903,7 +962,11 @@ mod tests {
 
     #[test]
     fn redaction_masks_secrets_and_numbers_minted_ids() {
-        let secrets = vec!["hunter2-long".to_owned(), "pw".to_owned()];
+        let secrets = vec![
+            "hunter2-long".to_owned(),
+            "pw".to_owned(),
+            "quo\"te-secret".to_owned(),
+        ];
         let extra = vec![("instance-7".to_owned(), "<inst>".to_owned())];
         let mut snap = sample();
         let cmd_a = format!("cmd-{}", "ab".repeat(16));
@@ -914,6 +977,7 @@ mod tests {
             "note = \"the key is hunter2-long!\"".into(),
             "creds = \"password=abc\"".into(),
             "who = \"instance-7\"".into(),
+            "esc = \"a quo\\\"te-secret inside\"".into(),
         ];
         snap.audit = Some(vec![
             format!("allow 200 COMMAND {cmd_a} {call}"),
@@ -924,13 +988,17 @@ mod tests {
         Redactor::new(&extra, &secrets).apply(&mut snap);
         assert_eq!(
             snap.storage,
+            // Sorted as printed.
             [
-                "short = \"***\"",
-                "note = \"the key is ***!\"",
                 "creds = \"password=***\"",
+                "esc = \"a *** inside\"",
+                "note = \"the key is ***!\"",
+                "short = \"***\"",
                 "who = \"<inst>\"",
             ]
         );
+        assert_eq!(masked("password", "json:\"x\"".into()), "\"***\"");
+        assert_eq!(masked("count", "3".into()), "3");
         assert_eq!(
             snap.audit.unwrap(),
             [
@@ -939,6 +1007,13 @@ mod tests {
                 &format!("cmd-test cmd-{}0", "ab".repeat(16)),
             ]
         );
+        // A seeded id keeps its number wherever it shows up first.
+        let mut snap = sample();
+        snap.storage = vec![format!("{cmd_a} = 1"), format!("{cmd_b} = 2")];
+        let mut redactor = Redactor::new(&[], &[]);
+        let _ = redactor.minted_ids(&cmd_b);
+        redactor.apply(&mut snap);
+        assert_eq!(snap.storage, ["<cmd-1> = 2", "<cmd-2> = 1"]);
         assert_eq!(minted_id_at("cmd-", "cmd-"), None);
         assert_eq!(
             minted_id_at(&format!("cmd-{}", "AB".repeat(16)), "cmd-"),
@@ -989,7 +1064,7 @@ mod tests {
             command_outcome: Some("rejected".into()),
         };
         assert_eq!(
-            render_audit_row(&row, &Stamp::Off),
+            render_audit_row(&row),
             "deny 403 STATE device.state/inst/dev-1 scope=reads_state outcome=failed \
              command=rejected error=\"not found\""
         );

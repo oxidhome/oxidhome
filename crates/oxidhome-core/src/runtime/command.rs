@@ -568,12 +568,15 @@ impl PendingCommands {
             let id = command_id.to_owned();
             // Created here rather than in the task: a virtual clock
             // then knows the timer before `register` returns.
-            let timer = self.clock.sleep_until(expires_at);
+            let mut timer = self.clock.sleep_until(expires_at);
             let expiry = tokio::spawn(async move {
-                timer.await;
+                (&mut timer).await;
                 if let Some(table) = weak.upgrade() {
                     table.expire(&id, ExpiryReason::Expired);
                 }
+                // Held until the expiry is done: a virtual clock counts
+                // it in progress until then.
+                drop(timer);
             })
             .abort_handle();
             // Queued under the table lock, so the persist is ahead of

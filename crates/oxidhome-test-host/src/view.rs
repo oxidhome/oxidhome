@@ -10,7 +10,7 @@ use oxidhome_core::state::{
 };
 
 use crate::TestHostError;
-use crate::snapshot::{CommandRecord, Snapshot, SnapshotOptions};
+use crate::snapshot::{CommandRecord, Secrets, Snapshot, SnapshotOptions};
 use crate::tempdir::TempDir;
 use crate::wit::types::Value;
 
@@ -20,8 +20,8 @@ pub(crate) struct InstanceRef<'a> {
     pub(crate) state_dir: &'a Arc<TempDir>,
     pub(crate) installation_uuid: Arc<str>,
     pub(crate) instance_id: &'a str,
-    /// The instance's secret config values, masked in snapshots.
-    pub(crate) secrets: &'a [String],
+    /// The host's secret config values, masked in snapshots.
+    pub(crate) secrets: &'a Secrets,
     /// Commands the test sent through the harness.
     pub(crate) commands: &'a Mutex<Vec<CommandRecord>>,
 }

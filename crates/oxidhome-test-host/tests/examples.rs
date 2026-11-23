@@ -627,22 +627,26 @@ async fn hang_tick_is_interrupted_by_the_watchdog() {
         .unwrap();
     hang.wait_for_running().await.unwrap();
 
-    // The first tick is due 10 ms after `Running`; once it fires, the
-    // supervisor reschedules the next one while the tick spins. The
-    // jump doesn't wait for the tick (it never returns).
+    // The first tick is due 10 ms after `Running` and never returns,
+    // so step the clock itself (`TestHost::advance` would wait for the
+    // tick) a second at a time until the watchdog interrupts it. The
+    // watchdog arms its 30 s once the tick starts, so it can't fire
+    // before 30 s of virtual time have passed — however long the
+    // steps take in real time.
     clock.advance(Duration::from_millis(10));
-    eventually("the first tick to start", || {
-        clock.next_deadline() > Some(clock.elapsed())
-    })
-    .await;
-    // Short of the deadline, however long in real time, it runs on.
-    clock.advance(Duration::from_secs(29));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(hang.state(), InstanceState::Running);
-
-    // Past it, the watchdog interrupts the call.
-    clock.advance(Duration::from_secs(2));
-    let error = failed_error(hang.wait_terminal().await);
+    let mut terminal = None;
+    for _ in 0..120 {
+        clock.advance(Duration::from_secs(1));
+        if let Ok(state) =
+            tokio::time::timeout(Duration::from_millis(50), hang.wait_terminal()).await
+        {
+            terminal = Some(state);
+            break;
+        }
+    }
+    let state = terminal.expect("the watchdog to interrupt the tick within 120 s");
+    assert!(clock.elapsed() >= Duration::from_secs(30), "{clock:?}");
+    let error = failed_error(state);
     assert!(error.contains("unresponsive"), "{error}");
 }
 
@@ -883,8 +887,18 @@ async fn snapshots_mask_secrets() {
     snapshot.assert_matches(expected);
     direct.shutdown().await.unwrap();
 
-    // The supervised path resolves the same secrets.
-    let supervised = host.start_with(staged.path(), options()).await.unwrap();
+    // The supervised path resolves secrets the same way. Reloaded
+    // with a rotated key, the old one, still in its storage, stays
+    // masked too.
+    let supervised = host
+        .start_with(
+            staged.path(),
+            LoadOptions::new()
+                .instance_id("counter")
+                .config(config("api_key = \"r0tated-secret\"")),
+        )
+        .await
+        .unwrap();
     supervised.wait_for_running().await.unwrap();
     supervised.send_command("", bogus).await;
     supervised
@@ -907,18 +921,6 @@ fn switch_command(action: &str, args: Vec<KeyValue>) -> Command {
 
 fn only_device(instance: &SupervisedInstance) -> String {
     instance.devices()[0].id.clone()
-}
-
-/// Poll `done` every 10 ms for up to 5 s.
-async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !done() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 /// Success is `completed` with the plugin's state; a plugin refusal is

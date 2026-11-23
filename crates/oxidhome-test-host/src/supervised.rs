@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::TestHostError;
 use crate::live::IdLease;
-use crate::snapshot::{CommandRecord, Snapshot, SnapshotOptions};
+use crate::snapshot::{CommandRecord, Secrets, Snapshot, SnapshotOptions};
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::Command;
@@ -40,7 +40,7 @@ pub struct SupervisedInstance {
     watcher: Option<JoinHandle<InstanceState>>,
     runtime: tokio::runtime::Handle,
     state_dir: Arc<TempDir>,
-    secrets: Vec<String>,
+    secrets: Arc<Secrets>,
     commands: Mutex<Vec<CommandRecord>>,
 }
 
@@ -50,7 +50,7 @@ impl SupervisedInstance {
         handle: InstanceHandle,
         lease: IdLease,
         state_dir: Arc<TempDir>,
-        secrets: Vec<String>,
+        secrets: Arc<Secrets>,
     ) -> Self {
         let plugin_id: Arc<str> = handle.plugin_id().into();
         let watcher = {

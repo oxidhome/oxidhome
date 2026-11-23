@@ -9,7 +9,7 @@ use oxidhome_manifest::PluginManifest;
 
 use crate::TestHostError;
 use crate::live::IdLease;
-use crate::snapshot::{CommandRecord, Snapshot, SnapshotOptions};
+use crate::snapshot::{CommandRecord, Secrets, Snapshot, SnapshotOptions};
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::{Command, CommandResult};
@@ -49,7 +49,7 @@ pub struct TestPluginInstance {
     /// On a virtual-clock host: the clock's time at load, which the
     /// tick schedule counts from.
     loaded_at: Duration,
-    secrets: Vec<String>,
+    secrets: Arc<Secrets>,
     commands: Mutex<Vec<CommandRecord>>,
 }
 
@@ -59,11 +59,9 @@ impl TestPluginInstance {
         inner: PluginInstance,
         lease: IdLease,
         state_dir: Arc<TempDir>,
+        secrets: Arc<Secrets>,
     ) -> Self {
-        let secrets = oxidhome_core::redact::config_secrets(inner.config())
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        secrets.add(oxidhome_core::redact::config_secrets(inner.config()));
         let loaded_at = engine
             .clock()
             .as_virtual()

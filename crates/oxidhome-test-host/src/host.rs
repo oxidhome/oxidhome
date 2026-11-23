@@ -14,6 +14,7 @@ use crate::TestHostError;
 use crate::grant::grant_excess;
 use crate::instance::TestPluginInstance;
 use crate::live::{IdLease, LiveIds};
+use crate::snapshot::Secrets;
 use crate::supervised::SupervisedInstance;
 use crate::tempdir::TempDir;
 use crate::wit::devices::CommandResult;
@@ -51,6 +52,9 @@ pub struct TestHost {
     live: Arc<LiveIds>,
     next_id: AtomicU64,
     state_dir: Arc<TempDir>,
+    /// Every loaded instance's secret config values, for snapshot
+    /// redaction.
+    secrets: Arc<Secrets>,
 }
 
 /// Per-load knobs for [`TestHost::load_with`] and
@@ -191,6 +195,7 @@ impl TestHost {
             live: Arc::default(),
             next_id: AtomicU64::new(1),
             state_dir: Arc::new(state_dir),
+            secrets: Arc::default(),
         })
     }
 
@@ -228,6 +233,14 @@ impl TestHost {
     /// Directly driven instances aren't ticked here: their ticks run
     /// when the test calls [`TestPluginInstance::advance`] (which also
     /// moves this clock) or [`TestPluginInstance::tick`].
+    ///
+    /// "The work a timer triggers" is its owner's: a supervised tick
+    /// counts as done once the supervisor waits for its next tick. An
+    /// event that tick published may still be on its way to another
+    /// instance's `on-event`; wait for that effect itself. Advance one
+    /// clock from one task at a time (concurrent steps interleave), on
+    /// a multi-thread runtime if a plugin call may hang: a spinning
+    /// guest holds its worker thread.
     ///
     /// # Errors
     ///
@@ -316,6 +329,7 @@ impl TestHost {
             inner,
             reservation.keep(),
             Arc::clone(&self.state_dir),
+            Arc::clone(&self.secrets),
         ))
     }
 
@@ -386,12 +400,13 @@ impl TestHost {
                 plugin_id,
                 source: e.into(),
             })?;
+        self.secrets.add(secrets.iter().map(String::as_str));
         Ok(SupervisedInstance::new(
             self.engine.clone(),
             handle,
             reservation.keep(),
             Arc::clone(&self.state_dir),
-            secrets,
+            Arc::clone(&self.secrets),
         ))
     }
 

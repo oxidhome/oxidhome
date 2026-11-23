@@ -116,7 +116,12 @@ counter.stop().await?;
 ```
 
 `host.run_until_idle()` waits for the work already due without moving
-time. A plugin call that never returns keeps `advance` waiting, so to
+time. Both wait for the timers' owners — a supervised tick, a command
+expiry — not for what those publish: an event a tick sends to another
+instance's `on-event` may still be in flight, so wait for that effect
+itself. Advance a clock from one task at a time, and use a
+multi-thread runtime when a plugin call may hang (a spinning guest
+holds its worker thread). A plugin call that never returns keeps `advance` waiting, so to
 move time past the watchdog, jump the clock itself:
 `host.virtual_clock().unwrap().advance(Duration::from_secs(31))` moves
 time and fires what falls due without waiting for anything.

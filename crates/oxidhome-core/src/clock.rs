@@ -106,6 +106,10 @@ impl Clock {
 
     /// A future that completes once [`Self::instant`] reaches
     /// `deadline` (`tokio::time::sleep_until` on the system clock).
+    ///
+    /// On a virtual clock, a sleep that fired counts as work in
+    /// progress ([`VirtualClock::is_settled`] is `false`) until it is
+    /// dropped: keep it until the work it triggers is done.
     #[must_use]
     pub fn sleep_until(&self, deadline: Instant) -> Sleep {
         match &self.source {
@@ -267,12 +271,10 @@ struct State {
     /// Registered timers by id: the time since start each is due at,
     /// and who to wake.
     timers: BTreeMap<u64, Timer>,
-    /// Intervals that fired and whose owner hasn't come back for the
-    /// next tick yet — it is still handling this one.
+    /// Work in progress: intervals that fired and whose owner hasn't
+    /// come back for the next tick yet, and sleeps that fired and
+    /// haven't been dropped yet.
     busy: BTreeSet<u64>,
-    /// One-shot timers that fired since the last
-    /// [`VirtualClock::take_fired`].
-    fired: u64,
     engines: Vec<Weak<WasmtimeEngine>>,
 }
 
@@ -378,15 +380,21 @@ impl VirtualClock {
     /// all fire at its end; step with [`Self::next_deadline`] to fire
     /// them one at a time.
     pub fn advance(&self, by: Duration) {
-        let target = self.elapsed().saturating_add(by);
-        self.advance_to(target);
+        self.step(|now| now.saturating_add(by));
     }
 
     /// Move the clock to `elapsed` since its start, as
     /// [`Self::advance`]. A time in the past leaves it where it is.
     pub fn advance_to(&self, elapsed: Duration) {
+        self.step(|_| elapsed);
+    }
+
+    /// Move the clock to `target(now)`, read and applied under one
+    /// lock so concurrent advances add up.
+    fn step(&self, target: impl FnOnce(Duration) -> Duration) {
         let (wake, engines, ticks) = {
             let mut state = self.lock();
+            let elapsed = target(state.elapsed);
             if elapsed <= state.elapsed {
                 return;
             }
@@ -428,9 +436,9 @@ impl VirtualClock {
         self.lock().timers.len()
     }
 
-    /// Whether every timer that is due has fired and every tick
-    /// interval that fired is being waited on again — the work the
-    /// current time triggered has been picked up.
+    /// Whether every timer that is due has fired, every tick interval
+    /// that fired is being waited on again, and every sleep that fired
+    /// was dropped — the work the current time triggered is done.
     #[must_use]
     pub fn is_settled(&self) -> bool {
         let state = self.lock();
@@ -452,15 +460,6 @@ impl VirtualClock {
         }
     }
 
-    /// How many one-shot timers ([`Clock::sleep_until`]) fired since
-    /// the last call. Code awaiting one runs on after it fires, which
-    /// [`Self::is_settled`] can't see; a caller that saw a non-zero
-    /// count gives those tasks a moment to finish.
-    #[must_use]
-    pub fn take_fired(&self) -> u64 {
-        std::mem::take(&mut self.lock().fired)
-    }
-
     fn lock(&self) -> MutexGuard<'_, State> {
         self.shared.lock()
     }
@@ -475,8 +474,9 @@ impl VirtualClock {
         self.shared.changed.notify_waiters();
         VirtualSleep {
             shared: Arc::clone(&self.shared),
-            id: Some(id),
+            id,
             at,
+            fired: false,
         }
     }
 
@@ -510,34 +510,40 @@ fn epoch_ticks(from: Duration, to: Duration) -> u128 {
 
 struct VirtualSleep {
     shared: Arc<Shared>,
+    /// Both the timer id and the busy-set key.
+    id: u64,
     at: Duration,
-    /// `None` once fired.
-    id: Option<u64>,
+    fired: bool,
 }
 
 impl VirtualSleep {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        let Some(id) = self.id else {
+        if self.fired {
             return Poll::Ready(());
-        };
+        }
         let mut state = self.shared.lock();
         if state.elapsed >= self.at {
-            state.timers.remove(&id);
-            state.fired += 1;
+            // Fired: the timer becomes work in progress under one
+            // lock, so a settle check never sees neither. It stays
+            // busy until the sleep is dropped.
+            state.timers.remove(&self.id);
+            state.busy.insert(self.id);
             drop(state);
-            self.id = None;
+            self.fired = true;
             self.shared.changed.notify_waiters();
             return Poll::Ready(());
         }
-        state.set_waker(id, cx.waker());
+        state.set_waker(self.id, cx.waker());
         Poll::Pending
     }
 }
 
 impl Drop for VirtualSleep {
     fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            self.shared.lock().timers.remove(&id);
+        let mut state = self.shared.lock();
+        let removed = state.timers.remove(&self.id).is_some() | state.busy.remove(&self.id);
+        drop(state);
+        if removed {
             self.shared.changed.notify_waiters();
         }
     }
@@ -614,8 +620,9 @@ impl HostWallClock for GuestWallClock {
     }
 
     fn now(&self) -> Duration {
-        let since_epoch = self.0.start.duration_since(UNIX_EPOCH).unwrap_or_default();
-        since_epoch.saturating_add(self.0.lock().elapsed)
+        // As the host's `now`, clamped at the epoch only at the end.
+        let now = self.0.start + self.0.lock().elapsed;
+        now.duration_since(UNIX_EPOCH).unwrap_or_default()
     }
 }
 
@@ -692,11 +699,12 @@ mod tests {
         v.advance(Duration::from_secs(1));
         assert!(!v.is_settled(), "a due timer hasn't fired yet");
         assert!(Pin::new(&mut sleep).poll(&mut cx).is_ready());
-        assert!(v.is_settled());
+        assert!(Pin::new(&mut sleep).poll(&mut cx).is_ready());
         assert_eq!(v.pending_timers(), 0);
-        assert_eq!(v.take_fired(), 1);
-        assert_eq!(v.take_fired(), 0);
+        assert!(!v.is_settled(), "fired, but its owner still holds it");
         assert!(format!("{sleep:?}").starts_with("Sleep"));
+        drop(sleep);
+        assert!(v.is_settled());
 
         // A dropped sleep deregisters.
         let mut dropped = clock.sleep_until(clock.instant() + Duration::from_secs(1));
@@ -754,19 +762,25 @@ mod tests {
         interval.tick().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn settled_waits_for_the_woken_task() {
         let v = VirtualClock::new();
         let clock = Clock::from(v.clone());
-        let deadline = clock.instant() + Duration::from_secs(1);
-        let task = tokio::spawn(async move { clock.sleep_until(deadline).await });
-        while v.pending_timers() == 0 {
-            tokio::task::yield_now().await;
-        }
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut sleep = clock.sleep_until(clock.instant() + Duration::from_secs(1));
+        let task = tokio::spawn({
+            let done = Arc::clone(&done);
+            async move {
+                (&mut sleep).await;
+                // Work after the timer, before the sleep drops.
+                std::thread::sleep(Duration::from_millis(50));
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
         v.advance(Duration::from_secs(1));
         v.settled().await;
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
         task.await.unwrap();
-        assert_eq!(v.take_fired(), 1);
     }
 
     #[test]
@@ -816,5 +830,28 @@ mod tests {
         let mut builder = WasiCtxBuilder::new();
         Clock::from(v).configure_wasi(&mut builder);
         Clock::system().configure_wasi(&mut builder);
+
+        // Before the epoch, guest and host agree once time passes it.
+        let early = VirtualClock::starting_at(UNIX_EPOCH - Duration::from_secs(1));
+        let wall = GuestWallClock(Arc::clone(&early.shared));
+        assert_eq!(wall.now(), Duration::ZERO);
+        early.advance(Duration::from_secs(2));
+        assert_eq!(wall.now(), Duration::from_secs(1));
+        assert_eq!(early.now_unix_ms(), 1000);
+    }
+
+    #[test]
+    fn concurrent_advances_add_up() {
+        let v = VirtualClock::new();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..100 {
+                        v.advance(Duration::from_millis(1));
+                    }
+                });
+            }
+        });
+        assert_eq!(v.elapsed(), Duration::from_millis(800));
     }
 }
