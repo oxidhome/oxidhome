@@ -343,20 +343,37 @@ fn wait_retry_unless_closed(shared: &Shared) {
 /// Whether a batch that failed while closing gets another attempt:
 /// sleeps briefly and answers `true` while the close budget lasts.
 fn retry_while_closing(shared: &Shared) -> bool {
-    const CLOSING_RETRY_DELAY: Duration = Duration::from_millis(50);
     let delay = match shared.lock().retry {
         Retry::Never => return false,
-        // A last attempt fits in whatever budget is left.
-        // Near the end, retry after half of what is left, so an attempt
-        // still lands inside the budget.
-        Retry::Until(until) => match until.checked_duration_since(Instant::now()) {
-            Some(left) if left >= Duration::from_millis(2) => (left / 2).min(CLOSING_RETRY_DELAY),
-            _ => return false,
-        },
+        Retry::Until(until) => {
+            let Some(delay) = closing_retry_delay(until.checked_duration_since(Instant::now()))
+            else {
+                return false;
+            };
+            delay
+        }
         Retry::Unbounded => CLOSING_RETRY_DELAY,
     };
-    std::thread::sleep(delay);
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
     true
+}
+
+/// Retry spacing while closing, until the budget gets short.
+const CLOSING_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// The wait before retrying a failed batch with `left` of the close
+/// budget remaining; `None` once it is spent. Near the end, half of
+/// what is left (so an attempt still lands inside the budget), and at
+/// once below 2 ms.
+fn closing_retry_delay(left: Option<Duration>) -> Option<Duration> {
+    match left {
+        Some(left) if left.is_zero() => None,
+        Some(left) if left < Duration::from_millis(2) => Some(Duration::ZERO),
+        Some(left) => Some((left / 2).min(CLOSING_RETRY_DELAY)),
+        None => None,
+    }
 }
 
 fn write_batch(db: &Db, batch: &[Job], unwritten: &HashSet<String>) -> Result<(), AuditLogError> {
@@ -763,6 +780,22 @@ mod tests {
         assert!(reconcile(&db).is_err());
         assert_eq!(load_rows(&db).unwrap().len(), 2, "both rows kept");
         assert_eq!(resolution_rows(&db), Vec::<AuditEntry>::new());
+    }
+
+    #[test]
+    fn closing_retries_use_the_budget_to_its_end() {
+        let ms = Duration::from_millis;
+        assert_eq!(
+            closing_retry_delay(Some(ms(500))),
+            Some(CLOSING_RETRY_DELAY)
+        );
+        assert_eq!(closing_retry_delay(Some(ms(30))), Some(ms(15)));
+        assert_eq!(
+            closing_retry_delay(Some(Duration::from_micros(1500))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(closing_retry_delay(Some(Duration::ZERO)), None);
+        assert_eq!(closing_retry_delay(None), None);
     }
 
     #[test]
