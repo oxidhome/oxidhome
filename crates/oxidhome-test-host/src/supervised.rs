@@ -62,7 +62,10 @@ impl SupervisedInstance {
                 // The engine's reaper releases the instance's devices
                 // and services, then unregisters it; only after that
                 // may the id go to a new instance.
-                while engine.instance(lease.id()).is_some() {
+                // Its script sandboxes (ADR-0001) stop after it; they
+                // use the same state dir.
+                let sandboxes = engine.sandboxes();
+                while engine.instance(lease.id()).is_some() || sandboxes.has_children(lease.id()) {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 drop(lease);

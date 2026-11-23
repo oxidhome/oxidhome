@@ -57,7 +57,9 @@ pub fn start(local_id: &str, source: &str) -> Result<String, Error> {
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] if no such sandbox is live.
+/// [`Error::NotFound`] if no such sandbox is live;
+/// [`Error::PermissionDenied`] inside a sandbox;
+/// [`Error::Unavailable`] in an instance the host doesn't supervise.
 pub fn stop(local_id: &str) -> Result<(), Error> {
     host_sandboxes::stop_sandbox(local_id)
 }

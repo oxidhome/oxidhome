@@ -281,6 +281,21 @@ impl InstanceHandle {
         }
     }
 
+    /// A handle that reports `Running` forever, for sandbox-registry
+    /// unit tests that need a live child.
+    #[cfg(test)]
+    pub(crate) fn running_for_test(instance_id: &str, plugin_id: &str) -> Self {
+        let (control, _rx) = tokio::sync::mpsc::channel(1);
+        let (_tx, state) = tokio::sync::watch::channel(InstanceState::Running);
+        Self {
+            instance_id: Arc::from(instance_id),
+            plugin_id: Arc::from(plugin_id),
+            loaded: Arc::default(),
+            control,
+            state,
+        }
+    }
+
     /// The instance id this supervisor was started with.
     #[must_use]
     pub fn instance_id(&self) -> &str {

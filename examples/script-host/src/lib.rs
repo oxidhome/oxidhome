@@ -17,7 +17,7 @@
 //! - `ok` — reply `ok`;
 //! - `call <script> <command>` — call `<command>` on the sibling script
 //!   `<script>` through `host::call_service` and reply with its result;
-//! - `sleep <ms>` — sleep, then reply `ok`;
+//! - `sleep <ms>` — sleep (at most 10 s), then reply `ok`;
 //! - `trap` — panic (the sandbox crashes and restarts on its own).
 //!
 //! Blank lines and lines starting with `#` are ignored.
@@ -91,6 +91,9 @@ fn string_arg<'a>(args: &'a [KeyValue], name: &str) -> Option<&'a str> {
 }
 
 /// Start every pending script; keep the ones refused as `unavailable`
+/// Longest `sleep` a script may ask for, in milliseconds.
+const MAX_SLEEP_MS: u64 = 10_000;
+
 /// (retried on the next tick) and drop the rest.
 fn restore(pending: &mut BTreeMap<String, String>) {
     pending.retain(|id, source| match host::sandboxes::start(id, source) {
@@ -123,10 +126,15 @@ impl ScriptHost {
         .map_err(|e| format!("register-service failed: {e:?}"))?;
         // Re-adopt (after a manager crash) or re-create (after a daemon
         // restart) every script this instance had loaded.
+        // A storage error fails init (and the supervisor retries it)
+        // rather than leaving saved scripts offline for this whole life.
         let mut pending = BTreeMap::new();
-        for key in host::storage::list_keys(KV_PREFIX).unwrap_or_default() {
-            if let (Some(id), Ok(Some(Value::StringVal(source)))) =
-                (key.strip_prefix(KV_PREFIX), host::storage::get(&key))
+        let keys = host::storage::list_keys(KV_PREFIX)
+            .map_err(|e| format!("listing saved scripts failed: {e:?}"))?;
+        for key in keys {
+            let saved = host::storage::get(&key)
+                .map_err(|e| format!("reading saved script `{key}` failed: {e:?}"))?;
+            if let (Some(id), Some(Value::StringVal(source))) = (key.strip_prefix(KV_PREFIX), saved)
             {
                 pending.insert(id.to_owned(), source);
             }
@@ -150,7 +158,11 @@ impl ScriptHost {
         Ok(())
     }
 
-    fn manage(command: &str, args: &[KeyValue]) -> CommandResult {
+    fn manage(
+        pending: &mut BTreeMap<String, String>,
+        command: &str,
+        args: &[KeyValue],
+    ) -> CommandResult {
         let Some(id) = string_arg(args, "id") else {
             return CommandResult::Err(Error::InvalidArgument("missing `id`".into()));
         };
@@ -167,6 +179,7 @@ impl ScriptHost {
                 if let Err(e) = host::storage::set(&key, &Value::StringVal(source.into())) {
                     return CommandResult::Err(e);
                 }
+                pending.remove(id);
                 match host::sandboxes::start(id, source) {
                     Ok(instance_id) => CommandResult::OkWithState(vec![KeyValue {
                         key: "instance_id".into(),
@@ -191,8 +204,11 @@ impl ScriptHost {
                 if let Err(e) = host::storage::delete(&key) {
                     return CommandResult::Err(e);
                 }
+                let was_pending = pending.remove(id).is_some();
                 match host::sandboxes::stop(id) {
                     Ok(()) => CommandResult::Ok,
+                    // Never started this life: forgetting it was enough.
+                    Err(Error::NotFound(_)) if was_pending => CommandResult::Ok,
                     Err(e) => CommandResult::Err(e),
                 }
             }
@@ -206,7 +222,9 @@ impl ScriptHost {
         match action {
             Action::Ok => CommandResult::Ok,
             Action::Sleep(ms) => {
-                std::thread::sleep(Duration::from_millis(*ms));
+                // Bounded: a guest blocked in a host sleep can't be
+                // interrupted by the epoch watchdog or a shutdown.
+                std::thread::sleep(Duration::from_millis((*ms).min(MAX_SLEEP_MS)));
                 CommandResult::Ok
             }
             Action::Trap => panic!("script asked to trap"),
@@ -245,8 +263,8 @@ impl Plugin for ScriptHost {
         command: String,
         args: Vec<KeyValue>,
     ) -> CommandResult {
-        match &self.role {
-            Some(Role::Manager { .. }) => Self::manage(&command, &args),
+        match &mut self.role {
+            Some(Role::Manager { pending }) => Self::manage(pending, &command, &args),
             Some(Role::Script { parent, commands }) => match commands.get(&command) {
                 Some(action) => Self::run(parent, action),
                 None => CommandResult::Err(Error::InvalidArgument(format!(

@@ -485,7 +485,11 @@ async fn sandbox_limit_counts_stopping_sandboxes() {
         assert!(Instant::now() < deadline, "a never finished stopping");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(engine.instance("main~a").is_none());
+    // `a`'s slot goes just before its instance-registry entry.
+    while engine.instance("main~a").is_some() {
+        assert!(Instant::now() < deadline, "a never left the registry");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     manager.stop().await.expect("stop manager");
 }

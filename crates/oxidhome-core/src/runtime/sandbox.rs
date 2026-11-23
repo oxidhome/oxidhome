@@ -35,7 +35,7 @@ use crate::host_impl::plugin::oxidhome::plugin::host_sandboxes::{
 use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
 
 use super::instance::LoadMode;
-use super::lifecycle::{InstanceHandle, SupervisorTuning};
+use super::lifecycle::{InstanceHandle, InstanceState, SupervisorTuning};
 use super::registry::RegistryError;
 use super::state::PluginState;
 
@@ -145,6 +145,16 @@ struct Entry {
     stopping: bool,
 }
 
+impl Entry {
+    /// Live: not asked to stop here, and not stopping or stopped by
+    /// anyone else (an operator stopping the instance directly).
+    fn is_live(&self) -> bool {
+        !self.stopping
+            && !matches!(self.handle.state(), InstanceState::Stopping)
+            && !self.handle.state().is_terminal()
+    }
+}
+
 /// Sandboxes per parent instance, live or stopping. Owned by the
 /// [`Engine`].
 #[derive(Default)]
@@ -167,7 +177,7 @@ impl SandboxRegistry {
         self.lock().get(parent).map_or_default(|children| {
             children
                 .values()
-                .filter(|e| !e.stopping)
+                .filter(|e| e.is_live())
                 .map(|e| (e.script.local_id.clone(), e.script.instance_id.clone()))
                 .collect()
         })
@@ -177,10 +187,16 @@ impl SandboxRegistry {
         self.lock().get(parent).map_or_default(|children| {
             children
                 .values()
-                .filter(|e| !e.stopping)
+                .filter(|e| e.is_live())
                 .map(|e| e.script.info())
                 .collect()
         })
+    }
+
+    /// Whether `parent` has sandboxes that haven't been reaped yet.
+    #[must_use]
+    pub fn has_children(&self, parent: &str) -> bool {
+        self.lock().contains_key(parent)
     }
 
     /// Reaper hook: drop the entry for `(parent, local_id)` if it is
@@ -266,7 +282,7 @@ impl Engine {
         let mut guard = registry.lock();
         let children = guard.entry(parent.to_owned()).or_default();
         if let Some(existing) = children.get(&local_id) {
-            return if existing.stopping {
+            return if !existing.is_live() {
                 Err(WitError::Unavailable(format!(
                     "sandbox `{local_id}` is still stopping; retry shortly"
                 )))
@@ -400,7 +416,9 @@ impl host_sandboxes::Host for PluginState {
             source,
         );
         if let Err(err) = &result {
-            tracing::warn!(instance_id = %self.instance_id, error = ?err, "start-sandbox refused");
+            // Debug, not warn: a plugin retrying a refused start would
+            // otherwise flood the host log.
+            tracing::debug!(instance_id = %self.instance_id, error = ?err, "start-sandbox refused");
         }
         result
     }
@@ -481,7 +499,7 @@ mod tests {
                         parent_instance: parent.to_owned(),
                         source: Arc::from(""),
                     }),
-                    handle: InstanceHandle::for_registry_test(&instance_id, "p"),
+                    handle: InstanceHandle::running_for_test(&instance_id, "p"),
                     generation,
                     stopping: false,
                 },
@@ -492,6 +510,21 @@ mod tests {
     /// A stopped sandbox leaves the list at once but stays registered
     /// (counted) until its reaper removes it; a stale reaper can't
     /// remove a newer entry.
+    /// A sandbox an operator stopped directly isn't live either.
+    #[test]
+    fn stopped_handles_are_not_listed() {
+        let registry = SandboxRegistry::default();
+        entry(&registry, "main", "a");
+        registry
+            .lock()
+            .get_mut("main")
+            .and_then(|c| c.get_mut("a"))
+            .expect("entry")
+            .handle = InstanceHandle::for_registry_test("main~a", "p");
+        assert_eq!(registry.list("main"), Vec::<(String, String)>::new());
+        assert!(registry.has_children("main"));
+    }
+
     #[test]
     fn stopping_entries_stay_until_their_reaper_runs() {
         let registry = SandboxRegistry::default();

@@ -1253,7 +1253,9 @@ interface host-sandboxes {
 
   /// Stop a sandbox this instance started. It leaves the list at once
   /// and stops in the background; until it has stopped it still counts
-  /// against `script_sandboxes`. Errors: `not-found`.
+  /// against `script_sandboxes`. Errors: `not-found`;
+  /// `permission-denied` inside a sandbox; `unavailable` in an instance
+  /// the host doesn't supervise.
   stop-sandbox: func(local-id: string) -> result<_, error>;
 
   /// The sandboxes this instance started that are still live.
