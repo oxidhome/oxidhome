@@ -237,23 +237,31 @@ fn effective_log_filter() -> Setting<String> {
 /// M7 rules don't see inside a directive string. Targets and levels
 /// stay readable.
 fn mask_span_fields(filter: &str) -> String {
-    // `EnvFilter`'s grammar: `{` opens a span's field list and the
-    // first `}` closes it, with no nesting, quoting or escapes.
+    // `EnvFilter`'s grammar: inside a `[span]` selector, `{` opens the
+    // field list and the first `}` closes it, with no nesting, quoting
+    // or escapes. Outside a selector `{` is a literal target character.
     let mut out = String::with_capacity(filter.len());
+    let mut in_span = false;
     let mut in_fields = false;
     for c in filter.chars() {
-        match (in_fields, c) {
-            (false, '{') => {
-                out.push_str("{***");
-                in_fields = true;
-            }
-            (true, '}') => {
+        if in_fields {
+            if c == '}' {
                 out.push('}');
                 in_fields = false;
             }
-            (true, _) => {}
-            (false, c) => out.push(c),
+            continue;
         }
+        match c {
+            '[' => in_span = true,
+            ']' => in_span = false,
+            '{' if in_span => {
+                out.push_str("{***");
+                in_fields = true;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
     }
     if in_fields {
         out.push('}');
@@ -456,6 +464,10 @@ mod tests {
             mask_span_fields(filter),
             "app[request{***}]=debug,other=trace"
         );
+        // Outside a span selector `{` is part of a target name.
+        let filter = "worker{=warn,oxidhome_core=debug";
+        assert!(tracing_subscriber::EnvFilter::try_new(filter).is_ok());
+        assert_eq!(mask_span_fields(filter), filter);
     }
 
     #[cfg(unix)]
