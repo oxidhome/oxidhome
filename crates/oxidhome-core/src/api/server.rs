@@ -2452,8 +2452,8 @@ fn js_string_escape(input: &str) -> String {
 ///   itself;
 /// - `{"cursor_expired": {"after_id", "oldest_id", "head_id"}}` —
 ///   the cursor can't be resumed without a gap; the server then
-///   closes the socket. Resync from a snapshot and reopen with
-///   `after_id = head_id`.
+///   closes the socket. Reopen with `after_id = head_id`, then read
+///   a snapshot, then apply the streamed events in order.
 ///
 /// With `after_id` the stream delivers every history row with
 /// `id > after_id` exactly once and in id order, then continues live.
@@ -2493,7 +2493,7 @@ async fn tail_events(
     // published in between. `EventTail::open` subscribes (and, with
     // a cursor, resolves it against history) before returning.
     let tail = match crate::state::EventTail::open(
-        state.engine.events(),
+        &state.engine.events(),
         state.engine.event_log(),
         params.after_id,
         "http-tail",
@@ -2951,6 +2951,12 @@ struct EventsParams {
 const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
 const EVENTS_QUERY_MAX_LIMIT: u32 = 1_000;
 
+/// `GET /api/v1/events` reads allowed on the blocking pool at once;
+/// more answer `503`.
+const EVENTS_QUERY_INFLIGHT: usize = 8;
+static EVENTS_QUERY_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(EVENTS_QUERY_INFLIGHT)));
+
 /// `GET /api/v1/events?…` — historical event query against the
 /// `EventLog` `SQLite` table. Gated on `events:read`. Returns rows
 /// in descending `id` order (highest first). Under normal
@@ -3005,13 +3011,22 @@ async fn query_events(
     // H4: the query and the `after_id` check share one connection
     // lock, so a pruned (or future) cursor is reported, not skipped.
     // Off the async workers: both hold the shared database mutex.
+    // At most `EVENTS_QUERY_INFLIGHT` reads queued on the blocking
+    // pool; the permit moves into the closure, so a cancelled request
+    // still holds it until its read finishes.
+    let permit = Arc::clone(&EVENTS_QUERY_SLOTS)
+        .try_acquire_owned()
+        .map_err(|_| EventsError::Busy)?;
     let event_log = state.engine.event_log();
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let rows = tokio::task::spawn_blocking(move || event_log.query_after_cursor(&query, limit))
-        .await
-        .map_err(|_| EventsError::Join)?
-        .map_err(EventsError::Storage)?
-        .map_err(EventsError::CursorExpired)?;
+    let rows = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        event_log.query_after_cursor(&query, limit)
+    })
+    .await
+    .map_err(|_| EventsError::Join)?
+    .map_err(EventsError::Storage)?
+    .map_err(EventsError::CursorExpired)?;
     let events = rows
         .into_iter()
         .map(|row| WireHistoricalEvent::from_row(row, can_read_blobs(&actor)))
@@ -3023,6 +3038,7 @@ enum EventsError {
     Scope(ScopeDenied),
     Storage(EventLogError),
     Join,
+    Busy,
     CursorExpired(crate::state::CursorExpired),
 }
 
@@ -3034,6 +3050,11 @@ impl IntoResponse for EventsError {
                 tracing::error!(target: "api.events", error = %err, "events query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
             }
+            EventsError::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "event history busy; retry shortly",
+            )
+                .into_response(),
             EventsError::Join => {
                 tracing::error!(target: "api.events", "events query task failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

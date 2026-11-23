@@ -212,7 +212,22 @@ pub struct EventBus {
     /// every recorded event at or below it reached subscribers
     /// before the new subscription existed, every later fan-out
     /// lands in its queue.
-    last_row_id: AtomicU64,
+    last_row_id: Arc<AtomicU64>,
+}
+
+/// H4: read handle on the bus's fanned-out row-id watermark (see
+/// [`EventBus::fanned_out_row_id`]). Holds only the counter, not the
+/// bus, so a holder doesn't keep subscriber senders alive past engine
+/// shutdown.
+#[derive(Debug, Clone)]
+pub struct RowWatermark(Arc<AtomicU64>);
+
+impl RowWatermark {
+    /// Current watermark.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// One subscription's delivery slot. Owned via `Arc` by the
@@ -350,7 +365,7 @@ impl EventBus {
             rate_capacity: DEFAULT_PUBLISH_BURST,
             rate_refill_per_sec: DEFAULT_PUBLISH_RATE_PER_SEC,
             publish_sequence: Arc::new(tokio::sync::Mutex::new(())),
-            last_row_id: AtomicU64::new(0),
+            last_row_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -369,6 +384,12 @@ impl EventBus {
     #[must_use]
     pub fn fanned_out_row_id(&self) -> u64 {
         self.last_row_id.load(Ordering::Acquire)
+    }
+
+    /// H4: a [`RowWatermark`] handle on [`Self::fanned_out_row_id`].
+    #[must_use]
+    pub fn row_watermark(&self) -> RowWatermark {
+        RowWatermark(Arc::clone(&self.last_row_id))
     }
 
     /// H4: subscribe and snapshot the fanned-out row-id watermark

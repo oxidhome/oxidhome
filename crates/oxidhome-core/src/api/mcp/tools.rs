@@ -1720,7 +1720,7 @@ fn cursor_expired_outcome(expired: crate::state::CursorExpired) -> ToolOutcome {
     ToolOutcome::ExecErr {
         message: format!(
             "cursor_expired: after_id {} is no longer in history (oldest {}, head {}); \
-             resync from a state snapshot and resume from head_id",
+             resume from head_id, then read a state snapshot",
             expired.after_id,
             expired
                 .oldest_id
@@ -1815,7 +1815,7 @@ fn events_subscribe_schema() -> serde_json::Map<String, JsonValue> {
                 "type": "integer",
                 "minimum": 0,
                 "maximum": i64::MAX,
-                "description": "Cursor: return only rows with `id > after_id`, oldest first. Client resumes with the last returned event's `id`. Omitted or `0` = start at the oldest retained matching row. A cursor whose next row was pruned by retention fails with a `cursor_expired` error: resync from a state snapshot and resume from its `head_id`.",
+                "description": "Cursor: return only rows with `id > after_id`, oldest first. Client resumes with the last returned event's `id`. Omitted or `0` = start at the oldest retained matching row. A cursor whose next row was pruned by retention fails with a `cursor_expired` error: resume from its `head_id`, then read a state snapshot.",
             },
             "limit": {
                 "type": "integer",

@@ -1024,7 +1024,7 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         // for `after_id` and the lag / cursor-expired notices; see
         // `crate::state::event_tail`.
         let tail = crate::state::EventTail::open(
-            self.engine.events(),
+            &self.engine.events(),
             self.engine.event_log(),
             after_id,
             "connect-tail",
