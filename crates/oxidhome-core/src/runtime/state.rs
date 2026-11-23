@@ -1059,15 +1059,21 @@ impl host_devices::Host for PluginState {
         // but its projected reading (and `unit` / `unit_label`) is in
         // the old unit. Treat it as dropped so it flips `Stale` and
         // the next reading replaces it instead of merging into it.
-        let unit_changed = self
-            .devices
-            .get(&self.instance_id, &id)
-            .is_ok_and(|old| super::schema::sensor_unit_changed(&old.info, &info));
+        let old = self.devices.get(&self.instance_id, &id).ok();
+        let unit_changed = old
+            .as_ref()
+            .is_some_and(|old| super::schema::sensor_unit_changed(&old.info, &info));
+        // Likewise an opener that stops supporting a position: its
+        // projected `position` would otherwise stay `Fresh`.
+        let position_dropped = old
+            .as_ref()
+            .is_some_and(|old| super::schema::opener_position_dropped(&old.info, &info));
         let live_capabilities: Vec<String> = info
             .capabilities
             .iter()
             .map(capability_name)
             .filter(|name| !(unit_changed && name == "sensor"))
+            .filter(|name| !(position_dropped && name == "opener"))
             .collect();
         let outcome = self.devices.update(&self.instance_id, &id, info);
         if outcome.is_ok() {

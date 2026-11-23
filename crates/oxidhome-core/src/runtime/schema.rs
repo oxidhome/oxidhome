@@ -204,6 +204,12 @@ pub(crate) fn sensor_unit_changed(old: &DeviceInfo, new: &DeviceInfo) -> bool {
     }
 }
 
+/// `true` when an `update-device` takes away its opener's position
+/// support: the projected `position` is then no longer valid.
+pub(crate) fn opener_position_dropped(old: &DeviceInfo, new: &DeviceInfo) -> bool {
+    opener_supports_position(old) && !opener_supports_position(new)
+}
+
 /// Every sensor `state-changed` delta and `ok-with-state` reply must
 /// carry the device's unit: `unit` (the spec's code) and, for the
 /// `other` fallback, `unit_label`, both exactly as the spec declares
@@ -967,8 +973,12 @@ mod tests {
         assert!(check_state_fields(&info, "opener", &pos(Value::StringVal("x".into()))).is_err());
         assert!(check_state_fields(&info, "switch", &pos(Value::FloatVal(9.0))).is_ok());
         // No position support: no position at all.
+        let with = info.clone();
         info.capabilities = vec![opener(false)];
         assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(0.5))).is_err());
+        // Dropping the support invalidates the projected position.
+        assert!(opener_position_dropped(&with, &info));
+        assert!(!opener_position_dropped(&info, &with));
     }
 
     #[test]

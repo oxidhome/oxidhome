@@ -88,18 +88,17 @@ pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
                 .get("device.send_command")
                 .and_then(|c| c.devices.as_deref());
             let covered = |c: SensitiveCategory| {
-                policy.sensitive.iter().any(|g| {
-                    g.category == c
-                        && match (&g.devices, command_devices) {
-                            (None, _) => true,
-                            // A command grant naming at least the
-                            // allowlist restores all it reached.
-                            (Some(granted), Some(allowed)) if c.guards_commands() => {
-                                allowed.iter().all(|d| granted.contains(d))
-                            }
-                            (Some(_), _) => false,
-                        }
-                })
+                let grants = policy.sensitive.iter().filter(|g| g.category == c);
+                if grants.clone().any(|g| g.devices.is_none()) {
+                    return true;
+                }
+                // Command grants that together cover every allowlist
+                // pattern restore all the token reached.
+                let granted: Vec<String> =
+                    grants.filter_map(|g| g.devices.clone()).flatten().collect();
+                c.guards_commands()
+                    && command_devices
+                        .is_some_and(|allowed| allowed.iter().all(|a| pattern_covers(&granted, a)))
             };
             let reached = reached_by(&policy.scopes);
             let missing: SensitiveSet = reached
@@ -114,6 +113,16 @@ pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
             })
         })
         .collect()
+}
+
+/// `true` when some pattern in `granted` matches every id `pattern`
+/// can: the same pattern, or a `prefix*` that `pattern` starts with.
+fn pattern_covers(granted: &[String], pattern: &str) -> bool {
+    granted.iter().any(|g| {
+        g == pattern
+            || g.strip_suffix('*')
+                .is_some_and(|prefix| pattern.starts_with(prefix))
+    })
 }
 
 /// Startup check (H6 slice 2, Q8): log at `warn` every live non-owner
@@ -551,6 +560,28 @@ mod tests {
             "{gaps:?}"
         );
         assert!(gaps[0].missing.contains(SensitiveCategory::Opener));
+
+        // A wider prefix grant covers a narrower allowlist pattern.
+        let wide = tokens
+            .create(
+                "wide",
+                br#"{"scopes":["devices:command"],"constraints":{"device.send_command":{"devices":["dev-ab12*"]}}}"#,
+            )
+            .unwrap();
+        grant_sensitive(
+            &tokens,
+            &audit,
+            &wide.id,
+            SensitiveCategory::Lock,
+            &["dev-ab*".into()],
+        )
+        .unwrap();
+        let gaps = sensitive_access_report(&tokens);
+        let gap = gaps
+            .iter()
+            .find(|g| g.token_id == wide.id)
+            .expect("opener still missing");
+        assert!(!gap.missing.contains(SensitiveCategory::Lock), "{gap:?}");
 
         // An empty allowlist reached no device at all.
         let none = tokens

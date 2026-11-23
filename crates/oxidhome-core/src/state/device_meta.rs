@@ -62,6 +62,11 @@ impl DeviceMetaRow {
 /// devices a few times never meets it.
 pub const MAX_FLOOR_ROWS_PER_INSTANCE: usize = 4 * super::devices::MAX_DEVICES_PER_INSTANCE;
 
+/// Most sensitive devices the host remembers in all. Instance ids are
+/// cheap (every scripting sandbox has its own), so the per-instance cap
+/// alone doesn't bound the table every startup loads.
+pub const MAX_FLOOR_ROWS_TOTAL: usize = 16 * MAX_FLOOR_ROWS_PER_INSTANCE;
+
 /// Why [`DeviceMetaStore::observe`] refused a registration.
 #[derive(Debug, thiserror::Error)]
 pub enum ObserveError {
@@ -69,6 +74,10 @@ pub enum ObserveError {
     /// sensitive devices on record.
     #[error("the instance has {MAX_FLOOR_ROWS_PER_INSTANCE} sensitive devices on record")]
     CapExceeded,
+    /// The host already remembers [`MAX_FLOOR_ROWS_TOTAL`] sensitive
+    /// devices.
+    #[error("the host has {MAX_FLOOR_ROWS_TOTAL} sensitive devices on record")]
+    TotalCapExceeded,
     /// The floor couldn't be stored.
     #[error("storing the device's sensitive categories failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -247,6 +256,9 @@ impl DeviceMetaStore {
                 .is_some_and(|o| o == owner_instance);
             if derived.sensitive().is_subset(floor) && (owner_known || current.is_none()) {
                 return Ok(());
+            }
+            if current.is_none() && rows.len() >= MAX_FLOOR_ROWS_TOTAL {
+                return Err(ObserveError::TotalCapExceeded);
             }
             if current.is_none() {
                 let owned = rows
