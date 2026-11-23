@@ -341,7 +341,9 @@ async fn cycle_between_scripts_is_refused() {
 
 /// The root's deadline bounds the script-to-script hop: with 500 ms
 /// left, `a`'s call into a `b` that sleeps 3 s gives up at the root's
-/// deadline, not after the 30 s dispatch timeout or the sleep.
+/// deadline, not after the 30 s dispatch timeout or the sleep. `b` had
+/// started, so the answer is `unknown` (H5), not a retry-safe
+/// `unavailable`.
 #[tokio::test(flavor = "multi_thread")]
 async fn deadline_propagates_to_the_sibling_hop() {
     let state = support::tempdir("sandbox-deadline");
@@ -361,13 +363,10 @@ async fn deadline_propagates_to_the_sibling_hop() {
     let elapsed = started.elapsed();
     assert!(elapsed < Duration::from_millis(2500), "took {elapsed:?}");
     let msg = match outcome {
-        Err(Error::Unavailable(msg)) | Ok(CommandResult::Err(Error::Unavailable(msg))) => msg,
-        other => panic!("expected the hop to time out, got {other:?}"),
+        Ok(CommandResult::Unknown(msg)) => msg,
+        other => panic!("expected the started hop to be unknown, got {other:?}"),
     };
-    assert!(
-        msg.contains("timed out") || msg.contains("deadline"),
-        "{msg}"
-    );
+    assert!(msg.contains("deadline"), "{msg}");
 
     // The inner hop was dispatched under the same root and chain.
     let rows = hop_rows(&engine, &call_id, 2).await;
@@ -378,9 +377,11 @@ async fn deadline_propagates_to_the_sibling_hop() {
     let inner: serde_json::Value =
         serde_json::from_str(rows[1].invocation.as_deref().expect("invocation")).expect("json");
     assert_eq!(inner["chain"][1]["caller"], "main~a");
-    // ...and timed out too, rather than running `b`'s sleep to success.
-    assert_eq!(rows[1].status, 503, "{:?}", rows[1]);
-    assert_eq!(rows[1].decision, "error", "{:?}", rows[1]);
+    // ...and ended without an outcome: `b` was running, so it may
+    // have acted, rather than running its sleep to success.
+    assert_eq!(rows[1].status, 200, "{:?}", rows[1]);
+    assert_eq!(rows[1].decision, "allow", "{:?}", rows[1]);
+    assert_eq!(rows[1].execution_outcome, None, "{:?}", rows[1]);
 
     manager.stop().await.expect("stop manager");
 }

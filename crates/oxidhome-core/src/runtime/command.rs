@@ -26,6 +26,7 @@
 //! | plugin returned `accepted` | `accepted` (then pending) |
 //! | pending → plugin called `complete-command` | its mapped outcome |
 //! | pending → TTL elapsed, instance restarted or stopped | `outcome_unknown` |
+//! | pending → the daemon stopped (resolved at the next boot) | `outcome_unknown` |
 //!
 //! The line between `timed_out` and `outcome_unknown` is a single
 //! compare-and-swap on a `DispatchTicket` shared by the waiting
@@ -44,6 +45,8 @@ use crate::auth::invocation::{InvocationContext, audit_cap, mint_prefixed_id};
 use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue};
 use crate::state::{AuditEntry, AuditLog};
+
+use super::command_journal::{CommandJournal, PendingRow, REASON_EXPIRED};
 
 /// Prefix of every host-minted command id.
 pub const COMMAND_ID_PREFIX: &str = "cmd-";
@@ -321,6 +324,38 @@ impl Drop for AbandonOnDrop {
     }
 }
 
+/// Why a pending command expired. Its code is the `domain_error` of
+/// the `outcome_unknown` resolution row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryReason {
+    /// No completion arrived within the TTL.
+    Expired,
+    /// The owning instance restarted; its new store can't complete it.
+    InstanceRestarted,
+    /// The owning instance stopped.
+    InstanceStopped,
+}
+
+impl ExpiryReason {
+    /// Stable code recorded in the resolution row's `domain_error`.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Expired => REASON_EXPIRED,
+            Self::InstanceRestarted => "instance_restarted",
+            Self::InstanceStopped => "instance_stopped",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Expired => "no completion arrived before the pending command expired",
+            Self::InstanceRestarted => "the plugin instance restarted",
+            Self::InstanceStopped => "the plugin instance stopped",
+        }
+    }
+}
+
 /// One accepted command waiting for `complete-command`.
 #[derive(Debug)]
 struct Pending {
@@ -328,6 +363,9 @@ struct Pending {
     device_id: String,
     capability: String,
     ctx: InvocationContext,
+    /// Queued for the `pending_command` table; its resolution must
+    /// delete the row.
+    journaled: bool,
     /// The entry's TTL timer, aborted when the entry leaves the table
     /// any other way, so finished commands don't leave sleeping tasks.
     expiry: tokio::task::AbortHandle,
@@ -343,16 +381,34 @@ pub(crate) struct PendingCommand {
     pub(crate) device_id: String,
     pub(crate) capability: String,
     ctx: InvocationContext,
+    journaled: bool,
+}
+
+impl From<Pending> for PendingCommand {
+    fn from(p: Pending) -> Self {
+        Self {
+            device_id: p.device_id,
+            capability: p.capability,
+            ctx: p.ctx,
+            journaled: p.journaled,
+        }
+    }
 }
 
 /// Bounded table of `accepted` device commands (H5). An entry leaves
 /// the table exactly once: through `complete-command`, through its TTL
 /// expiring, or through its owning instance restarting / stopping —
 /// the last two record `outcome_unknown`.
+///
+/// Externally-rooted entries are also written behind to the
+/// `pending_command` table through the [command
+/// journal](super::command_journal), which also writes every `COMMAND`
+/// resolution row, so a daemon restart resolves them at the next boot
+/// instead of dropping them.
 pub struct PendingCommands {
     entries: Mutex<HashMap<String, Pending>>,
     ttl_ms: AtomicU64,
-    audit: Option<Arc<AuditLog>>,
+    journal: Option<CommandJournal>,
 }
 
 impl std::fmt::Debug for PendingCommands {
@@ -364,15 +420,38 @@ impl std::fmt::Debug for PendingCommands {
 }
 
 impl PendingCommands {
-    /// Empty table. `audit` receives the `COMMAND` resolution rows of
-    /// externally-rooted commands.
-    #[must_use]
-    pub fn new(audit: Option<Arc<AuditLog>>) -> Self {
-        Self {
+    /// Empty table. With `audit`, a journal writer thread on the
+    /// ledger's database persists externally-rooted entries and writes
+    /// their `COMMAND` resolution rows; without it nothing is recorded.
+    ///
+    /// # Errors
+    ///
+    /// The journal's writer thread could not be started.
+    pub fn new(audit: Option<Arc<AuditLog>>) -> std::io::Result<Self> {
+        let journal = match audit {
+            Some(log) => Some(CommandJournal::start(Arc::clone(log.db()))?),
+            None => None,
+        };
+        Ok(Self {
             entries: Mutex::new(HashMap::new()),
             ttl_ms: AtomicU64::new(duration_ms(PENDING_COMMAND_TTL)),
-            audit,
-        }
+            journal,
+        })
+    }
+
+    /// Wait up to `timeout` for every queued persist and resolution row
+    /// to reach the database. `true` when the journal drained (or there
+    /// is none).
+    pub fn flush_journal(&self, timeout: Duration) -> bool {
+        self.journal.as_ref().is_none_or(|j| j.flush(timeout))
+    }
+
+    /// Shutdown: stop taking journal work and wait up to `timeout` for
+    /// what is queued. Entries still pending stay in the
+    /// `pending_command` table and are resolved at the next boot.
+    /// `true` when the journal drained.
+    pub fn close_journal(&self, timeout: Duration) -> bool {
+        self.journal.as_ref().is_none_or(|j| j.close(timeout))
     }
 
     /// Change how long an accepted command may stay pending (default
@@ -457,13 +536,24 @@ impl PendingCommands {
             let expiry = tokio::spawn(async move {
                 tokio::time::sleep_until(expires_at).await;
                 if let Some(table) = weak.upgrade() {
-                    table.expire(
-                        &id,
-                        "no completion arrived before the pending command expired",
-                    );
+                    table.expire(&id, ExpiryReason::Expired);
                 }
             })
             .abort_handle();
+            // Queued under the table lock, so the persist is ahead of
+            // any resolution of this entry in the journal and a
+            // resolved command's row can't resurrect.
+            let journaled = match &self.journal {
+                Some(journal) if ctx.root().is_external() => journal.persist(pending_row(
+                    command_id,
+                    owner_instance,
+                    device_id,
+                    capability,
+                    &ctx,
+                    ttl,
+                )),
+                _ => false,
+            };
             entries.insert(
                 command_id.to_owned(),
                 Pending {
@@ -471,6 +561,7 @@ impl PendingCommands {
                     device_id: device_id.to_owned(),
                     capability: capability.to_owned(),
                     ctx,
+                    journaled,
                     expiry,
                     expires_at,
                 },
@@ -514,23 +605,19 @@ impl PendingCommands {
             .expect("entry checked under the same lock");
         // Decided under the lock that claimed the entry.
         let expired = tokio::time::Instant::now() >= p.expires_at;
-        drop(entries);
         p.expiry.abort();
         if expired {
             // The TTL passed; the timer just hasn't run yet. Expire it
             // here so a late completion can't count as `completed`.
-            let reason = "no completion arrived before the pending command expired";
-            self.expired(command_id, p, reason);
+            self.expired(command_id, p, ExpiryReason::Expired);
+            drop(entries);
             return Err(WitError::NotFound(format!(
                 "command `{}` expired before it was completed",
                 audit_cap(command_id),
             )));
         }
-        Ok(PendingCommand {
-            device_id: p.device_id,
-            capability: p.capability,
-            ctx: p.ctx,
-        })
+        drop(entries);
+        Ok(p.into())
     }
 
     /// Record the final outcome of a command taken with [`Self::take`].
@@ -540,63 +627,102 @@ impl PendingCommands {
         pending: &PendingCommand,
         outcome: &CommandOutcome,
     ) {
+        self.resolve_with(command_id, pending, outcome, None);
+    }
+
+    fn resolve_with(
+        &self,
+        command_id: &str,
+        pending: &PendingCommand,
+        outcome: &CommandOutcome,
+        reason: Option<ExpiryReason>,
+    ) {
         tracing::info!(
             target: "host.command",
             command_id,
             call_id = pending.ctx.call_id(),
             device_id = %pending.device_id,
             outcome = outcome.as_str(),
+            reason = reason.map(ExpiryReason::code),
             "accepted command resolved",
         );
-        record_resolution(
-            self.audit.as_ref(),
+        let Some(journal) = &self.journal else { return };
+        let forget = pending.journaled.then(|| command_id.to_owned());
+        match resolution_entry(
             &pending.ctx,
             command_id,
             &pending.device_id,
             outcome,
-        );
+            reason.map(ExpiryReason::code),
+        ) {
+            Some(entry) => journal.resolve(entry, forget),
+            // Only externally-rooted commands are journaled.
+            None => debug_assert!(forget.is_none(), "host-origin command was persisted"),
+        }
+    }
+
+    /// Record the final outcome of a command that never reached the
+    /// pending table — a result that arrived after its caller stopped
+    /// waiting, or a queued command whose caller disconnected — as a
+    /// `COMMAND` row. Externally-rooted commands only (host-origin work
+    /// stays out of the ledger, as for H6 hops); queued on the journal,
+    /// so this never blocks.
+    pub(crate) fn record_resolution(
+        &self,
+        ctx: &InvocationContext,
+        command_id: &str,
+        device_id: &str,
+        outcome: &CommandOutcome,
+    ) {
+        if let (Some(journal), Some(entry)) = (
+            &self.journal,
+            resolution_entry(ctx, command_id, device_id, outcome, None),
+        ) {
+            journal.resolve(entry, None);
+        }
     }
 
     /// Expire every pending command of `owner_instance` as
     /// `outcome_unknown` — its plugin instance restarted or stopped, so
     /// no completion can be matched any more.
-    pub fn expire_owner(&self, owner_instance: &str, reason: &str) {
-        let drained: Vec<(String, Pending)> = {
-            let mut entries = self.lock();
-            let ids: Vec<String> = entries
-                .iter()
-                .filter(|(_, p)| p.owner_instance == owner_instance)
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| entries.remove(&id).map(|p| (id, p)))
-                .collect()
-        };
-        for (id, p) in drained {
-            p.expiry.abort();
-            self.expired(&id, p, reason);
+    ///
+    /// Like every expiry, the resolution is queued on the journal
+    /// before the table lock is released, so a caller that sees the
+    /// entry gone (the reaper, then shutdown closing the journal) knows
+    /// its row is already queued.
+    pub fn expire_owner(&self, owner_instance: &str, reason: ExpiryReason) {
+        let mut entries = self.lock();
+        let ids: Vec<String> = entries
+            .iter()
+            .filter(|(_, p)| p.owner_instance == owner_instance)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(p) = entries.remove(&id) {
+                p.expiry.abort();
+                self.expired(&id, p, reason);
+            }
         }
     }
 
-    fn expire(&self, command_id: &str, reason: &str) {
-        let removed = self.lock().remove(command_id);
-        if let Some(p) = removed {
+    fn expire(&self, command_id: &str, reason: ExpiryReason) {
+        let mut entries = self.lock();
+        if let Some(p) = entries.remove(command_id) {
             self.expired(command_id, p, reason);
         }
     }
 
-    fn expired(&self, command_id: &str, p: Pending, reason: &str) {
-        let pending = PendingCommand {
-            device_id: p.device_id,
-            capability: p.capability,
-            ctx: p.ctx,
-        };
-        self.resolve(
+    /// Resolve a removed entry as `outcome_unknown`. Called with the
+    /// table lock held.
+    fn expired(&self, command_id: &str, p: Pending, reason: ExpiryReason) {
+        let pending = PendingCommand::from(p);
+        self.resolve_with(
             command_id,
             &pending,
             &CommandOutcome::Unknown {
-                message: format!("accepted command did not complete: {reason}"),
+                message: format!("accepted command did not complete: {}", reason.message()),
             },
+            Some(reason),
         );
     }
 }
@@ -768,51 +894,76 @@ fn duration_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Write a `COMMAND` resolution row for an externally-rooted command
-/// (host-origin work stays out of the ledger, as for H6 hops). Detached
-/// and best-effort: the dispatch row is the durable evidence; this row
-/// records how the command finally ended.
-pub(crate) fn record_resolution(
-    audit: Option<&Arc<AuditLog>>,
+/// `path` of a `COMMAND` resolution row.
+pub(crate) fn resolution_path(device_id: &str) -> String {
+    format!("device.command/{}", audit_cap(device_id))
+}
+
+/// The persisted form of an accepted command (H5 restart
+/// reconciliation): what the next boot needs to write its final row.
+fn pending_row(
+    command_id: &str,
+    owner_instance: &str,
+    device_id: &str,
+    capability: &str,
+    ctx: &InvocationContext,
+    ttl: Duration,
+) -> PendingRow {
+    let root = ctx.root();
+    let created_ms = crate::state::event_log::now_unix_ms();
+    // M7: the row holds the same attribution an audit row would, so it
+    // is redacted the same way before it reaches the database (and any
+    // backup of it).
+    let scrub = |text: &str| crate::redact::scrub_text(text).into_owned();
+    PendingRow {
+        command_id: command_id.to_owned(),
+        call_id: ctx.call_id().to_owned(),
+        owner_instance: scrub(audit_cap(owner_instance)),
+        device_id: scrub(audit_cap(device_id)),
+        // Caller-supplied, so redacted structurally too.
+        capability: crate::redact::redact_text(capability).into_owned(),
+        created_ms,
+        expires_ms: created_ms.saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX)),
+        token_id: root.audit_token_id().to_owned(),
+        actor_kind: root.kind().as_str().to_owned(),
+        invocation_json: crate::redact::redact_text(&ctx.audit_json()).into_owned(),
+    }
+}
+
+/// The `COMMAND` resolution row for an externally-rooted command;
+/// `None` for host-origin work, which stays out of the ledger (as for
+/// H6 hops). `reason` (an [`ExpiryReason`] code) overrides
+/// `domain_error`.
+fn resolution_entry(
     ctx: &InvocationContext,
     command_id: &str,
     device_id: &str,
     outcome: &CommandOutcome,
-) {
-    let Some(log) = audit else { return };
-    if !ctx.root().is_external() {
-        return;
-    }
+    reason: Option<&str>,
+) -> Option<AuditEntry> {
     let root = ctx.root();
-    let entry = AuditEntry {
+    if !root.is_external() {
+        return None;
+    }
+    Some(AuditEntry {
         id: 0,
         intent_ms: 0,
         finalized_ms: None,
         token_id: root.audit_token_id().to_owned(),
         actor_kind: root.kind().as_str().to_owned(),
         method: COMMAND_RESOLUTION_AUDIT_METHOD.to_owned(),
-        path: format!("device.command/{}", audit_cap(device_id)),
+        path: resolution_path(device_id),
         status: 200,
         decision: "allow".into(),
         required_scope: None,
         execution_outcome: outcome.execution_outcome().map(str::to_owned),
-        domain_error: outcome.domain_error().map(str::to_owned),
+        domain_error: reason.or_else(|| outcome.domain_error()).map(str::to_owned),
         credential_fp: None,
         call_id: Some(ctx.call_id().to_owned()),
         invocation: Some(ctx.audit_json()),
         command_id: Some(audit_cap(command_id).to_owned()),
         command_outcome: Some(outcome.as_str().to_owned()),
-    };
-    let log = Arc::clone(log);
-    let Ok(rt) = tokio::runtime::Handle::try_current() else {
-        tracing::warn!(target: "host.audit", command_id, "no runtime for command resolution row");
-        return;
-    };
-    rt.spawn_blocking(move || {
-        if let Err(err) = log.record_completed(&entry) {
-            tracing::error!(target: "host.audit", error = %err, "command resolution row failed");
-        }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -917,7 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_command_completes_once_for_its_owner_only() {
-        let table = Arc::new(PendingCommands::new(None));
+        let table = Arc::new(PendingCommands::new(None).unwrap());
         let id = mint_command_id();
         table
             .register(&id, "inst-a", "dev-1", "switch", host_ctx())
@@ -943,7 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_command_refuses_foreign_ids_and_bounds_per_instance() {
-        let table = Arc::new(PendingCommands::new(None));
+        let table = Arc::new(PendingCommands::new(None).unwrap());
         assert!(
             table
                 .register("plugin-made", "inst-a", "dev-1", "switch", host_ctx())
@@ -966,7 +1117,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_command_bounds_capability_and_refuses_late_completion() {
-        let table = Arc::new(PendingCommands::new(None));
+        let table = Arc::new(PendingCommands::new(None).unwrap());
         let long = "x".repeat(MAX_PENDING_CAPABILITY_BYTES + 1);
         assert!(
             table
@@ -989,7 +1140,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_command_expires_after_ttl() {
-        let table = Arc::new(PendingCommands::new(None));
+        let table = Arc::new(PendingCommands::new(None).unwrap());
         table.set_ttl(Duration::from_millis(20));
         let id = mint_command_id();
         table
@@ -1003,9 +1154,28 @@ mod tests {
         assert!(table.take("inst-a", &id).is_err());
     }
 
+    #[test]
+    fn persisted_rows_are_redacted() {
+        use crate::auth::{Actor, ActorKind, Principal, Transport};
+        let actor = Actor::api("tok-1", vec!["*".into()]);
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
+        let row = pending_row(
+            &mint_command_id(),
+            "inst-a",
+            "dev-1",
+            r#"{"key":"password","value":"hunter2-secret"}"#,
+            &ctx,
+            PENDING_COMMAND_TTL,
+        );
+        assert!(!row.capability.contains("hunter2"), "{}", row.capability);
+        assert_eq!(row.token_id, "tok-1");
+        assert!(row.expires_ms > row.created_ms);
+    }
+
     #[tokio::test]
     async fn expire_owner_drains_only_that_instance() {
-        let table = Arc::new(PendingCommands::new(None));
+        let table = Arc::new(PendingCommands::new(None).unwrap());
         let a = mint_command_id();
         let b = mint_command_id();
         table
@@ -1014,7 +1184,7 @@ mod tests {
         table
             .register(&b, "inst-b", "dev-2", "switch", host_ctx())
             .expect("b");
-        table.expire_owner("inst-a", "instance restarted");
+        table.expire_owner("inst-a", ExpiryReason::InstanceRestarted);
         assert_eq!(table.len(), 1);
         assert!(table.take("inst-b", &b).is_ok());
     }

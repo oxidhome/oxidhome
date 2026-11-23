@@ -43,7 +43,7 @@ use crate::host_impl::plugin::oxidhome::plugin::types::{
 use crate::state::CallGuard;
 
 use super::command::{
-    AbandonOnDrop, CommandOutcome, CommandReport, DispatchTicket, mint_command_id,
+    AbandonOnDrop, CommandOutcome, CommandReport, DispatchTicket, PendingCommands, mint_command_id,
 };
 use super::instance::{ComponentCache, InitError, PluginInstance, SupervisedLoad};
 use super::sandbox::{SandboxLauncher, SandboxRole, SandboxScript};
@@ -201,23 +201,84 @@ enum ControlCommand {
     /// `execute-service-command` see the full chain for cycle checks
     /// and inherit the root principal and deadline (H6).
     ///
-    /// `guard` is the [`CallGuard`] the dispatcher acquired before
+    /// `guard` holds the [`CallGuard`] the dispatcher acquired before
     /// sending the message. It rides with the work so the in-flight
-    /// refcount tracks *real* execution: dropped when the supervisor
-    /// finishes the wasm call (`handle_control` holds it across the
-    /// scoped invocation), or dropped with the message if the
-    /// channel closes before the supervisor consumes it. Nothing
+    /// refcount tracks *real* execution: the supervisor takes it when
+    /// it starts the call and drops it when the wasm call finishes
+    /// (`handle_control` holds it across the scoped invocation). A
+    /// caller that withdraws the still-queued call takes and drops it
+    /// at once, so the queued message doesn't hold up
+    /// `remove-service`; otherwise it drops with the message. Nothing
     /// *reads* it — `Drop` does the decrement.
+    ///
+    /// H5: `ticket` works as for `Execute`: the supervisor enters the
+    /// callee only if it wins `queued → started`, so a caller that
+    /// stopped waiting while the call was queued knows it never ran.
+    /// An `Err` reply means the call did not run.
     ExecuteService {
         ctx: InvocationContext,
-        guard: CallGuard,
+        guard: SharedCallGuard,
         service: ServiceId,
         command: String,
         args: Vec<KeyValue>,
+        ticket: DispatchTicket,
         reply: oneshot::Sender<anyhow::Result<CommandResult>>,
     },
     /// Run `shutdown` and end the supervisor task.
     Shutdown { reply: oneshot::Sender<()> },
+}
+
+/// A [`CallGuard`] shared by a queued service call and its caller:
+/// whoever decides the call's fate takes it — the supervisor when it
+/// starts the call, the caller when it withdraws it.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedCallGuard(Arc<std::sync::Mutex<Option<CallGuard>>>);
+
+impl SharedCallGuard {
+    fn new(guard: CallGuard) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(guard))))
+    }
+
+    fn take(&self) -> Option<CallGuard> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// Releases the [`SharedCallGuard`] of a service call that never
+/// started once its caller stops waiting. Declared before the
+/// call's [`AbandonOnDrop`] so it drops after the ticket is settled.
+struct ReleaseUnlessStarted {
+    ticket: DispatchTicket,
+    guard: SharedCallGuard,
+}
+
+impl Drop for ReleaseUnlessStarted {
+    fn drop(&mut self) {
+        if !self.ticket.started() {
+            drop(self.guard.take());
+        }
+    }
+}
+
+/// How a service call dispatched to the owner's supervisor ended
+/// (H5, the service-call side of [`super::command`]).
+#[derive(Debug)]
+pub(crate) enum ServiceCallOutcome {
+    /// The callee ran and replied. A trap mid-call is
+    /// `CommandResult::Unknown` here, since the callee was entered.
+    Replied(CommandResult),
+    /// The call did not run and never will (supervisor gone, instance
+    /// restarting, refused at dequeue); safe to retry.
+    NotRun(String),
+    /// The caller's wait ended while the call was still queued; it did
+    /// not run and never will. Safe to retry.
+    TimedOut,
+    /// The callee was entered but no reply arrived (the wait ended
+    /// mid-call, or its supervisor went away): it may have acted.
+    Unknown(String),
 }
 
 /// Facts the supervisor learns on the first successful load and
@@ -584,20 +645,20 @@ impl InstanceHandle {
     /// the wasm, so cycle detection and root attribution survive the
     /// task hop.
     ///
+    /// H5: the call carries the same dispatch ticket as a device
+    /// command. The caller waits until `wait_until`; if that passes
+    /// while the call is still queued it never runs
+    /// ([`ServiceCallOutcome::TimedOut`]), and once the callee was
+    /// entered a missed deadline or a lost supervisor is
+    /// [`ServiceCallOutcome::Unknown`]. Dropping the returned future
+    /// withdraws a still-queued call.
+    ///
     /// **Caller blocking note.** The caller's supervisor task is
     /// parked on the oneshot until this returns, so any other control
     /// message (including `stop`) queued on the caller's mpsc waits
     /// up to [`crate::runtime::dispatcher::DISPATCH_TIMEOUT`] for the
     /// service call to complete.
-    ///
-    /// # Errors
-    ///
-    /// `Err` if the call never ran: the supervisor is gone, dropped the
-    /// reply, is restarting, or refused the call at its deadline. A
-    /// plugin returning a normal error result surfaces as
-    /// `Ok(CommandResult::Err(..))`; a trap mid-call as
-    /// `Ok(CommandResult::Unknown(..))` (H5; the trap also crashes the
-    /// instance).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_service_command(
         &self,
         ctx: InvocationContext,
@@ -605,35 +666,70 @@ impl InstanceHandle {
         service: ServiceId,
         command: String,
         args: Vec<KeyValue>,
-    ) -> anyhow::Result<CommandResult> {
-        let (reply, rx) = oneshot::channel();
-        // If the send fails (control channel closed), the
-        // `SendError` carries the message back; `map_err` discards
-        // it, which drops the `ControlCommand::ExecuteService` and
-        // with it the `CallGuard` → refcount decrements cleanly even
-        // on the supervisor-gone path.
-        self.control
-            .send(ControlCommand::ExecuteService {
-                ctx,
-                guard,
-                service,
-                command,
-                args,
-                reply,
-            })
-            .await
-            .map_err(|_| {
-                anyhow!(
+        ticket: DispatchTicket,
+        wait_until: Instant,
+    ) -> ServiceCallOutcome {
+        let guard = SharedCallGuard::new(guard);
+        // Drop order: `_withdraw` settles the ticket, then `_release`
+        // frees the guard of a call that will never start.
+        let _release = ReleaseUnlessStarted {
+            ticket: ticket.clone(),
+            guard: guard.clone(),
+        };
+        let _withdraw = AbandonOnDrop(ticket.clone());
+        let (reply, mut rx) = oneshot::channel();
+        // If the send fails (control channel closed), `_release` drops
+        // the `CallGuard` → refcount decrements cleanly even on the
+        // supervisor-gone path.
+        let enqueue = self.control.send(ControlCommand::ExecuteService {
+            ctx,
+            guard,
+            service,
+            command,
+            args,
+            ticket: ticket.clone(),
+            reply,
+        });
+        match tokio::time::timeout_at(wait_until, enqueue).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return ServiceCallOutcome::NotRun(format!(
                     "instance `{}` supervisor is no longer running",
                     self.instance_id,
-                )
-            })?;
-        rx.await.map_err(|_| {
-            anyhow!(
-                "instance `{}` supervisor dropped the service-command reply",
+                ));
+            }
+            // Never enqueued.
+            Err(_) => return ServiceCallOutcome::TimedOut,
+        }
+        let Ok(received) = tokio::time::timeout_at(wait_until, &mut rx).await else {
+            if ticket.try_withdraw() {
+                return ServiceCallOutcome::TimedOut;
+            }
+            // Entered before the deadline; as for device commands,
+            // close first so a reply landing now is either taken here
+            // or fails on the supervisor's side.
+            rx.close();
+            return match rx.try_recv() {
+                Ok(Ok(result)) => ServiceCallOutcome::Replied(result),
+                Ok(Err(err)) => ServiceCallOutcome::NotRun(format!("{err:#}")),
+                Err(_) => ServiceCallOutcome::Unknown(format!(
+                    "the deadline passed while instance `{}` was executing the call",
+                    self.instance_id,
+                )),
+            };
+        };
+        match received {
+            Ok(Ok(result)) => ServiceCallOutcome::Replied(result),
+            Ok(Err(err)) => ServiceCallOutcome::NotRun(format!("{err:#}")),
+            Err(_) if ticket.started() => ServiceCallOutcome::Unknown(format!(
+                "instance `{}` supervisor went away while executing the call",
                 self.instance_id,
-            )
-        })?
+            )),
+            Err(_) => ServiceCallOutcome::NotRun(format!(
+                "instance `{}` stopped before running the call",
+                self.instance_id,
+            )),
+        }
     }
 
     /// Ask the supervisor to stop, without waiting. A plugin call in
@@ -1029,12 +1125,12 @@ async fn guest_call<T>(
 }
 
 /// The supervisor's control receiver. When the supervisor ends, the
-/// commands still queued are refused (`rejected`: they never ran)
-/// instead of dropped, and a queued command whose caller disconnected
-/// gets its H5 resolution row here, since nobody else will write it.
+/// commands still queued are refused through [`refuse_unserved`]
+/// instead of dropped. `run_supervisor` drains it before publishing
+/// the terminal state; `Drop` is the backstop for any other exit.
 struct ControlQueue {
     rx: mpsc::Receiver<ControlCommand>,
-    audit: Arc<crate::state::AuditLog>,
+    pending: Arc<PendingCommands>,
     instance_id: Arc<str>,
 }
 
@@ -1054,57 +1150,13 @@ impl std::ops::DerefMut for ControlQueue {
 impl Drop for ControlQueue {
     fn drop(&mut self) {
         self.rx.close();
-        let instance_id = &self.instance_id;
         while let Ok(command) = self.rx.try_recv() {
-            match command {
-                ControlCommand::Shutdown { reply } => {
-                    let _ = reply.send(());
-                }
-                ControlCommand::Execute {
-                    ctx,
-                    device,
-                    cmd,
-                    ticket,
-                    reply,
-                } => {
-                    // A caller that went away (or whose deadline passed)
-                    // while queued gets `timed_out` (H5); the stop
-                    // refuses the rest. `None`: the plugin was entered,
-                    // which a command still in the channel never was.
-                    let Some(caller_gone) = ticket.try_refuse() else {
-                        continue;
-                    };
-                    let refused = if caller_gone || ctx.is_expired() {
-                        CommandOutcome::TimedOut {
-                            message: format!(
-                                "instance `{instance_id}` stopped; the command did not run",
-                            ),
-                        }
-                    } else {
-                        CommandOutcome::Rejected {
-                            error: WitError::Unavailable(format!(
-                                "instance `{instance_id}` stopped before running the command",
-                            )),
-                        }
-                    };
-                    if let Err(outcome) = reply.send(refused)
-                        && !ticket.withdrawn_by_caller()
-                    {
-                        super::command::record_resolution(
-                            Some(&self.audit),
-                            &ctx,
-                            &cmd.id,
-                            &device,
-                            &outcome,
-                        );
-                    }
-                }
-                ControlCommand::ExecuteService { reply, .. } => {
-                    let _ = reply.send(Err(anyhow!(
-                        "instance `{instance_id}` stopped before running the service command",
-                    )));
-                }
-            }
+            refuse_unserved(
+                command,
+                &self.instance_id,
+                "stopped before running it",
+                &self.pending,
+            );
         }
     }
 }
@@ -1297,9 +1349,10 @@ async fn run_supervisor(
         state: state_tx,
         stop: mut stop_rx,
     } = channels;
+    let pending = engine.pending_commands();
     let mut control_rx = ControlQueue {
         rx: control,
-        audit: engine.audit_log(),
+        pending: Arc::clone(&pending),
         instance_id: Arc::clone(&instance_id),
     };
     // C2d — the pre-C2d supervisor eagerly subscribed to
@@ -1316,7 +1369,10 @@ async fn run_supervisor(
     // Consecutive restarts; reset once an instance runs healthily.
     let mut restarts: u32 = 0;
 
-    loop {
+    // The terminal state is published only after the queue drain
+    // below, so the reaper (and shutdown, which waits for it) sees
+    // every refusal already queued on the journal.
+    let terminal = loop {
         // Round-2 F3: clone the pinned snapshot for THIS
         // attempt, keeping the original held on the
         // supervisor stack so every subsequent restart
@@ -1346,26 +1402,16 @@ async fn run_supervisor(
         .await;
 
         match outcome {
-            LifecycleOutcome::Stopped => return,
+            LifecycleOutcome::Stopped => break InstanceState::Stopped,
             LifecycleOutcome::StoppedFailed(reason) => {
                 // Round-3 F1: operator asked to stop; the guest
                 // shutdown trapped. Terminal — no restart, ever.
-                transition(
-                    &state_tx,
-                    &instance_id,
-                    InstanceState::Failed { error: reason },
-                );
-                return;
+                break InstanceState::Failed { error: reason };
             }
             LifecycleOutcome::LoadFailed(msg) => {
-                transition(
-                    &state_tx,
-                    &instance_id,
-                    InstanceState::Failed {
-                        error: format!("load failed: {msg}"),
-                    },
-                );
-                return;
+                break InstanceState::Failed {
+                    error: format!("load failed: {msg}"),
+                };
             }
             LifecycleOutcome::Crashed {
                 policy,
@@ -1379,15 +1425,13 @@ async fn run_supervisor(
                 // (say, the watchdog interrupting a call a stop was
                 // waiting on) wins over the restart policy.
                 if stop_is_requested(&stop_rx) {
-                    transition(&state_tx, &instance_id, InstanceState::Stopped);
-                    return;
+                    break InstanceState::Stopped;
                 }
                 if restart_decision(policy, &reason, restarts, tuning.max_restarts)
                     == RestartDecision::GiveUp
                 {
                     let error = give_up_reason(policy, &reason, restarts, tuning.max_restarts);
-                    transition(&state_tx, &instance_id, InstanceState::Failed { error });
-                    return;
+                    break InstanceState::Failed { error };
                 }
                 transition(
                     &state_tx,
@@ -1405,14 +1449,23 @@ async fn run_supervisor(
                     InstanceState::Restarting { attempt: restarts },
                 );
                 if let BackoffOutcome::Shutdown =
-                    backoff_wait(delay, &mut control_rx, &mut stop_rx, &instance_id).await
+                    backoff_wait(delay, &mut control_rx, &mut stop_rx, &instance_id, &pending).await
                 {
-                    transition(&state_tx, &instance_id, InstanceState::Stopped);
-                    return;
+                    break InstanceState::Stopped;
                 }
             }
         }
+    };
+    // H5: the instance is terminal. Refuse whatever is still queued
+    // instead of dropping it, so a device command whose caller already
+    // disconnected still gets its `COMMAND` row. `recv` (not
+    // `try_recv`) after `close` also waits out a sender that reserved
+    // its slot before the close, and ends once the queue is empty.
+    control_rx.close();
+    while let Some(ctrl) = control_rx.recv().await {
+        refuse_unserved(ctrl, &instance_id, "stopped before running it", &pending);
     }
+    transition(&state_tx, &instance_id, terminal);
 }
 
 /// The `Failed` reason when the restart decision gives up.
@@ -1433,8 +1486,8 @@ fn give_up_reason(
 }
 
 /// Run one load → init → serve attempt. State transitions up to
-/// `Running` (and the clean `Stopped`) are emitted here; the
-/// supervisor owns `Crashed` / `Restarting` / `Failed`.
+/// `Running` are emitted here; the supervisor owns `Crashed` /
+/// `Restarting` and the terminal `Stopped` / `Failed`.
 //
 // The argument list is wide because the supervisor lends this helper
 // every borrow it needs for one attempt; bundling them into a struct
@@ -1479,7 +1532,7 @@ async fn run_one_lifecycle(
     // accepted.
     engine
         .pending_commands()
-        .expire_owner(instance_id, "the plugin instance restarted");
+        .expire_owner(instance_id, super::ExpiryReason::InstanceRestarted);
     // H9: mark this instance's previous device-state entries `Stale`
     // and bump the supervisor generation, so entries applied under
     // this life are distinguishable. H9 round-5 finding 1: the composite
@@ -1511,7 +1564,7 @@ async fn run_one_lifecycle(
     let mut instance = match load_result {
         Some(Ok(instance)) => instance,
         Some(Err(e)) => return LifecycleOutcome::LoadFailed(format!("{e:#}")),
-        None => return stopped_while_loading(state_tx, instance_id),
+        None => return stopped_while_loading(instance_id),
     };
     // The installation UUID is now known and stable across
     // every subsequent restart of this supervisor (same
@@ -1531,10 +1584,10 @@ async fn run_one_lifecycle(
 
     // Stopped while loading: don't enter the plugin at all.
     if stop_is_requested(stop) {
-        return stop_after_cancel(instance, state_tx, instance_id);
+        return stop_after_cancel(instance, instance_id);
     }
     match guest_call(stop, instance.init()).await {
-        None => return stop_after_cancel(instance, state_tx, instance_id),
+        None => return stop_after_cancel(instance, instance_id),
         Some(Ok(())) => {}
         Some(Err(e)) => {
             let reason = match e {
@@ -1556,7 +1609,7 @@ async fn run_one_lifecycle(
     }
     // Deliver anything the plugin's subscriptions buffered during init.
     match guest_call(stop, instance.drain_events()).await {
-        None => return stop_after_cancel(instance, state_tx, instance_id),
+        None => return stop_after_cancel(instance, instance_id),
         Some(Ok(_)) => {}
         Some(Err(e)) => {
             return LifecycleOutcome::Crashed {
@@ -1589,14 +1642,14 @@ async fn run_one_lifecycle(
     .await
     {
         ServeOutcome::Stopped => {
-            // `Stopped` is published only once the `Store` is gone, so
-            // a caller that saw it (and the reaper) knows no guest code
-            // of this life can still run.
+            // The supervisor publishes `Stopped` only once the `Store`
+            // is gone (and the control queue drained), so a caller that
+            // saw it (and the reaper) knows no guest code of this life
+            // can still run.
             drop(instance);
-            transition(state_tx, instance_id, InstanceState::Stopped);
             LifecycleOutcome::Stopped
         }
-        ServeOutcome::Cancelled => stop_after_cancel(instance, state_tx, instance_id),
+        ServeOutcome::Cancelled => stop_after_cancel(instance, instance_id),
         ServeOutcome::StoppedFailed(reason) => LifecycleOutcome::StoppedFailed(reason),
         ServeOutcome::Crashed(reason) => LifecycleOutcome::Crashed {
             policy,
@@ -1607,17 +1660,14 @@ async fn run_one_lifecycle(
 }
 
 /// A stop cancelled the load (instantiation runs start functions).
-fn stopped_while_loading(
-    state_tx: &watch::Sender<InstanceState>,
-    instance_id: &str,
-) -> LifecycleOutcome {
+fn stopped_while_loading(instance_id: &str) -> LifecycleOutcome {
     tracing::warn!(instance_id, "stop requested while loading; load cancelled");
-    transition(state_tx, instance_id, InstanceState::Stopped);
     LifecycleOutcome::Stopped
 }
 
 /// A stop requested while `init` ran: run `on-shutdown` without
-/// delivering events first, drop the `Store`, then publish `Stopped`.
+/// delivering events first, then drop the `Store` (the supervisor
+/// publishes `Stopped`).
 async fn shutdown_before_serving(
     mut instance: PluginInstance,
     state_tx: &watch::Sender<InstanceState>,
@@ -1629,25 +1679,19 @@ async fn shutdown_before_serving(
         return LifecycleOutcome::StoppedFailed(reason);
     }
     drop(instance);
-    transition(state_tx, instance_id, InstanceState::Stopped);
     LifecycleOutcome::Stopped
 }
 
 /// A stop cancelled (or preempted) a plugin call: the instance can't
 /// be entered again, so skip `on-shutdown`, drop the `Store`, then
 /// publish `Stopped`.
-fn stop_after_cancel(
-    instance: PluginInstance,
-    state_tx: &watch::Sender<InstanceState>,
-    instance_id: &str,
-) -> LifecycleOutcome {
+fn stop_after_cancel(instance: PluginInstance, instance_id: &str) -> LifecycleOutcome {
     tracing::warn!(
         instance_id,
         "stop requested: a plugin call didn't finish within the grace period and was \
          cancelled; on-shutdown skipped",
     );
     drop(instance);
-    transition(state_tx, instance_id, InstanceState::Stopped);
     LifecycleOutcome::Stopped
 }
 
@@ -1731,6 +1775,8 @@ async fn serve_loop(
                 Some(Err(e)) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),
                 None => return ServeOutcome::Cancelled,
             },
+            // The supervisor publishes `Stopped` once the control
+            // queue is drained.
             Ok(LoopAction::Stop) => return ServeOutcome::Stopped,
             Ok(LoopAction::Cancelled) => return ServeOutcome::Cancelled,
             Ok(LoopAction::StopFailed(reason)) => {
@@ -1771,6 +1817,7 @@ async fn backoff_wait(
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     stop: &mut watch::Receiver<bool>,
     instance_id: &str,
+    pending: &PendingCommands,
 ) -> BackoffOutcome {
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
@@ -1786,28 +1833,68 @@ async fn backoff_wait(
                     let _ = reply.send(());
                     return BackoffOutcome::Shutdown;
                 }
-                // The two `Execute*` arms hand the caller the same
-                // "instance is restarting" Err, but the typed reply
-                // channels are distinct so the arms can't share a
-                // single block. The arms may diverge later (e.g.
-                // returning a typed `CommandResult::Err` for service
-                // calls); keep them separate now rather than merging.
-                #[allow(clippy::match_same_arms)]
-                // H5: refused before acting — retry-safe.
-                Some(ControlCommand::Execute { reply, .. }) => {
-                    let _ = reply.send(CommandOutcome::Rejected {
-                        error: WitError::Unavailable(format!(
-                            "instance `{instance_id}` is restarting after a crash",
-                        )),
-                    });
-                }
-                #[allow(clippy::match_same_arms)]
-                Some(ControlCommand::ExecuteService { reply, .. }) => {
-                    let _ = reply.send(Err(anyhow!(
-                        "instance `{instance_id}` is restarting after a crash",
-                    )));
+                Some(ctrl) => {
+                    refuse_unserved(ctrl, instance_id, "is restarting after a crash", pending);
                 }
             }
+        }
+    }
+}
+
+/// Refuse a control message the instance can't serve (restart backoff,
+/// or a terminal supervisor draining its queue): `instance
+/// `<id>` <why>`. A device command is `rejected` (it never ran, so a
+/// retry is safe); when its caller already disconnected, the refusal is
+/// recorded as its `COMMAND` row, since the request row has no outcome.
+/// A service call gets a dispatch error; a shutdown is acknowledged.
+fn refuse_unserved(ctrl: ControlCommand, instance_id: &str, why: &str, pending: &PendingCommands) {
+    match ctrl {
+        ControlCommand::Execute {
+            ctx,
+            device,
+            cmd,
+            ticket,
+            reply,
+        } => {
+            // `None`: the plugin was entered, which a command still in
+            // the queue never was.
+            let Some(caller_gone) = ticket.try_refuse() else {
+                return;
+            };
+            // A caller that went away or whose deadline passed while
+            // queued gets `timed_out`; the rest `rejected`. Neither ran.
+            let refused = if caller_gone || ctx.is_expired() {
+                CommandOutcome::TimedOut {
+                    message: format!("instance `{instance_id}` {why}; the command did not run"),
+                }
+            } else {
+                CommandOutcome::Rejected {
+                    error: WitError::Unavailable(format!("instance `{instance_id}` {why}")),
+                }
+            };
+            // A caller that withdrew at its own deadline reported
+            // `timed_out` itself.
+            if let Err(outcome) = reply.send(refused)
+                && !ticket.withdrawn_by_caller()
+            {
+                pending.record_resolution(&ctx, &cmd.id, &device, &outcome);
+            }
+        }
+        ControlCommand::ExecuteService {
+            guard,
+            ticket,
+            reply,
+            ..
+        } => {
+            // Settles the ticket so the caller reads "did not run".
+            let _ = ticket.try_refuse();
+            // Released before the reply, as on the dequeue refusal, so
+            // the caller never sees the refused call still active.
+            drop(guard.take());
+            let _ = reply.send(Err(anyhow!("instance `{instance_id}` {why}")));
+        }
+        ControlCommand::Shutdown { reply } => {
+            let _ = reply.send(());
         }
     }
 }
@@ -1849,13 +1936,9 @@ async fn run_execute(
             // that path reports `timed_out` itself) while the command
             // was queued; its request row has no outcome, so record
             // that it never ran.
-            super::command::record_resolution(
-                instance.audit_log().as_ref(),
-                &ctx,
-                &cmd.id,
-                &device,
-                &outcome,
-            );
+            if let Some(pending) = instance.pending_commands() {
+                pending.record_resolution(&ctx, &cmd.id, &device, &outcome);
+            }
         }
         return Ok(LoopAction::Continue);
     }
@@ -1913,13 +1996,9 @@ async fn run_execute(
         // `outcome_unknown`; record how the command really
         // ended. A late `accepted` is skipped: the pending entry
         // records the terminal outcome.
-        super::command::record_resolution(
-            instance.audit_log().as_ref(),
-            &entered_ctx,
-            &command_id,
-            &device_id,
-            &outcome,
-        );
+        if let Some(pending) = instance.pending_commands() {
+            pending.record_resolution(&entered_ctx, &command_id, &device_id, &outcome);
+        }
     }
     match (result_cancelled, trap) {
         (true, _) => Ok(LoopAction::Cancelled),
@@ -1973,6 +2052,7 @@ async fn handle_control(
             service,
             command,
             args,
+            ticket,
             reply,
         }) => {
             // Scope the invocation context handed to us by the
@@ -1993,9 +2073,12 @@ async fn handle_control(
             //
             // H6: a hop whose deadline already passed is dropped
             // unexecuted — the caller's dispatcher has stopped
-            // waiting for it.
-            if ctx.is_expired() {
-                drop(guard);
+            // waiting for it. H5: one ticket decision with the
+            // caller's withdrawal, so a caller that gave up while the
+            // call was queued knows it never ran.
+            if !ticket.try_start_unless(|| ctx.is_expired()) {
+                let _ = ticket.try_abandon();
+                drop(guard.take());
                 let _ = reply.send(Err(anyhow!(
                     "instance `{instance_id}` refused execute-service-command: invocation \
                      `{}` deadline exceeded before dispatch",
@@ -2003,6 +2086,8 @@ async fn handle_control(
                 )));
                 return Ok(LoopAction::Continue);
             }
+            // Started: the caller no longer releases it.
+            let guard = guard.take();
             let outcome = guest_call(
                 stop,
                 invocation::CURRENT.scope(
@@ -2023,7 +2108,14 @@ async fn handle_control(
                     Ok(LoopAction::Cancelled)
                 }
                 Some(Ok(result)) => {
-                    let _ = reply.send(Ok(result));
+                    if reply.send(Ok(result)).is_err() {
+                        // The caller's wait ended mid-call and it
+                        // reported `unknown`; its hop row says so.
+                        tracing::debug!(
+                            instance_id = %instance_id,
+                            "execute-service-command finished after the caller stopped waiting",
+                        );
+                    }
                     Ok(LoopAction::Continue)
                 }
                 // H5: the callee was entered, so whatever it did may

@@ -318,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
     stop_event_log_retention(event_log_retention).await;
     close_device_state(&engine).await;
+    close_command_journal(&engine).await;
 
     // Drain the log writer before process exit so the tail of the
     // run actually lands in `<state_dir>/oxidhome.db`. `Drop`'s
@@ -603,6 +604,37 @@ async fn close_device_state(engine: &oxidhome_core::Engine) {
     }
 }
 
+/// Bound on draining the H5 command journal at shutdown.
+const SHUTDOWN_COMMAND_JOURNAL_DEADLINE: Duration = Duration::from_secs(5);
+
+/// H5: write the `COMMAND` rows the stopped supervisors queued (their
+/// pending commands expire as `outcome_unknown` when they stop) and
+/// close the journal. Bounded: whatever is still pending afterwards is
+/// resolved at the next start.
+async fn close_command_journal(engine: &oxidhome_core::Engine) {
+    // A dedicated thread, as for the device-state close: the deadline
+    // starts now, not once a blocking-pool slot frees up.
+    let engine = engine.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("command-journal-close".into())
+        .spawn(move || {
+            let _ = tx.send(engine.close_command_journal(SHUTDOWN_COMMAND_JOURNAL_DEADLINE));
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(error = %err, "command journal: shutdown drain not started");
+        return;
+    }
+    // The close is bounded by the same deadline; the extra second
+    // only covers thread start-up.
+    let wait = SHUTDOWN_COMMAND_JOURNAL_DEADLINE + Duration::from_secs(1);
+    if !matches!(tokio::time::timeout(wait, rx).await, Ok(Ok(true))) {
+        tracing::warn!(
+            "command journal: shutdown drain incomplete; pending commands resolve at the next start"
+        );
+    }
+}
+
 /// Waits for the first arriving shutdown signal and returns its
 /// name for the tracing line. On non-Unix platforms only `SIGINT`
 /// (ctrl-c) is observable; `SIGTERM` is Unix-only.
@@ -734,6 +766,7 @@ async fn run_stdio() -> anyhow::Result<()> {
         .await;
     stop_event_log_retention(event_log_retention).await;
     close_device_state(&engine).await;
+    close_command_journal(&engine).await;
 
     // Flush the log writer before returning so the tail of the
     // session lands in `<state_dir>/oxidhome.db`. Matches the

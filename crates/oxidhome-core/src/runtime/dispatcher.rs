@@ -108,6 +108,8 @@ use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, ServiceId};
 use crate::state::{AuditEntry, AuditLog, ServiceRegistry};
 
+use super::command::DispatchTicket;
+use super::lifecycle::ServiceCallOutcome;
 use super::registry::InstanceRegistry;
 
 /// Per-dispatcher-call wall-clock timeout. Independent of the
@@ -442,6 +444,15 @@ pub(crate) async fn call_service(
         return outcome;
     }
 
+    // From here the hop row is finalized even if this future is
+    // dropped (the caller was cancelled mid-call), by the ticket's
+    // verdict: never started → `error`, started → `unknown`.
+    let ticket = DispatchTicket::default();
+    let mut hop = HopFinalizer {
+        pending: hop_audit.zip(audit_id),
+        ticket: ticket.clone(),
+    };
+
     // 5. Acquire the in-flight refcount. The guard travels in the
     //    `ExecuteService` message — the callee's supervisor holds it
     //    across the wasm call and `Drop` decrements when the work
@@ -457,21 +468,35 @@ pub(crate) async fn call_service(
             // 6. Hand the callee context (parent chain + this hop) to
             //    the owner's supervisor, which scopes it on its own
             //    task so nested `call-service`s see the full chain.
-            let dispatch_future = target_handle.execute_service_command(
-                callee_ctx,
-                guard,
-                target.clone(),
-                command,
-                args,
-            );
-            match tokio::time::timeout_at(wait_until, dispatch_future).await {
-                Ok(Ok(result)) => Ok(result),
-                Ok(Err(trap)) => Err(WitError::Unavailable(format!(
-                    "call-service to `{target}` (owner `{target_instance}`) failed: {trap:#}"
+            //    H5: the dispatch ticket tells a call that timed out
+            //    in the callee's queue (it never runs: `unavailable`,
+            //    safe to retry) from one the callee had started (it
+            //    may have acted: `unknown`).
+            let outcome = target_handle
+                .execute_service_command(
+                    callee_ctx,
+                    guard,
+                    target.clone(),
+                    command,
+                    args,
+                    ticket,
+                    wait_until,
+                )
+                .await;
+            match outcome {
+                ServiceCallOutcome::Replied(result) => Ok(result),
+                ServiceCallOutcome::NotRun(why) => Err(WitError::Unavailable(format!(
+                    "call-service to `{target}` (owner `{target_instance}`) failed: {why}; \
+                     it did not run"
                 ))),
-                Err(_) => Err(WitError::Unavailable(format!(
-                    "call-service to `{target}` (owner `{target_instance}`) timed out after {} ms",
+                ServiceCallOutcome::TimedOut => Err(WitError::Unavailable(format!(
+                    "call-service to `{target}` (owner `{target_instance}`) timed out after {} ms \
+                     before the callee started it; it did not run",
                     timeout.as_millis(),
+                ))),
+                ServiceCallOutcome::Unknown(why) => Ok(CommandResult::Unknown(format!(
+                    "call-service to `{target}` (owner `{target_instance}`): {why}; \
+                     it may have taken effect"
                 ))),
             }
         }
@@ -488,10 +513,44 @@ pub(crate) async fn call_service(
         },
         Err(err) => (Err(err), None),
     };
-    if let (Some(hop_audit), Some(id)) = (hop_audit, audit_id) {
-        hop_audit.finalize(id, audited.as_ref().unwrap_or(&outcome));
-    }
+    hop.finish(audited.as_ref().unwrap_or(&outcome));
     outcome
+}
+
+/// Finalizes a hop's intent row exactly once: with the call's outcome,
+/// or — when the caller's future is dropped mid-dispatch — with what
+/// the dispatch ticket says happened, so the row never stays `pending`.
+struct HopFinalizer {
+    pending: Option<(HopAudit, u64)>,
+    ticket: DispatchTicket,
+}
+
+impl HopFinalizer {
+    fn finish(&mut self, outcome: &Result<CommandResult, WitError>) {
+        if let Some((hop_audit, id)) = self.pending.take() {
+            hop_audit.finalize(id, outcome);
+        }
+    }
+}
+
+impl Drop for HopFinalizer {
+    fn drop(&mut self) {
+        if self.pending.is_none() {
+            return;
+        }
+        // Settle the ticket first: a still-queued call won't start now.
+        let _ = self.ticket.try_abandon();
+        let outcome = if self.ticket.started() {
+            Ok(CommandResult::Unknown(
+                "the caller was cancelled while the callee ran the call".into(),
+            ))
+        } else {
+            Err(WitError::Unavailable(
+                "the caller was cancelled before the callee started the call".into(),
+            ))
+        };
+        self.finish(&outcome);
+    }
 }
 
 /// Audit writer for one delegated hop (H6). Built only for
@@ -596,13 +655,19 @@ impl HopAudit {
             Err(_) => (503, "error", None, None),
         };
         let log = self.log;
-        tokio::task::spawn_blocking(move || {
+        let write = move || {
             if let Err(err) =
                 log.finalize(id, status, decision, None, execution_outcome, domain_error)
             {
                 tracing::error!(target: "host.audit", error = %err, id, "service-call finalize failed");
             }
-        });
+        };
+        // Also reached from `HopFinalizer::drop`, possibly while the
+        // runtime shuts down: write inline when there is no runtime.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(write)),
+            Err(_) => write(),
+        }
     }
 }
 
