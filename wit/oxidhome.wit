@@ -1307,8 +1307,9 @@ interface host-services {
   ///   passes after it started the call, the result is
   ///   `ok(command-result::unknown)`: the callee may have acted, so
   ///   read its state before retrying. A reply the callee produces
-  ///   after the caller stopped waiting is recorded in the host's
-  ///   audit trail, not returned.
+  ///   after the caller stopped waiting is not returned; for an
+  ///   invocation that started outside the host (API, MCP), it is
+  ///   recorded in the host's audit trail.
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
   /// (no matching entry in the caller's `consumes_services`

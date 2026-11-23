@@ -490,10 +490,14 @@ pub(crate) async fn call_service(
             //    in the callee's queue (it never runs: `unavailable`,
             //    safe to retry) from one the callee had started (it
             //    may have acted: `unknown`).
+            // The registration snapshot the call was checked against,
+            // shared rather than copied.
             let check = {
-                let (target, spec) = (target.clone(), command_spec.clone());
+                let (target, meta, name) =
+                    (target.clone(), Arc::clone(&target_meta), command.clone());
                 ResultCheck::new(move |result| {
-                    super::schema::check_result(&target, &spec, result)
+                    super::schema::find_command(&meta.info, &target, &name)
+                        .and_then(|spec| super::schema::check_result(&target, spec, result))
                         .unwrap_or_else(CommandResult::Err)
                 })
             };

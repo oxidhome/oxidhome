@@ -37,7 +37,7 @@ use crate::host_impl::plugin::oxidhome::plugin::types::Error as WitError;
 use super::instance::{ComponentCache, LoadMode};
 use super::lifecycle::{InstanceHandle, InstanceState, SupervisorTuning};
 use super::registry::RegistryError;
-use super::sandbox_purge::Removal;
+use super::sandbox_purge::{Marked, Removal};
 use super::state::PluginState;
 
 /// Separator between the parent instance id and the script's
@@ -159,13 +159,13 @@ struct Entry {
     /// down.
     stopping: bool,
     /// `Some` once its parent removed it (`stop-sandbox`): the reaper
-    /// purges its storage and per-instance bookkeeping. It turns `true`
-    /// once `stop-sandbox` has persisted the removal marker (or given
-    /// up), and the reaper waits for that, so the marker can't land
+    /// purges its storage and per-instance bookkeeping. It holds a
+    /// [`Marked`] once `stop-sandbox` has tried to persist the removal
+    /// marker, and the reaper waits for that, so the marker can't land
     /// after the purge deleted it. A sandbox stopped any other way (its
     /// parent stopping, an operator, shutdown) keeps them for the
     /// parent to re-create it.
-    retire: Option<tokio::sync::watch::Receiver<bool>>,
+    retire: Option<tokio::sync::watch::Receiver<Option<Marked>>>,
 }
 
 impl Entry {
@@ -234,12 +234,19 @@ impl SandboxRegistry {
         Ok(())
     }
 
-    /// How many of `parent`'s removed sandboxes, no longer in
-    /// `children`, still await their purge.
-    fn purges_pending_of(&self, parent: &str, children: &BTreeMap<String, Entry>) -> usize {
+    /// How many of `parent`'s removed sandboxes (under
+    /// `installation_uuid`), no longer in `children`, still await their
+    /// purge.
+    fn purges_pending_of(
+        &self,
+        installation_uuid: &str,
+        parent: &str,
+        children: &BTreeMap<String, Entry>,
+    ) -> usize {
         let prefix = format!("{parent}{SANDBOX_SEPARATOR}");
         self.removals()
             .iter()
+            .filter(|(uuid, _)| uuid == installation_uuid)
             .filter_map(|(_, id)| id.strip_prefix(&prefix))
             .filter(|local_id| !children.contains_key(*local_id))
             .count()
@@ -326,13 +333,13 @@ impl SandboxRegistry {
         &self,
         parent: &str,
         local_id: &str,
-    ) -> Option<(InstanceHandle, tokio::sync::watch::Sender<bool>)> {
+    ) -> Option<(InstanceHandle, tokio::sync::watch::Sender<Option<Marked>>)> {
         let mut guard = self.lock();
         let entry = guard.get_mut(parent)?.get_mut(local_id)?;
         if !entry.is_live() {
             return None;
         }
-        let (marked, rx) = tokio::sync::watch::channel(false);
+        let (marked, rx) = tokio::sync::watch::channel(None);
         entry.stopping = true;
         entry.retire = Some(rx);
         Some((entry.handle.clone(), marked))
@@ -344,7 +351,7 @@ impl SandboxRegistry {
     pub(crate) fn retirement(
         &self,
         slot: &SandboxSlot,
-    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+    ) -> Option<tokio::sync::watch::Receiver<Option<Marked>>> {
         self.lock()
             .get(&slot.parent)
             .and_then(|children| children.get(&slot.local_id))
@@ -364,11 +371,13 @@ impl Engine {
     /// `start-sandbox` for `parent`. Synchronous: everything happens
     /// under the sandbox registry lock, so two concurrent starts of the
     /// same `local-id` can't both spawn.
+    #[allow(clippy::too_many_arguments)]
     fn start_sandbox(
         &self,
         launcher: &SandboxLauncher,
         parent: &str,
         plugin_id: &str,
+        installation_uuid: &str,
         limit: u32,
         local_id: String,
         source: String,
@@ -415,7 +424,7 @@ impl Engine {
         }
         // A removed sandbox whose purge hasn't succeeded still holds
         // its storage, so it still counts.
-        let held = children.len() + registry.purges_pending_of(parent, children);
+        let held = children.len() + registry.purges_pending_of(installation_uuid, parent, children);
         if held >= limit as usize {
             let err = WitError::Unavailable(format!(
                 "instance `{parent}` already has {held} sandboxes running, stopping or \
@@ -534,6 +543,7 @@ impl host_sandboxes::Host for PluginState {
             &launcher,
             &self.instance_id,
             &self.manifest.plugin.id,
+            &self.installation_uuid,
             limit,
             local_id,
             source,
@@ -573,19 +583,24 @@ impl host_sandboxes::Host for PluginState {
         let (persisted_tx, persisted) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let id = handle.instance_id().to_owned();
+            let (db_uuid, db_id) = (uuid.clone(), id);
             let write = tokio::task::spawn_blocking(move || {
-                super::sandbox_purge::mark(&db, &uuid, &id).map_err(|err| err.to_string())
+                super::sandbox_purge::mark(&db, &db_uuid, &db_id).map_err(|err| err.to_string())
             })
             .await
             .unwrap_or_else(|join| Err(join.to_string()));
-            marked.send_replace(true);
+            marked.send_replace(Some(Marked {
+                installation_uuid: uuid,
+                persisted: write.is_ok(),
+            }));
             let _ = persisted_tx.send(write);
             let _ = handle.stop().await;
         });
         match persisted.await {
             Ok(Ok(())) => Ok(()),
-            // The sandbox is stopping and its storage is purged all the
-            // same; only a crash before that purge would leave it.
+            // The sandbox is stopping and the reaper still tries the
+            // purge, but a crash before it would leave the storage for
+            // a new sandbox under this id: not a clean removal.
             Ok(Err(err)) => {
                 tracing::error!(
                     parent_instance = %self.instance_id,
@@ -593,7 +608,10 @@ impl host_sandboxes::Host for PluginState {
                     error = %err,
                     "persisting the sandbox removal marker failed",
                 );
-                Ok(())
+                Err(WitError::Internal(format!(
+                    "sandbox `{}` is stopping, but its removal could not be recorded: {err}",
+                    crate::auth::invocation::audit_cap(&local_id),
+                )))
             }
             Err(_) => Err(WitError::Internal(
                 "the sandbox stop task ended before persisting its removal".into(),
@@ -690,12 +708,18 @@ mod tests {
             ("u".to_owned(), "main~a".to_owned()),
             ("u".to_owned(), "main~gone".to_owned()),
             ("u".to_owned(), "other~b".to_owned()),
+            ("v".to_owned(), "main~c".to_owned()),
         ]));
         entry(&registry, "main", "a");
         let guard = registry.lock();
-        assert_eq!(registry.purges_pending_of("main", &guard["main"]), 1);
-        assert_eq!(registry.purges_pending_of("other", &BTreeMap::new()), 1);
-        assert_eq!(registry.purges_pending_of("none", &BTreeMap::new()), 0);
+        assert_eq!(registry.purges_pending_of("u", "main", &guard["main"]), 1);
+        assert_eq!(
+            registry.purges_pending_of("u", "other", &BTreeMap::new()),
+            1
+        );
+        assert_eq!(registry.purges_pending_of("u", "none", &BTreeMap::new()), 0);
+        // Another installation's leftovers under a reused parent id.
+        assert_eq!(registry.purges_pending_of("v", "main", &guard["main"]), 1);
     }
 
     #[test]

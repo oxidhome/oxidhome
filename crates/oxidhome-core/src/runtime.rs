@@ -1362,12 +1362,18 @@ impl Engine {
                 // waits for it here, so the marker can't land after the
                 // purge. A dropped sender (runtime teardown) doesn't
                 // hold this up.
-                let _ = marked.wait_for(|done| *done).await;
-                // A sandbox removed before it finished loading has no
-                // installation of its own yet; it runs its parent's.
-                let installation = reaper_handle
-                    .installation_uuid()
-                    .map(str::to_owned)
+                let marked = marked
+                    .wait_for(Option::is_some)
+                    .await
+                    .ok()
+                    .and_then(|m| m.clone());
+                // The installation `stop-sandbox` marked under; else the
+                // sandbox's own, or (removed before it finished loading)
+                // its parent's.
+                let persisted = marked.as_ref().is_some_and(|m| m.persisted);
+                let installation = marked
+                    .map(|m| m.installation_uuid)
+                    .or_else(|| reaper_handle.installation_uuid().map(str::to_owned))
                     .or_else(|| {
                         engine
                             .instances
@@ -1375,7 +1381,7 @@ impl Engine {
                             .and_then(|parent| parent.installation_uuid().map(str::to_owned))
                     });
                 engine
-                    .retire_sandbox_instance(&instance_id, installation.as_deref())
+                    .retire_sandbox_instance(&instance_id, installation.as_deref(), persisted)
                     .await;
             }
             engine.instances.unregister(&instance_id, &plugin_id);
@@ -1449,7 +1455,12 @@ impl Engine {
     /// cancelled call left running, and is announced by a persisted
     /// marker, so one that fails or is cut off (shutdown, crash) runs
     /// again at the next boot.
-    async fn retire_sandbox_instance(&self, instance_id: &str, installation_uuid: Option<&str>) {
+    async fn retire_sandbox_instance(
+        &self,
+        instance_id: &str,
+        installation_uuid: Option<&str>,
+        marked: bool,
+    ) {
         self.device_state.forget_instance(instance_id);
         self.events.forget_instance(instance_id);
         // No installation: neither the sandbox nor its parent ever
@@ -1461,14 +1472,18 @@ impl Engine {
         // Before the registry entry goes: a start that finds the entry
         // gone finds the block.
         self.sandboxes.block_removal(removal.clone());
-        let db = Arc::clone(&self.db);
-        let (uuid, id) = removal.clone();
-        let marked =
-            tokio::task::spawn_blocking(move || sandbox_purge::mark(&db, &uuid, &id)).await;
-        if !matches!(marked, Ok(Ok(()))) {
-            // Purged below all the same; only a failure there loses
-            // the block at the next boot.
-            tracing::error!(instance_id, result = ?marked, "persisting the sandbox removal marker failed");
+        // `stop-sandbox` already persisted the marker; retried here only
+        // if that failed.
+        if !marked {
+            let db = Arc::clone(&self.db);
+            let (uuid, id) = removal.clone();
+            let marked =
+                tokio::task::spawn_blocking(move || sandbox_purge::mark(&db, &uuid, &id)).await;
+            if !matches!(marked, Ok(Ok(()))) {
+                // Purged below all the same; only a failure there
+                // loses the block at the next boot.
+                tracing::error!(instance_id, result = ?marked, "persisting the sandbox removal marker failed");
+            }
         }
         if !self
             .storage_ops

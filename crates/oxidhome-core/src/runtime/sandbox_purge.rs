@@ -103,20 +103,39 @@ impl Drop for StorageOpGuard {
 /// `(installation_uuid, instance_id)`.
 pub(crate) type Removal = (String, String);
 
-/// Persist the marker for a purge about to start.
+/// Persist the marker for a purge about to start. Committed with
+/// `synchronous = FULL`, so a power cut can't lose it while keeping the
+/// storage it announces the purge of.
 pub(crate) fn mark(db: &Db, installation_uuid: &str, instance_id: &str) -> rusqlite::Result<()> {
     db.write(|conn| {
-        conn.execute(
-            "INSERT OR IGNORE INTO sandbox_removal (installation_uuid, instance_id, created_ms) \
-             VALUES (?1, ?2, ?3)",
-            params![
-                installation_uuid,
-                instance_id,
-                crate::state::event_log::now_unix_ms()
-            ],
-        )
-        .map(drop)
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let result = conn
+            .execute(
+                "INSERT OR IGNORE INTO sandbox_removal (installation_uuid, instance_id, created_ms) \
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    installation_uuid,
+                    instance_id,
+                    crate::state::event_log::now_unix_ms()
+                ],
+            )
+            .map(drop);
+        // A failed restore leaves the connection at FULL: safe, only
+        // slower.
+        if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+            tracing::warn!(error = %err, "failed to restore synchronous = NORMAL after a removal marker");
+        }
+        result
     })
+}
+
+/// What `stop-sandbox` tells the reaper once it has tried to persist a
+/// removal: the installation the sandbox's storage belongs to, and
+/// whether the marker committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Marked {
+    pub(crate) installation_uuid: String,
+    pub(crate) persisted: bool,
 }
 
 /// Every marker left, oldest first.
