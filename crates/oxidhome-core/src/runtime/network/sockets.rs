@@ -238,6 +238,11 @@ fn ip_literal(name: &str) -> Option<IpAddr> {
     bare.parse().ok()
 }
 
+/// Blocking name lookups in flight across every instance.
+static HOST_LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_HOST_LOOKUPS);
+/// Cap for [`HOST_LOOKUPS`].
+const MAX_HOST_LOOKUPS: usize = 32;
+
 /// Resolve `name` (already allowed by `rules`) on the blocking pool,
 /// holding one of the instance's lookup permits until `getaddrinfo`
 /// returns, so timed-out lookups can't pile up threads.
@@ -250,11 +255,17 @@ pub(super) async fn resolve(
     let Ok(permit) = Arc::clone(&policy.lookups).try_acquire_owned() else {
         return Err(ErrorCode::TemporaryResolverFailure);
     };
+    // A timed-out `getaddrinfo` keeps its thread until it returns, and a
+    // restarted instance gets a fresh per-instance limit; this one is
+    // process-wide, so lookups can't pile up threads across restarts.
+    let Ok(global) = HOST_LOOKUPS.try_acquire() else {
+        return Err(ErrorCode::TemporaryResolverFailure);
+    };
     // Resolved as an absolute name, so a resolver search list can't
     // turn it into a different name than the one the rules matched.
     let host = format!("{}.", super::policy::normalize_name(name));
     let blocking = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _permits = (permit, global);
         (host.as_str(), 0)
             .to_socket_addrs()
             .map(|addrs| addrs.map(|a| a.ip()).collect::<Vec<_>>())

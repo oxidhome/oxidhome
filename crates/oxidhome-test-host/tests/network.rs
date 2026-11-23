@@ -286,6 +286,57 @@ async fn disallowed_host_port_and_proto_are_refused_and_audited() {
     wait_for_deny(&host, "connect", "denied", "169.254.169.254:80").await;
 }
 
+/// The policy is built from what the operator granted, not from what the
+/// manifest requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_granted_rules_are_enforced_as_allowed() {
+    let host = TestHost::new().unwrap();
+    let granted = TcpServer::line();
+    let withheld = TcpServer::line();
+    let granted_rule = format!("tcp://127.0.0.1:{}", granted.port());
+    let dir = probe_dir(&[
+        granted_rule.clone(),
+        format!("tcp://127.0.0.1:{}", withheld.port()),
+    ]);
+    let grant = oxidhome_test_host::CapabilitiesSection {
+        network: vec![granted_rule.parse().unwrap()],
+        storage_quota_kb: 16,
+        ..Default::default()
+    };
+    let mut overrides = toml::Table::new();
+    overrides.insert(
+        "ops".into(),
+        toml::Value::String(format!(
+            "tcp 127.0.0.1:{};tcp 127.0.0.1:{}",
+            granted.port(),
+            withheld.port()
+        )),
+    );
+    let mut instance = host
+        .load_with(
+            dir.path(),
+            LoadOptions::new()
+                .instance_id("granted")
+                .config(toml::Value::Table(overrides))
+                .grant(grant),
+        )
+        .await
+        .unwrap();
+    instance.init().await.unwrap();
+    assert_eq!(
+        results(&instance, 2),
+        vec!["ok:pong".to_owned(), "err:PermissionDenied".to_owned()]
+    );
+    assert_eq!(withheld.accepted(), 0);
+    wait_for_deny(
+        &host,
+        "connect",
+        "granted",
+        &format!("127.0.0.1:{}", withheld.port()),
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_name_resolving_to_a_forbidden_address_is_refused() {
     let host = TestHost::new().unwrap();
@@ -372,6 +423,12 @@ async fn http_requests_are_checked_on_every_hop() {
             format!("http https://127.0.0.1:{}/", allowed.port()),
             // Userinfo never reaches the wire.
             format!("http http://user:pw@127.0.0.1:{}/ok", allowed.port()),
+            // Nor does an oversized path.
+            format!(
+                "http http://127.0.0.1:{}/{}",
+                allowed.port(),
+                "a".repeat(9000)
+            ),
         ],
     )
     .await;
@@ -380,6 +437,7 @@ async fn http_requests_are_checked_on_every_hop() {
     assert_eq!(results[2], "err:ErrorCode::HttpRequestDenied");
     assert_eq!(results[3], "err:ErrorCode::HttpRequestDenied");
     assert!(results[4].starts_with("err:"), "{results:?}");
+    assert_eq!(results[5], "err:path");
     // Only the `/ok` request and the redirecting hop reached the server.
     assert_eq!(allowed.accepted(), 2);
     assert_eq!(

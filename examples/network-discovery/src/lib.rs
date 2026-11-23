@@ -33,7 +33,8 @@ const MAX_REPLIES_PER_TICK: usize = 32;
 
 #[derive(Default)]
 struct NetworkDiscovery {
-    socket: Option<UdpSocket>,
+    /// One socket per address family the targets use.
+    sockets: Vec<UdpSocket>,
     replies: i64,
 }
 
@@ -58,26 +59,10 @@ fn parse_targets(targets: &str) -> Result<Vec<SocketAddr>, String> {
 
 impl NetworkDiscovery {
     fn drain(&mut self) {
-        let Some(socket) = &self.socket else { return };
         let mut buf = [0u8; MAX_REPLY];
         let before = self.replies;
-        for _ in 0..MAX_REPLIES_PER_TICK {
-            match socket.recv_from(&mut buf) {
-                Ok((n, from)) => {
-                    let payload = String::from_utf8_lossy(&buf[..n]);
-                    self.replies += 1;
-                    if let Err(e) =
-                        host::publish_custom_event(None, REPLY_TOPIC, format!("{from} {payload}"))
-                    {
-                        oxidhome_sdk::tracing::warn!(error = ?e, "publishing a reply failed");
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    oxidhome_sdk::tracing::warn!(error = %e, "receiving failed");
-                    break;
-                }
-            }
+        for socket in &self.sockets {
+            self.replies += drain_socket(socket, &mut buf);
         }
         if self.replies != before
             && let Err(e) = storage::set(REPLIES_KEY, &Value::IntVal(self.replies))
@@ -87,28 +72,69 @@ impl NetworkDiscovery {
     }
 }
 
+/// An unspecified-address socket for `family` — the only bind the host
+/// allows.
+fn bind(ipv6: bool) -> Result<UdpSocket, String> {
+    let socket = if ipv6 {
+        UdpSocket::bind("[::]:0")
+    } else {
+        UdpSocket::bind("0.0.0.0:0")
+    }
+    .map_err(|e| format!("bind: {e}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking: {e}"))?;
+    Ok(socket)
+}
+
+/// Publish the replies waiting on `socket`; returns how many.
+fn drain_socket(socket: &UdpSocket, buf: &mut [u8]) -> i64 {
+    let mut replies = 0;
+    for _ in 0..MAX_REPLIES_PER_TICK {
+        match socket.recv_from(buf) {
+            Ok((n, from)) => {
+                let payload = String::from_utf8_lossy(&buf[..n]);
+                replies += 1;
+                if let Err(e) =
+                    host::publish_custom_event(None, REPLY_TOPIC, format!("{from} {payload}"))
+                {
+                    oxidhome_sdk::tracing::warn!(error = ?e, "publishing a reply failed");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                oxidhome_sdk::tracing::warn!(error = %e, "receiving failed");
+                break;
+            }
+        }
+    }
+    replies
+}
+
 impl Plugin for NetworkDiscovery {
     fn init(&mut self) -> Result<(), String> {
         let targets = parse_targets(&config_string("targets").unwrap_or_default())?;
         let probe = config_string("probe").unwrap_or_else(|| "discover".into());
-        // The only bind the host allows: the unspecified address.
-        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("set_nonblocking: {e}"))?;
-        for target in &targets {
-            match socket.send_to(probe.as_bytes(), target) {
-                Ok(_) => oxidhome_sdk::tracing::info!(%target, "probe sent"),
-                // Refused by the host when no network rule allows it.
-                Err(e) => oxidhome_sdk::tracing::warn!(%target, error = %e, "probe not sent"),
+        for ipv6 in [false, true] {
+            let family: Vec<&SocketAddr> = targets.iter().filter(|t| t.is_ipv6() == ipv6).collect();
+            if family.is_empty() {
+                continue;
             }
+            let socket = bind(ipv6)?;
+            for target in family {
+                match socket.send_to(probe.as_bytes(), target) {
+                    Ok(_) => oxidhome_sdk::tracing::info!(%target, "probe sent"),
+                    // Refused by the host when no network rule allows it.
+                    Err(e) => oxidhome_sdk::tracing::warn!(%target, error = %e, "probe not sent"),
+                }
+            }
+            self.sockets.push(socket);
         }
-        self.socket = Some(socket);
         Ok(())
     }
 
     fn shutdown(&mut self) {
-        self.socket = None;
+        self.sockets.clear();
     }
 
     fn tick(&mut self) {

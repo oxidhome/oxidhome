@@ -163,7 +163,7 @@ impl CompiledRule {
                 Err(_) => RuleHost::Name(normalize_name(host)),
             },
             HostMatch::SuffixWildcard(suffix) => RuleHost::Suffix(normalize_name(suffix)),
-            HostMatch::Cidr(net) => RuleHost::Net(net.trunc()),
+            HostMatch::Cidr(net) => RuleHost::Net(canonical_net(*net)),
         };
         Self {
             proto: rule.proto,
@@ -206,6 +206,19 @@ impl CompiledRule {
     fn is_name_rule(&self) -> bool {
         matches!(self.host, RuleHost::Name(_) | RuleHost::Suffix(_))
     }
+}
+
+/// A CIDR inside the IPv4-mapped IPv6 range (`::ffff:0:0/96`) as the
+/// IPv4 range it maps, since addresses are matched in canonical form.
+fn canonical_net(net: IpNet) -> IpNet {
+    if let IpNet::V6(v6) = net
+        && v6.prefix_len() >= 96
+        && let Some(v4) = v6.network().to_ipv4_mapped()
+        && let Ok(v4net) = ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96)
+    {
+        return IpNet::V4(v4net.trunc());
+    }
+    net.trunc()
 }
 
 /// Lowercase, without a trailing dot.
@@ -643,6 +656,28 @@ mod tests {
             straddle.check_addr(Use::Tcp, sa("172.1.0.1:80"), None),
             Ok(())
         );
+    }
+
+    #[test]
+    fn ipv4_mapped_cidr_rules_match_ipv4_addresses() {
+        let p = policy(&["udp://[::ffff:192.168.1.0/120]:9999"]);
+        assert_eq!(
+            p.check_addr(Use::Udp, sa("192.168.1.20:9999"), None),
+            Ok(())
+        );
+        assert_eq!(
+            p.check_addr(Use::Udp, sa("[::ffff:192.168.1.20]:9999"), None),
+            Ok(())
+        );
+        assert!(
+            p.check_addr(Use::Udp, sa("192.168.2.20:9999"), None)
+                .is_err()
+        );
+        // Still contained in the private blocks, so a mapped `/96`
+        // (all of IPv4) grants public space only.
+        let all = policy(&["tcp://[::ffff:0.0.0.0/96]:*"]);
+        assert_eq!(all.check_addr(Use::Tcp, sa("1.1.1.1:80"), None), Ok(()));
+        assert!(all.check_addr(Use::Tcp, sa("10.0.0.1:80"), None).is_err());
     }
 
     #[test]

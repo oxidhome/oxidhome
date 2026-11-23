@@ -82,13 +82,79 @@ pub(super) fn add_to_linker(
             },
         )
     });
+    let limited = shadowed.and_then(|()| limit_request_setters(linker));
     linker.allow_shadowing(false);
-    shadowed?;
+    limited?;
     Ok(())
 }
 
 /// The `outgoing-handler` interface `wasmtime-wasi-http` links.
 const OUTGOING_HANDLER: &str = "wasi:http/outgoing-handler@0.2.12";
+/// The `types` interface `wasmtime-wasi-http` links.
+const HTTP_TYPES: &str = "wasi:http/types@0.2.12";
+/// Longest custom method name a request may set.
+const MAX_METHOD_LEN: usize = 64;
+/// Longest authority a request may set.
+const MAX_AUTHORITY_LEN: usize = 512;
+/// Longest path-with-query a request may set.
+const MAX_PATH_LEN: usize = 8 * 1024;
+
+/// The `outgoing-request` setters `wasmtime-wasi-http` stores without a
+/// length limit, wrapped to refuse oversized values: a request that is
+/// never sent would otherwise hold guest-sized strings in host memory.
+fn limit_request_setters(
+    linker: &mut wasmtime::component::Linker<crate::runtime::state::PluginState>,
+) -> wasmtime::Result<()> {
+    use wasmtime_wasi_http::WasiHttpView as _;
+    use wasmtime_wasi_http::p2::bindings::http::types::{HostOutgoingRequest as Setters, Method};
+    type Store<'a> = wasmtime::StoreContextMut<'a, crate::runtime::state::PluginState>;
+    type Request = Resource<HostOutgoingRequest>;
+
+    let mut types = linker.instance(HTTP_TYPES)?;
+    types.func_wrap(
+        "[method]outgoing-request.set-method",
+        |mut store: Store<'_>, (request, method): (Request, Method)| {
+            if matches!(&method, Method::Other(m) if m.len() > MAX_METHOD_LEN) {
+                return Ok((Err(()),));
+            }
+            Ok((Setters::set_method(
+                &mut store.data_mut().http(),
+                request,
+                method,
+            )?,))
+        },
+    )?;
+    types.func_wrap(
+        "[method]outgoing-request.set-authority",
+        |mut store: Store<'_>, (request, authority): (Request, Option<String>)| {
+            if authority
+                .as_ref()
+                .is_some_and(|a| a.len() > MAX_AUTHORITY_LEN)
+            {
+                return Ok((Err(()),));
+            }
+            Ok((Setters::set_authority(
+                &mut store.data_mut().http(),
+                request,
+                authority,
+            )?,))
+        },
+    )?;
+    types.func_wrap(
+        "[method]outgoing-request.set-path-with-query",
+        |mut store: Store<'_>, (request, path): (Request, Option<String>)| {
+            if path.as_ref().is_some_and(|p| p.len() > MAX_PATH_LEN) {
+                return Ok((Err(()),));
+            }
+            Ok((Setters::set_path_with_query(
+                &mut store.data_mut().http(),
+                request,
+                path,
+            )?,))
+        },
+    )?;
+    Ok(())
+}
 
 /// The future `send_request` returns: the response plus a future that
 /// drives the connection until the response body is done.
@@ -154,14 +220,15 @@ fn dns_error(code: SocketErrorCode) -> Error {
     }
 }
 
-/// Pick the address to connect to for `host:port`.
-async fn checked_address(
+/// The addresses `host:port` may be reached at, in resolver order.
+/// Every one has passed the policy; connecting tries them in turn.
+async fn checked_addresses(
     policy: &Arc<NetworkPolicy>,
     using: Use,
     target: &str,
     host: &str,
     port: u16,
-) -> Result<SocketAddr, Error> {
+) -> Result<Vec<SocketAddr>, Error> {
     let (candidates, name_rules) = if let Ok(ip) = host.parse::<IpAddr>() {
         (vec![ip], None)
     } else {
@@ -175,16 +242,59 @@ async fn checked_address(
         (addrs, Some(rules))
     };
     let mut denial = None;
+    let mut allowed = Vec::new();
     for ip in candidates {
         let addr = SocketAddr::new(ip, port);
         match policy.check_addr(using, addr, name_rules.as_deref()) {
-            Ok(()) => return Ok(addr),
+            Ok(()) => allowed.push(addr),
             Err(d) => denial = denial.or(Some(d)),
         }
     }
-    let denial = denial.unwrap_or_else(|| Denial::ResolvedRefused(host.to_owned()));
-    policy.audit_denial("http", target, &denial);
-    Err(Error::HttpRequestDenied)
+    if allowed.is_empty() {
+        let denial = denial.unwrap_or_else(|| Denial::ResolvedRefused(host.to_owned()));
+        policy.audit_denial("http", target, &denial);
+        return Err(Error::HttpRequestDenied);
+    }
+    Ok(allowed)
+}
+
+/// Connect to each checked address in turn, within one deadline;
+/// never a fresh lookup.
+async fn connect_any(
+    addrs: Vec<SocketAddr>,
+    connect_timeout: Duration,
+) -> Result<tokio::net::TcpStream, Error> {
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let mut last_error = None;
+    for addr in addrs {
+        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(err)) => last_error = Some(err),
+            Err(_) => return Err(Error::ConnectionTimeout),
+        }
+    }
+    Err(last_error.map_or(Error::ConnectionTimeout, Error::Connect))
+}
+
+/// `authority` exactly as `host[:port]`: nothing hidden after a
+/// bracketed IPv6 literal, and a bracket holding an IPv6 address, so the
+/// `Host` header names what the policy checked.
+fn plain_authority(authority: &http::uri::Authority) -> bool {
+    let raw = authority.as_str();
+    let host = authority.host();
+    if host.starts_with('[') {
+        let inner = host.trim_start_matches('[').trim_end_matches(']');
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+    }
+    match raw.strip_prefix(host) {
+        Some("") => true,
+        Some(rest) => rest.strip_prefix(':').is_some_and(|p| {
+            !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit())
+        }),
+        None => false,
+    }
 }
 
 async fn send(
@@ -202,7 +312,7 @@ async fn send(
     let authority = uri.authority().ok_or(Error::HttpRequestUriInvalid)?;
     // Userinfo would reach the `Host` header and the audit row; the
     // checked host and port are all a request may carry.
-    if authority.as_str().contains('@') {
+    if authority.as_str().contains('@') || !plain_authority(authority) {
         return Err(Error::HttpRequestUriInvalid);
     }
     let tls = uri.scheme() == Some(&Scheme::HTTPS);
@@ -222,7 +332,7 @@ async fn send(
     let permit = Arc::clone(&policy.http_requests)
         .try_acquire_owned()
         .map_err(|_| Error::ConnectionLimitReached)?;
-    let addr = checked_address(&policy, using, &target, &host, port).await?;
+    let addrs = checked_addresses(&policy, using, &target, &host, port).await?;
     if tls {
         // Checked first, so a target the rules don't allow is refused
         // (and audited) as such.
@@ -239,10 +349,7 @@ async fn send(
         .unwrap_or(BETWEEN_BYTES_TIMEOUT)
         .max(Duration::from_millis(1));
 
-    let stream = tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(addr))
-        .await
-        .map_err(|_| Error::ConnectionTimeout)?
-        .map_err(Error::Connect)?;
+    let stream = connect_any(addrs, connect_timeout).await?;
     let (mut sender, conn) = tokio::time::timeout(
         connect_timeout,
         hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(stream)),
@@ -346,5 +453,32 @@ impl http_body::Body for IncomingBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.incoming.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_authority;
+
+    fn plain(s: &str) -> bool {
+        plain_authority(&s.parse().expect("authority"))
+    }
+
+    #[test]
+    fn authority_must_be_exactly_host_and_port() {
+        for ok in [
+            "example.com",
+            "example.com:8080",
+            "127.0.0.1:80",
+            "[::1]",
+            "[::1]:8080",
+        ] {
+            assert!(plain(ok), "{ok}");
+        }
+        for bad in ["[::1]x", "[::1]x:80", "[v1.x]:80", "[::1]:", "example.com:"] {
+            if let Ok(a) = bad.parse::<http::uri::Authority>() {
+                assert!(!plain_authority(&a), "{bad}");
+            }
+        }
     }
 }
