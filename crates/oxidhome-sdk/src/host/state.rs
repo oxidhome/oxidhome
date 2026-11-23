@@ -45,9 +45,9 @@ pub const MAX_LIST_ALL_PAGES: usize = 64;
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] when the host has no state for the device,
-/// [`Error::PermissionDenied`] when none of it is visible to this
-/// plugin.
+/// [`Error::NotFound`] when nothing is visible: the host has no state
+/// for the device, or none of it is visible to this plugin (the host
+/// doesn't say which).
 pub fn get(device: &str) -> Result<Vec<DeviceState>, Error> {
     host_state::get_state(device)
 }

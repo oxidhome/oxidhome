@@ -7,15 +7,15 @@
 //! effective grant is requested ∩ granted (see
 //! `state::effective_capabilities`). `bytes-val` fields are replaced
 //! by a withheld marker unless a matching grant sets `bytes = true`
-//! (own entries are returned as written). A `get-state` refused for
-//! lack of a grant writes an audit `deny` row (`method = STATE`,
-//! `required_scope = reads_state`), awaited for a bounded time so a
-//! plugin looping on refused reads is throttled by the ledger rather
-//! than queueing writes. Allowed reads are traced, not audited:
-//! reads change nothing and would dominate the ledger.
+//! (own entries are returned as written). `get-state` answers
+//! `not-found` both for an unknown device and for one with no entry
+//! this plugin may see, so a plugin can't probe which device ids
+//! exist; the second case also writes an audit `deny` row
+//! (`method = STATE`, `required_scope = reads_state`) in the
+//! background, for the operator. Allowed reads are traced, not
+//! audited: reads change nothing and would dominate the ledger.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use oxidhome_manifest::StateGrant;
 
@@ -36,12 +36,9 @@ const MAX_LIST_PAGE_BYTES: usize = 1024 * 1024;
 /// page, bounding how long it holds the store lock under a sparse
 /// filter or grant.
 const LIST_SCAN_BUDGET: usize = 4096;
-/// How long a refused read waits for its audit row.
-const DENY_AUDIT_WAIT: Duration = Duration::from_secs(2);
-/// Deny-row writes in flight at once, process-wide. A write that
-/// outlives [`DENY_AUDIT_WAIT`] keeps its permit until it completes,
-/// so a stalled writer can't pile up blocking tasks; past the limit a
-/// refusal is traced but not audited.
+/// Deny-row writes in flight at once, process-wide. Each write keeps
+/// its permit until it completes, so a stalled writer can't pile up
+/// threads; past the limit a refusal is traced but not audited.
 const MAX_PENDING_DENY_AUDITS: usize = 32;
 static DENY_AUDIT_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_PENDING_DENY_AUDITS);
@@ -112,77 +109,71 @@ fn to_wit(entry: &DeviceState, vis: Visibility) -> WitDeviceState {
     }
 }
 
-/// Audit `deny` row for a refused `get-state` (H2). Takes owned
-/// values: the host-import future must be `Send`, and `PluginState`
-/// is not `Sync`.
-async fn audit_state_denied(
-    log: Option<Arc<crate::state::AuditLog>>,
-    instance_id: String,
-    device: String,
-) {
-    {
-        let Some(log) = log else {
-            return;
-        };
-        let ctx = invocation::current_or_host(&instance_id);
-        let root = ctx.root();
-        let entry = AuditEntry {
-            id: 0,
-            intent_ms: 0,
-            finalized_ms: None,
-            token_id: root.audit_token_id().to_owned(),
-            actor_kind: root.kind().as_str().to_owned(),
-            method: STATE_READ_AUDIT_METHOD.to_owned(),
-            path: format!(
-                "device.state/{}/{}",
-                invocation::audit_cap(&instance_id),
-                invocation::audit_cap(&device)
-            ),
-            status: 403,
-            decision: "deny".into(),
-            required_scope: Some("reads_state".into()),
-            execution_outcome: None,
-            domain_error: None,
-            credential_fp: None,
-            call_id: Some(ctx.call_id().to_owned()),
-            invocation: Some(ctx.audit_json()),
-            command_id: None,
-            command_outcome: None,
-        };
-        let Ok(permit) = DENY_AUDIT_PERMITS.try_acquire() else {
-            tracing::warn!(
-                target: "host.audit",
-                "state-read deny row dropped: too many audit writes pending",
-            );
-            return;
-        };
-        // A detached std thread, not `spawn_blocking`: Tokio waits for
-        // blocking tasks at runtime teardown, so a write stuck on the
-        // disk would hold the daemon's shutdown open.
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let spawned = std::thread::Builder::new()
-            .name("state-deny-audit".into())
-            .spawn(move || {
-                let _permit = permit;
-                let _ = tx.send(log.record_completed(&entry));
-            });
-        if let Err(err) = spawned {
-            tracing::error!(target: "host.audit", error = %err, "state-read deny row not started");
-            return;
-        }
-        match tokio::time::timeout(DENY_AUDIT_WAIT, rx).await {
-            Ok(Ok(Ok(_))) => {}
-            Ok(Ok(Err(err))) => {
+/// Audit `deny` row for a `get-state` that found state the plugin may
+/// not see (H2). Written in the background, never awaited: the plugin
+/// gets the same answer, at the same speed, as for a device with no
+/// state at all, so neither the error nor its latency tells it the
+/// device exists. The operator still sees the row. Takes owned values
+/// because `PluginState` is not `Sync`.
+fn audit_state_denied(log: Option<Arc<crate::state::AuditLog>>, instance_id: &str, device: &str) {
+    let Some(log) = log else {
+        return;
+    };
+    let ctx = invocation::current_or_host(instance_id);
+    let root = ctx.root();
+    let entry = AuditEntry {
+        id: 0,
+        intent_ms: 0,
+        finalized_ms: None,
+        token_id: root.audit_token_id().to_owned(),
+        actor_kind: root.kind().as_str().to_owned(),
+        method: STATE_READ_AUDIT_METHOD.to_owned(),
+        path: format!(
+            "device.state/{}/{}",
+            invocation::audit_cap(instance_id),
+            invocation::audit_cap(device)
+        ),
+        status: 403,
+        decision: "deny".into(),
+        required_scope: Some("reads_state".into()),
+        execution_outcome: None,
+        domain_error: None,
+        credential_fp: None,
+        call_id: Some(ctx.call_id().to_owned()),
+        invocation: Some(ctx.audit_json()),
+        command_id: None,
+        command_outcome: None,
+    };
+    let Ok(permit) = DENY_AUDIT_PERMITS.try_acquire() else {
+        tracing::warn!(
+            target: "host.audit",
+            "state-read deny row dropped: too many audit writes pending",
+        );
+        return;
+    };
+    // A detached std thread, not `spawn_blocking`: Tokio waits for
+    // blocking tasks at runtime teardown, so a write stuck on the disk
+    // would hold the daemon's shutdown open.
+    let spawned = std::thread::Builder::new()
+        .name("state-deny-audit".into())
+        .spawn(move || {
+            let _permit = permit;
+            if let Err(err) = log.record_completed(&entry) {
                 tracing::error!(target: "host.audit", error = %err, "state-read deny row failed");
             }
-            Ok(Err(_)) => {
-                tracing::error!(target: "host.audit", "state-read deny row panicked");
-            }
-            Err(_) => {
-                tracing::warn!(target: "host.audit", "state-read deny row still pending");
-            }
-        }
+        });
+    if let Err(err) = spawned {
+        tracing::error!(target: "host.audit", error = %err, "state-read deny row not started");
     }
+}
+
+/// The one answer for "nothing to show": an unknown device and a
+/// device the plugin may not see are indistinguishable.
+fn no_visible_state(device: &str) -> WitError {
+    WitError::NotFound(format!(
+        "no visible state for device {device} (unknown, or needs a matching \
+         `[[capabilities.reads_state]]` grant)"
+    ))
 }
 
 impl host_state::Host for PluginState {
@@ -194,7 +185,7 @@ impl host_state::Host for PluginState {
         }
         let entries = self.device_state.snapshot_device(&device);
         if entries.is_empty() {
-            return Err(WitError::NotFound(format!("no state for device {device}")));
+            return Err(no_visible_state(&device));
         }
         let grants = Arc::clone(&self.granted_capabilities);
         let install = self.installation_uuid.to_string();
@@ -212,10 +203,8 @@ impl host_state::Host for PluginState {
                 device = %device,
                 "get-state denied — no matching capabilities.reads_state grant",
             );
-            audit_state_denied(self.audit_log.clone(), self.instance_id.clone(), device).await;
-            return Err(WitError::PermissionDenied(
-                "get-state requires a matching `[[capabilities.reads_state]]` grant".into(),
-            ));
+            audit_state_denied(self.audit_log.clone(), &self.instance_id, &device);
+            return Err(no_visible_state(&device));
         }
         out.sort_by(|a, b| a.capability.cmp(&b.capability));
         tracing::debug!(

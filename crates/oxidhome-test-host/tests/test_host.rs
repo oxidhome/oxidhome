@@ -325,6 +325,7 @@ fn read_state(device: &str) -> Command {
 /// read is a `permission-denied` with an audit `deny` row, and
 /// `list-state` leaves the device out.
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn plugin_reads_device_state_only_with_a_grant() {
     use oxidhome_core::state::AuditQuery;
     use oxidhome_test_host::wit::types::Error as WitError;
@@ -354,26 +355,58 @@ async fn plugin_reads_device_state_only_with_a_grant() {
         .await
         .unwrap();
     denied.init().await.unwrap();
-    match denied.send_command("", read_state(&device)).await.unwrap() {
-        CommandResult::Err(WitError::PermissionDenied(msg)) => {
-            assert!(msg.contains("reads_state"), "{msg}");
-        }
-        other => panic!("expected permission-denied, got {other:?}"),
-    }
+    // An invisible device and an unknown one get the same answer, so
+    // the plugin can't probe which ids exist.
+    let hidden = match denied.send_command("", read_state(&device)).await.unwrap() {
+        CommandResult::Err(WitError::NotFound(msg)) => msg,
+        other => panic!("expected not-found, got {other:?}"),
+    };
+    let unknown_id = "dev-00000000000000000000";
+    let unknown = match denied
+        .send_command("", read_state(unknown_id))
+        .await
+        .unwrap()
+    {
+        CommandResult::Err(WitError::NotFound(msg)) => msg,
+        other => panic!("expected not-found, got {other:?}"),
+    };
+    assert_eq!(
+        hidden.replace(device.as_str(), "<id>"),
+        unknown.replace(unknown_id, "<id>"),
+        "the two refusals must be indistinguishable",
+    );
+    assert!(hidden.contains("reads_state"), "{hidden}");
     assert!(matches!(
         int_field(denied.send_command("", list()).await.unwrap(), "entries"),
         Some(Value::IntVal(0))
     ));
-    let rows = host
-        .engine()
-        .audit_log()
-        .query(&AuditQuery::default(), 32)
-        .unwrap();
+    // The operator still gets a deny row for the hidden device (written
+    // in the background), and none for the unknown one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let rows = loop {
+        let rows = host
+            .engine()
+            .audit_log()
+            .query(&AuditQuery::default(), 64)
+            .unwrap();
+        let found = rows.iter().any(|r| {
+            r.method == "STATE"
+                && r.decision == "deny"
+                && r.required_scope.as_deref() == Some("reads_state")
+                && r.path.ends_with(&device)
+        });
+        if found || std::time::Instant::now() > deadline {
+            break rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     assert!(
-        rows.iter().any(|r| r.method == "STATE"
-            && r.decision == "deny"
-            && r.required_scope.as_deref() == Some("reads_state")
-            && r.path.ends_with(&device)),
+        rows.iter()
+            .any(|r| r.method == "STATE" && r.path.ends_with(&device)),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.path.ends_with(unknown_id)),
         "{rows:?}"
     );
 

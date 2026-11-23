@@ -31,8 +31,9 @@ rule that a disk problem never stops live control, and it must not add disk work
   and expire every cursor.
 - Plugins read state through a new `host-state` WIT import (`get-state`, `list-state`). An instance always reads what
   it wrote as the same installation. Other entries need a `[[capabilities.reads_state]]` grant selecting owner plugin, capability and device,
-  with `bytes = true` required to see `bytes-val` fields. Requested and granted lists are intersected by equality, and
-  refused `get-state` calls are audited.
+  with `bytes = true` required to see `bytes-val` fields. Requested and granted lists are intersected by equality.
+  `get-state` answers `not-found` alike for an unknown device and an invisible one, so plugins can't probe for device
+  ids; the refused case is still audited for the operator.
 - Connect gains `GetDeviceState`, `ListDeviceState` and `ListDeviceStateChanges`, with parity to the REST endpoints.
 
 ## Rejected options

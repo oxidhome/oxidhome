@@ -1292,8 +1292,8 @@ interface host-config {
 /// A plugin can always read the devices it registered itself. Reading
 /// another instance's devices needs a matching
 /// `[[capabilities.reads_state]]` grant (owner plugin, capability,
-/// device); without one, `get-state` returns `permission-denied` and
-/// `list-state` leaves those entries out. `bytes-val` fields are
+/// device); without one, `get-state` answers `not-found` (the same as
+/// for an unknown device) and `list-state` leaves those entries out. `bytes-val` fields are
 /// replaced by a `json-val` marker
 /// `{"withheld":"bytes","size_bytes":N,"required_scope":"reads_state.bytes"}`
 /// unless the matching grant sets `bytes = true`; a plugin's own
@@ -1345,9 +1345,10 @@ interface host-state {
     next-cursor: option<string>,
   }
 
-  /// Every visible capability entry of `device`. `not-found` when the
-  /// host has no state for it; `permission-denied` when it has state
-  /// but none of it is visible to this plugin.
+  /// Every visible capability entry of `device`. `not-found` when
+  /// none is visible: the host has no state for it, or none of it is
+  /// visible to this plugin (the two are not told apart, so a plugin
+  /// can't learn which device ids exist).
   get-state: func(device: device-id) -> result<list<device-state>, error>;
 
   /// Visible entries matching `filter`, from the start (`cursor` is
