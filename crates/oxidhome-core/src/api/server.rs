@@ -29,8 +29,8 @@ use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, Value};
 use crate::runtime::{CommandOutcome, CommandReport};
 use crate::state::{
-    AuditQuery, EventLog, EventLogError, EventQuery, HistoricalEvent, HistoricalLogEvent,
-    InstallError, LogLevel, LogQuery, LogStore, LogValue, TopicMatch, UninstallError,
+    AuditQuery, EventLogError, EventQuery, HistoricalEvent, HistoricalLogEvent, InstallError,
+    LogLevel, LogQuery, LogStore, LogValue, TopicMatch, UninstallError,
 };
 
 use super::auth::{AuthState, require_token};
@@ -2434,16 +2434,32 @@ fn js_string_escape(input: &str) -> String {
 
 // ── Events tail (WebSocket) ──────────────────────────────────────
 
-/// `GET /api/v1/events/tail` — WebSocket upgrade that streams every
-/// bus event to the client as a JSON text frame. Gated on
-/// `events:tail`. Filter parameters (`--filter device=…`, topic
+/// `GET /api/v1/events/tail[?after_id=N]` — WebSocket upgrade that
+/// streams every bus event to the client as a JSON text frame. Gated
+/// on `events:tail`; `after_id` also needs `events:read`, since it
+/// replays history. Filter parameters (`--filter device=…`, topic
 /// prefix) are a follow-up; v1 streams everything and lets the
-/// client filter, matching the existing `EventBus::subscribe_all`
-/// shape. Backpressure is the broadcast channel's lag policy: if
-/// a client falls behind, the channel drops the oldest events and
-/// the client sees a `Lagged` notice (encoded as a `{"lagged":N}`
-/// frame so a consumer can log the gap rather than silently miss
-/// rows).
+/// client filter.
+///
+/// Frames (H4; see [`crate::state::EventTail`] and ARCHITECTURE.md
+/// "Event delivery"):
+///
+/// - an event ([`WireEvent`]), with `id` when it is in history;
+/// - `{"lagged": N, "resume_after_id": ID}` — the subscriber queue
+///   dropped `N` events; `ID` (absent if no event with an id was
+///   delivered yet) is the cursor to reopen with. A stream opened
+///   with `after_id` re-reads dropped recorded events from history
+///   itself;
+/// - `{"cursor_expired": {"after_id", "oldest_id", "head_id"}}` —
+///   the cursor can't be resumed without a gap; the server then
+///   closes the socket. Reopen with `after_id = head_id`, then
+///   rebuild device state from the state snapshot and its revision
+///   cursor.
+///
+/// With `after_id` the stream delivers every history row with
+/// `id > after_id` exactly once and in id order, then continues live;
+/// an accepted cursor is acknowledged by the `oxidhome-resume-after-id`
+/// header on the 101.
 ///
 /// **Ordering note.** Axum runs extractors in declaration order; a
 /// non-WS request rejects at `WebSocketUpgrade` with **426
@@ -2468,43 +2484,86 @@ async fn tail_events(
     Extension(actor): Extension<Actor>,
     State(state): State<ApiState>,
     upgrade: WebSocketUpgrade,
+    Query(params): Query<TailParams>,
 ) -> Result<axum::response::Response, ScopeDenied> {
     require_scope(&actor, EVENTS_TAIL)?;
+    if params.after_id.is_some() {
+        require_scope(&actor, EVENTS_READ)?;
+    }
     // H5 review P1 F1: subscribe to the bus BEFORE the 101 upgrade
-    // response goes back to the client. The pre-fix shape created
-    // the subscription inside `tail_events_loop` — i.e. AFTER the
-    // upgrade completed — so a client that saw 101, then queried
-    // `GET /api/v1/events` for its cursor, could lose any event
-    // that landed on the bus in the window between the 101 and the
-    // (still async) subscribe. Moving the `subscribe_labeled` call
-    // out here closes that window: any event that lands on the
-    // bus after the handler returned but before the loop runs is
-    // buffered in this subscriber's `mpsc` queue and drained on
-    // the loop's first `recv()`.
-    let subscription = state.engine.events().subscribe_labeled(
-        crate::host_impl::plugin::oxidhome::plugin::events::EventFilter {
-            device: None,
-            topic: None,
-        },
+    // response goes back to the client, so a client that saw 101
+    // and then queried `GET /api/v1/events` can't lose an event
+    // published in between. `EventTail::open` subscribes (and, with
+    // a cursor, resolves it against history) before returning.
+    let tail = match crate::state::EventTail::open(
+        &state.engine.events(),
+        state.engine.event_log(),
+        params.after_id,
         "http-tail",
-    );
+    )
+    .await
+    {
+        Ok(tail) => tail,
+        Err(err) => {
+            tracing::error!(target: "api.events", error = %err, "events tail open failed");
+            return Ok(
+                (StatusCode::SERVICE_UNAVAILABLE, "event history unavailable").into_response(),
+            );
+        }
+    };
+    let resume_after_id = tail.resume_after_id();
+    // M7: live and replayed events alike withhold `bytes-val`
+    // payloads unless the caller holds `blobs:read`.
     let blobs = can_read_blobs(&actor);
-    Ok(upgrade.on_upgrade(move |socket| tail_events_loop(socket, subscription, blobs)))
+    let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail, blobs));
+    if let Some(id) = resume_after_id {
+        response
+            .headers_mut()
+            .insert(RESUME_AFTER_ID_HEADER, axum::http::HeaderValue::from(id));
+    }
+    Ok(response)
 }
 
-async fn tail_events_loop(
-    mut socket: WebSocket,
-    mut sub: crate::state::EventSubscription,
-    blobs: bool,
+/// H4: response header acknowledging an accepted `after_id` on the
+/// event tails (WebSocket 101 and Connect `TailEvents`), carrying the
+/// resolved cursor. Absent on live-only streams, on expired cursors
+/// (whose stream carries only `cursor_expired`), and on servers that
+/// predate cursor resume.
+pub(crate) const RESUME_AFTER_ID_HEADER: &str = "oxidhome-resume-after-id";
+
+/// Query string for `GET /api/v1/events/tail`.
+#[derive(Deserialize)]
+struct TailParams {
+    /// H4 resume cursor: replay history rows with `id > after_id`,
+    /// then continue live. `0` starts at the oldest retained row.
+    after_id: Option<u64>,
+}
+
+/// One [`crate::state::EventTail::next`] step that owns the tail, so
+/// the WebSocket loop can keep the same step running across client
+/// frames.
+async fn tail_step(
+    mut tail: crate::state::EventTail,
+) -> (
+    crate::state::EventTail,
+    Result<Option<crate::state::TailItem>, crate::state::TailError>,
 ) {
-    use axum::extract::ws::Message;
-    // C2e: per-subscriber mpsc queue. `recv()` returns `None` when
-    // the bus drops (engine shutdown) or the subscription's
-    // `SubscriberToken` is dropped. Drops due to a slow WebSocket
-    // now happen *for this subscriber only* — the pre-C2e shared
-    // ring evicted events for every subscriber on lag.
+    let item = tail.next().await;
+    (tail, item)
+}
+
+async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail, blobs: bool) {
+    use crate::state::TailItem;
+    use axum::extract::ws::{CloseFrame, Message};
+    // C2e: per-subscriber mpsc queue. The tail ends when the bus
+    // drops (engine shutdown). Drops due to a slow WebSocket happen
+    // *for this subscriber only*.
+    //
+    // The pending step survives client frames: a Ping must not
+    // restart a history read that is already running.
+    let mut step = Box::pin(tail_step(tail));
     loop {
-        // Select between the bus (events to push) and the socket
+        // Select between the tail (events to push) and the socket
         // (client frames + disconnects). Polling `socket.recv()`
         // is what makes axum drive the WS control frames —
         // auto-Pong on client Ping, Close handling — and what
@@ -2512,41 +2571,50 @@ async fn tail_events_loop(
         // buses rather than waiting for the next publish to find
         // a dead send target.
         tokio::select! {
-            msg = sub.receiver.recv() => match msg {
-                // Follow-up review H4 round-2 F1: the mpsc slot
-                // now carries `Event { event, skipped_before }`.
-                // When `skipped_before > 0` emit the
-                // `{"lagged": N}` reconcile frame FIRST, then
-                // the event — clients still see the pre-C2e
-                // "Lagged then Event" ordering on the wire
-                // without the two-slot mpsc pressure that
-                // could starve fresh events.
-                Some(crate::state::SubscriberMessage::Event {
-                    event,
-                    skipped_before,
-                }) => {
-                    if skipped_before > 0 {
-                        let notice = format!("{{\"lagged\":{skipped_before}}}");
-                        if socket.send(Message::Text(notice.into())).await.is_err() {
-                            break;
+            (tail, item) = &mut step => {
+                step = Box::pin(tail_step(tail));
+                let text = match item {
+                    Ok(Some(TailItem::Event(event))) => {
+                        match serde_json::to_string(&WireEvent::from_host(&event, blobs)) {
+                            Ok(text) => text,
+                            Err(_) => continue,
                         }
                     }
-                    // H5: the durable `event_log` row id rides on
-                    // the WIT event itself (`event.row_id`); tail
-                    // clients use it to reconcile against a later
-                    // `GET /api/v1/events` history query without
-                    // double-counting or missing rows across a
-                    // reconnect boundary.
-                    let wire = WireEvent::from_host(&event, blobs);
-                    let Ok(text) = serde_json::to_string(&wire) else {
-                        continue;
-                    };
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                    Ok(Some(TailItem::Lagged { skipped, resume_after_id })) => {
+                        let mut frame = serde_json::json!({ "lagged": skipped });
+                        if let Some(id) = resume_after_id {
+                            frame["resume_after_id"] = id.into();
+                        }
+                        frame.to_string()
+                    }
+                    Ok(Some(TailItem::CursorExpired(expired))) => {
+                        let frame = serde_json::json!({ "cursor_expired": expired });
+                        if socket.send(Message::Text(frame.to_string().into())).await.is_ok() {
+                            let _ = socket
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: axum::extract::ws::close_code::NORMAL,
+                                    reason: "cursor_expired".into(),
+                                })))
+                                .await;
+                        }
                         break;
                     }
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::error!(target: "api.events", error = %err, "events tail stopped");
+                        let _ = socket
+                            .send(Message::Close(Some(CloseFrame {
+                                code: axum::extract::ws::close_code::ERROR,
+                                reason: "event history unavailable".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
                 }
-                None => break,
-            },
+            }
             client = socket.recv() => match client {
                 // Client gone (None) or socket error → exit. Close
                 // frame is the polite version of the same thing.
@@ -2887,7 +2955,10 @@ struct EventsParams {
     /// rows with `id > after_id`. A tail client that saved the
     /// last seen event id resumes from here — the id is a
     /// monotonic `INTEGER PRIMARY KEY`, so this is safe even
-    /// when many events land in the same millisecond.
+    /// when many events land in the same millisecond. H4: a
+    /// cursor whose next row was pruned (or that is ahead of
+    /// history) returns `410 Gone` with a `cursor_expired` body;
+    /// `0` never expires.
     after_id: Option<u64>,
     /// Complements `after_id`: return only rows with
     /// `id < before_id`. Used to walk backwards through history
@@ -2899,6 +2970,12 @@ struct EventsParams {
 
 const EVENTS_QUERY_DEFAULT_LIMIT: u32 = 100;
 const EVENTS_QUERY_MAX_LIMIT: u32 = 1_000;
+
+/// `GET /api/v1/events` reads allowed on the blocking pool at once;
+/// more answer `503`.
+const EVENTS_QUERY_INFLIGHT: usize = 8;
+static EVENTS_QUERY_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(EVENTS_QUERY_INFLIGHT)));
 
 /// `GET /api/v1/events?…` — historical event query against the
 /// `EventLog` `SQLite` table. Gated on `events:read`. Returns rows
@@ -2951,8 +3028,25 @@ async fn query_events(
         before_id: params.before_id,
         order: crate::state::EventOrder::Desc,
     };
-    let rows =
-        run_events_query(&state.engine.event_log(), &query, limit).map_err(EventsError::Storage)?;
+    // H4: the query and the `after_id` check share one connection
+    // lock, so a pruned (or future) cursor is reported, not skipped.
+    // Off the async workers: both hold the shared database mutex.
+    // At most `EVENTS_QUERY_INFLIGHT` reads queued on the blocking
+    // pool; the permit moves into the closure, so a cancelled request
+    // still holds it until its read finishes.
+    let permit = Arc::clone(&EVENTS_QUERY_SLOTS)
+        .try_acquire_owned()
+        .map_err(|_| EventsError::Busy)?;
+    let event_log = state.engine.event_log();
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let rows = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        event_log.query_after_cursor(&query, limit)
+    })
+    .await
+    .map_err(|_| EventsError::Join)?
+    .map_err(EventsError::Storage)?
+    .map_err(EventsError::CursorExpired)?;
     let events = rows
         .into_iter()
         .map(|row| WireHistoricalEvent::from_row(row, can_read_blobs(&actor)))
@@ -2960,18 +3054,12 @@ async fn query_events(
     Ok(Json(EventsBody { events }))
 }
 
-fn run_events_query(
-    store: &EventLog,
-    query: &EventQuery,
-    limit: u32,
-) -> Result<Vec<HistoricalEvent>, EventLogError> {
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    store.query(query, limit)
-}
-
 enum EventsError {
     Scope(ScopeDenied),
     Storage(EventLogError),
+    Join,
+    Busy,
+    CursorExpired(crate::state::CursorExpired),
 }
 
 impl IntoResponse for EventsError {
@@ -2982,6 +3070,21 @@ impl IntoResponse for EventsError {
                 tracing::error!(target: "api.events", error = %err, "events query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
             }
+            EventsError::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "event history busy; retry shortly",
+            )
+                .into_response(),
+            EventsError::Join => {
+                tracing::error!(target: "api.events", "events query task failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+            // Same body as the tail's `cursor_expired` frame.
+            EventsError::CursorExpired(expired) => (
+                StatusCode::GONE,
+                Json(serde_json::json!({ "cursor_expired": expired })),
+            )
+                .into_response(),
         }
     }
 }

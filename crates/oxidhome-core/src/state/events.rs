@@ -85,9 +85,17 @@ pub enum SubscriberMessage {
     /// [`EventBus::publish`] (host-side simulators, in-process
     /// tests) — that path skips the durable log — or when the H3
     /// event-log mirror was degraded and the event isn't in history.
+    ///
+    /// H4: `rows_through` is the bus's fanned-out row-id watermark
+    /// when this message was enqueued — every recorded event with a
+    /// row id up to it was fanned out no later than this one. A
+    /// cursor tail that sees it above its cursor knows rows were
+    /// dropped ahead of this event and replays them from history
+    /// first, even when this event carries no row id itself.
     Event {
         event: Arc<Event>,
         skipped_before: u64,
+        rows_through: u64,
     },
 }
 
@@ -198,6 +206,65 @@ pub struct EventBus {
     /// rate-limited (C2d), so contention stays bounded. `Arc` so
     /// `EventBus` stays `Clone`-friendly.
     publish_sequence: Arc<tokio::sync::Mutex<()>>,
+    /// H4: highest `event_log` row id fanned out so far, seeded at
+    /// boot with the history head ([`Self::note_history_head`]).
+    /// Read under `publish_sequence` by [`Self::subscribe_at_head`]:
+    /// every recorded event at or below it reached subscribers
+    /// before the new subscription existed, every later fan-out
+    /// lands in its queue.
+    last_row_id: Arc<AtomicU64>,
+    /// H4: like `last_row_id`, but raised only after the event's
+    /// fan-out to every subscriber queue finished. Idle cursor tails
+    /// replay up to this one, so they never re-read from history a
+    /// row that is still on its way into their queue.
+    queued_row_id: Arc<QueuedRowId>,
+}
+
+/// H4: the post-fan-out row-id watermark plus a wakeup for cursor
+/// tails waiting on an empty queue. A row dropped from a full queue
+/// raises the watermark without enqueueing anything, so the tail must
+/// be woken by the watermark itself.
+#[derive(Debug, Default)]
+struct QueuedRowId {
+    id: AtomicU64,
+    advanced: Notify,
+}
+
+impl QueuedRowId {
+    fn raise(&self, id: u64) {
+        if self.id.fetch_max(id, Ordering::AcqRel) < id {
+            self.advanced.notify_waiters();
+        }
+    }
+}
+
+/// H4: read handle on the bus's queued row-id watermark (see
+/// [`EventBus::row_watermark`]). Holds only the counter, not the
+/// bus, so a holder doesn't keep subscriber senders alive past engine
+/// shutdown.
+#[derive(Debug, Clone)]
+pub struct RowWatermark(Arc<QueuedRowId>);
+
+impl RowWatermark {
+    /// Current watermark.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.id.load(Ordering::Acquire)
+    }
+
+    /// Wait until the watermark rises above `seen`. Registers for the
+    /// wakeup before re-checking, so a raise can't slip in between.
+    pub async fn advanced_past(&self, seen: u64) {
+        loop {
+            let notified = self.0.advanced.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.get() > seen {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// One subscription's delivery slot. Owned via `Arc` by the
@@ -335,7 +402,57 @@ impl EventBus {
             rate_capacity: DEFAULT_PUBLISH_BURST,
             rate_refill_per_sec: DEFAULT_PUBLISH_RATE_PER_SEC,
             publish_sequence: Arc::new(tokio::sync::Mutex::new(())),
+            last_row_id: Arc::new(AtomicU64::new(0)),
+            queued_row_id: Arc::new(QueuedRowId::default()),
         }
+    }
+
+    /// H4: raise the fanned-out row-id watermark to `head` (the
+    /// history head at boot). Rows written by an earlier daemon run
+    /// were never fanned out by this bus, so a cursor stream reads
+    /// them from history before switching to live delivery.
+    pub fn note_history_head(&self, head: u64) {
+        self.last_row_id.fetch_max(head, Ordering::AcqRel);
+        self.queued_row_id.raise(head);
+    }
+
+    /// H4: highest row id fanned out so far (or the boot-time
+    /// history head). Every recorded event up to it has been handed
+    /// to the subscriber queues, or is being handed to them right now
+    /// by a publish that already passed this point.
+    #[must_use]
+    pub fn fanned_out_row_id(&self) -> u64 {
+        self.last_row_id.load(Ordering::Acquire)
+    }
+
+    /// H4: a [`RowWatermark`] handle on the highest row id whose
+    /// fan-out has finished: every recorded event up to it is in each
+    /// matching subscriber's queue, or was dropped from it.
+    #[must_use]
+    pub fn row_watermark(&self) -> RowWatermark {
+        RowWatermark(Arc::clone(&self.queued_row_id))
+    }
+
+    /// H4: subscribe and snapshot the fanned-out row-id watermark
+    /// atomically with respect to recorded publishes. Holds the
+    /// `publish_sequence` gate (the one `publish_event` holds across
+    /// mirror write and fan-out), so every recorded event with a row
+    /// id at or below the returned watermark was fanned out before
+    /// this subscription existed, and every event fanned out later
+    /// is in its queue. The wait is not bounded here: each publisher
+    /// already queued on the gate holds it for up to one mirror write
+    /// deadline while the mirror is healthy, and none while it is
+    /// degraded. Never reads the database under the gate.
+    pub async fn subscribe_at_head(
+        &self,
+        filter: EventFilter,
+        label: &str,
+    ) -> (EventSubscription, u64) {
+        let gate = self.publish_sequence();
+        let _guard = gate.lock().await;
+        let subscription = self.subscribe_labeled(filter, label);
+        let head = self.last_row_id.load(Ordering::Acquire);
+        (subscription, head)
     }
 
     /// H5 review round-2 P2 F1: `Arc<tokio::sync::Mutex>` gate
@@ -385,6 +502,10 @@ impl EventBus {
         // in-process `EventBus::publish` fast path leaves it
         // `None` (host-side simulators, tests).
         event.row_id = event_id;
+        if let Some(id) = event_id {
+            self.last_row_id.fetch_max(id, Ordering::AcqRel);
+        }
+        let rows_through = self.last_row_id.load(Ordering::Acquire);
         // C2e review F1: wrap the event once in an `Arc` so
         // per-subscriber fan-out is a ref-count bump, not a full
         // clone per queue slot. With unbounded custom-event
@@ -470,6 +591,7 @@ impl EventBus {
             match sub.sender.try_send(SubscriberMessage::Event {
                 event: Arc::clone(&event),
                 skipped_before: claimed,
+                rows_through,
             }) {
                 Ok(()) => delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -500,6 +622,9 @@ impl EventBus {
                     // the subscription is going away.
                 }
             }
+        }
+        if let Some(id) = event_id {
+            self.queued_row_id.raise(id);
         }
         self.signal_wakes(event.as_ref());
         delivered
@@ -1160,6 +1285,7 @@ mod tests {
             while let Ok(SubscriberMessage::Event {
                 event: _,
                 skipped_before,
+                ..
             }) = fast.receiver.try_recv()
             {
                 assert_eq!(
@@ -1216,6 +1342,7 @@ mod tests {
         while let Ok(SubscriberMessage::Event {
             event: _,
             skipped_before,
+            ..
         }) = sub.receiver.try_recv()
         {
             assert_eq!(skipped_before, 0, "pre-overflow event carried lag hint");
@@ -1231,6 +1358,7 @@ mod tests {
             SubscriberMessage::Event {
                 skipped_before,
                 event,
+                ..
             } => {
                 assert_eq!(
                     skipped_before, overflow,

@@ -195,13 +195,32 @@ impl ::buffa::Enumeration for ButtonKind {
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct TailEventsRequest {
+    /// H4: resume cursor. Unset = live only (events published after
+    /// the subscription opens). Set = replay history rows with
+    /// `row_id > after_id`, then continue live; every row id is
+    /// delivered exactly once and in increasing order. `0` starts at
+    /// the oldest retained row. Requires the `events:read` scope in
+    /// addition to `events:tail`. An accepted cursor is acknowledged by
+    /// the `oxidhome-resume-after-id` response header (the resolved
+    /// cursor). Without the header the stream is not resumed: either the
+    /// cursor expired (the first message is `CursorExpired`) or the
+    /// server predates `after_id` and ignored it.
+    ///
+    /// Field 1: `after_id`
+    #[serde(
+        rename = "afterId",
+        alias = "after_id",
+        with = "::buffa::json_helpers::opt_uint64",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub after_id: ::core::option::Option<u64>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for TailEventsRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("TailEventsRequest").finish()
+        f.debug_struct("TailEventsRequest").field("after_id", &self.after_id).finish()
     }
 }
 impl TailEventsRequest {
@@ -210,6 +229,15 @@ impl TailEventsRequest {
     ///
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.TailEventsRequest";
+}
+impl TailEventsRequest {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::after_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_after_id(mut self, value: u64) -> Self {
+        self.after_id = Some(value);
+        self
+    }
 }
 ::buffa::impl_default_instance!(TailEventsRequest);
 impl ::buffa::MessageName for TailEventsRequest {
@@ -231,6 +259,9 @@ impl ::buffa::Message for TailEventsRequest {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
+        if let Some(v) = self.after_id {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -241,6 +272,9 @@ impl ::buffa::Message for TailEventsRequest {
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
+        if let Some(v) = self.after_id {
+            ::buffa::types::put_uint64_field(1u32, v, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
@@ -254,6 +288,15 @@ impl ::buffa::Message for TailEventsRequest {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.after_id = ::core::option::Option::Some(
+                    ::buffa::types::decode_uint64(buf)?,
+                );
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -262,6 +305,7 @@ impl ::buffa::Message for TailEventsRequest {
         ::core::result::Result::Ok(())
     }
     fn clear(&mut self) {
+        self.after_id = ::core::option::Option::None;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -359,6 +403,14 @@ impl ::buffa::Message for TailEventsResponse {
                         += 1u64 + ::buffa::encoding::varint_len(inner as u64) as u64
                             + inner as u64;
                 }
+                __buffa::oneof::tail_events_response::Body::CursorExpired(x) => {
+                    let __slot = __cache.reserve();
+                    let inner = x.compute_size(__cache);
+                    __cache.set(__slot, inner);
+                    size
+                        += 1u64 + ::buffa::encoding::varint_len(inner as u64) as u64
+                            + inner as u64;
+                }
             }
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
@@ -384,6 +436,14 @@ impl ::buffa::Message for TailEventsResponse {
                 __buffa::oneof::tail_events_response::Body::Lagged(x) => {
                     ::buffa::types::put_len_delimited_header(
                         2u32,
+                        u64::from(__cache.consume_next()),
+                        buf,
+                    );
+                    x.write_to(__cache, buf);
+                }
+                __buffa::oneof::tail_events_response::Body::CursorExpired(x) => {
+                    ::buffa::types::put_len_delimited_header(
+                        3u32,
                         u64::from(__cache.consume_next()),
                         buf,
                     );
@@ -439,6 +499,28 @@ impl ::buffa::Message for TailEventsResponse {
                     ::buffa::Message::merge_length_delimited(&mut val, buf, ctx)?;
                     self.body = ::core::option::Option::Some(
                         __buffa::oneof::tail_events_response::Body::Lagged(
+                            ::buffa::alloc::boxed::Box::new(val),
+                        ),
+                    );
+                }
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                if let ::core::option::Option::Some(
+                    __buffa::oneof::tail_events_response::Body::CursorExpired(
+                        ref mut existing,
+                    ),
+                ) = self.body
+                {
+                    ::buffa::Message::merge_length_delimited(&mut **existing, buf, ctx)?;
+                } else {
+                    let mut val = ::core::default::Default::default();
+                    ::buffa::Message::merge_length_delimited(&mut val, buf, ctx)?;
+                    self.body = ::core::option::Option::Some(
+                        __buffa::oneof::tail_events_response::Body::CursorExpired(
                             ::buffa::alloc::boxed::Box::new(val),
                         ),
                     );
@@ -528,6 +610,30 @@ impl<'de> serde::Deserialize<'de> for TailEventsResponse {
                                 }
                                 __oneof_body = Some(
                                     __buffa::oneof::tail_events_response::Body::Lagged(
+                                        ::buffa::alloc::boxed::Box::new(v),
+                                    ),
+                                );
+                            }
+                        }
+                        "cursorExpired" | "cursor_expired" => {
+                            let v: ::core::option::Option<CursorExpired> = map
+                                .next_value_seed(
+                                    ::buffa::json_helpers::NullableDeserializeSeed(
+                                        ::buffa::json_helpers::DefaultDeserializeSeed::<
+                                            CursorExpired,
+                                        >::new(),
+                                    ),
+                                )?;
+                            if let Some(v) = v {
+                                if __oneof_body.is_some() {
+                                    return Err(
+                                        serde::de::Error::custom(
+                                            "multiple oneof fields set for 'body'",
+                                        ),
+                                    );
+                                }
+                                __oneof_body = Some(
+                                    __buffa::oneof::tail_events_response::Body::CursorExpired(
                                         ::buffa::alloc::boxed::Box::new(v),
                                     ),
                                 );
@@ -1924,7 +2030,7 @@ pub const __CUSTOM_EVENT_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buff
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct Lagged {
-    /// Count of events the broadcast channel dropped since this
+    /// Count of events the subscriber queue dropped since this
     /// subscriber last saw a message. Matches the JSON WebSocket's
     /// `{"lagged": N}` shape.
     ///
@@ -1935,13 +2041,36 @@ pub struct Lagged {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub skipped: u64,
+    /// H4: the stream's resume cursor when this notice is emitted —
+    /// the highest row id delivered so far (with `after_id`, possibly
+    /// including rows already re-read from history, or the opening
+    /// cursor if nothing was delivered yet).
+    /// Without `after_id` the stream stays live-only and lossy;
+    /// reopen with `after_id = resume_after_id` to recover the dropped
+    /// events that are in history. With `after_id` the stream re-reads
+    /// them from history itself, so this notice is informational
+    /// (dropped events without a row id are not in history and are
+    /// lost either way). Unset if no event with a row id was
+    /// delivered yet.
+    ///
+    /// Field 2: `resume_after_id`
+    #[serde(
+        rename = "resumeAfterId",
+        alias = "resume_after_id",
+        with = "::buffa::json_helpers::opt_uint64",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub resume_after_id: ::core::option::Option<u64>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for Lagged {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("Lagged").field("skipped", &self.skipped).finish()
+        f.debug_struct("Lagged")
+            .field("skipped", &self.skipped)
+            .field("resume_after_id", &self.resume_after_id)
+            .finish()
     }
 }
 impl Lagged {
@@ -1950,6 +2079,15 @@ impl Lagged {
     ///
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Lagged";
+}
+impl Lagged {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::resume_after_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_resume_after_id(mut self, value: u64) -> Self {
+        self.resume_after_id = Some(value);
+        self
+    }
 }
 ::buffa::impl_default_instance!(Lagged);
 impl ::buffa::MessageName for Lagged {
@@ -1974,6 +2112,9 @@ impl ::buffa::Message for Lagged {
         if self.skipped != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.skipped) as u64;
         }
+        if let Some(v) = self.resume_after_id {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1986,6 +2127,9 @@ impl ::buffa::Message for Lagged {
         use ::buffa::Enumeration as _;
         if self.skipped != 0u64 {
             ::buffa::types::put_uint64_field(1u32, self.skipped, buf);
+        }
+        if let Some(v) = self.resume_after_id {
+            ::buffa::types::put_uint64_field(2u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2007,6 +2151,15 @@ impl ::buffa::Message for Lagged {
                 )?;
                 self.skipped = ::buffa::types::decode_uint64(buf)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.resume_after_id = ::core::option::Option::Some(
+                    ::buffa::types::decode_uint64(buf)?,
+                );
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -2016,6 +2169,7 @@ impl ::buffa::Message for Lagged {
     }
     fn clear(&mut self) {
         self.skipped = 0u64;
+        self.resume_after_id = ::core::option::Option::None;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -2046,5 +2200,199 @@ pub const __LAGGED_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::typ
     type_url: "type.googleapis.com/oxidhome.v1.Lagged",
     to_json: ::buffa::type_registry::any_to_json::<Lagged>,
     from_json: ::buffa::type_registry::any_from_json::<Lagged>,
+    is_wkt: false,
+};
+/// H4: the requested cursor can't be resumed without a gap.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct CursorExpired {
+    /// The cursor that couldn't be honored: the request's `after_id`,
+    /// or the last row id this stream delivered when a row it still
+    /// had to replay was pruned mid-stream.
+    ///
+    /// Field 1: `after_id`
+    #[serde(
+        rename = "afterId",
+        alias = "after_id",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub after_id: u64,
+    /// Oldest row id still in history. Unset if history is empty.
+    ///
+    /// Field 2: `oldest_id`
+    #[serde(
+        rename = "oldestId",
+        alias = "oldest_id",
+        with = "::buffa::json_helpers::opt_uint64",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub oldest_id: ::core::option::Option<u64>,
+    /// Highest row id ever assigned. A cursor above it (e.g. after a
+    /// restore from an older backup) is expired too.
+    ///
+    /// Field 3: `head_id`
+    #[serde(
+        rename = "headId",
+        alias = "head_id",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub head_id: u64,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for CursorExpired {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("CursorExpired")
+            .field("after_id", &self.after_id)
+            .field("oldest_id", &self.oldest_id)
+            .field("head_id", &self.head_id)
+            .finish()
+    }
+}
+impl CursorExpired {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.CursorExpired";
+}
+impl CursorExpired {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::oldest_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_oldest_id(mut self, value: u64) -> Self {
+        self.oldest_id = Some(value);
+        self
+    }
+}
+::buffa::impl_default_instance!(CursorExpired);
+impl ::buffa::MessageName for CursorExpired {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "CursorExpired";
+    const FULL_NAME: &'static str = "oxidhome.v1.CursorExpired";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.CursorExpired";
+}
+impl ::buffa::Message for CursorExpired {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.after_id != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.after_id) as u64;
+        }
+        if let Some(v) = self.oldest_id {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(v) as u64;
+        }
+        if self.head_id != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.head_id) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.after_id != 0u64 {
+            ::buffa::types::put_uint64_field(1u32, self.after_id, buf);
+        }
+        if let Some(v) = self.oldest_id {
+            ::buffa::types::put_uint64_field(2u32, v, buf);
+        }
+        if self.head_id != 0u64 {
+            ::buffa::types::put_uint64_field(3u32, self.head_id, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.after_id = ::buffa::types::decode_uint64(buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.oldest_id = ::core::option::Option::Some(
+                    ::buffa::types::decode_uint64(buf)?,
+                );
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.head_id = ::buffa::types::decode_uint64(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.after_id = 0u64;
+        self.oldest_id = ::core::option::Option::None;
+        self.head_id = 0u64;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for CursorExpired {
+    const PROTO_FQN: &'static str = "oxidhome.v1.CursorExpired";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for CursorExpired {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __CURSOR_EXPIRED_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.CursorExpired",
+    to_json: ::buffa::type_registry::any_to_json::<CursorExpired>,
+    from_json: ::buffa::type_registry::any_from_json::<CursorExpired>,
     is_wkt: false,
 };

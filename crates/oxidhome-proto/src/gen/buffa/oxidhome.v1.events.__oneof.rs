@@ -8,6 +8,7 @@ pub mod tail_events_response {
     pub enum Body {
         Event(::buffa::alloc::boxed::Box<super::super::super::Event>),
         Lagged(::buffa::alloc::boxed::Box<super::super::super::Lagged>),
+        CursorExpired(::buffa::alloc::boxed::Box<super::super::super::CursorExpired>),
     }
     impl ::buffa::Oneof for Body {}
     impl From<super::super::super::Event> for Body {
@@ -30,6 +31,16 @@ pub mod tail_events_response {
             Self::Some(Body::from(v))
         }
     }
+    impl From<super::super::super::CursorExpired> for Body {
+        fn from(v: super::super::super::CursorExpired) -> Self {
+            Self::CursorExpired(::buffa::alloc::boxed::Box::new(v))
+        }
+    }
+    impl From<super::super::super::CursorExpired> for ::core::option::Option<Body> {
+        fn from(v: super::super::super::CursorExpired) -> Self {
+            Self::Some(Body::from(v))
+        }
+    }
     impl serde::Serialize for Body {
         fn serialize<S: serde::Serializer>(
             &self,
@@ -43,6 +54,9 @@ pub mod tail_events_response {
                 }
                 Self::Lagged(v) => {
                     map.serialize_entry("lagged", v)?;
+                }
+                Self::CursorExpired(v) => {
+                    map.serialize_entry("cursorExpired", v)?;
                 }
             }
             map.end()

@@ -37,8 +37,10 @@ use crate::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value as WitVa
 
 use super::db::Db;
 
+mod cursor;
 mod mirror;
 
+pub use cursor::CursorExpired;
 pub use mirror::{
     EventLogHealth, GAP_MARKER_ORIGIN, GAP_MARKER_TOPIC, GapMarker, MirrorPolicy, is_gap_marker,
 };
@@ -279,6 +281,17 @@ impl EventLog {
         filter: &EventQuery,
         limit: usize,
     ) -> Result<Vec<HistoricalEvent>, EventLogError> {
+        self.db.read(|conn| query_on(conn, filter, limit))
+    }
+}
+
+/// [`EventLog::query`] on an already-locked connection.
+fn query_on(
+    conn: &rusqlite::Connection,
+    filter: &EventQuery,
+    limit: usize,
+) -> Result<Vec<HistoricalEvent>, EventLogError> {
+    {
         let selected = build_query(filter, limit, Rows::Selected);
         let has_selectors = filter.device_id.is_some()
             || filter.instance_id.is_some()
@@ -292,19 +305,17 @@ impl EventLog {
         // forces a full sort before `LIMIT`) merged by id, both under
         // one connection lock so no write lands between them.
         let markers = has_selectors.then(|| build_query(filter, limit, Rows::GapMarkers));
-        self.db.read(|conn| -> Result<_, EventLogError> {
-            let mut out = run_query(conn, &selected)?;
-            if let Some(markers) = &markers {
-                out.extend(run_query(conn, markers)?);
-                match filter.order {
-                    EventOrder::Desc => out.sort_by_key(|r| std::cmp::Reverse(r.id)),
-                    EventOrder::Asc => out.sort_by_key(|r| r.id),
-                }
-                out.dedup_by_key(|r| r.id);
-                out.truncate(limit);
+        let mut out = run_query(conn, &selected)?;
+        if let Some(markers) = &markers {
+            out.extend(run_query(conn, markers)?);
+            match filter.order {
+                EventOrder::Desc => out.sort_by_key(|r| std::cmp::Reverse(r.id)),
+                EventOrder::Asc => out.sort_by_key(|r| r.id),
             }
-            Ok(out)
-        })
+            out.dedup_by_key(|r| r.id);
+            out.truncate(limit);
+        }
+        Ok(out)
     }
 }
 
@@ -499,10 +510,20 @@ impl EventLog {
     /// [`EventPayload`]'s public surface so the storage-encoding
     /// choice (JSON today, `postcard` tomorrow) doesn't leak past
     /// the `state` module.
+    ///
+    /// H4: deletes only a **prefix of row ids** — every row below the
+    /// first row (by id) received at or after `cutoff_ms`. Under a
+    /// wall-clock rollback an old-stamped row above that point stays
+    /// until the rows before it age out. Keeping retention to an id
+    /// prefix means a pruned range is always `1..=k`, so checking the
+    /// row right after a cursor (`EventLog::resolve_cursor`) proves
+    /// nothing after it is missing.
     pub fn trim_older_than(&self, cutoff_ms: i64) -> Result<usize, EventLogError> {
         self.db.write(|conn| -> Result<_, EventLogError> {
             Ok(conn.execute(
-                "DELETE FROM event_log WHERE received_ms < ?1",
+                "DELETE FROM event_log WHERE id < COALESCE( \
+                     (SELECT MIN(id) FROM event_log WHERE received_ms >= ?1), \
+                     (SELECT MAX(id) + 1 FROM event_log))",
                 params![cutoff_ms],
             )?)
         })
@@ -1092,10 +1113,12 @@ mod tests {
             .expect("record rollback row");
         assert_eq!(rollback_id, 4, "rollback row still gets next id");
 
-        // Retention drops rows with received_ms < 5 — that
-        // matches the rollback row (ts=0), which is currently
-        // the max id.
-        let dropped = log.trim_older_than(5).expect("trim");
+        // Delete the max-id row (the rollback row). Retention only
+        // trims id prefixes (H4), so delete it directly.
+        let dropped = log
+            .db
+            .write(|conn| conn.execute("DELETE FROM event_log WHERE id = 4", ()))
+            .expect("delete");
         assert_eq!(dropped, 1);
 
         // Next insert MUST NOT reuse id=4 (that's the
@@ -1141,6 +1164,27 @@ mod tests {
             .map(|r| r.received_ms)
             .collect();
         assert_eq!(remaining, vec![50, 40, 30]);
+    }
+
+    /// H4: under a clock rollback retention keeps the old-stamped
+    /// row above the first fresh one, so pruning stays an id prefix.
+    #[test]
+    fn trim_only_removes_an_id_prefix() {
+        let log = log();
+        for t in [10, 20, 40, 5, 50] {
+            log.record(t, &switch_event("d-1", true, 0), "alpha", "example.alpha")
+                .expect("record");
+        }
+        assert_eq!(log.trim_older_than(30).expect("trim"), 2);
+        let ids: Vec<_> = log
+            .query(&EventQuery::default(), 16)
+            .expect("query")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec![5, 4, 3]);
+        assert_eq!(log.trim_older_than(i64::MAX).expect("trim"), 3);
+        assert_eq!(log.count().expect("count"), 0);
     }
 
     #[test]

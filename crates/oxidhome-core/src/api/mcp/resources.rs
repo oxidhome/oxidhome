@@ -102,6 +102,12 @@ pub(super) const RESOURCE_TOO_LARGE_CODE: ErrorCode = ErrorCode(-32003);
 /// permanent `413` on this particular resource.
 pub(super) const RESOURCE_BUSY_CODE: ErrorCode = ErrorCode(-32004);
 
+/// H4: JSON-RPC error code for an `after_id` cursor that is no longer
+/// in history (pruned by retention, or ahead of the head). The error
+/// `data` is `{"cursor_expired": {after_id, oldest_id, head_id}}`, the
+/// same body the REST history and the event tails return.
+pub(super) const CURSOR_EXPIRED_CODE: ErrorCode = ErrorCode(-32005);
+
 /// [`AuditEntry::actor_kind`] value we stamp on every MCP row.
 /// Matches [`crate::auth::ActorKind::Mcp`]'s `as_str()` — kept
 /// as a literal here to avoid a cross-module dep just for the
@@ -410,6 +416,9 @@ enum ReadOutcome {
     /// audit ledger. Reported as [`RESOURCE_BUSY_CODE`] and
     /// audited as HTTP 503.
     Busy(String),
+    /// H4: the `after_id` cursor can't be resumed without a gap.
+    /// Audited as HTTP 410, like REST history.
+    CursorExpired(crate::state::CursorExpired),
     /// Bearer resolved, but its scope list does not include
     /// [`Self::Denied::required`]. Carried through so the
     /// audit row can name the scope that was missing.
@@ -436,6 +445,14 @@ impl ReadOutcome {
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
             Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
+            Self::CursorExpired(expired) => Err(McpError::new(
+                CURSOR_EXPIRED_CODE,
+                format!(
+                    "cursor_expired: after_id {} is no longer in history",
+                    expired.after_id
+                ),
+                Some(serde_json::json!({ "cursor_expired": expired })),
+            )),
             Self::Denied { required: _ } => Err(McpError::new(
                 SCOPE_DENIED_CODE,
                 // Deliberately omits the scope name; see
@@ -454,6 +471,7 @@ impl ReadOutcome {
             Self::InvalidParams(_) => 400,
             Self::TooLarge(_) => 413,
             Self::Busy(_) => 503,
+            Self::CursorExpired(_) => 410,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -478,7 +496,8 @@ impl ReadOutcome {
             Self::NotFound(_)
             | Self::Denied { .. }
             | Self::InvalidParams(_)
-            | Self::TooLarge(_) => "deny",
+            | Self::TooLarge(_)
+            | Self::CursorExpired(_) => "deny",
             Self::Internal(_) | Self::Busy(_) => "error",
         }
     }
@@ -1059,11 +1078,12 @@ async fn events_read(engine: Engine, raw_query: &str, blobs: bool) -> ReadOutcom
     let event_log = engine.event_log();
     let join = tokio::task::spawn_blocking(move || {
         let _guard = permit;
-        event_log.query(&event_query, limit_usize)
+        event_log.query_after_cursor(&event_query, limit_usize)
     })
     .await;
     let rows = match join {
-        Ok(Ok(rows)) => rows,
+        Ok(Ok(Ok(rows))) => rows,
+        Ok(Ok(Err(expired))) => return ReadOutcome::CursorExpired(expired),
         Ok(Err(err)) => {
             tracing::error!(%err, "MCP events query failed");
             return ReadOutcome::Internal("event query failed".into());

@@ -16,6 +16,11 @@ pub mod tail_events_response {
                 super::super::super::super::__buffa::view::LaggedView<'a>,
             >,
         ),
+        CursorExpired(
+            ::buffa::alloc::boxed::Box<
+                super::super::super::super::__buffa::view::CursorExpiredView<'a>,
+            >,
+        ),
     }
 }
 pub mod event {

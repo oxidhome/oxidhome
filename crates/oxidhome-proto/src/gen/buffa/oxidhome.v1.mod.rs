@@ -69,6 +69,7 @@ pub mod __buffa {
         reg.register_json_any(super::__INFERENCE_JSON_ANY);
         reg.register_json_any(super::__CUSTOM_EVENT_JSON_ANY);
         reg.register_json_any(super::__LAGGED_JSON_ANY);
+        reg.register_json_any(super::__CURSOR_EXPIRED_JSON_ANY);
         reg.register_json_any(super::__CHECK_REQUEST_JSON_ANY);
         reg.register_json_any(super::__CHECK_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__LIST_INSTANCES_REQUEST_JSON_ANY);
@@ -156,6 +157,10 @@ pub use self::__buffa::view::CustomEventOwnedView;
 pub use self::__buffa::view::LaggedView;
 #[doc(inline)]
 pub use self::__buffa::view::LaggedOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::CursorExpiredView;
+#[doc(inline)]
+pub use self::__buffa::view::CursorExpiredOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::CheckRequestView;
 #[doc(inline)]

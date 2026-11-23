@@ -1239,6 +1239,7 @@ impl PluginInstance {
             while let Ok(SubscriberMessage::Event {
                 event: ev,
                 skipped_before,
+                ..
             }) = sub.receiver.try_recv()
             {
                 // Follow-up review H4 round-2 F1: lag count now

@@ -369,14 +369,30 @@ impl Engine {
         );
         watchdog::EpochTicker::spawn(&inner);
         let audit_log = Arc::new(AuditLog::new(Arc::clone(&db)));
+        let event_log = Arc::new(EventLog::new(Arc::clone(&db)));
+        let events = Arc::new(EventBus::new());
+        // H4: rows from earlier runs were never fanned out by this
+        // bus; cursor tails replay them from history. A failed read
+        // only costs that replay (cursor tails then fill those rows in
+        // when the next recorded event arrives), so it doesn't stop
+        // the daemon: live delivery never depends on history (H3).
+        match event_log.head_id() {
+            Ok(head) => events.note_history_head(head),
+            Err(err) => tracing::error!(
+                target: "event_log",
+                error = %err,
+                "reading the event-log head row id failed; cursor tails replay \
+                 rows from earlier runs only once a new event is recorded",
+            ),
+        }
         Ok(Self {
             inner,
             pending_commands: Arc::new(PendingCommands::new(Some(Arc::clone(&audit_log)))),
             devices: Arc::new(DeviceRegistry::new()),
             device_state: Arc::new(DeviceStateStore::new()),
-            events: Arc::new(EventBus::new()),
+            events,
             kv: Arc::new(KvStore::new(Arc::clone(&db))),
-            event_log: Arc::new(EventLog::new(Arc::clone(&db))),
+            event_log,
             log_store: Arc::new(LogStore::new(Arc::clone(&db))),
             audit_log,
             dashboards: Arc::new(crate::state::DashboardStore::new(Arc::clone(&db))),

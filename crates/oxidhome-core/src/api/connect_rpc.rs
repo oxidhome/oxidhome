@@ -54,17 +54,18 @@ use oxidhome_proto::connect::oxidhome::v1::{
 };
 use oxidhome_proto::proto::oxidhome::v1::{
     Button as ProtoButton, ButtonKind as ProtoButtonKind, CheckRequest, CheckResponse,
-    CommandOutcome as ProtoCommandOutcome, CustomEvent as ProtoCustomEvent, Device,
-    Event as ProtoEvent, ExecuteCommandError as ProtoCmdError, ExecuteCommandRequest,
-    ExecuteCommandResponse, Inference as ProtoInference, InstallPluginRequest,
-    InstallPluginResponse, Instance, KeyValue as ProtoKeyValue, Lagged as ProtoLagged,
-    ListDevicesRequest, ListDevicesResponse, ListInstancesRequest, ListInstancesResponse,
-    ListPluginsRequest, ListPluginsResponse, LogEvent as ProtoLogEvent, LogField as ProtoLogField,
-    LogLevel as ProtoLogLevel, LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest,
-    QueryLogsResponse, StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged,
-    StopPluginRequest, StopPluginResponse, TailEventsRequest, TailEventsResponse,
-    UninstallPluginRequest, UninstallPluginResponse, Value as ProtoValue, event as proto_event,
-    execute_command_error, execute_command_response, log_value, tail_events_response, value,
+    CommandOutcome as ProtoCommandOutcome, CursorExpired as ProtoCursorExpired,
+    CustomEvent as ProtoCustomEvent, Device, Event as ProtoEvent,
+    ExecuteCommandError as ProtoCmdError, ExecuteCommandRequest, ExecuteCommandResponse,
+    Inference as ProtoInference, InstallPluginRequest, InstallPluginResponse, Instance,
+    KeyValue as ProtoKeyValue, Lagged as ProtoLagged, ListDevicesRequest, ListDevicesResponse,
+    ListInstancesRequest, ListInstancesResponse, ListPluginsRequest, ListPluginsResponse,
+    LogEvent as ProtoLogEvent, LogField as ProtoLogField, LogLevel as ProtoLogLevel,
+    LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest, QueryLogsResponse,
+    StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged, StopPluginRequest,
+    StopPluginResponse, TailEventsRequest, TailEventsResponse, UninstallPluginRequest,
+    UninstallPluginResponse, Value as ProtoValue, event as proto_event, execute_command_error,
+    execute_command_response, log_value, tail_events_response, value,
 };
 
 use crate::Engine;
@@ -82,9 +83,9 @@ use super::auth::{
     AuthState, actor_from_record, extract_bearer, finalize_audit, record_anonymous_probe,
 };
 use super::scopes::{
-    DEVICES_COMMAND, DEVICES_LIST, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL,
-    PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope, ScopeDenied,
-    can_read_blobs, require_scope,
+    DEVICES_COMMAND, DEVICES_LIST, EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ,
+    PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL, Scope,
+    ScopeDenied, can_read_blobs, require_scope,
 };
 
 /// `HealthService` implementation. Anonymous — no engine state is
@@ -1002,106 +1003,92 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
     async fn tail_events(
         &self,
         ctx: RequestContext,
-        _request: ServiceRequest<'_, TailEventsRequest>,
+        request: ServiceRequest<'_, TailEventsRequest>,
     ) -> ServiceResult<connectrpc::ServiceStream<impl Encodable<TailEventsResponse> + Send + use<>>>
     {
         // Auth + scope check runs BEFORE the stream is established
         // — a denied caller sees a clean Connect error, no wasted
         // stream setup, and the audit row lands with the right
-        // decision via the outcome slot.
+        // decision via the outcome slot. A cursor replays history,
+        // so it also needs `events:read`.
         require_scope_connect(&ctx, EVENTS_TAIL)?;
+        let after_id = request.to_owned_message().after_id;
+        if after_id.is_some() {
+            require_scope_connect(&ctx, EVENTS_READ)?;
+        }
 
         // Subscribe *before* returning the stream so the caller
         // doesn't miss an event that fires between `stream_ok`
         // returning and the future being polled for the first
-        // time.
-        //
-        // C2e: per-subscriber mpsc queue with SUBSCRIBER_CAPACITY
-        // slots. A slow gRPC / Connect client whose queue fills
-        // drops events *for itself only* (the bus emits a
-        // per-subscriber warn log). The wire protocol no longer
-        // needs a Lagged body variant because there's no shared
-        // ring for other subscribers to be evicted from — but the
-        // variant stays in the proto for backwards compat.
-        let subscription = self.engine.events().subscribe_labeled(
-            crate::host_impl::plugin::oxidhome::plugin::events::EventFilter {
-                device: None,
-                topic: None,
-            },
+        // time. H4: `EventTail` owns the history-to-live handoff
+        // for `after_id` and the lag / cursor-expired notices; see
+        // `crate::state::event_tail`.
+        let tail = crate::state::EventTail::open(
+            &self.engine.events(),
+            self.engine.event_log(),
+            after_id,
             "connect-tail",
-        );
-        // Keep the whole `EventSubscription` (not just its
-        // receiver) alive in the unfold state, so its
-        // `SubscriberToken` drops when the stream ends and the
-        // subscription slot on the bus is freed.
-        //
-        // Follow-up review H4 round-2 F1: the mpsc now delivers
-        // `Event { event, skipped_before }` in one slot. When
-        // `skipped_before > 0` we yield the `Lagged` wire frame
-        // first, then buffer the event for the next iteration —
-        // clients still see the pre-C2e "Lagged then Event"
-        // ordering on the wire without the two-slot mpsc pressure
-        // that starved fresh events under a tight consumer.
+        )
+        .await
+        .map_err(|err| {
+            tracing::error!(target: "api.events", error = %err, "connect events tail open failed");
+            rpc_err(&ctx, ConnectError::unavailable("event history unavailable"))
+        })?;
+        let resume_after_id = tail.resume_after_id();
+        // The tail (and its `SubscriberToken`) lives in the unfold
+        // state, so the bus slot is freed when the stream ends.
+        // M7: live and replayed events alike withhold `bytes-val`
+        // payloads unless the caller holds `blobs:read`.
         let blobs = ctx_can_read_blobs(&ctx);
-        let response_stream = futures_util::stream::unfold(
-            (subscription, None::<std::sync::Arc<WitEvent>>),
-            move |(mut subscription, buffered_event)| async move {
-                use crate::state::SubscriberMessage;
-                if let Some(event) = buffered_event {
-                    let body = tail_events_response::Body::Event(Box::new(wit_event_to_proto(
-                        std::sync::Arc::unwrap_or_clone(event),
-                        blobs,
-                    )));
+        let response_stream = futures_util::stream::unfold(Some(tail), move |tail| async move {
+            use crate::state::TailItem;
+            let mut tail = tail?;
+            let body = match tail.next().await {
+                Ok(Some(TailItem::Event(event))) => tail_events_response::Body::Event(Box::new(
+                    wit_event_to_proto(std::sync::Arc::unwrap_or_clone(event), blobs),
+                )),
+                Ok(Some(TailItem::Lagged {
+                    skipped,
+                    resume_after_id,
+                })) => tail_events_response::Body::Lagged(Box::new(ProtoLagged {
+                    skipped,
+                    resume_after_id,
+                    ..Default::default()
+                })),
+                Ok(Some(TailItem::CursorExpired(expired))) => {
+                    tail_events_response::Body::CursorExpired(Box::new(ProtoCursorExpired {
+                        after_id: expired.after_id,
+                        oldest_id: expired.oldest_id,
+                        head_id: expired.head_id,
+                        ..Default::default()
+                    }))
+                }
+                // Bus gone (engine shutting down), or the
+                // stream already sent `CursorExpired`.
+                Ok(None) => return None,
+                Err(err) => {
+                    tracing::error!(target: "api.events", error = %err, "connect events tail stopped");
                     return Some((
-                        Ok(TailEventsResponse {
-                            body: Some(body),
-                            ..Default::default()
-                        }),
-                        (subscription, None),
+                        Err(ConnectError::unavailable("event history unavailable")),
+                        None,
                     ));
                 }
-                match subscription.receiver.recv().await {
-                    Some(SubscriberMessage::Event {
-                        event,
-                        skipped_before: 0,
-                    }) => {
-                        let body = tail_events_response::Body::Event(Box::new(wit_event_to_proto(
-                            std::sync::Arc::unwrap_or_clone(event),
-                            blobs,
-                        )));
-                        Some((
-                            Ok(TailEventsResponse {
-                                body: Some(body),
-                                ..Default::default()
-                            }),
-                            (subscription, None),
-                        ))
-                    }
-                    Some(SubscriberMessage::Event {
-                        event,
-                        skipped_before,
-                    }) => {
-                        // Yield the Lagged wire frame now; hold
-                        // the event for the next tick.
-                        let body = tail_events_response::Body::Lagged(Box::new(ProtoLagged {
-                            skipped: skipped_before,
-                            ..Default::default()
-                        }));
-                        Some((
-                            Ok(TailEventsResponse {
-                                body: Some(body),
-                                ..Default::default()
-                            }),
-                            (subscription, Some(event)),
-                        ))
-                    }
-                    // Channel closed — publisher gone (engine
-                    // shutting down). End the stream cleanly.
-                    None => None,
-                }
-            },
-        );
-        Response::stream_ok(response_stream)
+            };
+            Some((
+                Ok(TailEventsResponse {
+                    body: Some(body),
+                    ..Default::default()
+                }),
+                Some(tail),
+            ))
+        });
+        // H4: acknowledge an accepted cursor, so a client can tell a
+        // resumed stream from a server that ignored `after_id`.
+        let response = Response::stream(response_stream);
+        Ok(match resume_after_id {
+            Some(id) => response.with_header(super::server::RESUME_AFTER_ID_HEADER, id),
+            None => response,
+        })
     }
 }
 
