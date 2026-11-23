@@ -111,6 +111,27 @@ fn limit_request_setters(
     type Request = Resource<HostOutgoingRequest>;
 
     let mut types = linker.instance(HTTP_TYPES)?;
+    // Upstream `get` returns `none` for a pending entry even after the
+    // request finished, until the guest polls a subscription; a plugin
+    // that just calls `get` each tick would never see its response.
+    // Poll once, without waiting, first.
+    types.func_wrap(
+        "[method]future-incoming-response.get",
+        |mut store: Store<'_>, (response,): (Resource<HostFutureIncomingResponse>,)| {
+            use futures_util::FutureExt as _;
+            use wasmtime_wasi::p2::Pollable as _;
+            let mut view = store.data_mut().http();
+            let entry = view.table.get_mut(&response)?;
+            if matches!(entry, HostFutureIncomingResponse::Pending(_)) {
+                let _ = entry.ready().now_or_never();
+            }
+            Ok((
+                wasmtime_wasi_http::p2::bindings::http::types::HostFutureIncomingResponse::get(
+                    &mut view, response,
+                )?,
+            ))
+        },
+    )?;
     types.func_wrap(
         "[method]outgoing-request.set-method",
         |mut store: Store<'_>, (request, method): (Request, Method)| {
@@ -236,9 +257,10 @@ async fn checked_addresses(
             policy.audit_denial("http", target, &denial);
             Error::HttpRequestDenied
         })?;
-        let addrs = super::sockets::resolve(policy, host, &rules, "http", target)
-            .await
-            .map_err(dns_error)?;
+        let addrs =
+            super::sockets::resolve(policy, host, &rules, "http", target, Some((using, port)))
+                .await
+                .map_err(dns_error)?;
         (addrs, Some(rules))
     };
     let mut denial = None;

@@ -84,7 +84,11 @@ pub(crate) fn check_world_exports(
     let exports_streaming = component
         .component_type()
         .exports(engine)
-        .any(|(name, _)| name.starts_with(STREAMING_EXPORT));
+        .any(|(name, item)| {
+            name.starts_with(STREAMING_EXPORT)
+                && matches!(item.ty, wasmtime::component::types::ComponentItem::ComponentInstance(instance)
+                    if instance.exports(engine).any(|(f, _)| f == "setup-pipeline"))
+        });
     anyhow::ensure!(
         exports_streaming,
         "the manifest selects a streaming world, but the component doesn't export \

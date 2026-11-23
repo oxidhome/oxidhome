@@ -463,7 +463,16 @@ impl NetworkPolicy {
     /// the plugin, and remember the public ones for later connects.
     /// Addresses no rule could ever allow are dropped here, so a
     /// rebinding answer never reaches the plugin.
-    pub(crate) fn admit_resolved(&self, addrs: Vec<IpAddr>, rules: &[usize]) -> Vec<IpAddr> {
+    ///
+    /// With `only`, keep just the addresses that use and port may reach
+    /// (an HTTP request), so the result cap never drops the one answer
+    /// the request could use.
+    pub(crate) fn admit_resolved(
+        &self,
+        addrs: Vec<IpAddr>,
+        rules: &[usize],
+        only: Option<(Use, u16)>,
+    ) -> Vec<IpAddr> {
         let now = Instant::now();
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -483,7 +492,11 @@ impl NetworkPolicy {
                 // LAN name with a matching CIDR rule works.
                 _ => self.rules.iter().any(|r| r.covers_ip(ip, class)),
             };
-            if usable {
+            let wanted = only.is_none_or(|(using, port)| {
+                self.check_addr(using, SocketAddr::new(ip, port), Some(rules))
+                    .is_ok()
+            });
+            if usable && wanted {
                 out.push(ip);
             }
         }
@@ -742,6 +755,7 @@ mod tests {
                 ip("::ffff:93.184.216.34"),
             ],
             &rules,
+            None,
         );
         // The rebinding answers never reach the plugin.
         assert_eq!(admitted, vec![ip("93.184.216.34")]);
@@ -787,17 +801,36 @@ mod tests {
             .map(|i| IpAddr::from(std::net::Ipv4Addr::from(0x0808_0000 + i)))
             .chain([ip("8.8.0.0"), ip("::ffff:8.8.0.1")])
             .collect();
-        let admitted = p.admit_resolved(many, &rules);
+        let admitted = p.admit_resolved(many, &rules, None);
         assert_eq!(admitted.len(), MAX_LOOKUP_RESULTS);
         assert_eq!(admitted[0], ip("8.8.0.0"));
         assert_eq!(admitted[1], ip("8.8.0.1"));
     }
 
     #[test]
+    fn an_http_lookup_keeps_only_what_the_request_can_use() {
+        let p = policy(&["udp://10.0.0.0/8:*", "tcp://*.example.com:80"]);
+        let rules = p.name_rules("a.example.com", &[Use::Http]).expect("named");
+        // 40 LAN answers only the UDP rule covers, then one public one.
+        let answers: Vec<IpAddr> = (0..40u32)
+            .map(|i| IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0001 + i)))
+            .chain([ip("93.184.216.34")])
+            .collect();
+        assert_eq!(
+            p.admit_resolved(answers.clone(), &rules, Some((Use::Http, 80))),
+            vec![ip("93.184.216.34")]
+        );
+        assert_eq!(
+            p.admit_resolved(answers, &rules, None).len(),
+            MAX_LOOKUP_RESULTS
+        );
+    }
+
+    #[test]
     fn lan_names_resolve_through_a_cidr_rule() {
         let p = policy(&["tcp://mqtt.lan:1883", "tcp://192.168.1.0/24:1883"]);
         let rules = p.name_rules("mqtt.lan", &[Use::Tcp]).expect("named");
-        let admitted = p.admit_resolved(vec![ip("192.168.1.5"), ip("192.168.2.5")], &rules);
+        let admitted = p.admit_resolved(vec![ip("192.168.1.5"), ip("192.168.2.5")], &rules, None);
         assert_eq!(admitted, vec![ip("192.168.1.5")]);
         assert_eq!(p.check_addr(Use::Tcp, sa("192.168.1.5:1883"), None), Ok(()));
         assert!(
