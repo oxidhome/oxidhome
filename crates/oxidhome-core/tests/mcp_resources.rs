@@ -1428,10 +1428,14 @@ async fn camera_blobs_need_the_camera_grant() {
     let router = build_router(engine.clone());
     let uri = json!({"uri": "oxidhome://blobs/cam-inst/snap.jpg"});
 
+    // An encoded spelling of the instance names the same blobs.
+    let encoded = json!({"uri": "oxidhome://blobs/%63am-inst/snap.jpg"});
     for bearer in [&wildcard, &reader] {
-        let (router, session) = handshake(router.clone(), bearer).await;
-        let response = call(&router, bearer, &session, "resources/read", uri.clone()).await;
-        assert_eq!(response["error"]["code"], -32001, "{response}");
+        for uri in [&uri, &encoded] {
+            let (router, session) = handshake(router.clone(), bearer).await;
+            let response = call(&router, bearer, &session, "resources/read", uri.clone()).await;
+            assert_eq!(response["error"]["code"], -32001, "{response}");
+        }
     }
     // A non-camera instance's blobs are unchanged for the wildcard.
     let (r, session) = handshake(router.clone(), &wildcard).await;
@@ -1461,4 +1465,20 @@ async fn camera_blobs_need_the_camera_grant() {
     assert_eq!(warn.len(), 1, "{warn:?}");
     assert_eq!(warn[0].token_id, viewer.id);
     assert_eq!(warn[0].required_scope.as_deref(), Some("sensitive:camera"));
+    // The resource row carries the same call id as the warn row.
+    let call_id = warn[0].call_id.clone().expect("warn row call id");
+    let joined = engine
+        .audit_log()
+        .query(
+            &AuditQuery {
+                call_id: Some(call_id),
+                ..AuditQuery::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert!(
+        joined.iter().any(|e| e.path == "mcp.resource.blobs"),
+        "{joined:?}"
+    );
 }

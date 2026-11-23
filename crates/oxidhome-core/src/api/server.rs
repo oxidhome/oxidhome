@@ -556,7 +556,7 @@ async fn set_device_category(
     };
     let devices = state.engine.devices();
     let id = device_id.clone();
-    let stored = tokio::task::spawn_blocking(move || devices.meta().set_override(&id, category))
+    let stored = tokio::task::spawn_blocking(move || devices.set_category(&id, category))
         .await
         .map_err(|_| CategoryError::Internal)?
         .map_err(|err| {
@@ -1387,9 +1387,14 @@ async fn send_command(
 
     let gate = BytesGate::new(&invocation, &state.engine);
     let report = handle
-        .execute_command_in(invocation, device_id.clone(), cmd)
+        .execute_command_admitted(
+            invocation,
+            device_id.clone(),
+            cmd,
+            decision.obligations.sensitive,
+        )
         .await;
-    let blobs = gate.release_report(&device_id, &report);
+    let blobs = gate.release_report(&device_id, &owner, &report);
 
     // F4 + H5: the authorization decision stays `allow` whatever the
     // command outcome; the outcome and command id ride to the audit

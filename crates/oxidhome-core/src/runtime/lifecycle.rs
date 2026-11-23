@@ -35,6 +35,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use crate::Engine;
+use crate::auth::SensitiveSet;
 use crate::auth::invocation::{self, InvocationContext};
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::types::{
@@ -188,6 +189,11 @@ enum ControlCommand {
         ctx: InvocationContext,
         device: DeviceId,
         cmd: Command,
+        /// H6 slice 2: the sensitive categories the caller's decision
+        /// covered at admission. The supervisor re-authorizes at
+        /// dispatch and refuses a command whose device has since
+        /// gained a category outside this set.
+        admitted: SensitiveSet,
         ticket: DispatchTicket,
         reply: oneshot::Sender<CommandOutcome>,
     },
@@ -568,11 +574,28 @@ impl InstanceHandle {
         &self,
         ctx: InvocationContext,
         device: DeviceId,
+        cmd: Command,
+    ) -> CommandReport {
+        self.execute_command_admitted(ctx, device, cmd, SensitiveSet::empty())
+            .await
+    }
+
+    /// [`Self::execute_command_in`] for a caller whose authorization
+    /// decision covered (and discharged) the sensitive categories
+    /// `admitted` (H6 slice 2). An external command is re-authorized
+    /// when the supervisor dequeues it: if the device's class now
+    /// needs a category outside `admitted`, or the caller is no longer
+    /// allowed at all, it is `rejected` without running.
+    pub async fn execute_command_admitted(
+        &self,
+        ctx: InvocationContext,
+        device: DeviceId,
         mut cmd: Command,
+        admitted: SensitiveSet,
     ) -> CommandReport {
         let command_id = mint_command_id();
         cmd.id.clone_from(&command_id);
-        let outcome = self.dispatch_command(ctx, device, cmd).await;
+        let outcome = self.dispatch_command(ctx, device, cmd, admitted).await;
         CommandReport {
             command_id,
             outcome,
@@ -584,6 +607,7 @@ impl InstanceHandle {
         ctx: InvocationContext,
         device: DeviceId,
         cmd: Command,
+        admitted: SensitiveSet,
     ) -> CommandOutcome {
         let ticket = DispatchTicket::default();
         // Declared before `_withdraw` so a dropped caller withdraws the
@@ -604,6 +628,7 @@ impl InstanceHandle {
             ctx,
             device,
             cmd,
+            admitted,
             ticket: ticket.clone(),
             reply,
         });
@@ -1895,6 +1920,7 @@ fn refuse_unserved(ctrl: ControlCommand, instance_id: &str, why: &str, pending: 
             cmd,
             ticket,
             reply,
+            ..
         } => {
             // `None`: the plugin was entered, which a command still in
             // the queue never was.
@@ -1956,6 +1982,33 @@ fn record_refusal(
     }
 }
 
+/// Why an external command admitted for `admitted` may not run against
+/// `resource` as it is classed now; `None` when it may (or when the
+/// command is host-origin, which no grant governs).
+fn dispatch_refusal(
+    ctx: &InvocationContext,
+    resource: &crate::auth::Resource,
+    admitted: SensitiveSet,
+) -> Option<String> {
+    if !ctx.root().is_external() {
+        return None;
+    }
+    let decision = crate::auth::authorize(ctx, crate::auth::Action::DeviceCommand, resource);
+    if !decision.allow {
+        return Some(
+            "the device's category changed while the command was queued; the caller \
+                     may no longer command it"
+                .to_owned(),
+        );
+    }
+    (!decision.obligations.sensitive.is_subset(admitted)).then(|| {
+        format!(
+            "the device became sensitive ({}) while the command was queued; send it again",
+            decision.obligations.sensitive.to_csv()
+        )
+    })
+}
+
 /// `ControlCommand::Execute`: run one device command and reply with
 /// its H5 outcome. A trap is still a crash (propagated after replying).
 #[allow(clippy::too_many_arguments)]
@@ -1964,11 +2017,35 @@ async fn run_execute(
     stop: &mut watch::Receiver<bool>,
     instance_id: &str,
     ctx: InvocationContext,
-    device: DeviceId,
-    cmd: Command,
+    (device, cmd, admitted): (DeviceId, Command, SensitiveSet),
     ticket: &DispatchTicket,
     reply: oneshot::Sender<CommandOutcome>,
 ) -> anyhow::Result<LoopAction> {
+    // H6 slice 2: the device's class may have changed while the
+    // command was queued (a plugin's `update-device`, an operator's
+    // category raise). Re-authorize against the class it has now; a
+    // command admitted for a switch must not actuate a lock.
+    if let Some(why) = dispatch_refusal(&ctx, &instance.device_resource(&device), admitted)
+        && let Some(caller_gone) = ticket.try_refuse()
+    {
+        let refused = if caller_gone {
+            CommandOutcome::TimedOut {
+                message: format!("instance `{instance_id}`: {why}; the command did not run"),
+            }
+        } else {
+            CommandOutcome::Rejected {
+                error: WitError::PermissionDenied(why),
+            }
+        };
+        if let Some(pending) = instance.pending_commands() {
+            record_refusal(ticket, reply, refused, |outcome| {
+                pending.record_resolution(&ctx, &cmd.id, &device, outcome);
+            });
+        } else {
+            let _ = reply.send(refused);
+        }
+        return Ok(LoopAction::Continue);
+    }
     // H6: the root gave up (or its budget ran out while the
     // command sat in this queue). Running it now would actuate
     // a device nobody is waiting on any more. H5: the ticket
@@ -2088,6 +2165,7 @@ async fn handle_control(
             ctx,
             device,
             cmd,
+            admitted,
             ticket,
             reply,
         }) => {
@@ -2096,8 +2174,7 @@ async fn handle_control(
                 stop,
                 instance_id,
                 ctx,
-                device,
-                cmd,
+                (device, cmd, admitted),
                 &ticket,
                 reply,
             )
@@ -2222,6 +2299,42 @@ mod tests {
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
     }
 
+    /// H6 slice 2: a command admitted for a switch is refused at
+    /// dispatch once the device reads as a lock, unless the admission
+    /// already covered `lock`; host-origin commands are not checked.
+    #[test]
+    fn dispatch_rechecks_the_device_class() {
+        use crate::auth::policy::SensitiveGrant;
+        use crate::auth::{
+            Actor, ActorKind, DeviceCategory, DeviceClass, Principal, Resource, SensitiveCategory,
+            Transport,
+        };
+        let switch = Resource::device("dev-1", DeviceClass::of(DeviceCategory::Switch));
+        let lock = Resource::device("dev-1", DeviceClass::of(DeviceCategory::Lock));
+        let none = SensitiveSet::empty();
+        let locks: SensitiveSet = [SensitiveCategory::Lock].into_iter().collect();
+
+        assert_eq!(dispatch_refusal(&api_ctx(), &switch, none), None);
+        assert!(
+            dispatch_refusal(&api_ctx(), &lock, none).is_some(),
+            "no grant"
+        );
+
+        let granted = Actor::api("tok-2", vec!["*".into()])
+            .with_sensitive(vec![SensitiveGrant::all(SensitiveCategory::Lock)]);
+        let ctx = InvocationContext::external(Principal::token(
+            ActorKind::Api,
+            &granted,
+            Transport::Rest,
+        ));
+        let why = dispatch_refusal(&ctx, &lock, none).expect("grant, but not admitted");
+        assert!(why.contains("lock"), "{why}");
+        assert_eq!(dispatch_refusal(&ctx, &lock, locks), None);
+
+        let host = InvocationContext::host_origin("inst");
+        assert_eq!(dispatch_refusal(&host, &lock, none), None);
+    }
+
     /// A refusal racing a dropped caller: the ticket says the caller
     /// is gone but its receiver is still open, so the send succeeds.
     /// The refusal is still recorded, exactly once.
@@ -2243,6 +2356,7 @@ mod tests {
                     action: "toggle".into(),
                     args: Vec::new(),
                 },
+                admitted: SensitiveSet::empty(),
                 ticket,
                 reply,
             },

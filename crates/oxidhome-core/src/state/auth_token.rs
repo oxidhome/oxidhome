@@ -377,7 +377,7 @@ impl TokenStore {
     /// committed, so the plaintext can be durably written to disk
     /// first. A row whose secret was never delivered is exactly
     /// the unrecoverable state M4 removes. Pair with
-    /// [`Self::insert_if_empty`] or [`Self::insert_and_revoke`].
+    /// [`Self::insert_if_empty`] or [`Self::insert_owner_and_revoke`].
     #[must_use]
     pub fn generate() -> IssuedToken {
         let secret = generate_secret();
@@ -416,9 +416,12 @@ impl TokenStore {
         })
     }
 
-    /// Insert a token produced by [`Self::generate`] and revoke
-    /// every still-active id in `revoke_ids`, all in one
+    /// Insert a token produced by [`Self::generate`] **as the owner**
+    /// and revoke every still-active id in `revoke_ids`, all in one
     /// transaction — the offline recovery command's rotation step.
+    /// The row is marked owner only when `scope_json` is the minted
+    /// `["*"]`; this and [`Self::insert_if_empty`] are the only token
+    /// inserts, so no other path can produce an owner (H6 slice 2).
     /// Either the new token exists *and* the old ones are revoked,
     /// or nothing changed. Returns the ids that were newly revoked
     /// (already-revoked or unknown ids are skipped).
@@ -427,7 +430,7 @@ impl TokenStore {
     ///
     /// [`TokenError::Malformed`] if `issued.plaintext` isn't a token
     /// this module produced; [`TokenError::Sqlite`] on DB failure.
-    pub fn insert_and_revoke(
+    pub fn insert_owner_and_revoke(
         &self,
         issued: &IssuedToken,
         label: &str,
@@ -570,20 +573,23 @@ impl PendingRow {
         })
     }
 
-    /// Insert the row as the owner token: `PendingRow` is only used by
-    /// the first-run bootstrap and offline recovery, the two paths
-    /// that mint the owner (H6 slice 2).
+    /// Insert the row, as the owner token when its scope is the minted
+    /// `["*"]`: `PendingRow` is only used by the first-run bootstrap
+    /// and offline recovery, the two paths that mint the owner (H6
+    /// slice 2). Any other scope is a plain token.
     fn insert(&self, conn: &rusqlite::Connection) -> Result<(), TokenError> {
+        let owner = self.scope_json.as_slice() == br#"["*"]"#;
         conn.execute(
             "INSERT INTO auth_token \
                (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms, owner) \
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 1)",
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
             params![
                 self.id,
                 self.label,
                 self.hash,
                 self.scope_json,
-                self.created_ms
+                self.created_ms,
+                owner
             ],
         )?;
         Ok(())
@@ -904,13 +910,13 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_revoke_is_atomic_rotation() {
+    fn insert_owner_and_revoke_is_atomic_rotation() {
         let store = TokenStore::new(fresh());
         let old = store.create("admin", b"[\"*\"]").unwrap();
         let other = store.create("ci", b"[]").unwrap();
         let new = TokenStore::generate();
         let revoked = store
-            .insert_and_revoke(
+            .insert_owner_and_revoke(
                 &new,
                 "admin",
                 b"[\"*\"]",
@@ -951,14 +957,14 @@ mod tests {
 
         reset();
         store
-            .insert_and_revoke(
+            .insert_owner_and_revoke(
                 &TokenStore::generate(),
                 "admin",
                 b"[]",
                 std::slice::from_ref(&first.id),
             )
             .unwrap();
-        assert_eq!(sync(), 1, "insert_and_revoke");
+        assert_eq!(sync(), 1, "insert_owner_and_revoke");
 
         reset();
         let unused = store.create("x", b"[]").unwrap();
@@ -976,7 +982,7 @@ mod tests {
         reset();
         assert!(
             store
-                .insert_and_revoke(&TokenStore::generate(), "admin", b"[]", &[])
+                .insert_owner_and_revoke(&TokenStore::generate(), "admin", b"[]", &[])
                 .is_err()
         );
         assert_eq!(sync(), 1, "error path");

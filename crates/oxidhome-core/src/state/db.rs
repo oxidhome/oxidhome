@@ -888,7 +888,11 @@ const MIGRATIONS: &[&str] = &[
     // - `device_meta`: per device id, the sensitive categories the host
     //   has ever derived (a floor a plugin can't lower), the operator's
     //   category raise, and the registering instance. See
-    //   `state::device_meta`.
+    //   `state::device_meta`. Backfilled with a `camera` floor for
+    //   every device whose `video-stream` state is persisted, so the
+    //   state restored before plugins load (and the instance's blobs)
+    //   is camera data from the first read after upgrade. The other
+    //   sensitive capabilities are new in this version.
     "
     ALTER TABLE auth_token ADD COLUMN owner INTEGER NOT NULL DEFAULT 0;
     UPDATE auth_token SET owner = 1
@@ -906,6 +910,9 @@ const MIGRATIONS: &[&str] = &[
         category_override  TEXT,
         updated_ms         INTEGER NOT NULL
     ) STRICT, WITHOUT ROWID;
+    INSERT INTO device_meta(device_id, owner_instance, sensitive_floor, category_override, updated_ms)
+    SELECT device_id, owner_instance, 'camera', NULL, 0
+      FROM device_state WHERE capability = 'video-stream';
     ",
 ];
 
@@ -2026,6 +2033,11 @@ mod tests {
                            (3, 'spoof', 'api', 'POST', 'host.auth.bootstrap', 200, 'allow'),
                            (4, 'spoof', 'api', 'LOCAL', 'host.auth.bootstrap', 200, 'allow'),
                            (5, 'narrowed', 'host', 'LOCAL', 'host.auth.bootstrap', 200, 'allow');
+                    INSERT INTO device_state(device_id, capability, owner_instance, owner_plugin,
+                        owner_install, fields_blob, global_revision, received_ms, observed_ms,
+                        source_generation, quality)
+                    VALUES ('dev-00000000000000aa', 'video-stream', 'cam', 'p', 'u', X'00', 1, 1, 1, 1, 'ok'),
+                           ('dev-00000000000000bb', 'on-off', 'cam', 'p', 'u', X'00', 2, 1, 1, 1, 'ok');
                     PRAGMA user_version = 20;
                     ",
                 )
@@ -2041,6 +2053,23 @@ mod tests {
             })
             .expect("owners");
         assert_eq!(owners, vec!["boot".to_string(), "recovered".to_string()]);
+        let floors: Vec<(String, String, String)> = db
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT device_id, owner_instance, sensitive_floor FROM device_meta",
+                )?;
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect()
+            })
+            .expect("floors");
+        assert_eq!(
+            floors,
+            vec![(
+                "dev-00000000000000aa".to_string(),
+                "cam".to_string(),
+                "camera".to_string()
+            )]
+        );
     }
 
     #[test]

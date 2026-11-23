@@ -467,7 +467,12 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             None => invocation,
         };
         let report = handle
-            .execute_command_in(invocation, req.device_id.clone(), cmd)
+            .execute_command_admitted(
+                invocation,
+                req.device_id.clone(),
+                cmd,
+                decision.obligations.sensitive,
+            )
             .await;
         // F4 + H5: every routed command is an RPC success carrying
         // its explicit outcome. Record the command id and outcome on
@@ -475,7 +480,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         // authorization decision. Mirrors the JSON side's
         // `DomainOutcome` response-extension smuggle.
         record_domain_outcome(&ctx, &report);
-        let blobs = gate.release_report(&req.device_id, &report);
+        let blobs = gate.release_report(&req.device_id, &owner, &report);
         Response::ok(command_report_to_proto(report, blobs))
     }
 

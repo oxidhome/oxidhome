@@ -209,10 +209,29 @@ impl DeviceRegistry {
             .filter(|m| m.owner_instance == instance_id)
             .map(Arc::clone)
             .collect();
-        owned
-            .iter()
-            .any(|m| DeviceClass::derive(&m.info.capabilities).is_camera())
-            || self.meta.instance_is_camera(instance_id)
+        owned.iter().any(|m| {
+            let derived = DeviceClass::derive(&m.info.capabilities);
+            self.meta
+                .get(&m.id)
+                .map_or(derived, |row| row.apply(derived))
+                .is_camera()
+        }) || self.meta.instance_is_camera(instance_id)
+    }
+
+    /// Set (or clear) the operator's category override for `id`,
+    /// recording the device's current owner with it so a raise to
+    /// `camera` classes that instance's blobs and bytes too.
+    ///
+    /// # Errors
+    ///
+    /// As [`DeviceMetaStore::set_override`].
+    pub fn set_category(
+        &self,
+        id: &str,
+        category: Option<crate::auth::DeviceCategory>,
+    ) -> Result<super::DeviceMetaRow, super::DeviceMetaError> {
+        let owner = self.read().get(id).map(|m| m.owner_instance.clone());
+        self.meta.set_override(id, category, owner.as_deref())
     }
 
     /// Report `info`'s derived class to the durable floor. Refused
@@ -694,5 +713,26 @@ mod tests {
         other.local_id = "hello".into();
         reg.try_register("plugin.a", "beta".into(), other)
             .expect("other instance has its own count");
+    }
+
+    /// An operator's raise to `camera` on a registered device classes
+    /// its instance as a camera source, live and after a restart.
+    #[test]
+    fn camera_override_classes_the_owning_instance() {
+        use crate::auth::DeviceCategory;
+        let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
+        let reg = DeviceRegistry::with_meta(Arc::new(
+            DeviceMetaStore::open(Arc::clone(&db)).expect("meta"),
+        ));
+        let id = reg.register("u", "inst".into(), empty_info());
+        assert!(!reg.instance_is_camera("inst"));
+        reg.set_category(&id, Some(DeviceCategory::Camera))
+            .expect("override");
+        assert!(reg.instance_is_camera("inst"));
+        assert!(!reg.instance_is_camera("other"));
+
+        let reopened =
+            DeviceRegistry::with_meta(Arc::new(DeviceMetaStore::open(db).expect("reopen")));
+        assert!(reopened.instance_is_camera("inst"), "offline, from the row");
     }
 }

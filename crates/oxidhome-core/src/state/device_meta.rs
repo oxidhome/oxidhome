@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 
 use super::db::Db;
 use super::event_log::now_unix_ms;
@@ -62,11 +62,17 @@ impl DeviceMetaRow {
 /// devices a few times never meets it.
 pub const MAX_FLOOR_ROWS_PER_INSTANCE: usize = 4 * super::devices::MAX_DEVICES_PER_INSTANCE;
 
-/// [`DeviceMetaStore::observe`] refused to remember another device for
-/// an instance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the instance has {MAX_FLOOR_ROWS_PER_INSTANCE} sensitive devices on record")]
-pub struct FloorCapExceeded;
+/// Why [`DeviceMetaStore::observe`] refused a registration.
+#[derive(Debug, thiserror::Error)]
+pub enum ObserveError {
+    /// The instance already has [`MAX_FLOOR_ROWS_PER_INSTANCE`]
+    /// sensitive devices on record.
+    #[error("the instance has {MAX_FLOOR_ROWS_PER_INSTANCE} sensitive devices on record")]
+    CapExceeded,
+    /// The floor couldn't be stored.
+    #[error("storing the device's sensitive categories failed: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+}
 
 /// Errors from the operator-facing writes.
 #[derive(Debug, thiserror::Error)]
@@ -187,49 +193,50 @@ impl DeviceMetaStore {
 
     /// Record that `device_id`, registered by `owner_instance`, was
     /// derived as `derived`. Raises the durable floor when `derived`
-    /// has a sensitive category the floor lacks; otherwise does
-    /// nothing (no write for non-sensitive devices).
+    /// has a sensitive category the floor lacks, and records the owner
+    /// of a remembered device; otherwise does nothing (no write for
+    /// non-sensitive devices). The `SQLite` write commits before the
+    /// in-memory row changes, both under the store's lock, so memory
+    /// never runs ahead of (or behind) the table.
     ///
     /// # Errors
     ///
-    /// [`FloorCapExceeded`] when this would remember a new device for
-    /// an instance that already has [`MAX_FLOOR_ROWS_PER_INSTANCE`]
-    /// rows: the caller refuses the registration, so a plugin cycling
-    /// `register-device` / `remove-device` through fresh ids can't grow
-    /// the table without bound.
+    /// [`ObserveError::CapExceeded`] when this would remember a new
+    /// device for an instance that already has
+    /// [`MAX_FLOOR_ROWS_PER_INSTANCE`] rows: the caller refuses the
+    /// registration, so a plugin cycling `register-device` /
+    /// `remove-device` through fresh ids can't grow the table without
+    /// bound. [`ObserveError::Sqlite`] when the floor couldn't be
+    /// stored: the caller refuses the registration too, and the next
+    /// attempt writes again.
     pub fn observe(
         &self,
         device_id: &str,
         owner_instance: &str,
         derived: DeviceClass,
-    ) -> Result<(), FloorCapExceeded> {
-        let current = self.get(device_id);
-        let floor = current
-            .as_ref()
-            .map_or_else(SensitiveSet::empty, |r| r.sensitive_floor);
+    ) -> Result<(), ObserveError> {
+        let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
+        let current = rows.get(device_id);
+        let floor = current.map_or_else(SensitiveSet::empty, |r| r.sensitive_floor);
         let owner_known = current
-            .as_ref()
             .and_then(|r| r.owner_instance.as_deref())
             .is_some_and(|o| o == owner_instance);
         if derived.sensitive().is_subset(floor) && (owner_known || current.is_none()) {
             return Ok(());
         }
         if current.is_none() {
-            let owned = self
-                .rows
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
+            let owned = rows
                 .values()
                 .filter(|r| r.owner_instance.as_deref() == Some(owner_instance))
                 .count();
             if owned >= MAX_FLOOR_ROWS_PER_INSTANCE {
-                return Err(FloorCapExceeded);
+                return Err(ObserveError::CapExceeded);
             }
         }
         let new_floor = floor.union(derived.sensitive());
         if let Some(db) = &self.db {
             let csv = new_floor.to_csv();
-            let result = db.write(|conn| -> Result<usize, rusqlite::Error> {
+            db.write(|conn| -> Result<usize, rusqlite::Error> {
                 conn.execute(
                     "INSERT INTO device_meta \
                        (device_id, owner_instance, sensitive_floor, category_override, updated_ms) \
@@ -240,29 +247,20 @@ impl DeviceMetaStore {
                        updated_ms = excluded.updated_ms",
                     params![device_id, owner_instance, csv, now_unix_ms()],
                 )
-            });
-            if let Err(err) = result {
-                tracing::error!(
-                    target: "auth.device_meta",
-                    device_id,
-                    error = %err,
-                    "persisting the device's sensitive-category floor failed; \
-                     it holds in memory until the daemon restarts",
-                );
-            }
+            })?;
         }
-        let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
         let row = rows.entry(device_id.to_owned()).or_default();
-        // Union again under the lock: a concurrent observe may have
-        // raised it meanwhile, and the floor never shrinks.
-        row.sensitive_floor = row.sensitive_floor.union(new_floor);
+        row.sensitive_floor = new_floor;
         row.owner_instance = Some(owner_instance.to_owned());
         Ok(())
     }
 
     /// Set (or with `None` clear) the operator's category override for
-    /// `device_id`. The device need not be registered right now.
-    /// Returns the row as stored.
+    /// `device_id`. The device need not be registered right now;
+    /// `owner_instance` is its owner when the host knows it, recorded so
+    /// a raise to `camera` classes the instance's blobs too. Returns the
+    /// row as stored. Commit and publication happen under one lock, so
+    /// concurrent overrides land in memory in the order they committed.
     ///
     /// # Errors
     ///
@@ -272,42 +270,36 @@ impl DeviceMetaStore {
         &self,
         device_id: &str,
         category: Option<DeviceCategory>,
+        owner_instance: Option<&str>,
     ) -> Result<DeviceMetaRow, DeviceMetaError> {
         if !is_device_id(device_id) {
             return Err(DeviceMetaError::BadDeviceId(device_id.to_owned()));
         }
         let name = category.map(DeviceCategory::as_str);
+        let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
+        let owner = owner_instance
+            .map(str::to_owned)
+            .or_else(|| rows.get(device_id).and_then(|r| r.owner_instance.clone()));
         if let Some(db) = &self.db {
             db.write(|conn| -> Result<(), rusqlite::Error> {
-                let tx = conn.transaction()?;
-                let exists = tx
-                    .query_row(
-                        "SELECT 1 FROM device_meta WHERE device_id = ?1",
-                        params![device_id],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
-                if exists {
-                    tx.execute(
-                        "UPDATE device_meta SET category_override = ?2, updated_ms = ?3 \
-                         WHERE device_id = ?1",
-                        params![device_id, name, now_unix_ms()],
-                    )?;
-                } else if name.is_some() {
-                    tx.execute(
-                        "INSERT INTO device_meta \
-                           (device_id, owner_instance, sensitive_floor, category_override, updated_ms) \
-                         VALUES (?1, NULL, '', ?2, ?3)",
-                        params![device_id, name, now_unix_ms()],
-                    )?;
-                }
-                tx.commit()
+                conn.execute(
+                    "INSERT INTO device_meta \
+                       (device_id, owner_instance, sensitive_floor, category_override, updated_ms) \
+                     VALUES (?1, ?2, '', ?3, ?4) \
+                     ON CONFLICT(device_id) DO UPDATE SET \
+                       owner_instance = COALESCE(excluded.owner_instance, owner_instance), \
+                       category_override = excluded.category_override, \
+                       updated_ms = excluded.updated_ms",
+                    params![device_id, owner, name, now_unix_ms()],
+                )?;
+                Ok(())
             })?;
         }
-        let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
         let row = rows.entry(device_id.to_owned()).or_default();
         row.category_override = category;
+        if owner.is_some() {
+            row.owner_instance = owner;
+        }
         Ok(row.clone())
     }
 }
@@ -381,7 +373,7 @@ mod tests {
         let db = Arc::new(Db::open_in_memory().expect("db"));
         let store = DeviceMetaStore::open(Arc::clone(&db)).expect("open");
         let row = store
-            .set_override(DEV, Some(DeviceCategory::Opener))
+            .set_override(DEV, Some(DeviceCategory::Opener), None)
             .expect("set");
         let class = row.apply(DeviceClass::of(DeviceCategory::Switch));
         assert_eq!(class.category(), DeviceCategory::Opener);
@@ -391,14 +383,14 @@ mod tests {
             .observe(DEV, "inst", DeviceClass::of(DeviceCategory::Lock))
             .unwrap();
         let row = store
-            .set_override(DEV, Some(DeviceCategory::Light))
+            .set_override(DEV, Some(DeviceCategory::Light), None)
             .expect("set");
         assert_eq!(
             row.apply(DeviceClass::of(DeviceCategory::Switch))
                 .category(),
             DeviceCategory::Lock
         );
-        let row = store.set_override(DEV, None).expect("clear");
+        let row = store.set_override(DEV, None, None).expect("clear");
         assert!(row.sensitive_floor.contains(SensitiveCategory::Lock));
         assert_eq!(row.category_override, None);
         assert_eq!(
@@ -406,7 +398,7 @@ mod tests {
             Some(row)
         );
         assert!(matches!(
-            store.set_override("dev-XYZ", Some(DeviceCategory::Lock)),
+            store.set_override("dev-XYZ", Some(DeviceCategory::Lock), None),
             Err(DeviceMetaError::BadDeviceId(_))
         ));
     }
@@ -431,10 +423,10 @@ mod tests {
                 .observe(&format!("dev-{i:016x}"), "p", lock)
                 .expect("under the cap");
         }
-        assert_eq!(
+        assert!(matches!(
             store.observe("dev-ffffffffffffffff", "p", lock),
-            Err(FloorCapExceeded)
-        );
+            Err(ObserveError::CapExceeded)
+        ));
         // A known device and another instance are unaffected.
         store.observe("dev-0000000000000000", "p", lock).unwrap();
         store.observe("dev-ffffffffffffffff", "q", lock).unwrap();

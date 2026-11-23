@@ -311,7 +311,7 @@ pub(super) async fn read(
     // (ledger unreachable, disk full, read-only DB, …) refuse
     // the read.
     let audit_log = engine.audit_log();
-    let audit_entry = new_audit_entry(&token_id, family, &outcome);
+    let audit_entry = new_audit_entry(&token_id, family, &outcome, ctx.call_id());
     let audit_result = tokio::task::spawn_blocking(move || {
         // Move the permit into the closure so it drops when
         // the actual audit write completes — not when the
@@ -586,11 +586,22 @@ impl Kind<'_> {
             Kind::PluginsList | Kind::PluginsDetail(_) => AuthResource::plugins(),
             Kind::Events => AuthResource::events(),
             Kind::Logs | Kind::Status | Kind::Config => AuthResource::Host,
-            Kind::Blob(instance, name) => AuthResource::blob(
-                *instance,
-                *name,
-                engine.devices().instance_is_camera(instance),
-            ),
+            Kind::Blob(instance, name) => {
+                // Classify the instance `blob_read` will look up: the
+                // percent-decoded segment, so an encoded spelling of a
+                // camera instance can't dodge the camera check. A
+                // segment that doesn't decode is refused by
+                // `blob_read`; class it as a camera meanwhile.
+                let decoded = percent_decode_segment(instance);
+                let camera = decoded
+                    .as_deref()
+                    .map_or(true, |i| engine.devices().instance_is_camera(i));
+                AuthResource::blob(
+                    decoded.unwrap_or_else(|_| (*instance).to_owned()),
+                    *name,
+                    camera,
+                )
+            }
         }
     }
 }
@@ -779,7 +790,15 @@ async fn read_inner(
     if let Kind::Blob(instance, name) = &kind
         && let Err(e) = engine
             .sensitive()
-            .discharge_blocking(ctx, action, &format!("{instance}/{name}"), &decision)
+            .discharge_blocking(
+                ctx,
+                action,
+                &format!(
+                    "{}/{name}",
+                    percent_decode_segment(instance).unwrap_or_else(|_| (*instance).to_owned())
+                ),
+                &decision,
+            )
             .await
     {
         use crate::auth::sensitive::ObligationError;
@@ -815,7 +834,14 @@ async fn read_inner(
     (family, outcome)
 }
 
-fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> AuditEntry {
+/// `call_id` joins the row to any `warn` row the read's sensitive
+/// release wrote (H6 slice 2).
+fn new_audit_entry(
+    token_id: &str,
+    family: &str,
+    outcome: &ReadOutcome,
+    call_id: &str,
+) -> AuditEntry {
     AuditEntry {
         id: 0,
         intent_ms: 0,
@@ -830,11 +856,10 @@ fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> Audit
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
-        call_id: None,
+        call_id: Some(call_id.to_owned()),
         invocation: None,
         command_id: None,
         command_outcome: None,
-
         level: None,
     }
 }

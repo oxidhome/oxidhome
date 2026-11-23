@@ -1310,9 +1310,14 @@ async fn device_send_command_call(
 
     let gate = BytesGate::new(&invocation, &engine);
     let report = handle
-        .execute_command_in(invocation, args.device_id.clone(), cmd)
+        .execute_command_admitted(
+            invocation,
+            args.device_id.clone(),
+            cmd,
+            decision.obligations.sensitive,
+        )
         .await;
-    let blobs = gate.release_report(&args.device_id, &report);
+    let blobs = gate.release_report(&args.device_id, &owner, &report);
 
     // Round-1 F2 on PR #123: plugin-supplied text is already capped
     // (`runtime::command::cap_plugin_text`) before any wire copy.

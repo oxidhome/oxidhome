@@ -111,6 +111,16 @@ pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
         }
     };
     let gaps = sensitive_gaps(&records);
+    if !records.is_empty() && !records.iter().any(|r| r.owner && r.revoked_ms.is_none()) {
+        // The upgrade marks the owner from the bootstrap / recovery
+        // audit rows; retention may have pruned them.
+        tracing::warn!(
+            target: "auth.sensitive",
+            "no live owner token: nothing holds sensitive categories by default; mint one \
+             offline with `oxidhome recover-admin-token` (it revokes the current admin \
+             tokens) or grant categories with `oxidhome token grant-sensitive`",
+        );
+    }
     for gap in &gaps {
         tracing::warn!(
             target: "auth.sensitive",
@@ -301,8 +311,7 @@ pub fn set_device_category(
     let devices = engine.devices();
     audited(&engine.audit_log(), "cli", device_id, &path, || {
         devices
-            .meta()
-            .set_override(device_id, category)
+            .set_category(device_id, category)
             .context("storing the category override")
     })
 }

@@ -1167,6 +1167,13 @@ impl PluginInstance {
     /// owner in [`DeviceRegistry`](crate::DeviceRegistry) and calls
     /// this method on the matching [`PluginInstance`].
     ///
+    /// The authorization resource for `device`, classed as the host
+    /// registry sees it right now (H6 slice 2).
+    #[must_use]
+    pub fn device_resource(&self, device: &str) -> crate::auth::Resource {
+        self.store.data().devices.resource(device)
+    }
+
     /// H5: `cmd.id` is the host-minted command id. An `accepted` reply
     /// is registered in the engine's pending-command table here (so
     /// supervised and directly-driven instances behave alike); when it

@@ -427,23 +427,27 @@ pub fn recover_admin_token(
         return Err(err.context("recording recovery audit intent"));
     }
 
-    let revoked =
-        match tokens.insert_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &to_revoke) {
-            Ok(revoked) => revoked,
-            Err(err) => {
-                // Keep the pending file — see the matching branch in
-                // `ensure_admin_token`: the commit may have landed.
-                for id in intents {
-                    finalize(audit, id, Outcome::Error);
-                }
-                return Err(anyhow::Error::new(err).context(format!(
-                    "minting recovery admin token failed; if the change did commit, the new \
+    let revoked = match tokens.insert_owner_and_revoke(
+        &issued,
+        ADMIN_TOKEN_LABEL,
+        ADMIN_SCOPE_JSON,
+        &to_revoke,
+    ) {
+        Ok(revoked) => revoked,
+        Err(err) => {
+            // Keep the pending file — see the matching branch in
+            // `ensure_admin_token`: the commit may have landed.
+            for id in intents {
+                finalize(audit, id, Outcome::Error);
+            }
+            return Err(anyhow::Error::new(err).context(format!(
+                "minting recovery admin token failed; if the change did commit, the new \
                      secret is in {} and the next daemon start promotes it (otherwise it is \
                      discarded) — re-running recovery is also safe",
-                    pending.display()
-                )));
-            }
-        };
+                pending.display()
+            )));
+        }
+    };
     // The mutation is committed: finalize as allowed regardless of
     // the delivery step (the pending file already holds the secret).
     for id in intents {
@@ -863,7 +867,7 @@ mod tests {
         let issued = TokenStore::generate();
         write_new_secret(&pending_path(fx.dir.path(), &issued.id), &issued.plaintext).unwrap();
         fx.tokens
-            .insert_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &[])
+            .insert_owner_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &[])
             .unwrap();
         fx.reconcile().unwrap();
         assert_eq!(

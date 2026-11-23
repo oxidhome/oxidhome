@@ -28,7 +28,6 @@
 //! whole stream on an audit hiccup would be worse than a missed row
 //! (the failure is logged at error).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::Engine;
@@ -51,9 +50,6 @@ pub(crate) struct BytesGate {
 
 #[derive(Default)]
 struct GateState {
-    /// `instance_is_camera` answers, so a page of entries from one
-    /// instance scans the registry once.
-    camera_instances: HashMap<String, bool>,
     camera: CameraRelease,
 }
 
@@ -167,24 +163,25 @@ impl BytesGate {
     }
 
     /// [`Self::release_kvs`] for a command's `completed` readout from
-    /// `device`.
-    pub(crate) fn release_report(&self, device: &str, report: &CommandReport) -> bool {
+    /// `device`, owned by `owner_instance` at dispatch.
+    pub(crate) fn release_report(
+        &self,
+        device: &str,
+        owner_instance: &str,
+        report: &CommandReport,
+    ) -> bool {
         match &report.outcome {
             CommandOutcome::Completed { state: Some(kvs) } => {
-                self.release_kvs(Some(device), None, kvs)
+                self.release_kvs(Some(device), Some(owner_instance), kvs)
             }
             _ => true,
         }
     }
 
+    /// Asked afresh for every byte-bearing value (not cached), so an
+    /// open stream sees an instance become a camera source.
     fn instance_is_camera(&self, instance: &str) -> bool {
-        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(&known) = st.camera_instances.get(instance) {
-            return known;
-        }
-        let camera = self.devices.instance_is_camera(instance);
-        st.camera_instances.insert(instance.to_owned(), camera);
-        camera
+        self.devices.instance_is_camera(instance)
     }
 
     fn camera_release(&self, decision: &crate::auth::Decision, target: &str) -> bool {
