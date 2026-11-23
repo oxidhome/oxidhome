@@ -424,7 +424,7 @@ async fn drain_state_read_audit(engine: &Engine) {
         .await
         .is_ok_and(|joined| joined.unwrap_or(false));
     if !drained {
-        tracing::warn!("audit: rows still being written at the shutdown deadline are lost");
+        tracing::warn!("deny-audit drain timed out; queued rows may be lost at exit");
     }
 }
 
