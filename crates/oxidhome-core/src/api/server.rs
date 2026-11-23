@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::Engine;
-use crate::auth::{Actor, InvocationContext};
+use crate::auth::{Action, InvocationContext, Resource};
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
@@ -34,12 +34,7 @@ use crate::state::{
 };
 
 use super::auth::{AuthState, require_token};
-use super::scopes::{
-    AUDIT_READ, DASHBOARDS_READ, DASHBOARDS_WRITE, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ,
-    EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST,
-    PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL, STATUS_READ, ScopeDenied,
-    can_read_blobs, require_scope,
-};
+use super::scopes::{ScopeDenied, can_read_blobs, require};
 use super::ui_ticket;
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
@@ -202,9 +197,9 @@ pub fn build_router(engine: Engine) -> Router {
 /// `status:read`: operational metadata next to the status surface, no
 /// secrets.
 async fn get_config(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
 ) -> Result<Json<serde_json::Value>, ScopeDenied> {
-    require_scope(&actor, STATUS_READ)?;
+    require(&ctx, Action::HostStatus, &Resource::Host)?;
     Ok(Json(super::mcp::config_json()))
 }
 
@@ -393,10 +388,10 @@ struct InstanceSummary {
 /// on the `instances:list` scope; the admin / wildcard token
 /// satisfies it via [`crate::api::scopes::WILDCARD`].
 async fn list_instances(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<InstancesBody>, ScopeDenied> {
-    require_scope(&actor, INSTANCES_LIST)?;
+    require(&ctx, Action::InstanceRead, &Resource::instances())?;
     let mut instances = Vec::new();
     for handle in state.engine.instances().list() {
         instances.push(InstanceSummary {
@@ -435,10 +430,10 @@ struct DeviceSummary {
 /// state-vector projection lands in a later slice once we have a
 /// concrete UI/CLI consumer.
 async fn list_devices(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<DevicesBody>, ScopeDenied> {
-    require_scope(&actor, DEVICES_LIST)?;
+    require(&ctx, Action::DeviceList, &Resource::devices())?;
     let devices = state
         .engine
         .devices()
@@ -577,12 +572,16 @@ impl DeviceStateEntry {
 /// # Errors
 /// - `403` scope check failed.
 async fn get_device_state(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(device_id): Path<String>,
 ) -> Result<Json<DeviceStateSnapshot>, ScopeDenied> {
-    require_scope(&actor, DEVICES_READ)?;
-    let blobs = can_read_blobs(&actor);
+    require(
+        &ctx,
+        Action::DeviceRead,
+        &Resource::device(device_id.as_str()),
+    )?;
+    let blobs = can_read_blobs(&ctx);
     // H9 round-3 finding 3: read `revision` and `entries` **under
     // one lock**. The pre-fix shape called `current_revision()`
     // then `snapshot_device()` in two separate lock acquires, so
@@ -787,12 +786,12 @@ impl From<ScopeDenied> for AllDevicesStateError {
 ///   request.
 #[allow(clippy::too_many_lines)]
 async fn get_all_device_state(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<AllDevicesStateParams>,
 ) -> Result<Json<AllDevicesStateSnapshot>, AllDevicesStateError> {
-    require_scope(&actor, DEVICES_READ)?;
-    let blobs = can_read_blobs(&actor);
+    require(&ctx, Action::DeviceRead, &Resource::devices())?;
+    let blobs = can_read_blobs(&ctx);
     let limit = params
         .limit
         .filter(|n| *n > 0)
@@ -947,12 +946,12 @@ pub(crate) const MAX_STATE_CHANGES_LIMIT: usize = 1024;
 /// # Errors
 /// - `403` scope check failed.
 async fn query_device_state_changes(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<StateChangesParams>,
 ) -> Result<Json<StateChangesBody>, ScopeDenied> {
-    require_scope(&actor, DEVICES_READ)?;
-    let blobs = can_read_blobs(&actor);
+    require(&ctx, Action::DeviceRead, &Resource::devices())?;
+    let blobs = can_read_blobs(&ctx);
     let limit = params
         .limit
         .filter(|n| *n > 0)
@@ -1194,17 +1193,20 @@ impl From<WitError> for WireWitError {
 /// audit row records `command_id` and `command_outcome`, with
 /// `decision = "allow"` whatever the outcome status.
 async fn send_command(
-    Extension(actor): Extension<Actor>,
     Extension(invocation): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(device_id): Path<String>,
     Json(body): Json<CommandBody>,
 ) -> Result<axum::response::Response, CommandError> {
-    require_scope(&actor, DEVICES_COMMAND).map_err(CommandError::Scope)?;
-    // H6: per-device resource check, shared with Connect and MCP.
+    // H6: `device.command` on the addressed device — the scope and the
+    // token's per-device allowlist, shared with Connect and MCP.
     // Before the lookup so a refused token can't probe device ids.
-    crate::auth::authorize_device_command(&actor, &device_id)
-        .map_err(|required| CommandError::Scope(ScopeDenied { required }))?;
+    require(
+        &invocation,
+        Action::DeviceCommand,
+        &Resource::device(device_id.as_str()),
+    )
+    .map_err(CommandError::Scope)?;
 
     // Resolve device → owning instance via the registry's
     // cross-instance owner-only lookup (mirrors the dispatcher's
@@ -1239,6 +1241,7 @@ async fn send_command(
             .collect(),
     };
 
+    let blobs = can_read_blobs(&invocation);
     let report = handle.execute_command_in(invocation, device_id, cmd).await;
 
     // F4 + H5: the authorization decision stays `allow` whatever the
@@ -1248,10 +1251,7 @@ async fn send_command(
     let domain_outcome = crate::api::auth::DomainOutcome::from_report(&report);
     let mut response = (
         status,
-        Json(WireCommandReport::from_report(
-            report,
-            can_read_blobs(&actor),
-        )),
+        Json(WireCommandReport::from_report(report, blobs)),
     )
         .into_response();
     response.extensions_mut().insert(domain_outcome);
@@ -1305,10 +1305,10 @@ struct PluginSummary {
 /// [`InstanceRegistry::list`] by `plugin_id`. Gated on
 /// `plugins:list`. Sorted by plugin id for stable CLI output.
 async fn list_plugins(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<PluginsBody>, ScopeDenied> {
-    require_scope(&actor, PLUGINS_LIST)?;
+    require(&ctx, Action::PluginRead, &Resource::plugins())?;
     // First, count running instances by plugin id.
     let mut by_plugin: HashMap<String, u32> = HashMap::new();
     for handle in state.engine.instances().list() {
@@ -1393,11 +1393,15 @@ struct PluginSchemaBody {
 ///   the installer guarantees a valid manifest, so an
 ///   unreadable one is a host-side integrity failure.
 async fn get_plugin_schema(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
 ) -> Result<Json<PluginSchemaBody>, PluginSchemaError> {
-    require_scope(&actor, PLUGINS_LIST)?;
+    require(
+        &ctx,
+        Action::PluginRead,
+        &Resource::plugin(plugin_id.as_str()),
+    )?;
     // Round-2 F4 + round-9 F1: hold the per-plugin
     // lifecycle lock across the registry lookup + the
     // package re-read + the digest verification. Without it,
@@ -1537,11 +1541,11 @@ struct InstalledRow {
 /// would surprise an operator who wanted to inspect the staged
 /// install before letting it run.
 async fn install_plugin(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Json(body): Json<InstallBody>,
 ) -> Result<Json<InstalledRow>, PluginLifecycleError> {
-    require_scope(&actor, PLUGINS_INSTALL)?;
+    require(&ctx, Action::PluginInstall, &Resource::Host)?;
     // The registry's install is sync (filesystem + manifest read
     // is fast enough not to need tokio::fs). Wrap in `spawn_blocking`
     // so a slow disk doesn't stall the axum runtime; a `cp -r` of a
@@ -1583,13 +1587,17 @@ struct StartedRow {
 /// instance of an installed plugin. Returns once the instance
 /// reaches `Running` (or fails to). Gated on `plugins:start`.
 async fn start_plugin_instance(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
     body: Option<Json<StartBody>>,
 ) -> Result<Json<StartedRow>, PluginLifecycleError> {
-    require_scope(&actor, PLUGINS_START)?;
     let body = body.map_or_default(|Json(b)| b);
+    require(
+        &ctx,
+        Action::InstanceStart,
+        &Resource::instance(plugin_id.as_str(), body.instance_id.clone()),
+    )?;
     let instance_id = body
         .instance_id
         .clone()
@@ -1673,13 +1681,17 @@ struct StoppedRow {
 /// `{"error": "stop_timed_out", "stopped": [...], "stopping": [...]}`,
 /// and the `stopping` instances finish stopping in the background.
 async fn stop_plugin_instances(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
     body: Option<Json<StopBody>>,
 ) -> Result<Json<StoppedRow>, PluginLifecycleError> {
-    require_scope(&actor, PLUGINS_STOP)?;
     let body = body.map_or_default(|Json(b)| b);
+    require(
+        &ctx,
+        Action::InstanceStop,
+        &Resource::instance(plugin_id.as_str(), body.instance_id.clone()),
+    )?;
     let handles = state
         .engine
         .instances()
@@ -1716,11 +1728,15 @@ struct UninstalledRow {
 /// operator must `POST .../stop` first. Gated on
 /// `plugins:uninstall` (sensitive).
 async fn uninstall_plugin(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
 ) -> Result<Json<UninstalledRow>, PluginLifecycleError> {
-    require_scope(&actor, PLUGINS_UNINSTALL)?;
+    require(
+        &ctx,
+        Action::PluginUninstall,
+        &Resource::plugin(plugin_id.as_str()),
+    )?;
     // H2 round-2 F1 + H3 round-2 F1: hold the per-plugin_id
     // lifecycle lock across the running-instances check + the
     // compose uninstall, and — crucially — MOVE the guard into
@@ -1935,11 +1951,11 @@ impl IntoResponse for PluginLifecycleError {
 /// - `403` scope check failed.
 /// - `404` no such installed plugin.
 async fn post_plugin_ui_session(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
 ) -> Result<Response, PluginUiError> {
-    require_scope(&actor, PLUGINS_UI)?;
+    require(&ctx, Action::PluginUi, &Resource::plugin(plugin_id.as_str()))?;
     let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
         return Err(PluginUiError::NotFound);
     };
@@ -2444,14 +2460,14 @@ fn js_string_escape(input: &str) -> String {
 /// to record. Documenting so a future audit-completeness audit
 /// doesn't read it as a gap.
 async fn tail_events(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     upgrade: WebSocketUpgrade,
     Query(params): Query<TailParams>,
 ) -> Result<axum::response::Response, ScopeDenied> {
-    require_scope(&actor, EVENTS_TAIL)?;
+    require(&ctx, Action::EventSubscribe, &Resource::events())?;
     if params.after_id.is_some() {
-        require_scope(&actor, EVENTS_READ)?;
+        require(&ctx, Action::EventRead, &Resource::events())?;
     }
     // H5 review P1 F1: subscribe to the bus BEFORE the 101 upgrade
     // response goes back to the client, so a client that saw 101
@@ -2477,7 +2493,7 @@ async fn tail_events(
     let resume_after_id = tail.resume_after_id();
     // M7: live and replayed events alike withhold `bytes-val`
     // payloads unless the caller holds `blobs:read`.
-    let blobs = can_read_blobs(&actor);
+    let blobs = can_read_blobs(&ctx);
     let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail, blobs));
     if let Some(id) = resume_after_id {
         response
@@ -2794,11 +2810,11 @@ const LOGS_QUERY_MAX_LIMIT: u32 = 1_000;
 /// `LogStore` `SQLite` table. Gated on `logs:read`. Returns rows
 /// newest-first (the store's native order).
 async fn query_logs(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<LogsParams>,
 ) -> Result<Json<LogsBody>, LogsError> {
-    require_scope(&actor, LOGS_READ).map_err(LogsError::Scope)?;
+    require(&ctx, Action::HostLogs, &Resource::Host).map_err(LogsError::Scope)?;
     let limit = params
         .limit
         .unwrap_or(LOGS_QUERY_DEFAULT_LIMIT)
@@ -2950,11 +2966,11 @@ static EVENTS_QUERY_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 /// so a client that saved the last-seen tail id can resume
 /// from `since_ms` or reconcile against `id`.
 async fn query_events(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<EventsParams>,
 ) -> Result<Json<EventsBody>, EventsError> {
-    require_scope(&actor, EVENTS_READ).map_err(EventsError::Scope)?;
+    require(&ctx, Action::EventRead, &Resource::events()).map_err(EventsError::Scope)?;
     let limit = params
         .limit
         .unwrap_or(EVENTS_QUERY_DEFAULT_LIMIT)
@@ -3012,7 +3028,7 @@ async fn query_events(
     .map_err(EventsError::CursorExpired)?;
     let events = rows
         .into_iter()
-        .map(|row| WireHistoricalEvent::from_row(row, can_read_blobs(&actor)))
+        .map(|row| WireHistoricalEvent::from_row(row, can_read_blobs(&ctx)))
         .collect();
     Ok(Json(EventsBody { events }))
 }
@@ -3150,12 +3166,12 @@ const AUDIT_QUERY_MAX_LIMIT: u32 = 1_000;
 /// `audit:read`. Returns rows newest-first with a `next_cursor`
 /// for lossless pagination.
 async fn query_audit(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     Extension(self_id): Extension<crate::api::auth::AuditIntentId>,
     State(state): State<ApiState>,
     Query(params): Query<AuditParams>,
 ) -> Result<Json<AuditBody>, AuditError> {
-    require_scope(&actor, AUDIT_READ).map_err(AuditError::Scope)?;
+    require(&ctx, Action::HostAudit, &Resource::Host).map_err(AuditError::Scope)?;
     let limit = params
         .limit
         .unwrap_or(AUDIT_QUERY_DEFAULT_LIMIT)
@@ -3426,10 +3442,10 @@ struct DashboardsBody {
 /// # Errors
 /// - `403` scope check failed.
 async fn list_dashboards(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<DashboardsBody>, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_READ)?;
+    require(&ctx, Action::DashboardRead, &Resource::dashboards())?;
     let rows = tokio::task::spawn_blocking(move || {
         state
             .engine
@@ -3452,11 +3468,11 @@ async fn list_dashboards(
 /// - `403` scope check failed.
 /// - `409` the owner is already at `MAX_DASHBOARDS_PER_OWNER`.
 async fn create_dashboard(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Json(body): Json<DashboardInputBody>,
 ) -> Result<Json<WireDashboard>, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_WRITE)?;
+    require(&ctx, Action::DashboardWrite, &Resource::dashboards())?;
     let layout_json =
         serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
     let input = crate::state::DashboardInput {
@@ -3480,11 +3496,11 @@ async fn create_dashboard(
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn get_dashboard(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<WireDashboard>, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_READ)?;
+    require(&ctx, Action::DashboardRead, &Resource::dashboard(id))?;
     let row = tokio::task::spawn_blocking(move || {
         state
             .engine
@@ -3510,12 +3526,12 @@ async fn get_dashboard(
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn update_dashboard(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
     Json(body): Json<DashboardInputBody>,
 ) -> Result<Json<WireDashboard>, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_WRITE)?;
+    require(&ctx, Action::DashboardWrite, &Resource::dashboard(id))?;
     let layout_json =
         serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
     let input = crate::state::DashboardInput {
@@ -3546,11 +3562,11 @@ async fn update_dashboard(
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn delete_dashboard(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_WRITE)?;
+    require(&ctx, Action::DashboardWrite, &Resource::dashboard(id))?;
     let removed = tokio::task::spawn_blocking(move || {
         state
             .engine

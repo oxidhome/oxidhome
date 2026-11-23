@@ -39,6 +39,8 @@ mod stdio;
 mod tools;
 
 pub(crate) use config::config_json;
+#[cfg(test)]
+pub(crate) use server::MCP_ENFORCED_CONSTRAINTS;
 pub use config::{
     ConfigSource, DaemonConfig, DaemonMode, ENV_BIND, ENV_STATE_DIR, install_daemon_config,
 };

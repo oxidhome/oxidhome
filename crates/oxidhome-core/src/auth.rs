@@ -20,10 +20,11 @@
 //! plugin actors get a minimal scope set derived from their manifest's
 //! `[capabilities]` block.
 //!
-//! What happens *after* the route check — the root principal, call
-//! id, deadline and delegation chain that follow a request into plugin
-//! dispatch — lives in [`invocation::InvocationContext`] (H6). `Actor`
-//! stays the credential-scoped authorization view.
+//! What happens *after* authentication — the root principal with its
+//! resolved authority, call id, deadline and delegation chain that
+//! follow a request into plugin dispatch — lives in
+//! [`invocation::InvocationContext`] (H6). Every authorization decision
+//! is made by [`authorize()`] against that root authority.
 //!
 //! See `ARCHITECTURE.md` "Auth & actor identity" for the
 //! cross-cutting design and `00_OVERVIEW.md` for the per-phase
@@ -32,13 +33,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod authorize;
 pub mod invocation;
 pub mod policy;
 
+pub use authorize::{
+    Action, AuditLevel, Authority, Decision, Obligations, Reason, Resource, ResourceKind,
+    authorize,
+};
 pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
+#[cfg(test)]
+pub use policy::authorize_device_command;
 pub use policy::{
-    DEVICE_COMMAND_ENFORCED, EnforcedConstraint, TokenPolicy, ToolConstraint,
-    authorize_device_command, parse_policy,
+    DEVICE_COMMAND_ENFORCED, EnforcedConstraint, TokenPolicy, ToolConstraint, parse_policy,
 };
 
 /// What kind of caller this `Actor` represents. Drives where the
@@ -181,20 +188,19 @@ impl Actor {
     /// **unrestricted** for this actor (subject to the flat
     /// scope check upstream).
     ///
-    /// Callers combine this with the flat scope check — a
-    /// dispatch site first calls
-    /// `crate::api::scopes::require_scope` to confirm the
-    /// actor holds `<tool>:...`, then, if a constraint
-    /// exists, checks the tool's argument shape against
-    /// [`ToolConstraint::allows_device`] /
-    /// [`ToolConstraint::allows_plugin`].
-    ///
-    /// Introduced in Phase 14.4a; enforcement lands per-tool
-    /// in follow-up slices — no dispatch site consults this
-    /// yet.
+    /// Dispatch sites don't consult this directly: the constraint
+    /// map is copied into the invocation's root
+    /// [`authorize::Authority`] and applied by [`authorize()`].
     #[must_use]
     pub fn constraint(&self, tool_name: &str) -> Option<&policy::ToolConstraint> {
         self.inner.constraints.get(tool_name)
+    }
+
+    /// The full per-tool constraint map, keyed by tool name. Copied
+    /// into the root [`Authority`] when an invocation is minted.
+    #[must_use]
+    pub fn constraints(&self) -> &HashMap<String, policy::ToolConstraint> {
+        &self.inner.constraints
     }
 
     /// `true` when this actor's token carried any per-tool

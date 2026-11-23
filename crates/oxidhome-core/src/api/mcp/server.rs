@@ -201,6 +201,48 @@ pub fn mount_routes_with_all_limits(
     )
 }
 
+
+/// Constraint keys the MCP mount enforces, each with the
+/// `ToolConstraint` field its dispatch site consults through
+/// [`crate::auth::authorize`]:
+///
+/// - 14.4b: `device.send_command` / `devices`.
+/// - 14.4c: four `plugins.*` entries / `plugins`, each checked
+///   before touching any state (existence / running-state / FS
+///   layout can't be probed).
+/// - 14.4d: `plugins.install` / `plugins` — takes `source_dir`, not
+///   `plugin_id`, so the check runs inside
+///   `installed_plugins::install_gated` against the manifest-derived
+///   id BEFORE any FS or SQL side effect.
+pub(crate) const MCP_ENFORCED_CONSTRAINTS: &[crate::auth::EnforcedConstraint] = &[
+    crate::auth::DEVICE_COMMAND_ENFORCED,
+    crate::auth::EnforcedConstraint {
+        key: "plugins.show",
+        enforce_devices: false,
+        enforce_plugins: true,
+    },
+    crate::auth::EnforcedConstraint {
+        key: "plugins.stop",
+        enforce_devices: false,
+        enforce_plugins: true,
+    },
+    crate::auth::EnforcedConstraint {
+        key: "plugins.uninstall",
+        enforce_devices: false,
+        enforce_plugins: true,
+    },
+    crate::auth::EnforcedConstraint {
+        key: "plugins.start",
+        enforce_devices: false,
+        enforce_plugins: true,
+    },
+    crate::auth::EnforcedConstraint {
+        key: "plugins.install",
+        enforce_devices: false,
+        enforce_plugins: true,
+    },
+];
+
 /// Internal mount that takes every knob. Every `mount_*` public
 /// variant delegates here.
 fn mount_inner(
@@ -256,45 +298,7 @@ fn mount_inner(
         // `ToolConstraint` fields the dispatch site consults.
         // Added atomically with the corresponding dispatch
         // check so bearer time and dispatch time can't drift.
-        //
-        // 14.4b: `device.send_command` / `devices`.
-        // 14.4c: four `plugins.*` entries / `plugins` — each
-        //   consults `actor.constraint(<tool>).allows_plugin`
-        //   before touching any state (existence /
-        //   running-state / FS layout can't be probed).
-        // 14.4d: `plugins.install` / `plugins` — takes
-        //   `source_dir`, not `plugin_id`, so enforcement
-        //   runs inside `installed_plugins::install_gated`
-        //   against the manifest-derived id BEFORE any FS
-        //   or SQL side effect. Orphan state is impossible.
-        enforced_constraints: &[
-            crate::auth::DEVICE_COMMAND_ENFORCED,
-            crate::auth::EnforcedConstraint {
-                key: "plugins.show",
-                enforce_devices: false,
-                enforce_plugins: true,
-            },
-            crate::auth::EnforcedConstraint {
-                key: "plugins.stop",
-                enforce_devices: false,
-                enforce_plugins: true,
-            },
-            crate::auth::EnforcedConstraint {
-                key: "plugins.uninstall",
-                enforce_devices: false,
-                enforce_plugins: true,
-            },
-            crate::auth::EnforcedConstraint {
-                key: "plugins.start",
-                enforce_devices: false,
-                enforce_plugins: true,
-            },
-            crate::auth::EnforcedConstraint {
-                key: "plugins.install",
-                enforce_devices: false,
-                enforce_plugins: true,
-            },
-        ],
+        enforced_constraints: MCP_ENFORCED_CONSTRAINTS,
         transport: crate::auth::Transport::McpHttp,
     };
 

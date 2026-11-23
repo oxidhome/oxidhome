@@ -53,11 +53,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::Engine;
-use crate::api::scopes::{
-    BLOBS_READ, DEVICES_LIST, EVENTS_READ, LOGS_READ, PLUGINS_LIST, STATUS_READ, Scope,
-    can_read_blobs, require_scope,
-};
-use crate::auth::Actor;
+use crate::api::scopes::can_read_blobs;
+use crate::auth::{Action, Actor, InvocationContext, Resource as AuthResource, authorize};
 use crate::state::audit_log::AuditEntry;
 use crate::state::event_log::now_unix_ms;
 use crate::state::{EventQuery, LogLevel, LogQuery, TopicMatch};
@@ -230,10 +227,11 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
 /// (round-1 F2 on PR #120, matching the same rule the REST
 /// middleware in [`crate::api::auth::require_token`] applies).
 ///
-/// `actor` carries the bearer's resolved [`Actor::id`] AND
-/// [`Actor::scopes`]. Round-2 F1: enforce the per-resource
-/// scope up front (mirrors the REST endpoints' `require_scope`
-/// gates), so a token holding e.g. `logs:read` can't enumerate
+/// `actor` carries the bearer's resolved [`Actor::id`] for the
+/// audit row; `ctx` carries its authority. Round-2 F1: authorize
+/// the per-resource action up front through
+/// [`crate::auth::authorize`] (the same decision the REST endpoints
+/// use), so a token holding e.g. `logs:read` can't enumerate
 /// devices just by hitting the MCP mount.
 /// Result of dispatching a resource read.
 ///
@@ -250,7 +248,12 @@ pub(super) struct ReadDispatch {
     pub result: Result<ReadResourceResult, McpError>,
 }
 
-pub(super) async fn read(engine: Engine, uri: &str, actor: &Actor) -> ReadDispatch {
+pub(super) async fn read(
+    engine: Engine,
+    uri: &str,
+    actor: &Actor,
+    ctx: &InvocationContext,
+) -> ReadDispatch {
     // Round-6 F3 on PR #122: bound the concurrent audit-write
     // tasks. `try_acquire_owned` refuses immediately when the
     // queue is at [`AUDIT_QUEUE_MAX`], so a disconnect-flooded
@@ -295,7 +298,7 @@ pub(super) async fn read(engine: Engine, uri: &str, actor: &Actor) -> ReadDispat
     };
 
     let token_id = actor.id().to_string();
-    let (family, outcome) = read_inner(engine.clone(), uri, actor).await;
+    let (family, outcome) = read_inner(engine.clone(), uri, ctx).await;
     // Audit-log every read. The audit call is synchronous and
     // takes the shared `Db` mutex — spawn_blocking so it can't
     // park the tokio worker under a slow disk. Fail-closed:
@@ -554,6 +557,24 @@ enum Kind<'a> {
     Blob(&'a str, &'a str),
 }
 
+impl Kind<'_> {
+    /// What the read targets, for [`authorize`].
+    fn resource(&self) -> AuthResource {
+        match self {
+            Kind::DevicesList => AuthResource::devices(),
+            Kind::DevicesDetail(id) => AuthResource::device(*id),
+            // The detail read is checked against the plugin collection:
+            // `plugin.read` on `oxidhome://plugins/{id}` has always been
+            // the flat `plugins:list` scope, and naming the plugin here
+            // would newly apply a token's `plugins.show` allowlist.
+            Kind::PluginsList | Kind::PluginsDetail(_) => AuthResource::plugins(),
+            Kind::Events => AuthResource::events(),
+            Kind::Logs | Kind::Status | Kind::Config => AuthResource::Host,
+            Kind::Blob(instance, name) => AuthResource::blob(*instance, *name),
+        }
+    }
+}
+
 /// Output of routing a URI without any I/O — carries the
 /// family label + scope requirement + dispatch kind, or a
 /// terminal outcome the caller must return without dispatch
@@ -568,7 +589,7 @@ enum Kind<'a> {
 enum Route<'a> {
     Dispatch {
         family: &'static str,
-        required: Scope,
+        required: Action,
         kind: Kind<'a>,
     },
     Terminal {
@@ -609,7 +630,7 @@ fn resolve_route(uri: &str) -> Route<'_> {
     match (family_seg, id_seg) {
         ("devices", None) => Route::Dispatch {
             family: "devices",
-            required: DEVICES_LIST,
+            required: Action::DeviceList,
             kind: Kind::DevicesList,
         },
         ("devices", Some(id)) if !id.is_empty() && !id.contains('/') => Route::Dispatch {
@@ -629,32 +650,32 @@ fn resolve_route(uri: &str) -> Route<'_> {
             // withholding it from `devices:list` tokens
             // was the opposite of the intended
             // boundary — round-3 F1 fix).
-            required: DEVICES_LIST,
+            required: Action::DeviceList,
             kind: Kind::DevicesDetail(id),
         },
         ("plugins", None) => Route::Dispatch {
             family: "plugins",
-            required: PLUGINS_LIST,
+            required: Action::PluginRead,
             kind: Kind::PluginsList,
         },
         ("plugins", Some(id)) if !id.is_empty() && !id.contains('/') => Route::Dispatch {
             family: "plugins.detail",
-            required: PLUGINS_LIST,
+            required: Action::PluginRead,
             kind: Kind::PluginsDetail(id),
         },
         ("events", None) => Route::Dispatch {
             family: "events",
-            required: EVENTS_READ,
+            required: Action::EventRead,
             kind: Kind::Events,
         },
         ("logs", None) => Route::Dispatch {
             family: "logs",
-            required: LOGS_READ,
+            required: Action::HostLogs,
             kind: Kind::Logs,
         },
         ("status", None) => Route::Dispatch {
             family: "status",
-            required: STATUS_READ,
+            required: Action::HostStatus,
             kind: Kind::Status,
         },
         // Host configuration: operational metadata next to
@@ -663,7 +684,7 @@ fn resolve_route(uri: &str) -> Route<'_> {
         // a new scope.
         ("config", None) => Route::Dispatch {
             family: "config",
-            required: STATUS_READ,
+            required: Action::HostStatus,
             kind: Kind::Config,
         },
         // Blobs URI: `oxidhome://blobs/<instance_id>/<name>`.
@@ -675,7 +696,7 @@ fn resolve_route(uri: &str) -> Route<'_> {
         ("blobs", Some(tail)) => match tail.split_once('/') {
             Some((instance, name)) if !instance.is_empty() && !name.is_empty() => Route::Dispatch {
                 family: "blobs",
-                required: BLOBS_READ,
+                required: Action::BlobRead,
                 kind: Kind::Blob(instance, name),
             },
             _ => Route::Terminal {
@@ -707,7 +728,11 @@ fn route_family(uri: &str) -> &'static str {
 /// Async because the events / logs families hit the shared
 /// `SQLite` mutex and must run under `spawn_blocking` to keep
 /// the tokio worker free (round-1 F1 on PR #121).
-async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, ReadOutcome) {
+async fn read_inner(
+    engine: Engine,
+    uri: &str,
+    ctx: &InvocationContext,
+) -> (&'static str, ReadOutcome) {
     // Re-peel the query string here — the borrowed `Kind`
     // arms don't need it, but the events / logs family
     // builders do.
@@ -725,13 +750,8 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         Route::Terminal { family, outcome } => return (family, outcome),
     };
 
-    if require_scope(actor, required).is_err() {
-        return (
-            family,
-            ReadOutcome::Denied {
-                required: required.name(),
-            },
-        );
+    if let Err(required) = authorize(ctx, required, &kind.resource()).into_result() {
+        return (family, ReadOutcome::Denied { required });
     }
 
     let outcome = match kind {
@@ -741,7 +761,7 @@ async fn read_inner(engine: Engine, uri: &str, actor: &Actor) -> (&'static str, 
         Kind::PluginsDetail(id) => plugins_detail(&engine, id),
         // Events + logs hit `SQLite`, so parse the query
         // and run the read under `spawn_blocking`.
-        Kind::Events => events_read(engine, query_str, can_read_blobs(actor)).await,
+        Kind::Events => events_read(engine, query_str, can_read_blobs(ctx)).await,
         Kind::Logs => logs_read(engine, query_str).await,
         Kind::Status => status_read(engine.clone()).await,
         Kind::Config => encode(&super::config::config_body(), "config"),

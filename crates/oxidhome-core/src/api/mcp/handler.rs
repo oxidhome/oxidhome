@@ -133,6 +133,9 @@ impl ServerHandler for OxidHomeMcpHandler {
     {
         let engine = self.engine.clone();
         let actor = self.resolve_actor(&context);
+        // Resource reads write their own audit row without a call id;
+        // the context only carries the root's authority to `authorize`.
+        let invocation = crate::auth::InvocationContext::external(self.principal(&actor));
         async move {
             // 14.7c: standardised completion event. `read` is
             // instrumented at the dispatch boundary (one event
@@ -153,7 +156,7 @@ impl ServerHandler for OxidHomeMcpHandler {
             // in this module stay on plain `mcp.*` targets and
             // don't leak into completion counts.
             let start = Instant::now();
-            let dispatch = resources::read(engine, &request.uri, &actor).await;
+            let dispatch = resources::read(engine, &request.uri, &actor, &invocation).await;
             emit_completion(
                 "mcp.resource.complete",
                 dispatch.family,
@@ -186,22 +189,7 @@ impl ServerHandler for OxidHomeMcpHandler {
     + '_ {
         let engine = self.engine.clone();
         let actor = self.resolve_actor(&context);
-        // H6: the root principal of the tool's invocation. stdio is
-        // authorized by the parent process, not a credential, so its
-        // principal carries no `credential_id`.
-        let principal = if self.stdio_actor.is_some() {
-            crate::auth::Principal::local_process(
-                crate::auth::ActorKind::Mcp,
-                actor.id(),
-                crate::auth::Transport::McpStdio,
-            )
-        } else {
-            crate::auth::Principal::token(
-                crate::auth::ActorKind::Mcp,
-                &actor,
-                crate::auth::Transport::McpHttp,
-            )
-        };
+        let principal = self.principal(&actor);
         async move {
             // 14.7c: standardised completion event. See
             // `read_resource` above for the rationale.
@@ -265,7 +253,8 @@ impl ServerHandler for OxidHomeMcpHandler {
         // a routed static string or the sentinel `"unknown"`.
         let start = Instant::now();
         let canonical = prompts::canonical_prompt_name(&request.name);
-        let result = prompts::get(&request, &actor);
+        let invocation = crate::auth::InvocationContext::external(self.principal(&actor));
+        let result = prompts::get(&request, &invocation);
         emit_completion(
             "mcp.prompt.complete",
             canonical,
@@ -278,6 +267,27 @@ impl ServerHandler for OxidHomeMcpHandler {
 }
 
 impl OxidHomeMcpHandler {
+    /// H6: the root principal of an MCP request, carrying `actor`'s
+    /// scopes and constraints as its authority. stdio is authorized by
+    /// the parent process, not a credential, so its principal carries
+    /// no `credential_id`.
+    fn principal(&self, actor: &Actor) -> crate::auth::Principal {
+        if self.stdio_actor.is_some() {
+            crate::auth::Principal::local_process(
+                crate::auth::ActorKind::Mcp,
+                actor.id(),
+                crate::auth::Transport::McpStdio,
+            )
+            .with_authority(crate::auth::Authority::of_local_process(actor))
+        } else {
+            crate::auth::Principal::token(
+                crate::auth::ActorKind::Mcp,
+                actor,
+                crate::auth::Transport::McpHttp,
+            )
+        }
+    }
+
     /// Pull the [`Actor`] off the request.
     ///
     /// 14.5 (stdio): when the handler was built with
@@ -292,7 +302,7 @@ impl OxidHomeMcpHandler {
     /// [`RequestContext::extensions`]. Missing at either hop
     /// means something upstream skipped the auth layer —
     /// synthesize a **no-scope anonymous actor** so every
-    /// subsequent `require_scope` check fails closed. This
+    /// subsequent authorization check fails closed. This
     /// protects against a future mis-wire (e.g. someone
     /// removing the `require_token` layer): the resource
     /// dispatch still refuses every read, records `decision

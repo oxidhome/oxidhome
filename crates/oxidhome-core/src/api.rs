@@ -19,11 +19,11 @@
 //! only verifies inbound `Authorization: Bearer …` headers against
 //! [`TokenStore::verify`](crate::state::TokenStore::verify).
 
-mod auth;
+pub(crate) mod auth;
 mod bootstrap;
 mod connect_rpc;
 pub mod mcp;
-mod scopes;
+pub(crate) mod scopes;
 mod server;
 mod ui_ticket;
 

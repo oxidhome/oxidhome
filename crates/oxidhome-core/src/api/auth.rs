@@ -175,7 +175,7 @@ pub(crate) struct AuthState {
     /// side effect). H6 adds
     /// [`crate::auth::DEVICE_COMMAND_ENFORCED`] to REST and
     /// Connect, whose device-command handlers call the shared
-    /// [`crate::auth::authorize_device_command`].
+    /// `crate::auth::authorize`.
     ///
     /// Round-6 P1 on PR #147 replaced the per-key-only set
     /// with per-(key, field) entries — a plain key set would
@@ -547,7 +547,7 @@ async fn try_best_effort_probe(
 /// couldn't tell an unknown-key case from a supported-key /
 /// unsupported-field case. The variants preserve that
 /// distinction.
-pub(super) enum ConstraintRefusal<'a> {
+pub(crate) enum ConstraintRefusal<'a> {
     /// Tool name is outside the transport's enforced set —
     /// either an unknown key or one this transport doesn't
     /// consume.
@@ -580,7 +580,7 @@ impl ConstraintRefusal<'_> {
     /// preserved verbatim (`parse_policy` accepts arbitrary
     /// forward-compat keys), so no character in the key
     /// itself is reserved.
-    pub(super) fn audit_sentinel(&self) -> String {
+    pub(crate) fn audit_sentinel(&self) -> String {
         match self {
             Self::KeyNotEnforced { key } => {
                 format!("<constraint-key-unenforced:{key}>")
@@ -610,7 +610,7 @@ impl ConstraintRefusal<'_> {
 /// (bounded by the number of MCP tools), so an inner linear
 /// scan is fine and keeps the enforced-declaration site a
 /// plain `&'static [EnforcedConstraint]`.
-pub(super) fn first_constraint_refusal<'a>(
+pub(crate) fn first_constraint_refusal<'a>(
     actor: &'a Actor,
     enforced: &[crate::auth::EnforcedConstraint],
 ) -> Option<ConstraintRefusal<'a>> {

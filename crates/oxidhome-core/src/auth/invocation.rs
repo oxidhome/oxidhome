@@ -47,6 +47,7 @@ use rand::TryRng;
 use tokio::task_local;
 use tokio::time::Instant;
 
+use super::authorize::Authority;
 use super::{Actor, ActorKind};
 
 /// Deadline budget granted to an externally-rooted invocation. Bounds
@@ -94,18 +95,25 @@ impl Transport {
 /// There is no per-person identity yet, so for bearer tokens the
 /// subject is the token id; a future user model changes the subject
 /// without touching `credential_id`.
+///
+/// It also carries the principal's resolved [`Authority`] (scopes and
+/// 14.4 constraints) that [`crate::auth::authorize`] decides on. The
+/// authority is host-only: [`InvocationContext::audit_json`] does not
+/// include it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     kind: ActorKind,
     subject: String,
     credential_id: Option<String>,
     transport: Transport,
+    authority: Authority,
 }
 
 impl Principal {
     /// Principal for a caller that authenticated with a bearer token.
     /// `kind` is the audit actor kind the transport records (`api` for
-    /// REST / Connect, `mcp` for MCP tool calls).
+    /// REST / Connect, `mcp` for MCP tool calls). The token's scopes and
+    /// constraints become the principal's [`Authority`].
     #[must_use]
     pub fn token(kind: ActorKind, actor: &Actor, transport: Transport) -> Self {
         Self {
@@ -113,11 +121,13 @@ impl Principal {
             subject: actor.id().to_owned(),
             credential_id: Some(actor.id().to_owned()),
             transport,
+            authority: Authority::of_token(actor),
         }
     }
 
     /// Principal for a caller authorized by the local process boundary
-    /// rather than a credential (MCP stdio).
+    /// rather than a credential (MCP stdio). It holds no authority until
+    /// [`Self::with_authority`] grants one.
     #[must_use]
     pub fn local_process(
         kind: ActorKind,
@@ -129,7 +139,15 @@ impl Principal {
             subject: subject.into(),
             credential_id: None,
             transport,
+            authority: Authority::none(),
         }
+    }
+
+    /// The same principal with `authority` as its resolved authority.
+    #[must_use]
+    pub fn with_authority(mut self, authority: Authority) -> Self {
+        self.authority = authority;
+        self
     }
 
     /// Principal for work that starts inside the host on behalf of a
@@ -141,6 +159,7 @@ impl Principal {
             subject: instance_id.into(),
             credential_id: None,
             transport: Transport::Host,
+            authority: Authority::none(),
         }
     }
 
@@ -166,6 +185,13 @@ impl Principal {
     #[must_use]
     pub fn transport(&self) -> Transport {
         self.transport
+    }
+
+    /// Resolved scopes and constraints [`crate::auth::authorize`]
+    /// decides on. Empty for host-origin principals.
+    #[must_use]
+    pub fn authority(&self) -> &Authority {
+        &self.authority
     }
 
     /// `true` for principals that came from outside the host. Only

@@ -19,17 +19,19 @@
 //! fallback (see [`connect_auth_middleware`], added in 15-b). It
 //! authenticates every non-anonymous request against the same
 //! [`TokenStore`](crate::state::TokenStore) the JSON `require_token`
-//! uses, stamps an [`Actor`] into `req.extensions_mut()` (forwarded
+//! uses, stamps the [`Actor`](crate::auth::Actor) and its
+//! [`InvocationContext`] into `req.extensions_mut()` (forwarded
 //! into [`RequestContext::extensions()`] by the Connect dispatcher),
 //! and records one row per authenticated request in the C3 audit
 //! ledger via [`crate::api::auth::finalize_audit`]. The
 //! `Health.Check` path is on the anonymous allow-list so liveness
 //! probes still work without credentials.
 //!
-//! Per-RPC scope enforcement happens inside each handler via
-//! [`require_scope_connect`], mirroring the JSON handler-side
-//! `require_scope` pattern. Handlers record their outcome (the
-//! denied scope on `permission_denied`, or the synthesized HTTP
+//! Per-RPC authorization happens inside each handler via
+//! [`require_connect`], which asks [`crate::auth::authorize`] — the
+//! same decision the JSON handlers' `require` uses. Handlers record
+//! their outcome (the deny's audit label on `permission_denied`, or
+//! the synthesized HTTP
 //! status of any other [`ConnectError`] via [`rpc_err`]) into a
 //! [`HandlerOutcomeSlot`] request-extension the middleware reads
 //! back — that's what keeps the audit row's decision classification
@@ -73,7 +75,7 @@ use oxidhome_proto::proto::oxidhome::v1::{
 };
 
 use crate::Engine;
-use crate::auth::Actor;
+use crate::auth::{Action, InvocationContext, Resource};
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent as WitButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event as WitEvent, EventPayload};
@@ -86,11 +88,7 @@ use crate::state::{
 use super::auth::{
     AuthState, actor_from_record, extract_bearer, finalize_audit, record_anonymous_probe,
 };
-use super::scopes::{
-    DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ, EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST,
-    LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START, PLUGINS_STOP, PLUGINS_UNINSTALL,
-    Scope, ScopeDenied, can_read_blobs, require_scope,
-};
+use super::scopes::{ScopeDenied, can_read_blobs, require};
 
 /// `HealthService` implementation. Anonymous; reads only the
 /// in-memory event-log mirror health (H3) and device-state flush
@@ -158,11 +156,12 @@ struct HandlerOutcome {
     /// authorization and execution outcomes must not share the
     /// same audit field.
     status: Option<axum::http::StatusCode>,
-    /// The missing scope, if this outcome was a
-    /// `PermissionDenied` recorded by [`require_scope_connect`].
-    /// Middleware populates the `required_scope` audit field from
-    /// this — mirrors the JSON side's `DeniedScope` smuggle.
-    denied_scope: Option<Scope>,
+    /// The deny's audit label (missing scope or constraint
+    /// sentinel), if this outcome was a `PermissionDenied` recorded by
+    /// [`require_connect`]. Middleware populates the `required_scope`
+    /// audit field from this — mirrors the JSON side's `DeniedScope`
+    /// smuggle.
+    denied_scope: Option<&'static str>,
     /// H5: the dispatched device command's id and explicit outcome.
     /// Populated by [`record_domain_outcome`]; the middleware forwards
     /// it to the audit ledger's command / execution columns (F4).
@@ -173,7 +172,7 @@ struct HandlerOutcome {
 /// [`connect_auth_middleware`]. The middleware installs an empty
 /// slot on `req.extensions_mut()` before running the handler;
 /// handlers write to it on the error path via
-/// [`require_scope_connect`] (for scope denials) or [`rpc_err`]
+/// [`require_connect`] (for authorization denials) or [`rpc_err`]
 /// (for every other `ConnectError`); the middleware reads it after
 /// the handler returns.
 ///
@@ -207,10 +206,12 @@ impl HandlerOutcomeSlot {
     }
 }
 
-/// M7: does the request's `Actor` hold `blobs:read` (see
+/// M7: may the request's root read blob bytes (see
 /// [`can_read_blobs`])? `false` when the extension is missing.
 fn ctx_can_read_blobs(ctx: &RequestContext) -> bool {
-    ctx.extensions().get::<Actor>().is_some_and(can_read_blobs)
+    ctx.extensions()
+        .get::<InvocationContext>()
+        .is_some_and(can_read_blobs)
 }
 
 /// Wrap a [`ConnectError`] on the error-return site so the audit
@@ -221,7 +222,7 @@ fn ctx_can_read_blobs(ctx: &RequestContext) -> bool {
 /// return Err(rpc_err(&ctx, ConnectError::not_found("device x")));
 /// ```
 ///
-/// [`require_scope_connect`] does the equivalent for scope denials
+/// [`require_connect`] does the equivalent for authorization denials
 /// via the same slot; no double-record and no ambiguity.
 #[must_use]
 fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
@@ -235,35 +236,39 @@ fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
     err
 }
 
-/// Handler-side scope check for Connect RPCs. Mirrors the JSON
-/// [`require_scope`] but returns a [`ConnectError::permission_denied`]
-/// instead of a `ScopeDenied` axum response, and records the
-/// missing scope on the request's [`HandlerOutcomeSlot`] so the
+/// Handler-side authorization for Connect RPCs. Mirrors the JSON
+/// [`require`] but returns a [`ConnectError::permission_denied`]
+/// instead of a `ScopeDenied` axum response, and records the deny's
+/// audit label on the request's [`HandlerOutcomeSlot`] so the
 /// middleware populates `required_scope` on the audit row (same
 /// field shape as the JSON `DeniedScope` extension smuggle).
 ///
-/// The `Actor` is read out of `ctx.extensions()`. Its presence is a
-/// contract with the middleware (which stamps it during auth);
-/// missing it is an internal bug rather than a client error →
+/// The [`InvocationContext`] is read out of `ctx.extensions()`. Its
+/// presence is a contract with the middleware (which stamps it during
+/// auth); missing it is an internal bug rather than a client error →
 /// `ConnectError::internal`, not `Unauthenticated`.
-fn require_scope_connect(ctx: &RequestContext, required: Scope) -> Result<(), ConnectError> {
-    // If the middleware failed to stamp `Actor` into extensions,
+fn require_connect(
+    ctx: &RequestContext,
+    action: Action,
+    resource: &Resource,
+) -> Result<(), ConnectError> {
+    // If the middleware failed to stamp the context into extensions,
     // wrap the internal error through `rpc_err` too — otherwise a
     // gRPC / gRPC-Web caller of a scoped RPC in a broken pipeline
     // would audit as `allow` on an HTTP 200 wire response. Defense
     // in depth for the same class of bug PR #74 review flagged on
     // `query_logs`.
-    let actor = ctx.extensions().get::<Actor>().ok_or_else(|| {
+    let invocation = ctx.extensions().get::<InvocationContext>().ok_or_else(|| {
         rpc_err(
             ctx,
-            ConnectError::internal("connect handler ran without an Actor extension"),
+            ConnectError::internal("connect handler ran without an invocation context"),
         )
     })?;
-    if let Err(ScopeDenied { required }) = require_scope(actor, required) {
+    if let Err(ScopeDenied { required }) = require(invocation, action, resource) {
         if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
             slot.set(HandlerOutcome {
                 status: Some(axum::http::StatusCode::FORBIDDEN),
-                denied_scope: Some(Scope::new(required)),
+                denied_scope: Some(required),
                 command: None,
             });
         }
@@ -289,7 +294,7 @@ impl oxidhome_proto::connect::oxidhome::v1::InstancesService for OxidHomeInstanc
         ctx: RequestContext,
         _request: ServiceRequest<'_, ListInstancesRequest>,
     ) -> ServiceResult<impl Encodable<ListInstancesResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, INSTANCES_LIST)?;
+        require_connect(&ctx, Action::InstanceRead, &Resource::instances())?;
         let instances = self
             .engine
             .instances()
@@ -325,7 +330,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         _request: ServiceRequest<'_, ListDevicesRequest>,
     ) -> ServiceResult<impl Encodable<ListDevicesResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, DEVICES_LIST)?;
+        require_connect(&ctx, Action::DeviceList, &Resource::devices())?;
         let devices = self
             .engine
             .devices()
@@ -349,25 +354,15 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, ExecuteCommandRequest>,
     ) -> ServiceResult<impl Encodable<ExecuteCommandResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, DEVICES_COMMAND)?;
         let req = request.to_owned_message();
-        // H6: per-device resource check shared with REST and MCP,
+        // H6: `device.command` on the addressed device — the scope and
+        // the token's per-device allowlist, shared with REST and MCP —
         // before the lookup so a refused token can't probe ids.
-        // `require_scope_connect` already proved the Actor is present.
-        if let Some(actor) = ctx.extensions().get::<Actor>()
-            && let Err(required) = crate::auth::authorize_device_command(actor, &req.device_id)
-        {
-            if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
-                slot.set(HandlerOutcome {
-                    status: Some(axum::http::StatusCode::FORBIDDEN),
-                    denied_scope: Some(Scope::new(required)),
-                    command: None,
-                });
-            }
-            return Err(ConnectError::permission_denied(format!(
-                "scope {required} required"
-            )));
-        }
+        require_connect(
+            &ctx,
+            Action::DeviceCommand,
+            &Resource::device(req.device_id.as_str()),
+        )?;
         let invocation = ctx
             .extensions()
             .get::<crate::auth::InvocationContext>()
@@ -433,9 +428,13 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, GetDeviceStateRequest>,
     ) -> ServiceResult<impl Encodable<GetDeviceStateResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, DEVICES_READ)?;
-        let blobs = ctx_can_read_blobs(&ctx);
         let device_id = request.to_owned_message().device_id;
+        require_connect(
+            &ctx,
+            Action::DeviceRead,
+            &Resource::device(device_id.as_str()),
+        )?;
+        let blobs = ctx_can_read_blobs(&ctx);
         // Host-minted ids are short; don't copy a huge one under the
         // projection lock.
         if device_id.len() > MAX_DEVICE_ID_LEN {
@@ -464,7 +463,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             DEFAULT_ALL_DEVICES_STATE_LIMIT, MAX_ALL_DEVICES_STATE_LIMIT,
             MAX_ALL_DEVICES_STATE_SCAN, MAX_STATE_PAGE_WIRE_BYTES,
         };
-        require_scope_connect(&ctx, DEVICES_READ)?;
+        require_connect(&ctx, Action::DeviceRead, &Resource::devices())?;
         let blobs = ctx_can_read_blobs(&ctx);
         let req = request.to_owned_message();
         let limit = match usize::try_from(req.limit).unwrap_or(usize::MAX) {
@@ -540,7 +539,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         use super::server::{
             DEFAULT_STATE_CHANGES_LIMIT, MAX_STATE_CHANGES_LIMIT, MAX_STATE_PAGE_WIRE_BYTES,
         };
-        require_scope_connect(&ctx, DEVICES_READ)?;
+        require_connect(&ctx, Action::DeviceRead, &Resource::devices())?;
         let blobs = ctx_can_read_blobs(&ctx);
         let req = request.to_owned_message();
         let limit = match usize::try_from(req.limit).unwrap_or(usize::MAX) {
@@ -754,7 +753,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         _request: ServiceRequest<'_, ListPluginsRequest>,
     ) -> ServiceResult<impl Encodable<ListPluginsResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, PLUGINS_LIST)?;
+        require_connect(&ctx, Action::PluginRead, &Resource::plugins())?;
         // Mirrors the JSON `list_plugins` aggregation: installed
         // rows first (with `installed = true` + `version`), then
         // running-but-not-installed rows from the dev argv path.
@@ -796,7 +795,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, InstallPluginRequest>,
     ) -> ServiceResult<impl Encodable<InstallPluginResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, PLUGINS_INSTALL)?;
+        require_connect(&ctx, Action::PluginInstall, &Resource::Host)?;
         let req = request.to_owned_message();
         let installed_registry = self.engine.installed_plugins();
         let source_dir = std::path::PathBuf::from(req.source_dir);
@@ -822,8 +821,12 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, StartPluginRequest>,
     ) -> ServiceResult<impl Encodable<StartPluginResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, PLUGINS_START)?;
         let req = request.to_owned_message();
+        require_connect(
+            &ctx,
+            Action::InstanceStart,
+            &Resource::instance(req.plugin_id.as_str(), req.instance_id.clone()),
+        )?;
         // H2 round-2 F1: serialize against a concurrent uninstall
         // for the same plugin_id. Held for the full start-through-
         // reach-Running window so no uninstall can slip in between
@@ -907,8 +910,12 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, StopPluginRequest>,
     ) -> ServiceResult<impl Encodable<StopPluginResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, PLUGINS_STOP)?;
         let req = request.to_owned_message();
+        require_connect(
+            &ctx,
+            Action::InstanceStop,
+            &Resource::instance(req.plugin_id.as_str(), req.instance_id.clone()),
+        )?;
         // Same shape as the JSON handler: stop every match at once and
         // wait for each to be reaped (sandboxes included), bounded.
         let handles = self
@@ -948,8 +955,12 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, UninstallPluginRequest>,
     ) -> ServiceResult<impl Encodable<UninstallPluginResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, PLUGINS_UNINSTALL)?;
         let req = request.to_owned_message();
+        require_connect(
+            &ctx,
+            Action::PluginUninstall,
+            &Resource::plugin(req.plugin_id.as_str()),
+        )?;
         // H2 round-2 F1 + H3 round-2 F1: hold the per-plugin_id
         // lifecycle lock across the running-instances check +
         // the compose uninstall, and MOVE the guard into the
@@ -1075,7 +1086,7 @@ impl oxidhome_proto::connect::oxidhome::v1::LogsService for OxidHomeLogs {
         ctx: RequestContext,
         request: ServiceRequest<'_, QueryLogsRequest>,
     ) -> ServiceResult<impl Encodable<QueryLogsResponse> + Send + use<'a>> {
-        require_scope_connect(&ctx, LOGS_READ)?;
+        require_connect(&ctx, Action::HostLogs, &Resource::Host)?;
         // `request` is a `ServiceRequest` view; its zero-copy field
         // accessors either return owned copies or `&str` slices, both
         // fine for a synchronous read.
@@ -1216,10 +1227,10 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         // stream setup, and the audit row lands with the right
         // decision via the outcome slot. A cursor replays history,
         // so it also needs `events:read`.
-        require_scope_connect(&ctx, EVENTS_TAIL)?;
+        require_connect(&ctx, Action::EventSubscribe, &Resource::events())?;
         let after_id = request.to_owned_message().after_id;
         if after_id.is_some() {
-            require_scope_connect(&ctx, EVENTS_READ)?;
+            require_connect(&ctx, Action::EventRead, &Resource::events())?;
         }
 
         // Subscribe *before* returning the stream so the caller
@@ -1423,8 +1434,8 @@ pub fn router(engine: Engine) -> ConnectRouter {
 ///
 /// Adding a new entry is a deliberate decision — every other
 /// Connect path defaults to "requires a verified token." A future
-/// scope check happens inside each handler via
-/// [`super::scopes::require_scope`]; the middleware here only
+/// authorization check happens inside each handler via
+/// [`require_connect`]; the middleware here only
 /// enforces authentication and emits the audit row.
 ///
 /// Linear scan is fine at one entry. If the list grows past a
@@ -1452,9 +1463,9 @@ pub fn axum_service(engine: Engine) -> axum::Router {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
         // H6: `DevicesService.ExecuteCommand` applies the
-        // `device.send_command` per-device allowlist through the
-        // shared `authorize_device_command` check, same as REST and
-        // MCP. Every other constraint key is still refused here.
+        // `device.send_command` per-device allowlist through
+        // `crate::auth::authorize`, same as REST and MCP. Every other
+        // constraint key is still refused here.
         enforced_constraints: &[crate::auth::DEVICE_COMMAND_ENFORCED],
         transport: crate::auth::Transport::Connect,
     };
@@ -1467,11 +1478,12 @@ pub fn axum_service(engine: Engine) -> axum::Router {
 /// axum `from_fn_with_state` middleware. Wraps every Connect call:
 ///
 /// 1. Allow-listed path → pass through, no audit (anonymous probe).
-/// 2. Otherwise extract bearer → verify → stamp [`Actor`] into
+/// 2. Otherwise extract bearer → verify → stamp the
+///    [`Actor`](crate::auth::Actor) and its [`InvocationContext`] into
 ///    `req.extensions_mut()` (the Connect dispatcher forwards
 ///    `req.extensions()` into [`RequestContext::extensions()`], so
-///    a future scoped handler reads it via
-///    `ctx.extensions().get::<Actor>()`).
+///    a handler reads the context via
+///    `ctx.extensions().get::<InvocationContext>()`).
 /// 3. After the handler runs, finalize one audit-ledger row via
 ///    [`crate::api::auth::finalize_audit`] — same shape and same
 ///    ledger the JSON middleware uses.
@@ -1656,7 +1668,7 @@ async fn connect_auth_middleware(
     // handler-returned errors as `decision=allow` on those
     // transports. `HandlerOutcomeSlot` sidesteps that by having the
     // handler record its outcome at return time (see [`rpc_err`]
-    // and [`require_scope_connect`]) — the middleware then trusts
+    // and [`require_connect`]) — the middleware then trusts
     // that record over the wire-shaped HTTP status.
     //
     // Residual gap: framing / dispatch errors that reject BEFORE
@@ -1677,10 +1689,7 @@ async fn connect_auth_middleware(
         .as_ref()
         .and_then(|o| o.status)
         .unwrap_or_else(|| response.status());
-    let denied_scope = outcome
-        .as_ref()
-        .and_then(|o| o.denied_scope)
-        .map(Scope::name);
+    let denied_scope = outcome.as_ref().and_then(|o| o.denied_scope);
     // F4 + H5: a dispatched command's id and outcome. Lives on the
     // same slot but is orthogonal to the transport status — see
     // `super::auth::DomainOutcome` for the split. The JSON side

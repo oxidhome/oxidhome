@@ -76,9 +76,14 @@
 //!
 //! H6 made `device.send_command` / `devices` transport-neutral:
 //! REST, Connect and MCP all list [`DEVICE_COMMAND_ENFORCED`] and
-//! call [`authorize_device_command`] at their device-command
-//! dispatch boundary, so the allowlist can't be bypassed by
+//! authorize their device commands through
+//! [`crate::auth::authorize`], so the allowlist can't be bypassed by
 //! switching transport.
+//!
+//! The constraints are applied by [`crate::auth::authorize`]: its
+//! evaluator maps each (action, resource) pair that a constraint
+//! narrows to the constraint key and field. This module only parses
+//! the policy and matches ids.
 //!
 //! See round-3 / round-4 / round-5 / round-6 P1 on PR #147
 //! for the iteration history (bool → key set → (key, field)
@@ -127,8 +132,7 @@ use serde::{Deserialize, Serialize};
 /// see the module-level doc for the accepted JSON shapes.
 ///
 /// `scopes` mirrors the pre-14.4 flat scope list — the
-/// existing `crate::api::scopes::require_scope` path uses
-/// it verbatim.
+/// [`crate::auth::authorize`] evaluator matches it verbatim.
 ///
 /// `constraints` maps a tool name to that tool's
 /// [`ToolConstraint`]. A tool name with **no** entry in the
@@ -363,20 +367,22 @@ impl EnforcedConstraint {
 /// transport that can dispatch a device command (REST
 /// `POST /api/v1/devices/{id}/command`, Connect
 /// `DevicesService.ExecuteCommand`, MCP `device.send_command`) lists it
-/// and calls [`authorize_device_command`] at its dispatch boundary
-/// (H6), so a per-device allowlist cannot be sidestepped by switching
-/// transport.
+/// and authorizes `device.command` on the addressed device through
+/// [`crate::auth::authorize`] at its dispatch boundary (H6), so a
+/// per-device allowlist cannot be sidestepped by switching transport.
 pub const DEVICE_COMMAND_ENFORCED: EnforcedConstraint = EnforcedConstraint {
     key: "device.send_command",
     enforce_devices: true,
     enforce_plugins: false,
 };
 
-/// Audit sentinel recorded as `required_scope` when
-/// [`authorize_device_command`] refuses.
+/// Audit sentinel recorded as `required_scope` when the
+/// `device.send_command` allowlist refuses a device command.
 pub const DEVICE_COMMAND_DENIED_SENTINEL: &str = "constraint:device.send_command:devices";
 
-/// Shared device-command resource check (H6). The flat
+/// The pre-`authorize()` device-command resource check, kept as the
+/// reference the parity tests compare [`crate::auth::authorize`]
+/// against. Production code calls `authorize`. The flat
 /// `devices:command` scope is checked by the caller first; this then
 /// applies the token's per-device allowlist, if it carries one. A token
 /// without a `device.send_command` constraint is unrestricted (legacy
@@ -389,6 +395,7 @@ pub const DEVICE_COMMAND_DENIED_SENTINEL: &str = "constraint:device.send_command
 ///
 /// Returns [`DEVICE_COMMAND_DENIED_SENTINEL`] when the constraint does
 /// not cover `device_id`.
+#[cfg(test)]
 pub fn authorize_device_command(
     actor: &crate::auth::Actor,
     device_id: &str,
