@@ -1043,28 +1043,56 @@ impl PluginInstance {
         );
         // H9: `OkWithState` is authoritative state — validate and
         // project it (see `project_command_state`).
+        let mut reply = self.map_command_reply(
+            result,
+            &command_id,
+            &owner_instance,
+            &device_for_projection,
+            &capability,
+        );
+        // M7: a host-built `unknown` (projection refusal) can quote
+        // plugin-registered text such as a unit label.
+        if matches!(reply, CommandResult::Unknown(_)) {
+            super::command::scrub_and_cap_reply(
+                &mut reply,
+                &crate::redact::config_secrets(&self.store.data().config),
+            );
+        }
+        Ok(reply)
+    }
+
+    /// Project `ok-with-state` and register `accepted` (H5) for a
+    /// scrubbed `execute-command` reply.
+    fn map_command_reply(
+        &self,
+        result: CommandResult,
+        command_id: &str,
+        owner_instance: &str,
+        device_for_projection: &DeviceId,
+        capability: &str,
+    ) -> CommandResult {
         let data = self.store.data();
         match result {
-            CommandResult::OkWithState(fields) => Ok(project_command_state(
+            CommandResult::OkWithState(fields) => project_command_state(
                 &data.devices,
                 &data.device_state,
-                &owner_instance,
-                &device_for_projection,
-                &capability,
+                owner_instance,
+                device_for_projection,
+                capability,
                 fields,
-            )),
+            ),
             CommandResult::Accepted => {
                 let tracked = match &data.pending_commands {
                     Some(table) => table.register(
-                        &command_id,
-                        &owner_instance,
-                        &device_for_projection,
-                        &capability,
-                        crate::auth::invocation::current_or_host(&owner_instance),
+                        command_id,
+                        owner_instance,
+                        device_for_projection,
+                        capability,
+                        crate::auth::invocation::current_or_host(owner_instance),
                     ),
                     None => Err("this host cannot track accepted commands".to_owned()),
                 };
-                Ok(match tracked {
+                match tracked {
                     Ok(()) => CommandResult::Accepted,
                     Err(why) => {
                         tracing::warn!(
@@ -1077,9 +1105,9 @@ impl PluginInstance {
                             "plugin accepted the command but the host cannot track it: {why}"
                         ))
                     }
-                })
+                }
             }
-            other => Ok(other),
+            other => other,
         }
     }
 

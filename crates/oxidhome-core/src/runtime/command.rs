@@ -466,9 +466,11 @@ impl PendingCommands {
         let p = entries
             .remove(command_id)
             .expect("entry checked under the same lock");
+        // Decided under the lock that claimed the entry.
+        let expired = tokio::time::Instant::now() >= p.expires_at;
         drop(entries);
         p.expiry.abort();
-        if tokio::time::Instant::now() >= p.expires_at {
+        if expired {
             // The TTL passed; the timer just hasn't run yet. Expire it
             // here so a late completion can't count as `completed`.
             let reason = "no completion arrived before the pending command expired";
@@ -616,8 +618,10 @@ pub(crate) fn scrub_and_cap_reply(result: &mut CommandResult, secrets: &[&str]) 
         | CommandResult::Unknown(m)
             if m.len() > MAX_PLUGIN_MESSAGE_BYTES =>
         {
-            let cut = secret_safe_cut(m, MAX_PLUGIN_MESSAGE_BYTES, secrets);
-            *m = cap_text_at(std::mem::take(m), cut);
+            *m = match secret_safe_cut(m, MAX_PLUGIN_MESSAGE_BYTES, secrets) {
+                Some(cut) => cap_text_at(std::mem::take(m), cut),
+                None => "[plugin message withheld by host]".to_owned(),
+            };
         }
         _ => {}
     }
@@ -627,32 +631,66 @@ pub(crate) fn scrub_and_cap_reply(result: &mut CommandResult, secrets: &[&str]) 
 /// The largest char boundary `<= limit`, moved back before every
 /// secret occurrence that would straddle it, so the kept prefix holds
 /// only whole matches. Never exceeds `limit`, so the scrubber's input
-/// stays bounded.
-fn secret_safe_cut(text: &str, limit: usize, secrets: &[&str]) -> usize {
-    let bytes = text.as_bytes();
+/// stays bounded. Linear in `limit` plus the longest secret: one
+/// overlapping Aho-Corasick pass over that window, then a sweep over
+/// the merged match intervals. `None` when the matcher can't be built
+/// (pathological secrets); the caller then withholds the text.
+fn secret_safe_cut(text: &str, limit: usize, secrets: &[&str]) -> Option<usize> {
     let mut cut = limit.min(text.len());
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    loop {
-        // Occurrences crossing `cut` start in `(cut - len, cut)`.
-        let crossing_start = secrets
-            .iter()
-            .map(|s| s.as_bytes())
-            .filter(|s| !s.is_empty())
-            .flat_map(|secret| {
-                (cut.saturating_sub(secret.len() - 1)..cut).filter(move |&start| {
-                    let end = start + secret.len();
-                    end > cut && bytes.get(start..end) == Some(secret)
-                })
-            })
-            .min();
-        match crossing_start {
-            // Strictly decreasing, so this terminates.
-            Some(start) => cut = start,
-            None => return cut,
-        }
+    // Same eligibility as the scrubber: shorter secrets aren't masked.
+    let longest = secrets
+        .iter()
+        .filter(|s| s.len() >= crate::redact::MIN_SCRUB_SECRET_LEN)
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
+    let mut window_end = text.len().min(cut.saturating_add(longest));
+    while !text.is_char_boundary(window_end) {
+        window_end += 1;
     }
+    let window = &text[..window_end];
+    let secrets: Vec<&str> = secrets
+        .iter()
+        .copied()
+        .filter(|s| s.len() >= crate::redact::MIN_SCRUB_SECRET_LEN && window.contains(s))
+        .collect();
+    if secrets.is_empty() {
+        return Some(cut);
+    }
+    // Contiguous NFA, as in the scrubber: a DFA's construction is
+    // quadratic in a long repetitive secret.
+    let matcher = aho_corasick::AhoCorasick::builder()
+        .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+        .build(&secrets)
+        .ok()?;
+    // Merge overlapping match intervals (sorted by start); a cut is
+    // safe unless it falls strictly inside a merged interval, and a
+    // merged interval's start is never inside another one.
+    let mut spans: Vec<(usize, usize)> = matcher
+        .find_overlapping_iter(window)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Option<(usize, usize)> = None;
+    for (start, end) in spans {
+        merged = match merged {
+            Some((s, e)) if start < e => Some((s, e.max(end))),
+            Some((s, e)) => {
+                if s < cut && cut < e {
+                    return Some(s);
+                }
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    Some(match merged {
+        Some((s, e)) if s < cut && cut < e => s,
+        _ => cut,
+    })
 }
 
 fn cap_text_at(m: String, limit: usize) -> String {
@@ -976,6 +1014,21 @@ mod message_cap_tests {
         };
         assert!(out.len() < MAX_PLUGIN_MESSAGE_BYTES + 128, "{}", out.len());
         assert!(!out.contains(secret), "{out}");
+    }
+
+    #[test]
+    fn a_long_repetitive_secret_is_handled_in_linear_time() {
+        // A secret longer than the cap, matched by the reply: the
+        // whole prefix is covered, so nothing of it is kept.
+        let secret = "b".repeat(64 * 1024);
+        let mut reply = CommandResult::Unknown("b".repeat(1 << 20));
+        let start = std::time::Instant::now();
+        scrub_and_cap_reply(&mut reply, &[secret.as_str()]);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        let CommandResult::Unknown(out) = reply else {
+            panic!("variant kept")
+        };
+        assert!(!out.contains(&"b".repeat(16)), "{}", out.len());
     }
 
     #[test]
