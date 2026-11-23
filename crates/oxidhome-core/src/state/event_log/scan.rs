@@ -35,7 +35,7 @@ pub struct ScanPage {
     /// Kept rows as WIT events (each with its `row-id`), oldest first.
     pub events: Vec<Event>,
     /// Cursor to resume from: the last row the scan consumed (kept or
-    /// skipped), or `head_id` once it reached the end of history.
+    /// skipped). It equals `head_id` once the scan reached the end.
     pub next_after_id: u64,
     /// Highest row id ever assigned, in the scan's snapshot.
     pub head_id: u64,
@@ -86,18 +86,14 @@ impl EventLog {
                 i64::try_from(pos).unwrap_or(i64::MAX),
                 i64::try_from(scan_budget).unwrap_or(i64::MAX),
             ])?;
-            let mut scanned = 0;
             let mut bad = BadRows::default();
-            let mut hole = false;
             while let Some(row) = rows.next()? {
-                scanned += 1;
                 let id = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
                 if id != pos + 1 {
                     // A hole inside history (left by pre-H4 retention,
                     // which deleted by time): stop before it, so the
                     // next read from `pos` reports `cursor-expired`
                     // instead of silently crossing it.
-                    hole = true;
                     break;
                 }
                 // An undecodable row is skipped (and logged once per
@@ -127,11 +123,10 @@ impl EventLog {
                 }
                 pos = id;
             }
-            if !hole && scanned < scan_budget {
-                // Nothing after `pos` in this snapshot: every row up
-                // to the snapshot's head has been seen.
-                pos = pos.max(head_id);
-            }
+            // `pos` stays at the last row consumed. In a dense log
+            // the end of the scan is the head; if rows up to the head
+            // are missing (a pruned suffix), the next read from `pos`
+            // reports `cursor-expired` instead of skipping them.
             bad.log();
             Ok(Ok(ScanPage {
                 events,
@@ -315,6 +310,25 @@ mod tests {
         assert_eq!(page.next_after_id, 2);
         assert!(
             log.scan_after_cursor(2, 10, |_| ScanStep::Take)
+                .expect("scan")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pruned_suffix_expires_instead_of_reporting_caught_up() {
+        let log = log_with(5);
+        log.db
+            .write(|conn| conn.execute("DELETE FROM event_log WHERE id > 3", ()))
+            .expect("delete");
+        let page = log
+            .scan_after_cursor(1, 10, |_| ScanStep::Take)
+            .expect("scan")
+            .expect("cursor");
+        assert_eq!(ids(&page), vec![2, 3]);
+        assert_eq!((page.next_after_id, page.head_id), (3, 5));
+        assert!(
+            log.scan_after_cursor(3, 10, |_| ScanStep::Take)
                 .expect("scan")
                 .is_err()
         );

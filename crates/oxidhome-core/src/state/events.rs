@@ -782,6 +782,7 @@ impl EventBus {
             filter,
             receiver,
             wake_token: None,
+            held: None,
             _slot_token: SubscriberToken {
                 id,
                 // C2e review F3: `Weak`, not `Arc`. If the token
@@ -914,6 +915,12 @@ pub struct EventSubscription {
     /// read directly; Rust would otherwise warn about it.
     #[allow(dead_code)]
     _slot_token: SubscriberToken,
+    /// A recorded event taken off `receiver` but not delivered yet,
+    /// with its `rows_through`: the plugin supervisor holds it until
+    /// every older row has finished its fan-out, and stops draining
+    /// this queue meanwhile so delivery stays FIFO. Dropped with the
+    /// subscription.
+    pub(crate) held: Option<(u64, Event)>,
 }
 
 impl SubscriberMessage {

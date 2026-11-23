@@ -18,9 +18,7 @@ use crate::auth::Actor;
 use crate::host_impl::plugin::Plugin as PluginBindings;
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::events::Event;
-use crate::host_impl::plugin::oxidhome::plugin::types::{
-    DeviceId, KeyValue, ServiceId, SubscriptionId,
-};
+use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue, ServiceId};
 use crate::{MIN_SUPPORTED_SDK_VERSION, OXIDHOME_SDK_VERSION};
 
 use super::Engine;
@@ -207,12 +205,6 @@ pub struct PluginInstance {
     /// Fixed [`watchdog::WATCHDOG_DEFAULT`] in production; the
     /// supervisor lowers it for tests via [`Self::set_watchdog`].
     watchdog: std::time::Duration,
-    /// Events taken off the subscription queues but held for the
-    /// next drain: they were fanned out after the drain's cutoff, so
-    /// an older event may still be on its way to another queue (see
-    /// [`Self::collect_pending_events`]). Bounded by the queues.
-    /// Each entry is `(rows_through, subscription id, event)`.
-    deferred_events: Vec<(u64, SubscriptionId, Event)>,
 }
 
 /// H11 round-2 F1: caller-declared load provenance. Passed through
@@ -1046,7 +1038,6 @@ impl PluginInstance {
             bindings,
             store,
             watchdog: watchdog::WATCHDOG_DEFAULT,
-            deferred_events: Vec::new(),
         })
     }
 
@@ -1410,10 +1401,20 @@ impl PluginInstance {
         // fan-out (it is in every matching queue); later ones may not
         // have yet.
         let cutoff = state.events.row_watermark().get();
-        let mut events = std::mem::take(&mut self.deferred_events);
-        // Held events of a subscription dropped since go with it.
-        events.retain(|(_, id, _)| state.subscriptions.iter().any(|s| s.id == *id));
+        let mut events = Vec::new();
         for sub in &mut state.subscriptions {
+            // A held event goes first; while it is still above the
+            // cutoff, the rest of its queue waits behind it (FIFO).
+            if let Some((rows_through, ev)) = sub.held.take() {
+                if rows_through > cutoff {
+                    sub.held = Some((rows_through, ev));
+                    continue;
+                }
+                events.push((rows_through, ev));
+            }
+            // Take at most what is queued now, so publishers refilling
+            // the queue can't keep this drain going.
+            let queued = sub.receiver.len();
             // C2e: publish filters before enqueue, so every event
             // that reaches `try_recv` already matches. The
             // defensive `matches` check stays in case a future
@@ -1423,12 +1424,15 @@ impl PluginInstance {
             // plugin cares it can subscribe again with more
             // slack, or reconcile via `Logs.Query` / the durable
             // event history.
-            while let Ok(SubscriberMessage::Event {
-                event: ev,
-                skipped_before,
-                rows_through,
-            }) = sub.receiver.try_recv()
-            {
+            for _ in 0..queued {
+                let Ok(SubscriberMessage::Event {
+                    event: ev,
+                    skipped_before,
+                    rows_through,
+                }) = sub.receiver.try_recv()
+                else {
+                    break;
+                };
                 // Follow-up review H4 round-2 F1: lag count now
                 // travels with the event; log it (best-effort
                 // observability, same shape the pre-fix bare
@@ -1446,35 +1450,36 @@ impl PluginInstance {
                 // `Arc::unwrap_or_clone` (Rust 1.76) — clone-on-
                 // write per subscription.
                 let ev = Arc::unwrap_or_clone(ev);
-                if sub.matches(&ev) {
-                    events.push((rows_through, sub.id, ev));
+                if !sub.matches(&ev) {
+                    continue;
                 }
+                // A recorded event fanned out after the cutoff may
+                // have an older row still on its way to another
+                // queue: hold it, and leave the rest of this queue
+                // for the next drain. Its publisher raises the
+                // watermark and then wakes this subscription
+                // (`notify_one` keeps a permit), so that drain comes.
+                // Events without a row id are never held: nothing
+                // would wake the plugin for them.
+                if rows_through > cutoff && ev.row_id.is_some() {
+                    sub.held = Some((rows_through, ev));
+                    break;
+                }
+                events.push((rows_through, ev));
             }
         }
         // Each subscription has its own queue, so draining them one
-        // after another can hand over row 12 before row 11, and a
-        // publish can land between two queue drains. Plugins resuming
-        // from a `row-id` cursor (`host-events::read-events`) need
-        // row-id order, so: publishes are serialized, `rows_through`
-        // is the bus watermark at each fan-out (an event's own row
-        // id, or the last one fanned out before an event without
-        // one), and events above the cutoff (the bus's queued-row
-        // watermark, read before draining) are held for the next
-        // drain, when every older event has reached its queues. The sort is stable, so order within a queue is
-        // kept. (Two events without a row id on different queues
-        // share a key and keep drain order.)
-        events.sort_by_key(|(rows_through, _, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
-        // Only recorded events are held, so only their order is
-        // guaranteed. No self-wake is needed: a held event's own
-        // publisher raises the watermark and only then signals the
-        // wakes matching it (`notify_one` keeps a permit), so a later
-        // drain follows. An event without a row id can't be held:
-        // nothing would wake the plugin for it.
-        let (held, ready): (Vec<_>, Vec<_>) = events
-            .into_iter()
-            .partition(|(rows_through, _, ev)| *rows_through > cutoff && ev.row_id.is_some());
-        self.deferred_events = held;
-        ready.into_iter().map(|(_, _, ev)| ev).collect()
+        // after another can hand over row 12 before row 11. Plugins
+        // resuming from a `row-id` cursor (`host-events::read-events`)
+        // need row-id order, so: recorded publishes are serialized,
+        // `rows_through` is the bus watermark at each fan-out (an
+        // event's own row id, or the last one fanned out before an
+        // event without one), and recorded events above the cutoff
+        // are held (above). The sort is stable, so order within a
+        // queue is kept. (Two events without a row id on different
+        // queues share a key and keep drain order.)
+        events.sort_by_key(|(rows_through, ev)| (*rows_through, ev.row_id.unwrap_or(u64::MAX)));
+        events.into_iter().map(|(_, ev)| ev).collect()
     }
 
     /// The instance id this state was built with. Currently the plugin's
