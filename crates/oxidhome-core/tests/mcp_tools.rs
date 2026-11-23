@@ -3883,3 +3883,43 @@ async fn plugins_show_allowlist_does_not_narrow_the_plugin_resource() {
     assert_eq!(read_row.status, 404, "{read_row:?}");
     assert!(read_row.required_scope.is_none(), "{read_row:?}");
 }
+
+/// MCP `events.subscribe` is a history poll, so it is gated by
+/// `events:read`, not the `events:tail` that gates the REST / Connect
+/// live tail: `events:read` alone succeeds, `events:tail` alone is
+/// denied with `events:read` in the audit row.
+#[tokio::test(flavor = "current_thread")]
+async fn events_subscribe_is_gated_by_events_read_not_events_tail() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    for (label, scope, denied) in [
+        ("read-only", "events:read", false),
+        ("tail-only", "events:tail", true),
+    ] {
+        let bearer = mint_bearer_with_scopes(&engine, label, &[scope]);
+        let (router, session) = handshake(build_router(engine.clone()), &bearer).await;
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "events.subscribe", "arguments": {"timeout_ms": 0}}),
+        )
+        .await;
+        if denied {
+            assert_eq!(response["error"]["code"], -32001, "{label}: {response}");
+        } else {
+            assert!(response.get("error").is_none(), "{label}: {response}");
+            assert_ne!(response["result"]["isError"], true, "{label}: {response}");
+        }
+    }
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let deny = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.events.subscribe" && r.decision == "deny")
+        .expect("deny row");
+    assert_eq!(deny.required_scope.as_deref(), Some("events:read"));
+}

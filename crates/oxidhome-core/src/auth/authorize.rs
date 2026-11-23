@@ -400,17 +400,42 @@ impl DashboardResource {
 /// Host-origin work (`init`, `tick`, `on-event`) has an empty
 /// authority: plugins are authorized by their manifest grants, not
 /// scopes.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Authority {
-    inner: Arc<AuthorityInner>,
+    source: Source,
 }
 
-#[derive(Debug, PartialEq, Eq, Default)]
+/// Where the policy lives. A token authority shares the verified
+/// [`Actor`]'s `Arc` instead of copying its scopes and constraints, so
+/// building a principal per request or per MCP read is a refcount bump.
+#[derive(Debug, Clone)]
+enum Source {
+    Owned(Arc<AuthorityInner>),
+    Actor { actor: Actor, token: bool },
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Self::Owned(Arc::default())
+    }
+}
+
+#[derive(Debug, Default)]
 struct AuthorityInner {
     token_id: Option<String>,
     scopes: Vec<String>,
     constraints: HashMap<String, ToolConstraint>,
 }
+
+impl PartialEq for Authority {
+    fn eq(&self, other: &Self) -> bool {
+        self.token_id() == other.token_id()
+            && self.scopes() == other.scopes()
+            && self.constraints() == other.constraints()
+    }
+}
+
+impl Eq for Authority {}
 
 impl Authority {
     /// No authority: every action is refused.
@@ -428,11 +453,11 @@ impl Authority {
         constraints: HashMap<String, ToolConstraint>,
     ) -> Self {
         Self {
-            inner: Arc::new(AuthorityInner {
+            source: Source::Owned(Arc::new(AuthorityInner {
                 token_id,
                 scopes,
                 constraints,
-            }),
+            })),
         }
     }
 
@@ -440,11 +465,12 @@ impl Authority {
     /// id, its scopes and its constraints.
     #[must_use]
     pub fn of_token(actor: &Actor) -> Self {
-        Self::new(
-            Some(actor.id().to_owned()),
-            actor.scopes().to_vec(),
-            actor.constraints().clone(),
-        )
+        Self {
+            source: Source::Actor {
+                actor: actor.clone(),
+                token: true,
+            },
+        }
     }
 
     /// The authority of an actor authorized by the local process
@@ -452,26 +478,44 @@ impl Authority {
     /// constraints, no token id.
     #[must_use]
     pub fn of_local_process(actor: &Actor) -> Self {
-        Self::new(None, actor.scopes().to_vec(), actor.constraints().clone())
+        Self {
+            source: Source::Actor {
+                actor: actor.clone(),
+                token: false,
+            },
+        }
     }
 
     /// Token that carries this authority, if any.
     #[must_use]
     pub fn token_id(&self) -> Option<&str> {
-        self.inner.token_id.as_deref()
+        match &self.source {
+            Source::Owned(inner) => inner.token_id.as_deref(),
+            Source::Actor { actor, token } => token.then(|| actor.id()),
+        }
     }
 
     /// Resolved scope list.
     #[must_use]
     pub fn scopes(&self) -> &[String] {
-        &self.inner.scopes
+        match &self.source {
+            Source::Owned(inner) => &inner.scopes,
+            Source::Actor { actor, .. } => actor.scopes(),
+        }
     }
 
     /// The 14.4 constraint for `key` (a tool name), if the token
     /// carries one.
     #[must_use]
     pub fn constraint(&self, key: &str) -> Option<&ToolConstraint> {
-        self.inner.constraints.get(key)
+        self.constraints().get(key)
+    }
+
+    fn constraints(&self) -> &HashMap<String, ToolConstraint> {
+        match &self.source {
+            Source::Owned(inner) => &inner.constraints,
+            Source::Actor { actor, .. } => actor.constraints(),
+        }
     }
 }
 
