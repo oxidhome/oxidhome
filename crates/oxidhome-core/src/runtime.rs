@@ -372,12 +372,19 @@ impl Engine {
         let event_log = Arc::new(EventLog::new(Arc::clone(&db)));
         let events = Arc::new(EventBus::new());
         // H4: rows from earlier runs were never fanned out by this
-        // bus; cursor tails replay them from history.
-        events.note_history_head(
-            event_log
-                .head_id()
-                .context("reading the event-log head row id")?,
-        );
+        // bus; cursor tails replay them from history. A failed read
+        // only costs that replay (cursor tails then fill those rows in
+        // when the next recorded event arrives), so it doesn't stop
+        // the daemon: live delivery never depends on history (H3).
+        match event_log.head_id() {
+            Ok(head) => events.note_history_head(head),
+            Err(err) => tracing::error!(
+                target: "event_log",
+                error = %err,
+                "reading the event-log head row id failed; cursor tails replay \
+                 rows from earlier runs only once a new event is recorded",
+            ),
+        }
         Ok(Self {
             inner,
             pending_commands: Arc::new(PendingCommands::new(Some(Arc::clone(&audit_log)))),

@@ -130,6 +130,8 @@ pub struct EventTail {
     held: Option<Arc<Event>>,
     pending: VecDeque<TailItem>,
     finished: bool,
+    /// The cursor an accepted `after_id` resolved to, fixed at open.
+    accepted_cursor: Option<u64>,
 }
 
 impl EventTail {
@@ -170,12 +172,14 @@ impl EventTail {
             held: None,
             pending: VecDeque::new(),
             finished: false,
+            accepted_cursor: None,
         };
         if let Some(after_id) = after_id {
             match tail.read(move |log| log.resolve_cursor(after_id)).await? {
                 Ok(cursor) => {
                     tail.mode = Mode::Cursor { cursor };
                     tail.replay_through = fanned_out;
+                    tail.accepted_cursor = Some(cursor);
                 }
                 Err(expired) => tail.expire(expired),
             }
@@ -183,19 +187,16 @@ impl EventTail {
         Ok(tail)
     }
 
-    /// The cursor this stream resumes from: `Some` once a cursor
-    /// open was accepted (before any item is taken it is the resolved
-    /// `after_id`; `0` resolves to just below the oldest retained
-    /// row). `None` for live-only streams and expired cursors. The
+    /// The cursor an accepted `after_id` resolved to at open (`0`
+    /// resolves to just below the oldest retained row); it does not
+    /// move as the stream advances. `None` for live-only streams and
+    /// expired cursors. The
     /// transports echo it as the `oxidhome-resume-after-id` response
     /// header, so a client can tell a resumed stream from a server
     /// that ignored `after_id`.
     #[must_use]
     pub fn resume_after_id(&self) -> Option<u64> {
-        match self.mode {
-            Mode::Cursor { cursor } if !self.finished => Some(cursor),
-            _ => None,
-        }
+        self.accepted_cursor
     }
 
     /// Next item, or `Ok(None)` once the stream is over (bus shut
@@ -244,6 +245,10 @@ impl EventTail {
                 // have been dropped from the queue: replay them before
                 // ending.
                 Err(TryRecvError::Disconnected) => {
+                    // Re-read: the last publisher raises the watermark
+                    // before it releases the bus, possibly after the
+                    // sample above.
+                    let fanned_out = self.watermark.get();
                     if let Mode::Cursor { cursor } = self.mode
                         && fanned_out > cursor
                     {
