@@ -1421,6 +1421,32 @@ impl Engine {
         self.pending_commands.close_journal(timeout)
     }
 
+    /// Start the periodic retention tasks for the event log, the
+    /// diagnostic log and the audit ledger on the current tokio
+    /// runtime (see [`crate::state::retention`]). Tables with both
+    /// limits disabled get no task. The caller shuts them down before
+    /// it releases the state directory.
+    #[must_use]
+    pub fn spawn_retention(
+        &self,
+        config: crate::state::RetentionConfig,
+    ) -> crate::state::RetentionTasks {
+        let mut tasks = crate::state::RetentionTasks::default();
+        tasks.push(self.event_log.spawn_retention(config.event_log));
+        tasks.push(self.log_store.spawn_retention(config.logs));
+        tasks.push(self.audit_log.spawn_retention(config.audit));
+        tasks
+    }
+
+    /// H2 follow-up: wait up to `timeout` for the `host-state` deny
+    /// rows still queued for the audit worker to be written. Called
+    /// at shutdown after every supervised instance stopped; returns
+    /// whether the queue drained. Blocking.
+    #[must_use]
+    pub fn drain_state_read_audit(&self, timeout: std::time::Duration) -> bool {
+        state_read::drain_state_read_audit(timeout)
+    }
+
     /// Post-terminal cleanup for one instance: drop the device and
     /// service registry entries it owns and mark its device-state
     /// projection `Stale`. The supervisor's reaper runs this once an

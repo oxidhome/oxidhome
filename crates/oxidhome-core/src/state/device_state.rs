@@ -79,7 +79,7 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rand::TryRng;
 
 mod persist;
-pub use persist::{FlushError, REVISION_GAP, invalidate_cursors_after_restore};
+pub use persist::{DeviceStateHealth, FlushError, REVISION_GAP, invalidate_cursors_after_restore};
 
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, KeyValue};
 
@@ -166,6 +166,24 @@ impl DeviceState {
     #[must_use]
     pub fn field_byte_estimate(&self) -> usize {
         fields_byte_estimate(&self.fields)
+    }
+
+    /// Upper bound on this entry's encoded size in the REST JSON,
+    /// Connect JSON and Connect protobuf state responses, string
+    /// escaping included. `blobs`: the caller sees `bytes-val` fields
+    /// rather than the withheld marker (M7).
+    #[must_use]
+    pub fn wire_size_bound(&self, blobs: bool) -> usize {
+        self.fields.iter().fold(
+            ENTRY_WIRE_OVERHEAD
+                .saturating_add(json_escaped_len(&self.device_id))
+                .saturating_add(json_escaped_len(&self.capability)),
+            |acc, kv| {
+                acc.saturating_add(FIELD_WIRE_OVERHEAD)
+                    .saturating_add(json_escaped_len(&kv.key))
+                    .saturating_add(value_wire_bound(&kv.value, blobs))
+            },
+        )
     }
 }
 
@@ -815,18 +833,26 @@ impl DeviceStateStore {
     /// skipped). A device is committed whole: the page stops before a
     /// device that would exceed `device_limit` or push the page past
     /// `byte_cap` (the first device is always kept, so paging makes
-    /// progress). Bytes are estimated as capability name plus field
-    /// bytes. The scan also stops at a device boundary once it has
-    /// looked at `scan_budget` entries, which bounds the lock hold for
-    /// a sparse `keep`. `resume_after` is set when the caller should
-    /// read on: the last device committed (page full) or scanned
-    /// (budget spent).
+    /// progress). `sizing` says how a kept entry is measured: the
+    /// encoded API size bound ([`PageSizing::Wire`]) or the plugin
+    /// page estimate ([`PageSizing::Estimate`]).
+    ///
+    /// The scan looks at no more than `scan_budget` entries, which
+    /// bounds the lock hold for a sparse `keep`. When the budget runs
+    /// out inside a device, that device is left for the next page and
+    /// the page resumes after the last device scanned whole. The one
+    /// exception is the page's first device: it is always scanned
+    /// whole, so a device with more slots than the budget still makes
+    /// progress. `resume_after` is set when the caller should read on:
+    /// the last device committed (page full) or scanned whole (budget
+    /// spent).
     #[must_use]
     pub fn snapshot_page_capped(
         &self,
         after_device_id: Option<&str>,
         device_limit: usize,
         byte_cap: usize,
+        sizing: PageSizing,
         scan_budget: usize,
         keep: impl Fn(&DeviceState) -> bool,
     ) -> CappedPage {
@@ -840,6 +866,8 @@ impl DeviceStateStore {
         let mut pending: Vec<Arc<DeviceState>> = Vec::new();
         let mut pending_bytes: usize = 0;
         let mut pending_device: Option<&DeviceId> = None;
+        // The last device whose entries were all looked at.
+        let mut last_whole: Option<&DeviceId> = None;
         let mut resume_after: Option<DeviceId> = None;
         let mut full = false;
         // Commit `pending` if it fits; `false` means the page is full
@@ -871,21 +899,21 @@ impl DeviceStateStore {
                     full = true;
                     break;
                 }
-                if scanned >= scan_budget {
-                    // Resume after the last device looked at, whether
-                    // or not it had a kept entry.
-                    resume_after = pending_device.cloned();
-                    break;
-                }
+                last_whole = pending_device;
                 pending_device = Some(did);
             }
+            if scanned >= scan_budget && last_whole.is_some() {
+                // Budget spent: drop the partly scanned device and
+                // resume after the last whole one, kept or not.
+                pending.clear();
+                resume_after = last_whole.cloned();
+                break;
+            }
             if keep(entry) {
-                // Plus a per-field allowance: a withheld `bytes-val`
-                // (even an empty one) is sent as a JSON marker.
-                pending_bytes = pending_bytes
-                    .saturating_add(entry.capability.len())
-                    .saturating_add(entry.field_byte_estimate())
-                    .saturating_add(entry.fields.len().saturating_mul(PAGE_FIELD_OVERHEAD));
+                if pending.is_empty() {
+                    pending_bytes = sizing.device_overhead(did);
+                }
+                pending_bytes = pending_bytes.saturating_add(sizing.entry(entry));
                 pending.push(Arc::clone(entry));
             }
         }
@@ -899,11 +927,13 @@ impl DeviceStateStore {
                 .and_then(|d| d.first())
                 .map(|e| e.device_id.clone());
         }
+        let truncated = resume_after.is_some() && devices.len() < device_limit;
         CappedPage {
             epoch: inner.epoch.clone(),
             revision: inner.global_revision,
             devices,
             resume_after,
+            truncated,
         }
     }
 
@@ -1335,6 +1365,23 @@ impl DeviceStateStore {
     /// missed those transitions.
     #[must_use]
     pub fn deltas_since_with_revision(&self, since_revision: u64, limit: usize) -> DeltaPage {
+        self.deltas_since_capped(since_revision, limit, usize::MAX, PageSizing::Estimate)
+    }
+
+    /// [`Self::deltas_since_with_revision`] with a byte budget: the
+    /// page stops before the entry that would push it past
+    /// `byte_cap` as measured by `sizing` (the first entry is always
+    /// returned, so paging makes progress). A page cut short this way
+    /// has [`DeltaPage::truncated`] set; the caller polls again from
+    /// the highest returned `global_revision`.
+    #[must_use]
+    pub fn deltas_since_capped(
+        &self,
+        since_revision: u64,
+        limit: usize,
+        byte_cap: usize,
+        sizing: PageSizing,
+    ) -> DeltaPage {
         let inner = self.inner_read();
         if since_revision > inner.global_revision
             || since_revision < inner.evicted_through_revision
@@ -1348,6 +1395,7 @@ impl DeviceStateStore {
                 current_revision: inner.global_revision,
                 entries: Vec::new(),
                 reset_required: true,
+                truncated: false,
             };
         }
         let mut out: Vec<Arc<DeviceState>> = inner
@@ -1358,11 +1406,22 @@ impl DeviceStateStore {
             .collect();
         out.sort_by_key(|m| m.global_revision);
         out.truncate(limit);
+        let mut bytes: usize = 0;
+        let fits = out
+            .iter()
+            .position(|e| {
+                bytes = bytes.saturating_add(sizing.entry(e));
+                bytes > byte_cap
+            })
+            .map_or(out.len(), |over| over.max(1));
+        let truncated = fits < out.len();
+        out.truncate(fits);
         DeltaPage {
             epoch: inner.epoch.clone(),
             current_revision: inner.global_revision,
             entries: out,
             reset_required: false,
+            truncated,
         }
     }
 
@@ -2054,6 +2113,9 @@ pub struct DeltaPage {
     pub current_revision: u64,
     pub entries: Vec<Arc<DeviceState>>,
     pub reset_required: bool,
+    /// The byte budget cut the page short: more changes follow even
+    /// though it holds fewer than the requested number of entries.
+    pub truncated: bool,
 }
 
 /// H2: return of [`DeviceStateStore::snapshot_page_capped`].
@@ -2069,6 +2131,99 @@ pub struct CappedPage {
     /// Set when more entries may follow: pass it as the next page's
     /// `after_device_id`. See [`DeviceStateStore::snapshot_page_capped`].
     pub resume_after: Option<DeviceId>,
+    /// The byte or scan budget ended the page before `device_limit`
+    /// devices: `resume_after` is set and more may follow.
+    pub truncated: bool,
+}
+
+/// How [`DeviceStateStore::snapshot_page_capped`] and
+/// [`DeviceStateStore::deltas_since_capped`] measure an entry against
+/// their byte budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSizing {
+    /// Field bytes plus a per-field allowance: the plugin
+    /// `list-state` page estimate.
+    Estimate,
+    /// An upper bound on the encoded size in every API encoding (REST
+    /// JSON, Connect JSON and Connect protobuf), escaping included.
+    /// `blobs` is whether the caller sees `bytes-val` fields (M7);
+    /// without it they are sent as a short withheld marker.
+    Wire {
+        /// The caller may read raw bytes.
+        blobs: bool,
+    },
+}
+
+impl PageSizing {
+    fn entry(self, entry: &DeviceState) -> usize {
+        match self {
+            Self::Estimate => entry
+                .capability
+                .len()
+                .saturating_add(entry.field_byte_estimate())
+                .saturating_add(entry.fields.len().saturating_mul(PAGE_FIELD_OVERHEAD)),
+            Self::Wire { blobs } => entry.wire_size_bound(blobs),
+        }
+    }
+
+    fn device_overhead(self, device_id: &str) -> usize {
+        match self {
+            Self::Estimate => 0,
+            Self::Wire { .. } => DEVICE_WIRE_OVERHEAD.saturating_add(json_escaped_len(device_id)),
+        }
+    }
+}
+
+/// Encoded bytes of one entry besides its strings and fields: field
+/// names, four 64-bit numbers (quoted in proto JSON), the quality enum
+/// name and punctuation.
+const ENTRY_WIRE_OVERHEAD: usize = 320;
+
+/// Encoded bytes of one field besides its key and value: the
+/// `{"key":…,"value":{"t":…,"v":…}}` framing (REST) or its proto JSON
+/// equivalent.
+const FIELD_WIRE_OVERHEAD: usize = 64;
+
+/// Upper bound on a withheld `bytes-val` marker as encoded, JSON
+/// string escaping included.
+const WITHHELD_WIRE_BYTES: usize = 160;
+
+/// Encoded bytes of a snapshot page's per-device wrapper besides the
+/// device id: the epoch, revision and field names.
+const DEVICE_WIRE_OVERHEAD: usize = 192;
+
+/// Length of `s` as a JSON string body, as `serde_json` (used by the
+/// REST handlers and by `buffa`'s proto JSON) escapes it: quote and
+/// backslash take two bytes, control characters two or six, anything
+/// else is copied as UTF-8.
+#[must_use]
+pub fn json_escaped_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            0..=0x1f => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+fn value_wire_bound(
+    v: &crate::host_impl::plugin::oxidhome::plugin::types::Value,
+    blobs: bool,
+) -> usize {
+    use crate::host_impl::plugin::oxidhome::plugin::types::Value;
+    match v {
+        Value::BoolVal(_) => 5,
+        // 20 digits and a sign, quoted in proto JSON.
+        Value::IntVal(_) => 24,
+        // Shortest round-trip form, or a quoted "-Infinity".
+        Value::FloatVal(_) => 32,
+        Value::StringVal(s) | Value::JsonVal(s) => json_escaped_len(s).saturating_add(2),
+        // REST sends bytes as a JSON array (at most four bytes per
+        // element, comma included); base64 and protobuf are smaller.
+        Value::BytesVal(b) if blobs => b.len().saturating_mul(4).saturating_add(2),
+        Value::BytesVal(_) => WITHHELD_WIRE_BYTES,
+    }
 }
 
 /// H9 round-12 finding 2: sentinel string that sorts strictly
@@ -3646,28 +3801,143 @@ mod tests {
                 .map(|d| d[0].device_id.clone())
                 .collect::<Vec<_>>()
         };
-        let page = store.snapshot_page_capped(None, 2, usize::MAX, usize::MAX, |_| true);
+        let page = store.snapshot_page_capped(
+            None,
+            2,
+            usize::MAX,
+            PageSizing::Estimate,
+            usize::MAX,
+            |_| true,
+        );
         assert_eq!(ids(&page), ["dev-0", "dev-1"]);
         assert_eq!(page.devices[0].len(), 2, "a device is committed whole");
         assert_eq!(page.resume_after.as_deref(), Some("dev-1"));
-        let last = store.snapshot_page_capped(Some("dev-3"), 10, usize::MAX, usize::MAX, |_| true);
+        let last = store.snapshot_page_capped(
+            Some("dev-3"),
+            10,
+            usize::MAX,
+            PageSizing::Estimate,
+            usize::MAX,
+            |_| true,
+        );
         assert_eq!(ids(&last), ["dev-4", "dev-5"]);
         assert_eq!(last.resume_after, None);
         // Only odd devices kept, capability `b` only.
-        let odd = store.snapshot_page_capped(None, 10, usize::MAX, usize::MAX, |e| {
-            e.device_id.ends_with(['1', '3', '5']) && e.capability == "b"
-        });
+        let odd = store.snapshot_page_capped(
+            None,
+            10,
+            usize::MAX,
+            PageSizing::Estimate,
+            usize::MAX,
+            |e| e.device_id.ends_with(['1', '3', '5']) && e.capability == "b",
+        );
         assert_eq!(ids(&odd), ["dev-1", "dev-3", "dev-5"]);
         assert!(odd.devices.iter().all(|d| d.len() == 1));
-        // Budget of 3 entries: stops after the second device's entries,
-        // at a device boundary, and resumes after the last one scanned.
-        let none = store.snapshot_page_capped(None, 10, usize::MAX, 3, |_| false);
+        // Budget of 3 entries: the third entry is dev-1's first, so the
+        // scan stops inside dev-1 and resumes after dev-0, the last
+        // device looked at whole. It never looks past the budget.
+        let none =
+            store.snapshot_page_capped(None, 10, usize::MAX, PageSizing::Estimate, 3, |_| false);
         assert!(none.devices.is_empty());
-        assert_eq!(none.resume_after.as_deref(), Some("dev-1"));
+        assert_eq!(none.resume_after.as_deref(), Some("dev-0"));
+        assert!(none.truncated);
+        let kept =
+            store.snapshot_page_capped(None, 10, usize::MAX, PageSizing::Estimate, 3, |_| true);
+        assert_eq!(
+            ids(&kept),
+            ["dev-0"],
+            "the partly scanned device is left out"
+        );
+        assert_eq!(kept.resume_after.as_deref(), Some("dev-0"));
+        // The page's first device is scanned whole even past the
+        // budget, so paging always makes progress.
+        let first =
+            store.snapshot_page_capped(None, 10, usize::MAX, PageSizing::Estimate, 1, |_| true);
+        assert_eq!(ids(&first), ["dev-0"]);
+        assert_eq!(first.devices[0].len(), 2);
+        assert_eq!(first.resume_after.as_deref(), Some("dev-0"));
         // Byte cap: the first device always fits, the second doesn't.
-        let tiny = store.snapshot_page_capped(None, 10, 1, usize::MAX, |_| true);
+        let tiny =
+            store.snapshot_page_capped(None, 10, 1, PageSizing::Estimate, usize::MAX, |_| true);
         assert_eq!(ids(&tiny), ["dev-0"]);
         assert_eq!(tiny.resume_after.as_deref(), Some("dev-0"));
+        assert!(tiny.truncated, "cut by bytes, not by the device limit");
+        assert!(!page.truncated, "cut by the device limit");
+        assert!(!last.truncated);
+    }
+
+    /// The wire bound covers JSON escaping and the REST byte-array
+    /// encoding, and a withheld `bytes-val` counts as its marker.
+    #[test]
+    fn wire_bound_covers_escaping_and_bytes() {
+        assert_eq!(json_escaped_len("ab"), 2);
+        assert_eq!(json_escaped_len("\"\\\n"), 6);
+        assert_eq!(json_escaped_len("\u{1}"), 6);
+        assert_eq!(json_escaped_len("é"), 2);
+        let entry = |v: Value| DeviceState {
+            device_id: "dev".into(),
+            capability: "cap".into(),
+            fields: vec![kv("k", v)],
+            global_revision: u64::MAX,
+            received_ms: i64::MIN,
+            observed_ms: u64::MAX,
+            source_generation: u64::MAX,
+            owner_instance: String::new(),
+            owner_plugin: String::new(),
+            owner_install: String::new(),
+            quality: StateQuality::Stale,
+        };
+        let controls = entry(Value::StringVal("\u{1}".repeat(1000)));
+        let rest = serde_json::to_string(&serde_json::json!({
+            "device_id": controls.device_id, "capability": controls.capability,
+            "fields": [{"key": "k", "value": {"t": "String", "v": "\u{1}".repeat(1000)}}],
+            "global_revision": u64::MAX, "received_ms": i64::MIN, "observed_ms": u64::MAX,
+            "source_generation": u64::MAX, "quality": "stale",
+        }))
+        .expect("json");
+        assert!(controls.wire_size_bound(true) >= rest.len());
+        assert!(controls.wire_size_bound(true) >= 6000);
+        let bytes = entry(Value::BytesVal(vec![255; 1000]));
+        let as_array = serde_json::to_string(&vec![255u8; 1000]).expect("json");
+        assert!(bytes.wire_size_bound(true) >= as_array.len());
+        assert!(
+            bytes.wire_size_bound(false) < 1000,
+            "withheld bytes are a marker"
+        );
+    }
+
+    /// `deltas_since_capped` stops before the entry that would cross
+    /// the budget, always returns one entry, and flags the cut.
+    #[test]
+    fn capped_deltas_stop_at_the_byte_budget() {
+        let store = DeviceStateStore::new();
+        for d in 0..4 {
+            store.apply_delta(
+                format!("dev-{d}"),
+                "inst".into(),
+                "cap".into(),
+                vec![kv("x", Value::StringVal("y".repeat(100)))],
+                0,
+                0,
+            );
+        }
+        let sizing = PageSizing::Wire { blobs: true };
+        let one = store
+            .snapshot_capability("dev-0", "cap")
+            .expect("entry")
+            .wire_size_bound(true);
+        let page = store.deltas_since_capped(0, 10, one * 2, sizing);
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.truncated);
+        let page = store.deltas_since_capped(0, 10, 1, sizing);
+        assert_eq!(page.entries.len(), 1, "the first entry always fits");
+        assert!(page.truncated);
+        let page = store.deltas_since_capped(0, 2, usize::MAX, sizing);
+        assert_eq!(page.entries.len(), 2);
+        assert!(!page.truncated, "cut by the limit, not the budget");
+        let page = store.deltas_since_capped(0, 10, usize::MAX, sizing);
+        assert_eq!(page.entries.len(), 4);
+        assert!(!page.truncated);
     }
 
     /// H2: a sealed `list-state` position hides the device id, round-
@@ -3701,7 +3971,14 @@ mod tests {
         ] {
             store.apply_delta(d.into(), "inst".into(), cap.into(), Vec::new(), 0, 0);
         }
-        let page = store.snapshot_page_capped(Some("dev-a"), 1, usize::MAX, usize::MAX, |_| true);
+        let page = store.snapshot_page_capped(
+            Some("dev-a"),
+            1,
+            usize::MAX,
+            PageSizing::Estimate,
+            usize::MAX,
+            |_| true,
+        );
         let ids: Vec<_> = page
             .devices
             .iter()

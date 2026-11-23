@@ -1262,6 +1262,9 @@ struct StatusBody {
     /// H3: durable event-mirror health — whether live events are
     /// currently delivered without history rows, and how many were.
     event_log: crate::state::EventLogHealth,
+    /// H2: durable device-state projection flush health — whether
+    /// changes are queued in memory because flushes fail, and why.
+    device_state: crate::state::DeviceStateHealth,
 }
 
 async fn status_read(engine: Engine) -> ReadOutcome {
@@ -1291,6 +1294,7 @@ async fn status_read(engine: Engine) -> ReadOutcome {
         running_instances: engine.instances().list().len(),
         devices: engine.devices().list().len(),
         event_log: engine.event_log().health(),
+        device_state: engine.device_state().flush_health(),
     };
     encode(&body, "status")
 }

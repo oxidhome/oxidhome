@@ -56,5 +56,8 @@ rule that a disk problem never stops live control, and it must not add disk work
   that window resync.
 - Each boot uses 2^32 revisions, which keeps revisions below 2^53 for about two million restarts.
 - Installs that predate `reads_state` have no grant until an operator grants one.
-- Follow-ups: expose flush health (pending keys, last error) in `readyz` and `oxidhome://status`, and add an operator
-  API to narrow `reads_state` grants.
+- Flush health (degraded, last error, pending keys) is reported by `readyz`, Connect `HealthService.Check` and
+  `oxidhome://status`, and each flush stores a consistency marker (row count and a checksum over the meta row) so
+  damage that still decodes starts a new history instead of keeping cursors valid.
+- Follow-ups: an operator API to narrow `reads_state` grants; a renewable revision reservation for a process that
+  issues more than 2^32 unflushed changes; the in-process two-store load/claim race.

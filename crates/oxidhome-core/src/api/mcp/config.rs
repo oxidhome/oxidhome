@@ -2,7 +2,7 @@
 //! `oxidhome://config` resource and `GET /api/v1/config`.
 //!
 //! This is the *host* configuration: where state lives, what address
-//! the API listens on, event-log retention, the stdout log filter and
+//! the API listens on, retention, the stdout log filter and
 //! the MCP mount's compiled-in limits, plus the build and plugin
 //! contract versions. Per-instance plugin config is a different thing
 //! and stays on `oxidhome://plugins/{id}` (masked, M7).
@@ -31,8 +31,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::state::EventLogRetention;
-use crate::state::event_log::{ENV_EVENT_LOG_MAX_ROWS, ENV_EVENT_LOG_RETENTION_DAYS};
+use crate::state::{
+    AUDIT_RETENTION_ENV, EVENT_LOG_RETENTION_ENV, LOG_RETENTION_ENV, RetentionConfig, RetentionEnv,
+    RetentionPolicy,
+};
 
 /// Environment variable naming the state directory.
 pub const ENV_STATE_DIR: &str = "OXIDHOME_STATE_DIR";
@@ -108,7 +110,7 @@ pub enum DaemonMode {
     McpStdio,
 }
 
-/// Event-log retention, as applied by the retention task.
+/// One table's retention, as applied by its retention task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct RetentionView {
     /// Maximum event age in days; `null` = no age limit.
@@ -122,13 +124,13 @@ struct RetentionView {
 }
 
 impl RetentionView {
-    fn new(retention: &EventLogRetention) -> Self {
+    fn new(retention: &RetentionPolicy, env: &RetentionEnv) -> Self {
         Self {
             max_age_days: Setting::from_env(
                 retention.max_age.map(|age| age.as_secs() / 86_400),
-                ENV_EVENT_LOG_RETENTION_DAYS,
+                env.days_var,
             ),
-            max_rows: Setting::from_env(retention.max_rows, ENV_EVENT_LOG_MAX_ROWS),
+            max_rows: Setting::from_env(retention.max_rows, env.rows_var),
             interval_secs: Setting::fixed(retention.interval.as_secs()),
             first_delay_secs: Setting::fixed(retention.first_delay.as_secs()),
         }
@@ -155,6 +157,10 @@ pub struct DaemonConfig {
     dev_plugin_dir: Option<Setting<String>>,
     log_filter: Setting<String>,
     event_log_retention: RetentionView,
+    /// Diagnostic-log (`log_event`) retention.
+    log_retention: RetentionView,
+    /// Audit-ledger (`audit_event`) retention.
+    audit_retention: RetentionView,
 }
 
 impl DaemonConfig {
@@ -163,7 +169,7 @@ impl DaemonConfig {
     /// the environment, so call this from the process that resolved
     /// them.
     #[must_use]
-    pub fn resolve(mode: DaemonMode, state_dir: &Path, retention: &EventLogRetention) -> Self {
+    pub fn resolve(mode: DaemonMode, state_dir: &Path, retention: &RetentionConfig) -> Self {
         Self {
             mode,
             state_dir: Setting::from_env(lossy(state_dir), ENV_STATE_DIR),
@@ -171,7 +177,9 @@ impl DaemonConfig {
             listen_addr: None,
             dev_plugin_dir: None,
             log_filter: effective_log_filter(),
-            event_log_retention: RetentionView::new(retention),
+            event_log_retention: RetentionView::new(&retention.event_log, &EVENT_LOG_RETENTION_ENV),
+            log_retention: RetentionView::new(&retention.logs, &LOG_RETENTION_ENV),
+            audit_retention: RetentionView::new(&retention.audit, &AUDIT_RETENTION_ENV),
         }
     }
 
@@ -393,7 +401,15 @@ mod tests {
             listen_addr: Some("127.0.0.1:7780".parse().unwrap()),
             dev_plugin_dir: None,
             log_filter: Setting::fixed(DEFAULT_LOG_FILTER.to_owned()),
-            event_log_retention: RetentionView::new(&EventLogRetention::default()),
+            event_log_retention: RetentionView::new(
+                &RetentionConfig::default().event_log,
+                &EVENT_LOG_RETENTION_ENV,
+            ),
+            log_retention: RetentionView::new(&RetentionConfig::default().logs, &LOG_RETENTION_ENV),
+            audit_retention: RetentionView::new(
+                &RetentionConfig::default().audit,
+                &AUDIT_RETENTION_ENV,
+            ),
         }
     }
 
@@ -414,12 +430,20 @@ mod tests {
         let retention = &body["daemon"]["event_log_retention"];
         assert_eq!(retention["max_age_days"]["value"], 30);
         assert_eq!(
-            retention["max_rows"]["env"], ENV_EVENT_LOG_MAX_ROWS,
+            retention["max_rows"]["env"], EVENT_LOG_RETENTION_ENV.rows_var,
             "overridable settings name their variable",
         );
         assert!(
             retention["interval_secs"].get("env").is_none(),
             "fixed settings name no variable",
+        );
+        assert_eq!(
+            body["daemon"]["audit_retention"]["max_age_days"]["value"],
+            365
+        );
+        assert_eq!(
+            body["daemon"]["log_retention"]["max_rows"]["env"],
+            "OXIDHOME_LOG_MAX_ROWS"
         );
         assert_eq!(body["mcp"]["max_sessions"]["value"], 128);
         assert_eq!(body["mcp"]["max_sessions"]["source"], "default");
@@ -435,11 +459,14 @@ mod tests {
 
     #[test]
     fn disabled_retention_limits_are_null() {
-        let view = RetentionView::new(&EventLogRetention {
-            max_age: None,
-            max_rows: None,
-            ..EventLogRetention::default()
-        });
+        let view = RetentionView::new(
+            &RetentionPolicy {
+                max_age: None,
+                max_rows: None,
+                ..RetentionPolicy::defaults(&EVENT_LOG_RETENTION_ENV)
+            },
+            &EVENT_LOG_RETENTION_ENV,
+        );
         let json = serde_json::to_value(view).unwrap();
         assert!(json["max_age_days"]["value"].is_null());
         assert!(json["max_rows"]["value"].is_null());
@@ -475,7 +502,7 @@ mod tests {
     fn non_utf8_state_dir_still_serializes() {
         use std::os::unix::ffi::OsStrExt as _;
         let dir = Path::new(std::ffi::OsStr::from_bytes(b"/srv/\xff/state"));
-        let cfg = DaemonConfig::resolve(DaemonMode::McpStdio, dir, &EventLogRetention::default());
+        let cfg = DaemonConfig::resolve(DaemonMode::McpStdio, dir, &RetentionConfig::default());
         let json = serde_json::to_value(config_body_for(Some(&cfg))).unwrap();
         assert!(json["daemon"]["state_dir"]["value"].is_string());
     }

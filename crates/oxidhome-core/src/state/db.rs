@@ -1297,12 +1297,63 @@ impl Db {
     {
         let ticket = self
             .write_gate
-            .acquire_low(self.policy.low_priority_max_defer);
+            .acquire_low(self.policy.low_priority_max_defer, &|| false)
+            .expect("an uncancellable wait is always admitted");
         let mut conn = WriterGuard {
             conn: self.conn.lock().expect("db mutex poisoned"),
             _ticket: ticket,
         };
         f(&mut conn)
+    }
+
+    /// [`Self::write_low_priority`] with a cancellable wait for the
+    /// writer: `cancelled` is checked before every wait, and after
+    /// every wakeup, including the ones
+    /// [`Self::wake_low_priority_writers`] forces. Once it returns
+    /// `true` the call gives up its place and returns `Ok(None)`
+    /// without running `f`; once the writer is granted `f` runs to
+    /// completion. Retention uses this so a stop request at shutdown
+    /// doesn't leave a chunk queued behind a hung write, to run after
+    /// the caller moved on.
+    ///
+    /// `cancelled` runs under the admission mutex, so it must be
+    /// cheap and must not take the writer.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` returns.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`Self::write`].
+    pub fn write_low_priority_unless<R, E>(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+        f: impl FnOnce(&mut Connection) -> Result<R, E>,
+    ) -> Result<Option<R>, E>
+    where
+        R: Send,
+    {
+        let Some(ticket) = self
+            .write_gate
+            .acquire_low(self.policy.low_priority_max_defer, cancelled)
+        else {
+            return Ok(None);
+        };
+        let mut conn = WriterGuard {
+            conn: self.conn.lock().expect("db mutex poisoned"),
+            _ticket: ticket,
+        };
+        f(&mut conn).map(Some)
+    }
+
+    /// Wake every caller waiting in
+    /// [`Self::write_low_priority_unless`] so it re-checks its
+    /// cancellation. Call it after setting whatever `cancelled`
+    /// reads.
+    pub fn wake_low_priority_writers(&self) {
+        let _state = self.write_gate.lock_state();
+        self.write_gate.changed.notify_all();
     }
 
     /// The writer at normal priority.
@@ -1452,12 +1503,28 @@ impl WriteGate {
         GateTicket { gate: self }
     }
 
-    fn acquire_low(&self, max_defer: Duration) -> GateTicket<'_> {
+    /// `None` when `cancelled` turned true before the writer was
+    /// granted; the caller has then left the queue.
+    fn acquire_low(
+        &self,
+        max_defer: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<GateTicket<'_>> {
         let deadline = Instant::now().checked_add(max_defer);
         let mut state = self.lock_state();
         state.low_waiting += 1;
         let mut overdue = false;
         loop {
+            if cancelled() {
+                state.low_waiting -= 1;
+                if overdue {
+                    state.overdue -= 1;
+                }
+                // Normal waiters may have been standing aside for this
+                // caller's owed turn.
+                self.changed.notify_all();
+                return None;
+            }
             let now = Instant::now();
             if !overdue && deadline.is_some_and(|d| now >= d) {
                 overdue = true;
@@ -1491,7 +1558,7 @@ impl WriteGate {
         }
         state.held = true;
         state.last_was_low = true;
-        GateTicket { gate: self }
+        Some(GateTicket { gate: self })
     }
 }
 
@@ -2499,6 +2566,55 @@ mod tests {
         assert_eq!(logs, 5_001);
     }
 
+    /// A low-priority caller queued behind a hung writer leaves the
+    /// queue once cancelled and woken, without running its closure,
+    /// and the gate's counters are back to idle.
+    #[test]
+    fn cancelled_low_priority_wait_gives_up_its_place() {
+        use std::sync::atomic::AtomicBool;
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.write(|_| {
+                    held_tx.send(()).expect("held");
+                    release_rx.recv().expect("release");
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .expect("hold");
+            })
+        };
+        held_rx.recv().expect("writer held");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let db = Arc::clone(&db);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                db.write_low_priority_unless(&|| cancel.load(Ordering::SeqCst), |_| {
+                    Ok::<_, rusqlite::Error>("ran")
+                })
+            })
+        };
+        wait_until("low-priority caller queued", || {
+            db.waiting_low_priority_writers() == 1
+        });
+        cancel.store(true, Ordering::SeqCst);
+        db.wake_low_priority_writers();
+        assert_eq!(waiter.join().expect("waiter").expect("no error"), None);
+        assert_eq!(db.waiting_low_priority_writers(), 0);
+        assert_eq!(db.write_gate.lock_state().overdue, 0);
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+        // Not cancelled: runs as usual.
+        assert_eq!(
+            db.write_low_priority_unless(&|| false, |_| Ok::<_, rusqlite::Error>(1))
+                .expect("write"),
+            Some(1)
+        );
+    }
+
     /// Run `who` on a thread that takes the gate and appends its
     /// label to `order` while it owns the writer.
     fn gate_contender(
@@ -2511,7 +2627,7 @@ mod tests {
         let order = Arc::clone(order);
         std::thread::spawn(move || {
             let _ticket = match low_defer {
-                Some(defer) => gate.acquire_low(defer),
+                Some(defer) => gate.acquire_low(defer, &|| false).expect("admitted"),
                 None => gate.acquire_normal(),
             };
             order.lock().unwrap().push(who);

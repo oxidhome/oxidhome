@@ -162,12 +162,47 @@ pub(crate) fn queue_deny_audit(
         instance_id: instance_id.to_owned(),
         read,
     };
+    // Counted before the send, so a drain never sees a queued job as
+    // already written.
+    deny_audit_adjust(1);
     if deny_audit_queue().is_none_or(|q| q.try_send(job).is_err()) {
+        deny_audit_adjust(-1);
         DENY_AUDIT_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 static DENY_AUDIT_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Deny rows queued or being written, and the condvar a drain waits
+/// on for it to reach zero.
+static DENY_AUDIT_PENDING: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static DENY_AUDIT_IDLE: std::sync::Condvar = std::sync::Condvar::new();
+
+fn deny_audit_adjust(delta: isize) {
+    let mut pending = DENY_AUDIT_PENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *pending = pending.saturating_add_signed(delta);
+    if *pending == 0 {
+        DENY_AUDIT_IDLE.notify_all();
+    }
+}
+
+/// Wait up to `timeout` for every queued `get-state` deny row to be
+/// written (H2 follow-up). Called at shutdown after the supervisors
+/// stop, so the refusals they made reach the ledger. Returns whether
+/// the queue drained; on `false` the remaining rows may be lost (a
+/// hung disk must not hold shutdown). Process-wide: the worker is.
+#[must_use]
+pub fn drain_state_read_audit(timeout: std::time::Duration) -> bool {
+    let pending = DENY_AUDIT_PENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pending, _) = DENY_AUDIT_IDLE
+        .wait_timeout_while(pending, timeout, |n| *n > 0)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *pending == 0
+}
 
 /// The audit worker's queue, starting the worker on first use. Called
 /// from `PluginState::new` so the first refused read doesn't pay for
@@ -259,6 +294,7 @@ fn deny_audit_worker(
         if let Err(err) = job.log.record_completed(&entry) {
             tracing::error!(target: "host.audit", method, error = %err, "plugin-read deny row failed");
         }
+        deny_audit_adjust(-1);
     }
 }
 
@@ -342,6 +378,7 @@ impl host_state::Host for PluginState {
             after.as_deref(),
             limit,
             MAX_LIST_PAGE_BYTES,
+            crate::state::PageSizing::Estimate,
             LIST_SCAN_BUDGET,
             |e| {
                 filter.device.as_ref().is_none_or(|d| *d == e.device_id)
@@ -473,5 +510,40 @@ mod tests {
         assert!(marker.contains("reads_state.bytes"));
         let f = to_wit(&e, Visibility::Full);
         assert!(matches!(f.fields[0].value, Value::BytesVal(_)));
+    }
+
+    /// H2 follow-up: a shutdown drain waits for queued deny rows to be
+    /// written, and reports a queue that can't drain in time.
+    #[test]
+    fn drain_waits_for_queued_deny_rows() {
+        let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
+        let log = Arc::new(crate::state::AuditLog::new(Arc::clone(&db)));
+        assert!(drain_state_read_audit(std::time::Duration::ZERO));
+        // Hold the writer so the worker can't finish the rows yet.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.write(|_| {
+                    held_tx.send(()).expect("held");
+                    release_rx.recv().expect("release");
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .expect("hold");
+            })
+        };
+        held_rx.recv().expect("writer held");
+        for device in ["dev-a", "dev-b"] {
+            audit_state_denied(Some(Arc::clone(&log)), "inst", device);
+        }
+        assert!(
+            !drain_state_read_audit(std::time::Duration::from_millis(50)),
+            "rows are still waiting on the writer"
+        );
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+        assert!(drain_state_read_audit(std::time::Duration::from_secs(10)));
+        assert_eq!(log.count().expect("count"), 2);
     }
 }

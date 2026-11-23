@@ -237,6 +237,11 @@ message ListDeviceStateResponse {
   repeated DeviceStateSnapshot devices = 3;
   // Empty on the last page.
   string next_cursor = 4;
+  // The page holds fewer than `limit` devices because it reached the
+  // server's byte budget (an upper bound on the encoded size, kept
+  // well under a 4 MiB receive limit) or its scan budget;
+  // `next_cursor` is set. The first device is always sent whole.
+  bool truncated = 5;
 }
 
 message ListDeviceStateChangesRequest {
@@ -255,4 +260,8 @@ message ListDeviceStateChangesResponse {
   // eviction watermark, or inside a revision range skipped at boot):
   // resync with `ListDeviceState`.
   bool reset_required = 4;
+  // The server's byte budget cut the page short: more changes follow
+  // even though `changes` holds fewer than `limit` entries. Advance
+  // the cursor to the highest returned revision and poll again.
+  bool truncated = 5;
 }

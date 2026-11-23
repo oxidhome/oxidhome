@@ -257,15 +257,54 @@ fn scrub_opt(text: Option<&str>) -> Option<std::borrow::Cow<'_, str>> {
 /// `Arc<Db>`.
 pub struct AuditLog {
     db: Arc<Db>,
+    /// Highest row id when this handle was created: a pending row
+    /// above it was written by this process and may still be
+    /// finalized, so retention keeps it.
+    boot_floor: i64,
 }
 
 impl AuditLog {
     /// Wrap the shared [`Db`]. The `audit_event` table is created by
     /// the migration list in [`super::db`]; no per-instance setup
     /// runs here.
+    ///
+    /// Reads the highest row id, which retention uses to tell this
+    /// process's pending rows from abandoned ones; if that read fails
+    /// every pending row is kept.
     #[must_use]
     pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+        let boot_floor = db
+            .read(|c| {
+                c.query_row("SELECT COALESCE(MAX(id), 0) FROM audit_event", [], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap_or(0);
+        Self { db, boot_floor }
+    }
+
+    /// Spawn the periodic audit retention task on the current tokio
+    /// runtime (see [`crate::state::retention`]). Deletes rows whose
+    /// intent is older than `policy.max_age` or that fall beyond the
+    /// newest `policy.max_rows`, except rows an unfinished write
+    /// still needs:
+    ///
+    /// - a pending row (`finalized_ms` NULL) written by this process,
+    ///   which its request may still finalize. A pending row from an
+    ///   earlier process (an abandoned request) goes only by age,
+    ///   never by the row limit;
+    /// - an `accepted` device-command row (H5) whose `COMMAND`
+    ///   resolution row (same `call_id` and `command_id`) hasn't been
+    ///   written yet.
+    ///
+    /// The newest row is never deleted, so ids are not reused. `None`
+    /// with no limits.
+    #[must_use]
+    pub fn spawn_retention(
+        self: &Arc<Self>,
+        policy: crate::state::RetentionPolicy,
+    ) -> Option<crate::state::RetentionTask> {
+        crate::state::retention::spawn(Arc::clone(self), policy)
     }
 
     /// Phase 1 of the two-phase write. Insert a `decision = "pending"`
@@ -643,6 +682,54 @@ pub fn credential_fingerprint(bearer: &str) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// Rows retention may delete (`?1` cutoff, `?2` row bound, `?3` boot
+/// floor); see [`AuditLog::spawn_retention`].
+const AUDIT_RETENTION_DUE: &str = "\
+    ((?1 IS NOT NULL AND intent_ms < ?1) OR (?2 IS NOT NULL AND id <= ?2)) \
+    AND NOT (finalized_ms IS NULL AND (id > ?3 OR ?1 IS NULL OR intent_ms >= ?1)) \
+    AND NOT (command_outcome IS 'accepted' AND NOT EXISTS ( \
+        SELECT 1 FROM audit_event AS r WHERE r.call_id = audit_event.call_id \
+        AND r.method = 'COMMAND' AND r.command_id = audit_event.command_id))";
+
+impl crate::state::retention::RetentionTarget for AuditLog {
+    type Plan = crate::state::retention::IdWindowPlan;
+
+    const TABLE: &'static str = "audit_event";
+
+    fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
+    fn plan(
+        &self,
+        cutoff_ms: Option<i64>,
+        max_rows: Option<u64>,
+    ) -> anyhow::Result<Option<Self::Plan>> {
+        Ok(crate::state::retention::plan_id_window(
+            &self.db,
+            "audit_event",
+            "intent_ms",
+            cutoff_ms,
+            max_rows,
+        )?)
+    }
+
+    fn step(
+        &self,
+        plan: &mut Self::Plan,
+        stopped: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Option<usize>> {
+        Ok(crate::state::retention::step_id_window(
+            &self.db,
+            "audit_event",
+            AUDIT_RETENTION_DUE,
+            &[&self.boot_floor],
+            plan,
+            stopped,
+        )?)
+    }
 }
 
 #[cfg(test)]
