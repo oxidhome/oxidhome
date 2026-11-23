@@ -69,7 +69,7 @@
 //! - **Durable (H2).** [`DeviceStateStore::open_persistent`] restores
 //!   the store from the `device_state` table at boot and starts a
 //!   flusher thread that writes changed slots back in coalesced
-//!   batches, off the publish path. See the [`persist`] module for
+//!   batches, off the publish path. See the `persist` submodule for
 //!   the freshness and revision rules across a restart.
 
 use std::collections::{BTreeMap, HashMap};
