@@ -2457,7 +2457,9 @@ fn js_string_escape(input: &str) -> String {
 ///   cursor.
 ///
 /// With `after_id` the stream delivers every history row with
-/// `id > after_id` exactly once and in id order, then continues live.
+/// `id > after_id` exactly once and in id order, then continues live;
+/// an accepted cursor is acknowledged by the `oxidhome-resume-after-id`
+/// header on the 101.
 ///
 /// **Ordering note.** Axum runs extractors in declaration order; a
 /// non-WS request rejects at `WebSocketUpgrade` with **426
@@ -2509,8 +2511,21 @@ async fn tail_events(
             );
         }
     };
-    Ok(upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail)))
+    let resume_after_id = tail.resume_after_id();
+    let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail));
+    if let Some(id) = resume_after_id {
+        response
+            .headers_mut()
+            .insert(RESUME_AFTER_ID_HEADER, axum::http::HeaderValue::from(id));
+    }
+    Ok(response)
 }
+
+/// H4: response header acknowledging an accepted `after_id` on the
+/// event tails (WebSocket 101 and Connect `TailEvents`), carrying the
+/// resolved cursor. Absent on live-only and expired-cursor streams,
+/// and on servers that predate cursor resume.
+pub(crate) const RESUME_AFTER_ID_HEADER: &str = "oxidhome-resume-after-id";
 
 /// Query string for `GET /api/v1/events/tail`.
 #[derive(Deserialize)]

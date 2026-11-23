@@ -1034,6 +1034,7 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
             tracing::error!(target: "api.events", error = %err, "connect events tail open failed");
             rpc_err(&ctx, ConnectError::unavailable("event history unavailable"))
         })?;
+        let resume_after_id = tail.resume_after_id();
         // The tail (and its `SubscriberToken`) lives in the unfold
         // state, so the bus slot is freed when the stream ends.
         let response_stream = futures_util::stream::unfold(Some(tail), |tail| async move {
@@ -1078,7 +1079,13 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
                 Some(tail),
             ))
         });
-        Response::stream_ok(response_stream)
+        // H4: acknowledge an accepted cursor, so a client can tell a
+        // resumed stream from a server that ignored `after_id`.
+        let response = Response::stream(response_stream);
+        Ok(match resume_after_id {
+            Some(id) => response.with_header(super::server::RESUME_AFTER_ID_HEADER, id),
+            None => response,
+        })
     }
 }
 

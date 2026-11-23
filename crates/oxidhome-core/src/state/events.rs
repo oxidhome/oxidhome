@@ -213,10 +213,15 @@ pub struct EventBus {
     /// before the new subscription existed, every later fan-out
     /// lands in its queue.
     last_row_id: Arc<AtomicU64>,
+    /// H4: like `last_row_id`, but raised only after the event's
+    /// fan-out to every subscriber queue finished. Idle cursor tails
+    /// replay up to this one, so they never re-read from history a
+    /// row that is still on its way into their queue.
+    queued_row_id: Arc<AtomicU64>,
 }
 
-/// H4: read handle on the bus's fanned-out row-id watermark (see
-/// [`EventBus::fanned_out_row_id`]). Holds only the counter, not the
+/// H4: read handle on the bus's queued row-id watermark (see
+/// [`EventBus::row_watermark`]). Holds only the counter, not the
 /// bus, so a holder doesn't keep subscriber senders alive past engine
 /// shutdown.
 #[derive(Debug, Clone)]
@@ -366,6 +371,7 @@ impl EventBus {
             rate_refill_per_sec: DEFAULT_PUBLISH_RATE_PER_SEC,
             publish_sequence: Arc::new(tokio::sync::Mutex::new(())),
             last_row_id: Arc::new(AtomicU64::new(0)),
+            queued_row_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -375,6 +381,7 @@ impl EventBus {
     /// them from history before switching to live delivery.
     pub fn note_history_head(&self, head: u64) {
         self.last_row_id.fetch_max(head, Ordering::AcqRel);
+        self.queued_row_id.fetch_max(head, Ordering::AcqRel);
     }
 
     /// H4: highest row id fanned out so far (or the boot-time
@@ -386,10 +393,12 @@ impl EventBus {
         self.last_row_id.load(Ordering::Acquire)
     }
 
-    /// H4: a [`RowWatermark`] handle on [`Self::fanned_out_row_id`].
+    /// H4: a [`RowWatermark`] handle on the highest row id whose
+    /// fan-out has finished: every recorded event up to it is in each
+    /// matching subscriber's queue, or was dropped from it.
     #[must_use]
     pub fn row_watermark(&self) -> RowWatermark {
-        RowWatermark(Arc::clone(&self.last_row_id))
+        RowWatermark(Arc::clone(&self.queued_row_id))
     }
 
     /// H4: subscribe and snapshot the fanned-out row-id watermark
@@ -581,6 +590,9 @@ impl EventBus {
                     // the subscription is going away.
                 }
             }
+        }
+        if let Some(id) = event_id {
+            self.queued_row_id.fetch_max(id, Ordering::AcqRel);
         }
         self.signal_wakes(event.as_ref());
         delivered

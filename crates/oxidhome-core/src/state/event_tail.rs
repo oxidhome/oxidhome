@@ -84,7 +84,10 @@ pub enum TailItem {
     /// A bus event, live or replayed from history.
     Event(Arc<Event>),
     /// The subscriber queue dropped `skipped` events. `resume_after_id`
-    /// is the highest row id this stream delivered before the drop.
+    /// is the stream's resume cursor when the notice is emitted: the
+    /// highest row id delivered so far (in cursor mode possibly
+    /// including rows already re-read from history, or the opening
+    /// cursor if nothing was delivered yet).
     /// Cursor-mode streams re-read the dropped recorded events from
     /// history themselves, so for them the notice is informational.
     Lagged {
@@ -178,6 +181,21 @@ impl EventTail {
             }
         }
         Ok(tail)
+    }
+
+    /// The cursor this stream resumes from: `Some` once a cursor
+    /// open was accepted (before any item is taken it is the resolved
+    /// `after_id`; `0` resolves to just below the oldest retained
+    /// row). `None` for live-only streams and expired cursors. The
+    /// transports echo it as the `oxidhome-resume-after-id` response
+    /// header, so a client can tell a resumed stream from a server
+    /// that ignored `after_id`.
+    #[must_use]
+    pub fn resume_after_id(&self) -> Option<u64> {
+        match self.mode {
+            Mode::Cursor { cursor } if !self.finished => Some(cursor),
+            _ => None,
+        }
     }
 
     /// Next item, or `Ok(None)` once the stream is over (bus shut

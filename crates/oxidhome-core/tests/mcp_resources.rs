@@ -1175,3 +1175,59 @@ async fn blobs_resource_requires_blobs_read_scope() {
         "devices:list must not satisfy blobs:read; got {response}",
     );
 }
+
+/// H4: a pruned `after_id` on `oxidhome://events` fails with the
+/// `cursor_expired` error instead of silently returning the rows
+/// after the gap.
+#[tokio::test(flavor = "current_thread")]
+async fn events_resource_reports_pruned_cursor() {
+    use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::{
+        CustomEvent, Event, EventPayload,
+    };
+
+    let engine = Engine::new().expect("engine");
+    for n in 1..=4 {
+        let event = Event {
+            device: None,
+            timestamp: 0,
+            origin_plugin_id: "com.example.res".into(),
+            origin_instance_id: "res-a".into(),
+            row_id: None,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: "res.expire".into(),
+                payload: String::new(),
+            }),
+        };
+        engine
+            .event_log()
+            .record(n, &event, "res-a", "com.example.res")
+            .expect("record");
+    }
+    engine.event_log().trim_older_than(4).expect("trim");
+    let bearer = mint_bearer(&engine);
+    let router = build_router(engine);
+    let (router, session) = handshake(router, &bearer).await;
+
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://events?after_id=2"}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32005, "{response}");
+    assert_eq!(
+        response["error"]["data"]["cursor_expired"],
+        json!({"after_id": 2, "oldest_id": 4, "head_id": 4}),
+    );
+    let response = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://events?after_id=3"}),
+    )
+    .await;
+    assert!(response["error"].is_null(), "{response}");
+}

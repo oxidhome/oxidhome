@@ -87,6 +87,29 @@ async fn ws_connect(
         .map(|(ws, _)| ws)
 }
 
+async fn ws_connect_with_response(
+    addr: SocketAddr,
+    query: &str,
+    token: &str,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tungstenite::handshake::client::Response,
+    ),
+    tungstenite::Error,
+> {
+    let mut request = format!("ws://{addr}/api/v1/events/tail{query}")
+        .into_client_request()
+        .expect("ws url");
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        format!("Bearer {token}").parse().expect("header"),
+    );
+    tokio_tungstenite::connect_async(request).await
+}
+
 async fn next_json<S>(ws: &mut S) -> Value
 where
     S: futures_util::Stream<Item = Result<Message, tungstenite::Error>> + Unpin,
@@ -110,9 +133,15 @@ async fn ws_tail_resumes_from_cursor_then_goes_live() {
         publish_recorded(&engine, n).await;
     }
     let (addr, server) = serve_engine(&engine).await;
-    let mut ws = ws_connect(addr, "?after_id=1", &token.plaintext)
+    let (mut ws, resp) = ws_connect_with_response(addr, "?after_id=1", &token.plaintext)
         .await
         .expect("connect");
+    assert_eq!(
+        resp.headers()
+            .get("oxidhome-resume-after-id")
+            .map(|v| v.to_str().expect("ascii")),
+        Some("1")
+    );
     // The subscription exists before the 101, so this live publish
     // can't fall between the replay and live delivery.
     publish_recorded(&engine, 4).await;
@@ -221,7 +250,7 @@ async fn connect_messages(body: Body, n: usize) -> (Vec<Value>, Option<Value>) {
     .map_or_else(|_| panic!("connect messages within 5s"), |end| (out, end))
 }
 
-async fn connect_tail(engine: &Engine, scopes: &[u8], request: &[u8]) -> Body {
+async fn connect_tail(engine: &Engine, scopes: &[u8], request: &[u8]) -> (Option<String>, Body) {
     let token = engine
         .auth_tokens()
         .create("connect", scopes)
@@ -239,7 +268,11 @@ async fn connect_tail(engine: &Engine, scopes: &[u8], request: &[u8]) -> Body {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
-    response.into_body()
+    let resume = response
+        .headers()
+        .get("oxidhome-resume-after-id")
+        .map(|v| v.to_str().expect("ascii").to_owned());
+    (resume, response.into_body())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -248,12 +281,13 @@ async fn connect_tail_resumes_from_cursor() {
     for n in 1..=3 {
         publish_recorded(&engine, n).await;
     }
-    let body = connect_tail(
+    let (resume, body) = connect_tail(
         &engine,
         br#"["events:tail","events:read"]"#,
         br#"{"afterId":"1"}"#,
     )
     .await;
+    assert_eq!(resume.as_deref(), Some("1"));
     publish_recorded(&engine, 4).await;
     let (messages, _) = connect_messages(body, 3).await;
     let ids: Vec<&Value> = messages.iter().map(|m| &m["event"]["rowId"]).collect();
@@ -267,12 +301,13 @@ async fn connect_tail_reports_cursor_expired_then_ends() {
         publish_recorded(&engine, n).await;
     }
     engine.event_log().trim_older_than(4).expect("trim");
-    let body = connect_tail(
+    let (resume, body) = connect_tail(
         &engine,
         br#"["events:tail","events:read"]"#,
         br#"{"afterId":"2"}"#,
     )
     .await;
+    assert_eq!(resume, None, "expired cursors are not acknowledged");
     let (messages, end) = connect_messages(body, 2).await;
     assert_eq!(
         messages,
@@ -287,7 +322,7 @@ async fn connect_tail_reports_cursor_expired_then_ends() {
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_tail_cursor_requires_events_read() {
     let engine = Engine::new().expect("engine");
-    let body = connect_tail(&engine, br#"["events:tail"]"#, br#"{"afterId":"0"}"#).await;
+    let (_, body) = connect_tail(&engine, br#"["events:tail"]"#, br#"{"afterId":"0"}"#).await;
     let (messages, end) = connect_messages(body, 1).await;
     assert_eq!(messages, Vec::<Value>::new());
     assert_eq!(
