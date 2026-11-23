@@ -8,6 +8,7 @@
 //! - the guest's `wasi:clocks` wall and monotonic clocks;
 //! - the supervisor's `tick_interval_ms` schedule;
 //! - the `accepted`-command TTL (H5);
+//! - the event bus's per-instance publish rate buckets;
 //! - the liveness watchdog's epoch counter.
 //!
 //! [`Clock::system`] — the default, and the only clock the daemon
@@ -25,8 +26,8 @@
 //! Not on the clock: KV and blob write times, log-store and
 //! command-journal row times (with the journal's `COMMAND` audit
 //! rows), request and call-service deadlines (H6 invocation
-//! deadlines), restart backoff, and shutdown grace periods. They keep
-//! reading real time under a virtual clock too.
+//! deadlines), restart backoff, shutdown grace periods, and retention
+//! cutoffs. They keep reading real time under a virtual clock too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -393,30 +394,30 @@ impl VirtualClock {
     /// Move the clock to `target(now)`, read and applied under one
     /// lock so concurrent advances add up.
     fn step(&self, target: impl FnOnce(Duration) -> Duration) {
-        let (wake, engines, ticks) = {
+        let wake = {
             let mut state = self.lock();
             let elapsed = target(state.elapsed);
             if elapsed <= state.elapsed {
                 return;
             }
+            // The epoch moves before the new time is observable: a
+            // call that starts at the new time arms its watchdog
+            // against the new epoch, not one the jump then overtakes.
             let ticks = epoch_ticks(state.elapsed, elapsed);
+            state.engines.retain(|e| e.strong_count() > 0);
+            for engine in state.engines.iter().filter_map(Weak::upgrade) {
+                for _ in 0..ticks {
+                    engine.increment_epoch();
+                }
+            }
             state.elapsed = elapsed;
-            let wake: Vec<Waker> = state
+            state
                 .timers
                 .values_mut()
                 .filter(|t| t.at <= elapsed)
                 .filter_map(|t| t.waker.take())
-                .collect();
-            state.engines.retain(|e| e.strong_count() > 0);
-            let engines: Vec<Arc<WasmtimeEngine>> =
-                state.engines.iter().filter_map(Weak::upgrade).collect();
-            (wake, engines, ticks)
+                .collect::<Vec<Waker>>()
         };
-        for engine in engines {
-            for _ in 0..ticks {
-                engine.increment_epoch();
-            }
-        }
         for waker in wake {
             waker.wake();
         }

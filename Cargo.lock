@@ -1575,6 +1575,7 @@ dependencies = [
  "anyhow",
  "oxidhome-core",
  "oxidhome-manifest",
+ "serde_json",
  "thiserror",
  "tokio",
  "toml",

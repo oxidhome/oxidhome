@@ -186,6 +186,8 @@ pub struct EventBus {
     rate_limiters: Mutex<HashMap<String, Arc<RateLimiter>>>,
     rate_capacity: f64,
     rate_refill_per_sec: f64,
+    /// Times the publish buckets' refill (see [`crate::clock`]).
+    clock: crate::clock::Clock,
     /// H5 review round-2 P2 F1: publisher-order sequencer. The
     /// host's `publish_event` awaits `event_log.record` on a
     /// blocking task and then calls `publish_with_id` — two
@@ -327,6 +329,7 @@ struct RateLimiter {
     state: Mutex<RateState>,
     capacity: f64,
     refill_per_sec: f64,
+    clock: crate::clock::Clock,
 }
 
 #[derive(Debug)]
@@ -336,15 +339,25 @@ struct RateState {
 }
 
 impl RateLimiter {
-    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+    fn new(capacity: f64, refill_per_sec: f64, clock: crate::clock::Clock) -> Self {
+        let last_refill = Self::now(&clock);
         Self {
             state: Mutex::new(RateState {
                 tokens: capacity,
-                last_refill: Instant::now(),
+                last_refill,
             }),
             capacity,
             refill_per_sec,
+            clock,
         }
+    }
+
+    /// `std::time::Instant::now()` on the system clock (as before the
+    /// clock seam), the virtual instant on a virtual one.
+    fn now(clock: &crate::clock::Clock) -> Instant {
+        clock
+            .as_virtual()
+            .map_or_else(Instant::now, |v| v.instant().into_std())
     }
 
     fn consume(&self) -> bool {
@@ -352,7 +365,7 @@ impl RateLimiter {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = Instant::now();
+        let now = Self::now(&self.clock);
         let elapsed = now.duration_since(s.last_refill).as_secs_f64();
         s.tokens = (s.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         s.last_refill = now;
@@ -401,10 +414,19 @@ impl EventBus {
             rate_limiters: Mutex::new(HashMap::new()),
             rate_capacity: DEFAULT_PUBLISH_BURST,
             rate_refill_per_sec: DEFAULT_PUBLISH_RATE_PER_SEC,
+            clock: crate::clock::Clock::system(),
             publish_sequence: Arc::new(tokio::sync::Mutex::new(())),
             last_row_id: Arc::new(AtomicU64::new(0)),
             queued_row_id: Arc::new(QueuedRowId::default()),
         }
+    }
+
+    /// Refill the publish buckets from `clock` instead of the system
+    /// clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: crate::clock::Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// H4: raise the fanned-out row-id watermark to `head` (the
@@ -694,6 +716,7 @@ impl EventBus {
         let l = Arc::new(RateLimiter::new(
             self.rate_capacity,
             self.rate_refill_per_sec,
+            self.clock.clone(),
         ));
         map.insert(instance_id.to_owned(), Arc::clone(&l));
         l
@@ -1092,6 +1115,18 @@ mod tests {
             bus.admit_publish("alpha")
                 .expect("under-limit admission must succeed");
         }
+    }
+
+    #[test]
+    fn publish_buckets_refill_on_the_virtual_clock() {
+        let clock = crate::clock::VirtualClock::new();
+        let bus = EventBus::new().with_clock(clock.clone().into());
+        while bus.admit_publish("alpha").is_ok() {}
+        // Real time passing refills nothing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(bus.admit_publish("alpha").is_err());
+        clock.advance(std::time::Duration::from_secs(1));
+        assert!(bus.admit_publish("alpha").is_ok());
     }
 
     #[test]

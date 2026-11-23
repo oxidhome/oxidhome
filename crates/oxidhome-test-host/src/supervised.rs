@@ -1,6 +1,6 @@
 //! [`SupervisedInstance`] — a plugin run by the production supervisor.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use oxidhome_core::runtime::PendingCommands;
@@ -10,7 +10,9 @@ use tokio::task::JoinHandle;
 
 use crate::TestHostError;
 use crate::live::IdLease;
-use crate::snapshot::{CommandRecord, Secrets, Snapshot, SnapshotOptions};
+use crate::snapshot::{
+    CommandRecord, HostRecords, Snapshot, SnapshotOptions, record_reply, reserve_command,
+};
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::Command;
@@ -40,7 +42,7 @@ pub struct SupervisedInstance {
     watcher: Option<JoinHandle<InstanceState>>,
     runtime: tokio::runtime::Handle,
     state_dir: Arc<TempDir>,
-    secrets: Arc<Secrets>,
+    secrets: Arc<HostRecords>,
     commands: Mutex<Vec<CommandRecord>>,
 }
 
@@ -50,7 +52,7 @@ impl SupervisedInstance {
         handle: InstanceHandle,
         lease: IdLease,
         state_dir: Arc<TempDir>,
-        secrets: Arc<Secrets>,
+        secrets: Arc<HostRecords>,
     ) -> Self {
         let plugin_id: Arc<str> = handle.plugin_id().into();
         let watcher = {
@@ -162,9 +164,9 @@ impl SupervisedInstance {
         command: Command,
     ) -> CommandReport {
         let device = device.into();
-        let (capability, action) = (command.capability.clone(), command.action.clone());
-        let report = self.handle.execute_command(device.clone(), command).await;
-        self.record(device, capability, action, &report);
+        let slot = self.reserve(&device, &command);
+        let report = self.handle.execute_command(device, command).await;
+        self.record(slot, &report);
         report
     }
 
@@ -182,26 +184,30 @@ impl SupervisedInstance {
         let ctx = oxidhome_core::auth::InvocationContext::host_origin(self.handle.instance_id())
             .with_deadline(Some(tokio::time::Instant::now() + budget));
         let device = device.into();
-        let (capability, action) = (command.capability.clone(), command.action.clone());
-        let report = self
-            .handle
-            .execute_command_in(ctx, device.clone(), command)
-            .await;
-        self.record(device, capability, action, &report);
+        let slot = self.reserve(&device, &command);
+        let report = self.handle.execute_command_in(ctx, device, command).await;
+        self.record(slot, &report);
         report
     }
 
-    fn record(&self, device: String, capability: String, action: String, report: &CommandReport) {
-        self.commands
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(CommandRecord {
-                device,
-                capability,
-                action,
-                command_id: report.command_id.clone(),
-                outcome: report.outcome.clone(),
-            });
+    /// The command's place in the history, in send order.
+    fn reserve(&self, device: &str, command: &Command) -> usize {
+        reserve_command(
+            &self.commands,
+            device.to_owned(),
+            command.capability.clone(),
+            command.action.clone(),
+        )
+    }
+
+    fn record(&self, slot: usize, report: &CommandReport) {
+        record_reply(
+            &self.commands,
+            &self.secrets,
+            slot,
+            &report.command_id,
+            report.outcome.clone(),
+        );
     }
 
     /// The engine's table of accepted-but-unfinished commands (H5), for

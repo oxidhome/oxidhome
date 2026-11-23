@@ -115,6 +115,12 @@ pub enum TestHostError {
         /// command journal.
         writer: &'static str,
     },
+    /// More audit rows than one snapshot prints.
+    #[error("more than {limit} audit rows; an audit snapshot would be partial")]
+    AuditTooLarge {
+        /// The most rows a snapshot prints.
+        limit: usize,
+    },
     /// A virtual-clock operation on a host built with
     /// [`crate::TestHost::new`], which runs on the real clock.
     #[error(

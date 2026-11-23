@@ -14,7 +14,7 @@ use crate::TestHostError;
 use crate::grant::grant_excess;
 use crate::instance::TestPluginInstance;
 use crate::live::{IdLease, LiveIds};
-use crate::snapshot::Secrets;
+use crate::snapshot::HostRecords;
 use crate::supervised::SupervisedInstance;
 use crate::tempdir::TempDir;
 use crate::wit::devices::CommandResult;
@@ -54,7 +54,7 @@ pub struct TestHost {
     state_dir: Arc<TempDir>,
     /// Every loaded instance's secret config values, for snapshot
     /// redaction.
-    secrets: Arc<Secrets>,
+    secrets: Arc<HostRecords>,
 }
 
 /// Per-load knobs for [`TestHost::load_with`] and

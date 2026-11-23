@@ -42,6 +42,8 @@ path = "tests/network.rs"
 anyhow.workspace = true
 oxidhome-core.workspace = true
 oxidhome-manifest.workspace = true
+# Parses JSON values in snapshots to mask structured credentials.
+serde_json.workspace = true
 thiserror.workspace = true
 # Supervised instances run on Tokio (the supervisor is a task), and
 # `block_on` owns a runtime for synchronous tests.

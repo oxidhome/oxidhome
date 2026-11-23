@@ -186,8 +186,10 @@ pub(crate) struct CommandRecord {
     pub(crate) device: String,
     pub(crate) capability: String,
     pub(crate) action: String,
+    /// Empty until the reply.
     pub(crate) command_id: String,
-    pub(crate) outcome: CommandOutcome,
+    /// `None` while the command is in flight.
+    pub(crate) outcome: Option<CommandOutcome>,
 }
 
 /// How long a snapshot waits for background audit writers.
@@ -196,22 +198,76 @@ const AUDIT_FLUSH: Duration = Duration::from_secs(10);
 /// Upper bound on the audit rows one snapshot reads.
 const AUDIT_ROWS: usize = 100_000;
 
-/// Every secret config value of every instance loaded on one host.
-/// Snapshots mask them all: an instance id's stored data and events
-/// outlive a reload with a rotated secret.
+/// What one host's snapshots redact with, across every instance it
+/// loaded: an instance id's stored data and events outlive a reload
+/// (with a rotated secret, or a fresh command history).
 #[derive(Debug, Default)]
-pub(crate) struct Secrets(Mutex<BTreeSet<String>>);
+pub(crate) struct HostRecords {
+    /// Every instance's secret config values.
+    secrets: Mutex<BTreeSet<String>>,
+    /// Every command id the harness sent, in send order.
+    command_ids: Mutex<Vec<String>>,
+}
 
-impl Secrets {
+impl HostRecords {
     pub(crate) fn add<'s>(&self, values: impl IntoIterator<Item = &'s str>) {
-        let mut set = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut set = self.secrets.lock().unwrap_or_else(PoisonError::into_inner);
         set.extend(values.into_iter().map(str::to_owned));
     }
 
-    fn all(&self) -> Vec<String> {
-        let set = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+    fn secret_values(&self) -> Vec<String> {
+        let set = self.secrets.lock().unwrap_or_else(PoisonError::into_inner);
         set.iter().cloned().collect()
     }
+
+    fn command_ids(&self) -> Vec<String> {
+        self.command_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// A command's place in an instance's history, taken before it is
+/// sent so the history keeps send order (see [`CommandRecord`]).
+pub(crate) fn reserve_command(
+    commands: &Mutex<Vec<CommandRecord>>,
+    device: String,
+    capability: String,
+    action: String,
+) -> usize {
+    let mut list = commands.lock().unwrap_or_else(PoisonError::into_inner);
+    list.push(CommandRecord {
+        device,
+        capability,
+        action,
+        command_id: String::new(),
+        outcome: None,
+    });
+    list.len() - 1
+}
+
+/// Fill in the reply for the command [`reserve_command`] placed at
+/// `slot`.
+pub(crate) fn record_reply(
+    commands: &Mutex<Vec<CommandRecord>>,
+    host: &HostRecords,
+    slot: usize,
+    command_id: &str,
+    outcome: CommandOutcome,
+) {
+    if let Some(record) = commands
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_mut(slot)
+    {
+        command_id.clone_into(&mut record.command_id);
+        record.outcome = Some(outcome);
+    }
+    host.command_ids
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(command_id.to_owned());
 }
 
 impl Snapshot {
@@ -300,17 +356,20 @@ impl Snapshot {
             commands,
             audit,
         };
-        let secrets = instance.secrets.all();
+        let secrets = instance.secrets.secret_values();
         let mut redactor = Redactor::new(&options.redactions, &secrets);
-        // Number the commands' ids in the order they were sent, not in
-        // the order the snapshot happens to print them.
-        for record in instance
+        // Number the commands' ids in the order they were sent — this
+        // instance's first, then earlier loads' — not in the order the
+        // snapshot happens to print them.
+        let own: Vec<String> = instance
             .commands
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-        {
-            let _ = redactor.minted_ids(&record.command_id);
+            .map(|r| r.command_id.clone())
+            .collect();
+        for id in own.iter().chain(&instance.secrets.command_ids()) {
+            let _ = redactor.minted_ids(id);
         }
         redactor.apply(&mut snapshot);
         Ok(snapshot)
@@ -423,6 +482,15 @@ impl fmt::Display for Snapshot {
     }
 }
 
+/// `t` in Unix milliseconds, negative before the epoch.
+fn signed_unix_ms(t: std::time::SystemTime) -> i64 {
+    let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(after) => ms(after),
+        Err(before) => -ms(before.duration()),
+    }
+}
+
 /// Renders host timestamps for [`SnapshotOptions::times`].
 enum Stamp {
     Off,
@@ -436,11 +504,7 @@ impl Stamp {
         match (on, clock.as_virtual()) {
             (false, _) => Self::Off,
             (true, None) => Self::RealClock,
-            (true, Some(v)) => Self::Since(
-                v.start()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
-            ),
+            (true, Some(v)) => Self::Since(signed_unix_ms(v.start())),
         }
     }
 
@@ -450,6 +514,8 @@ impl Stamp {
         match *self {
             Self::Off => String::new(),
             Self::RealClock => " @?".to_owned(),
+            // Stamps clamp at the epoch: one there can't be placed.
+            Self::Since(start) if start < 0 && ms == 0 => " @?".to_owned(),
             Self::Since(start) => {
                 let rel = ms.saturating_sub(start);
                 let sign = if rel < 0 { '-' } else { '+' };
@@ -505,13 +571,23 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
     let latest: HashMap<&str, usize> = records
         .iter()
         .enumerate()
+        .filter(|(_, r)| matches!(r.outcome, Some(CommandOutcome::Accepted)))
         .map(|(i, r)| (r.command_id.as_str(), i))
         .collect();
     records
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let detail = match &r.outcome {
+            let head = format!(
+                "{} {}.{} ->",
+                tok(&r.device),
+                tok(&r.capability),
+                tok(&r.action),
+            );
+            let Some(outcome) = &r.outcome else {
+                return format!("{head} (in flight)");
+            };
+            let detail = match outcome {
                 CommandOutcome::Accepted
                     if latest.get(r.command_id.as_str()) == Some(&i)
                         && pending.is_pending(&r.command_id) =>
@@ -528,13 +604,7 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
                     format!(" {}", esc(message))
                 }
             };
-            format!(
-                "{} {}.{} -> {}{detail}",
-                tok(&r.device),
-                tok(&r.capability),
-                tok(&r.action),
-                r.outcome.as_str(),
-            )
+            format!("{head} {}{detail}", outcome.as_str())
         })
         .collect()
 }
@@ -561,7 +631,13 @@ fn render_audit(instance: &InstanceRef<'_>) -> Result<Vec<String>, TestHostError
         token_id: Some(instance.instance_id.to_owned()),
         ..AuditQuery::default()
     };
-    let mut rows = instance.engine.audit_log().query(&query, AUDIT_ROWS)?;
+    let mut rows = instance
+        .engine
+        .audit_log()
+        .query(&query, AUDIT_ROWS.saturating_add(1))?;
+    if rows.len() > AUDIT_ROWS {
+        return Err(TestHostError::AuditTooLarge { limit: AUDIT_ROWS });
+    }
     rows.sort_by_key(|r| r.id);
     Ok(rows.iter().map(render_audit_row).collect())
 }
@@ -638,12 +714,15 @@ impl<'a> Redactor<'a> {
                     s.escape_debug().to_string(),
                     json.escape_debug().to_string(),
                     json,
-                    s.bytes().fold(String::new(), |mut hex, b| {
-                        let _ = write!(hex, "{b:02x}");
-                        hex
-                    }),
+                    hex(s.as_bytes()),
                 ]
             })
+            .chain(raw.iter().flat_map(|s| {
+                // A bytes value cut off mid-secret: its shown prefix.
+                let bytes = s.as_bytes();
+                (MIN_CUT_SECRET..bytes.len())
+                    .map(move |n| format!("{}{TRUNCATED}", hex(&bytes[..n])))
+            }))
             .collect();
         secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         secrets.dedup();
@@ -706,6 +785,19 @@ impl<'a> Redactor<'a> {
     }
 }
 
+/// Marks a bytes value cut off after its first bytes.
+const TRUNCATED: char = '…';
+
+/// Shortest secret prefix masked where a bytes value is cut off.
+const MIN_CUT_SECRET: usize = 4;
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
 /// `text` escaped as inside a JSON string.
 fn json_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -763,11 +855,21 @@ pub fn render_value(value: &Value) -> String {
                 let _ = write!(out, "{b:02x}");
             }
             if bytes.len() > SHOWN {
-                let _ = write!(out, "…({} bytes)", bytes.len());
+                let _ = write!(out, "{TRUNCATED}({} bytes)", bytes.len());
             }
             out
         }
-        Value::JsonVal(json) => format!("json:{json:?}"),
+        Value::JsonVal(json) => {
+            // Structured credentials (`{"password": …}`, a `key-value`
+            // whose key is credential-like) are masked as the API
+            // masks them; other JSON prints as stored.
+            let masked = serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|mut doc| {
+                    oxidhome_core::redact::redact_json(&mut doc).then(|| doc.to_string())
+                });
+            format!("json:{:?}", masked.as_deref().unwrap_or(json))
+        }
     }
 }
 
@@ -1080,6 +1182,28 @@ mod tests {
             ["doc = json:\"{\\\"k\\\": \\\"***\\\"}\"", "raw = 0x***"]
         );
         assert_eq!(json_escape("a\"b\\c\n\u{1}"), "a\\\"b\\\\c\\n\\u0001");
+        // A bytes value cut off mid-secret.
+        let long = "s".repeat(30) + "ecret!";
+        let mut snap = sample();
+        snap.storage = vec![format!(
+            "raw = {}",
+            render_value(&Value::BytesVal([b"ab", long.as_bytes()].concat()))
+        )];
+        Redactor::new(&[], &[long]).apply(&mut snap);
+        assert_eq!(snap.storage, ["raw = 0x6162***(38 bytes)"]);
+        // Structured credentials in JSON, as the API masks them.
+        assert_eq!(
+            render_value(&Value::JsonVal(
+                "{\"key\":\"password\",\"value\":\"hunter2\"}".into()
+            )),
+            format!(
+                "json:{:?}",
+                format!(
+                    "{{\"key\":\"password\",\"value\":\"{}\"}}",
+                    oxidhome_core::redact::REDACTED
+                )
+            )
+        );
         // A seeded id keeps its number wherever it shows up first.
         let mut snap = sample();
         snap.storage = vec![format!("{cmd_a} = 1"), format!("{cmd_b} = 2")];
@@ -1113,6 +1237,13 @@ mod tests {
         assert_eq!(stamp.at(11_500), " @+1.500s");
         assert_eq!(stamp.at(10_000), " @+0.000s");
         assert_eq!(stamp.at(9_000), " @-1.000s");
+        // Before the epoch, stamps clamped to it can't be placed.
+        let early = Clock::from(oxidhome_core::VirtualClock::starting_at(
+            UNIX_EPOCH - Duration::from_secs(1),
+        ));
+        let stamp = Stamp::new(&early, true);
+        assert_eq!(stamp.at(1_000), " @+2.000s");
+        assert_eq!(stamp.at(0), " @?");
     }
 
     #[test]

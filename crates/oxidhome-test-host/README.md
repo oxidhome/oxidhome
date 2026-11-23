@@ -137,7 +137,8 @@ five:
   instance's devices, with ` stale` once it stopped;
 - `.commands()` — every command the test sent through the harness and
   its outcome (`completed`, `rejected`, `accepted (pending)` /
-  `accepted (resolved)`, `timed_out`, `outcome_unknown`);
+  `accepted (resolved)`, `timed_out`, `outcome_unknown`, or
+  `(in flight)` before the reply), in the order they were sent;
 - `.audit()` — the audit rows rooted at the instance, e.g. a refused
   `get-state` (it waits for rows the host writes in the background);
 - `.times()` — `@+1.500s` stamps on events and device state, relative
@@ -147,7 +148,8 @@ five:
 Every snapshot is redacted so it can be committed: host-minted
 `cmd-…` / `call-…` ids become `<cmd-1>`, `<call-1>`, …; the instance's
 `type = "secret"` config values, values under credential-like keys,
-`Bearer` credentials, and `oxh_` tokens are masked as `***`; and
+`Bearer` credentials, and `oxh_` tokens are masked as `***` (in
+JSON values too, and in bytes printed as hex); and
 `.redact(text, placeholder)` adds replacements of your own.
 
 ## Denying a capability

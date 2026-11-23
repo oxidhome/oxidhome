@@ -1,6 +1,6 @@
 //! [`TestPluginInstance`] — one loaded plugin plus assertion helpers.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use oxidhome_core::state::{BlobInfo, DeviceMeta, HistoricalEvent, ServiceMeta};
@@ -9,7 +9,9 @@ use oxidhome_manifest::PluginManifest;
 
 use crate::TestHostError;
 use crate::live::IdLease;
-use crate::snapshot::{CommandRecord, Secrets, Snapshot, SnapshotOptions};
+use crate::snapshot::{
+    CommandRecord, HostRecords, Snapshot, SnapshotOptions, record_reply, reserve_command,
+};
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::{Command, CommandResult};
@@ -49,7 +51,7 @@ pub struct TestPluginInstance {
     /// On a virtual-clock host: the clock's time at load, which the
     /// tick schedule counts from.
     loaded_at: Duration,
-    secrets: Arc<Secrets>,
+    secrets: Arc<HostRecords>,
     commands: Mutex<Vec<CommandRecord>>,
 }
 
@@ -59,7 +61,7 @@ impl TestPluginInstance {
         inner: PluginInstance,
         lease: IdLease,
         state_dir: Arc<TempDir>,
-        secrets: Arc<Secrets>,
+        secrets: Arc<HostRecords>,
     ) -> Self {
         secrets.add(oxidhome_core::redact::config_secrets(inner.config()));
         let loaded_at = engine
@@ -143,25 +145,22 @@ impl TestPluginInstance {
         command: Command,
     ) -> Result<CommandResult, TestHostError> {
         let device = device.into();
-        let mut record = CommandRecord {
-            device: device.clone(),
-            capability: command.capability.clone(),
-            action: command.action.clone(),
-            command_id: command.id.clone(),
-            outcome: CommandOutcome::Accepted,
-        };
+        let slot = reserve_command(
+            &self.commands,
+            device.clone(),
+            command.capability.clone(),
+            command.action.clone(),
+        );
+        let command_id = command.id.clone();
         let result = self.inner.execute_command(device, command).await;
-        record.outcome = match &result {
+        let outcome = match &result {
             Ok(reply) => CommandOutcome::from_plugin(reply.clone()),
             // The plugin was entered: whatever it did may stand.
             Err(_) => CommandOutcome::Unknown {
                 message: "execute-command trapped".into(),
             },
         };
-        self.commands
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(record);
+        record_reply(&self.commands, &self.secrets, slot, &command_id, outcome);
         result.map_err(|e| TestHostError::call("execute-command", e))
     }
 

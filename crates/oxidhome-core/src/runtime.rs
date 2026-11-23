@@ -409,7 +409,7 @@ impl Engine {
         clock.drive_epoch(&inner);
         let audit_log = Arc::new(AuditLog::new(Arc::clone(&db)).with_clock(clock.clone()));
         let event_log = Arc::new(EventLog::new(Arc::clone(&db)));
-        let events = Arc::new(EventBus::new());
+        let events = Arc::new(EventBus::new().with_clock(clock.clone()));
         // H4: rows from earlier runs were never fanned out by this
         // bus; cursor tails replay them from history. A failed read
         // only costs that replay (cursor tails then fill those rows in
