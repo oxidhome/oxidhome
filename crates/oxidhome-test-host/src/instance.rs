@@ -9,9 +9,7 @@ use oxidhome_manifest::PluginManifest;
 
 use crate::TestHostError;
 use crate::live::IdLease;
-use crate::snapshot::{
-    CommandRecord, HostRecords, Snapshot, SnapshotOptions, record_reply, reserve_command,
-};
+use crate::snapshot::{CommandRecord, CommandSlot, HostRecords, Snapshot, SnapshotOptions};
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::{Command, CommandResult};
@@ -130,7 +128,8 @@ impl TestPluginInstance {
     /// projection's caps), and an `accepted` reply is registered as a
     /// pending command the plugin can finish with `complete-command`.
     /// `command.id` is passed through as given; use a `cmd-` prefixed
-    /// id if the plugin may answer `accepted`.
+    /// id if the plugin may answer `accepted`, and a fresh one per
+    /// command: the host's pending table is keyed by id alone.
     ///
     /// The call and its H5 outcome are recorded for the snapshot's
     /// `commands` section ([`crate::SnapshotOptions::commands`]).
@@ -145,8 +144,9 @@ impl TestPluginInstance {
         command: Command,
     ) -> Result<CommandResult, TestHostError> {
         let device = device.into();
-        let slot = reserve_command(
+        let slot = CommandSlot::reserve(
             &self.commands,
+            &self.secrets,
             device.clone(),
             command.capability.clone(),
             command.action.clone(),
@@ -160,7 +160,7 @@ impl TestPluginInstance {
                 message: "execute-command trapped".into(),
             },
         };
-        record_reply(&self.commands, &self.secrets, slot, &command_id, outcome);
+        slot.reply(&command_id, outcome);
         result.map_err(|e| TestHostError::call("execute-command", e))
     }
 

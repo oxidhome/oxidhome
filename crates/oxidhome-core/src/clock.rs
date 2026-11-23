@@ -226,6 +226,10 @@ impl Interval {
     }
 }
 
+/// How late a tick must be before Tokio's `MissedTickBehavior::Delay`
+/// reschedules from now rather than from the missed tick.
+const DELAY_THRESHOLD: Duration = Duration::from_millis(5);
+
 /// Default start of a [`VirtualClock`]: 2026-01-01T00:00:00Z.
 pub const VIRTUAL_CLOCK_DEFAULT_START: Duration = Duration::from_hours(490_896);
 
@@ -580,9 +584,14 @@ impl VirtualInterval {
             state.busy.insert(self.id);
             changed = true;
             let fired = self.next;
-            // `MissedTickBehavior::Delay`: the next tick is a full
-            // period after this one fired.
-            self.next = state.elapsed.saturating_add(self.period);
+            // `MissedTickBehavior::Delay`, as Tokio applies it: a tick
+            // more than 5 ms late puts the next a full period after
+            // now; a less late one keeps the schedule.
+            self.next = if state.elapsed > fired.saturating_add(DELAY_THRESHOLD) {
+                state.elapsed.saturating_add(self.period)
+            } else {
+                fired.saturating_add(self.period)
+            };
             state.timers.insert(
                 self.id,
                 Timer {
@@ -741,6 +750,11 @@ mod tests {
         assert!(inner.poll_tick(&mut cx).is_ready());
         assert!(inner.poll_tick(&mut cx).is_pending());
         assert_eq!(v.next_deadline(), Some(Duration::from_millis(5500)));
+        // Up to 5 ms late keeps the schedule, as Tokio does.
+        v.advance(Duration::from_millis(1001));
+        assert!(inner.poll_tick(&mut cx).is_ready());
+        assert!(inner.poll_tick(&mut cx).is_pending());
+        assert_eq!(v.next_deadline(), Some(Duration::from_millis(6500)));
         assert!(format!("{interval:?}").contains("VirtualInterval"));
         drop(interval);
         assert_eq!(v.pending_timers(), 0);

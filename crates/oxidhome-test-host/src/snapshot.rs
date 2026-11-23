@@ -188,8 +188,11 @@ pub(crate) struct CommandRecord {
     pub(crate) action: String,
     /// Empty until the reply.
     pub(crate) command_id: String,
-    /// `None` while the command is in flight.
+    /// `None` while the command is in flight, or if the caller
+    /// dropped the request before the reply.
     pub(crate) outcome: Option<CommandOutcome>,
+    /// The caller dropped the request before the reply.
+    pub(crate) dropped: bool,
 }
 
 /// How long a snapshot waits for background audit writers.
@@ -228,46 +231,90 @@ impl HostRecords {
     }
 }
 
-/// A command's place in an instance's history, taken before it is
-/// sent so the history keeps send order (see [`CommandRecord`]).
-pub(crate) fn reserve_command(
-    commands: &Mutex<Vec<CommandRecord>>,
-    device: String,
-    capability: String,
-    action: String,
-) -> usize {
-    let mut list = commands.lock().unwrap_or_else(PoisonError::into_inner);
-    list.push(CommandRecord {
-        device,
-        capability,
-        action,
-        command_id: String::new(),
-        outcome: None,
-    });
-    list.len() - 1
+/// A command's place in the histories — the instance's and the
+/// host's — taken before it is sent, so both keep send order. Filled
+/// by [`Self::reply`]; dropped without one (the caller gave up on the
+/// request), it records that instead of staying in flight.
+pub(crate) struct CommandSlot<'a> {
+    commands: &'a Mutex<Vec<CommandRecord>>,
+    host: &'a HostRecords,
+    slot: usize,
+    host_slot: usize,
+    replied: bool,
 }
 
-/// Fill in the reply for the command [`reserve_command`] placed at
-/// `slot`.
-pub(crate) fn record_reply(
-    commands: &Mutex<Vec<CommandRecord>>,
-    host: &HostRecords,
-    slot: usize,
-    command_id: &str,
-    outcome: CommandOutcome,
-) {
-    if let Some(record) = commands
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get_mut(slot)
-    {
-        command_id.clone_into(&mut record.command_id);
-        record.outcome = Some(outcome);
+impl<'a> CommandSlot<'a> {
+    pub(crate) fn reserve(
+        commands: &'a Mutex<Vec<CommandRecord>>,
+        host: &'a HostRecords,
+        device: String,
+        capability: String,
+        action: String,
+    ) -> Self {
+        let slot = {
+            let mut list = commands.lock().unwrap_or_else(PoisonError::into_inner);
+            list.push(CommandRecord {
+                device,
+                capability,
+                action,
+                command_id: String::new(),
+                outcome: None,
+                dropped: false,
+            });
+            list.len() - 1
+        };
+        let host_slot = {
+            let mut ids = host
+                .command_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ids.push(String::new());
+            ids.len() - 1
+        };
+        Self {
+            commands,
+            host,
+            slot,
+            host_slot,
+            replied: false,
+        }
     }
-    host.command_ids
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .push(command_id.to_owned());
+
+    /// Record the reply.
+    pub(crate) fn reply(mut self, command_id: &str, outcome: CommandOutcome) {
+        self.replied = true;
+        self.fill(command_id, Some(outcome));
+    }
+
+    fn fill(&self, command_id: &str, outcome: Option<CommandOutcome>) {
+        if let Some(record) = self
+            .commands
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(self.slot)
+        {
+            command_id.clone_into(&mut record.command_id);
+            record.outcome = outcome;
+            record.dropped = !self.replied;
+        }
+        if let Some(id) = self
+            .host
+            .command_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(self.host_slot)
+        {
+            command_id.clone_into(id);
+        }
+    }
+}
+
+impl Drop for CommandSlot<'_> {
+    fn drop(&mut self) {
+        if !self.replied {
+            self.fill("", None);
+        }
+    }
 }
 
 impl Snapshot {
@@ -585,7 +632,12 @@ fn render_commands(instance: &InstanceRef<'_>) -> Vec<String> {
                 tok(&r.action),
             );
             let Some(outcome) = &r.outcome else {
-                return format!("{head} (in flight)");
+                let status = if r.dropped {
+                    "(dropped before the reply)"
+                } else {
+                    "(in flight)"
+                };
+                return format!("{head} {status}");
             };
             let detail = match outcome {
                 CommandOutcome::Accepted
@@ -719,8 +771,9 @@ impl<'a> Redactor<'a> {
             })
             .chain(raw.iter().flat_map(|s| {
                 // A bytes value cut off mid-secret: its shown prefix.
+                // Only the bytes a value shows can be cut off.
                 let bytes = s.as_bytes();
-                (MIN_CUT_SECRET..bytes.len())
+                (MIN_CUT_SECRET..bytes.len().min(SHOWN_BYTES))
                     .map(move |n| format!("{}{TRUNCATED}", hex(&bytes[..n])))
             }))
             .collect();
@@ -784,6 +837,9 @@ impl<'a> Redactor<'a> {
         out
     }
 }
+
+/// How many bytes of a bytes value a snapshot shows.
+const SHOWN_BYTES: usize = 32;
 
 /// Marks a bytes value cut off after its first bytes.
 const TRUNCATED: char = '…';
@@ -849,12 +905,11 @@ pub fn render_value(value: &Value) -> String {
         Value::FloatVal(x) => format!("{x:?}"),
         Value::StringVal(s) => format!("{s:?}"),
         Value::BytesVal(bytes) => {
-            const SHOWN: usize = 32;
             let mut out = String::from("0x");
-            for b in bytes.iter().take(SHOWN) {
+            for b in bytes.iter().take(SHOWN_BYTES) {
                 let _ = write!(out, "{b:02x}");
             }
-            if bytes.len() > SHOWN {
+            if bytes.len() > SHOWN_BYTES {
                 let _ = write!(out, "{TRUNCATED}({} bytes)", bytes.len());
             }
             out
@@ -939,8 +994,17 @@ fn render_payload(payload: &EventPayload) -> String {
             )
         }
         EventPayload::Button(b) => format!("button {}", render_button(b)),
-        EventPayload::Inference(r) => format!("inference {} {}", tok(&r.model), esc(&r.payload)),
-        EventPayload::Custom(c) => format!("custom {} {}", tok(&c.topic), esc(&c.payload)),
+        // Structured credentials masked as the API masks them.
+        EventPayload::Inference(r) => format!(
+            "inference {} {}",
+            tok(&r.model),
+            esc(&oxidhome_core::redact::redact_text(&r.payload))
+        ),
+        EventPayload::Custom(c) => format!(
+            "custom {} {}",
+            tok(&c.topic),
+            esc(&oxidhome_core::redact::redact_text(&c.payload))
+        ),
     }
 }
 
@@ -1374,6 +1438,22 @@ mod tests {
     }
 
     #[test]
+    fn command_slots_keep_send_order() {
+        let commands = Mutex::default();
+        let host = HostRecords::default();
+        let first = CommandSlot::reserve(&commands, &host, "d".into(), "c".into(), "a".into());
+        let second = CommandSlot::reserve(&commands, &host, "d".into(), "c".into(), "b".into());
+        second.reply("cmd-2", CommandOutcome::Accepted);
+        drop(first);
+        let list = commands.lock().unwrap();
+        assert_eq!(list[0].action, "a");
+        assert!(list[0].dropped && list[0].outcome.is_none());
+        assert_eq!(list[1].command_id, "cmd-2");
+        assert!(!list[1].dropped);
+        assert_eq!(host.command_ids(), ["", "cmd-2"]);
+    }
+
+    #[test]
     fn payloads_and_specs_render() {
         use crate::wit::capabilities::{ExtensionSpec, SensorSpec, Unit};
         use crate::wit::events::{CustomEvent, InferenceResult};
@@ -1405,6 +1485,18 @@ mod tests {
             })),
             "inference m []"
         );
+        // Structured credentials in a payload are masked.
+        let masked = render_payload(&EventPayload::Custom(CustomEvent {
+            topic: "t".into(),
+            payload: r#"{"key":"password","value":"fixture-value"}"#.into(),
+        }));
+        assert!(!masked.contains("fixture-value"), "{masked}");
+        let masked = render_payload(&EventPayload::Inference(InferenceResult {
+            model: "m".into(),
+            payload: r#"{"token":"fixture-value"}"#.into(),
+            frame_timestamp: None,
+        }));
+        assert!(!masked.contains("fixture-value"), "{masked}");
         assert_eq!(
             render_spec(&CapabilitySpec::Extension(ExtensionSpec {
                 namespace: "acme".into(),

@@ -1691,7 +1691,10 @@ async fn run_one_lifecycle(
     }
 
     let tick = build_tick_interval(&instance);
-    let running_since = Instant::now();
+    // The healthy window is measured on the engine clock, as ticks
+    // are (see `crate::clock`); the restart backoff stays real time.
+    let clock = instance.clock().clone();
+    let running_since = clock.instant();
     // C2d — grab the wake AFTER load, because it's constructed
     // inside `PluginState::new()`. Each restart gets a fresh
     // `Notify` (the freshly-loaded `PluginInstance` has its own
@@ -1724,7 +1727,7 @@ async fn run_one_lifecycle(
         ServeOutcome::Crashed(reason) => LifecycleOutcome::Crashed {
             policy,
             reason,
-            ran_healthy: running_since.elapsed() >= healthy_reset,
+            ran_healthy: clock.instant().saturating_duration_since(running_since) >= healthy_reset,
         },
     }
 }

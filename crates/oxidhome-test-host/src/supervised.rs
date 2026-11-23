@@ -10,9 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::TestHostError;
 use crate::live::IdLease;
-use crate::snapshot::{
-    CommandRecord, HostRecords, Snapshot, SnapshotOptions, record_reply, reserve_command,
-};
+use crate::snapshot::{CommandRecord, CommandSlot, HostRecords, Snapshot, SnapshotOptions};
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::Command;
@@ -166,7 +164,7 @@ impl SupervisedInstance {
         let device = device.into();
         let slot = self.reserve(&device, &command);
         let report = self.handle.execute_command(device, command).await;
-        self.record(slot, &report);
+        slot.reply(&report.command_id, report.outcome.clone());
         report
     }
 
@@ -186,28 +184,19 @@ impl SupervisedInstance {
         let device = device.into();
         let slot = self.reserve(&device, &command);
         let report = self.handle.execute_command_in(ctx, device, command).await;
-        self.record(slot, &report);
+        slot.reply(&report.command_id, report.outcome.clone());
         report
     }
 
     /// The command's place in the history, in send order.
-    fn reserve(&self, device: &str, command: &Command) -> usize {
-        reserve_command(
+    fn reserve(&self, device: &str, command: &Command) -> CommandSlot<'_> {
+        CommandSlot::reserve(
             &self.commands,
+            &self.secrets,
             device.to_owned(),
             command.capability.clone(),
             command.action.clone(),
         )
-    }
-
-    fn record(&self, slot: usize, report: &CommandReport) {
-        record_reply(
-            &self.commands,
-            &self.secrets,
-            slot,
-            &report.command_id,
-            report.outcome.clone(),
-        );
     }
 
     /// The engine's table of accepted-but-unfinished commands (H5), for

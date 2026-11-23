@@ -138,7 +138,8 @@ five:
 - `.commands()` — every command the test sent through the harness and
   its outcome (`completed`, `rejected`, `accepted (pending)` /
   `accepted (resolved)`, `timed_out`, `outcome_unknown`, or
-  `(in flight)` before the reply), in the order they were sent;
+  `(in flight)` before the reply, `(dropped before the reply)` when
+  the test gave up on it), in the order they were sent;
 - `.audit()` — the audit rows rooted at the instance, e.g. a refused
   `get-state` (it waits for rows the host writes in the background);
 - `.times()` — `@+1.500s` stamps on events and device state, relative
