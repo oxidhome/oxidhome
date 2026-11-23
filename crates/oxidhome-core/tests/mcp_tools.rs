@@ -3690,7 +3690,7 @@ async fn events_cursor_pruned_by_retention_reports_cursor_expired() {
     let (id_1, id_3) = (ids[0], ids[2]);
     assert_eq!(engine.event_log().trim_older_than(3).expect("trim"), 2);
     let bearer = mint_bearer(&engine);
-    let router = build_router(engine);
+    let router = build_router(engine.clone());
     let (router, session) = handshake(router, &bearer).await;
 
     for (tool, extra) in [
@@ -3715,5 +3715,21 @@ async fn events_cursor_pruned_by_retention_reports_cursor_expired() {
             .as_array()
             .expect("events array");
         assert_eq!(events.len(), 1, "{tool}: {response}");
+    }
+
+    // A history read never reaches a plugin: the expiry is not a
+    // plugin failure in the audit ledger.
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    for tool in ["events.subscribe", "events.history"] {
+        let path = format!("mcp.tool.{tool}");
+        for row in rows.iter().filter(|r| r.path == path) {
+            assert_eq!(row.execution_outcome, None, "{path}");
+            assert_eq!(row.domain_error, None, "{path}");
+        }
+        assert!(rows.iter().any(|r| r.path == path), "{path} audited");
     }
 }

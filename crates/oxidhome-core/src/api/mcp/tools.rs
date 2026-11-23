@@ -1728,7 +1728,9 @@ fn cursor_expired_outcome(expired: crate::state::CursorExpired) -> ToolOutcome {
             expired.head_id,
         ),
         structured: Some(serde_json::json!({ "cursor_expired": expired })),
-        domain_kind: Some("cursor-expired"),
+        // A host history read: the plugin was never reached, so the
+        // audit row keeps `execution_outcome` / `domain_error` NULL.
+        domain_kind: None,
     }
 }
 
