@@ -121,9 +121,11 @@ releases() {
 # Whether crate $1's release $2 (any version form) is not yanked and
 # was published by $CUTOFF.
 eligible() {
-  index_entries "$1" |
-    jq -e --arg v "$2" --arg cutoff "$CUTOFF" \
-      'any(.[]; .vers == $v and (.yanked | not) and .pubtime != null and .pubtime <= $cutoff)' >/dev/null
+  local entries
+  entries="$(index_entries "$1")" || die "cannot read the crates.io index entry for $1"
+  jq -e --arg v "$2" --arg cutoff "$CUTOFF" \
+      'any(.[]; .vers == $v and (.yanked | not) and .pubtime != null and .pubtime <= $cutoff)' \
+    <<<"$entries" >/dev/null
 }
 
 # OSV advisory ids (space-separated, empty if none) for crate $1 @ $2.
@@ -419,7 +421,9 @@ align_examples() {
   local lock name ver rver root_pkgs
   root_pkgs="$(registry_packages "$ROOT/Cargo.lock")"
   for lock in "$ROOT"/examples/*/Cargo.lock; do
-    for name in $TOOLS_CRATES; do
+    # Dependents first, so a downgrade never leaves a dependent asking
+    # for a newer patch of what it uses.
+    for name in wit-component wasm-metadata wit-parser wasm-encoder wasmparser; do
       # Re-read each time: moving one crate can move its siblings.
       while read -r ver; do
         rver="$(awk -v n="$name" -v l="${ver%.*}." '$1 == n && index($2, l) == 1 { print $2 }' <<<"$root_pkgs" | tail -n 1)"
@@ -474,8 +478,8 @@ apply() {
     [[ $c == wit-bindgen ]] && wb="$new"
     table+="| \`$c\` | $old | $new |"$'\n'
     [[ $old == "$new" ]] && continue
-    sed -i.bak -E "s/^($c = (\\{ *version = )?\")=$old\"/\\1=$new\"/" "$MANIFEST"
-    rm -f "$MANIFEST.bak"
+    sed -E "s/^($c = (\\{ *version = )?\")=$old\"/\\1=$new\"/" "$MANIFEST" >"$CACHE/Cargo.toml.new"
+    cp "$CACHE/Cargo.toml.new" "$MANIFEST"
     [[ "$(current_pin "$c")" == "$new" ]] || die "failed to rewrite the $c pin"
   done < <(grep '^pin ' <<<"$p")
 
@@ -484,11 +488,13 @@ apply() {
   # Cargo resolves every unpinned crate the bump adds or moves (wasmparser,
   # regalloc2, ...) to its newest compatible release; those must be out
   # of quarantine too.
-  local fresh="" f n v
+  local fresh="" f n v locked_after moved
+  locked_after="$(locked_packages)"
+  moved="$(comm -13 <(printf '%s\n' "$locked_before") <(printf '%s\n' "$locked_after"))"
   while read -r f n v; do
     [[ -z $n ]] && continue
     eligible "$n" "$v" || fresh+="$f $n $v"$'\n'
-  done < <(comm -13 <(printf '%s\n' "$locked_before") <(locked_packages))
+  done <<<"$moved"
   after="$(scan_lockfiles)"
   added="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
 
@@ -508,7 +514,6 @@ apply() {
     if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=false" >>"$GITHUB_OUTPUT"; fi
     return 0
   fi
-  RESTORE=""
 
   local title="build(deps): bump wasm toolchain to wasmtime $wt, wit-bindgen $wb"
   # Every target pin; the workflow leaves an open PR with the same set alone.
@@ -536,6 +541,7 @@ EOF
       echo "pins=$pins_key"
     } >>"$GITHUB_OUTPUT"
   fi
+  RESTORE=""
 }
 
 case "${1:-}" in
