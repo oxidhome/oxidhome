@@ -860,6 +860,12 @@ async fn get_device_state(
         .engine
         .device_state()
         .snapshot_device_with_revision(&device_id);
+    // The device may have been re-registered (a light became a lock)
+    // since the check: the snapshot answers to its current class.
+    let current = state.engine.devices().resource(&device_id);
+    if !authorize(&ctx, Action::DeviceRead, &current).allow {
+        require(&ctx, Action::DeviceRead, &current)?;
+    }
     let mut capabilities: Vec<DeviceStateEntry> = entries
         .iter()
         .map(|s| DeviceStateEntry::from_state(s, &gate))

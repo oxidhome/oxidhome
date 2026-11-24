@@ -1096,7 +1096,7 @@ fn oracle(role: crate::auth::Role, action: Action, resource: &Resource) -> bool 
     });
     // The assistant never commands a lock.
     let assistant_deny = role == crate::auth::Role::Assistant
-        && matches!(action, Action::DeviceCommand | Action::ServiceCall)
+        && action == Action::DeviceCommand
         && matches!(resource, Resource::Device(d) if d.class().category() == DeviceCategory::Lock
             || d.class().sensitive().contains(SensitiveCategory::Lock));
     // No role holds a sensitive category.

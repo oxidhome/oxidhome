@@ -498,6 +498,8 @@ impl TokenStore {
     /// create`, and the owner's `POST /api/v1/tokens` and Connect
     /// `TokensService.CreateToken`). Committed
     /// durably, since the caller hands the secret out right after.
+    /// Returns the stored record, so the caller needn't read it back
+    /// (a failed read would strand a live token whose secret is lost).
     ///
     /// # Errors
     ///
@@ -508,9 +510,19 @@ impl TokenStore {
         issued: &IssuedToken,
         label: &str,
         scope_json: &[u8],
-    ) -> Result<(), TokenError> {
+    ) -> Result<TokenRecord, TokenError> {
         let row = PendingRow::new(issued, label, scope_json, false)?;
-        self.durable_write(move |conn| row.insert(conn))
+        let record = TokenRecord {
+            id: row.id.clone(),
+            label: row.label.clone(),
+            scope_json: row.scope_json.clone(),
+            created_ms: row.created_ms,
+            last_used_ms: None,
+            revoked_ms: None,
+            owner: false,
+        };
+        self.durable_write(move |conn| row.insert(conn))?;
+        Ok(record)
     }
 
     /// Replace a token's policy blob (`scope_json`). The offline

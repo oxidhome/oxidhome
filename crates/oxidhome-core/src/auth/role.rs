@@ -16,7 +16,7 @@
 //! | `guest` | `device.list`, `device.read`, `device.command` on `light`, `media`, `climate` devices | — |
 //! | `dashboard` | `device.list`, `device.read`, `device.command` on `light` devices | — |
 //! | `monitor` | the read group | — |
-//! | `assistant` | the read group, `device.command` on `light` devices | `device.command`, `service.call` on `lock` devices |
+//! | `assistant` | the read group, `device.command` on `light` devices | `device.command` on `lock` devices |
 //!
 //! The **read group** is `device.list`, `device.read`, `event.read`,
 //! `event.subscribe`, `instance.read`, `plugin.read`, `host.status`,
@@ -284,7 +284,7 @@ const ASSISTANT: &[RoleGrant] = &[
 ];
 
 const ASSISTANT_DENY: &[RoleDeny] = &[RoleDeny {
-    actions: ActionSet::of(&[Action::DeviceCommand, Action::ServiceCall]),
+    actions: ActionSet::of(&[Action::DeviceCommand]),
     categories: Some(&[DeviceCategory::Lock]),
 }];
 
@@ -571,11 +571,12 @@ fn deny_matches(
         }
         Resource::Blob(b) => {
             // A blob names no device: a device-narrowed deny refuses
-            // it; a category deny refuses a camera instance's blob
-            // when it names `camera`.
-            categories.is_none_or(|c| {
-                b.is_camera() && falls_under(c, DeviceCategory::Camera, camera_set())
-            })
+            // it (whatever else it narrows to); a category deny refuses
+            // a camera instance's blob when it names `camera`.
+            devices.is_some()
+                || categories.is_none_or(|c| {
+                    b.is_camera() && falls_under(c, DeviceCategory::Camera, camera_set())
+                })
         }
         // Every device, event or blob: may include a denied device.
         Resource::Collection(ResourceKind::Device | ResourceKind::Event | ResourceKind::Blob) => {
@@ -738,6 +739,12 @@ mod tests {
             &Resource::device("dev-ff00000000000000", DeviceClass::other())
         ));
         assert!(ids.matches(Action::BlobRead, &Resource::blob("c", "s", false)));
+        // Narrowed to devices and a category: still every blob.
+        let both = DenyRule {
+            categories: Some(vec![DeviceCategory::Light]),
+            ..ids.clone()
+        };
+        assert!(both.matches(Action::BlobRead, &Resource::blob("c", "s", false)));
         assert!(!ids.matches(Action::PluginRead, &Resource::plugin("acme.lamp")));
 
         let all = DenyRule {

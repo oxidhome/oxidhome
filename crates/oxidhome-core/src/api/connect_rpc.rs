@@ -524,6 +524,16 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .engine
             .device_state()
             .snapshot_device_with_revision(&device_id);
+        // The device may have been re-registered since the check: the
+        // snapshot answers to its current class.
+        let current = self.engine.devices().resource(&device_id);
+        let allowed = ctx
+            .extensions()
+            .get::<InvocationContext>()
+            .is_some_and(|i| authorize(i, Action::DeviceRead, &current).allow);
+        if !allowed {
+            require_connect(&ctx, Action::DeviceRead, &current)?;
+        }
         entries.sort_by(|a, b| a.capability.cmp(&b.capability));
         Response::ok(GetDeviceStateResponse {
             state: device_snapshot_to_proto(device_id, &entries, &epoch, revision, &gate).into(),

@@ -215,17 +215,30 @@ fn deny_rule(spec: &DenySpec) -> Result<DenyRule, MintError> {
     }
     let actions = ActionSet::parse(spec.actions.iter().map(String::as_str))
         .map_err(|e| invalid(format!("{e}")))?;
+    if actions.contains(Action::ServiceCall) && spec.actions.iter().all(|a| a != "*") {
+        return Err(invalid(
+            "`service.call` is not checked for tokens (a service hop is governed by the \
+             calling plugin's `consumes_services` grant); deny `device.command` instead",
+        ));
+    }
     let categories = match &spec.category {
         None => None,
         Some(list) if list.is_empty() => {
             return Err(invalid("a deny entry's `category` must not be empty"));
         }
-        Some(list) => Some(
-            list.iter()
-                .map(|c| c.parse::<DeviceCategory>())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| invalid(format!("{e}")))?,
-        ),
+        Some(list) => {
+            check_len("deny categories", list)?;
+            let mut parsed = Vec::with_capacity(list.len());
+            for c in list {
+                let c = c
+                    .parse::<DeviceCategory>()
+                    .map_err(|e| invalid(format!("{e}")))?;
+                if !parsed.contains(&c) {
+                    parsed.push(c);
+                }
+            }
+            Some(parsed)
+        }
     };
     let devices = match &spec.devices {
         None => None,
@@ -273,7 +286,7 @@ pub fn mint(
             .join(",")
     };
     let path = format!("{surface}.{AUDIT_PATH_MINT}:{what}");
-    audited_call(audit, actor_kind, &issued.id, &path, call_id, || {
+    let record = audited_call(audit, actor_kind, &issued.id, &path, call_id, || {
         tokens
             .insert(&issued, label, &policy.to_json())
             .map_err(anyhow::Error::from)
@@ -287,11 +300,6 @@ pub fn mint(
         roles = %what,
         "token minted",
     );
-    let record = tokens
-        .get(&issued.id)
-        .ok()
-        .flatten()
-        .ok_or_else(|| MintError::Store("the new token is not readable".into()))?;
     Ok(Minted {
         token_id: issued.id,
         secret: issued.plaintext,
@@ -502,6 +510,28 @@ mod tests {
                     ..req("x", &["resident"])
                 },
                 "device pattern",
+            ),
+            (
+                MintRequest {
+                    deny: vec![DenySpec {
+                        actions: vec!["service.call".into()],
+                        category: None,
+                        devices: None,
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "not checked for tokens",
+            ),
+            (
+                MintRequest {
+                    deny: vec![DenySpec {
+                        actions: vec!["*".into()],
+                        category: Some(vec!["light".into(); MAX_LIST + 1]),
+                        devices: None,
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "deny categories",
             ),
         ];
         for (r, needle) in cases {
