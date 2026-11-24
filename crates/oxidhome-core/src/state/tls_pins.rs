@@ -1,16 +1,19 @@
 //! Trust-on-first-use certificate pins for LAN devices (Phase 8): the
 //! `network_tls_pin` table.
 //!
-//! A streaming instance's `https://` request to a *private* or
-//! *link-local* address whose certificate the system roots don't vouch
-//! for (a camera or plug with a self-signed certificate) is accepted once
+//! A streaming instance's `https://` request to a *private*,
+//! *link-local* or *loopback* address whose certificate comes from an
+//! issuer the system roots don't know (a camera or plug with a
+//! self-signed certificate) is accepted once
 //! and its leaf certificate's SHA-256 recorded here, keyed by
 //! `(instance, host, port)` as the request named them. Later requests to
 //! the same key must present the same certificate; anything else is
 //! refused (`TLS-certificate-error`) and audited. The operator resets a
 //! pin (`oxidhome tls-pin reset`, `DELETE /api/v1/network/tls-pins`, the
 //! Connect `ResetTlsPins`) when a device's certificate legitimately
-//! changes; the next request pins again.
+//! changes; the next request pins again. Each pin records the plugin
+//! installation whose instance made it, and uninstalling that plugin
+//! deletes its pins ([`TlsPinStore::purge_installation`]).
 //!
 //! The table is small and bounded ([`MAX_PINS_PER_INSTANCE`],
 //! [`MAX_PINS_TOTAL`]) and loaded into memory at open; a check reads only
@@ -87,6 +90,16 @@ pub struct TlsPin {
     pub fingerprint: Fingerprint,
     /// When it was pinned (Unix ms).
     pub pinned_ms: i64,
+    /// The plugin installation whose instance made the pin.
+    pub installation_uuid: String,
+}
+
+/// A pin as held in memory.
+#[derive(Debug, Clone)]
+struct PinEntry {
+    fingerprint: Fingerprint,
+    pinned_ms: i64,
+    installation_uuid: String,
 }
 
 /// The outcome of [`TlsPinStore::check_or_pin`].
@@ -179,7 +192,7 @@ pub fn normalize_host(host: &str) -> String {
 #[derive(Debug)]
 pub struct TlsPinStore {
     db: Option<Arc<Db>>,
-    pins: RwLock<BTreeMap<PinKey, (Fingerprint, i64)>>,
+    pins: RwLock<BTreeMap<PinKey, PinEntry>>,
     /// Serializes writers through commit and publication.
     writer: Mutex<()>,
 }
@@ -210,7 +223,8 @@ impl TlsPinStore {
     pub fn open(db: Arc<Db>) -> Result<Self, rusqlite::Error> {
         let pins = db.read(|conn| -> Result<_, rusqlite::Error> {
             let mut stmt = conn.prepare(
-                "SELECT instance_id, host, port, sha256, pinned_ms FROM network_tls_pin",
+                "SELECT instance_id, host, port, sha256, pinned_ms, installation_uuid \
+                 FROM network_tls_pin",
             )?;
             // Columns read loosely: a row of the wrong types is skipped
             // (and re-pinned over), never a reason to refuse to start.
@@ -227,11 +241,12 @@ impl TlsPinStore {
                     int(2),
                     text(3),
                     int(4).unwrap_or_default(),
+                    text(5).unwrap_or_default(),
                 ))
             })?;
             let mut out = BTreeMap::new();
             for row in rows {
-                let (instance_id, host, port, sha, pinned_ms) = row?;
+                let (instance_id, host, port, sha, pinned_ms, installation_uuid) = row?;
                 let port = port.and_then(|p| u16::try_from(p).ok());
                 let fingerprint = sha.as_deref().and_then(Fingerprint::from_hex);
                 // A key that doesn't decode couldn't be reset by key.
@@ -244,7 +259,11 @@ impl TlsPinStore {
                             host,
                             port,
                         },
-                        (fp, pinned_ms),
+                        PinEntry {
+                            fingerprint: fp,
+                            pinned_ms,
+                            installation_uuid,
+                        },
                     );
                 } else {
                     tracing::warn!(target: "host.network", "skipping a malformed TLS pin row");
@@ -259,8 +278,9 @@ impl TlsPinStore {
         })
     }
 
-    /// Compare `fingerprint` with `key`'s pin, pinning it when there is
-    /// none. Blocking (a new pin is a durable `SQLite` write).
+    /// Compare `fingerprint` with `key`'s pin, pinning it (for the plugin
+    /// installation `installation_uuid`) when there is none. Blocking (a
+    /// new pin is a durable `SQLite` write).
     ///
     /// # Errors
     ///
@@ -269,6 +289,7 @@ impl TlsPinStore {
     pub fn check_or_pin(
         &self,
         key: &PinKey,
+        installation_uuid: &str,
         fingerprint: Fingerprint,
     ) -> Result<PinCheck, rusqlite::Error> {
         if let Some(check) = self.check(key, fingerprint) {
@@ -296,13 +317,15 @@ impl TlsPinStore {
             durable_write(db, |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO network_tls_pin \
-                     (instance_id, host, port, sha256, pinned_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                     (instance_id, host, port, sha256, pinned_ms, installation_uuid) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         key.instance_id,
                         key.host,
                         i64::from(key.port),
                         fingerprint.to_hex(),
-                        now
+                        now,
+                        installation_uuid
                     ],
                 )
             })?;
@@ -310,7 +333,14 @@ impl TlsPinStore {
         self.pins
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(key.clone(), (fingerprint, now));
+            .insert(
+                key.clone(),
+                PinEntry {
+                    fingerprint,
+                    pinned_ms: now,
+                    installation_uuid: installation_uuid.to_owned(),
+                },
+            );
         Ok(PinCheck::Pinned)
     }
 
@@ -321,16 +351,16 @@ impl TlsPinStore {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
-            .map(|(fingerprint, _)| *fingerprint)
+            .map(|pinned| pinned.fingerprint)
     }
 
     fn check(&self, key: &PinKey, fingerprint: Fingerprint) -> Option<PinCheck> {
         let pins = self.pins.read().unwrap_or_else(PoisonError::into_inner);
-        pins.get(key).map(|(pinned, _)| {
-            if *pinned == fingerprint {
+        pins.get(key).map(|pinned| {
+            if pinned.fingerprint == fingerprint {
                 PinCheck::Matches
             } else {
-                PinCheck::Mismatch(*pinned)
+                PinCheck::Mismatch(pinned.fingerprint)
             }
         })
     }
@@ -338,17 +368,35 @@ impl TlsPinStore {
     /// The pins `filter` selects, ordered by instance, host and port.
     #[must_use]
     pub fn list(&self, filter: &PinFilter) -> Vec<TlsPin> {
+        self.select(|key, _| filter.matches(key))
+    }
+
+    fn select(&self, pick: impl Fn(&PinKey, &PinEntry) -> bool) -> Vec<TlsPin> {
         self.pins
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .filter(|(key, _)| filter.matches(key))
-            .map(|(key, (fingerprint, pinned_ms))| TlsPin {
+            .filter(|(key, pinned)| pick(key, pinned))
+            .map(|(key, pinned)| TlsPin {
                 key: key.clone(),
-                fingerprint: *fingerprint,
-                pinned_ms: *pinned_ms,
+                fingerprint: pinned.fingerprint,
+                pinned_ms: pinned.pinned_ms,
+                installation_uuid: pinned.installation_uuid.clone(),
             })
             .collect()
+    }
+
+    /// Remove every pin the plugin installation `installation_uuid`'s
+    /// instances made (on uninstall); returns what was removed.
+    ///
+    /// # Errors
+    ///
+    /// `SQLite` errors; memory is then unchanged.
+    pub fn purge_installation(
+        &self,
+        installation_uuid: &str,
+    ) -> Result<Vec<TlsPin>, rusqlite::Error> {
+        self.remove(|_, pinned| pinned.installation_uuid == installation_uuid)
     }
 
     /// Remove the pins `filter` selects (an empty filter removes every
@@ -359,8 +407,15 @@ impl TlsPinStore {
     ///
     /// `SQLite` errors; memory is then unchanged.
     pub fn reset(&self, filter: &PinFilter) -> Result<Vec<TlsPin>, rusqlite::Error> {
+        self.remove(|key, _| filter.matches(key))
+    }
+
+    fn remove(
+        &self,
+        pick: impl Fn(&PinKey, &PinEntry) -> bool,
+    ) -> Result<Vec<TlsPin>, rusqlite::Error> {
         let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        let removed = self.list(filter);
+        let removed = self.select(pick);
         if removed.is_empty() {
             return Ok(removed);
         }
@@ -443,16 +498,22 @@ mod tests {
     fn first_use_pins_then_matches_or_mismatches() {
         let store = TlsPinStore::open(Arc::new(Db::open_in_memory().unwrap())).unwrap();
         let k = key("cam", "192.168.1.20", 443);
-        assert_eq!(store.check_or_pin(&k, fp(1)).unwrap(), PinCheck::Pinned);
-        assert_eq!(store.check_or_pin(&k, fp(1)).unwrap(), PinCheck::Matches);
         assert_eq!(
-            store.check_or_pin(&k, fp(2)).unwrap(),
+            store.check_or_pin(&k, "inst-1", fp(1)).unwrap(),
+            PinCheck::Pinned
+        );
+        assert_eq!(
+            store.check_or_pin(&k, "inst-1", fp(1)).unwrap(),
+            PinCheck::Matches
+        );
+        assert_eq!(
+            store.check_or_pin(&k, "inst-1", fp(2)).unwrap(),
             PinCheck::Mismatch(fp(1))
         );
         // Another port is another key.
         assert_eq!(
             store
-                .check_or_pin(&key("cam", "192.168.1.20", 8443), fp(2))
+                .check_or_pin(&key("cam", "192.168.1.20", 8443), "inst-1", fp(2))
                 .unwrap(),
             PinCheck::Pinned
         );
@@ -463,13 +524,13 @@ mod tests {
         let db = Arc::new(Db::open_in_memory().unwrap());
         let store = TlsPinStore::open(Arc::clone(&db)).unwrap();
         store
-            .check_or_pin(&key("a", "cam.lan", 443), fp(1))
+            .check_or_pin(&key("a", "cam.lan", 443), "inst-1", fp(1))
             .unwrap();
         store
-            .check_or_pin(&key("a", "cam.lan", 8443), fp(2))
+            .check_or_pin(&key("a", "cam.lan", 8443), "inst-1", fp(2))
             .unwrap();
         store
-            .check_or_pin(&key("b", "cam.lan", 443), fp(3))
+            .check_or_pin(&key("b", "cam.lan", 443), "inst-1", fp(3))
             .unwrap();
         let reopened = TlsPinStore::open(Arc::clone(&db)).unwrap();
         assert_eq!(reopened.list(&PinFilter::default()).len(), 3);
@@ -525,23 +586,53 @@ mod tests {
         let store = TlsPinStore::detached();
         for port in 0..u16::try_from(MAX_PINS_PER_INSTANCE).unwrap() {
             assert_eq!(
-                store.check_or_pin(&key("a", "h", port), fp(1)).unwrap(),
+                store
+                    .check_or_pin(&key("a", "h", port), "inst-1", fp(1))
+                    .unwrap(),
                 PinCheck::Pinned
             );
         }
         assert_eq!(
-            store.check_or_pin(&key("a", "h", 9999), fp(1)).unwrap(),
+            store
+                .check_or_pin(&key("a", "h", 9999), "inst-1", fp(1))
+                .unwrap(),
             PinCheck::Full
         );
         // Existing keys still check.
         assert_eq!(
-            store.check_or_pin(&key("a", "h", 0), fp(1)).unwrap(),
+            store
+                .check_or_pin(&key("a", "h", 0), "inst-1", fp(1))
+                .unwrap(),
             PinCheck::Matches
         );
         assert_eq!(
-            store.check_or_pin(&key("b", "h", 0), fp(1)).unwrap(),
+            store
+                .check_or_pin(&key("b", "h", 0), "inst-1", fp(1))
+                .unwrap(),
             PinCheck::Pinned
         );
+    }
+
+    #[test]
+    fn uninstall_purges_the_installation_pins() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let store = TlsPinStore::open(Arc::clone(&db)).unwrap();
+        store
+            .check_or_pin(&key("a", "cam.lan", 443), "old", fp(1))
+            .unwrap();
+        store
+            .check_or_pin(&key("a", "cam.lan", 8443), "old", fp(2))
+            .unwrap();
+        store
+            .check_or_pin(&key("b", "cam.lan", 443), "other", fp(3))
+            .unwrap();
+        let removed = store.purge_installation("old").unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.iter().all(|p| p.installation_uuid == "old"));
+        let left = TlsPinStore::open(db).unwrap().list(&PinFilter::default());
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].key.instance_id, "b");
+        assert_eq!(left[0].installation_uuid, "other");
     }
 
     #[test]

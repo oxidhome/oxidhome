@@ -135,6 +135,9 @@ pub(crate) enum Denial {
 /// address check, the name-lookup implementation and the HTTP client.
 pub(crate) struct NetworkPolicy {
     instance_id: Arc<str>,
+    /// The plugin installation the instance runs: TLS pins are recorded
+    /// against it, so uninstalling deletes them.
+    installation_uuid: Arc<str>,
     rules: Vec<CompiledRule>,
     resolved: Mutex<Resolved>,
     audit: Mutex<AuditBucket>,
@@ -499,6 +502,7 @@ impl NetworkPolicy {
     ) -> Self {
         Self {
             instance_id: Arc::from(instance_id),
+            installation_uuid: Arc::from(""),
             rules: rules.iter().map(CompiledRule::compile).collect(),
             resolved: Mutex::default(),
             audit: Mutex::new(AuditBucket::new(clock.std_instant())),
@@ -664,6 +668,19 @@ impl NetworkPolicy {
     /// The instance this policy belongs to.
     pub(crate) fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// This policy for an instance of the plugin installation
+    /// `installation_uuid`.
+    #[must_use]
+    pub(crate) fn for_installation(mut self, installation_uuid: Arc<str>) -> Self {
+        self.installation_uuid = installation_uuid;
+        self
+    }
+
+    /// The plugin installation the instance runs.
+    pub(crate) fn installation_uuid(&self) -> &str {
+        &self.installation_uuid
     }
 
     /// Record that a request to `target` pinned a LAN device's

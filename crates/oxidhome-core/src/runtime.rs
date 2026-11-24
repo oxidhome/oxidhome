@@ -514,16 +514,14 @@ impl Engine {
     }
 
     /// Test hook: also trust the DER certificates `roots` for `https://`
-    /// requests, and with `tofu_loopback` treat loopback servers like
-    /// LAN devices for trust on first use (tests have no LAN). Keeps the
-    /// pins. Not for production: it widens what the host trusts.
+    /// requests. Keeps the pins. Not for production: it widens what the
+    /// host trusts.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_tls_for_tests(mut self, roots: Vec<Vec<u8>>, tofu_loopback: bool) -> Self {
+    pub fn with_tls_for_tests(mut self, roots: Vec<Vec<u8>>) -> Self {
         self.tls = Arc::new(network::TlsClient::for_tests(
             Arc::clone(self.tls.pins()),
             roots,
-            tofu_loopback,
         ));
         self
     }
@@ -835,6 +833,15 @@ impl Engine {
                 )))
             })?;
             self.sandboxes.forget_removals_of(uuid);
+            // Phase 8.2: the certificates its instances trusted on first
+            // use go with it, so a reinstall under the same instance id
+            // trusts nothing it didn't see itself.
+            let removed = self.tls.pins().purge_installation(uuid).map_err(|err| {
+                crate::state::UninstallError::Io(std::io::Error::other(format!(
+                    "TLS pin purge failed for install {uuid}: {err}"
+                )))
+            })?;
+            self.audit_pin_purge(plugin_id, &removed);
         }
         // Tombstone the registry row last. Ordering matters: a
         // crash between purge success and tombstone leaves the
@@ -845,6 +852,54 @@ impl Engine {
         // failure (the pre-fix behaviour).
         self.installed_plugins.uninstall(plugin_id)?;
         Ok(())
+    }
+
+    /// One audit `allow` row (level `warn`) per TLS pin an uninstall
+    /// deleted: `net.tls_pin_purge/<instance>/<host>:<port>/sha256:<hex>`.
+    fn audit_pin_purge(&self, plugin_id: &str, removed: &[crate::state::TlsPin]) {
+        use crate::auth::invocation;
+        if removed.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            target: "host.network",
+            plugin_id,
+            removed = removed.len(),
+            "uninstall removed the plugin's TLS certificate pins",
+        );
+        let ctx = invocation::current_or_host(plugin_id);
+        let root = ctx.root();
+        for pin in removed {
+            let entry = crate::state::AuditEntry {
+                id: 0,
+                intent_ms: 0,
+                finalized_ms: None,
+                token_id: root.audit_token_id().to_owned(),
+                actor_kind: root.kind().as_str().to_owned(),
+                method: state_read::NETWORK_AUDIT_METHOD.to_owned(),
+                path: format!(
+                    "net.tls_pin_purge/{}/{}:{}/sha256:{}",
+                    invocation::audit_cap(&pin.key.instance_id),
+                    invocation::audit_cap(&pin.key.host),
+                    pin.key.port,
+                    pin.fingerprint.to_hex()
+                ),
+                status: 200,
+                decision: "allow".into(),
+                required_scope: Some("network".into()),
+                execution_outcome: None,
+                domain_error: None,
+                credential_fp: None,
+                call_id: Some(ctx.call_id().to_owned()),
+                invocation: Some(ctx.audit_json()),
+                command_id: None,
+                command_outcome: None,
+                level: Some("warn".into()),
+            };
+            if let Err(err) = self.audit_log.record_completed(&entry) {
+                tracing::error!(target: "host.audit", error = %err, "TLS pin purge row failed");
+            }
+        }
     }
 
     /// Start a supervised plugin instance under this engine. Reads
@@ -1722,6 +1777,7 @@ mod tests {
     /// `state::kv::tests::purge_installation_*` and
     /// `state::blobs::tests::purge_installation_*`.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn uninstall_plugin_purges_kv_and_blobs_for_installation_uuid() {
         use crate::host_impl::plugin::oxidhome::plugin::types::Value as WitValue;
 
@@ -1780,9 +1836,41 @@ wasm = "plugin.wasm"
             .expect("blob write");
         let blob_dir = state_dir.join("blobs").join(&*uuid);
         assert!(blob_dir.is_dir(), "blob dir should exist post-write");
+        // A TLS pin its instance made, and one another installation made.
+        let pin_key = |instance: &str| crate::state::PinKey {
+            instance_id: instance.into(),
+            host: "camera.lan".into(),
+            port: 443,
+        };
+        let fp = crate::state::Fingerprint::of_der(b"cert");
+        engine
+            .tls_pins()
+            .check_or_pin(&pin_key("inst-a"), &uuid, fp)
+            .unwrap();
+        engine
+            .tls_pins()
+            .check_or_pin(&pin_key("inst-b"), "another-install", fp)
+            .unwrap();
 
         // Uninstall composes registry tombstone + kv purge + blob purge.
         engine.uninstall_plugin("example.h2").expect("uninstall");
+
+        // Its pins are gone (and audited); the other installation's stay.
+        let left = engine.tls_pins().list(&crate::state::PinFilter::default());
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].key.instance_id, "inst-b");
+        let rows = engine
+            .audit_log()
+            .query(&crate::state::AuditQuery::default(), 100)
+            .unwrap();
+        assert!(
+            rows.iter().any(|r| r.path
+                == format!(
+                    "net.tls_pin_purge/inst-a/camera.lan:443/sha256:{}",
+                    fp.to_hex()
+                )),
+            "pin purge audit row"
+        );
 
         // KV and blob usage rows are gone for the uninstalled uuid.
         assert!(

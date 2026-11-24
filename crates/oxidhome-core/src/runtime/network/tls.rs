@@ -7,9 +7,11 @@
 //! - **Names.** SNI and certificate name checks use the host the request
 //!   named, never the address it was resolved to; an IP-literal host is
 //!   checked against the certificate's IP addresses and sends no SNI.
-//! - **Trust on first use.** When the connected address is *private* or
-//!   *link-local* and the roots don't vouch for the certificate (a device
-//!   with a self-signed certificate), the handshake still proves the
+//! - **Trust on first use.** When the connected address is *private*,
+//!   *link-local* or *loopback* and the certificate's only fault is an
+//!   issuer the roots don't know (a device with a self-signed
+//!   certificate; an expired one, or one for another name, is refused),
+//!   the handshake still proves the
 //!   server holds the leaf certificate's key, and the leaf's SHA-256 is
 //!   checked against the instance's pin for `(host, port)` in the
 //!   [`TlsPinStore`]: no pin pins it, the same certificate passes, any
@@ -53,15 +55,12 @@ pub(crate) struct TlsClient {
     roots_started: AtomicBool,
     extra_roots: Vec<CertificateDer<'static>>,
     pins: Arc<TlsPinStore>,
-    /// Test hook: also trust loopback servers on first use.
-    tofu_loopback: bool,
 }
 
 impl std::fmt::Debug for TlsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsClient")
             .field("extra_roots", &self.extra_roots.len())
-            .field("tofu_loopback", &self.tofu_loopback)
             .finish_non_exhaustive()
     }
 }
@@ -76,22 +75,15 @@ impl TlsClient {
             roots_started: AtomicBool::new(false),
             extra_roots: Vec::new(),
             pins,
-            tofu_loopback: false,
         }
     }
 
-    /// Test hook: add the DER certificates `roots` to the system roots,
-    /// and with `tofu_loopback` treat loopback servers like LAN devices
-    /// for trust on first use. Not for production.
+    /// Test hook: add the DER certificates `roots` to the system roots.
+    /// Not for production.
     #[must_use]
-    pub(crate) fn for_tests(
-        pins: Arc<TlsPinStore>,
-        roots: Vec<Vec<u8>>,
-        tofu_loopback: bool,
-    ) -> Self {
+    pub(crate) fn for_tests(pins: Arc<TlsPinStore>, roots: Vec<Vec<u8>>) -> Self {
         Self {
             extra_roots: roots.into_iter().map(CertificateDer::from).collect(),
-            tofu_loopback,
             ..Self::new(pins)
         }
     }
@@ -125,14 +117,13 @@ impl TlsClient {
     }
 
     /// Whether a server at `addr` may be trusted on first use.
-    fn tofu_allowed(&self, addr: SocketAddr) -> bool {
+    fn tofu_allowed(addr: SocketAddr) -> bool {
         let ip = addr.ip().to_canonical();
         if is_nat64(ip) {
             return false;
         }
         match classify(ip) {
-            AddressClass::Private | AddressClass::LinkLocal => true,
-            AddressClass::Loopback => self.tofu_loopback,
+            AddressClass::Private | AddressClass::LinkLocal | AddressClass::Loopback => true,
             AddressClass::Public | AddressClass::Forbidden => false,
         }
     }
@@ -227,7 +218,12 @@ impl ServerCertVerifier for Verifier {
                     Some(Trust::Roots(Fingerprint::of_der(end_entity)));
                 return Ok(verified);
             }
-            Err(rustls::Error::InvalidCertificate(_)) if self.tofu => {
+            // Only an issuer the roots don't know (a self-signed device):
+            // an expired certificate, one for another name or one for
+            // another use is refused like anywhere else.
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))
+                if self.tofu =>
+            {
                 Trust::FirstUse(Fingerprint::of_der(end_entity))
             }
             Err(err) => return Err(err),
@@ -319,7 +315,7 @@ pub(super) async fn connect(
     let verifier = Arc::new(Verifier {
         roots: client.root_verifier().await,
         provider: Arc::clone(&client.provider),
-        tofu: client.tofu_allowed(peer),
+        tofu: TlsClient::tofu_allowed(peer),
         trust: Mutex::new(None),
         seen: Mutex::new(None),
     });
@@ -375,13 +371,14 @@ pub(super) async fn connect(
         Some(Trust::FirstUse(seen)) => {
             let pins = Arc::clone(&client.pins);
             let (policy, target) = (Arc::clone(policy), target.to_owned());
+            let installation = policy.installation_uuid().to_owned();
             // The audit row's caller: task-locals don't reach the
             // blocking thread.
             let ctx = crate::auth::invocation::current();
             // Pinned and audited together on the blocking thread, so a
             // request that times out meanwhile can't leave an unaudited pin.
             let check = tokio::task::spawn_blocking(move || {
-                let check = pins.check_or_pin(&key, seen);
+                let check = pins.check_or_pin(&key, &installation, seen);
                 if matches!(check, Ok(PinCheck::Pinned)) {
                     tracing::warn!(
                         target: "host.network",
@@ -440,5 +437,35 @@ fn tls_error(err: &std::io::Error) -> Error {
         | std::io::ErrorKind::BrokenPipe
         | std::io::ErrorKind::UnexpectedEof => Error::ConnectionTerminated,
         _ => Error::TlsProtocolError,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_use_trust_is_for_local_peers_only() {
+        for local in [
+            "192.168.1.20:443",
+            "10.0.0.7:443",
+            "[fe80::1]:443",
+            "[fd00::1]:443",
+            "127.0.0.1:443",
+            "[::1]:443",
+        ] {
+            assert!(TlsClient::tofu_allowed(local.parse().unwrap()), "{local}");
+        }
+        for remote in [
+            "8.8.8.8:443",
+            "[2606:4700::1111]:443",
+            "[64:ff9b::c0a8:114]:443",
+            "0.0.0.0:443",
+        ] {
+            assert!(
+                !TlsClient::tofu_allowed(remote.parse().unwrap()),
+                "{remote}"
+            );
+        }
     }
 }

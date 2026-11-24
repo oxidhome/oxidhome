@@ -644,6 +644,19 @@ fn self_signed(names: &[&str]) -> Cert {
     }
 }
 
+/// A self-signed certificate for `name` that expired a year ago.
+fn expired_self_signed(name: &str) -> Cert {
+    let key = rcgen::KeyPair::generate().expect("key");
+    let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).expect("params");
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    let cert = params.self_signed(&key).expect("cert");
+    Cert {
+        der: cert.der().to_vec(),
+        key: key.serialize_der(),
+    }
+}
+
 /// The certificate a [`TlsServer`] presents; swappable.
 #[derive(Debug)]
 struct CurrentCert(std::sync::Mutex<Arc<rustls::sign::CertifiedKey>>);
@@ -747,28 +760,35 @@ impl TlsServer {
 #[tokio::test(flavor = "multi_thread")]
 async fn https_reaches_servers_the_roots_vouch_for() {
     let (ca, issuer) = test_ca();
-    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca], false);
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca]);
     let server = TlsServer::start(&leaf(&issuer, "127.0.0.1"), |_| http_ok("secure"));
-    // Signed by the trusted CA, for another name: only the name check fails.
+    // Signed by the trusted CA, for another name: only the name check
+    // fails, and that is refused even where trust on first use applies.
     let wrong_name = TlsServer::start(&leaf(&issuer, "camera.example"), |_| http_ok("no"));
+    // Self-signed but expired: refused, not pinned (only an unknown
+    // issuer is trusted on first use).
+    let expired = TlsServer::start(&expired_self_signed("127.0.0.1"), |_| http_ok("no"));
     let results = probe(
         &host,
         "https",
         &[
             format!("https://127.0.0.1:{}", server.port()),
             format!("https://127.0.0.1:{}", wrong_name.port()),
+            format!("https://127.0.0.1:{}", expired.port()),
         ],
         &[
             format!("get https://127.0.0.1:{}/ok", server.port()),
-            // Loopback isn't a LAN device: no trust on first use.
             format!("get https://127.0.0.1:{}/ok", wrong_name.port()),
+            format!("get https://127.0.0.1:{}/ok", expired.port()),
         ],
     )
     .await;
     assert_eq!(results[0], "ok:200:secure");
     assert_eq!(results[1], "err:Http(ErrorCode::TlsCertificateError)");
+    assert_eq!(results[2], "err:Http(ErrorCode::TlsCertificateError)");
     assert_eq!(server.served(), 1);
     assert_eq!(wrong_name.served(), 0);
+    assert_eq!(expired.served(), 0);
     assert_eq!(
         host.engine()
             .tls_pins()
@@ -779,10 +799,8 @@ async fn https_reaches_servers_the_roots_vouch_for() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lan_certificates_are_pinned_on_first_use() {
-    // Loopback stands in for a LAN address here.
-    let host = TestHost::new()
-        .unwrap()
-        .with_tls_for_tests(Vec::new(), true);
+    // Loopback is trusted on first use like a LAN address.
+    let host = TestHost::new().unwrap().with_tls_for_tests(Vec::new());
     let first = self_signed(&["camera.lan"]);
     let server = TlsServer::start(&first, |_| http_ok("frame"));
     let rule = format!("https://127.0.0.1:{}", server.port());
@@ -845,7 +863,7 @@ async fn lan_certificates_are_pinned_on_first_use() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sdk_client_follows_redirects_without_downgrading() {
     let (ca, leaf) = ca_and_leaf();
-    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca], false);
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca]);
     let plain = TcpServer::http(|_| http_ok("plain"));
     let plain_url = format!("http://127.0.0.1:{}/x", plain.port());
     let secure = TlsServer::start(&leaf, move |path| match path {
@@ -885,8 +903,7 @@ async fn the_sdk_client_follows_redirects_without_downgrading() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pin_holds_against_a_root_vouched_replacement() {
     let (ca, issuer) = test_ca();
-    // Loopback stands in for a LAN address here.
-    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca], true);
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca]);
     let server = TlsServer::start(&leaf(&issuer, "127.0.0.1"), |_| http_ok("secure"));
     let key = oxidhome_core::state::PinKey {
         instance_id: "held".into(),
@@ -897,6 +914,7 @@ async fn a_pin_holds_against_a_root_vouched_replacement() {
         .tls_pins()
         .check_or_pin(
             &key,
+            "test-installation",
             oxidhome_core::state::Fingerprint::of_der(b"the device's old certificate"),
         )
         .unwrap();
@@ -920,13 +938,12 @@ async fn a_pin_holds_against_a_root_vouched_replacement() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_changed_untrusted_certificate_is_audited_as_a_pin_mismatch() {
-    // No trust on first use here (as for a public address): the
-    // certificate fails verification anyway, but against a pin that is
-    // the event the operator needs to see.
-    let host = TestHost::new()
-        .unwrap()
-        .with_tls_for_tests(Vec::new(), false);
-    let server = TlsServer::start(&self_signed(&["127.0.0.1"]), |_| http_ok("no"));
+    // A certificate for another name fails verification whatever the
+    // pin says, but against a pin that is the event the operator needs
+    // to see.
+    let (ca, issuer) = test_ca();
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca]);
+    let server = TlsServer::start(&leaf(&issuer, "camera.example"), |_| http_ok("no"));
     host.engine()
         .tls_pins()
         .check_or_pin(
@@ -935,6 +952,7 @@ async fn a_changed_untrusted_certificate_is_audited_as_a_pin_mismatch() {
                 host: "127.0.0.1".into(),
                 port: server.port(),
             },
+            "test-installation",
             oxidhome_core::state::Fingerprint::of_der(b"the device's old certificate"),
         )
         .unwrap();

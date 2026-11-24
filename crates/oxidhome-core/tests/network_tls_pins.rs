@@ -51,7 +51,7 @@ fn pin(engine: &Engine, instance: &str, host: &str, port: u16, der: &[u8]) {
     assert_eq!(
         engine
             .tls_pins()
-            .check_or_pin(&key, Fingerprint::of_der(der))
+            .check_or_pin(&key, "test-installation", Fingerprint::of_der(der))
             .unwrap(),
         PinCheck::Pinned
     );

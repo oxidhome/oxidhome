@@ -599,12 +599,15 @@ impl PluginState {
     /// [`Self::with_granted_capabilities`] and [`Self::with_audit_log`].
     #[must_use]
     pub(crate) fn with_network_access(mut self, tls: Arc<super::network::TlsClient>) -> Self {
-        let policy = Arc::new(super::network::NetworkPolicy::new(
-            self.instance_id.as_str(),
-            &self.granted_capabilities.network,
-            self.audit_log.clone(),
-            self.clock.clone(),
-        ));
+        let policy = Arc::new(
+            super::network::NetworkPolicy::new(
+                self.instance_id.as_str(),
+                &self.granted_capabilities.network,
+                self.audit_log.clone(),
+                self.clock.clone(),
+            )
+            .for_installation(Arc::clone(&self.installation_uuid)),
+        );
         self.wasi = build_wasi(
             &self.instance_id,
             &self.manifest,

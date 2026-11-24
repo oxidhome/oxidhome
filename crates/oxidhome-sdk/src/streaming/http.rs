@@ -35,8 +35,8 @@
 //!   yourself). `303`, and `301` / `302` after a `POST`, continue as a
 //!   `GET` without a body.
 //! - **HTTPS.** The host verifies certificates against the system's
-//!   roots. A device on the LAN (a private or link-local address) with a
-//!   self-signed certificate is trusted on first use: the host pins the
+//!   roots. A local device (a private, link-local or loopback address)
+//!   with a self-signed certificate is trusted on first use: the host pins the
 //!   certificate it sees first and refuses any other until the operator
 //!   resets the pin.
 
