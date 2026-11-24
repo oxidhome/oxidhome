@@ -1,8 +1,10 @@
 name: Wasm toolchain
 
 # Bumps wasmtime, wit-bindgen and the wasm-tools crates together onto one
-# wasm-tools release (Dependabot ignores them). The version logic lives in
-# .github/scripts/wasm-toolchain.sh; `wasm-toolchain.sh plan` is its dry run.
+# wasm-tools release (Dependabot ignores them), using only releases out of
+# a 7-day quarantine (Dependabot's cooldown) and without OSV advisories.
+# The logic lives in .github/scripts/wasm-toolchain.sh; `wasm-toolchain.sh
+# plan` is its dry run.
 
 on:
   schedule:
@@ -22,6 +24,8 @@ permissions: read-all
 jobs:
   Update:
     name: Bump the wasm toolchain
+    # The PR branch is cut from the checkout; never from a feature branch.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -29,6 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+      # Same osv-scanner release as the OSV jobs in checks.yaml.
+      - name: Install osv-scanner
+        run: |
+          go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Bump pins and lockfiles
         id: bump
         env:
@@ -44,9 +53,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TITLE: ${{ steps.bump.outputs.title }}
+          BASE: ${{ github.event.repository.default_branch }}
         run: |
-          open_title=$(gh pr list --head chore/update-wasm-toolchain --state open --json title --jq '.[0].title // ""')
-          if [ "$open_title" = "$TITLE" ]; then
+          if gh pr list --state open --base "$BASE" --limit 200 --json title,isCrossRepository \
+               | jq -e --arg t "$TITLE" 'any(.[]; .title == $t and (.isCrossRepository | not))' > /dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "An open PR already makes this bump; leaving it alone."
           else

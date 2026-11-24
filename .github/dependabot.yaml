@@ -1,9 +1,13 @@
 version: 2
+# Version updates wait out a 7-day cooldown, the same quarantine
+# .github/workflows/wasm-toolchain.yaml applies; security updates don't.
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       ci:
         patterns:
@@ -12,6 +16,8 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    cooldown:
+      default-days: 7
     # The wasm toolchain moves together onto one wasm-tools release
     # (a skew breaks the build, #200); .github/workflows/wasm-toolchain.yaml
     # bumps it, so Dependabot leaves these crates alone.

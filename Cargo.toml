@@ -52,7 +52,7 @@ oxidhome-wit = { path = "crates/oxidhome-wit", default-features = false }
 # PR (Dependabot ignores it): to the newest wasmtime for which a
 # `wit-bindgen` release on the same wasm-tools line exists, with the
 # wasm-tools pins on that line's newest release, counting only releases
-# at least 7 days old.
+# at least 7 days old and without an OSV advisory.
 #
 # Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli, random, …) so
 # libstd-pulled WASI imports resolve; Phase 8 adds its sockets and

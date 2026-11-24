@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Bumps the exact-pinned wasm toolchain crates in the root Cargo.toml
 # together, so the host and the guest bindings stay on one wasm-tools
-# release. Used by .github/workflows/wasm-toolchain.yaml; Dependabot
-# ignores these crates.
+# release line. Used by .github/workflows/wasm-toolchain.yaml;
+# Dependabot ignores these crates. Needs bash >= 4.4, curl and jq;
+# `apply` also needs cargo and osv-scanner.
 #
 #   wasm-toolchain.sh plan    print the bump it would make (dry run)
 #   wasm-toolchain.sh apply   make it: rewrite the pins, update the
@@ -19,9 +20,15 @@
 # wit-bindgen bump would put a second wasm-tools copy in the build.
 #
 # Quarantine: only releases published at least QUARANTINE_DAYS (default
-# 7) days ago count, for every crate involved; yanked releases never
-# do. The publish time is the index's `pubtime`, crates.io's
-# `created_at` for the version. A pin never moves backwards.
+# 7, the same as Dependabot's cooldown) days ago count, for every crate
+# involved; yanked releases never do. The publish time is the index's
+# `pubtime`, crates.io's `created_at` for the version.
+#
+# Advisories: a release with an OSV advisory (api.osv.dev, crates.io
+# ecosystem) is never picked; the next-newest clean one is. `apply` then
+# runs osv-scanner over every lockfile before and after the update and
+# opens no PR when the update adds a vulnerability. An unreachable OSV
+# fails the run. A pin never moves backwards.
 #
 # Versions come from the crates.io sparse index (CRATES_INDEX
 # overrides it, e.g. a file:// fixture directory). `apply` writes the
@@ -29,10 +36,15 @@
 # the PR body to $PR_BODY_FILE (default: wasm-toolchain-pr.md in
 # $RUNNER_TEMP or the system temp directory).
 set -euo pipefail
+if ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 404)); then
+  echo "error: needs bash >= 4.4 (this is $BASH_VERSION)" >&2
+  exit 1
+fi
 # Command substitutions below carry most of the logic; fail in them too.
 shopt -s inherit_errexit
 
 INDEX="${CRATES_INDEX:-https://index.crates.io}"
+OSV_API="${OSV_API:-https://api.osv.dev}"
 QUARANTINE_DAYS="${QUARANTINE_DAYS:-7}"
 [[ $QUARANTINE_DAYS =~ ^[0-9]+$ ]] || { echo "error: QUARANTINE_DAYS must be a whole number of days" >&2; exit 1; }
 # Releases published after this instant are still in quarantine.
@@ -44,6 +56,8 @@ trap 'rm -rf "$CACHE"' EXIT
 
 # Pinned in lockstep with wasmtime (same version number).
 WASMTIME_CRATES="wasmtime wasmtime-wasi wasmtime-wasi-http"
+# Released in lockstep with wit-bindgen.
+BINDGEN_CRATES="wit-bindgen wit-bindgen-core wit-bindgen-rust wit-bindgen-rust-macro"
 # wasm-tools crates that may be pinned to wasmtime's line.
 TOOLS_CRATES="wit-parser wit-component wasm-encoder wasm-metadata wasmparser"
 
@@ -67,7 +81,7 @@ index_path() {
 releases() {
   local file="$CACHE/$1.json"
   if [[ ! -s $file ]]; then
-    curl -fsSL --retry 3 -A 'oxidhome-wasm-toolchain-bump' \
+    curl -fsSL --retry 3 --max-time 60 -A 'oxidhome-wasm-toolchain-bump' \
       "$INDEX/$(index_path "$1")" |
       jq -s --arg cutoff "$CUTOFF" '[.[] | select((.yanked | not)
                      and (.vers | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
@@ -78,6 +92,35 @@ releases() {
       die "cannot read the crates.io index entry for $1"
   fi
   cat "$file"
+}
+
+# OSV advisory ids (space-separated, empty if none) for crate $1 @ $2.
+# Withdrawn advisories don't count. Cached per run; fails the run when
+# OSV can't be queried.
+advisories() {
+  local file="$CACHE/osv-$1@$2.txt"
+  if [[ ! -e $file ]]; then
+    jq -n --arg n "$1" --arg v "$2" '{package: {ecosystem: "crates.io", name: $n}, version: $v}' |
+      curl -fsS --retry 3 --max-time 60 -A 'oxidhome-wasm-toolchain-bump' \
+        -H 'Content-Type: application/json' --data-binary @- "$OSV_API/v1/query" |
+      jq -r '[.vulns[]? | select(.withdrawn == null) | .id] | join(" ")' >"$file" ||
+      { rm -f "$file"; die "cannot query OSV for $1 $2"; }
+  fi
+  cat "$file"
+}
+
+# Advisories of every crate in $2.. at version $1, as "crate version:
+# ids" lines. Exits the run when OSV can't be queried: callers sit in
+# conditions, where errexit doesn't reach, so a failed query must never
+# read as "no advisories".
+advisories_of() {
+  local v="$1" c ids
+  shift
+  for c in "$@"; do
+    ids="$(advisories "$c" "$v")" || die "cannot query OSV for $c $v"
+    [[ -n $ids ]] && echo "$c $v: $ids"
+  done
+  return 0
 }
 
 # jq prelude: semver ordering and the compatibility line of a version or
@@ -92,10 +135,20 @@ def line: if test("^\\^?[0-9]+\\.[0-9]+(\\.[0-9]+)?$") | not
   | if .[0] == "0" then "0." + .[1] else .[0] end;
 '
 
+# $1 > $2 as versions.
+newer() {
+  jq -en --arg a "$1" --arg b "$2" "$JQ_LIB"'($a | nums) > ($b | nums)' >/dev/null
+}
+
 # Versions of crate $1 not older than $2, newest first.
 versions_from() {
   releases "$1" | jq -r --arg min "$2" "$JQ_LIB"'
     .[] | select((.vers | nums) >= ($min | nums)) | .vers'
+}
+
+# Releases of crate $1 on line $2, newest first.
+versions_on_line() {
+  releases "$1" | jq -r --arg l "$2" "$JQ_LIB"'.[] | select(.vers | line == $l) | .vers'
 }
 
 # The line of crate $1 @ $2's requirement on $3 (empty if no such dep).
@@ -105,10 +158,9 @@ dep_line() {
     | unique | if length > 1 then error("several lines") else (.[0] // "") end'
 }
 
-# Newest release of crate $1 on line $2 (empty if none).
-newest_on_line() {
-  releases "$1" | jq -r --arg l "$2" "$JQ_LIB"'
-    [.[] | select(.vers | line == $l) | .vers][0] // ""'
+# Whether crate $1 has release $2 out of quarantine.
+published() {
+  releases "$1" | jq -e --arg v "$2" 'any(.[]; .vers == $v)' >/dev/null
 }
 
 # The exact pin of crate $1 in the root manifest (empty if not pinned).
@@ -119,9 +171,9 @@ current_pin() {
 # The wasm-tools line wasmtime $1 is built on (empty if its
 # requirements disagree).
 wasmtime_line() {
-  local l line=""
+  local dep l line=""
   for dep in wasmparser wit-parser wasm-encoder; do
-    l="$(dep_line wasmtime "$1" "$dep")" || return 1
+    l="$(dep_line wasmtime "$1" "$dep")"
     [[ -z $l ]] && continue
     if [[ -z $line ]]; then line="$l"; elif [[ $l != "$line" ]]; then echo ""; return; fi
   done
@@ -142,20 +194,37 @@ bindgen_line() {
   fi
 }
 
+# Whether every crate in $2.. has release $1 out of quarantine and
+# without advisories; logs why not.
+clean_release() {
+  local v="$1" c found l
+  shift
+  for c in "$@"; do
+    published "$c" "$v" || { log "  $c $v: not published or still in quarantine"; return 1; }
+  done
+  found="$(advisories_of "$v" "$@")" || exit 1
+  if [[ -n $found ]]; then
+    while read -r l; do log "  advisory: $l"; done <<<"$found"
+    return 1
+  fi
+}
+
 # Prints the plan as "quarantine <days> <cutoff>", "status
 # <current|bump|none>", "line <0.N>", then one "pin <crate> <old> <new>"
 # per pinned crate.
 plan() {
-  local cur_wt cur_wb wts wbs wt wb bl line="" target_wt="" target_wb="" c old new
+  local cur_wt cur_wb wts wbs wt wb bl line="" target_wt="" target_wb="" c old new v found
+  local wasmtime_pinned="" tools_pinned="" pins=""
   cur_wt="$(current_pin wasmtime)"
   cur_wb="$(current_pin wit-bindgen)"
   [[ -n $cur_wt && -n $cur_wb ]] || die "no exact wasmtime / wit-bindgen pin in $MANIFEST"
+  for c in $WASMTIME_CRATES; do [[ -n "$(current_pin "$c")" ]] && wasmtime_pinned+=" $c"; done
+  for c in $TOOLS_CRATES; do [[ -n "$(current_pin "$c")" ]] && tools_pinned+=" $c"; done
   echo "quarantine $QUARANTINE_DAYS $CUTOFF"
   log "quarantine: $QUARANTINE_DAYS days, only releases published by $CUTOFF"
 
-  # Fetch up front so a failed download stops the run here instead of
-  # reading as "no release" inside a substitution below.
-  for c in $WASMTIME_CRATES wit-bindgen wit-bindgen-core wit-bindgen-rust $TOOLS_CRATES; do
+  # Fetch up front so a failed download stops the run here.
+  for c in $WASMTIME_CRATES $BINDGEN_CRATES $TOOLS_CRATES; do
     releases "$c" >/dev/null
   done
   wts="$(versions_from wasmtime "$cur_wt")"
@@ -168,54 +237,97 @@ plan() {
       log "wasmtime $wt: its wasm-tools requirements disagree, skipped"
       continue
     fi
+    log "wasmtime $wt (wasm-tools $line):"
+    # shellcheck disable=SC2086 # word-split crate lists
+    clean_release "$wt" $wasmtime_pinned || continue
+
+    target_wb=""
     for wb in $wbs; do
       bl="$(bindgen_line "$wb")"
-      if [[ $bl == "$line" ]]; then
+      [[ $bl == "$line" ]] || continue
+      # shellcheck disable=SC2086
+      if clean_release "$wb" $BINDGEN_CRATES; then
         target_wb="$wb"
         break
       fi
     done
-    if [[ -n $target_wb ]]; then
-      target_wt="$wt"
-      break
+    if [[ -z $target_wb ]]; then
+      log "  no clean wit-bindgen >= $cur_wb out of quarantine on that line"
+      continue
     fi
-    log "wasmtime $wt (wasm-tools $line): no wit-bindgen >= $cur_wb out of quarantine on that line"
+
+    # Each pinned wasm-tools crate: newest clean release on the line,
+    # never older than its pin.
+    pins=""
+    for c in $tools_pinned; do
+      old="$(current_pin "$c")"
+      new=""
+      for v in $(versions_on_line "$c" "$line"); do
+        if newer "$old" "$v"; then new="$old"; break; fi
+        [[ $v == "$old" ]] && { new="$v"; break; }
+        found="$(advisories_of "$v" "$c")"
+        [[ -z $found ]] && { new="$v"; break; }
+        log "  advisory: $found"
+      done
+      if [[ -z $new ]]; then
+        log "  no clean $c on wasm-tools $line"
+        pins=""
+        break
+      fi
+      pins+="pin $c $old $new"$'\n'
+    done
+    if [[ -n $tools_pinned && -z $pins ]]; then
+      continue
+    fi
+    target_wt="$wt"
+    break
   done
 
   if [[ -z $target_wt ]]; then
     echo "status none"
-    return
+    return 0
   fi
-  log "target: wasmtime $target_wt + wit-bindgen $target_wb on wasm-tools $line"
+  log "target: wasmtime $target_wt + wit-bindgen $target_wb on wasm-tools $line, no OSV advisories"
 
-  local out="" changed=0
-  for c in $WASMTIME_CRATES wit-bindgen $TOOLS_CRATES; do
-    old="$(current_pin "$c")"
-    [[ -z $old ]] && continue
-    if [[ " $WASMTIME_CRATES " == *" $c "* ]]; then
-      new="$target_wt"
-      releases "$c" | jq -e --arg v "$new" 'any(.[]; .vers == $v)' >/dev/null ||
-        die "$c $new is not published"
-    elif [[ $c == wit-bindgen ]]; then
-      new="$target_wb"
-    else
-      new="$(newest_on_line "$c" "$line")"
-      [[ -n $new ]] || die "$c has no release out of quarantine on wasm-tools $line"
-      # A pin newer than anything out of quarantine stays put.
-      if jq -en --arg a "$old" --arg b "$new" "$JQ_LIB"'($a | nums) > ($b | nums)' >/dev/null; then
-        new="$old"
-      fi
-    fi
-    [[ $old != "$new" ]] && changed=1
-    out+="pin $c $old $new"$'\n'
-  done
-  if ((changed)); then echo "status bump"; else echo "status current"; fi
+  local out=""
+  for c in $wasmtime_pinned; do out+="pin $c $(current_pin "$c") $target_wt"$'\n'; done
+  out+="pin wit-bindgen $cur_wb $target_wb"$'\n'
+  out+="$pins"
+  if awk '$1 == "pin" && $3 != $4 { found = 1 } END { exit !found }' <<<"$out"; then
+    echo "status bump"
+  else
+    echo "status current"
+  fi
   echo "line $line"
   printf '%s' "$out"
 }
 
+# osv-scanner findings over every lockfile as sorted "package version id"
+# lines. Fails the run unless the scan itself succeeded (exit 0: clean,
+# 1: findings).
+scan_lockfiles() {
+  local args=() lock json rc=0
+  for lock in "$ROOT"/Cargo.lock "$ROOT"/examples/*/Cargo.lock; do args+=(--lockfile "$lock"); done
+  json="$CACHE/osv-scan.json"
+  osv-scanner scan source --format json "${args[@]}" >"$json" || rc=$?
+  ((rc == 0 || rc == 1)) || die "osv-scanner failed (exit $rc)"
+  jq -r '.results[]?.packages[]? | .package as $p | .vulnerabilities[]?
+         | "\($p.name) \($p.version) \(.id)"' "$json" | sort -u
+}
+
+# Re-resolves only what the new pins require; the examples are
+# standalone workspaces whose lockfiles CI builds with --locked.
+update_lockfiles() {
+  local lock
+  (cd "$ROOT" && cargo update --workspace) || return 1
+  for lock in "$ROOT"/examples/*/Cargo.lock; do
+    (cd "$(dirname "$lock")" && cargo update --workspace) || return 1
+  done
+}
+
 apply() {
-  local p status line days c old new wt="" wb="" table=""
+  local p status line days c old new wt="" wb="" table="" before after added
+  command -v osv-scanner >/dev/null || die "osv-scanner is not on PATH"
   p="$(plan)"
   printf '%s\n' "$p"
   status="$(awk '$1 == "status" { print $2 }' <<<"$p")"
@@ -226,7 +338,11 @@ apply() {
   fi
   line="$(awk '$1 == "line" { print $2 }' <<<"$p")"
   days="$(awk '$1 == "quarantine" { print $2 }' <<<"$p")"
+  before="$(scan_lockfiles)"
 
+  # Restore the manifest if the lockfile update fails, so a rerun sees
+  # the old pins and tries again.
+  cp "$MANIFEST" "$CACHE/Cargo.toml.orig"
   while read -r _ c old new; do
     [[ $c == wasmtime ]] && wt="$new"
     [[ $c == wit-bindgen ]] && wb="$new"
@@ -237,22 +353,31 @@ apply() {
     [[ "$(current_pin "$c")" == "$new" ]] || die "failed to rewrite the $c pin"
   done < <(grep '^pin ' <<<"$p")
 
-  # Re-resolve only what the new pins require; the examples are
-  # standalone workspaces whose lockfiles CI builds with --locked.
-  (cd "$ROOT" && cargo update --workspace)
-  for lock in "$ROOT"/examples/*/Cargo.lock; do
-    (cd "$(dirname "$lock")" && cargo update --workspace)
-  done
+  if ! update_lockfiles; then
+    cp "$CACHE/Cargo.toml.orig" "$MANIFEST"
+    die "cargo update failed; Cargo.toml restored"
+  fi
+
+  after="$(scan_lockfiles)"
+  added="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
+  if [[ -n $added ]]; then
+    log "the bump adds vulnerabilities (package version advisory); no PR:"
+    while read -r pkg ver id; do
+      echo "::error title=wasm toolchain bump adds a vulnerability::$pkg $ver: $id"
+    done <<<"$added"
+    if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=false" >>"$GITHUB_OUTPUT"; fi
+    return 0
+  fi
 
   local title="build(deps): bump wasm toolchain to wasmtime $wt, wit-bindgen $wb"
   local body_file="${PR_BODY_FILE:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/wasm-toolchain-pr.md}"
   cat >"$body_file" <<EOF
-Bumps the exact-pinned wasm toolchain together onto wasm-tools $line, the line wasmtime $wt is built on. wit-bindgen moves to its newest release on the same line, so the host and the guest bindings share one wasm-tools version. Only releases published at least $days days ago were considered.
+Bumps the exact-pinned wasm toolchain together onto wasm-tools $line, the line wasmtime $wt is built on. wit-bindgen moves to its newest release on the same line, so the host and the guest bindings share one wasm-tools release line.
 
 | crate | from | to |
 | --- | --- | --- |
 ${table}
-The root and \`examples/*\` lockfiles were updated with \`cargo update --workspace\`. If the WIT contract baseline or the generated bindings change, fix them up in this PR before merging.
+Only releases published at least $days days ago were considered (the scheduled default, 7 days, matches Dependabot's cooldown for every other dependency). None of the new pins has an OSV advisory, and osv-scanner finds no vulnerability in the updated lockfiles that main doesn't already have. The root and \`examples/*\` lockfiles were updated with \`cargo update --workspace\`. If the WIT contract baseline or the generated bindings change, fix them up in this PR before merging.
 
 Opened by \`.github/workflows/wasm-toolchain.yaml\`.
 EOF
