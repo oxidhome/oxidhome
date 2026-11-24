@@ -1722,7 +1722,12 @@ fn purge_tls_pins_audited(
     pins.retire(uuid);
     let doomed = pins.list_installation(uuid);
     if doomed.is_empty() {
-        return Ok(());
+        // Nothing to audit, but rows the store skipped as malformed may
+        // remain on disk.
+        return pins
+            .purge_installation(uuid)
+            .map(drop)
+            .map_err(|err| format!("TLS pin purge failed for install {uuid}: {err}"));
     }
     let (actor_kind, token_id) = match ctx {
         Some(ctx) => (

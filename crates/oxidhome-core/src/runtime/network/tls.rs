@@ -8,10 +8,9 @@
 //!   named, never the address it was resolved to; an IP-literal host is
 //!   checked against the certificate's IP addresses and sends no SNI.
 //! - **Trust on first use.** When the connected address is *private*,
-//!   *link-local* or *loopback* and the certificate's only fault is an
-//!   issuer the roots don't know (a device with a self-signed
-//!   certificate; an expired one, or one for another name, is refused),
-//!   the handshake still proves the
+//!   *link-local* or *loopback* and the certificate is self-signed with
+//!   no other fault (an expired one, one for another name, or one from a
+//!   CA the roots don't know is refused), the handshake still proves the
 //!   server holds the leaf certificate's key, and the leaf's SHA-256 is
 //!   checked against the instance's pin for `(host, port)` in the
 //!   [`TlsPinStore`]: no pin pins it, the same certificate passes, any
@@ -194,43 +193,25 @@ struct Verifier {
 }
 
 impl Verifier {
-    /// Verify the chain as if the server's own certificates were roots:
-    /// everything but the issuer is checked (the name, validity dates,
-    /// key usage, signatures). Only the leaf (a self-signed device) and,
-    /// when the system roots loaded, the top of the presented chain (an
-    /// unknown CA the server sends) anchor; intermediates between them are checked like any others,
-    /// dates included. (An anchor's own dates are not checked, as for
-    /// any `WebPKI` root.)
-    fn verify_trusting_presented(
+    /// Verify a self-signed leaf as if it were its own root: everything
+    /// but the issuer is checked (the name, validity dates, extended key
+    /// usage, the self-signature). A leaf from a CA the roots don't know
+    /// is refused even when the server sends that CA, since an anchor's
+    /// own CA constraints are never checked.
+    fn verify_self_signed(
         &self,
         end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
         server_name: &ServerName<'_>,
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<(), rustls::Error> {
-        let verify = |anchor: &CertificateDer<'_>, chain: &[CertificateDer<'_>]| {
-            let mut roots = RootCertStore::empty();
-            roots.add(anchor.clone().into_owned())?;
-            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&self.provider))
-                .build()
-                .map_err(|err| rustls::Error::General(err.to_string()))?
-                .verify_server_cert(end_entity, chain, server_name, ocsp_response, now)
-                .map(|_| ())
-        };
-        // A self-signed leaf: it alone, nothing in between.
-        let self_signed = verify(end_entity, &[]);
-        // An unknown CA the server sends, only after the system roots
-        // ran: a root pass checks each presented issuer is a CA, which
-        // an anchor never is checked for.
-        match (
-            self_signed,
-            self.roots.is_some().then(|| intermediates.last()).flatten(),
-        ) {
-            (Ok(()), _) => Ok(()),
-            (Err(_), Some(top)) => verify(top, intermediates),
-            (Err(err), None) => Err(err),
-        }
+        let mut roots = RootCertStore::empty();
+        roots.add(end_entity.clone().into_owned())?;
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&self.provider))
+            .build()
+            .map_err(|err| rustls::Error::General(err.to_string()))?
+            .verify_server_cert(end_entity, &[], server_name, ocsp_response, now)
+            .map(|_| ())
     }
 }
 
@@ -260,19 +241,13 @@ impl ServerCertVerifier for Verifier {
                 return Ok(verified);
             }
             // Only an issuer the roots don't know (a self-signed device),
-            // and only once the rest checks out with that issuer trusted:
+            // and only once the rest checks out with the leaf trusted:
             // an expired certificate, one for another name or one for
             // another use is refused like anywhere else.
             Err(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))
                 if self.tofu =>
             {
-                self.verify_trusting_presented(
-                    end_entity,
-                    intermediates,
-                    server_name,
-                    ocsp_response,
-                    now,
-                )?;
+                self.verify_self_signed(end_entity, server_name, ocsp_response, now)?;
                 Trust::FirstUse(Fingerprint::of_der(end_entity))
             }
             Err(err) => return Err(err),

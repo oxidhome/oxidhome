@@ -470,7 +470,18 @@ impl TlsPinStore {
         installation_uuid: &str,
     ) -> Result<Vec<TlsPin>, rusqlite::Error> {
         self.retire(installation_uuid);
-        self.remove(|slot| slot.installation_uuid == installation_uuid)
+        let removed = self.remove(|slot| slot.installation_uuid == installation_uuid)?;
+        // Rows `open` skipped as malformed aren't in memory; they go too.
+        if let Some(db) = &self.db {
+            let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+            durable_write(db, |conn| {
+                conn.execute(
+                    "DELETE FROM network_tls_pin WHERE installation_uuid = ?1",
+                    params![installation_uuid],
+                )
+            })?;
+        }
+        Ok(removed)
     }
 
     /// Remove the pins `filter` selects (an empty filter removes every

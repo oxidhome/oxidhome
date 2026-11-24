@@ -55,8 +55,8 @@ the address it checked.
 host the request named. The network rule check runs before the connection is made.
 
 **Self-signed LAN devices are trusted on first use.** When the connected address is private, link-local or loopback
-(a co-located bridge is no different from a LAN device) and the certificate's only fault is an issuer the system
-roots don't know, the handshake must still prove the server holds the leaf certificate's key, and the leaf's SHA-256
+(a co-located bridge is no different from a LAN device) and the certificate is self-signed with no other fault
+(a leaf from a CA the roots don't know is refused even when the server sends that CA), the handshake must still prove the server holds the leaf certificate's key, and the leaf's SHA-256
 is checked against the host-held pin for `(instance, host, port)`: no pin pins it (logged and audited), the same
 certificate passes, a different one is refused and audited, even one the roots vouch for. Any other certificate
 fault (expired, issued for another name, not for server use) is refused, never pinned. Public addresses, and NAT64
