@@ -64,7 +64,8 @@ jobs:
         run: |
           prs=$(gh pr list --state open --head chore/update-wasm-toolchain --json body,isCrossRepository)
           marker="<!-- wasm-toolchain-pins: $PINS -->"
-          if jq -e --arg m "$marker" 'any(.[]; (.body | contains($m)) and (.isCrossRepository | not))' <<<"$prs" > /dev/null; then
+          found=$(jq --arg m "$marker" 'any(.[]; (.body | contains($m)) and (.isCrossRepository | not))' <<<"$prs")
+          if [ "$found" = true ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "An open PR already makes this bump; leaving it alone."
           else

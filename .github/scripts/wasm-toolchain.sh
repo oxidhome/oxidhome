@@ -60,14 +60,15 @@ CACHE="$(mktemp -d)"
 # succeeds puts them back, so a rerun starts from the same state.
 RESTORE=""
 cleanup() {
-  local f failed=""
+  local f files failed=""
   if [[ -n $RESTORE ]]; then
-    while IFS= read -r -d '' f; do
+    files="$(cd "$RESTORE" && find . -type f)" || failed=1
+    for f in $files; do
       cp "$RESTORE/$f" "$ROOT/$f" || failed=1
-    done < <(cd "$RESTORE" && find . -type f -print0)
-    if [[ -n $failed ]]; then
+    done
+    if [[ -n $failed || -z $files ]]; then
       echo "error: could not restore every file; the originals are in $RESTORE" >&2
-      return
+      exit 1
     fi
     echo "restored Cargo.toml and the lockfiles" >&2
   fi
@@ -102,7 +103,8 @@ index_entries() {
   local file="$CACHE/$1.index.json"
   if [[ ! -s $file ]]; then
     curl -fsSL --retry 3 --max-time 60 -A 'oxidhome-wasm-toolchain-bump' \
-      "$INDEX/$(index_path "$1")" | jq -s . >"$file" ||
+      "$INDEX/$(index_path "$1")" |
+      jq -s 'if length > 0 then . else error("empty index entry") end' >"$file" ||
       die "cannot read the crates.io index entry for $1"
   fi
   cat "$file"
@@ -444,6 +446,27 @@ align_examples() {
   done
 }
 
+# The wasm-tools lines the wit-bindgen helpers locked in lockfile $1 on
+# wit-bindgen $2's minor line are built on, one per line. Cargo reaches
+# the helpers through caret requirements, so a helper patch could sit on
+# another line than the planned wit-bindgen release.
+guest_lines() {
+  local lock="$1" minor="${2%.*}." c v pkgs vs out=""
+  pkgs="$(registry_packages "$lock")"
+  for c in wit-bindgen-core wit-bindgen-rust; do
+    vs="$(awk -v n="$c" -v l="$minor" '$1 == n && index($2, l) == 1 { print $2 }' <<<"$pkgs")"
+    for v in $vs; do
+      if [[ $c == wit-bindgen-core ]]; then
+        out+="$(dep_line "$c" "$v" wit-parser)"$'\n'
+      else
+        out+="$(dep_line "$c" "$v" wit-component)"$'\n'
+        out+="$(dep_line "$c" "$v" wasm-metadata)"$'\n'
+      fi
+    done
+  done
+  [[ -z $out ]] || sort -u <<<"${out%$'\n'}"
+}
+
 # Re-resolves only what the new pins require; the examples are
 # standalone workspaces whose lockfiles CI builds with --locked.
 update_lockfiles() {
@@ -505,6 +528,15 @@ apply() {
     [[ -z $n ]] && continue
     eligible "$n" "$v" || fresh+="$f $n $v"$'\n'
   done <<<"$moved"
+  # Every lockfile's wit-bindgen helpers must sit on the planned line.
+  local skew="" gl
+  for lock in "$ROOT"/Cargo.lock "$ROOT"/examples/*/Cargo.lock; do
+    gl="$(guest_lines "$lock" "$wb")"
+    if [[ -n $gl && $gl != "$line" ]]; then
+      skew+="${lock#"$ROOT"/}: $(xargs <<<"$gl")"$'\n'
+    fi
+  done
+
   after="$(scan_lockfiles)"
   added="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
 
@@ -520,7 +552,13 @@ apply() {
       echo "::error title=wasm toolchain bump adds a vulnerability::$f: $pkg $ver: $id"
     done <<<"$added"
   fi
-  if [[ -n $fresh || -n $added ]]; then
+  if [[ -n $skew ]]; then
+    log "wit-bindgen's helpers resolved onto other wasm-tools lines than $line; no PR:"
+    while read -r f; do
+      [[ -n $f ]] && echo "::warning title=wasm-tools line skew::$f"
+    done <<<"$skew"
+  fi
+  if [[ -n $fresh || -n $added || -n $skew ]]; then
     if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=false" >>"$GITHUB_OUTPUT"; fi
     return 0
   fi
