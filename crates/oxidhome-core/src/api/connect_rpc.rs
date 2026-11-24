@@ -420,19 +420,24 @@ impl oxidhome_proto::connect::oxidhome::v1::NetworkService for OxidHomeNetwork {
         .map_err(|e| rpc_err(&ctx, ConnectError::invalid_argument(e)))?;
         let scope = filter.scope();
         let pins = self.engine.tls_pins();
-        let removed = tokio::task::spawn_blocking(move || pins.reset(&filter))
-            .await
-            .map_err(|_| rpc_err(&ctx, ConnectError::internal("removing TLS pins failed")))?
-            .map_err(|err| {
-                tracing::error!(target: "api.network", error = %err, "removing TLS pins failed");
-                rpc_err(&ctx, ConnectError::internal("removing TLS pins failed"))
-            })?;
-        tracing::warn!(
-            target: "host.network",
-            scope = %scope,
-            removed = removed.len(),
-            "TLS certificate pins reset",
-        );
+        let removed = tokio::task::spawn_blocking(move || {
+            let removed = pins.reset(&filter)?;
+            // Logged here, not after the await: a cancelled request's
+            // reset still commits, and still says what it selected.
+            tracing::warn!(
+                target: "host.network",
+                scope = %scope,
+                removed = removed.len(),
+                "TLS certificate pins reset",
+            );
+            Ok::<_, rusqlite::Error>(removed)
+        })
+        .await
+        .map_err(|_| rpc_err(&ctx, ConnectError::internal("removing TLS pins failed")))?
+        .map_err(|err| {
+            tracing::error!(target: "api.network", error = %err, "removing TLS pins failed");
+            rpc_err(&ctx, ConnectError::internal("removing TLS pins failed"))
+        })?;
         Response::ok(oxidhome_proto::proto::oxidhome::v1::ResetTlsPinsResponse {
             removed: removed.into_iter().map(proto_tls_pin).collect(),
             ..Default::default()

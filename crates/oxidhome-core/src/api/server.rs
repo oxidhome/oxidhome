@@ -959,19 +959,24 @@ async fn reset_tls_pins(
     let filter = params.reset_filter()?;
     let scope = filter.scope();
     let pins = state.engine.tls_pins();
-    let removed = tokio::task::spawn_blocking(move || pins.reset(&filter))
-        .await
-        .map_err(|_| TlsPinError::Internal)?
-        .map_err(|err| {
-            tracing::error!(target: "api.network", error = %err, "removing TLS pins failed");
-            TlsPinError::Internal
-        })?;
-    tracing::warn!(
-        target: "host.network",
-        scope = %scope,
-        removed = removed.len(),
-        "TLS certificate pins reset",
-    );
+    let removed = tokio::task::spawn_blocking(move || {
+        let removed = pins.reset(&filter)?;
+        // Logged here, not after the await: a cancelled request's
+        // reset still commits, and still says what it selected.
+        tracing::warn!(
+            target: "host.network",
+            scope = %scope,
+            removed = removed.len(),
+            "TLS certificate pins reset",
+        );
+        Ok::<_, rusqlite::Error>(removed)
+    })
+    .await
+    .map_err(|_| TlsPinError::Internal)?
+    .map_err(|err| {
+        tracing::error!(target: "api.network", error = %err, "removing TLS pins failed");
+        TlsPinError::Internal
+    })?;
     Ok(Json(TlsPinsRemovedBody {
         removed: removed.into_iter().map(Into::into).collect(),
     }))

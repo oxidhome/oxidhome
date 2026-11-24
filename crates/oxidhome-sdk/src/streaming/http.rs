@@ -16,7 +16,9 @@
 //!
 //! [`Request::send`] blocks until the whole response body has arrived (or
 //! a limit or timeout ends the request), so call it from `init`, a
-//! command or a service call, not from a tight `tick`.
+//! command or a service call, not from a tight `tick`. It sends the
+//! whole request body before reading the response body: an exchange
+//! that streams both ways at once needs `wasi:http` directly.
 //!
 //! - **Limits.** Bodies over [`Request::max_body`] (1 MiB by default) end
 //!   the request with [`Error::BodyTooLarge`]. [`Request::timeout`] (30 s
