@@ -418,6 +418,7 @@ impl oxidhome_proto::connect::oxidhome::v1::NetworkService for OxidHomeNetwork {
             req.all,
         )
         .map_err(|e| rpc_err(&ctx, ConnectError::invalid_argument(e)))?;
+        let scope = filter.scope();
         let pins = self.engine.tls_pins();
         let removed = tokio::task::spawn_blocking(move || pins.reset(&filter))
             .await
@@ -428,6 +429,7 @@ impl oxidhome_proto::connect::oxidhome::v1::NetworkService for OxidHomeNetwork {
             })?;
         tracing::warn!(
             target: "host.network",
+            scope = %scope,
             removed = removed.len(),
             "TLS certificate pins reset",
         );

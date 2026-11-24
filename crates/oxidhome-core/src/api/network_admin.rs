@@ -15,7 +15,8 @@ use serde::Serialize;
 use super::bootstrap::audited;
 use crate::state::{AuditLog, PinFilter, TlsPin, TlsPinStore};
 
-/// Audit `path` prefix of a pin reset (`…:<instance|*>`).
+/// Audit `path` prefix of a pin reset (`…:<scope>`, see
+/// [`PinFilter::scope`]).
 pub const AUDIT_PATH_RESET_TLS_PINS: &str = "cli.network.reset_tls_pins";
 
 /// One pin as the JSON API and MCP render it.
@@ -71,10 +72,7 @@ pub fn reset_tls_pins(
     pins: &TlsPinStore,
     filter: &PinFilter,
 ) -> anyhow::Result<Vec<TlsPin>> {
-    let path = format!(
-        "{AUDIT_PATH_RESET_TLS_PINS}:{}",
-        filter.instance_id.as_deref().unwrap_or("*")
-    );
+    let path = format!("{AUDIT_PATH_RESET_TLS_PINS}:{}", filter.scope());
     audited(audit, "cli", "-", &path, || {
         pins.reset(filter)
             .map_err(|e| anyhow::anyhow!("removing TLS pins: {e}"))

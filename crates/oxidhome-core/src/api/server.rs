@@ -957,6 +957,7 @@ async fn reset_tls_pins(
 ) -> Result<Json<TlsPinsRemovedBody>, TlsPinError> {
     require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TlsPinError::Scope)?;
     let filter = params.reset_filter()?;
+    let scope = filter.scope();
     let pins = state.engine.tls_pins();
     let removed = tokio::task::spawn_blocking(move || pins.reset(&filter))
         .await
@@ -967,6 +968,7 @@ async fn reset_tls_pins(
         })?;
     tracing::warn!(
         target: "host.network",
+        scope = %scope,
         removed = removed.len(),
         "TLS certificate pins reset",
     );

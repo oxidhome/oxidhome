@@ -129,6 +129,24 @@ impl PinFilter {
     ///
     /// A message naming what is missing.
     pub fn validated(self) -> Result<Self, String> {
+        self.check()
+    }
+
+    /// What the filter selects, for logs and audit paths: `*`, or
+    /// `<instance>[/<host>[:<port>]]`.
+    #[must_use]
+    pub fn scope(&self) -> String {
+        let Some(instance) = &self.instance_id else {
+            return "*".into();
+        };
+        match (&self.host, self.port) {
+            (Some(host), Some(port)) => format!("{instance}/{host}:{port}"),
+            (Some(host), None) => format!("{instance}/{host}"),
+            _ => instance.clone(),
+        }
+    }
+
+    fn check(self) -> Result<Self, String> {
         if self.host.is_some() && self.instance_id.is_none() {
             return Err("a host needs an instance id".into());
         }
@@ -204,8 +222,8 @@ impl TlsPinStore {
                 };
                 let int = |i| r.get_ref(i).ok().and_then(|v| v.as_i64().ok());
                 Ok((
-                    text(0).unwrap_or_default(),
-                    text(1).unwrap_or_default(),
+                    text(0),
+                    text(1),
                     int(2),
                     text(3),
                     int(4).unwrap_or_default(),
@@ -216,7 +234,10 @@ impl TlsPinStore {
                 let (instance_id, host, port, sha, pinned_ms) = row?;
                 let port = port.and_then(|p| u16::try_from(p).ok());
                 let fingerprint = sha.as_deref().and_then(Fingerprint::from_hex);
-                if let (Some(port), Some(fp)) = (port, fingerprint) {
+                // A key that doesn't decode couldn't be reset by key.
+                if let (Some(instance_id), Some(host), Some(port), Some(fp)) =
+                    (instance_id, host, port, fingerprint)
+                {
                     out.insert(
                         PinKey {
                             instance_id,
@@ -226,12 +247,7 @@ impl TlsPinStore {
                         (fp, pinned_ms),
                     );
                 } else {
-                    tracing::warn!(
-                        target: "host.network",
-                        instance_id = %instance_id,
-                        host = %host,
-                        "skipping a malformed TLS pin row",
-                    );
+                    tracing::warn!(target: "host.network", "skipping a malformed TLS pin row");
                 }
             }
             Ok(out)

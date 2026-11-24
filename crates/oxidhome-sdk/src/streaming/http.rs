@@ -338,13 +338,19 @@ impl Request {
             .write()
             .map_err(|()| fail("body stream"))
             .and_then(|stream| write_body(&stream, &self.body, &pending));
-        if let Ok(true) = written {
-            let _ = OutgoingBody::finish(outgoing, None);
-        } else {
-            // Unfinished: ends the request instead of leaving the host
-            // waiting for the rest of the body.
-            drop(outgoing);
-        }
+        let upload = match written {
+            Ok(true) => {
+                let _ = OutgoingBody::finish(outgoing, None);
+                None
+            }
+            // Answered mid-upload: the unfinished body stays open until
+            // the response body is read, since dropping it aborts the
+            // exchange.
+            Ok(false) => Some(outgoing),
+            // Dropped unfinished: ends the request instead of leaving the
+            // host waiting for the rest of the body.
+            Err(_) => None,
+        };
 
         pending.subscribe().block();
         let response = pending
@@ -365,6 +371,7 @@ impl Request {
             headers,
             incoming,
             _response: response,
+            _upload: upload,
         })
     }
 }
@@ -376,6 +383,8 @@ struct Head {
     // Dropped before the response it came from.
     incoming: IncomingBody,
     _response: IncomingResponse,
+    /// An upload the server answered before it finished.
+    _upload: Option<OutgoingBody>,
 }
 
 impl Head {
@@ -386,6 +395,7 @@ impl Head {
             headers,
             incoming,
             _response,
+            _upload,
         } = self;
         let body = read_body(incoming, max_body)?;
         Ok(Response {
