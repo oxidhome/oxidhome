@@ -28,6 +28,9 @@ use oxidhome_sdk::{Plugin, StreamingPlugin};
 const UDP_WAIT: Duration = Duration::from_secs(2);
 /// How long `httppoll` keeps calling `get`.
 const POLL_WAIT: Duration = Duration::from_secs(5);
+/// Most reads from one held socket per tick, so a busy peer can't keep a
+/// tick running.
+const MAX_READS_PER_TICK: usize = 256;
 /// Most redirects `http` follows.
 const MAX_REDIRECTS: usize = 3;
 
@@ -81,7 +84,10 @@ impl Plugin for NetProbe {
         let mut last = None;
         let mut buf = [0u8; 512];
         for socket in &self.udp {
-            while let Ok((n, _)) = socket.recv_from(&mut buf) {
+            for _ in 0..MAX_READS_PER_TICK {
+                let Ok((n, _)) = socket.recv_from(&mut buf) else {
+                    break;
+                };
                 last = Some(String::from_utf8_lossy(&buf[..n]).into_owned());
                 self.received += 1;
             }
@@ -89,7 +95,7 @@ impl Plugin for NetProbe {
         // A stream at its end is dropped: the host keeps waking a
         // plugin whose socket stays readable.
         self.tcp.retain_mut(|stream| {
-            loop {
+            for _ in 0..MAX_READS_PER_TICK {
                 match stream.read(&mut buf) {
                     Ok(0) => return false,
                     Ok(n) => {
@@ -99,6 +105,7 @@ impl Plugin for NetProbe {
                     Err(e) => return e.kind() == ErrorKind::WouldBlock,
                 }
             }
+            true
         });
         // `received` last: a test that sees it can read `last`.
         if let Some(last) = last {

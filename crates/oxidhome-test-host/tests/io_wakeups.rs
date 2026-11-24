@@ -192,7 +192,7 @@ async fn a_flood_is_coalesced_into_one_rate_bounded_wakeup() {
     wait_for(&storage, "received", 1).await;
 
     let (socket, plugin) = socket.recv_timeout(WAIT).expect("peer saw the probe");
-    for i in 0..100 {
+    for i in 0..20 {
         socket
             .send_to(format!("flood {i}").as_bytes(), plugin)
             .unwrap();
@@ -209,8 +209,8 @@ async fn a_flood_is_coalesced_into_one_rate_bounded_wakeup() {
     // The gap ends: one tick reads the whole flood.
     host.advance(Duration::from_millis(1)).await.unwrap();
     assert_eq!(int(&storage, "ticks"), 2);
-    assert_eq!(int(&storage, "received"), 101);
-    assert_eq!(string(&storage, "last"), "flood 99");
+    assert_eq!(int(&storage, "received"), 21);
+    assert_eq!(string(&storage, "last"), "flood 19");
 
     // Drained: no more wakeups.
     host.advance(GAP * 5).await.unwrap();

@@ -1925,6 +1925,12 @@ async fn io_ready(
 ) -> Option<Sleep> {
     let mut readable = instance.io_readable();
     if readable.is_empty() {
+        // Kept until it fires, so a socket a command opens meanwhile
+        // still waits out the gap; then dropped, so a virtual clock
+        // doesn't wait for a tick that has nothing to read.
+        if let Some(sleep) = gate.as_mut() {
+            sleep.await;
+        }
         *gate = None;
         return std::future::pending().await;
     }
