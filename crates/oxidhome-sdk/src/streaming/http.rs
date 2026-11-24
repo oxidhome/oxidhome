@@ -336,7 +336,7 @@ impl Request {
         // adds nothing.
         let written = match outgoing.write() {
             Ok(stream) => write_body(&stream, &self.body, &pending, self.timeout)?,
-            Err(()) => Written::Broken,
+            Err(()) => Written::Broken(None),
         };
         let (early, upload) = match written {
             Written::All(early) => {
@@ -349,7 +349,8 @@ impl Request {
             Written::Refused(response) => (Some(response), Some(outgoing)),
             // Dropped unfinished: ends the request instead of leaving the
             // host waiting for the rest of the body.
-            Written::Broken => (None, None),
+            // A response taken before it broke is still the answer.
+            Written::Broken(early) => (early, None),
         };
 
         let response = match early {
@@ -421,8 +422,9 @@ enum Written {
     All(Option<IncomingResponse>),
     /// The server refused (`3xx` and up) mid-upload; the rest is not sent.
     Refused(IncomingResponse),
-    /// The body stream failed; the response says why.
-    Broken,
+    /// The body stream failed: the response (taken already, or still
+    /// pending) says why.
+    Broken(Option<IncomingResponse>),
 }
 
 /// Write `body` and flush it. A response that arrives while the write is
@@ -448,7 +450,7 @@ fn write_body(
     let mut flushed = false;
     loop {
         let Ok(room) = stream.check_write() else {
-            return Ok(Written::Broken);
+            return Ok(Written::Broken(early));
         };
         if room == 0 {
             if early.is_some() {
@@ -471,7 +473,7 @@ fn write_body(
                 return Ok(Written::All(early));
             }
             if stream.flush().is_err() {
-                return Ok(Written::Broken);
+                return Ok(Written::Broken(early));
             }
             flushed = true;
             continue;
@@ -481,7 +483,7 @@ fn write_body(
             .min(rest.len())
             .min(WRITE_CHUNK);
         if stream.write(&rest[..n]).is_err() {
-            return Ok(Written::Broken);
+            return Ok(Written::Broken(early));
         }
         rest = &rest[n..];
     }
@@ -767,11 +769,12 @@ fn remove_dot_segments(path: &str) -> String {
             }
         }
     }
-    let mut joined = format!("/{}", out.join("/"));
-    if trailing_slash && !joined.ends_with('/') {
-        joined.push('/');
+    // A final `.` / `..` leaves an empty last segment (a trailing `/`),
+    // kept even after another empty one: `/a//.` is `/a//`.
+    if trailing_slash {
+        out.push("");
     }
-    joined
+    format!("/{}", out.join("/"))
 }
 
 #[cfg(test)]
@@ -815,6 +818,9 @@ mod tests {
             ("./", "https://cam.lan/api/v1/"),
             ("?y=2", "https://cam.lan/api/v1/status?y=2"),
             ("/a/./b/../c#f", "https://cam.lan/a/c"),
+            ("/a//.", "https://cam.lan/a//"),
+            ("/a/b/..", "https://cam.lan/a/"),
+            ("/..", "https://cam.lan/"),
             ("http://cam.lan/plain", "http://cam.lan/plain"),
             (
                 "next?return=https://cam.lan/s",
