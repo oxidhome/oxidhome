@@ -470,10 +470,12 @@ impl TlsPinStore {
         installation_uuid: &str,
     ) -> Result<Vec<TlsPin>, rusqlite::Error> {
         self.retire(installation_uuid);
-        let removed = self.remove(|slot| slot.installation_uuid == installation_uuid)?;
-        // Rows `open` skipped as malformed aren't in memory; they go too.
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let removed = self.list_installation(installation_uuid);
+        // One delete for the whole installation: rows `open` skipped as
+        // malformed (not in memory) go too, and memory changes only after
+        // it commits.
         if let Some(db) = &self.db {
-            let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
             durable_write(db, |conn| {
                 conn.execute(
                     "DELETE FROM network_tls_pin WHERE installation_uuid = ?1",
@@ -481,6 +483,10 @@ impl TlsPinStore {
                 )
             })?;
         }
+        self.pins
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|slot, _| slot.installation_uuid != installation_uuid);
         Ok(removed)
     }
 

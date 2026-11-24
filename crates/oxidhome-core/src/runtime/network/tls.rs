@@ -240,14 +240,19 @@ impl ServerCertVerifier for Verifier {
                     Some(Trust::Roots(Fingerprint::of_der(end_entity)));
                 return Ok(verified);
             }
-            // Only an issuer the roots don't know (a self-signed device),
-            // and only once the rest checks out with the leaf trusted:
-            // an expired certificate, one for another name or one for
-            // another use is refused like anywhere else.
-            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))
-                if self.tofu =>
-            {
-                self.verify_self_signed(end_entity, server_name, ocsp_response, now)?;
+            // Only a self-signed leaf, and only once the rest checks out
+            // with it trusted: an expired certificate, one for another
+            // name or use, or one from an unknown CA is refused like
+            // anywhere else. Checked whatever the roots objected to (a
+            // root sharing the leaf's subject name fails as a bad
+            // signature, not an unknown issuer).
+            Err(err @ rustls::Error::InvalidCertificate(_)) if self.tofu => {
+                if self
+                    .verify_self_signed(end_entity, server_name, ocsp_response, now)
+                    .is_err()
+                {
+                    return Err(err);
+                }
                 Trust::FirstUse(Fingerprint::of_der(end_entity))
             }
             Err(err) => return Err(err),
