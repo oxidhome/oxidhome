@@ -595,13 +595,29 @@ fn run_token() -> anyhow::Result<()> {
             }
             init_cli_tracing();
             let state_dir = resolve_state_dir()?;
-            let policy = with_offline_stores(&state_dir, |stores| {
-                if cmd == "grant-sensitive" {
-                    grant_sensitive(&stores.tokens, &stores.audit, token_id, category, &devices)
+            let (policy, by_role) = with_offline_stores(&state_dir, |stores| {
+                let policy = if cmd == "grant-sensitive" {
+                    grant_sensitive(&stores.tokens, &stores.audit, token_id, category, &devices)?
                 } else {
-                    revoke_sensitive(&stores.tokens, &stores.audit, token_id, category)
-                }
+                    revoke_sensitive(&stores.tokens, &stores.audit, token_id, category)?
+                };
+                // H6 slice 3: a held role may grant the category too.
+                let by_role: Vec<String> = stores
+                    .tokens
+                    .roles_by_id(&policy.roles)?
+                    .into_iter()
+                    .filter(|r| r.def().is_some_and(|d| d.sensitive.contains(&category)))
+                    .map(|r| r.name)
+                    .collect();
+                Ok((policy, by_role))
             })?;
+            if !by_role.is_empty() {
+                eprintln!(
+                    "note: role(s) {} held by this token also grant `{}`",
+                    by_role.join(", "),
+                    category.as_str(),
+                );
+            }
             println!(
                 "token {token_id} sensitive grants: {}",
                 if policy.sensitive.is_empty() {

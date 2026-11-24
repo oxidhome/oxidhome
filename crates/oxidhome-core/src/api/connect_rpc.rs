@@ -1645,6 +1645,14 @@ impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
     ) -> ServiceResult<impl Encodable<UpdateRoleResponse> + Send + use<'a>> {
         require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
         let req = request.to_owned_message();
+        // A replacement needs a definition: an unset one must not
+        // clear the role (`{}` does that explicitly).
+        if req.definition.is_unset() {
+            return Err(rpc_err(
+                &ctx,
+                ConnectError::invalid_argument("`definition` is required"),
+            ));
+        }
         let spec = role_spec(req.definition.into_option());
         let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
         let call_id = call_id_of(&ctx);

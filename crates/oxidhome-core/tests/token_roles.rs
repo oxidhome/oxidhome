@@ -586,7 +586,7 @@ async fn connect_tokens_service_is_owner_only() {
         "POST",
         "/oxidhome.v1.RolesService/UpdateRole",
         &owner.plaintext,
-        &json!({"name": "nope"}).to_string(),
+        &json!({"name": "nope", "definition": {}}).to_string(),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");

@@ -330,6 +330,13 @@ impl RoleDef {
             #[serde(default)]
             deny: Vec<SelectorWire>,
         }
+        // An object only: serde would also read `[]` as an empty one.
+        if !matches!(
+            serde_json::from_slice(definition),
+            Ok(serde_json::Value::Object(_))
+        ) {
+            return None;
+        }
         let wire: Wire = serde_json::from_slice(definition).ok()?;
         let mut grants = Vec::with_capacity(wire.grants.len());
         for g in wire.grants {

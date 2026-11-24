@@ -293,14 +293,21 @@ pub(crate) async fn require_token(
         Ok(rec) => {
             // H6 slice 3: resolving the token's roles reads `auth_role`;
             // the MCP mount keeps that off the runtime like its verify.
-            let actor = if pre_verified {
+            let holds_roles =
+                crate::auth::parse_policy(&rec.scope_json).is_some_and(|p| !p.roles.is_empty());
+            let actor = if pre_verified && holds_roles {
                 let (tokens, record) = (Arc::clone(&state.tokens), rec.clone());
-                // Under the same pre-admission cap as the verify.
+                // Under the same pre-admission cap as the verify, and
+                // refused like it when the cap is reached.
                 let permit = match &inflight {
-                    Some(gate) => match Arc::clone(&gate.0).acquire_owned().await {
+                    Some(gate) => match Arc::clone(&gate.0).try_acquire_owned() {
                         Ok(permit) => Some(permit),
                         Err(_) => {
-                            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                [(axum::http::header::RETRY_AFTER, "1")],
+                                r#"{"error":"MCP rate limit exceeded; retry shortly"}"#,
+                            )
                                 .into_response();
                         }
                     },

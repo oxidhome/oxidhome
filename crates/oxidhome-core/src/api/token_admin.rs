@@ -495,8 +495,10 @@ pub fn summaries(tokens: &TokenStore) -> Result<Vec<TokenSummary>, AdminError> {
 
 /// A role definition as given on every surface (the body of
 /// `POST /api/v1/roles` minus `name`, and of `PUT /api/v1/roles/{name}`).
+/// Only a JSON object: a struct would otherwise also accept an array,
+/// and `[]` must not quietly clear a role.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
 pub struct RoleSpec {
     /// What the role grants. Actions are those a scope can grant (`*`
     /// for all of them), optionally narrowed to device categories and
@@ -511,16 +513,56 @@ pub struct RoleSpec {
     pub deny: Vec<SelectorSpec>,
 }
 
-/// `POST /api/v1/roles`: a name and a definition.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// [`RoleSpec`]'s object form.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RoleSpecObject {
+    #[serde(default)]
+    grants: Vec<SelectorSpec>,
+    #[serde(default)]
+    sensitive: Vec<String>,
+    #[serde(default)]
+    deny: Vec<SelectorSpec>,
+}
+
+impl TryFrom<serde_json::Map<String, serde_json::Value>> for RoleSpec {
+    type Error = serde_json::Error;
+
+    fn try_from(map: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
+        let o: RoleSpecObject = serde_json::from_value(serde_json::Value::Object(map))?;
+        Ok(Self {
+            grants: o.grants,
+            sensitive: o.sensitive,
+            deny: o.deny,
+        })
+    }
+}
+
+/// `POST /api/v1/roles`: a name and a definition, in one object.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
 pub struct NewRole {
     /// Unique name: 1–32 of `a-z0-9-_`, starting with a letter, not
     /// `owner`.
     pub name: String,
     /// The definition.
-    #[serde(flatten)]
     pub spec: RoleSpec,
+}
+
+impl TryFrom<serde_json::Map<String, serde_json::Value>> for NewRole {
+    type Error = serde_json::Error;
+
+    fn try_from(mut map: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
+        let name = match map.remove("name") {
+            Some(serde_json::Value::String(name)) => name,
+            Some(_) => return Err(serde::de::Error::custom("`name` must be a string")),
+            None => return Err(serde::de::Error::missing_field("name")),
+        };
+        Ok(Self {
+            name,
+            spec: RoleSpec::try_from(map)?,
+        })
+    }
 }
 
 /// Validate `spec` into the definition stored for a role.
@@ -731,11 +773,13 @@ pub fn update_role(
     name: &str,
     spec: &RoleSpec,
 ) -> Result<RoleSummary, AdminError> {
+    // Checked before the audit row: the name lands in its path.
+    check_role_name(name)?;
     let json = build_role(spec)?;
-    let record = audit_role(audit, by, "update", name, name, || {
+    let (record, held) = audit_role(audit, by, "update", name, name, || {
         Ok(tokens.update_role(name, &json)?)
     })?;
-    Ok(RoleSummary::of(&record, tokens.role_holders(&record.id)?))
+    Ok(RoleSummary::of(&record, held))
 }
 
 /// Delete a role. Refused while live tokens hold it unless `force`;
@@ -753,6 +797,7 @@ pub fn delete_role(
     name: &str,
     force: bool,
 ) -> Result<RoleSummary, AdminError> {
+    check_role_name(name)?;
     let verb = if force { "delete-forced" } else { "delete" };
     let (record, held) = audit_role(audit, by, verb, name, name, || {
         Ok(tokens.delete_role(name, force)?)
@@ -936,6 +981,19 @@ mod tests {
             name: "tablet".into(),
             spec: spec.clone(),
         };
+        // An array is not a definition.
+        assert!(serde_json::from_str::<RoleSpec>("[]").is_err());
+        assert!(RoleDef::parse("role-0000000000000001", "x", b"[]").is_none());
+        assert!(matches!(
+            update_role(
+                &tokens,
+                &audit,
+                by,
+                "oxh_Not-A-Role-Name",
+                &RoleSpec::default()
+            ),
+            Err(AdminError::Invalid(_))
+        ));
         // The flattened body still refuses unknown fields.
         assert!(serde_json::from_str::<NewRole>(r#"{"name":"x","extra":1}"#).is_err());
         assert_eq!(

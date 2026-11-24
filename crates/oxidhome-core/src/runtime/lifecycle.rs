@@ -2441,13 +2441,18 @@ async fn run_execute(
     }
     // H6 slice 2: the command is dispatched; only now does it keep its
     // rate-limit charge and leave its `warn` row (fail-closed: no row,
-    // no run). The write is awaited, so the device's class and the
-    // deadline are checked again after it. The command was claimed as
+    // no run). The write is awaited, so a stop request, the device's
+    // class and the deadline are checked again after it. The command was claimed as
     // started: a caller whose deadline passes during the write reports
     // `outcome_unknown` for a command that in fact never ran.
     if let Some(charge) = charge
         && let Some(refused) = match commit_charge(charge, instance_id, &cmd.id).await {
             Err(refused) => Some(refused),
+            Ok(()) if *stop.borrow() => Some(CommandOutcome::Rejected {
+                error: WitError::Unavailable(format!(
+                    "instance `{instance_id}` is stopping; the command did not run"
+                )),
+            }),
             Ok(()) => recheck_after_commit(instance, &ctx, &device, admitted, instance_id),
         }
     {

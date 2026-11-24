@@ -238,28 +238,36 @@ impl TokenStore {
 
     /// Replace the definition of the role named `name`. Every token
     /// holding it sees the new definition from its next request on.
+    /// Returns the role and the live tokens holding it, read in the
+    /// same transaction.
     ///
     /// # Errors
     ///
     /// [`RoleError::NotFound`]; on database failure.
-    pub fn update_role(&self, name: &str, definition: &[u8]) -> Result<RoleRecord, RoleError> {
+    pub fn update_role(
+        &self,
+        name: &str,
+        definition: &[u8],
+    ) -> Result<(RoleRecord, Vec<String>), RoleError> {
         let name = name.to_owned();
         let definition = definition.to_vec();
         let now = now_ms();
         self.durable_write(
-            move |conn| -> Result<Result<RoleRecord, RoleError>, super::TokenError> {
-                let n = conn.execute(
+            move |conn| -> Result<Result<(RoleRecord, Vec<String>), RoleError>, super::TokenError> {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let n = tx.execute(
                     "UPDATE auth_role SET definition = ?1, updated_ms = ?2 WHERE name = ?3",
                     params![definition, now, name],
                 )?;
                 if n == 0 {
                     return Ok(Err(RoleError::NotFound(name)));
                 }
-                Ok(Ok(conn.query_row(
-                    &format!("{SELECT} WHERE name = ?1"),
-                    [&name],
-                    row_to_role,
-                )?))
+                let role =
+                    tx.query_row(&format!("{SELECT} WHERE name = ?1"), [&name], row_to_role)?;
+                let tokens = holders(&tx, &role.id)?;
+                tx.commit()?;
+                Ok(Ok((role, tokens)))
             },
         )?
     }
@@ -332,9 +340,10 @@ mod tests {
             vec![holder.id.clone()]
         );
 
-        let edited = tokens
+        let (edited, held) = tokens
             .update_role("tablet", br#"{"grants":[{"actions":["device.list"]}]}"#)
             .unwrap();
+        assert_eq!(held, vec![holder.id.clone()]);
         assert_eq!(edited.id, role.id);
         let found = tokens
             .roles_by_id(&[role.id.clone(), "role-ffffffffffffffff".into()])

@@ -59,8 +59,9 @@ share one axum listener, so a household hub only exposes one endpoint.
   lifecycle. See `crates/oxidhome-core/src/api/scopes.rs` for the full list.
 - **Sensitive categories**: commands on `lock`, `opener` and `alarm`
   devices and camera bytes need an explicit grant on top of the scope; no
-  scope reaches them, `*` included. Only the first-run (or recovered) admin
-  token, the owner, holds every category. Grant one offline with
+  scope reaches them, `*` included. The first-run (or recovered) admin
+  token, the owner, holds every category implicitly; any other token holds
+  a category through a grant of its own or through one of its roles. Grant one offline with
   `oxidhome token grant-sensitive <token-id> <lock|opener|alarm|camera>
   [--device <dev-id>]...` or at mint time (`--sensitive`);
   allowed sensitive actions are audited at `warn`
