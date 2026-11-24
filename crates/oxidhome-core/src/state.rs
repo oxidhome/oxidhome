@@ -61,8 +61,8 @@ pub use event_tail::{EventTail, TailError, TailItem};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
     InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, any_grant_matches,
-    content_digest, effective_capabilities, read_installed_bytes, recompute_digest_and_manifest,
-    recompute_installed_digest,
+    content_digest, effective_capabilities, effective_network_rules, network_rule_covers,
+    read_installed_bytes, recompute_digest_and_manifest, recompute_installed_digest,
 };
 // Crate-private wrapper for the gated-install flow; see the
 // type doc for why this stays out of the public re-export.

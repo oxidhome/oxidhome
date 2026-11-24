@@ -20,8 +20,11 @@ manifest's `[capabilities] network` rules:
   probes a list of unicast addresses;
 - the socket may only bind to the unspecified address (`0.0.0.0:0`).
 
-Network rules are granted explicitly at install time; a rule the
-operator didn't grant has no effect.
+Network rules are granted explicitly at install time, and a rule that
+wasn't granted has no effect. A grant narrower than the request (one
+host out of the subnet, say) is honored as granted; anything outside the
+request grants nothing. Only streaming-world manifests may declare
+network rules.
 
 ## Build
 

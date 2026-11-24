@@ -19,11 +19,19 @@
 //!    private addresses only when the whole range lies inside that
 //!    class's address blocks, so `0.0.0.0/0` covers public space only.
 //! 3. A **name rule** (exact DNS name or `*.suffix`) covers the *public*
-//!    addresses the host itself resolved a matching name to — never a
-//!    loopback, link-local or private one, which would let a DNS answer
-//!    reach the LAN (rebinding). Socket lookups record those addresses
-//!    in a bounded, expiring table that the connect / send check reads;
-//!    an HTTP request carries its matched rules directly.
+//!    addresses the host itself resolved a matching name to. A rule whose
+//!    name ends in a local-only suffix ([`LOCAL_SUFFIXES`]: `.local`,
+//!    `.lan`, `.home.arpa`, `.internal`) also covers *private* addresses
+//!    (`mqtt.lan` → `192.168.1.5`). No name rule covers loopback or
+//!    link-local addresses (`metadata.google.internal` is
+//!    `169.254.169.254`), and a name outside those suffixes never reaches
+//!    the LAN (DNS rebinding). Socket lookups record the covered
+//!    addresses in a bounded, expiring table that the connect / send
+//!    check reads; an HTTP request carries its matched rules directly.
+//!
+//! An operator narrows a grant by containment: the effective rules are
+//! the granted rules some requested rule covers plus the requested rules
+//! some granted rule covers ([`covers`]).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -56,6 +64,10 @@ const MAX_NAME_LEN: usize = 253;
 const AUDIT_BURST: f64 = 16.0;
 /// Audited denials refilled per second, per instance.
 const AUDIT_PER_SEC: f64 = 1.0;
+/// Name suffixes that are never delegated in public DNS, so a name
+/// under them is answered by the local network: a name rule ending in
+/// one may reach private addresses.
+pub(crate) const LOCAL_SUFFIXES: [&str; 4] = [".local", ".lan", ".home.arpa", ".internal"];
 
 /// What the plugin is doing with an address, which picks the rules that
 /// can allow it.
@@ -145,6 +157,8 @@ struct CompiledRule {
     proto: Proto,
     port: PortMatch,
     host: RuleHost,
+    /// A name rule under a [`LOCAL_SUFFIXES`] suffix.
+    local: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,11 +183,26 @@ impl CompiledRule {
             HostMatch::SuffixWildcard(suffix) => RuleHost::Suffix(normalize_name(suffix)),
             HostMatch::Cidr(net) => RuleHost::Net(canonical_net(*net)),
         };
+        let local = match &host {
+            RuleHost::Name(name) | RuleHost::Suffix(name) => is_local_name(name),
+            RuleHost::Ip(_) | RuleHost::Net(_) => false,
+        };
         Self {
             proto: rule.proto,
             port: rule.port,
             host,
+            local,
         }
+    }
+
+    /// Whether this name rule covers resolved addresses of `class`.
+    fn name_grants(&self, class: AddressClass) -> bool {
+        self.is_name_rule()
+            && match class {
+                AddressClass::Public => true,
+                AddressClass::Private => self.local,
+                _ => false,
+            }
     }
 
     fn allows(&self, using: Use, port: u16) -> bool {
@@ -229,6 +258,107 @@ fn canonical_net(net: IpNet) -> IpNet {
 pub(crate) fn normalize_name(name: &str) -> String {
     name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
+
+/// Whether a normalized name (or `.suffix`) lies under a local-only
+/// suffix: `mqtt.lan` and `.lan` do, `lan` and `.arpa` don't.
+fn is_local_name(name: &str) -> bool {
+    LOCAL_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+}
+
+/// Whether every address, proto and port `narrow` grants is also granted
+/// by `wide`, under this module's rules — so an operator may grant
+/// `narrow` against a request for `wide` (or the reverse) without
+/// widening anything.
+///
+/// - Proto: equal, or `wide` is `any`.
+/// - Port: `wide`'s ports include all of `narrow`'s (`0-65535` covers
+///   `*`).
+/// - Name hosts: an exact name is covered by itself or a `*.suffix` it
+///   matches; `*.a.b` by `*.b` (or itself). A local-only name is covered
+///   only by a local-only rule, since it may grant private addresses.
+/// - IP hosts: `wide`'s range contains `narrow`'s, and `narrow` grants no
+///   loopback, link-local or private address `wide` doesn't (`0.0.0.0/0`
+///   covers public space only, so it doesn't cover `10.0.0.0/8` or
+///   `10.0.0.5`).
+/// - A name never covers an IP rule, nor an IP rule a name.
+pub(crate) fn covers(wide: &NetworkRule, narrow: &NetworkRule) -> bool {
+    let (wide, narrow) = (CompiledRule::compile(wide), CompiledRule::compile(narrow));
+    let proto = wide.proto == Proto::Any || wide.proto == narrow.proto;
+    let port = match (wide.port, narrow.port) {
+        (PortMatch::Any, _) => true,
+        // Only the full range: a UDP sender may use source port 0.
+        (wide, PortMatch::Any) => port_range(wide) == (0..=u16::MAX),
+        (wide, PortMatch::Exact(p)) => port_range(wide).contains(&p),
+        (wide, PortMatch::Range(lo, hi)) => {
+            let range = port_range(wide);
+            range.contains(&lo) && range.contains(&hi)
+        }
+    };
+    proto && port && host_covers(&wide, &narrow)
+}
+
+fn port_range(port: PortMatch) -> std::ops::RangeInclusive<u16> {
+    match port {
+        PortMatch::Any => 0..=u16::MAX,
+        PortMatch::Exact(p) => p..=p,
+        PortMatch::Range(lo, hi) => lo..=hi,
+    }
+}
+
+fn host_covers(wide: &CompiledRule, narrow: &CompiledRule) -> bool {
+    match (&wide.host, &narrow.host) {
+        (RuleHost::Name(_) | RuleHost::Suffix(_), RuleHost::Name(name)) => {
+            wide.matches_name(name) && (wide.local || !narrow.local)
+        }
+        (RuleHost::Suffix(wide_suffix), RuleHost::Suffix(suffix)) => {
+            suffix.ends_with(wide_suffix.as_str()) && (wide.local || !narrow.local)
+        }
+        (RuleHost::Ip(_) | RuleHost::Net(_), RuleHost::Ip(_) | RuleHost::Net(_)) => {
+            let (wide_net, narrow_net) = (ip_host_net(&wide.host), ip_host_net(&narrow.host));
+            wide_net.contains(&narrow_net)
+                && (grants_whole_range(&wide.host) || !grants_non_public(&narrow.host))
+        }
+        _ => false,
+    }
+}
+
+/// An IP rule's host as a range (a literal is its single-address net).
+fn ip_host_net(host: &RuleHost) -> IpNet {
+    match host {
+        RuleHost::Ip(ip) => IpNet::from(*ip),
+        RuleHost::Net(net) => *net,
+        RuleHost::Name(_) | RuleHost::Suffix(_) => unreachable!("only called on IP rules"),
+    }
+}
+
+/// Whether an IP rule grants every (non-forbidden) address it contains:
+/// a literal does, and so does a CIDR inside one class's blocks.
+fn grants_whole_range(host: &RuleHost) -> bool {
+    match host {
+        RuleHost::Ip(_) => true,
+        RuleHost::Net(net) => NON_PUBLIC.iter().any(|class| net_within_class(net, *class)),
+        RuleHost::Name(_) | RuleHost::Suffix(_) => false,
+    }
+}
+
+/// Whether an IP rule grants some loopback, link-local or private address.
+fn grants_non_public(host: &RuleHost) -> bool {
+    match host {
+        RuleHost::Ip(ip) => !matches!(
+            classify(*ip),
+            AddressClass::Public | AddressClass::Forbidden
+        ),
+        RuleHost::Net(_) => grants_whole_range(host),
+        RuleHost::Name(_) | RuleHost::Suffix(_) => false,
+    }
+}
+
+/// The classes only an explicit IP rule (or a local name) reaches.
+const NON_PUBLIC: [AddressClass; 3] = [
+    AddressClass::Loopback,
+    AddressClass::LinkLocal,
+    AddressClass::Private,
+];
 
 /// Address blocks of the classes a CIDR rule has to stay inside to grant
 /// them. Mirrors `native_policy::endpoint::classify` for the forms a CIDR
@@ -398,11 +528,11 @@ impl NetworkPolicy {
         {
             return Ok(());
         }
-        if class == AddressClass::Public {
+        if matches!(class, AddressClass::Public | AddressClass::Private) {
             let allowed_by = |idx: &usize| {
                 self.rules
                     .get(*idx)
-                    .is_some_and(|r| r.is_name_rule() && r.allows(using, port))
+                    .is_some_and(|r| r.name_grants(class) && r.allows(using, port))
             };
             let allowed = match name_rules {
                 Some(rules) => rules.iter().any(allowed_by),
@@ -467,7 +597,8 @@ impl NetworkPolicy {
     }
 
     /// Keep the addresses a lookup of a name matching `rules` may hand to
-    /// the plugin, and remember the public ones for later connects.
+    /// the plugin, and remember the ones a name rule covers (public ones,
+    /// and private ones under a local-only rule) for later connects.
     /// Addresses no rule could ever allow are dropped here, so a
     /// rebinding answer never reaches the plugin.
     ///
@@ -495,9 +626,13 @@ impl NetworkPolicy {
             let usable = match class {
                 AddressClass::Forbidden => false,
                 AddressClass::Public => true,
-                // Reachable only through an IP rule; still listed so a
-                // LAN name with a matching CIDR rule works.
-                _ => self.rules.iter().any(|r| r.covers_ip(ip, class)),
+                // Reachable through a local-only name rule, or an IP
+                // rule; still listed in the latter case so a LAN name
+                // with a matching CIDR rule works.
+                _ => {
+                    self.grants_by_name(rules, class)
+                        || self.rules.iter().any(|r| r.covers_ip(ip, class))
+                }
             };
             let wanted = only.is_none_or(|(using, port)| {
                 self.check_addr(using, SocketAddr::new(ip, port), Some(rules))
@@ -509,11 +644,18 @@ impl NetworkPolicy {
         }
         let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
         for ip in &out {
-            if classify(*ip) == AddressClass::Public {
+            if self.grants_by_name(rules, classify(*ip)) {
                 resolved.insert(*ip, rules, now);
             }
         }
         out
+    }
+
+    /// Whether one of the name rules `rules` covers addresses of `class`.
+    fn grants_by_name(&self, rules: &[usize], class: AddressClass) -> bool {
+        rules
+            .iter()
+            .any(|idx| self.rules.get(*idx).is_some_and(|r| r.name_grants(class)))
     }
 
     /// Record a refusal: a `tracing` warning and an audit `deny` row,
@@ -834,9 +976,11 @@ mod tests {
     }
 
     #[test]
-    fn lan_names_resolve_through_a_cidr_rule() {
-        let p = policy(&["tcp://mqtt.lan:1883", "tcp://192.168.1.0/24:1883"]);
-        let rules = p.name_rules("mqtt.lan", &[Use::Tcp]).expect("named");
+    fn public_names_reach_the_lan_only_through_a_cidr_rule() {
+        let p = policy(&["tcp://mqtt.example.net:1883", "tcp://192.168.1.0/24:1883"]);
+        let rules = p
+            .name_rules("mqtt.example.net", &[Use::Tcp])
+            .expect("named");
         let admitted = p.admit_resolved(vec![ip("192.168.1.5"), ip("192.168.2.5")], &rules, None);
         assert_eq!(admitted, vec![ip("192.168.1.5")]);
         assert_eq!(p.check_addr(Use::Tcp, sa("192.168.1.5:1883"), None), Ok(()));
@@ -844,6 +988,165 @@ mod tests {
             p.check_addr(Use::Tcp, sa("192.168.2.5:1883"), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn local_name_rules_grant_private_addresses() {
+        let p = policy(&[
+            "tcp://mqtt.lan:1883",
+            "tcp://*.home.arpa:80",
+            "tcp://metadata.google.internal:80",
+            "tcp://*.example.com:1883",
+        ]);
+        let lan = p.name_rules("mqtt.lan", &[Use::Tcp]).expect("named");
+        let admitted = p.admit_resolved(
+            vec![
+                ip("192.168.1.5"),
+                ip("127.0.0.1"),
+                ip("169.254.169.254"),
+                ip("93.184.216.34"),
+            ],
+            &lan,
+            None,
+        );
+        // Private and public answers, never loopback or link-local.
+        assert_eq!(admitted, vec![ip("192.168.1.5"), ip("93.184.216.34")]);
+        assert_eq!(p.check_addr(Use::Tcp, sa("192.168.1.5:1883"), None), Ok(()));
+        assert!(
+            p.check_addr(Use::Tcp, sa("192.168.1.5:1884"), None)
+                .is_err()
+        );
+        assert!(
+            p.check_addr(Use::Udp, sa("192.168.1.5:1883"), None)
+                .is_err()
+        );
+
+        let home = p.name_rules("cam.home.arpa", &[Use::Http]).expect("named");
+        assert_eq!(
+            p.check_addr(Use::Http, sa("10.0.0.9:80"), Some(&home)),
+            Ok(())
+        );
+        assert!(
+            p.check_addr(Use::Http, sa("[fe80::1]:80"), Some(&home))
+                .is_err()
+        );
+
+        // The metadata name stays unreachable through its link-local answer.
+        let meta = p
+            .name_rules("metadata.google.internal", &[Use::Tcp])
+            .expect("named");
+        assert_eq!(
+            p.admit_resolved(vec![ip("169.254.169.254")], &meta, None),
+            Vec::<IpAddr>::new()
+        );
+        assert!(
+            p.check_addr(Use::Tcp, sa("169.254.169.254:80"), None)
+                .is_err()
+        );
+
+        // A public name resolving into the LAN is still a rebinding answer.
+        let public = p.name_rules("a.example.com", &[Use::Tcp]).expect("named");
+        assert_eq!(
+            p.admit_resolved(vec![ip("10.0.0.7")], &public, None),
+            Vec::<IpAddr>::new()
+        );
+        assert!(
+            p.check_addr(Use::Tcp, sa("10.0.0.7:1883"), Some(&public))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_suffixes_need_a_label_boundary() {
+        for (name, local) in [
+            ("mqtt.lan", true),
+            (".lan", true),
+            ("cam.home.arpa", true),
+            ("x.local", true),
+            ("db.internal", true),
+            ("lan", false),
+            ("notlan", false),
+            ("x.mylan", false),
+            (".arpa", false),
+            ("x.local.example.com", false),
+        ] {
+            assert_eq!(is_local_name(name), local, "{name}");
+        }
+    }
+
+    fn covers_str(wide: &str, narrow: &str) -> bool {
+        covers(
+            &wide.parse().expect("wide"),
+            &narrow.parse().expect("narrow"),
+        )
+    }
+
+    #[test]
+    fn containment_narrows_ip_rules_without_widening_classes() {
+        for (wide, narrow) in [
+            ("tcp://192.168.0.0/16:*", "tcp://192.168.1.20:80"),
+            ("tcp://192.168.0.0/16:*", "tcp://192.168.1.0/24:8000-8080"),
+            ("any://192.168.0.0/16:*", "udp://192.168.1.20:9999"),
+            ("any://10.0.0.0/8:1-1000", "https://10.1.2.3"),
+            ("tcp://0.0.0.0/0:*", "tcp://1.1.1.1:443"),
+            ("tcp://0.0.0.0/0:*", "tcp://172.0.0.0/8:80"),
+            ("tcp://10.0.0.5:80", "tcp://10.0.0.5/32:80"),
+            ("tcp://[fd00::/8]:*", "tcp://[fd00::1]:22"),
+            ("tcp://[::ffff:192.168.1.0/120]:*", "tcp://192.168.1.7:80"),
+            ("tcp://a.example.com:80", "tcp://a.example.com:80"),
+            ("any://192.168.1.2:0-65535", "udp://192.168.1.2:*"),
+        ] {
+            assert!(covers_str(wide, narrow), "{wide} ⊇ {narrow}");
+        }
+        for (wide, narrow) in [
+            // A broad CIDR grants public space only.
+            ("tcp://0.0.0.0/0:*", "tcp://10.0.0.0/8:*"),
+            ("tcp://0.0.0.0/0:*", "tcp://10.0.0.5:80"),
+            ("tcp://0.0.0.0/0:*", "tcp://127.0.0.1:80"),
+            ("tcp://[::/0]:*", "tcp://[fe80::1]:80"),
+            // Wider than the request on some axis.
+            ("tcp://192.168.1.0/24:*", "tcp://192.168.0.0/16:*"),
+            ("tcp://192.168.0.0/16:80", "tcp://192.168.1.2:*"),
+            ("tcp://192.168.0.0/16:80-90", "tcp://192.168.1.2:85-95"),
+            // Received datagrams may come from source port 0.
+            ("any://192.168.1.2:1-65535", "udp://192.168.1.2:*"),
+            ("tcp://192.168.0.0/16:*", "udp://192.168.1.2:80"),
+            ("tcp://192.168.0.0/16:*", "any://192.168.1.2:80"),
+            ("https://10.0.0.0/8", "tcp://10.0.0.1:443"),
+            // Names and addresses never cover each other.
+            ("tcp://mqtt.lan:1883", "tcp://192.168.1.5:1883"),
+            ("tcp://0.0.0.0/0:*", "tcp://a.example.com:80"),
+        ] {
+            assert!(!covers_str(wide, narrow), "{wide} ⊉ {narrow}");
+        }
+    }
+
+    #[test]
+    fn containment_narrows_name_rules() {
+        for (wide, narrow) in [
+            ("tcp://*.example.com:*", "tcp://mqtt.example.com:1883"),
+            ("tcp://*.example.com:*", "tcp://*.eu.example.com:*"),
+            ("https://*.example.com", "https://api.example.com"),
+            ("tcp://*.lan:*", "tcp://mqtt.lan:1883"),
+            (
+                "tcp://MQTT.example.com.:1883",
+                "tcp://mqtt.example.com:1883",
+            ),
+        ] {
+            assert!(covers_str(wide, narrow), "{wide} ⊇ {narrow}");
+        }
+        for (wide, narrow) in [
+            ("tcp://*.example.com:*", "tcp://example.com:80"),
+            ("tcp://*.example.com:*", "tcp://*.com:80"),
+            ("tcp://mqtt.example.com:*", "tcp://*.mqtt.example.com:80"),
+            ("tcp://*.example.com:*", "tcp://*.badexample.com:80"),
+            // A local-only name may grant private addresses the wider
+            // public-suffix rule never could.
+            ("tcp://*.arpa:*", "tcp://cam.home.arpa:80"),
+            ("tcp://*.arpa:*", "tcp://*.home.arpa:80"),
+        ] {
+            assert!(!covers_str(wide, narrow), "{wide} ⊉ {narrow}");
+        }
     }
 
     #[test]

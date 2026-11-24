@@ -36,8 +36,11 @@
 //! - A name rule (`tcp://mqtt.example.com:1883`, `tcp://*.example.com:*`)
 //!   covers the **public** addresses the host resolved that name to. Name
 //!   lookups for names no rule mentions are refused.
-//! - Loopback, link-local and private addresses need an IP or CIDR rule
-//!   inside that range (`tcp://127.0.0.1:1883`,
+//! - A name rule under `.local`, `.lan`, `.home.arpa` or `.internal`
+//!   (`tcp://mqtt.lan:1883`) also covers the **private** addresses its
+//!   names resolve to.
+//! - Other private addresses, and every loopback and link-local one, need
+//!   an IP or CIDR rule inside that range (`tcp://127.0.0.1:1883`,
 //!   `udp://192.168.0.0/16:9999`). Broadcast and multicast are refused.
 //! - Sockets may bind only to the unspecified address (`0.0.0.0:0` and
 //!   the like, any port); listening is refused.

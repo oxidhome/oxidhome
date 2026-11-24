@@ -20,7 +20,8 @@
 //!   incoming datagrams the policy wouldn't allow are dropped.
 //! - `wasi:sockets/ip-name-lookup` is implemented here, not by
 //!   `wasmtime-wasi`, so the host only resolves names a rule mentions and
-//!   remembers which public addresses each name resolved to.
+//!   remembers which addresses its name rules cover (public ones, and
+//!   private ones for local-only names) each name resolved to.
 //! - Socket creation is capped per instance.
 //! - `wasi:http` requests are sent by [`http::HttpHooks`]: the host
 //!   resolves the request's host, checks each address, and connects to
@@ -34,7 +35,7 @@ mod policy;
 mod sockets;
 
 pub(crate) use http::{FIELD_SIZE_LIMIT, HttpHooks};
-pub(crate) use policy::NetworkPolicy;
+pub(crate) use policy::{NetworkPolicy, covers as rule_covers};
 pub(crate) use sockets::address_check;
 
 use oxidhome_manifest::World;
@@ -62,7 +63,7 @@ pub(crate) async fn in_invocation<F: std::future::Future>(
 
 /// Whether `world` gets WASI sockets and HTTP.
 pub(crate) const fn is_streaming(world: World) -> bool {
-    matches!(world, World::StreamingPlugin | World::StreamingAiPlugin)
+    world.has_network()
 }
 
 /// A streaming world's component must export `oxidhome:plugin/streaming`

@@ -1643,9 +1643,11 @@ interface streaming {
 /// the instance's granted `[capabilities] network` rules, on the resolved
 /// IP address; with no matching rule the call fails with `access-denied`
 /// (sockets, name lookup) or `HTTP-request-denied` (HTTP). Names are
-/// resolved by the host, and a name rule only covers the public addresses
-/// the name resolved to: loopback, link-local and private addresses need
-/// an IP or CIDR rule inside that range. Binds are allowed only to the
+/// resolved by the host, and a name rule covers the public addresses the
+/// name resolved to; a name rule under `.local`, `.lan`, `.home.arpa` or
+/// `.internal` also covers private ones. Other private addresses, and all
+/// loopback and link-local ones, need an IP or CIDR rule inside that
+/// range. Binds are allowed only to the
 /// unspecified address; `listen` is refused. `wasi:http` does not follow
 /// redirects, so each hop is a new, separately checked request.
 world streaming-plugin {

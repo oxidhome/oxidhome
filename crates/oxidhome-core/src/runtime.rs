@@ -37,6 +37,7 @@ pub use lifecycle::{
     InstanceHandle, InstanceState, STOP_GRACE, STOP_WAIT_LIMIT, StopWaitReport, SupervisorTuning,
     stop_and_wait_reaped, supervise, supervise_with_tuning,
 };
+pub(crate) use network::rule_covers as network_rule_covers;
 pub use registry::{InstanceRegistry, RegistryError};
 pub use sandbox::{SANDBOX_SEPARATOR, SandboxRegistry, sandbox_instance_id};
 pub use state::PluginState;

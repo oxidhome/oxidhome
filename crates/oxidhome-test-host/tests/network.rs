@@ -299,17 +299,15 @@ async fn disallowed_host_port_and_proto_are_refused_and_audited() {
 }
 
 /// The policy is built from what the operator granted, not from what the
-/// manifest requests.
+/// manifest requests: a grant narrowed to one port out of a requested
+/// range allows only that port.
 #[tokio::test(flavor = "multi_thread")]
 async fn only_granted_rules_are_enforced_as_allowed() {
     let host = TestHost::new().unwrap();
     let granted = TcpServer::line();
     let withheld = TcpServer::line();
     let granted_rule = format!("tcp://127.0.0.1:{}", granted.port());
-    let dir = probe_dir(&[
-        granted_rule.clone(),
-        format!("tcp://127.0.0.1:{}", withheld.port()),
-    ]);
+    let dir = probe_dir(&["tcp://127.0.0.0/8:*".to_owned()]);
     let grant = oxidhome_test_host::CapabilitiesSection {
         network: vec![granted_rule.parse().unwrap()],
         storage_quota_kb: 16,

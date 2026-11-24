@@ -12,7 +12,9 @@ use oxidhome_manifest::{CapabilitiesSection, ServiceGrant};
 /// means the grant is a (possibly narrowed) subset of the request —
 /// one an operator could actually issue for this manifest.
 ///
-/// Set-shaped fields must be subsets, quotas must not exceed the
+/// Each `network` rule must be covered by some requested rule (the
+/// operator may narrow a CIDR, port range or `*.suffix`); the other
+/// set-shaped fields must be subsets, quotas must not exceed the
 /// request (nor may `script_sandboxes`), `subscribes_events` and
 /// `reads_event_bytes` may only be granted when requested, and each `consumes_services` entry must
 /// be covered by some requested entry (same plugin and service, a
@@ -22,8 +24,14 @@ use oxidhome_manifest::{CapabilitiesSection, ServiceGrant};
 pub fn grant_excess(requested: &CapabilitiesSection, granted: &CapabilitiesSection) -> Vec<String> {
     let mut excess = Vec::new();
     for rule in &granted.network {
-        if !requested.network.contains(rule) {
-            excess.push(format!("network rule `{rule}` is not requested"));
+        if !requested
+            .network
+            .iter()
+            .any(|req| oxidhome_core::state::network_rule_covers(req, rule))
+        {
+            excess.push(format!(
+                "network rule `{rule}` is not covered by any requested rule"
+            ));
         }
     }
     if granted.storage_quota_kb > requested.storage_quota_kb {
@@ -136,6 +144,20 @@ mod tests {
             }],
             reads_event_bytes: true,
         }
+    }
+
+    #[test]
+    fn network_grants_may_narrow_but_not_widen() {
+        let mut req = requested();
+        req.network = vec!["tcp://192.168.0.0/16:*".parse().expect("rule")];
+        let mut narrowed = req.clone();
+        narrowed.network = vec!["tcp://192.168.1.20:80".parse().expect("rule")];
+        assert_eq!(grant_excess(&req, &narrowed), Vec::<String>::new());
+        let mut wider = req.clone();
+        wider.network = vec!["tcp://10.0.0.0/8:*".parse().expect("rule")];
+        let excess = grant_excess(&req, &wider);
+        assert_eq!(excess.len(), 1, "{excess:?}");
+        assert!(excess[0].contains("10.0.0.0/8"), "{excess:?}");
     }
 
     #[test]
