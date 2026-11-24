@@ -209,26 +209,28 @@ impl Verifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<(), rustls::Error> {
-        let mut presented = RootCertStore::empty();
-        // The top of the chain anchors only after the system roots ran:
-        // a root pass checks each presented issuer is a CA, which an
-        // anchor never is checked for. Without roots, only a
-        // self-signed leaf can be trusted on first use.
-        let top = self.roots.as_ref().and(intermediates.last());
-        for cert in std::iter::once(end_entity).chain(top) {
-            // A certificate that can't anchor just isn't one.
-            let _ = presented.add(cert.clone().into_owned());
+        let verify = |anchor: &CertificateDer<'_>, chain: &[CertificateDer<'_>]| {
+            let mut roots = RootCertStore::empty();
+            roots.add(anchor.clone().into_owned())?;
+            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&self.provider))
+                .build()
+                .map_err(|err| rustls::Error::General(err.to_string()))?
+                .verify_server_cert(end_entity, chain, server_name, ocsp_response, now)
+                .map(|_| ())
+        };
+        // A self-signed leaf: it alone, nothing in between.
+        let self_signed = verify(end_entity, &[]);
+        // An unknown CA the server sends, only after the system roots
+        // ran: a root pass checks each presented issuer is a CA, which
+        // an anchor never is checked for.
+        match (
+            self_signed,
+            self.roots.is_some().then(|| intermediates.last()).flatten(),
+        ) {
+            (Ok(()), _) => Ok(()),
+            (Err(_), Some(top)) => verify(top, intermediates),
+            (Err(err), None) => Err(err),
         }
-        if presented.is_empty() {
-            return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer,
-            ));
-        }
-        WebPkiServerVerifier::builder_with_provider(Arc::new(presented), Arc::clone(&self.provider))
-            .build()
-            .map_err(|err| rustls::Error::General(err.to_string()))?
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-            .map(|_| ())
     }
 }
 

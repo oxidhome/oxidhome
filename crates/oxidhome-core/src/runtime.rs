@@ -861,7 +861,7 @@ impl Engine {
             && let Err(err) = purge_tls_pins_audited(
                 self.tls.pins(),
                 &self.audit_log,
-                &crate::auth::invocation::current_or_host(plugin_id),
+                crate::auth::invocation::current().as_ref(),
                 uuid,
             )
         {
@@ -1707,14 +1707,15 @@ pub fn is_operator_instance_id(instance_id: &str) -> bool {
 const MIGRATION_14: i64 = 14;
 
 /// Delete the TLS pins the (retired or tombstoned) installation
-/// `uuid`'s instances made, each one audited for `ctx`: a durable intent
-/// row (`net.tls_pin_purge/<instance>/<host>:<port>/sha256:<hex>`)
+/// `uuid`'s instances made, each one audited for `ctx` (the caller of an
+/// uninstall; `None`: the host itself): a durable intent row
+/// (`net.tls_pin_purge/<installation>/<instance>/<host>:<port>/sha256:<hex>`)
 /// before the delete, finalized after it (or with the failure), so a
 /// crash in between still leaves the record.
 fn purge_tls_pins_audited(
     pins: &crate::state::TlsPinStore,
     audit_log: &AuditLog,
-    ctx: &crate::auth::invocation::InvocationContext,
+    ctx: Option<&crate::auth::invocation::InvocationContext>,
     uuid: &str,
 ) -> Result<(), String> {
     use crate::auth::invocation;
@@ -1723,7 +1724,14 @@ fn purge_tls_pins_audited(
     if doomed.is_empty() {
         return Ok(());
     }
-    let root = ctx.root();
+    let (actor_kind, token_id) = match ctx {
+        Some(ctx) => (
+            ctx.root().kind().as_str().to_owned(),
+            ctx.root().audit_token_id().to_owned(),
+        ),
+        // The daemon on its own behalf, as the bootstrap rows record it.
+        None => ("host".to_owned(), "-".to_owned()),
+    };
     let finalize_all = |ids: &[u64], status: u16, decision: &str, error: Option<&str>| {
         for id in ids {
             if let Err(err) =
@@ -1739,11 +1747,12 @@ fn purge_tls_pins_audited(
             id: 0,
             intent_ms: 0,
             finalized_ms: None,
-            token_id: root.audit_token_id().to_owned(),
-            actor_kind: root.kind().as_str().to_owned(),
+            token_id: token_id.clone(),
+            actor_kind: actor_kind.clone(),
             method: state_read::NETWORK_AUDIT_METHOD.to_owned(),
             path: format!(
-                "net.tls_pin_purge/{}/{}:{}/sha256:{}",
+                "net.tls_pin_purge/{}/{}/{}:{}/sha256:{}",
+                invocation::audit_cap(uuid),
                 invocation::audit_cap(&pin.key.instance_id),
                 invocation::audit_cap(&pin.key.host),
                 pin.key.port,
@@ -1755,8 +1764,8 @@ fn purge_tls_pins_audited(
             execution_outcome: None,
             domain_error: None,
             credential_fp: None,
-            call_id: Some(ctx.call_id().to_owned()),
-            invocation: Some(ctx.audit_json()),
+            call_id: ctx.map(|ctx| ctx.call_id().to_owned()),
+            invocation: ctx.map(invocation::InvocationContext::audit_json),
             command_id: None,
             command_outcome: None,
             level: None,
@@ -1820,8 +1829,7 @@ fn purge_tls_pins_of_removed_installations(
         }
     };
     for uuid in uuids {
-        let ctx = crate::auth::invocation::InvocationContext::host_origin(&uuid);
-        if let Err(err) = purge_tls_pins_audited(pins, audit_log, &ctx, &uuid) {
+        if let Err(err) = purge_tls_pins_audited(pins, audit_log, None, &uuid) {
             tracing::error!(target: "host.network", error = %err, "removing stale TLS pins failed");
         }
     }
@@ -1923,8 +1931,9 @@ mod tests {
         assert!(
             rows.iter().any(|r| r
                 .path
-                .starts_with("net.tls_pin_purge/inst-a/camera.lan:443/")
-                && r.status == 200),
+                .starts_with(&format!("net.tls_pin_purge/{uuid}/inst-a/camera.lan:443/"))
+                && r.status == 200
+                && r.actor_kind == "host"),
             "pin purge audit row"
         );
         drop(engine);
@@ -2021,7 +2030,7 @@ wasm = "plugin.wasm"
         assert!(
             rows.iter().any(|r| r.path
                 == format!(
-                    "net.tls_pin_purge/inst-a/camera.lan:443/sha256:{}",
+                    "net.tls_pin_purge/{uuid}/inst-a/camera.lan:443/sha256:{}",
                     fp.to_hex()
                 )),
             "pin purge audit row"
