@@ -45,9 +45,14 @@ oxidhome-proto = { path = "crates/oxidhome-proto" }
 oxidhome-wit = { path = "crates/oxidhome-wit", default-features = false }
 
 # Shared external deps.
-# Pinned exactly. Wasmtime's component-model API surface evolves; we want
-# silent minor bumps to be deliberate. Bumps land as their own PR. Mirrors
-# the `wit-bindgen` pin policy below.
+# The wasm toolchain (`wasmtime*`, `wit-bindgen`, `wit-parser`,
+# `wit-component`) is pinned exactly: Wasmtime's component-model API
+# surface evolves and bindgen output is ABI, so no bump is silent.
+# `.github/workflows/wasm-toolchain.yaml` bumps it as one unit in its own
+# PR (Dependabot ignores it): to the newest wasmtime for which a
+# `wit-bindgen` release on the same wasm-tools line exists, with the
+# wasm-tools pins on that line's newest release, counting only releases
+# at least 7 days old and without an OSV advisory.
 #
 # Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli, random, …) so
 # libstd-pulled WASI imports resolve; Phase 8 adds its sockets and
@@ -68,9 +73,9 @@ wasmtime-wasi = { version = "=51.0.0", default-features = false, features = ["p2
 # (`runtime::network::http`), connecting to the address its network
 # policy checked.
 wasmtime-wasi-http = { version = "=51.0.0", default-features = false, features = ["p2"] }
-# Pinned to an exact version. Cross-crate ABI surfaces are sensitive — a
-# silent minor bump in bindgen output could break either side. Bumps land
-# as deliberate PRs that re-run both bindgens. See the exact-pinning
+# Cross-crate ABI surfaces are sensitive — a silent minor bump in bindgen
+# output could break either side. The toolchain job above only moves it
+# to a release on wasmtime's wasm-tools line. See the exact-pinning
 # policy in ARCHITECTURE.md "Implementation decisions".
 wit-bindgen = "=0.62.0"
 # `oxidhome-core`, unix-only (`flock` state-dir lock, no-follow opens).
@@ -79,11 +84,10 @@ libc = "0.2.189"
 # component's embedded types (`wit-parser`) and compares them against
 # the `oxidhome:plugin` package `build.rs` encodes (`wit-component`);
 # `oxidhome-wit`'s baseline test prints and semver-checks the package.
-# Pinned exact, bumped together (they share `wit_parser` types, so a
-# skew fails to compile), and kept on the versions `wasmtime` pulls in
-# so the host graph keeps one copy. Newer decoders read what an older
-# `wit-bindgen` embeds. (The dev-only `dummy-module` / `semver-check`
-# features add `wat` and a newer `wasmparser` to test builds.)
+# Pinned exact on the wasm-tools line `wasmtime` pulls in (they share
+# `wit_parser` types, so a skew fails to compile), so the host graph
+# keeps one copy; the toolchain job above moves them. (The dev-only
+# `dummy-module` / `semver-check` features add `wat` to test builds.)
 wit-parser = { version = "=0.263.0", default-features = false, features = ["std", "decoding"] }
 wit-component = { version = "=0.263.0", default-features = false }
 anyhow = "1.0.102"

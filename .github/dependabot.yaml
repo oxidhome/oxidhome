@@ -1,9 +1,13 @@
 version: 2
+# Version updates wait out a 7-day cooldown, the same quarantine
+# .github/workflows/wasm-toolchain.yaml applies; security updates don't.
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       ci:
         patterns:
@@ -12,17 +16,14 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
-    groups:
-      # wasmtime and the wasm-tools crates it pulls in move together:
-      # `wit-parser` / `wit-component` are pinned to wasmtime's versions
-      # and share types, so a lone bump of one breaks the build (#200).
-      # `wit-bindgen` stays out on purpose: its exact pin is bumped in
-      # its own PR (AGENTS.md, root Cargo.toml).
-      wasmtime:
-        patterns:
-          - "wasmtime*"
-          - "wit-parser"
-          - "wit-component"
-          - "wasm-encoder"
-          - "wasm-metadata"
-          - "wasmparser"
+    cooldown:
+      default-days: 7
+    # The wasm toolchain moves together onto one wasm-tools release
+    # (a skew breaks the build, #200); .github/workflows/wasm-toolchain.yaml
+    # bumps it, so Dependabot leaves these crates alone.
+    ignore:
+      - dependency-name: "wasmtime*"
+      - dependency-name: "wit-*"
+      - dependency-name: "wasm-encoder"
+      - dependency-name: "wasm-metadata"
+      - dependency-name: "wasmparser"
