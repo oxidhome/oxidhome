@@ -228,7 +228,9 @@ impl TestHost {
     /// deadline, and the host waits for the work it triggers —
     /// a supervised instance's tick, an `accepted` command's expiry —
     /// before moving on. So with `tick_interval_ms = 1000`, advancing
-    /// 3.5 s runs exactly three supervised ticks.
+    /// 3.5 s runs exactly three periodic ticks. A streaming instance
+    /// that holds a readable socket may also get early ticks in that
+    /// span (at most one per 100 ms).
     ///
     /// Directly driven instances aren't ticked here: their ticks run
     /// when the test calls [`TestPluginInstance::advance`] (which also

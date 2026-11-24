@@ -19,6 +19,7 @@ pub mod contract;
 pub mod dispatcher;
 mod event_read;
 mod instance;
+mod io_wakeup;
 mod lifecycle;
 mod media_placeholder;
 mod network;

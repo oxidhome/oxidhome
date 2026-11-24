@@ -17,6 +17,20 @@
 //! doesn't reach, so the instance is stuck until data arrives or it is
 //! stopped.
 //!
+//! # Readiness wakeups
+//!
+//! When the manifest sets `tick_interval_ms`, the host also calls
+//! [`Plugin::tick`](crate::Plugin::tick) early when a socket the plugin
+//! keeps open between calls becomes readable: a connected `TcpStream`, or
+//! a `UdpSocket` that has connected, sent, or tried a receive (a
+//! non-blocking `recv_from` that answered `WouldBlock` counts). The
+//! cadence can then be a slow fallback rather than a polling rate.
+//! Wakeups are coalesced (one tick however much arrived) and start at
+//! least 100 ms after the previous tick returned. Read what a tick finds,
+//! up to a bound per tick so a busy peer can't hold the call, and drop
+//! sockets that reached their end: a socket left readable (data still
+//! queued, or at its end) wakes the plugin again after each gap. Without `tick_interval_ms` the plugin is never ticked.
+//!
 //! # HTTP
 //!
 //! Outgoing HTTP goes through `wasi:http/outgoing-handler`; the raw

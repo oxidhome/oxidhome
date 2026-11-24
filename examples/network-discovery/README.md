@@ -7,7 +7,9 @@ On start the plugin binds one UDP socket and sends a probe datagram to
 each address in its `targets` config. Every tick it drains the replies
 without blocking, publishes each as a `network-discovery.reply` custom
 event (`<ip>:<port> <payload>`), and keeps the running count in plugin
-storage under `replies`.
+storage under `replies`. The host ticks the plugin early when a reply is
+readable, at least 100 ms after the previous tick returned, so the
+manifest's one-minute `tick_interval_ms` is only a fallback.
 
 The host checks every send and every received datagram against the
 manifest's `[capabilities] network` rules:

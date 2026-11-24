@@ -3,18 +3,23 @@
 //! [`supervise`] spawns one tokio task per plugin instance. That task
 //! *owns* the [`PluginInstance`] (hence its Wasmtime `Store`) and is
 //! the only thing that ever drives it — preserving the single-threaded
-//! per-`Store` WASM contract. The task `select!`s between three
-//! sources and drains the event bus after each:
+//! per-`Store` WASM contract. The task `select!`s between these
+//! sources and drains the plugin's buffered events after each:
 //!
 //! - **control commands** — `execute-command` / `shutdown` arriving
 //!   through the [`InstanceHandle`]'s mpsc channel;
 //! - **ticks** — a `tokio::time::interval` whose cadence is the
 //!   manifest's `runtime.tick_interval_ms` (absent ⇒ no ticks);
-//! - **bus events** — a `broadcast` wakeup receiver; any publish wakes
-//!   the loop, which then runs [`PluginInstance::drain_events`] to
+//! - **bus events** — the instance's wake `Notify`, signalled when a
+//!   publish matches one of its subscriptions; the loop then runs
+//!   [`PluginInstance::drain_events`] to
 //!   deliver matching events into the plugin's `on-event`. This is the
 //!   subscriber-only-plugin path: such a plugin never ticks, so a
-//!   `select!` arm on the bus is what makes its events arrive.
+//!   `select!` arm on the bus is what makes its events arrive;
+//! - **readable sockets** — for a streaming instance with a tick
+//!   cadence, a socket the guest holds open becoming readable runs
+//!   `tick` early, coalesced and rate-bounded (see
+//!   [`super::io_wakeup`]).
 //!
 //! The state machine is `Loading → Inited → Running`, with
 //! `Stopping → Stopped` on a clean shutdown. A crash goes
@@ -30,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use futures_util::FutureExt as _;
 use oxidhome_manifest::RestartPolicy;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -37,7 +43,7 @@ use tokio::time::Instant;
 use crate::Engine;
 use crate::auth::SensitiveSet;
 use crate::auth::invocation::{self, InvocationContext};
-use crate::clock::Interval;
+use crate::clock::{Clock, Interval, Sleep};
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::types::{
     DeviceId, Error as WitError, KeyValue, ServiceId,
@@ -1883,6 +1889,67 @@ enum Wakeup {
     Control(Option<ControlCommand>),
     Tick,
     Event,
+    /// A socket the guest holds open is readable: tick early. Carries
+    /// the rate-gate sleep when that is what let the wakeup through, so
+    /// a virtual clock counts the tick it triggered as in progress.
+    Io(Option<Sleep>),
+}
+
+/// The rate gate after a tick that returned at `last_tick`: a sleep
+/// until [`super::io_wakeup::IO_WAKE_MIN_GAP`] later, or `None` once
+/// that has passed.
+fn io_gate_after(clock: &Clock, last_tick: Option<Instant>) -> Option<Sleep> {
+    last_tick
+        .map(|at| at + super::io_wakeup::IO_WAKE_MIN_GAP)
+        .filter(|at| *at > clock.instant())
+        .map(|at| clock.sleep_until(at))
+}
+
+/// Wait until a socket the guest holds open is readable, but not
+/// before the `gate` (see [`io_gate_after`]) has fired. Never completes
+/// while the guest holds no socket: it can only open one in a call,
+/// after which the serve loop waits again.
+///
+/// The serve loop creates each gate as soon as the tick returns, so a
+/// virtual clock sees it registered without a gap. Like the tick
+/// interval, a gate that falls due while the loop runs other guest work
+/// (a command, event delivery) keeps a virtual clock unsettled until the
+/// loop comes back to it. When the gate is what held a ready socket
+/// back, the fired gate is returned and kept until the tick it triggers
+/// is done (a virtual clock then waits for that tick, see
+/// [`Clock::sleep_until`]). A wait that then goes on for real I/O drops
+/// it first: the clock didn't trigger what follows.
+async fn io_ready(
+    instance: &mut PluginInstance,
+    clock: &Clock,
+    last_tick: Option<Instant>,
+    gate: &mut Option<Sleep>,
+) -> Option<Sleep> {
+    if gate.is_none() {
+        *gate = io_gate_after(clock, last_tick);
+    }
+    // The gap first: no table scan while it is closed. A gate that
+    // fires with nothing to watch is dropped, so a virtual clock
+    // doesn't wait for a tick that has nothing to read.
+    if let Some(sleep) = gate.as_mut() {
+        sleep.await;
+    }
+    let mut readable = instance.io_readable();
+    if readable.is_empty() {
+        *gate = None;
+        return std::future::pending().await;
+    }
+    let gate = gate.take();
+    let now = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::pin::Pin::new(&mut readable).poll(cx))
+    })
+    .await;
+    if now.is_ready() {
+        return gate;
+    }
+    drop(gate);
+    readable.await;
+    None
 }
 
 /// Deliver the plugin's pending events as a [`guest_call`]. A stop
@@ -1910,7 +1977,17 @@ async fn serve_loop(
     instance_id: &str,
     mut tick: Option<Interval>,
 ) -> ServeOutcome {
+    let io_wakeups = instance.io_wakeups();
+    let clock = instance.clock().clone();
+    // When the last tick returned: an early tick waits out the gap
+    // after it. None until the first, so a socket readable straight
+    // after `init` is served at once.
+    let mut last_tick: Option<Instant> = None;
+    // The rate gate the next early tick waits for.
+    let mut next_gate: Option<Sleep> = None;
     loop {
+        // The gate of an early tick, held until its drain is done.
+        let mut io_gate: Option<Sleep> = None;
         let next = async {
             tokio::select! {
                 ctrl = control_rx.recv() => Wakeup::Control(ctrl),
@@ -1925,11 +2002,15 @@ async fn serve_loop(
                 // matching publishes drains together in one pass —
                 // exactly the behaviour we want.
                 () = wake.notified() => Wakeup::Event,
+                gate = io_ready(instance, &clock, last_tick, &mut next_gate), if io_wakeups => {
+                    Wakeup::Io(gate)
+                }
             }
         };
         // A requested stop goes first: queued commands are then refused
         // without running (see `ControlQueue`). The others are polled
-        // fairly, so a stream of commands can't starve the tick.
+        // fairly, so a stream of commands can't starve the tick or a
+        // readable socket.
         let wakeup = tokio::select! {
             biased;
             () = stop_requested(stop) => Wakeup::Stop,
@@ -1940,10 +2021,29 @@ async fn serve_loop(
             Wakeup::Control(ctrl) => {
                 handle_control(instance, state_tx, stop, instance_id, ctrl).await
             }
-            Wakeup::Tick => match guest_call(stop, instance.tick()).await {
-                Some(result) => result.map(|()| LoopAction::Continue),
-                None => Ok(LoopAction::Cancelled),
-            },
+            Wakeup::Tick => {
+                let outcome = tick_now(instance, stop, &clock, &mut last_tick).await;
+                if io_wakeups {
+                    next_gate = io_gate_after(&clock, last_tick);
+                }
+                outcome
+            }
+            Wakeup::Io(gate) => {
+                tracing::trace!(instance_id, "socket readable: ticking early");
+                io_gate = gate;
+                // A periodic tick due now is this same tick: taken here,
+                // so the two don't run back to back.
+                // Unconstrained: Tokio's task budget must not hide a due
+                // tick.
+                if let Some(interval) = tick.as_mut() {
+                    let _ = tokio::task::unconstrained(interval.tick()).now_or_never();
+                }
+                let outcome = tick_now(instance, stop, &clock, &mut last_tick).await;
+                // Registered before `io_gate` goes, so a virtual clock
+                // never sees neither.
+                next_gate = io_gate_after(&clock, last_tick);
+                outcome
+            }
             Wakeup::Event => Ok(LoopAction::Continue),
         };
 
@@ -1970,6 +2070,22 @@ async fn serve_loop(
             }
             Err(e) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),
         }
+        drop(io_gate);
+    }
+}
+
+/// Run `tick` as a [`guest_call`] and note when it returned.
+async fn tick_now(
+    instance: &mut PluginInstance,
+    stop: &mut watch::Receiver<bool>,
+    clock: &Clock,
+    last_tick: &mut Option<Instant>,
+) -> anyhow::Result<LoopAction> {
+    let result = guest_call(stop, instance.tick()).await;
+    *last_tick = Some(clock.instant());
+    match result {
+        Some(result) => result.map(|()| LoopAction::Continue),
+        None => Ok(LoopAction::Cancelled),
     }
 }
 
