@@ -301,6 +301,11 @@ impl AuditLog {
         self
     }
 
+    /// The clock rows are stamped from.
+    pub(crate) fn clock(&self) -> &Clock {
+        &self.clock
+    }
+
     /// Spawn the periodic audit retention task on the current tokio
     /// runtime (see [`crate::state::retention`]). Deletes rows whose
     /// intent is older than `policy.max_age` or that fall beyond the

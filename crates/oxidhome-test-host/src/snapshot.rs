@@ -104,7 +104,8 @@ pub struct Snapshot {
     /// With [`SnapshotOptions::audit`]: the audit-ledger rows rooted
     /// at this instance (a refused `get-state` / `read-events`, …),
     /// oldest first, `<decision> <status> <method> <path>` plus
-    /// `scope=`, `outcome=`, `command=` and `error=` when set.
+    /// `scope=`, `outcome=`, `command=`, `level=` (a sensitive action's
+    /// `warn` row) and `error=` when set.
     pub audit: Option<Vec<String>>,
 }
 
@@ -719,6 +720,7 @@ fn render_audit_row(row: &AuditEntry) -> String {
         ("scope", &row.required_scope),
         ("outcome", &row.execution_outcome),
         ("command", &row.command_outcome),
+        ("level", &row.level),
     ] {
         if let Some(value) = value {
             let _ = write!(line, " {key}={}", tok(value));
@@ -1639,11 +1641,12 @@ mod tests {
             invocation: None,
             command_id: None,
             command_outcome: Some("rejected".into()),
+            level: Some("warn".into()),
         };
         assert_eq!(
             render_audit_row(&row),
             "deny 403 STATE device.state/inst/dev-1 scope=reads_state outcome=failed \
-             command=rejected error=\"not found\""
+             command=rejected level=warn error=\"not found\""
         );
         for (error, text) in [
             (WitError::NotFound("a".into()), "not-found(\"a\")"),

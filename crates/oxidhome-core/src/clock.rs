@@ -8,8 +8,9 @@
 //! - the guest's `wasi:clocks` wall and monotonic clocks;
 //! - the supervisor's `tick_interval_ms` schedule;
 //! - the `accepted`-command TTL (H5);
-//! - the event bus's per-instance publish rate buckets and the
-//!   per-instance plugin log rate bucket;
+//! - the event bus's per-instance publish rate buckets, the
+//!   per-instance plugin log rate bucket, and the sensitive-action
+//!   (H6) rate buckets;
 //! - the network policy's resolved-address grant TTL and its
 //!   denial-audit rate bucket (streaming worlds);
 //! - the liveness watchdog's epoch counter.
@@ -26,7 +27,7 @@
 //! stands still until the test moves it, so ticks, TTL expiries, the
 //! watchdog, and every recorded timestamp are deterministic.
 //!
-//! Not on the clock: KV and blob write times, log-store and
+//! Not on the clock: KV, blob and `device_meta` write times, log-store and
 //! command-journal row times (with the journal's `COMMAND` audit
 //! rows), request and call-service deadlines (H6 invocation
 //! deadlines), the event-history read deadline, restart backoff, shutdown grace periods, retention
