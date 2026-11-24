@@ -497,23 +497,20 @@ pub fn summaries(tokens: &TokenStore) -> Result<Vec<TokenSummary>, AdminError> {
 /// `POST /api/v1/roles` minus `name`, and of `PUT /api/v1/roles/{name}`).
 /// Only a JSON object: a struct would otherwise also accept an array,
 /// and `[]` must not quietly clear a role.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleSpec {
     /// What the role grants. Actions are those a scope can grant (`*`
     /// for all of them), optionally narrowed to device categories and
     /// device ids.
-    #[serde(default)]
     pub grants: Vec<SelectorSpec>,
     /// Sensitive categories the role grants, on every device.
-    #[serde(default)]
     pub sensitive: Vec<String>,
     /// What the role denies, whatever grants it.
-    #[serde(default)]
     pub deny: Vec<SelectorSpec>,
 }
 
-/// [`RoleSpec`]'s object form.
+/// [`RoleSpec`]'s object form: typed, so unknown and duplicate fields
+/// are refused.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoleSpecObject {
@@ -525,11 +522,42 @@ struct RoleSpecObject {
     deny: Vec<SelectorSpec>,
 }
 
-impl TryFrom<serde_json::Map<String, serde_json::Value>> for RoleSpec {
-    type Error = serde_json::Error;
+/// [`NewRole`]'s object form.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewRoleObject {
+    name: String,
+    #[serde(default)]
+    grants: Vec<SelectorSpec>,
+    #[serde(default)]
+    sensitive: Vec<String>,
+    #[serde(default)]
+    deny: Vec<SelectorSpec>,
+}
 
-    fn try_from(map: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
-        let o: RoleSpecObject = serde_json::from_value(serde_json::Value::Object(map))?;
+/// Deserialize `T` from a JSON object only: a derived struct would
+/// also accept an array, and `[]` must not quietly clear a role.
+fn from_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct ObjectOnly<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectOnly<T> {
+        type Value = T;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(ObjectOnly(std::marker::PhantomData))
+}
+
+impl<'de> Deserialize<'de> for RoleSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let o: RoleSpecObject = from_object(deserializer)?;
         Ok(Self {
             grants: o.grants,
             sensitive: o.sensitive,
@@ -539,8 +567,7 @@ impl TryFrom<serde_json::Map<String, serde_json::Value>> for RoleSpec {
 }
 
 /// `POST /api/v1/roles`: a name and a definition, in one object.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewRole {
     /// Unique name: 1–32 of `a-z0-9-_`, starting with a letter, not
     /// `owner`.
@@ -549,18 +576,16 @@ pub struct NewRole {
     pub spec: RoleSpec,
 }
 
-impl TryFrom<serde_json::Map<String, serde_json::Value>> for NewRole {
-    type Error = serde_json::Error;
-
-    fn try_from(mut map: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
-        let name = match map.remove("name") {
-            Some(serde_json::Value::String(name)) => name,
-            Some(_) => return Err(serde::de::Error::custom("`name` must be a string")),
-            None => return Err(serde::de::Error::missing_field("name")),
-        };
+impl<'de> Deserialize<'de> for NewRole {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let o: NewRoleObject = from_object(deserializer)?;
         Ok(Self {
-            name,
-            spec: RoleSpec::try_from(map)?,
+            name: o.name,
+            spec: RoleSpec {
+                grants: o.grants,
+                sensitive: o.sensitive,
+                deny: o.deny,
+            },
         })
     }
 }
@@ -981,8 +1006,10 @@ mod tests {
             name: "tablet".into(),
             spec: spec.clone(),
         };
-        // An array is not a definition.
+        // An array is not a definition; a repeated field is refused.
         assert!(serde_json::from_str::<RoleSpec>("[]").is_err());
+        assert!(serde_json::from_str::<NewRole>("[]").is_err());
+        assert!(serde_json::from_str::<RoleSpec>(r#"{"deny":[],"deny":[]}"#).is_err());
         assert!(RoleDef::parse("role-0000000000000001", "x", b"[]").is_none());
         assert!(matches!(
             update_role(

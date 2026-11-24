@@ -2445,15 +2445,21 @@ async fn run_execute(
     // class and the deadline are checked again after it. The command was claimed as
     // started: a caller whose deadline passes during the write reports
     // `outcome_unknown` for a command that in fact never ran.
+    // A stop already requested refuses it before the write, so the
+    // charge is refunded and no row is left.
+    let stopping = || CommandOutcome::Rejected {
+        error: WitError::Unavailable(format!(
+            "instance `{instance_id}` is stopping; the command did not run"
+        )),
+    };
     if let Some(charge) = charge
-        && let Some(refused) = match commit_charge(charge, instance_id, &cmd.id).await {
-            Err(refused) => Some(refused),
-            Ok(()) if *stop.borrow() => Some(CommandOutcome::Rejected {
-                error: WitError::Unavailable(format!(
-                    "instance `{instance_id}` is stopping; the command did not run"
-                )),
-            }),
-            Ok(()) => recheck_after_commit(instance, &ctx, &device, admitted, instance_id),
+        && let Some(refused) = match charge {
+            _ if stop_is_requested(stop) => Some(stopping()),
+            charge => match commit_charge(charge, instance_id, &cmd.id).await {
+                Err(refused) => Some(refused),
+                Ok(()) if stop_is_requested(stop) => Some(stopping()),
+                Ok(()) => recheck_after_commit(instance, &ctx, &device, admitted, instance_id),
+            },
         }
     {
         reply_command_outcome(reply, refused, |outcome| {

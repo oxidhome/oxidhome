@@ -602,13 +602,18 @@ fn run_token() -> anyhow::Result<()> {
                     revoke_sensitive(&stores.tokens, &stores.audit, token_id, category)?
                 };
                 // H6 slice 3: a held role may grant the category too.
-                let by_role: Vec<String> = stores
-                    .tokens
-                    .roles_by_id(&policy.roles)?
-                    .into_iter()
-                    .filter(|r| r.def().is_some_and(|d| d.sensitive.contains(&category)))
-                    .map(|r| r.name)
-                    .collect();
+                // The change is stored; a failed lookup only loses the note.
+                let by_role: Vec<String> = match stores.tokens.roles_by_id(&policy.roles) {
+                    Ok(roles) => roles
+                        .into_iter()
+                        .filter(|r| r.def().is_some_and(|d| d.sensitive.contains(&category)))
+                        .map(|r| r.name)
+                        .collect(),
+                    Err(err) => {
+                        eprintln!("note: couldn't read this token's roles: {err}");
+                        Vec::new()
+                    }
+                };
                 Ok((policy, by_role))
             })?;
             if !by_role.is_empty() {
