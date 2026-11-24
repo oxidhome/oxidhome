@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::Engine;
-use crate::auth::{Action, InvocationContext, Resource};
+use crate::auth::{Action, InvocationContext, Resource, ResourceKind, authorize};
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
@@ -94,6 +94,7 @@ pub fn build_router(engine: Engine) -> Router {
             "/api/v1/devices/{device_id}/category",
             put(set_device_category),
         )
+        .route("/api/v1/tokens", get(list_tokens).post(create_token))
         .route("/api/v1/plugins", get(list_plugins).post(install_plugin))
         .route(
             "/api/v1/plugins/{plugin_id}",
@@ -464,21 +465,37 @@ async fn list_devices(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<DevicesBody>, ScopeDenied> {
-    require(&ctx, Action::DeviceList, &Resource::devices())?;
+    // Pre-check, then one decision per device: a role narrowed to
+    // device categories (H6 slice 3) lists only its devices, and a
+    // deny list hides the devices it names.
+    require(
+        &ctx,
+        Action::DeviceList,
+        &Resource::pre_check(ResourceKind::Device),
+    )?;
     let devices = state
         .engine
         .devices()
         .list()
         .into_iter()
-        .map(|meta| {
-            let class = WireDeviceClass::from(state.engine.devices().class_of_meta(&meta));
-            DeviceSummary {
-                device_id: meta.id.clone(),
-                owner_instance: meta.owner_instance.clone(),
-                name: meta.info.name.clone(),
-                category: class.category,
-                sensitive: class.sensitive,
-            }
+        .filter_map(|meta| {
+            let class = state.engine.devices().class_of_meta(&meta);
+            authorize(
+                &ctx,
+                Action::DeviceList,
+                &Resource::device(meta.id.as_str(), class),
+            )
+            .allow
+            .then(|| {
+                let class = WireDeviceClass::from(class);
+                DeviceSummary {
+                    device_id: meta.id.clone(),
+                    owner_instance: meta.owner_instance.clone(),
+                    name: meta.info.name.clone(),
+                    category: class.category,
+                    sensitive: class.sensitive,
+                }
+            })
         })
         .collect();
     Ok(Json(DevicesBody { devices }))
@@ -591,6 +608,109 @@ async fn set_device_category(
             .map(crate::auth::DeviceCategory::as_str),
         class: class.into(),
     }))
+}
+
+// ── Tokens (H6 slice 3) ──────────────────────────────────────────
+
+/// Errors of the `/api/v1/tokens` handlers.
+enum TokensError {
+    Scope(ScopeDenied),
+    BadRequest(String),
+    Internal,
+}
+
+impl IntoResponse for TokensError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+}
+
+/// Response of `POST /api/v1/tokens`: the new token's secret (shown
+/// once) and its listing.
+#[derive(Serialize)]
+struct CreatedToken {
+    /// The bearer secret. The host keeps only its hash.
+    token: String,
+    #[serde(flatten)]
+    summary: super::token_admin::TokenSummary,
+}
+
+/// Response of `GET /api/v1/tokens`.
+#[derive(Serialize)]
+struct TokensBody {
+    tokens: Vec<super::token_admin::TokenSummary>,
+}
+
+/// H6 slice 3: `POST /api/v1/tokens` — mint a token holding role
+/// presets, scopes, sensitive categories and a deny list
+/// (`{"label": "tablet", "roles": ["dashboard"]}`, see
+/// [`super::token_admin::MintRequest`]). Returns `201` with the secret,
+/// once. `token.manage`: the owner token only; no scope or role, the
+/// wildcard included, grants it. The body is read after the check, so
+/// a refused caller learns nothing about its shape.
+///
+/// # Errors
+/// - `400` malformed body or an invalid request (unknown role, scope,
+///   category or action; `owner`; the reserved `admin` label).
+/// - `403` not the owner.
+/// - `500` the token couldn't be stored.
+async fn create_token(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, TokensError> {
+    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Scope)?;
+    let req: super::token_admin::MintRequest = serde_json::from_slice(&body)
+        .map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
+    let tokens = state.engine.auth_tokens();
+    let audit = state.engine.audit_log();
+    let minted = tokio::task::spawn_blocking(move || {
+        super::token_admin::mint(&tokens, &audit, "api", "api", &req)
+    })
+    .await
+    .map_err(|_| TokensError::Internal)?
+    .map_err(|err| match err {
+        super::token_admin::MintError::Invalid(msg) => TokensError::BadRequest(msg),
+        super::token_admin::MintError::Store(msg) => {
+            tracing::error!(target: "api.tokens", error = %msg, "minting a token failed");
+            TokensError::Internal
+        }
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(CreatedToken {
+            token: minted.secret,
+            summary: minted.summary,
+        }),
+    ))
+}
+
+/// H6 slice 3: `GET /api/v1/tokens` — every token with its roles,
+/// scopes, sensitive grants and deny list; never a secret or hash.
+/// `token.manage`: the owner token only.
+///
+/// # Errors
+/// - `403` not the owner.
+/// - `500` the token table couldn't be read.
+async fn list_tokens(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+) -> Result<Json<TokensBody>, TokensError> {
+    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Scope)?;
+    let tokens = state.engine.auth_tokens();
+    let list = tokio::task::spawn_blocking(move || super::token_admin::summaries(&tokens))
+        .await
+        .map_err(|_| TokensError::Internal)?
+        .map_err(|err| {
+            tracing::error!(target: "api.tokens", error = %err, "listing tokens failed");
+            TokensError::Internal
+        })?;
+    Ok(Json(TokensBody { tokens: list }))
 }
 
 // ── Device state (H9 host-owned projection) ──────────────────────
@@ -1792,7 +1912,11 @@ async fn start_plugin_instance(
     body: Option<Json<StartBody>>,
 ) -> Result<Json<StartedRow>, PluginLifecycleError> {
     let body = body.map_or_default(|Json(b)| b);
-    require(&ctx, Action::InstanceStart, &Resource::instances())?;
+    require(
+        &ctx,
+        Action::InstanceStart,
+        &Resource::pre_check(ResourceKind::Instance),
+    )?;
     require(
         &ctx,
         Action::InstanceStart,
@@ -1887,7 +2011,11 @@ async fn stop_plugin_instances(
     body: Option<Json<StopBody>>,
 ) -> Result<Json<StoppedRow>, PluginLifecycleError> {
     let body = body.map_or_default(|Json(b)| b);
-    require(&ctx, Action::InstanceStop, &Resource::instances())?;
+    require(
+        &ctx,
+        Action::InstanceStop,
+        &Resource::pre_check(ResourceKind::Instance),
+    )?;
     require(
         &ctx,
         Action::InstanceStop,

@@ -204,7 +204,12 @@ pub(super) fn get(
 /// `oxidhome://logs`, `oxidhome://devices`.
 const EVENTS: (Action, Resource) = (Action::EventRead, Resource::events());
 const LOGS: (Action, Resource) = (Action::HostLogs, Resource::Host);
-const DEVICES: (Action, Resource) = (Action::DeviceList, Resource::devices());
+/// `oxidhome://devices` is filtered per device, so the prompt needs
+/// only the pre-check.
+const DEVICES: (Action, Resource) = (
+    Action::DeviceList,
+    Resource::pre_check(crate::auth::ResourceKind::Device),
+);
 
 /// The audit label (the missing scope) of the first denied action.
 fn first_denied(ctx: &InvocationContext, required: &[(Action, Resource)]) -> Option<&'static str> {

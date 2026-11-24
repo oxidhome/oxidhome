@@ -128,7 +128,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::category::SensitiveCategory;
+use super::category::{DeviceCategory, SensitiveCategory};
+use super::role::{ActionSet, DenyRule, Role};
 
 /// A decoded token policy. Constructed via [`parse_policy`];
 /// see the module-level doc for the accepted JSON shapes.
@@ -154,6 +155,12 @@ pub struct TokenPolicy {
     /// of these does, on top of the scope and constraints the action
     /// already needs.
     pub sensitive: Vec<SensitiveGrant>,
+    /// H6 slice 3: role presets ([`Role`]), expanded by
+    /// [`crate::auth::authorize()`] on every decision. Never `owner`.
+    pub roles: Vec<Role>,
+    /// H6 slice 3: the deny list. A matching [`DenyRule`] refuses the
+    /// action whatever scope, role or grant permits it.
+    pub deny: Vec<DenyRule>,
 }
 
 impl TokenPolicy {
@@ -162,7 +169,11 @@ impl TokenPolicy {
     /// object otherwise. Round-trips through [`parse_policy`].
     #[must_use]
     pub fn to_json(&self) -> Vec<u8> {
-        if self.constraints.is_empty() && self.sensitive.is_empty() {
+        if self.constraints.is_empty()
+            && self.sensitive.is_empty()
+            && self.roles.is_empty()
+            && self.deny.is_empty()
+        {
             return serde_json::to_vec(&self.scopes).unwrap_or_default();
         }
         let mut constraints: Vec<(&String, &ToolConstraint)> = self.constraints.iter().collect();
@@ -173,6 +184,18 @@ impl TokenPolicy {
             .collect();
         let mut obj = serde_json::Map::new();
         obj.insert("scopes".into(), serde_json::json!(self.scopes));
+        if !self.roles.is_empty() {
+            obj.insert(
+                "roles".into(),
+                serde_json::json!(self.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>()),
+            );
+        }
+        if !self.deny.is_empty() {
+            obj.insert(
+                "deny".into(),
+                serde_json::Value::Array(self.deny.iter().map(DenyRule::to_json).collect()),
+            );
+        }
         if !constraints.is_empty() {
             obj.insert("constraints".into(), serde_json::Value::Object(constraints));
         }
@@ -335,7 +358,7 @@ impl ToolConstraint {
 /// matches literally (the wire schema doesn't advertise
 /// mid-string `*` and rejecting it here keeps the match
 /// semantics small).
-fn match_pattern(pattern: &str, id: &str) -> bool {
+pub(crate) fn match_pattern(pattern: &str, id: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
         id.starts_with(prefix)
     } else {
@@ -368,6 +391,12 @@ struct ExtendedPolicy {
     /// H6 slice 2 sensitive grants; see [`SensitiveGrant`].
     #[serde(default)]
     sensitive: Vec<SensitiveGrantWire>,
+    /// H6 slice 3 role names; see [`Role`].
+    #[serde(default)]
+    roles: Vec<String>,
+    /// H6 slice 3 deny list; see [`DenyRule`].
+    #[serde(default)]
+    deny: Vec<DenyWire>,
     // Round-7 P1 on PR #147: reject duplicate JSON keys. The
     // default `HashMap` deserializer accepts them and keeps
     // the last value; once enforcement lands, a bearer with
@@ -408,6 +437,59 @@ impl SensitiveGrantWire {
             devices,
         })
     }
+}
+
+/// Wire form of a [`DenyRule`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenyWire {
+    actions: Vec<String>,
+    #[serde(default)]
+    category: Option<Vec<String>>,
+    #[serde(default)]
+    devices: Option<Vec<String>>,
+}
+
+impl DenyWire {
+    /// `None` for an unknown action or category, or an empty list: a
+    /// deny that names nothing would silently match nothing.
+    fn into_rule(self) -> Option<DenyRule> {
+        if self.actions.is_empty()
+            || self.category.as_ref().is_some_and(Vec::is_empty)
+            || self.devices.as_ref().is_some_and(Vec::is_empty)
+        {
+            return None;
+        }
+        Some(DenyRule {
+            actions: ActionSet::parse(self.actions.iter().map(String::as_str)).ok()?,
+            categories: self
+                .category
+                .map(|c| {
+                    c.iter()
+                        .map(|c| c.parse::<DeviceCategory>())
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+                .ok()?,
+            devices: self.devices,
+        })
+    }
+}
+
+/// Parse stored role names: an unknown name or `owner` (which only the
+/// host assigns) is `None`. Duplicates collapse.
+fn parse_roles(names: &[String]) -> Option<Vec<Role>> {
+    let mut roles = Vec::with_capacity(names.len());
+    for name in names {
+        let role: Role = name.parse().ok()?;
+        if !role.assignable() {
+            return None;
+        }
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    Some(roles)
 }
 
 fn deserialize_unique_map<'de, D>(
@@ -550,8 +632,7 @@ pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
     Some(match wire {
         PolicyWire::Legacy(scopes) => TokenPolicy {
             scopes,
-            constraints: HashMap::new(),
-            sensitive: Vec::new(),
+            ..TokenPolicy::default()
         },
         PolicyWire::Extended(ext) => TokenPolicy {
             scopes: ext.scopes,
@@ -562,6 +643,14 @@ pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
                 .sensitive
                 .into_iter()
                 .map(SensitiveGrantWire::into_grant)
+                .collect::<Option<Vec<_>>>()?,
+            // An unknown or unassignable role, or a malformed deny
+            // entry, fails the whole parse (deny-all) too.
+            roles: parse_roles(&ext.roles)?,
+            deny: ext
+                .deny
+                .into_iter()
+                .map(DenyWire::into_rule)
                 .collect::<Option<Vec<_>>>()?,
         },
     })
@@ -693,6 +782,60 @@ mod tests {
             parse_policy(br#"{"scopes":["*"],"sensitive":[{"category":"lock","x":1}]}"#).is_none()
         );
         assert!(parse_policy(br#"{"scopes":["*"],"sensitive":"lock"}"#).is_none());
+    }
+
+    #[test]
+    fn roles_and_deny_parse_and_round_trip() {
+        let blob = br#"{
+            "scopes": [],
+            "roles": ["resident", "assistant", "resident"],
+            "deny": [
+                {"actions": ["device.command"], "category": ["lock", "alarm"]},
+                {"actions": ["*"], "devices": ["dev-a1*"]}
+            ]
+        }"#;
+        let policy = parse_policy(blob).expect("parse");
+        assert_eq!(policy.roles, vec![Role::Resident, Role::Assistant]);
+        assert_eq!(policy.deny.len(), 2);
+        assert_eq!(
+            policy.deny[0].categories.as_deref(),
+            Some(&[DeviceCategory::Lock, DeviceCategory::Alarm][..])
+        );
+        assert_eq!(policy.deny[1].actions, ActionSet::ALL);
+        assert_eq!(parse_policy(&policy.to_json()), Some(policy.clone()));
+        // A role-only policy keeps the object shape.
+        let role_only = TokenPolicy {
+            roles: vec![Role::Monitor],
+            ..TokenPolicy::default()
+        };
+        assert_eq!(
+            role_only.to_json(),
+            br#"{"roles":["monitor"],"scopes":[]}"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn bad_roles_and_denies_reject_the_policy() {
+        for blob in [
+            // Unknown role, and `owner`, which only the host assigns.
+            &br#"{"scopes":[],"roles":["root"]}"#[..],
+            br#"{"scopes":[],"roles":["owner"]}"#,
+            br#"{"scopes":[],"roles":"monitor"}"#,
+            // Empty or unknown deny parts.
+            br#"{"scopes":[],"deny":[{"actions":[]}]}"#,
+            br#"{"scopes":[],"deny":[{"actions":["device.unlock"]}]}"#,
+            br#"{"scopes":[],"deny":[{"actions":["*"],"category":[]}]}"#,
+            br#"{"scopes":[],"deny":[{"actions":["*"],"category":["door"]}]}"#,
+            br#"{"scopes":[],"deny":[{"actions":["*"],"devices":[]}]}"#,
+            br#"{"scopes":[],"deny":[{"actions":["*"],"areas":["hall"]}]}"#,
+            br#"{"scopes":[],"deny":[{"category":["lock"]}]}"#,
+        ] {
+            assert!(
+                parse_policy(blob).is_none(),
+                "{}",
+                String::from_utf8_lossy(blob)
+            );
+        }
     }
 
     #[test]

@@ -77,7 +77,13 @@ impl BytesGate {
             ctx: ctx.clone(),
             devices: engine.devices(),
             guard: engine.sensitive(),
-            general: authorize(ctx, Action::BlobRead, &Resource::blobs()).allow,
+            // A pre-check: every value is decided per source below.
+            general: authorize(
+                ctx,
+                Action::BlobRead,
+                &Resource::pre_check(crate::auth::ResourceKind::Blob),
+            )
+            .allow,
             deferred: false,
             state: Mutex::new(GateState::default()),
         }

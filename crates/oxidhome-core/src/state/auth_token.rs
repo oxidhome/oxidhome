@@ -7,9 +7,11 @@
 //! brute-force on low-entropy passwords; against ~2^256 candidates,
 //! brute force is infeasible regardless of hash cost).
 //!
-//! Token administration is host-only — the CLI is the only path that
-//! mints, rotates, or revokes tokens. The API consults the store
-//! during request authentication; it never issues tokens itself.
+//! Rotation and revocation are offline CLI operations. Tokens are
+//! minted by the first-run bootstrap, `recover-admin-token`, the
+//! offline `oxidhome token create`, and (H6 slice 3) the owner token's
+//! `POST /api/v1/tokens` / Connect `CreateToken`, all through
+//! `crate::api::token_admin`. The API otherwise only verifies.
 //!
 //! ## Wire shape
 //!
@@ -489,6 +491,26 @@ impl TokenStore {
             tx.commit()?;
             Ok(revoked)
         })
+    }
+
+    /// Insert a plain (never owner) token produced by
+    /// [`Self::generate`]: the H6 slice 3 mint path (`oxidhome token
+    /// create`, and the owner's `POST /api/v1/tokens` and Connect
+    /// `TokensService.CreateToken`). Committed
+    /// durably, since the caller hands the secret out right after.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Malformed`] if `issued.plaintext` isn't a token
+    /// this module produced; [`TokenError::Sqlite`] on DB failure.
+    pub fn insert(
+        &self,
+        issued: &IssuedToken,
+        label: &str,
+        scope_json: &[u8],
+    ) -> Result<(), TokenError> {
+        let row = PendingRow::new(issued, label, scope_json, false)?;
+        self.durable_write(move |conn| row.insert(conn))
     }
 
     /// Replace a token's policy blob (`scope_json`). The offline

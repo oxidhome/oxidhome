@@ -52,7 +52,7 @@ use connectrpc::{
 };
 use oxidhome_proto::connect::oxidhome::v1::{
     DevicesServiceExt, EventsServiceExt, HealthServiceExt, InstancesServiceExt, LogsServiceExt,
-    PluginsServiceExt,
+    PluginsServiceExt, TokensServiceExt,
 };
 use oxidhome_proto::proto::oxidhome::v1::{
     Button as ProtoButton, ButtonKind as ProtoButtonKind, CheckRequest, CheckResponse,
@@ -73,9 +73,13 @@ use oxidhome_proto::proto::oxidhome::v1::{
     event as proto_event, execute_command_error, execute_command_response, log_value,
     tail_events_response, value,
 };
+use oxidhome_proto::proto::oxidhome::v1::{
+    CreateTokenRequest, CreateTokenResponse, ListTokensRequest, ListTokensResponse,
+    Token as ProtoToken,
+};
 
 use crate::Engine;
-use crate::auth::{Action, InvocationContext, Resource};
+use crate::auth::{Action, InvocationContext, Resource, ResourceKind, authorize};
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent as WitButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event as WitEvent, EventPayload};
@@ -90,6 +94,9 @@ use super::auth::{
 };
 use super::bytes::BytesGate;
 use super::scopes::{ScopeDenied, require};
+
+/// The device pre-check: a per-device decision always follows.
+const DEVICE_PRE_CHECK: Resource = Resource::pre_check(ResourceKind::Device);
 
 /// `HealthService` implementation. Anonymous; reads only the
 /// in-memory event-log mirror health (H3) and device-state flush
@@ -354,16 +361,27 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         _request: ServiceRequest<'_, ListDevicesRequest>,
     ) -> ServiceResult<impl Encodable<ListDevicesResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::DeviceList, &Resource::devices())?;
+        // Pre-check, then one decision per device: a role narrowed to
+        // device categories (H6 slice 3) lists only its devices.
+        require_connect(&ctx, Action::DeviceList, &DEVICE_PRE_CHECK)?;
+        let invocation = ctx.extensions().get::<InvocationContext>();
         let devices = self
             .engine
             .devices()
             .list()
             .into_iter()
-            .map(|meta| {
+            .filter_map(|meta| {
                 // One read, so `category` and `sensitive` agree.
                 let class = self.engine.devices().class_of_meta(&meta);
-                Device {
+                let listed = invocation.is_some_and(|i| {
+                    authorize(
+                        i,
+                        Action::DeviceList,
+                        &Resource::device(meta.id.as_str(), class),
+                    )
+                    .allow
+                });
+                listed.then(|| Device {
                     device_id: meta.id.clone(),
                     owner_instance: meta.owner_instance.clone(),
                     name: meta.info.name.clone(),
@@ -374,7 +392,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
                         .map(|c| c.as_str().to_owned())
                         .collect(),
                     ..Default::default()
-                }
+                })
             })
             .collect();
         Response::ok(ListDevicesResponse {
@@ -388,11 +406,12 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, ExecuteCommandRequest>,
     ) -> ServiceResult<impl Encodable<ExecuteCommandResponse> + Send + use<'a>> {
-        // Collection pre-check before the request is copied, then
-        // H6: `device.command` on the addressed device — the token's
-        // per-device allowlist, shared with REST and MCP — before the
-        // lookup so a refused token can't probe ids.
-        require_connect(&ctx, Action::DeviceCommand, &Resource::devices())?;
+        // Pre-check before the request is copied, then H6:
+        // `device.command` on the addressed device — the token's
+        // per-device allowlist, role and deny list, shared with REST
+        // and MCP — before the lookup so a refused token can't probe
+        // ids.
+        require_connect(&ctx, Action::DeviceCommand, &DEVICE_PRE_CHECK)?;
         let req = request.to_owned_message();
         let decision = require_connect(
             &ctx,
@@ -484,11 +503,11 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, GetDeviceStateRequest>,
     ) -> ServiceResult<impl Encodable<GetDeviceStateResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::DeviceRead, &Resource::devices())?;
+        require_connect(&ctx, Action::DeviceRead, &DEVICE_PRE_CHECK)?;
         let device_id = request.to_owned_message().device_id;
         // Host-minted ids are short; don't copy a huge one under the
-        // projection lock. (No constraint narrows `device.read`, so the
-        // target check below can't deny once the collection passed.)
+        // projection lock. The target check below decides for the
+        // device (a role narrowed to categories, a deny list).
         if device_id.len() > MAX_DEVICE_ID_LEN {
             return Err(rpc_err(
                 &ctx,
@@ -884,7 +903,11 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, StartPluginRequest>,
     ) -> ServiceResult<impl Encodable<StartPluginResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::InstanceStart, &Resource::instances())?;
+        require_connect(
+            &ctx,
+            Action::InstanceStart,
+            &Resource::pre_check(ResourceKind::Instance),
+        )?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -974,7 +997,11 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, StopPluginRequest>,
     ) -> ServiceResult<impl Encodable<StopPluginResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::InstanceStop, &Resource::instances())?;
+        require_connect(
+            &ctx,
+            Action::InstanceStop,
+            &Resource::pre_check(ResourceKind::Instance),
+        )?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -1020,7 +1047,11 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, UninstallPluginRequest>,
     ) -> ServiceResult<impl Encodable<UninstallPluginResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::PluginUninstall, &Resource::plugins())?;
+        require_connect(
+            &ctx,
+            Action::PluginUninstall,
+            &Resource::pre_check(ResourceKind::Plugin),
+        )?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -1468,6 +1499,97 @@ fn wit_key_value_to_proto(kv: KeyValue) -> ProtoKeyValue {
     }
 }
 
+/// H6 slice 3: `TokensService`, mirroring `POST` / `GET /api/v1/tokens`.
+/// Both RPCs need `token.manage`: the owner token only.
+struct OxidHomeTokens {
+    engine: Engine,
+}
+
+fn proto_token(s: super::token_admin::TokenSummary) -> ProtoToken {
+    ProtoToken {
+        token_id: s.token_id,
+        label: s.label,
+        owner: s.owner,
+        revoked: s.revoked,
+        roles: s.roles,
+        scopes: s.scopes,
+        sensitive: s.sensitive,
+        deny: s.deny,
+        created_ms: s.created_ms,
+        last_used_ms: s.last_used_ms,
+        policy_valid: s.policy_valid,
+        ..Default::default()
+    }
+}
+
+impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
+    async fn create_token<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateTokenRequest>,
+    ) -> ServiceResult<impl Encodable<CreateTokenResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::TokenManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        let none_if_empty = |v: Vec<String>| (!v.is_empty()).then_some(v);
+        let mint = super::token_admin::MintRequest {
+            label: req.label,
+            roles: req.roles,
+            scopes: req.scopes,
+            sensitive: req.sensitive,
+            deny: req
+                .deny
+                .into_iter()
+                .map(|d| super::token_admin::DenySpec {
+                    actions: d.actions,
+                    category: none_if_empty(d.category),
+                    devices: none_if_empty(d.devices),
+                })
+                .collect(),
+        };
+        let tokens = self.engine.auth_tokens();
+        let audit = self.engine.audit_log();
+        let minted = tokio::task::spawn_blocking(move || {
+            super::token_admin::mint(&tokens, &audit, "connect", "api", &mint)
+        })
+        .await
+        .map_err(|e| rpc_err(&ctx, ConnectError::internal(e.to_string())))?
+        .map_err(|err| match err {
+            super::token_admin::MintError::Invalid(msg) => {
+                rpc_err(&ctx, ConnectError::invalid_argument(msg))
+            }
+            super::token_admin::MintError::Store(msg) => {
+                tracing::error!(target: "api.tokens", error = %msg, "minting a token failed");
+                rpc_err(&ctx, ConnectError::internal("storing the token failed"))
+            }
+        })?;
+        Response::ok(CreateTokenResponse {
+            secret: minted.secret,
+            token: proto_token(minted.summary).into(),
+            ..Default::default()
+        })
+    }
+
+    async fn list_tokens<'a>(
+        &'a self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListTokensRequest>,
+    ) -> ServiceResult<impl Encodable<ListTokensResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::TokenManage, &Resource::Host)?;
+        let tokens = self.engine.auth_tokens();
+        let list = tokio::task::spawn_blocking(move || super::token_admin::summaries(&tokens))
+            .await
+            .map_err(|e| rpc_err(&ctx, ConnectError::internal(e.to_string())))?
+            .map_err(|err| {
+                tracing::error!(target: "api.tokens", error = %err, "listing tokens failed");
+                rpc_err(&ctx, ConnectError::internal("listing tokens failed"))
+            })?;
+        Response::ok(ListTokensResponse {
+            tokens: list.into_iter().map(proto_token).collect(),
+            ..Default::default()
+        })
+    }
+}
+
 /// Build the Connect router with every `OxidHome` service registered.
 /// The caller mounts it on the axum app via
 /// [`connectrpc::Router::into_axum_service`].
@@ -1487,6 +1609,10 @@ pub fn router(engine: Engine) -> ConnectRouter {
     })
     .register(router);
     let router = Arc::new(OxidHomePlugins {
+        engine: engine.clone(),
+    })
+    .register(router);
+    let router = Arc::new(OxidHomeTokens {
         engine: engine.clone(),
     })
     .register(router);

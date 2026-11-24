@@ -31,6 +31,11 @@
 //! - `plugins.start` (14.3f — mutating admin, gated on
 //!   `plugins:start`; tool-shape of `POST
 //!   /api/v1/plugins/{id}/start`).
+//! - `tokens.list` (H6 slice 3 — the owner token only,
+//!   `token.manage`; tool-shape of `GET /api/v1/tokens`). There is
+//!   no `tokens.create`: M7 keeps credentials out of every MCP
+//!   response (an LLM's context), so tokens are minted over the CLI,
+//!   REST or Connect.
 //! - `plugins.install` (14.3g — mutating admin, destructive,
 //!   gated on `plugins:install`; tool-shape of `POST
 //!   /api/v1/plugins`). Loopback-only (14.1 Origin+Host
@@ -68,7 +73,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::Engine;
 use crate::api::bytes::BytesGate;
 use crate::api::server::WireCommandReport;
-use crate::auth::{Action, Actor, InvocationContext, Resource, authorize};
+use crate::auth::{Action, Actor, InvocationContext, Resource, ResourceKind, authorize};
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::EventFilter as BusEventFilter;
 use crate::host_impl::plugin::oxidhome::plugin::types::KeyValue;
@@ -309,6 +314,20 @@ pub(super) fn list_tools() -> Vec<Tool> {
                 // stream, which reflects state advanced by other
                 // clients / plugins between calls.
                 .open_world(true),
+        ),
+        Tool::new(
+            "tokens.list",
+            "List every API token with its roles, scopes, sensitive grants and deny list. \
+             Never returns a secret. The owner token only (`token.manage`). Same shape as \
+             `GET /api/v1/tokens`.",
+            Arc::new(plugins_list_schema()),
+        )
+        .with_title("List API tokens")
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .open_world(false),
         ),
     ]
 }
@@ -563,6 +582,7 @@ pub(super) fn canonical_tool_name(name: &str) -> &'static str {
         "plugins.uninstall" => "plugins.uninstall",
         "plugins.start" => "plugins.start",
         "plugins.install" => "plugins.install",
+        "tokens.list" => "tokens.list",
         _ => "unknown",
     }
 }
@@ -620,25 +640,34 @@ pub(super) async fn call(
         "device.send_command" => (
             "device.send_command",
             Action::DeviceCommand,
-            Resource::devices(),
+            Resource::pre_check(ResourceKind::Device),
         ),
         "logs.query" => ("logs.query", Action::HostLogs, Resource::Host),
         "events.history" => ("events.history", Action::EventRead, Resource::events()),
         "events.subscribe" => ("events.subscribe", Action::EventRead, Resource::events()),
         "plugins.list" => ("plugins.list", Action::PluginRead, Resource::plugins()),
-        "plugins.show" => ("plugins.show", Action::PluginRead, Resource::plugins()),
-        "plugins.stop" => ("plugins.stop", Action::InstanceStop, Resource::instances()),
+        "plugins.show" => (
+            "plugins.show",
+            Action::PluginRead,
+            Resource::pre_check(ResourceKind::Plugin),
+        ),
+        "plugins.stop" => (
+            "plugins.stop",
+            Action::InstanceStop,
+            Resource::pre_check(ResourceKind::Instance),
+        ),
         "plugins.uninstall" => (
             "plugins.uninstall",
             Action::PluginUninstall,
-            Resource::plugins(),
+            Resource::pre_check(ResourceKind::Plugin),
         ),
         "plugins.start" => (
             "plugins.start",
             Action::InstanceStart,
-            Resource::instances(),
+            Resource::pre_check(ResourceKind::Instance),
         ),
         "plugins.install" => ("plugins.install", Action::PluginInstall, Resource::Host),
+        "tokens.list" => ("tokens.list", Action::TokenManage, Resource::Host),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -725,6 +754,7 @@ pub(super) async fn call(
         "plugins.install" => {
             plugins_install_call(engine.clone(), request.arguments, &invocation).await
         }
+        "tokens.list" => tokens_list_call(engine.clone(), request.arguments).await,
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -3306,5 +3336,50 @@ mod error_meta_tests {
         let data = err.data.expect("data must remain");
         assert_eq!(data["previous"], "opaque string payload");
         assert_eq!(data["oxidhome.audit"]["intent_id"], 3);
+    }
+}
+
+// ── tokens.list (H6 slice 3) ────────────────────────────────────
+
+/// `tokens.list` body.
+#[derive(Serialize)]
+struct TokensListBody {
+    tokens: Vec<super::super::token_admin::TokenSummary>,
+}
+
+async fn tokens_list_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+) -> ToolOutcome {
+    let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
+    if let Err(err) = serde_json::from_value::<PluginsListArgs>(args_value) {
+        return ToolOutcome::InvalidParams(format!(
+            "tokens.list arguments do not match the input schema: {err}",
+        ));
+    }
+    let tokens = engine.auth_tokens();
+    let list = match tokio::task::spawn_blocking(move || {
+        super::super::token_admin::summaries(&tokens)
+    })
+    .await
+    {
+        Ok(Ok(list)) => list,
+        Ok(Err(err)) => {
+            tracing::error!(target: "mcp.tool.tokens.list", error = %err, "listing tokens failed");
+            return ToolOutcome::Internal("listing tokens failed; see server logs".into());
+        }
+        Err(err) => return ToolOutcome::Internal(format!("list task failed: {err}")),
+    };
+    match super::resources::encode_body_capped(
+        &TokensListBody { tokens: list },
+        "tokens.list",
+        MAX_TOOL_BODY_BYTES,
+    ) {
+        EncodedBody::Value(v) => ToolOutcome::Ok {
+            value: v,
+            plugin_reached: false,
+        },
+        EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+        EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
     }
 }

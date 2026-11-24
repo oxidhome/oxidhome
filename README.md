@@ -26,13 +26,29 @@ share one axum listener, so a household hub only exposes one endpoint.
   peer-IP filter — a remote client can still send `Host: localhost` if the
   daemon is bound to a non-loopback address.
 - **Auth**: `Authorization: Bearer <token>`. The first-run daemon writes an
-  admin token (scope `*`) to `<state_dir>/admin-token` (mode `0600`).
-  Scope-limited tokens are minted programmatically today via
-  `engine.auth_tokens().create(id, &scope_json)` (see
-  `crates/oxidhome-core/src/state/auth_token.rs`); a CLI surface for
-  minting / rotation / revocation is planned but not yet shipped, and by
-  design token administration will not be exposed over REST (the API
-  layer only ever *verifies* tokens). Missing or malformed bearer → `401`.
+  admin token (scope `*`, the owner) to `<state_dir>/admin-token` (mode
+  `0600`). Mint further tokens by **role** offline with
+  `oxidhome token create <label> --role <role> [--scope <scope>]...
+  [--sensitive <category>]... [--deny <action,...|*>[@<category,...>]]...`
+  (the secret is printed once), or as the owner over
+  `POST /api/v1/tokens` / Connect `TokensService.CreateToken`
+  (`{"label": "hall tablet", "roles": ["dashboard"]}`, `201` with the
+  secret). `GET /api/v1/tokens`, Connect `ListTokens`, MCP `tokens.list`
+  and `oxidhome token list` list tokens without secrets; only the owner
+  reaches the API forms. Revocation is offline (`recover-admin-token
+  --revoke-all`). Missing or malformed bearer → `401`.
+- **Roles**: `admin` (every scoped action except `plugin.install`,
+  `plugin.uninstall` and `host.audit`), `resident` (read, command devices,
+  read blobs, edit dashboards, open plugin UIs), `guest` (list, read and
+  command `light`, `media` and `climate` devices), `dashboard` (the same,
+  `light` only), `monitor` (read devices, events, instances, plugins,
+  status and dashboards) and `assistant` (read like `monitor`, command
+  lights, never locks). `oxidhome token roles` prints them. A token's
+  roles add to its scopes; a `deny` entry refuses the actions it names
+  whatever grants them; no role includes a sensitive category. A role
+  narrowed to device categories lists only its devices and is refused
+  whole-fleet reads (`GET /api/v1/devices/state`, event history and
+  tails).
 - **Scope model**: per-surface. `devices:list` reads the fleet;
   `devices:command` sends actuation commands; `events:read` / `logs:read`
   read history; `plugins:list` reads plugin metadata; `plugins:install` /
@@ -43,7 +59,7 @@ share one axum listener, so a household hub only exposes one endpoint.
   scope reaches them, `*` included. Only the first-run (or recovered) admin
   token, the owner, holds every category. Grant one offline with
   `oxidhome token grant-sensitive <token-id> <lock|opener|alarm|camera>
-  [--device <dev-id>]...` (`oxidhome token list` shows tokens and grants);
+  [--device <dev-id>]...` or at mint time (`--sensitive`);
   allowed sensitive actions are audited at `warn`
   (`GET /api/v1/audit?level=warn`) and, except for the owner's, rate
   limited per token and category. The daemon warns at startup about
@@ -74,6 +90,7 @@ share one axum listener, so a household hub only exposes one endpoint.
 | Tool | `plugins.install` | `plugins:install` | Takes an absolute `source_dir` (no `..` components) that must exist on the daemon-local filesystem — the tool copies from there into `<state_dir>/plugins/`. |
 | Tool | `plugins.start` / `plugins.stop` | `plugins:start` / `plugins:stop` | Runtime lifecycle. |
 | Tool | `plugins.uninstall` | `plugins:uninstall` | Refuses if instances still running. |
+| Tool | `tokens.list` | owner only | Tokens with roles, scopes, sensitive grants and deny list; never a secret. No `tokens.create`: credentials never ride MCP responses. |
 | Prompt | `summarize_today` | `events:read` + `logs:read` | 24 h household summary. |
 | Prompt | `draft_automation` | `devices:list` | Composes `oxidhome://devices` + per-device detail. |
 | Prompt | `explain_recent_errors` | `logs:read` | 24 h error-log walk. |

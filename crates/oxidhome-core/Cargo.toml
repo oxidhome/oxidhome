@@ -104,6 +104,10 @@ name = "sensitive_categories"
 path = "tests/sensitive_categories.rs"
 
 [[test]]
+name = "token_roles"
+path = "tests/token_roles.rs"
+
+[[test]]
 name = "api_skeleton"
 path = "tests/api_skeleton.rs"
 

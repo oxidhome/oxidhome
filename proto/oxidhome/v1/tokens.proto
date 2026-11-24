@@ -1,0 +1,85 @@
+// OxidHome v1 tokens service (H6 slice 3).
+//
+// Mint and list API tokens by role preset: mirrors
+// `POST /api/v1/tokens` and `GET /api/v1/tokens` on the JSON API.
+// Both RPCs need `token.manage`, which only the owner token (the
+// bootstrap / recovered admin token) holds; no scope or role, the
+// wildcard included, grants it.
+syntax = "proto3";
+
+package oxidhome.v1;
+
+// TokensService — API tokens, by role.
+service TokensService {
+  // Mint a token. The response carries its bearer secret, once; the
+  // host keeps only the hash. Refuses an unknown role, scope,
+  // category or action, the `owner` role (only the host assigns it)
+  // and the reserved `admin` label with INVALID_ARGUMENT.
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
+
+  // List every token with its roles, scopes, sensitive grants and
+  // deny list. Never returns a secret or hash.
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+}
+
+message CreateTokenRequest {
+  // Operator-facing name, 1 to 64 characters. Not `admin`.
+  string label = 1;
+  // Role presets: `admin`, `resident`, `guest`, `dashboard`,
+  // `monitor`, `assistant`.
+  repeated string roles = 2;
+  // Flat scopes (`devices:read`, ..., or `*`), on top of the roles.
+  repeated string scopes = 3;
+  // Sensitive categories (`lock`, `opener`, `alarm`, `camera`)
+  // granted on every device.
+  repeated string sensitive = 4;
+  // The token's deny list.
+  repeated DenyRule deny = 5;
+}
+
+// One deny entry: refuses `actions` whatever grants them.
+message DenyRule {
+  // Action names (`device.command`) or `*`. Required.
+  repeated string actions = 1;
+  // Device categories the deny is narrowed to; empty for every
+  // resource.
+  repeated string category = 2;
+  // Device ids or `prefix*` patterns the deny is narrowed to; empty
+  // for every device.
+  repeated string devices = 3;
+}
+
+message CreateTokenResponse {
+  // The bearer secret (`oxh_...`). Shown once.
+  string secret = 1;
+  // The new token as listed.
+  Token token = 2;
+}
+
+message ListTokensRequest {}
+
+message ListTokensResponse {
+  repeated Token tokens = 1;
+}
+
+// One token, as listed. Same fields as the JSON API's rows.
+message Token {
+  string token_id = 1;
+  string label = 2;
+  // `true` for the bootstrap / recovered owner token.
+  bool owner = 3;
+  bool revoked = 4;
+  // Role names; `owner` for the owner token.
+  repeated string roles = 5;
+  repeated string scopes = 6;
+  // `lock`, or `camera[dev-a1* dev-b2*]` when narrowed to devices.
+  repeated string sensitive = 7;
+  // Deny entries as `actions@categories[devices]`.
+  repeated string deny = 8;
+  // Unix ms.
+  int64 created_ms = 9;
+  // Unix ms; unset when never used.
+  optional int64 last_used_ms = 10;
+  // `false` when the stored policy doesn't parse (deny-all).
+  bool policy_valid = 11;
+}

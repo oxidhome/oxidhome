@@ -39,6 +39,7 @@ pub mod authorize;
 pub mod category;
 pub mod invocation;
 pub mod policy;
+pub mod role;
 pub mod sensitive;
 
 pub use authorize::{
@@ -52,6 +53,7 @@ pub use policy::{
     DEVICE_COMMAND_ENFORCED, EnforcedConstraint, SensitiveGrant, TokenPolicy, ToolConstraint,
     parse_policy,
 };
+pub use role::{ActionSet, DenyRule, Role};
 
 /// What kind of caller this `Actor` represents. Drives where the
 /// audit log attributes the action and which scope policy the
@@ -113,6 +115,10 @@ struct ActorInner {
     // `recover-admin-token`), read from `auth_token.owner`. Never set
     // from a label or from caller input.
     owner: bool,
+    // H6 slice 3: role presets and the deny list from the token
+    // policy. Empty for plugins and scope-only tokens.
+    roles: Vec<role::Role>,
+    deny: Vec<role::DenyRule>,
 }
 
 impl Actor {
@@ -134,6 +140,8 @@ impl Actor {
                 constraints: HashMap::new(),
                 sensitive: Vec::new(),
                 owner: false,
+                roles: Vec::new(),
+                deny: Vec::new(),
             }),
         }
     }
@@ -173,6 +181,8 @@ impl Actor {
                 constraints,
                 sensitive: Vec::new(),
                 owner: false,
+                roles: Vec::new(),
+                deny: Vec::new(),
             }),
         }
     }
@@ -194,6 +204,8 @@ impl Actor {
                 constraints: policy.constraints,
                 sensitive: policy.sensitive,
                 owner,
+                roles: policy.roles,
+                deny: policy.deny,
             }),
         }
     }
@@ -211,6 +223,8 @@ impl Actor {
                 constraints: self.inner.constraints.clone(),
                 sensitive: grants,
                 owner: self.inner.owner,
+                roles: self.inner.roles.clone(),
+                deny: self.inner.deny.clone(),
             }),
         }
     }
@@ -219,6 +233,18 @@ impl Actor {
     #[must_use]
     pub fn sensitive_grants(&self) -> &[policy::SensitiveGrant] {
         &self.inner.sensitive
+    }
+
+    /// Role presets (H6 slice 3).
+    #[must_use]
+    pub fn roles(&self) -> &[role::Role] {
+        &self.inner.roles
+    }
+
+    /// The deny list (H6 slice 3).
+    #[must_use]
+    pub fn deny_rules(&self) -> &[role::DenyRule] {
+        &self.inner.deny
     }
 
     /// `true` when this actor's token is the host-recorded owner.

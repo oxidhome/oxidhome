@@ -196,7 +196,7 @@ fn live_policy(tokens: &TokenStore, token_id: &str) -> anyhow::Result<TokenPolic
     })
 }
 
-fn check_devices(devices: &[String]) -> anyhow::Result<()> {
+pub(crate) fn check_devices(devices: &[String]) -> anyhow::Result<()> {
     if devices.len() > MAX_DEVICE_PATTERNS {
         anyhow::bail!("at most {MAX_DEVICE_PATTERNS} --device patterns");
     }

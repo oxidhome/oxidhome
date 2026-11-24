@@ -26,10 +26,15 @@
 //! - **`token list` / `token grant-sensitive <id> <category>
 //!   [--device <dev-id>]...` / `token revoke-sensitive <id>
 //!   <category>` (H6 slice 2)** — offline: list tokens with their
-//!   owner flag and sensitive grants, or edit a token's explicit
-//!   grants for `lock`, `opener`, `alarm` or `camera`. No scope, the
-//!   wildcard included, reaches those without a grant; only the
-//!   bootstrap / recovered owner token holds them all.
+//!   owner flag, roles, scopes, sensitive grants and deny list, or
+//!   edit a token's explicit grants for `lock`, `opener`, `alarm` or
+//!   `camera`. No scope or role, the wildcard included, reaches those
+//!   without a grant; only the bootstrap / recovered owner token holds
+//!   them all.
+//! - **`token create <label> [--role <role>]... [--scope <scope>]...
+//!   [--sensitive <category>]... [--deny <actions>[@<categories>]]...`
+//!   / `token roles` (H6 slice 3)** — offline: mint a token holding
+//!   role presets (printing its secret once), or list the presets.
 //! - **`device set-category <dev-id> <category>|--clear` (H6 slice
 //!   2)** — offline: the operator's category raise (raise only).
 //! - **`backup <out-dir>` (M3)** — writes a consistent snapshot
@@ -550,6 +555,9 @@ fn parse_stdio_args() -> anyhow::Result<Option<StdioOptions>> {
 /// Offline, like `recover-admin-token`.
 fn run_token() -> anyhow::Result<()> {
     const USAGE: &str = "usage: oxidhome token list\n       \
+         oxidhome token roles\n       \
+         oxidhome token create <label> [--role <role>]... [--scope <scope>]... \
+         [--sensitive <lock|opener|alarm|camera>]... [--deny <action,...|*>[@<category,...>]]...\n       \
          oxidhome token grant-sensitive <token-id> <lock|opener|alarm|camera> [--device <dev-id>]...\n       \
          oxidhome token revoke-sensitive <token-id> <lock|opener|alarm|camera>";
     let args: Vec<String> = std::env::args().skip(2).collect();
@@ -558,51 +566,35 @@ fn run_token() -> anyhow::Result<()> {
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
             println!(
-                "Commands on locks, openers and alarms and camera bytes need an explicit grant; \
-                 no scope, the wildcard included, reaches them. Run with the daemon stopped."
+                "Roles: admin, resident, guest, dashboard, monitor, assistant (`token roles`). \
+                 Commands on locks, openers and alarms and camera bytes need an explicit grant; \
+                 no scope or role, the wildcard included, reaches them. Run with the daemon \
+                 stopped."
             );
             Ok(())
         }
-        Some("list") if args.len() == 1 => {
-            init_cli_tracing();
-            let state_dir = resolve_state_dir()?;
-            with_offline_stores(&state_dir, |stores| {
-                for t in stores.tokens.list()? {
-                    let policy = oxidhome_core::auth::parse_policy(&t.scope_json);
-                    let sensitive = policy.as_ref().map_or_else(
-                        || "(unparseable policy: deny-all)".to_owned(),
-                        |p| {
-                            p.sensitive
-                                .iter()
-                                .map(|g| match &g.devices {
-                                    None => g.category.as_str().to_owned(),
-                                    Some(d) => format!("{}[{}]", g.category.as_str(), d.join(" ")),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        },
-                    );
-                    println!(
-                        "{}\t{}\t{}{}\tscopes={}\tsensitive={}",
-                        t.id,
-                        t.label,
-                        if t.owner { "owner" } else { "-" },
-                        if t.revoked_ms.is_some() {
-                            " revoked"
-                        } else {
-                            ""
-                        },
-                        policy.map_or_else(String::new, |p| p.scopes.join(",")),
-                        if t.owner {
-                            "(all)".to_owned()
-                        } else {
-                            sensitive
-                        },
-                    );
-                }
-                Ok(())
-            })
+        Some("roles") if args.len() == 1 => {
+            for r in oxidhome_core::api::token_admin::roles() {
+                println!(
+                    "{}{}\t{}\n\tactions: {}",
+                    r.role,
+                    if r.assignable {
+                        ""
+                    } else {
+                        " (not assignable)"
+                    },
+                    r.description,
+                    if r.actions.is_empty() {
+                        "(all, by the owner flag)".to_owned()
+                    } else {
+                        r.actions.join(",")
+                    },
+                );
+            }
+            Ok(())
         }
+        Some("create") => run_token_create(&args[1..], USAGE),
+        Some("list") if args.len() == 1 => run_token_list(),
         Some(cmd @ ("grant-sensitive" | "revoke-sensitive")) => {
             let token_id = args.get(1).ok_or_else(usage)?;
             let category: SensitiveCategory = args
@@ -646,6 +638,102 @@ fn run_token() -> anyhow::Result<()> {
         }
         _ => Err(usage()),
     }
+}
+
+/// `oxidhome token list`.
+fn run_token_list() -> anyhow::Result<()> {
+    init_cli_tracing();
+    let state_dir = resolve_state_dir()?;
+    with_offline_stores(&state_dir, |stores| {
+        for t in oxidhome_core::api::token_admin::summaries(&stores.tokens)? {
+            let none = |v: &[String], sep: &str| {
+                if v.is_empty() {
+                    "-".to_owned()
+                } else {
+                    v.join(sep)
+                }
+            };
+            println!(
+                "{}\t{}\t{}{}\troles={}\tscopes={}\tsensitive={}\tdeny={}",
+                t.token_id,
+                t.label,
+                if t.owner { "owner" } else { "-" },
+                if t.revoked { " revoked" } else { "" },
+                none(&t.roles, ","),
+                if t.policy_valid {
+                    none(&t.scopes, ",")
+                } else {
+                    "(unparseable policy: deny-all)".to_owned()
+                },
+                none(&t.sensitive, ","),
+                none(&t.deny, " "),
+            );
+        }
+        Ok(())
+    })
+}
+
+/// H6 slice 3: `oxidhome token create`.
+fn run_token_create(args: &[String], usage: &str) -> anyhow::Result<()> {
+    let req = parse_token_create(args).map_err(|e| anyhow::anyhow!("{e}\n{usage}"))?;
+    init_cli_tracing();
+    let state_dir = resolve_state_dir()?;
+    let minted = with_offline_stores(&state_dir, |stores| {
+        oxidhome_core::api::token_admin::mint(&stores.tokens, &stores.audit, "cli", "cli", &req)
+            .map_err(anyhow::Error::from)
+    })?;
+    let s = &minted.summary;
+    eprintln!(
+        "token {} ({}) minted: roles={} scopes={} sensitive={} deny={}",
+        minted.token_id,
+        s.label,
+        s.roles.join(","),
+        s.scopes.join(","),
+        s.sensitive.join(","),
+        s.deny.join(" "),
+    );
+    eprintln!("the secret below is shown once; the host keeps only its hash");
+    println!("{}", minted.secret);
+    Ok(())
+}
+
+/// H6 slice 3: the arguments of `oxidhome token create`.
+fn parse_token_create(
+    args: &[String],
+) -> anyhow::Result<oxidhome_core::api::token_admin::MintRequest> {
+    use oxidhome_core::api::token_admin::{DenySpec, MintRequest};
+    let mut req = MintRequest::default();
+    let mut label = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let mut value = || {
+            rest.next()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("`{arg}` needs a value"))
+        };
+        match arg.as_str() {
+            "--role" => req.roles.push(value()?),
+            "--scope" => req.scopes.push(value()?),
+            "--sensitive" => req.sensitive.push(value()?),
+            "--deny" => {
+                let v = value()?;
+                let (actions, category) = match v.split_once('@') {
+                    Some((a, c)) => (a, Some(c.split(',').map(str::to_owned).collect())),
+                    None => (v.as_str(), None),
+                };
+                req.deny.push(DenySpec {
+                    actions: actions.split(',').map(str::to_owned).collect(),
+                    category,
+                    devices: None,
+                });
+            }
+            other if other.starts_with('-') => anyhow::bail!("unexpected argument `{other}`"),
+            other if label.is_none() => label = Some(other.to_owned()),
+            other => anyhow::bail!("unexpected argument `{other}`"),
+        }
+    }
+    req.label = label.ok_or_else(|| anyhow::anyhow!("missing <label>"))?;
+    Ok(req)
 }
 
 /// H6 slice 2: `oxidhome device set-category <dev-id> <category>|--clear`.

@@ -3926,3 +3926,64 @@ async fn events_subscribe_is_gated_by_events_read_not_events_tail() {
         .expect("deny row");
     assert_eq!(deny.required_scope.as_deref(), Some("events:read"));
 }
+
+/// H6 slice 3: `tokens.list` is the owner's alone and never carries a
+/// secret; there is no `tokens.create` (M7 keeps credentials out of
+/// MCP responses).
+#[tokio::test(flavor = "current_thread")]
+async fn tokens_list_is_owner_only_and_there_is_no_create() {
+    let engine = Engine::new().expect("engine");
+    let issued = oxidhome_core::state::TokenStore::generate();
+    assert!(
+        engine
+            .auth_tokens()
+            .insert_owner_if_empty(&issued, "admin", br#"["*"]"#)
+            .expect("owner")
+    );
+    let owner = issued.plaintext;
+    let wildcard = mint_bearer(&engine);
+    engine
+        .auth_tokens()
+        .create("llm", br#"{"scopes":[],"roles":["assistant"]}"#)
+        .expect("role token");
+    let router = build_router(engine.clone());
+
+    let (router, session) = handshake(router, &wildcard).await;
+    let response = call(
+        &router,
+        &wildcard,
+        &session,
+        "tools/call",
+        json!({"name": "tokens.list", "arguments": {}}),
+    )
+    .await;
+    assert!(response["error"].is_object(), "{response}");
+
+    let (router, session) = handshake(router, &owner).await;
+    let response = call(
+        &router,
+        &owner,
+        &session,
+        "tools/call",
+        json!({"name": "tokens.create", "arguments": {"label": "x", "roles": ["monitor"]}}),
+    )
+    .await;
+    assert!(response["error"].is_object(), "{response}");
+
+    let response = call(
+        &router,
+        &owner,
+        &session,
+        "tools/call",
+        json!({"name": "tokens.list", "arguments": {}}),
+    )
+    .await;
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let tokens = response["result"]["structuredContent"]["tokens"]
+        .as_array()
+        .expect("tokens");
+    assert_eq!(tokens.len(), 3, "{response}");
+    assert_eq!(tokens[0]["roles"], json!(["owner"]));
+    assert_eq!(tokens[2]["roles"], json!(["assistant"]));
+    assert!(!response.to_string().contains(&owner));
+}
