@@ -597,7 +597,8 @@ impl NetworkPolicy {
     }
 
     /// Keep the addresses a lookup of a name matching `rules` may hand to
-    /// the plugin, and remember the public ones for later connects.
+    /// the plugin, and remember the ones a name rule covers (public ones,
+    /// and private ones under a local-only rule) for later connects.
     /// Addresses no rule could ever allow are dropped here, so a
     /// rebinding answer never reaches the plugin.
     ///

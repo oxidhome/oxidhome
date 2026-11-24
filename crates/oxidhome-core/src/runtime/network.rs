@@ -20,7 +20,8 @@
 //!   incoming datagrams the policy wouldn't allow are dropped.
 //! - `wasi:sockets/ip-name-lookup` is implemented here, not by
 //!   `wasmtime-wasi`, so the host only resolves names a rule mentions and
-//!   remembers which public addresses each name resolved to.
+//!   remembers which addresses its name rules cover (public ones, and
+//!   private ones for local-only names) each name resolved to.
 //! - Socket creation is capped per instance.
 //! - `wasi:http` requests are sent by [`http::HttpHooks`]: the host
 //!   resolves the request's host, checks each address, and connects to
