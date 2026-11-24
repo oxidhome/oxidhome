@@ -49,7 +49,9 @@
 //! action whatever grants it: a scope, a role, the wildcard, a
 //! sensitive grant, the owner flag. Matching is conservative: a
 //! category deny matches a device whose display category *or*
-//! sensitive set names the category; any rule with a selector matches
+//! sensitive set names the category (and every device not registered
+//! right now, whose display category is unknown); any rule with a
+//! selector matches
 //! a whole collection of devices, events or blobs (which may contain a
 //! denied device); a device-narrowed rule matches every blob (a blob
 //! names no device) and a category rule a camera instance's blob when
@@ -561,8 +563,11 @@ fn deny_matches(
     match resource {
         Resource::Device(d) => {
             let class = d.class();
-            categories.is_none_or(|c| falls_under(c, class.category(), class.sensitive()))
-                && devices.is_none_or(|p| p.iter().any(|p| match_pattern(p, d.id())))
+            // An unregistered device's display category is unknown:
+            // every category deny matches it.
+            categories.is_none_or(|c| {
+                !class.is_registered() || falls_under(c, class.category(), class.sensitive())
+            }) && devices.is_none_or(|p| p.iter().any(|p| match_pattern(p, d.id())))
         }
         Resource::Blob(b) => {
             // A blob names no device: a device-narrowed deny refuses
@@ -597,6 +602,37 @@ mod tests {
 
     fn device(category: DeviceCategory) -> Resource {
         Resource::device("dev-a1b2c3d4e5f60718", DeviceClass::of(category))
+    }
+
+    /// An offline device's display category is unknown, so every
+    /// category deny matches it; a light whose bytes are camera bytes
+    /// keeps `light` for a deny on lights.
+    #[test]
+    fn category_denies_cover_offline_devices_and_camera_bytes() {
+        let deny = |action: Action, c: DeviceCategory| DenyRule {
+            actions: ActionSet::of(&[action]),
+            categories: Some(vec![c]),
+            devices: None,
+        };
+        let offline = Resource::device("dev-a1b2c3d4e5f60718", DeviceClass::unregistered());
+        assert!(
+            deny(Action::DeviceRead, DeviceCategory::Sensor).matches(Action::DeviceRead, &offline)
+        );
+        let registered_other = device(DeviceCategory::Other);
+        assert!(
+            !deny(Action::DeviceRead, DeviceCategory::Sensor)
+                .matches(Action::DeviceRead, &registered_other)
+        );
+        let camera_light = Resource::device(
+            "dev-a1b2c3d4e5f60718",
+            DeviceClass::of(DeviceCategory::Light).with_camera_bytes(),
+        );
+        assert!(
+            deny(Action::BlobRead, DeviceCategory::Light).matches(Action::BlobRead, &camera_light)
+        );
+        assert!(
+            deny(Action::BlobRead, DeviceCategory::Camera).matches(Action::BlobRead, &camera_light)
+        );
     }
 
     #[test]

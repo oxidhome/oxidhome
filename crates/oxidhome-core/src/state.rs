@@ -40,7 +40,7 @@ pub use dashboards::{
 };
 pub use db::Db;
 pub use device_meta::{
-    DeviceMetaError, DeviceMetaRow, DeviceMetaStore, ObserveError, is_device_id,
+    DeviceMetaError, DeviceMetaRow, DeviceMetaStore, ObserveError, is_device_id, is_device_pattern,
 };
 pub use device_state::{
     CappedPage, CursorError, DeltaPage, DeviceState, DeviceStateHealth, DeviceStateStore,

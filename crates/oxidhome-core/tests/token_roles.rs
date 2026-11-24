@@ -151,6 +151,29 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     let (status, _) = send(&router, "GET", "/api/v1/devices/state", &dashboard, "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
+    // Connect filters and refuses the same way.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.DevicesService/ListDevices",
+        &dashboard,
+        "{}",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.to_string().contains(&device), "{body}");
+    let connect_toggle =
+        json!({"deviceId": device, "capability": "switch", "action": "toggle"}).to_string();
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.DevicesService/ExecuteCommand",
+        &dashboard,
+        &connect_toggle,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
     // Raised to `light`, it is listed, readable and commandable.
     let (status, _) = send(
         &router,
@@ -166,6 +189,24 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     let (status, _) = send(&router, "GET", &state_uri, &dashboard, "").await;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = send(&router, "POST", &command_uri, &dashboard, TOGGLE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.DevicesService/ListDevices",
+        &dashboard,
+        "{}",
+    )
+    .await;
+    assert!(body.to_string().contains(&device), "{body}");
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.DevicesService/ExecuteCommand",
+        &dashboard,
+        &connect_toggle,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // An assistant with the lock grant still can't command a lock.
@@ -244,9 +285,15 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
             50,
         )
         .unwrap();
+    let mint = mints
+        .iter()
+        .find(|r| r.path == "api.auth.mint:dashboard")
+        .unwrap_or_else(|| panic!("{mints:?}"));
     assert!(
-        mints.iter().any(|r| r.path == "api.auth.mint:dashboard"),
-        "{mints:?}"
+        mint.call_id
+            .as_deref()
+            .is_some_and(|c| c.starts_with("call-")),
+        "the mint row joins the request: {mint:?}"
     );
 }
 
@@ -328,7 +375,6 @@ async fn connect_tokens_service_is_owner_only() {
 #[test]
 fn cli_creates_and_lists_role_tokens() {
     let state = support::tempdir("token-roles-cli");
-    drop(Engine::with_state_dir(state.path()).expect("engine creates the database"));
     let run = |args: &[&str]| {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_oxidhome-core"))
             .args(args)
@@ -341,6 +387,17 @@ fn cli_creates_and_lists_role_tokens() {
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
     };
+    // An empty token table belongs to the daemon's owner bootstrap.
+    drop(Engine::with_state_dir(state.path()).expect("engine creates the database"));
+    let (ok, _, stderr) = run(&["token", "create", "early", "--role", "monitor"]);
+    assert!(!ok);
+    assert!(stderr.contains("no owner token yet"), "{stderr}");
+    {
+        let engine = Engine::with_state_dir(state.path()).expect("engine");
+        ensure_admin_token(&engine.auth_tokens(), &engine.audit_log(), state.path())
+            .expect("bootstrap")
+            .expect("owner");
+    }
     let (ok, stdout, stderr) = run(&[
         "token",
         "create",

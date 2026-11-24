@@ -668,8 +668,9 @@ async fn create_token(
         .map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
     let tokens = state.engine.auth_tokens();
     let audit = state.engine.audit_log();
+    let call_id = ctx.call_id().to_owned();
     let minted = tokio::task::spawn_blocking(move || {
-        super::token_admin::mint(&tokens, &audit, "api", "api", &req)
+        super::token_admin::mint(&tokens, &audit, "api", "api", Some(&call_id), &req)
     })
     .await
     .map_err(|_| TokensError::Internal)?

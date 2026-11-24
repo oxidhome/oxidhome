@@ -790,7 +790,7 @@ async fn read_inner(
     }
     let outcome = match kind {
         Kind::DevicesList => devices_list(&engine, ctx),
-        Kind::DevicesDetail(id) => devices_detail(&engine, id),
+        Kind::DevicesDetail(id) => devices_detail(&engine, ctx, action, id),
         Kind::PluginsList => plugins_list(&engine),
         Kind::PluginsDetail(id) => plugins_detail(&engine, id),
         // Events + logs hit `SQLite`, so parse the query
@@ -972,10 +972,21 @@ struct DeviceDetail {
     class: crate::api::server::WireDeviceClass,
 }
 
-fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
+/// `oxidhome://devices/{id}`. The class answered is re-authorized: the
+/// registration may have changed since the caller's check.
+fn devices_detail(
+    engine: &Engine,
+    ctx: &InvocationContext,
+    action: Action,
+    id: &str,
+) -> ReadOutcome {
     let Some(meta) = engine.devices().get_any(&id.to_string()) else {
         return ReadOutcome::NotFound(format!("device {id} is not registered with the host"));
     };
+    let class = engine.devices().class_of_meta(&meta);
+    if let Err(required) = authorize(ctx, action, &AuthResource::device(id, class)).into_result() {
+        return ReadOutcome::Denied { required };
+    }
     let info = &meta.info;
     let detail = DeviceDetail {
         device_id: meta.id.clone(),
@@ -988,7 +999,7 @@ fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
             .iter()
             .map(crate::runtime::capability_name)
             .collect(),
-        class: engine.devices().class_of_meta(&meta).into(),
+        class: class.into(),
     };
     encode(&detail, "device detail")
 }

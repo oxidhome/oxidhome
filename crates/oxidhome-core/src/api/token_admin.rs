@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::bootstrap::{ADMIN_TOKEN_LABEL, audited};
+use super::bootstrap::{ADMIN_TOKEN_LABEL, audited_call};
 use super::sensitive_admin::check_devices;
 use crate::auth::{
     Action, ActionSet, DenyRule, DeviceCategory, Role, SensitiveCategory, SensitiveGrant,
@@ -54,8 +54,9 @@ pub struct MintRequest {
     #[serde(default)]
     pub scopes: Vec<String>,
     /// Sensitive categories (`lock`, `opener`, `alarm`, `camera`),
-    /// granted on every device. Narrow to devices afterwards with
-    /// `oxidhome token grant-sensitive --device`.
+    /// granted on every device. For a grant narrowed to devices, leave
+    /// the category out here and add it with `oxidhome token
+    /// grant-sensitive <id> <category> --device <dev-id>`.
     #[serde(default)]
     pub sensitive: Vec<String>,
     /// The token's deny list.
@@ -94,8 +95,8 @@ fn invalid(msg: impl Into<String>) -> MintError {
     MintError::Invalid(msg.into())
 }
 
-/// A freshly minted token: the only copy of its secret.
-#[derive(Debug)]
+/// A freshly minted token: the only copy of its secret. Its `Debug`
+/// masks the secret.
 pub struct Minted {
     /// The new token's id.
     pub token_id: String,
@@ -103,6 +104,16 @@ pub struct Minted {
     pub secret: String,
     /// The stored policy, as listed.
     pub summary: TokenSummary,
+}
+
+impl std::fmt::Debug for Minted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Minted")
+            .field("token_id", &self.token_id)
+            .field("secret", &crate::redact::REDACTED)
+            .field("summary", &self.summary)
+            .finish()
+    }
 }
 
 /// Every scope name a token can hold, and `*`.
@@ -245,6 +256,7 @@ pub fn mint(
     audit: &AuditLog,
     surface: &str,
     actor_kind: &str,
+    call_id: Option<&str>,
     req: &MintRequest,
 ) -> Result<Minted, MintError> {
     let policy = build_policy(req)?;
@@ -261,7 +273,7 @@ pub fn mint(
             .join(",")
     };
     let path = format!("{surface}.{AUDIT_PATH_MINT}:{what}");
-    audited(audit, actor_kind, &issued.id, &path, || {
+    audited_call(audit, actor_kind, &issued.id, &path, call_id, || {
         tokens
             .insert(&issued, label, &policy.to_json())
             .map_err(anyhow::Error::from)
@@ -421,7 +433,7 @@ mod tests {
             devices: Some(vec!["dev-a1*".into()]),
         }];
         r.sensitive = vec!["camera".into()];
-        let m = mint(&tokens, &audit, "cli", "cli", &r).expect("mint");
+        let m = mint(&tokens, &audit, "cli", "cli", None, &r).expect("mint");
         let rec = tokens.verify(&m.secret).expect("verifies");
         assert_eq!(rec.id, m.token_id);
         assert!(!rec.owner);
@@ -493,7 +505,7 @@ mod tests {
             ),
         ];
         for (r, needle) in cases {
-            let err = mint(&tokens, &audit, "cli", "cli", &r).expect_err("refused");
+            let err = mint(&tokens, &audit, "cli", "cli", None, &r).expect_err("refused");
             assert!(
                 matches!(&err, MintError::Invalid(m) if m.contains(needle)),
                 "{r:?}: {err}"

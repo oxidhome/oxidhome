@@ -156,7 +156,7 @@ impl BytesGate {
             Some(id) => {
                 let mut class = self.devices.class_of(id);
                 if camera_source {
-                    class = class.raised(crate::auth::DeviceCategory::Camera);
+                    class = class.with_camera_bytes();
                 }
                 Resource::device(id, class)
             }

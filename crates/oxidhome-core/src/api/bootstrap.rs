@@ -607,6 +607,18 @@ fn record_intent(
     token_id: &str,
     path: &str,
 ) -> anyhow::Result<u64> {
+    record_intent_call(audit, actor_kind, token_id, path, None)
+}
+
+/// [`record_intent`] with the request's `call_id`, joining the row to
+/// the network request that caused it.
+fn record_intent_call(
+    audit: &AuditLog,
+    actor_kind: &str,
+    token_id: &str,
+    path: &str,
+    call_id: Option<&str>,
+) -> anyhow::Result<u64> {
     let entry = AuditEntry {
         id: 0,
         intent_ms: 0,
@@ -622,7 +634,7 @@ fn record_intent(
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
-        call_id: None,
+        call_id: call_id.map(str::to_owned),
         invocation: None,
         command_id: None,
         command_outcome: None,
@@ -658,7 +670,19 @@ pub(super) fn audited<T>(
     path: &str,
     op: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let id = record_intent(audit, actor_kind, token_id, path)?;
+    audited_call(audit, actor_kind, token_id, path, None, op)
+}
+
+/// [`audited`] with the request's `call_id` on the row.
+pub(super) fn audited_call<T>(
+    audit: &AuditLog,
+    actor_kind: &str,
+    token_id: &str,
+    path: &str,
+    call_id: Option<&str>,
+    op: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let id = record_intent_call(audit, actor_kind, token_id, path, call_id)?;
     let result = op();
     finalize(
         audit,

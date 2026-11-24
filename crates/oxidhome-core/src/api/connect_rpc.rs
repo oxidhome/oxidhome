@@ -1548,8 +1548,12 @@ impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
         };
         let tokens = self.engine.auth_tokens();
         let audit = self.engine.audit_log();
+        let call_id = ctx
+            .extensions()
+            .get::<InvocationContext>()
+            .map(|i| i.call_id().to_owned());
         let minted = tokio::task::spawn_blocking(move || {
-            super::token_admin::mint(&tokens, &audit, "connect", "api", &mint)
+            super::token_admin::mint(&tokens, &audit, "connect", "api", call_id.as_deref(), &mint)
         })
         .await
         .map_err(|e| rpc_err(&ctx, ConnectError::internal(e.to_string())))?

@@ -201,16 +201,7 @@ pub(crate) fn check_devices(devices: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("at most {MAX_DEVICE_PATTERNS} --device patterns");
     }
     for d in devices {
-        let ok = match d.strip_suffix('*') {
-            // A prefix of some `dev-<16 hex>` id.
-            Some(prefix) => {
-                !prefix.is_empty()
-                    && prefix.len() < "dev-0123456789abcdef".len()
-                    && could_prefix_device_id(prefix)
-            }
-            None => crate::state::is_device_id(d),
-        };
-        if !ok || d.len() > MAX_DEVICE_PATTERN_LEN {
+        if !crate::state::is_device_pattern(d) || d.len() > MAX_DEVICE_PATTERN_LEN {
             anyhow::bail!(
                 "device pattern {d:?} must be a device id (dev-<16 hex>) or a `prefix*` of one \
                  (omit --device to grant every device)"
@@ -218,18 +209,6 @@ pub(crate) fn check_devices(devices: &[String]) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// `true` when `prefix` could start a `dev-<16 lowercase hex>` id.
-fn could_prefix_device_id(prefix: &str) -> bool {
-    let template = "dev-";
-    if prefix.len() <= template.len() {
-        return template.starts_with(prefix);
-    }
-    prefix.starts_with(template)
-        && prefix[template.len()..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `policy` with `category` granted: on every device (`devices` empty)

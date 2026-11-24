@@ -319,6 +319,9 @@ impl FromIterator<SensitiveCategory> for SensitiveSet {
 pub struct DeviceClass {
     category: DeviceCategory,
     sensitive: SensitiveSet,
+    /// `false` for a device that isn't registered right now: its
+    /// display category is unknown (a category deny then matches it).
+    registered: bool,
 }
 
 impl Default for DeviceClass {
@@ -334,6 +337,18 @@ impl DeviceClass {
         Self {
             category: DeviceCategory::Other,
             sensitive: SensitiveSet::empty(),
+            registered: true,
+        }
+    }
+
+    /// The class of a device that isn't registered right now: `other`
+    /// until its floor and override are applied, and
+    /// [`Self::is_registered`] `false`.
+    #[must_use]
+    pub const fn unregistered() -> Self {
+        Self {
+            registered: false,
+            ..Self::other()
         }
     }
 
@@ -343,6 +358,7 @@ impl DeviceClass {
         Self {
             category,
             sensitive: category.sensitive().into_iter().collect(),
+            registered: true,
         }
     }
 
@@ -373,7 +389,23 @@ impl DeviceClass {
         Self {
             category: self.category.max(category),
             sensitive,
+            registered: self.registered,
         }
+    }
+
+    /// `self` with its bytes classed as camera bytes (an instance that
+    /// registered a camera owns it), the display category unchanged.
+    #[must_use]
+    pub fn with_camera_bytes(mut self) -> Self {
+        self.sensitive.insert(SensitiveCategory::Camera);
+        self
+    }
+
+    /// `false` when the device isn't registered right now, so its
+    /// display category is unknown.
+    #[must_use]
+    pub const fn is_registered(self) -> bool {
+        self.registered
     }
 
     /// `self` with every sensitive category of `set` added.

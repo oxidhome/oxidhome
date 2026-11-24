@@ -451,12 +451,15 @@ struct DenyWire {
 }
 
 impl DenyWire {
-    /// `None` for an unknown action or category, or an empty list: a
-    /// deny that names nothing would silently match nothing.
+    /// `None` for an unknown action or category, an empty list or a
+    /// device pattern no device id can match: a deny that names
+    /// nothing would silently match nothing.
     fn into_rule(self) -> Option<DenyRule> {
         if self.actions.is_empty()
             || self.category.as_ref().is_some_and(Vec::is_empty)
-            || self.devices.as_ref().is_some_and(Vec::is_empty)
+            || self.devices.as_ref().is_some_and(|d| {
+                d.is_empty() || !d.iter().all(|p| crate::state::is_device_pattern(p))
+            })
         {
             return None;
         }
@@ -827,6 +830,9 @@ mod tests {
             br#"{"scopes":[],"deny":[{"actions":["*"],"category":[]}]}"#,
             br#"{"scopes":[],"deny":[{"actions":["*"],"category":["door"]}]}"#,
             br#"{"scopes":[],"deny":[{"actions":["*"],"devices":[]}]}"#,
+            br#"{"scopes":[],"deny":[{"actions":["*"],"devices":[""]}]}"#,
+            br#"{"scopes":[],"deny":[{"actions":["*"],"devices":["*"]}]}"#,
+            br#"{"scopes":[],"deny":[{"actions":["*"],"devices":["lamp"]}]}"#,
             br#"{"scopes":[],"deny":[{"actions":["*"],"areas":["hall"]}]}"#,
             br#"{"scopes":[],"deny":[{"category":["lock"]}]}"#,
         ] {

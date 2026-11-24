@@ -679,8 +679,23 @@ fn run_token_create(args: &[String], usage: &str) -> anyhow::Result<()> {
     init_cli_tracing();
     let state_dir = resolve_state_dir()?;
     let minted = with_offline_stores(&state_dir, |stores| {
-        oxidhome_core::api::token_admin::mint(&stores.tokens, &stores.audit, "cli", "cli", &req)
-            .map_err(anyhow::Error::from)
+        // The first token must be the owner: the daemon's bootstrap
+        // mints it only into an empty token table.
+        if stores.tokens.count()? == 0 {
+            anyhow::bail!(
+                "no owner token yet: start the daemon once so it mints the owner token, \
+                 then create role tokens"
+            );
+        }
+        oxidhome_core::api::token_admin::mint(
+            &stores.tokens,
+            &stores.audit,
+            "cli",
+            "cli",
+            None,
+            &req,
+        )
+        .map_err(anyhow::Error::from)
     })?;
     let s = &minted.summary;
     eprintln!(
