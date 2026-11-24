@@ -15,8 +15,8 @@
 # wasmtime's `wasmparser` / `wit-parser` / `wasm-encoder` requirements
 # give the line, wit-bindgen-core's `wit-parser` and wit-bindgen-rust's
 # `wit-component` / `wasm-metadata` requirements give wit-bindgen's.
-# Each pinned wasm-tools crate moves to its newest release on that
-# line. With no in-sync pair nothing is bumped: a lone wasmtime or
+# Each pinned wasm-tools crate moves to the newest release on that line
+# that meets both crates' requirements. With no in-sync pair nothing is bumped: a lone wasmtime or
 # wit-bindgen bump would put a second wasm-tools copy in the build.
 #
 # Quarantine: only releases published at least QUARANTINE_DAYS (default
@@ -56,7 +56,17 @@ CUTOFF="$(jq -nr --argjson d "$QUARANTINE_DAYS" 'now - $d * 86400 | floor | toda
 ROOT="$(git rev-parse --show-toplevel)"
 MANIFEST="$ROOT/Cargo.toml"
 CACHE="$(mktemp -d)"
-trap 'rm -rf "$CACHE"' EXIT
+# Set once `apply` has backed up the files it edits: any exit before it
+# succeeds puts them back, so a rerun starts from the same state.
+RESTORE=""
+cleanup() {
+  if [[ -n $RESTORE ]]; then
+    (cd "$RESTORE" && find . -type f -exec cp {} "$ROOT/{}" \;)
+    echo "restored Cargo.toml and the lockfiles" >&2
+  fi
+  rm -rf "$CACHE"
+}
+trap cleanup EXIT
 
 # Pinned in lockstep with wasmtime (same version number).
 WASMTIME_CRATES="wasmtime wasmtime-wasi wasmtime-wasi-http"
@@ -130,8 +140,9 @@ advisories() {
         curl -fsS --retry 3 --max-time 60 -A 'oxidhome-wasm-toolchain-bump' \
           -H 'Content-Type: application/json' --data-binary @- "$OSV_API/v1/query" |
         jq -s 'if length == 1 and (.[0] | type) == "object"
-                  and ((.[0].vulns // []) | type) == "array" then .[0]
-               else error("not an OSV query result") end' >"$page" ||
+                  and ((.[0] | has("vulns") | not) or (.[0].vulns | type) == "array")
+                  and all(.[0].vulns[]?; type == "object" and (.id | type) == "string" and .id != "")
+               then .[0] else error("not an OSV query result") end' >"$page" ||
         die "cannot query OSV for $1 $2"
       ids+=" $(jq -r '[.vulns[]? | select(.withdrawn == null) | .id] | join(" ")' "$page")"
       token="$(jq -r '.next_page_token // ""' "$page")"
@@ -408,12 +419,14 @@ align_examples() {
   local lock name ver rver root_pkgs
   root_pkgs="$(registry_packages "$ROOT/Cargo.lock")"
   for lock in "$ROOT"/examples/*/Cargo.lock; do
-    while read -r name ver; do
-      [[ " $TOOLS_CRATES " == *" $name "* ]] || continue
-      rver="$(awk -v n="$name" -v l="${ver%.*}." '$1 == n && index($2, l) == 1 { print $2 }' <<<"$root_pkgs" | tail -n 1)"
-      [[ -n $rver && $rver != "$ver" ]] || continue
-      (cd "$(dirname "$lock")" && cargo update -p "$name@$ver" --precise "$rver") || return 1
-    done < <(registry_packages "$lock")
+    for name in $TOOLS_CRATES; do
+      # Re-read each time: moving one crate can move its siblings.
+      while read -r ver; do
+        rver="$(awk -v n="$name" -v l="${ver%.*}." '$1 == n && index($2, l) == 1 { print $2 }' <<<"$root_pkgs" | tail -n 1)"
+        [[ -n $rver && $rver != "$ver" ]] || continue
+        (cd "$(dirname "$lock")" && cargo update -p "$name@$ver" --precise "$rver") || return 1
+      done < <(registry_packages "$lock" | awk -v n="$name" '$1 == n { print $2 }')
+    done
   done
 }
 
@@ -429,7 +442,7 @@ update_lockfiles() {
 }
 
 apply() {
-  ((QUARANTINE_DAYS >= MIN_QUARANTINE_DAYS)) ||
+  ((10#$QUARANTINE_DAYS >= MIN_QUARANTINE_DAYS)) ||
     die "apply needs QUARANTINE_DAYS >= $MIN_QUARANTINE_DAYS (plan takes any value)"
   local p status line days c old new wt="" wb="" table="" before after added pkg ver id
   command -v osv-scanner >/dev/null || die "osv-scanner is not on PATH"
@@ -455,6 +468,7 @@ apply() {
     mkdir -p "$backup/$(dirname "${lock#"$ROOT"/}")"
     cp "$lock" "$backup/${lock#"$ROOT"/}"
   done
+  RESTORE="$backup"
   while read -r _ c old new; do
     [[ $c == wasmtime ]] && wt="$new"
     [[ $c == wit-bindgen ]] && wb="$new"
@@ -465,10 +479,7 @@ apply() {
     [[ "$(current_pin "$c")" == "$new" ]] || die "failed to rewrite the $c pin"
   done < <(grep '^pin ' <<<"$p")
 
-  if ! update_lockfiles; then
-    (cd "$backup" && find . -type f -exec cp {} "$ROOT/{}" \;)
-    die "cargo update failed; Cargo.toml and the lockfiles restored"
-  fi
+  update_lockfiles || die "cargo update failed"
 
   # Cargo resolves every unpinned crate the bump adds or moves (wasmparser,
   # regalloc2, ...) to its newest compatible release; those must be out
@@ -497,8 +508,12 @@ apply() {
     if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=false" >>"$GITHUB_OUTPUT"; fi
     return 0
   fi
+  RESTORE=""
 
   local title="build(deps): bump wasm toolchain to wasmtime $wt, wit-bindgen $wb"
+  # Every target pin; the workflow leaves an open PR with the same set alone.
+  local pins_key
+  pins_key="$(awk '$1 == "pin" { printf "%s%s=%s", sep, $2, $4; sep = "," }' <<<"$p")"
   local body_file="${PR_BODY_FILE:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/wasm-toolchain-pr.md}"
   cat >"$body_file" <<EOF
 Bumps the exact-pinned wasm toolchain together onto wasm-tools $line, the line wasmtime $wt is built on. wit-bindgen moves to its newest release on the same line, so the host and the guest bindings share one wasm-tools release line.
@@ -509,6 +524,8 @@ ${table}
 Only releases published at least $days days ago were considered (the scheduled default, 7 days, matches Dependabot's cooldown for every other dependency). None of the new pins has an OSV advisory, and osv-scanner finds no vulnerability in the updated lockfiles that main doesn't already have. The root and \`examples/*\` lockfiles were updated with \`cargo update --workspace\`. If the WIT contract baseline or the generated bindings change, fix them up in this PR before merging.
 
 Opened by \`.github/workflows/wasm-toolchain.yaml\`.
+
+<!-- wasm-toolchain-pins: $pins_key -->
 EOF
   log "PR body written to $body_file"
   if [[ -n ${GITHUB_OUTPUT:-} ]]; then
@@ -516,6 +533,7 @@ EOF
       echo "changed=true"
       echo "title=$title"
       echo "body-file=$body_file"
+      echo "pins=$pins_key"
     } >>"$GITHUB_OUTPUT"
   fi
 }
