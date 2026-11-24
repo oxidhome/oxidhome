@@ -47,7 +47,7 @@ fn udp_peer() -> (SocketAddr, mpsc::Receiver<(UdpSocket, SocketAddr)>) {
 }
 
 /// A TCP peer on loopback: answers the first line of one connection
-/// with `pong` and keeps the connection open while the test holds the
+/// with a one-byte `!` (so it arrives in one read) and keeps the connection open while the test holds the
 /// returned receiver.
 fn tcp_peer() -> (SocketAddr, mpsc::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp peer");
@@ -60,7 +60,7 @@ fn tcp_peer() -> (SocketAddr, mpsc::Sender<()>) {
         let mut line = String::new();
         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
         if reader.read_line(&mut line).is_ok() {
-            let _ = stream.write_all(b"pong\n");
+            let _ = stream.write_all(b"!");
             let _ = stream.flush();
         }
         // Open until the test is done.
@@ -169,7 +169,7 @@ async fn a_tcp_reply_wakes_the_plugin_before_its_tick() {
     let storage = instance.storage();
 
     wait_for(&storage, "received", 1).await;
-    assert_eq!(string(&storage, "last"), "pong");
+    assert_eq!(string(&storage, "last"), "!");
     assert_eq!(int(&storage, "ticks"), 1);
     wait_for_gate(&host).await;
     // Drained and still open: nothing more to wake it for.

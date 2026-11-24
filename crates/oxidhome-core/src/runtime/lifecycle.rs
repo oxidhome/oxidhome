@@ -3,15 +3,16 @@
 //! [`supervise`] spawns one tokio task per plugin instance. That task
 //! *owns* the [`PluginInstance`] (hence its Wasmtime `Store`) and is
 //! the only thing that ever drives it — preserving the single-threaded
-//! per-`Store` WASM contract. The task `select!`s between three
-//! sources and drains the event bus after each:
+//! per-`Store` WASM contract. The task `select!`s between these
+//! sources and drains the plugin's buffered events after each:
 //!
 //! - **control commands** — `execute-command` / `shutdown` arriving
 //!   through the [`InstanceHandle`]'s mpsc channel;
 //! - **ticks** — a `tokio::time::interval` whose cadence is the
 //!   manifest's `runtime.tick_interval_ms` (absent ⇒ no ticks);
-//! - **bus events** — a `broadcast` wakeup receiver; any publish wakes
-//!   the loop, which then runs [`PluginInstance::drain_events`] to
+//! - **bus events** — the instance's wake `Notify`, signalled when a
+//!   publish matches one of its subscriptions; the loop then runs
+//!   [`PluginInstance::drain_events`] to
 //!   deliver matching events into the plugin's `on-event`. This is the
 //!   subscriber-only-plugin path: such a plugin never ticks, so a
 //!   `select!` arm on the bus is what makes its events arrive;
@@ -34,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use futures_util::FutureExt as _;
 use oxidhome_manifest::RestartPolicy;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -2003,21 +2005,19 @@ async fn serve_loop(
                 // matching publishes drains together in one pass —
                 // exactly the behaviour we want.
                 () = wake.notified() => Wakeup::Event,
+                gate = io_ready(instance, &clock, last_tick, &mut next_gate), if io_wakeups => {
+                    Wakeup::Io(gate)
+                }
             }
         };
         // A requested stop goes first: queued commands are then refused
         // without running (see `ControlQueue`). The others are polled
-        // fairly, so a stream of commands can't starve the tick. A
-        // readable socket comes last: a periodic tick due at the same
-        // instant runs instead of an early one, and its gate then
-        // defers the wakeup.
+        // fairly, so a stream of commands can't starve the tick or a
+        // readable socket.
         let wakeup = tokio::select! {
             biased;
             () = stop_requested(stop) => Wakeup::Stop,
             wakeup = next => wakeup,
-            gate = io_ready(instance, &clock, last_tick, &mut next_gate), if io_wakeups => {
-                Wakeup::Io(gate)
-            }
         };
         let outcome: anyhow::Result<LoopAction> = match wakeup {
             Wakeup::Stop => Ok(shutdown_on_request(instance, state_tx, instance_id).await),
@@ -2034,6 +2034,11 @@ async fn serve_loop(
             Wakeup::Io(gate) => {
                 tracing::trace!(instance_id, "socket readable: ticking early");
                 io_gate = gate;
+                // A periodic tick due now is this same tick: taken here,
+                // so the two don't run back to back.
+                if let Some(interval) = tick.as_mut() {
+                    let _ = interval.tick().now_or_never();
+                }
                 let outcome = tick_now(instance, stop, &clock, &mut last_tick).await;
                 // Registered before `io_gate` goes, so a virtual clock
                 // never sees neither.
