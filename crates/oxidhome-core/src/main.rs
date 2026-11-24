@@ -708,7 +708,11 @@ fn run_token_create(args: &[String], usage: &str) -> anyhow::Result<()> {
         s.deny.join(" "),
     );
     eprintln!("the secret below is shown once; the host keeps only its hash");
-    println!("{}", minted.secret);
+    // Stdout is the delivery channel for the secret (pipe it where it
+    // belongs); nothing else is written there.
+    let mut out = std::io::stdout().lock();
+    std::io::Write::write_all(&mut out, minted.secret.as_bytes())?;
+    std::io::Write::write_all(&mut out, b"\n")?;
     Ok(())
 }
 

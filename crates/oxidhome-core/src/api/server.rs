@@ -661,11 +661,10 @@ struct TokensBody {
 async fn create_token(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
-    body: axum::body::Bytes,
+    body: Result<Json<super::token_admin::MintRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, TokensError> {
     require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Scope)?;
-    let req: super::token_admin::MintRequest = serde_json::from_slice(&body)
-        .map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
+    let Json(req) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
     let tokens = state.engine.auth_tokens();
     let audit = state.engine.audit_log();
     let call_id = ctx.call_id().to_owned();
