@@ -1930,10 +1930,6 @@ async fn io_ready(
     }
     if let Some(sleep) = gate.as_mut() {
         sleep.await;
-        // A periodic tick due at the same instant goes first (the
-        // `select!` polls the other arms before this one again), and
-        // its own gate then defers this wakeup: one tick, not two.
-        tokio::task::yield_now().await;
     }
     let gate = gate.take();
     let now = std::future::poll_fn(|cx| {
@@ -1998,22 +1994,28 @@ async fn serve_loop(
                 // matching publishes drains together in one pass —
                 // exactly the behaviour we want.
                 () = wake.notified() => Wakeup::Event,
-                gate = io_ready(instance, &clock, last_tick, &mut next_gate), if io_wakeups => {
-                    Wakeup::Io(gate)
-                }
             }
         };
         // A requested stop goes first: queued commands are then refused
         // without running (see `ControlQueue`). The others are polled
-        // fairly, so a stream of commands can't starve the tick.
+        // fairly, so a stream of commands can't starve the tick. A
+        // readable socket comes last: a periodic tick due at the same
+        // instant runs instead of an early one, and its gate then
+        // defers the wakeup.
         let wakeup = tokio::select! {
             biased;
             () = stop_requested(stop) => Wakeup::Stop,
             wakeup = next => wakeup,
+            gate = io_ready(instance, &clock, last_tick, &mut next_gate), if io_wakeups => {
+                Wakeup::Io(gate)
+            }
         };
         let outcome: anyhow::Result<LoopAction> = match wakeup {
             Wakeup::Stop => Ok(shutdown_on_request(instance, state_tx, instance_id).await),
             Wakeup::Control(ctrl) => {
+                // Not held across the command: a virtual clock would wait
+                // for it. `io_ready` rebuilds it from `last_tick`.
+                next_gate = None;
                 handle_control(instance, state_tx, stop, instance_id, ctrl).await
             }
             Wakeup::Tick => {

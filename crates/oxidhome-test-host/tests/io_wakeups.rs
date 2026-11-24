@@ -190,8 +190,15 @@ async fn a_flood_is_coalesced_into_one_rate_bounded_wakeup() {
     tokio::time::sleep(QUIET).await;
     assert_eq!(int(&storage, "ticks"), 1);
 
+    // The gate after the first tick is registered (the tick returned).
+    let clock = host.virtual_clock().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while clock.next_deadline() != Some(GAP) {
+        assert!(Instant::now() < deadline, "no rate gate: {clock:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // Not a moment before the gap ends.
-    host.advance(GAP - Duration::from_millis(1)).await.unwrap();
+    host.advance(Duration::from_millis(99)).await.unwrap();
     assert_eq!(int(&storage, "ticks"), 1);
     // The gap ends: one tick reads the whole flood.
     host.advance(Duration::from_millis(1)).await.unwrap();

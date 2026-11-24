@@ -1112,9 +1112,8 @@ impl PluginInstance {
     /// Phase 6's per-instance supervisor drives this off a
     /// `tokio::time::interval` whose cadence is the manifest's
     /// `runtime.tick_interval_ms`, and runs it early for a streaming
-    /// instance whose socket became readable (see
-    /// [`super::io_wakeup`]). Plugins that declare no interval are never
-    /// ticked.
+    /// instance whose socket became readable (`runtime::io_wakeup`).
+    /// Plugins that declare no interval are never ticked.
     pub async fn tick(&mut self) -> anyhow::Result<()> {
         let data = self.store.data();
         let span = info_span!(
