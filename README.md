@@ -28,27 +28,30 @@ share one axum listener, so a household hub only exposes one endpoint.
 - **Auth**: `Authorization: Bearer <token>`. The first-run daemon writes an
   admin token (scope `*`, the owner) to `<state_dir>/admin-token` (mode
   `0600`). Mint further tokens by **role** offline with
-  `oxidhome token create <label> --role <role> [--scope <scope>]...
+  `oxidhome token create <label> --role <name> [--scope <scope>]...
   [--sensitive <category>]... [--deny <action,...|*>[@<category,...>]]...`
   (the secret is printed once), or as the owner over
   `POST /api/v1/tokens` / Connect `TokensService.CreateToken`
-  (`{"label": "hall tablet", "roles": ["dashboard"]}`, `201` with the
+  (`{"label": "hall tablet", "roles": ["tablet"]}`, `201` with the
   secret). `GET /api/v1/tokens`, Connect `ListTokens`, MCP `tokens.list`
   and `oxidhome token list` list tokens without secrets; only the owner
   reaches the API forms. Revocation is offline (`recover-admin-token
   --revoke-all`). Missing or malformed bearer → `401`.
-- **Roles**: `admin` (every scoped action except `plugin.install`,
-  `plugin.uninstall` and `host.audit`), `resident` (read, command devices,
-  read blobs, edit dashboards, open plugin UIs), `guest` (list, read and
-  command `light`, `media` and `climate` devices), `dashboard` (the same,
-  `light` only), `monitor` (read devices, events, instances, plugins,
-  status and dashboards) and `assistant` (read like `monitor`, command
-  lights, never locks). `oxidhome token roles` prints them. A token's
-  roles add to its scopes; a `deny` entry refuses the actions it names
-  whatever grants them; no role includes a sensitive category. A role
-  narrowed to device categories lists only its devices and is refused
-  whole-fleet reads (`GET /api/v1/devices/state`, event history and
-  tails).
+- **Roles**: there are no built-in roles; the owner defines them. A role
+  is a name plus grants (actions; `device.list`, `device.read` and
+  `device.command` can be narrowed to device categories and device ids),
+  sensitive categories and deny entries:
+  `oxidhome role create tablet '{"grants": [{"actions": ["device.list",
+  "device.read", "device.command"], "category": ["light"]}]}'` offline, or
+  over `/api/v1/roles` (`GET`, `POST`, `PUT /{name}`, `DELETE
+  /{name}[?force=true]`) and Connect `RolesService`, owner only. A token
+  holds a role by id: editing the role changes every token holding it
+  from its next request, deleting a role that live tokens hold is refused
+  unless forced, and a reference to a deleted role grants nothing. A
+  token's roles add to its scopes; a `deny` entry refuses the actions it
+  names whatever grants them. A role grant narrowed to devices lists only
+  its devices and is refused whole-fleet reads (`GET
+  /api/v1/devices/state`, event history and tails).
 - **Scope model**: per-surface. `devices:list` reads the fleet;
   `devices:command` sends actuation commands; `events:read` / `logs:read`
   read history; `plugins:list` reads plugin metadata; `plugins:install` /

@@ -1,10 +1,10 @@
-// OxidHome v1 tokens service (H6 slice 3).
+// OxidHome v1 tokens and roles services (H6 slice 3).
 //
-// Mint and list API tokens by role preset: mirrors
-// `POST /api/v1/tokens` and `GET /api/v1/tokens` on the JSON API.
-// Both RPCs need `token.manage`, which only the owner token (the
-// bootstrap / recovered admin token) holds; no scope or role, the
-// wildcard included, grants it.
+// Owner-defined roles, and API tokens minted by role: mirrors
+// `/api/v1/roles` and `/api/v1/tokens` on the JSON API. Roles need
+// `policy.manage`, tokens `token.manage`; only the owner token (the
+// bootstrap / recovered admin token) holds either. No scope or role,
+// the wildcard included, grants them.
 syntax = "proto3";
 
 package oxidhome.v1;
@@ -13,8 +13,8 @@ package oxidhome.v1;
 service TokensService {
   // Mint a token. The response carries its bearer secret, once; the
   // host keeps only the hash. Refuses an unknown role, scope,
-  // category or action, the `owner` role (only the host assigns it)
-  // and the reserved `admin` label with INVALID_ARGUMENT.
+  // category or action, `owner` (only the host assigns it) and the
+  // reserved `admin` label with INVALID_ARGUMENT.
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
 
   // List every token with its roles, scopes, sensitive grants and
@@ -22,11 +22,29 @@ service TokensService {
   rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
 }
 
+// RolesService — owner-defined roles. A token references a role by
+// id: an edit applies to every token holding it from its next request
+// on, and a reference to a deleted role grants nothing.
+service RolesService {
+  // Every role, by name.
+  rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
+
+  // Define a role. ALREADY_EXISTS for a taken name; INVALID_ARGUMENT
+  // for a bad name or definition.
+  rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
+
+  // Replace a role's definition. NOT_FOUND for an unknown name.
+  rpc UpdateRole(UpdateRoleRequest) returns (UpdateRoleResponse);
+
+  // Delete a role. FAILED_PRECONDITION while live tokens hold it,
+  // unless `force`.
+  rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
+}
+
 message CreateTokenRequest {
   // Operator-facing name, 1 to 64 characters. Not `admin`.
   string label = 1;
-  // Role presets: `admin`, `resident`, `guest`, `dashboard`,
-  // `monitor`, `assistant`.
+  // Names of owner-defined roles.
   repeated string roles = 2;
   // Flat scopes (`devices:read`, ..., or `*`), on top of the roles.
   repeated string scopes = 3;
@@ -34,17 +52,17 @@ message CreateTokenRequest {
   // granted on every device.
   repeated string sensitive = 4;
   // The token's deny list.
-  repeated DenyRule deny = 5;
+  repeated Selector deny = 5;
 }
 
-// One deny entry: refuses `actions` whatever grants them.
-message DenyRule {
+// One grant or deny entry: `actions`, optionally narrowed to devices.
+message Selector {
   // Action names (`device.command`) or `*`. Required.
   repeated string actions = 1;
-  // Device categories the deny is narrowed to; empty for every
+  // Device categories the entry is narrowed to; empty for every
   // resource.
   repeated string category = 2;
-  // Device ids or `prefix*` patterns the deny is narrowed to; empty
+  // Device ids or `prefix*` patterns the entry is narrowed to; empty
   // for every device.
   repeated string devices = 3;
 }
@@ -69,7 +87,8 @@ message Token {
   // `true` for the bootstrap / recovered owner token.
   bool owner = 3;
   bool revoked = 4;
-  // Role names; `owner` for the owner token.
+  // Role names (`<id> (deleted)` for a deleted role); `owner` for the
+  // owner token.
   repeated string roles = 5;
   repeated string scopes = 6;
   // `lock`, or `camera[dev-a1* dev-b2*]` when narrowed to devices.
@@ -82,4 +101,69 @@ message Token {
   optional int64 last_used_ms = 10;
   // `false` when the stored policy doesn't parse (deny-all).
   bool policy_valid = 11;
+}
+
+// A role's definition.
+message RoleDefinition {
+  // What the role grants: actions a scope can grant (`*` for all).
+  repeated Selector grants = 1;
+  // Sensitive categories the role grants, on every device.
+  repeated string sensitive = 2;
+  // What the role denies, whatever grants it.
+  repeated Selector deny = 3;
+}
+
+// One role, as listed. Same fields as the JSON API's rows.
+message Role {
+  string role_id = 1;
+  string name = 2;
+  // Grants as `actions@categories[devices]`.
+  repeated string grants = 3;
+  repeated string sensitive = 4;
+  // Denies as `actions@categories[devices]`.
+  repeated string deny = 5;
+  // Ids of the live tokens holding the role.
+  repeated string tokens = 6;
+  // Unix ms.
+  int64 created_ms = 7;
+  int64 updated_ms = 8;
+  // `false` when the stored definition doesn't parse (grants nothing).
+  bool definition_valid = 9;
+}
+
+message ListRolesRequest {}
+
+message ListRolesResponse {
+  repeated Role roles = 1;
+}
+
+message CreateRoleRequest {
+  // 1 to 32 of `a-z0-9-_`, starting with a letter; not `owner`.
+  string name = 1;
+  RoleDefinition definition = 2;
+}
+
+message CreateRoleResponse {
+  Role role = 1;
+}
+
+message UpdateRoleRequest {
+  string name = 1;
+  RoleDefinition definition = 2;
+}
+
+message UpdateRoleResponse {
+  Role role = 1;
+}
+
+message DeleteRoleRequest {
+  string name = 1;
+  // Delete even while live tokens hold the role; their reference then
+  // grants nothing.
+  bool force = 2;
+}
+
+message DeleteRoleResponse {
+  // The deleted role, with the tokens that held it.
+  Role role = 1;
 }

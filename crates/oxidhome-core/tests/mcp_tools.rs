@@ -3942,9 +3942,16 @@ async fn tokens_list_is_owner_only_and_there_is_no_create() {
     );
     let owner = issued.plaintext;
     let wildcard = mint_bearer(&engine);
+    let assistant = engine
+        .auth_tokens()
+        .create_role("assistant", br#"{"grants":[{"actions":["device.list"]}]}"#)
+        .expect("role");
     engine
         .auth_tokens()
-        .create("llm", br#"{"scopes":[],"roles":["assistant"]}"#)
+        .create(
+            "llm",
+            format!(r#"{{"scopes":[],"roles":["{}"]}}"#, assistant.id).as_bytes(),
+        )
         .expect("role token");
     let router = build_router(engine.clone());
 
@@ -3999,9 +4006,19 @@ async fn dashboard_role_reaches_only_lights_over_mcp() {
         .join("examples")
         .join("simulated-switch");
     let engine = Engine::new().expect("engine");
+    let dashboard = engine
+        .auth_tokens()
+        .create_role(
+            "dashboard",
+            br#"{"grants":[{"actions":["device.list","device.read","device.command"],"category":["light"]}]}"#,
+        )
+        .expect("role");
     let bearer = engine
         .auth_tokens()
-        .create("tablet", br#"{"scopes":[],"roles":["dashboard"]}"#)
+        .create(
+            "tablet",
+            format!(r#"{{"scopes":[],"roles":["{}"]}}"#, dashboard.id).as_bytes(),
+        )
         .expect("role token")
         .plaintext;
     let handle = engine

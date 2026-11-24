@@ -270,6 +270,10 @@ pub(crate) async fn require_token(
     // any `last_used_ms` bump on the happy path is offloaded
     // via `spawn_blocking` below (bounded by
     // `PreAdmissionInflight` when injected — round-6 P1).
+    let pre_verified = req
+        .extensions()
+        .get::<super::mcp::PreVerifiedBearer>()
+        .is_some();
     let verify_result = match req
         .extensions_mut()
         .remove::<super::mcp::PreVerifiedBearer>()
@@ -287,7 +291,36 @@ pub(crate) async fn require_token(
 
     let (token_id, actor_kind, invocation) = match verify_result {
         Ok(rec) => {
-            let actor = actor_from_record(&rec);
+            // H6 slice 3: resolving the token's roles reads `auth_role`;
+            // the MCP mount keeps that off the runtime like its verify.
+            let actor = if pre_verified {
+                let (tokens, record) = (Arc::clone(&state.tokens), rec.clone());
+                // Under the same pre-admission cap as the verify.
+                let permit = match &inflight {
+                    Some(gate) => match Arc::clone(&gate.0).acquire_owned().await {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                                .into_response();
+                        }
+                    },
+                    None => None,
+                };
+                match tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    actor_from_record(&record, &tokens)
+                })
+                .await
+                {
+                    Ok(actor) => actor,
+                    Err(_) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                            .into_response();
+                    }
+                }
+            } else {
+                actor_from_record(&rec, &state.tokens)
+            };
             // Round-3 P1 on PR #147: a token whose policy blob
             // carries per-tool constraints (14.4a extended
             // envelope) must not reach REST/Connect surfaces —
@@ -933,7 +966,7 @@ pub(super) async fn finalize_audit(
 ///
 /// `pub(super)` so the Connect-side auth middleware reuses the
 /// same record → actor projection.
-pub(super) fn actor_from_record(rec: &TokenRecord) -> Actor {
+pub(super) fn actor_from_record(rec: &TokenRecord, tokens: &TokenStore) -> Actor {
     // Phase 14.4a: `scope_json` now decodes into a
     // [`TokenPolicy`] — either the legacy `["scope"]` array or
     // the extended `{scopes, constraints}` object. Parse
@@ -952,7 +985,40 @@ pub(super) fn actor_from_record(rec: &TokenRecord) -> Actor {
     // H6 slice 2: the sensitive-category grants ride the policy; the
     // owner flag is the durable `auth_token.owner` column, never the
     // policy blob.
-    Actor::from_token_policy(rec.id.clone(), policy, rec.owner)
+    let role_ids = policy.roles.clone();
+    let actor = Actor::from_token_policy(rec.id.clone(), policy, rec.owner);
+    if role_ids.is_empty() {
+        return actor;
+    }
+    // H6 slice 3: the roles' current definitions, read per request so
+    // an edit applies from the next one. A deleted role is absent and
+    // grants nothing. A role whose definition doesn't parse, or a failed
+    // read, fails closed: the whole token is deny-all for this request,
+    // since the unread role may carry a deny its scopes would otherwise
+    // get past.
+    let deny_all = || {
+        Actor::from_token_policy(
+            rec.id.clone(),
+            crate::auth::TokenPolicy::default(),
+            rec.owner,
+        )
+    };
+    let rows = match tokens.roles_by_id(&role_ids) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(target: "api.auth", token_id = %rec.id, error = %err, "reading the token's roles failed; deny-all for this request");
+            return deny_all();
+        }
+    };
+    let mut roles = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let Some(def) = r.def() else {
+            tracing::warn!(target: "api.auth", token_id = %rec.id, role_id = %r.id, "role definition failed to parse; deny-all for this token");
+            return deny_all();
+        };
+        roles.push(std::sync::Arc::new(def));
+    }
+    actor.with_roles(roles)
 }
 
 /// Legacy scope-array parser retained as a thin shim over
@@ -1006,6 +1072,42 @@ fn unauthorized() -> Response {
 mod tests {
     use super::*;
 
+    fn test_store() -> TokenStore {
+        TokenStore::new(Arc::new(crate::state::Db::open_in_memory().expect("db")))
+    }
+
+    /// H6 slice 3: a held role resolves live; a deleted one grants
+    /// nothing; one that doesn't parse makes the whole token deny-all
+    /// (its deny may be what keeps the token's scopes in check).
+    #[test]
+    fn actor_from_record_resolves_roles_and_fails_closed() {
+        let store = test_store();
+        let good = store
+            .create_role("good", br#"{"grants":[{"actions":["device.read"]}]}"#)
+            .unwrap();
+        let bad = store
+            .create_role("bad", br#"{"deny":[{"actions":["nope"]}]}"#)
+            .unwrap();
+        let rec = |roles: &[&str]| TokenRecord {
+            id: "tok-r".into(),
+            label: "r".into(),
+            scope_json: serde_json::json!({"scopes": ["*"], "roles": roles})
+                .to_string()
+                .into_bytes(),
+            created_ms: 0,
+            last_used_ms: None,
+            revoked_ms: None,
+            owner: false,
+        };
+        let actor = actor_from_record(&rec(&[&good.id]), &store);
+        assert_eq!(actor.roles().len(), 1);
+        assert_eq!(actor.scopes(), ["*"]);
+        let actor = actor_from_record(&rec(&[&good.id, "role-ffffffffffffffff"]), &store);
+        assert_eq!(actor.roles().len(), 1, "a deleted role is skipped");
+        let actor = actor_from_record(&rec(&[&good.id, &bad.id]), &store);
+        assert!(actor.roles().is_empty() && actor.scopes().is_empty());
+    }
+
     #[test]
     fn parse_scopes_accepts_string_array() {
         let blob = br#"["devices:read","plugins:list"]"#;
@@ -1044,7 +1146,7 @@ mod tests {
             revoked_ms: None,
             owner: false,
         };
-        let actor = actor_from_record(&rec);
+        let actor = actor_from_record(&rec, &test_store());
         assert_eq!(actor.scopes(), &["devices:command".to_string()]);
         let cx = actor
             .constraint("device.send_command")
@@ -1065,7 +1167,7 @@ mod tests {
             revoked_ms: None,
             owner: false,
         };
-        let actor = actor_from_record(&rec);
+        let actor = actor_from_record(&rec, &test_store());
         assert_eq!(
             actor.scopes(),
             &["devices:command".to_string(), "plugins:list".to_string()]
@@ -1198,7 +1300,7 @@ mod tests {
             revoked_ms: None,
             owner: false,
         };
-        let actor = actor_from_record(&rec);
+        let actor = actor_from_record(&rec, &test_store());
         assert_eq!(actor.scopes(), Vec::<String>::new());
         assert!(actor.constraint("device.send_command").is_none());
     }

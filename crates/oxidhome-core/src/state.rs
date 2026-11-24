@@ -16,6 +16,7 @@
 //! through `PluginState`.
 
 pub mod audit_log;
+pub mod auth_role;
 pub mod auth_token;
 pub mod blobs;
 pub mod dashboards;
@@ -33,6 +34,7 @@ pub mod retention;
 pub mod services;
 
 pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery, credential_fingerprint};
+pub use auth_role::{RoleError, RoleRecord};
 pub use auth_token::{IssuedToken, TokenError, TokenRecord, TokenStore};
 pub use blobs::{BlobError, BlobInfo, BlobStore, is_safe_instance_id};
 pub use dashboards::{

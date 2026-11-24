@@ -21,6 +21,15 @@
 //!    to the request's own row. Fail-closed: if the row can't be
 //!    written the action doesn't run.
 //!
+//! A device command splits the two: [`SensitiveGuard::reserve`] takes
+//! the rate-limit charge at admission (so a refusal is still an
+//! immediate 429) and returns a [`SensitiveCharge`] that rides with the
+//! command; the supervisor [commits](SensitiveCharge::commit) it, writing
+//! the `warn` row, only once the command has won `queued → started` and
+//! passed re-authorization, before the plugin is entered. A command
+//! withdrawn, timed out or refused before that drops the charge, which
+//! refunds it and leaves no `warn` row.
+//!
 //! Byte releases inside reads (camera `bytes-val` in state, events and
 //! command results) are discharged once per response or stream, not
 //! per value (`api::bytes::BytesGate`).
@@ -210,6 +219,45 @@ impl SensitiveGuard {
             .map_err(|e| ObligationError::Join(e.to_string()))?
     }
 
+    /// Take the rate-limit charge for an allowed sensitive `action` on
+    /// `target` without writing its `warn` row: the row is written by
+    /// [`SensitiveCharge::commit`], when the action actually runs.
+    /// Dropping the returned charge uncommitted refunds it. `None` for
+    /// a decision without sensitive categories.
+    ///
+    /// # Errors
+    ///
+    /// [`ObligationError::RateLimited`].
+    pub fn reserve(
+        self: &Arc<Self>,
+        ctx: &InvocationContext,
+        action: Action,
+        target: &str,
+        decision: &Decision,
+    ) -> Result<Option<SensitiveCharge>, ObligationError> {
+        let Obligations {
+            sensitive,
+            rate_limit,
+            ..
+        } = decision.obligations;
+        if !decision.allow || sensitive.is_empty() {
+            return Ok(None);
+        }
+        let charged = rate_limit.is_some();
+        if charged {
+            self.charge(ctx.root().audit_token_id(), sensitive)?;
+        }
+        Ok(Some(SensitiveCharge(Box::new(Pending {
+            guard: Arc::clone(self),
+            ctx: ctx.clone(),
+            action,
+            target: target.to_owned(),
+            decision: decision.clone(),
+            charged,
+            committed: false,
+        }))))
+    }
+
     /// Write the `warn` row for an allowed sensitive `action`.
     ///
     /// # Errors
@@ -264,6 +312,83 @@ impl SensitiveGuard {
             self.audit.record_completed_durable(&entry)
         } else {
             self.audit.record_completed(&entry)
+        }
+    }
+}
+
+/// A rate-limit charge taken by [`SensitiveGuard::reserve`] for an
+/// action that hasn't run yet. [`Self::commit`] writes the `warn` row
+/// when it runs; dropping it uncommitted (the action was withdrawn,
+/// timed out or refused first) refunds the charge.
+pub struct SensitiveCharge(Box<Pending>);
+
+/// The charge's state; boxed, as it rides in every queued command.
+struct Pending {
+    guard: Arc<SensitiveGuard>,
+    ctx: InvocationContext,
+    action: Action,
+    target: String,
+    decision: Decision,
+    charged: bool,
+    committed: bool,
+}
+
+impl std::fmt::Debug for SensitiveCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SensitiveCharge")
+            .field("action", &self.0.action.as_str())
+            .field("target", &self.0.target)
+            .field("categories", &self.categories())
+            .field("charged", &self.0.charged)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SensitiveCharge {
+    /// The sensitive categories the decision covered.
+    #[must_use]
+    pub fn categories(&self) -> SensitiveSet {
+        self.0.decision.obligations.sensitive
+    }
+
+    /// The action is about to run: write its `warn` row (durably, on
+    /// the blocking pool). On failure the charge is refunded and the
+    /// action must not run.
+    ///
+    /// # Errors
+    ///
+    /// [`ObligationError::Audit`]; [`ObligationError::Join`].
+    pub async fn commit(self) -> Result<(), ObligationError> {
+        let mut pending = self.0;
+        tokio::task::spawn_blocking(move || {
+            let written = pending.guard.record(
+                &pending.ctx,
+                pending.action,
+                &pending.target,
+                &pending.decision,
+            );
+            pending.settle(written.is_ok());
+            written.map(drop).map_err(ObligationError::from)
+        })
+        .await
+        .map_err(|e| ObligationError::Join(e.to_string()))?
+    }
+}
+
+impl Pending {
+    /// Keep the charge (the row is written) or let `Drop` refund it.
+    fn settle(&mut self, committed: bool) {
+        self.committed = committed;
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if self.charged && !self.committed {
+            self.guard.refund(
+                self.ctx.root().audit_token_id(),
+                self.decision.obligations.sensitive,
+            );
         }
     }
 }
@@ -484,6 +609,65 @@ mod tests {
         assert_eq!(row.required_scope.as_deref(), Some("sensitive:lock"));
         assert_eq!(row.call_id.as_deref(), Some(ctx.call_id()));
         assert_eq!(row.level.as_deref(), Some("warn"));
+    }
+
+    /// A reserved charge writes its row only on commit; dropped
+    /// uncommitted it is refunded and leaves no row.
+    #[tokio::test]
+    async fn a_reserved_charge_is_refunded_unless_committed() {
+        let (guard, audit) = guard();
+        let guard = Arc::new(guard);
+        let ctx = lock_token();
+        let lock = Resource::device(
+            "dev-a1b2c3d4e5f60718",
+            DeviceClass::of(DeviceCategory::Lock),
+        );
+        let decision = authorize(&ctx, Action::DeviceCommand, &lock);
+        assert!(decision.allow);
+        let warn_rows = || {
+            audit
+                .query(&AuditQuery::default(), 100)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.method == AUDIT_METHOD_AUTHZ)
+                .count()
+        };
+        // Far more withdrawn commands than the allowance: none count.
+        for _ in 0..50 {
+            let charge = guard
+                .reserve(&ctx, Action::DeviceCommand, "dev-a1", &decision)
+                .unwrap()
+                .expect("sensitive");
+            assert_eq!(charge.categories(), decision.obligations.sensitive);
+            drop(charge);
+        }
+        assert_eq!(warn_rows(), 0);
+        for _ in 0..10 {
+            guard
+                .reserve(&ctx, Action::DeviceCommand, "dev-a1", &decision)
+                .unwrap()
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+        assert_eq!(warn_rows(), 10);
+        assert!(matches!(
+            guard.reserve(&ctx, Action::DeviceCommand, "dev-a1", &decision),
+            Err(ObligationError::RateLimited { .. })
+        ));
+        // A light needs nothing.
+        let light = Resource::device(
+            "dev-a1b2c3d4e5f60718",
+            DeviceClass::of(DeviceCategory::Light),
+        );
+        let decision = authorize(&ctx, Action::DeviceCommand, &light);
+        assert!(
+            guard
+                .reserve(&ctx, Action::DeviceCommand, "dev-a1", &decision)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

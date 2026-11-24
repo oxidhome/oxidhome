@@ -946,6 +946,19 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (installation_uuid, instance_id)
     ) WITHOUT ROWID;
     ",
+    // 23 — H6 slice 3: owner-defined roles. A token policy references
+    // a role by `id`, so a rename or an edit of `definition` (grants,
+    // sensitive categories, denies as JSON) applies to every token
+    // holding it from the next request on.
+    "
+    CREATE TABLE auth_role (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        definition  BLOB NOT NULL,
+        created_ms  INTEGER NOT NULL,
+        updated_ms  INTEGER NOT NULL
+    ) WITHOUT ROWID;
+    ",
 ];
 
 /// File name of the host database inside the state dir.
@@ -2048,6 +2061,7 @@ mod tests {
             db.write(|conn| -> rusqlite::Result<()> {
                 conn.execute_batch(
                     "
+                    DROP TABLE auth_role;
                     DROP TABLE sandbox_removal;
                     DROP TABLE device_meta;
                     ALTER TABLE audit_event DROP COLUMN level;
@@ -2140,6 +2154,8 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 23: owner-defined roles.
+                    DROP TABLE auth_role;
                     -- 22: sandbox removal markers.
                     DROP TABLE sandbox_removal;
                     -- 21 (H6 slice 2): owner flag, audit level,

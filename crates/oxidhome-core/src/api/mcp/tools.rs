@@ -1308,20 +1308,17 @@ async fn device_send_command_call(
         };
     };
 
-    // H6 slice 2: rate limit and `warn` row before a sensitive
-    // command runs.
-    if let Err(e) = engine
-        .sensitive()
-        .discharge_blocking(
-            &invocation,
-            Action::DeviceCommand,
-            &args.device_id,
-            &decision,
-        )
-        .await
-    {
-        return ToolOutcome::from_obligation(&e);
-    }
+    // H6 slice 2: a sensitive command takes its rate-limit charge
+    // now; its `warn` row is written when it is dispatched.
+    let charge = match engine.sensitive().reserve(
+        &invocation,
+        Action::DeviceCommand,
+        &args.device_id,
+        &decision,
+    ) {
+        Ok(charge) => charge,
+        Err(e) => return ToolOutcome::from_obligation(&e),
+    };
 
     // The supervisor handle mints `id` (H5).
     let cmd = Command {
@@ -1340,12 +1337,7 @@ async fn device_send_command_call(
 
     let gate = BytesGate::new(&invocation, &engine);
     let report = handle
-        .execute_command_admitted(
-            invocation,
-            args.device_id.clone(),
-            cmd,
-            decision.obligations.sensitive,
-        )
+        .execute_command_admitted(invocation, args.device_id.clone(), cmd, charge)
         .await;
     let blobs = gate.release_report(&args.device_id, &owner, &report);
 

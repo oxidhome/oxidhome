@@ -74,8 +74,14 @@ fn reached_by(scopes: &[String]) -> SensitiveSet {
 }
 
 /// The tokens [`sensitive_access_report`] would name, from records.
+/// `role_sensitive` maps a role id to the sensitive categories its
+/// definition grants on every device; a token holding such a role is
+/// covered for them.
 #[must_use]
-pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
+pub fn sensitive_gaps<S: std::hash::BuildHasher>(
+    records: &[TokenRecord],
+    role_sensitive: &std::collections::HashMap<String, SensitiveSet, S>,
+) -> Vec<SensitiveGap> {
     records
         .iter()
         .filter(|r| r.revoked_ms.is_none() && !r.owner)
@@ -88,6 +94,13 @@ pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
                 .get("device.send_command")
                 .and_then(|c| c.devices.as_deref());
             let covered = |c: SensitiveCategory| {
+                if policy
+                    .roles
+                    .iter()
+                    .any(|id| role_sensitive.get(id).is_some_and(|s| s.contains(c)))
+                {
+                    return true;
+                }
                 let grants = policy.sensitive.iter().filter(|g| g.category == c);
                 if grants.clone().any(|g| g.devices.is_none()) {
                     return true;
@@ -151,7 +164,20 @@ pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
             return Vec::new();
         }
     };
-    let gaps = sensitive_gaps(&records);
+    let role_sensitive = match tokens.roles() {
+        Ok(roles) => roles
+            .into_iter()
+            .filter_map(|r| {
+                let def = r.def()?;
+                Some((r.id, def.sensitive.into_iter().collect::<SensitiveSet>()))
+            })
+            .collect(),
+        Err(err) => {
+            tracing::error!(target: "auth.sensitive", error = %err, "listing roles for the sensitive-access check failed");
+            std::collections::HashMap::<String, SensitiveSet>::new()
+        }
+    };
+    let gaps = sensitive_gaps(&records, &role_sensitive);
     if !records.is_empty() && !records.iter().any(|r| r.owner && r.revoked_ms.is_none()) {
         // The upgrade marks the owner from the bootstrap / recovery
         // audit rows; retention may have pruned them.

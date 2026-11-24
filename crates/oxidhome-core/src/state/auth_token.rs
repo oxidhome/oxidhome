@@ -107,7 +107,7 @@ const LAST_USED_CACHE_MAX: usize = 1024;
 /// In-memory + SQLite-backed token registry. One per [`Engine`](crate::Engine).
 #[derive(Debug)]
 pub struct TokenStore {
-    db: Arc<Db>,
+    pub(super) db: Arc<Db>,
     /// `token_id -> last_used_ms` this process wrote, for callers
     /// that bump without a fresh row in hand
     /// ([`Self::touch_last_used`]).
@@ -525,6 +525,51 @@ impl TokenStore {
         Ok(record)
     }
 
+    /// [`Self::insert`] for a policy naming `role_ids`, which are
+    /// checked in the same transaction as the insert, so a concurrent
+    /// unforced role delete can't leave the new token with a dangling
+    /// reference. `Ok(Err(id))` names a role that no longer exists
+    /// (nothing was stored).
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Sqlite`] on DB failure.
+    pub fn insert_with_roles(
+        &self,
+        issued: &IssuedToken,
+        label: &str,
+        scope_json: &[u8],
+        role_ids: &[String],
+    ) -> Result<Result<TokenRecord, String>, TokenError> {
+        let row = PendingRow::new(issued, label, scope_json, false)?;
+        let record = TokenRecord {
+            id: row.id.clone(),
+            label: row.label.clone(),
+            scope_json: row.scope_json.clone(),
+            created_ms: row.created_ms,
+            last_used_ms: None,
+            revoked_ms: None,
+            owner: false,
+        };
+        let role_ids = role_ids.to_vec();
+        self.durable_write(move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for id in role_ids {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM auth_role WHERE id = ?1)",
+                    [&id],
+                    |r| r.get(0),
+                )?;
+                if !exists {
+                    return Ok(Err(id));
+                }
+            }
+            row.insert(&tx)?;
+            tx.commit()?;
+            Ok(Ok(record))
+        })
+    }
+
     /// Replace a token's policy blob (`scope_json`). The offline
     /// `oxidhome token grant-sensitive` / `revoke-sensitive` commands
     /// use it; the API never does. Returns `false` when no live token
@@ -584,7 +629,7 @@ impl TokenStore {
     /// and reporting failure would make the caller discard the
     /// secret of a token that exists. The connection then stays at
     /// `FULL`, which is safe (only slower).
-    fn durable_write<R: Send>(
+    pub(super) fn durable_write<R: Send>(
         &self,
         f: impl FnOnce(&mut rusqlite::Connection) -> Result<R, TokenError>,
     ) -> Result<R, TokenError> {
@@ -685,7 +730,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRecord> {
     })
 }
 
-fn generate_secret() -> [u8; TOKEN_BYTES] {
+pub(super) fn generate_secret() -> [u8; TOKEN_BYTES] {
     let mut buf = [0u8; TOKEN_BYTES];
     // `SysRng` is rand 0.10's stateless OS-CSPRNG interface
     // (the renamed-from-0.9 `OsRng`). Token minting is rare; we
@@ -764,7 +809,7 @@ fn touch_last_used(db: &Db, token_id: &str, now: i64) -> Option<i64> {
     }
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

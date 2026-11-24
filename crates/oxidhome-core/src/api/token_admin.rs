@@ -1,32 +1,39 @@
-//! H6 slice 3: minting and listing tokens by role.
+//! H6 slice 3: owner-defined roles, and minting and listing tokens by
+//! role.
 //!
-//! One validation and one storage path for every surface that mints a
-//! token:
+//! One validation and one storage path for every surface:
 //!
-//! - `oxidhome token create <label> --role <role> ...` (offline CLI);
-//! - `POST /api/v1/tokens` and Connect `TokensService.CreateToken`,
-//!   which [`crate::auth::authorize()`] allows for `token.manage`, i.e.
-//!   for the owner token only. MCP has no mint tool: M7 keeps
-//!   credentials out of MCP responses.
+//! - roles: `oxidhome role list|create|update|delete` (offline CLI),
+//!   `GET`/`POST /api/v1/roles`, `PUT`/`DELETE /api/v1/roles/{name}`
+//!   and Connect `RolesService`, which [`crate::auth::authorize()`]
+//!   allows for `policy.manage`, i.e. for the owner token only;
+//! - tokens: `oxidhome token create <label> --role <name> ...`
+//!   (offline CLI), `POST /api/v1/tokens` and Connect
+//!   `TokensService.CreateToken` (`token.manage`, the owner only). MCP
+//!   has no mint tool: M7 keeps credentials out of MCP responses.
 //!
-//! Listing (`oxidhome token list`, `GET /api/v1/tokens`, Connect
-//! `TokensService.ListTokens`, MCP `tokens.list`) goes through
+//! Listing tokens (`oxidhome token list`, `GET /api/v1/tokens`,
+//! Connect `TokensService.ListTokens`, MCP `tokens.list`) goes through
 //! [`summaries`]. No surface ever returns a secret other than the one
 //! it just minted, and the store keeps only its hash.
 //!
-//! A minted token is never the owner: `owner` is not an assignable
-//! role, and only the first-run bootstrap and `recover-admin-token`
-//! mint the owner. Each mint leaves a two-phase audit row whose
-//! `token_id` is the new token and whose `path` is
-//! `<surface>.auth.mint:<roles or "scopes">`.
+//! A token references its roles by id, so a role edit applies to it
+//! from its next request on. Deleting a role that live tokens hold is
+//! refused unless forced; a forced delete leaves references that grant
+//! nothing. A minted token is never the owner: `owner` is not a role,
+//! and only the first-run bootstrap and `recover-admin-token` mint the
+//! owner. Every mint and role write leaves a two-phase audit row:
+//! `<surface>.auth.mint:<roles or "scopes">` with the new token's id,
+//! `<surface>.auth.role.<create|update|delete>:<name>` with the role's.
 
 use serde::{Deserialize, Serialize};
 
 use super::bootstrap::{ADMIN_TOKEN_LABEL, audited_call};
 use super::sensitive_admin::check_devices;
+use crate::auth::role::{NARROWABLE, OWNER_LABEL, SCOPED, is_role_name};
 use crate::auth::{
-    Action, ActionSet, DenyRule, DeviceCategory, Role, SensitiveCategory, SensitiveGrant,
-    TokenPolicy, parse_policy,
+    Action, ActionSet, DenyRule, DeviceCategory, RoleDef, RoleGrant, SensitiveCategory,
+    SensitiveGrant, TokenPolicy, parse_policy,
 };
 use crate::state::{AuditLog, TokenRecord, TokenStore};
 
@@ -35,8 +42,9 @@ pub const AUDIT_PATH_MINT: &str = "auth.mint";
 
 /// Longest label, in characters.
 pub const MAX_LABEL_CHARS: usize = 64;
-/// Most entries in each list of a mint request.
+/// Most entries in each list of a mint request or role definition.
 pub const MAX_LIST: usize = 32;
+pub use crate::state::auth_role::MAX_ROLES;
 
 /// What to mint. Shared by every surface; the JSON form is the body of
 /// `POST /api/v1/tokens`.
@@ -46,8 +54,7 @@ pub struct MintRequest {
     /// Operator-facing name. Not `admin`, which `recover-admin-token`
     /// revokes.
     pub label: String,
-    /// Role presets (`admin`, `resident`, `guest`, `dashboard`,
-    /// `monitor`, `assistant`).
+    /// Names of owner-defined roles.
     #[serde(default)]
     pub roles: Vec<String>,
     /// Flat scopes (`devices:read`, ..., or `*`), on top of the roles.
@@ -61,14 +68,14 @@ pub struct MintRequest {
     pub sensitive: Vec<String>,
     /// The token's deny list.
     #[serde(default)]
-    pub deny: Vec<DenySpec>,
+    pub deny: Vec<SelectorSpec>,
 }
 
-/// One deny entry of a [`MintRequest`]: the wire shape of a
+/// One grant or deny entry: the wire shape of a [`RoleGrant`] or a
 /// [`DenyRule`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DenySpec {
+pub struct SelectorSpec {
     /// Action names (`device.command`) or `*`.
     pub actions: Vec<String>,
     /// Device categories; absent for every resource.
@@ -81,18 +88,41 @@ pub struct DenySpec {
 
 /// Why a mint was refused.
 #[derive(Debug, thiserror::Error)]
-pub enum MintError {
+pub enum AdminError {
     /// The request is malformed: a 400 / `invalid_argument` /
     /// `invalid_params`, with this message.
     #[error("{0}")]
     Invalid(String),
-    /// The token couldn't be stored or audited.
-    #[error("storing the token failed: {0}")]
+    /// The token or role couldn't be stored or audited.
+    #[error("storing failed: {0}")]
     Store(String),
+    /// No role has this name: a 404 / `not_found`.
+    #[error("no role named `{0}`")]
+    NotFound(String),
+    /// The role name is taken: a 409 / `already_exists`.
+    #[error("{0}")]
+    Exists(String),
+    /// A role write conflicts with what is stored (live tokens hold
+    /// the role, or the role limit is reached): a 409 /
+    /// `failed_precondition`.
+    #[error("{0}")]
+    Conflict(String),
 }
 
-fn invalid(msg: impl Into<String>) -> MintError {
-    MintError::Invalid(msg.into())
+impl From<crate::state::RoleError> for AdminError {
+    fn from(err: crate::state::RoleError) -> Self {
+        use crate::state::RoleError;
+        match err {
+            RoleError::NotFound(name) => Self::NotFound(name),
+            e @ RoleError::Exists(_) => Self::Exists(e.to_string()),
+            e @ (RoleError::InUse { .. } | RoleError::Full) => Self::Conflict(e.to_string()),
+            RoleError::Sqlite(e) => Self::Store(e.to_string()),
+        }
+    }
+}
+
+fn invalid(msg: impl Into<String>) -> AdminError {
+    AdminError::Invalid(msg.into())
 }
 
 /// A freshly minted token: the only copy of its secret. Its `Debug`
@@ -125,19 +155,23 @@ fn known_scope(name: &str) -> bool {
             .any(|s| s.name() == name)
 }
 
-fn check_len<T>(what: &str, list: &[T]) -> Result<(), MintError> {
+fn check_len<T>(what: &str, list: &[T]) -> Result<(), AdminError> {
     if list.len() > MAX_LIST {
         return Err(invalid(format!("at most {MAX_LIST} {what}")));
     }
     Ok(())
 }
 
-/// Validate `req` and build the policy it stores.
+/// Validate `req` and build the policy it stores, resolving each role
+/// name to its id with `role_id`.
 ///
 /// # Errors
 ///
-/// [`MintError::Invalid`] naming the first problem.
-pub fn build_policy(req: &MintRequest) -> Result<TokenPolicy, MintError> {
+/// [`AdminError::Invalid`] naming the first problem.
+pub fn build_policy(
+    req: &MintRequest,
+    mut role_id: impl FnMut(&str) -> Result<Option<String>, AdminError>,
+) -> Result<TokenPolicy, AdminError> {
     let label = req.label.trim();
     if label.is_empty() || label.chars().count() > MAX_LABEL_CHARS {
         return Err(invalid(format!(
@@ -160,16 +194,18 @@ pub fn build_policy(req: &MintRequest) -> Result<TokenPolicy, MintError> {
     if req.roles.is_empty() && req.scopes.is_empty() {
         return Err(invalid("name at least one role or scope"));
     }
-    let mut roles = Vec::new();
+    let mut roles: Vec<String> = Vec::new();
     for name in &req.roles {
-        let role: Role = name.parse().map_err(|e| invalid(format!("{e}")))?;
-        if !role.assignable() {
+        if name == OWNER_LABEL {
             return Err(invalid(
                 "`owner` is not assignable: the owner is the bootstrap / recovered token",
             ));
         }
-        if !roles.contains(&role) {
-            roles.push(role);
+        let Some(id) = role_id(name)? else {
+            return Err(invalid(format!("unknown role `{name}`")));
+        };
+        if !roles.contains(&id) {
+            roles.push(id);
         }
     }
     let mut scopes = Vec::new();
@@ -189,11 +225,7 @@ pub fn build_policy(req: &MintRequest) -> Result<TokenPolicy, MintError> {
         }
     }
     sensitive.sort_by_key(|g| g.category);
-    let deny = req
-        .deny
-        .iter()
-        .map(deny_rule)
-        .collect::<Result<Vec<_>, _>>()?;
+    let deny = deny_rules(&req.deny)?;
     let policy = TokenPolicy {
         scopes,
         sensitive,
@@ -209,25 +241,49 @@ pub fn build_policy(req: &MintRequest) -> Result<TokenPolicy, MintError> {
     Ok(policy)
 }
 
-fn deny_rule(spec: &DenySpec) -> Result<DenyRule, MintError> {
+fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
+    check_len("deny entries", specs)?;
+    specs
+        .iter()
+        .map(|spec| {
+            let (actions, categories, devices) = selector(spec, "deny")?;
+            if actions.contains(Action::ServiceCall) && spec.actions.iter().all(|a| a != "*") {
+                return Err(invalid(
+                    "`service.call` is not checked for tokens (a service hop is governed by \
+                     the calling plugin's `consumes_services` grant); deny `device.command` \
+                     instead",
+                ));
+            }
+            Ok(DenyRule {
+                actions,
+                categories,
+                devices,
+            })
+        })
+        .collect()
+}
+
+type Selector = (ActionSet, Option<Vec<DeviceCategory>>, Option<Vec<String>>);
+
+/// Validate one grant or deny entry (`what` names it in errors).
+fn selector(spec: &SelectorSpec, what: &str) -> Result<Selector, AdminError> {
     if spec.actions.is_empty() {
-        return Err(invalid("a deny entry needs at least one action (or `*`)"));
+        return Err(invalid(format!(
+            "a {what} entry needs at least one action (or `*`)"
+        )));
     }
+    check_len("actions", &spec.actions)?;
     let actions = ActionSet::parse(spec.actions.iter().map(String::as_str))
         .map_err(|e| invalid(format!("{e}")))?;
-    if actions.contains(Action::ServiceCall) && spec.actions.iter().all(|a| a != "*") {
-        return Err(invalid(
-            "`service.call` is not checked for tokens (a service hop is governed by the \
-             calling plugin's `consumes_services` grant); deny `device.command` instead",
-        ));
-    }
     let categories = match &spec.category {
         None => None,
         Some(list) if list.is_empty() => {
-            return Err(invalid("a deny entry's `category` must not be empty"));
+            return Err(invalid(format!(
+                "a {what} entry's `category` must not be empty"
+            )));
         }
         Some(list) => {
-            check_len("deny categories", list)?;
+            check_len("categories", list)?;
             let mut parsed = Vec::with_capacity(list.len());
             for c in list {
                 let c = c
@@ -243,18 +299,16 @@ fn deny_rule(spec: &DenySpec) -> Result<DenyRule, MintError> {
     let devices = match &spec.devices {
         None => None,
         Some(list) if list.is_empty() => {
-            return Err(invalid("a deny entry's `devices` must not be empty"));
+            return Err(invalid(format!(
+                "a {what} entry's `devices` must not be empty"
+            )));
         }
         Some(list) => {
             check_devices(list).map_err(|e| invalid(format!("{e:#}")))?;
             Some(list.clone())
         }
     };
-    Ok(DenyRule {
-        actions,
-        categories,
-        devices,
-    })
+    Ok((actions, categories, devices))
 }
 
 /// Mint a token for `req`, audited as `surface` (`cli`, `api`,
@@ -262,7 +316,7 @@ fn deny_rule(spec: &DenySpec) -> Result<DenyRule, MintError> {
 ///
 /// # Errors
 ///
-/// [`MintError::Invalid`] for a bad request; [`MintError::Store`] when
+/// [`AdminError::Invalid`] for a bad request; [`AdminError::Store`] when
 /// the row or its audit couldn't be written.
 pub fn mint(
     tokens: &TokenStore,
@@ -271,27 +325,48 @@ pub fn mint(
     actor_kind: &str,
     call_id: Option<&str>,
     req: &MintRequest,
-) -> Result<Minted, MintError> {
-    let policy = build_policy(req)?;
+) -> Result<Minted, AdminError> {
+    let mut resolved = std::collections::HashMap::new();
+    let policy = build_policy(req, |name| {
+        let id = tokens.role_by_name(name)?.map(|r| r.id);
+        if let Some(id) = &id {
+            resolved.insert(id.clone(), name.to_owned());
+        }
+        Ok(id)
+    })?;
     let label = req.label.trim();
     let issued = TokenStore::generate();
-    let what = if policy.roles.is_empty() {
+    let mut names: Vec<&str> = Vec::new();
+    for name in &req.roles {
+        if !names.contains(&name.as_str()) {
+            names.push(name);
+        }
+    }
+    let what = if names.is_empty() {
         "scopes".to_owned()
     } else {
-        policy
-            .roles
-            .iter()
-            .map(|r| r.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
+        names.join(",")
     };
     let path = format!("{surface}.{AUDIT_PATH_MINT}:{what}");
-    let record = audited_call(audit, actor_kind, &issued.id, &path, call_id, || {
-        tokens
-            .insert(&issued, label, &policy.to_json())
-            .map_err(anyhow::Error::from)
-    })
-    .map_err(|e| MintError::Store(format!("{e:#}")))?;
+    let mut vanished = None;
+    let record = audited_call(
+        audit,
+        actor_kind,
+        &issued.id,
+        &path,
+        call_id,
+        || match tokens.insert_with_roles(&issued, label, &policy.to_json(), &policy.roles)? {
+            Ok(record) => Ok(record),
+            Err(id) => {
+                vanished = resolved.get(&id).cloned();
+                anyhow::bail!("role deleted while minting")
+            }
+        },
+    );
+    if let Some(name) = vanished {
+        return Err(AdminError::Invalid(format!("unknown role `{name}`")));
+    }
+    let record = record.map_err(|e| AdminError::Store(format!("{e:#}")))?;
     tracing::warn!(
         target: "auth.token",
         token_id = %issued.id,
@@ -303,8 +378,21 @@ pub fn mint(
     Ok(Minted {
         token_id: issued.id,
         secret: issued.plaintext,
-        summary: TokenSummary::of(&record),
+        // From the names resolved for the insert: nothing fallible
+        // stands between the stored token and its secret's delivery.
+        summary: TokenSummary::of(&record, &resolved),
     })
+}
+
+/// `role id -> name` for every stored role.
+fn role_names(
+    tokens: &TokenStore,
+) -> Result<std::collections::HashMap<String, String>, AdminError> {
+    Ok(tokens
+        .roles()?
+        .into_iter()
+        .map(|r| (r.id, r.name))
+        .collect())
 }
 
 /// One token as listed: never its secret or hash.
@@ -318,7 +406,8 @@ pub struct TokenSummary {
     pub owner: bool,
     /// `true` once revoked.
     pub revoked: bool,
-    /// Role names; `["owner"]` for the owner.
+    /// Role names (`<id> (deleted)` for a role deleted since);
+    /// `["owner"]` for the owner.
     pub roles: Vec<String>,
     /// Flat scopes.
     pub scopes: Vec<String>,
@@ -337,15 +426,28 @@ pub struct TokenSummary {
 }
 
 impl TokenSummary {
-    /// The summary of one stored token.
+    /// The summary of one stored token; `role_names` maps role ids to
+    /// names.
     #[must_use]
-    pub fn of(record: &TokenRecord) -> Self {
+    pub fn of(
+        record: &TokenRecord,
+        role_names: &std::collections::HashMap<String, String>,
+    ) -> Self {
         let policy = parse_policy(&record.scope_json);
         let policy_valid = policy.is_some();
         let policy = policy.unwrap_or_default();
-        let mut roles: Vec<String> = policy.roles.iter().map(|r| r.as_str().into()).collect();
+        let mut roles: Vec<String> = policy
+            .roles
+            .iter()
+            .map(|id| {
+                role_names
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{id} (deleted)"))
+            })
+            .collect();
         let sensitive = if record.owner {
-            roles.insert(0, Role::Owner.as_str().into());
+            roles.insert(0, OWNER_LABEL.into());
             SensitiveCategory::ALL
                 .iter()
                 .map(|c| c.as_str().to_owned())
@@ -381,35 +483,281 @@ impl TokenSummary {
 /// # Errors
 ///
 /// The store's read error.
-pub fn summaries(tokens: &TokenStore) -> Result<Vec<TokenSummary>, crate::state::TokenError> {
-    Ok(tokens.list()?.iter().map(TokenSummary::of).collect())
+pub fn summaries(tokens: &TokenStore) -> Result<Vec<TokenSummary>, AdminError> {
+    let names = role_names(tokens)?;
+    Ok(tokens
+        .list()
+        .map_err(|e| AdminError::Store(e.to_string()))?
+        .iter()
+        .map(|r| TokenSummary::of(r, &names))
+        .collect())
 }
 
-/// One role preset as listed by `oxidhome token roles`.
+/// A role definition as given on every surface (the body of
+/// `POST /api/v1/roles` minus `name`, and of `PUT /api/v1/roles/{name}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSpec {
+    /// What the role grants. Actions are those a scope can grant (`*`
+    /// for all of them), optionally narrowed to device categories and
+    /// device ids.
+    #[serde(default)]
+    pub grants: Vec<SelectorSpec>,
+    /// Sensitive categories the role grants, on every device.
+    #[serde(default)]
+    pub sensitive: Vec<String>,
+    /// What the role denies, whatever grants it.
+    #[serde(default)]
+    pub deny: Vec<SelectorSpec>,
+}
+
+/// `POST /api/v1/roles`: a name and a definition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewRole {
+    /// Unique name: 1–32 of `a-z0-9-_`, starting with a letter, not
+    /// `owner`.
+    pub name: String,
+    /// The definition.
+    #[serde(flatten)]
+    pub spec: RoleSpec,
+}
+
+/// Validate `spec` into the definition stored for a role.
+///
+/// # Errors
+///
+/// [`AdminError::Invalid`] naming the first problem.
+pub fn build_role(spec: &RoleSpec) -> Result<Vec<u8>, AdminError> {
+    check_len("grants", &spec.grants)?;
+    check_len("sensitive categories", &spec.sensitive)?;
+    let mut grants = Vec::with_capacity(spec.grants.len());
+    for g in &spec.grants {
+        let (actions, categories, devices) = selector(g, "grant")?;
+        let narrowed = categories.is_some() || devices.is_some();
+        if narrowed && !g.actions.iter().any(|a| a == "*") && !NARROWABLE.contains_all(actions) {
+            let names = actions.without(NARROWABLE).names().join(", ");
+            return Err(invalid(format!(
+                "a grant narrowed to devices can only name device.list, device.read and \
+                 device.command, not {names}"
+            )));
+        }
+        let actions = if g.actions.iter().any(|a| a == "*") {
+            actions.intersection(if narrowed { NARROWABLE } else { SCOPED })
+        } else if SCOPED.contains_all(actions) {
+            actions
+        } else {
+            let names = actions.without(SCOPED).names().join(", ");
+            return Err(invalid(format!(
+                "a role can't grant {names}: no scope grants it (the owner holds \
+                 token.manage and policy.manage; plugins' manifests govern service.call and \
+                 state.read)"
+            )));
+        };
+        grants.push(RoleGrant {
+            actions,
+            categories,
+            devices,
+        });
+    }
+    let mut sensitive: Vec<SensitiveCategory> = Vec::new();
+    for name in &spec.sensitive {
+        let c: SensitiveCategory = name.parse().map_err(|e| invalid(format!("{e}")))?;
+        if !sensitive.contains(&c) {
+            sensitive.push(c);
+        }
+    }
+    sensitive.sort();
+    let def = RoleDef {
+        id: String::new(),
+        name: String::new(),
+        grants,
+        sensitive,
+        deny: deny_rules(&spec.deny)?,
+    };
+    let json = def.definition_json();
+    if RoleDef::parse("", "", &json).as_ref() != Some(&def) {
+        return Err(invalid("the role definition does not round-trip"));
+    }
+    Ok(json)
+}
+
+fn check_role_name(name: &str) -> Result<(), AdminError> {
+    if is_role_name(name) {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "role name `{name}` must be 1 to 32 of a-z, 0-9, `-`, `_`, start with a letter, \
+             and not be `{OWNER_LABEL}`"
+        )))
+    }
+}
+
+/// One role as listed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RoleSummary {
-    /// Role name.
-    pub role: &'static str,
-    /// What it grants, in one line.
-    pub description: &'static str,
-    /// Actions its grants name.
-    pub actions: Vec<&'static str>,
-    /// `false` for `owner`.
-    pub assignable: bool,
+    /// Stable id, what token policies reference.
+    pub role_id: String,
+    /// Name.
+    pub name: String,
+    /// Grants, as `actions@categories[devices]`.
+    pub grants: Vec<String>,
+    /// Sensitive categories.
+    pub sensitive: Vec<String>,
+    /// Denies, as `actions@categories[devices]`.
+    pub deny: Vec<String>,
+    /// Ids of the live tokens holding the role.
+    pub tokens: Vec<String>,
+    /// Created, Unix ms.
+    pub created_ms: i64,
+    /// Last edited, Unix ms.
+    pub updated_ms: i64,
+    /// `false` when the stored definition doesn't parse: the role
+    /// grants nothing.
+    pub definition_valid: bool,
 }
 
-/// Every role preset.
-#[must_use]
-pub fn roles() -> Vec<RoleSummary> {
-    Role::ALL
+impl RoleSummary {
+    fn of(record: &crate::state::RoleRecord, tokens: Vec<String>) -> Self {
+        let def = record.def();
+        let definition_valid = def.is_some();
+        let def = def.unwrap_or_else(|| RoleDef {
+            id: record.id.clone(),
+            name: record.name.clone(),
+            grants: Vec::new(),
+            sensitive: Vec::new(),
+            deny: Vec::new(),
+        });
+        Self {
+            role_id: record.id.clone(),
+            name: record.name.clone(),
+            grants: def.grants.iter().map(RoleGrant::describe).collect(),
+            sensitive: def
+                .sensitive
+                .iter()
+                .map(|c| c.as_str().to_owned())
+                .collect(),
+            deny: def.deny.iter().map(DenyRule::describe).collect(),
+            tokens,
+            created_ms: record.created_ms,
+            updated_ms: record.updated_ms,
+            definition_valid,
+        }
+    }
+}
+
+/// Every role, by name. Blocking.
+///
+/// # Errors
+///
+/// [`AdminError::Store`] on a read failure.
+pub fn role_summaries(tokens: &TokenStore) -> Result<Vec<RoleSummary>, AdminError> {
+    tokens
+        .roles()?
         .iter()
-        .map(|r| RoleSummary {
-            role: r.as_str(),
-            description: r.description(),
-            actions: r.actions().iter().map(Action::as_str).collect(),
-            assignable: r.assignable(),
-        })
+        .map(|r| Ok(RoleSummary::of(r, tokens.role_holders(&r.id)?)))
         .collect()
+}
+
+/// Who writes a role, for its audit row.
+#[derive(Debug, Clone, Copy)]
+pub struct Audited<'a> {
+    /// `cli`, `api`, `connect`.
+    pub surface: &'a str,
+    /// The audit row's `actor_kind`.
+    pub actor_kind: &'a str,
+    /// The request's call id, on network writes.
+    pub call_id: Option<&'a str>,
+}
+
+fn audit_role<T>(
+    audit: &AuditLog,
+    by: Audited<'_>,
+    verb: &str,
+    name: &str,
+    subject: &str,
+    op: impl FnOnce() -> Result<T, AdminError>,
+) -> Result<T, AdminError> {
+    let path = format!("{}.auth.role.{verb}:{name}", by.surface);
+    let mut refused = None;
+    let out = audited_call(audit, by.actor_kind, subject, &path, by.call_id, || {
+        op().map_err(|e| {
+            let msg = e.to_string();
+            refused = Some(e);
+            anyhow::anyhow!(msg)
+        })
+    });
+    match (out, refused) {
+        (Ok(v), _) => {
+            tracing::warn!(target: "auth.role", role = name, surface = by.surface, verb, "role written");
+            Ok(v)
+        }
+        (Err(_), Some(e)) => Err(e),
+        (Err(e), None) => Err(AdminError::Store(format!("{e:#}"))),
+    }
+}
+
+/// Create a role. Blocking.
+///
+/// # Errors
+///
+/// [`AdminError::Invalid`] for a bad name or definition,
+/// [`AdminError::Conflict`] for a taken name, [`AdminError::Store`].
+pub fn create_role(
+    tokens: &TokenStore,
+    audit: &AuditLog,
+    by: Audited<'_>,
+    req: &NewRole,
+) -> Result<RoleSummary, AdminError> {
+    check_role_name(&req.name)?;
+    let json = build_role(&req.spec)?;
+    let record = audit_role(audit, by, "create", &req.name, &req.name, || {
+        Ok(tokens.create_role(&req.name, &json)?)
+    })?;
+    Ok(RoleSummary::of(&record, Vec::new()))
+}
+
+/// Replace a role's definition; every token holding it sees the new
+/// definition from its next request on. Blocking.
+///
+/// # Errors
+///
+/// [`AdminError::Invalid`], [`AdminError::NotFound`],
+/// [`AdminError::Store`].
+pub fn update_role(
+    tokens: &TokenStore,
+    audit: &AuditLog,
+    by: Audited<'_>,
+    name: &str,
+    spec: &RoleSpec,
+) -> Result<RoleSummary, AdminError> {
+    let json = build_role(spec)?;
+    let record = audit_role(audit, by, "update", name, name, || {
+        Ok(tokens.update_role(name, &json)?)
+    })?;
+    Ok(RoleSummary::of(&record, tokens.role_holders(&record.id)?))
+}
+
+/// Delete a role. Refused while live tokens hold it unless `force`;
+/// then those tokens keep a reference that grants nothing. Returns the
+/// deleted role (with the tokens that held it). Blocking.
+///
+/// # Errors
+///
+/// [`AdminError::NotFound`], [`AdminError::Conflict`] (held, not
+/// forced), [`AdminError::Store`].
+pub fn delete_role(
+    tokens: &TokenStore,
+    audit: &AuditLog,
+    by: Audited<'_>,
+    name: &str,
+    force: bool,
+) -> Result<RoleSummary, AdminError> {
+    let verb = if force { "delete-forced" } else { "delete" };
+    let (record, held) = audit_role(audit, by, verb, name, name, || {
+        Ok(tokens.delete_role(name, force)?)
+    })?;
+    Ok(RoleSummary::of(&record, held))
 }
 
 #[cfg(test)]
@@ -420,7 +768,13 @@ mod tests {
 
     fn stores() -> (TokenStore, AuditLog) {
         let db = Arc::new(Db::open_in_memory().expect("db"));
-        (TokenStore::new(Arc::clone(&db)), AuditLog::new(db))
+        let tokens = TokenStore::new(Arc::clone(&db));
+        for name in ["dashboard", "monitor", "resident"] {
+            tokens
+                .create_role(name, br#"{"grants":[{"actions":["device.read"]}]}"#)
+                .unwrap();
+        }
+        (tokens, AuditLog::new(db))
     }
 
     fn req(label: &str, roles: &[&str]) -> MintRequest {
@@ -435,7 +789,7 @@ mod tests {
     fn mint_stores_a_role_token_that_verifies() {
         let (tokens, audit) = stores();
         let mut r = req("kitchen tablet", &["dashboard"]);
-        r.deny = vec![DenySpec {
+        r.deny = vec![SelectorSpec {
             actions: vec!["device.command".into()],
             category: None,
             devices: Some(vec!["dev-a1*".into()]),
@@ -446,7 +800,8 @@ mod tests {
         assert_eq!(rec.id, m.token_id);
         assert!(!rec.owner);
         let policy = parse_policy(&rec.scope_json).expect("parses");
-        assert_eq!(policy.roles, vec![Role::Dashboard]);
+        let dashboard = tokens.role_by_name("dashboard").unwrap().unwrap();
+        assert_eq!(policy.roles, vec![dashboard.id]);
         assert_eq!(policy.scopes, Vec::<String>::new());
         assert_eq!(m.summary.roles, vec!["dashboard"]);
         assert_eq!(m.summary.deny, vec!["device.command[dev-a1*]"]);
@@ -484,14 +839,14 @@ mod tests {
             ),
             (
                 MintRequest {
-                    deny: vec![DenySpec::default()],
+                    deny: vec![SelectorSpec::default()],
                     ..req("x", &["resident"])
                 },
                 "at least one action",
             ),
             (
                 MintRequest {
-                    deny: vec![DenySpec {
+                    deny: vec![SelectorSpec {
                         actions: vec!["*".into()],
                         category: Some(vec![]),
                         devices: None,
@@ -502,7 +857,7 @@ mod tests {
             ),
             (
                 MintRequest {
-                    deny: vec![DenySpec {
+                    deny: vec![SelectorSpec {
                         actions: vec!["*".into()],
                         category: None,
                         devices: Some(vec!["kitchen".into()]),
@@ -513,7 +868,7 @@ mod tests {
             ),
             (
                 MintRequest {
-                    deny: vec![DenySpec {
+                    deny: vec![SelectorSpec {
                         actions: vec!["service.call".into()],
                         category: None,
                         devices: None,
@@ -524,20 +879,20 @@ mod tests {
             ),
             (
                 MintRequest {
-                    deny: vec![DenySpec {
+                    deny: vec![SelectorSpec {
                         actions: vec!["*".into()],
                         category: Some(vec!["light".into(); MAX_LIST + 1]),
                         devices: None,
                     }],
                     ..req("x", &["resident"])
                 },
-                "deny categories",
+                "at most 32 categories",
             ),
         ];
         for (r, needle) in cases {
             let err = mint(&tokens, &audit, "cli", "cli", None, &r).expect_err("refused");
             assert!(
-                matches!(&err, MintError::Invalid(m) if m.contains(needle)),
+                matches!(&err, AdminError::Invalid(m) if m.contains(needle)),
                 "{r:?}: {err}"
             );
         }
@@ -564,14 +919,120 @@ mod tests {
     }
 
     #[test]
-    fn roles_listing_marks_owner_unassignable() {
-        let r = roles();
-        assert_eq!(r.len(), Role::ALL.len());
-        assert!(!r[0].assignable);
-        assert!(
-            r.iter()
-                .skip(1)
-                .all(|r| r.assignable && !r.actions.is_empty())
+    #[allow(clippy::too_many_lines)]
+    fn roles_are_validated_written_audited_and_listed() {
+        let (tokens, audit) = stores();
+        let by = Audited {
+            surface: "cli",
+            actor_kind: "cli",
+            call_id: None,
+        };
+        let spec: RoleSpec = serde_json::from_str(
+            r#"{"grants":[{"actions":["device.read","device.command"],"category":["light"]}],
+                "sensitive":["lock"],"deny":[{"actions":["device.command"],"category":["alarm"]}]}"#,
+        )
+        .unwrap();
+        let new = NewRole {
+            name: "tablet".into(),
+            spec: spec.clone(),
+        };
+        // The flattened body still refuses unknown fields.
+        assert!(serde_json::from_str::<NewRole>(r#"{"name":"x","extra":1}"#).is_err());
+        assert_eq!(
+            serde_json::from_str::<NewRole>(r#"{"name":"x","sensitive":["lock"]}"#)
+                .unwrap()
+                .spec
+                .sensitive,
+            vec!["lock"]
         );
+        let r = create_role(&tokens, &audit, by, &new).unwrap();
+        assert_eq!(r.grants, vec!["device.read,device.command@light"]);
+        assert_eq!(r.sensitive, vec!["lock"]);
+        assert_eq!(r.deny, vec!["device.command@alarm"]);
+        assert!(matches!(
+            create_role(&tokens, &audit, by, &new),
+            Err(AdminError::Exists(_))
+        ));
+        for (name, bad, needle) in [
+            ("owner", "{}", "role name"),
+            ("Bad Name", "{}", "role name"),
+            (
+                "x",
+                r#"{"grants":[{"actions":["token.manage"]}]}"#,
+                "can't grant token.manage",
+            ),
+            (
+                "x",
+                r#"{"grants":[{"actions":["service.call"]}]}"#,
+                "can't grant service.call",
+            ),
+            (
+                "x",
+                r#"{"deny":[{"actions":["service.call"]}]}"#,
+                "not checked for tokens",
+            ),
+            ("x", r#"{"sensitive":["door"]}"#, "unknown"),
+            (
+                "x",
+                r#"{"grants":[{"actions":["blob.read"],"category":["camera"]}]}"#,
+                "can only name device.list",
+            ),
+            (
+                "x",
+                r#"{"grants":[{"actions":["device.read"],"devices":["lamp"]}]}"#,
+                "device pattern",
+            ),
+        ] {
+            let req = NewRole {
+                name: name.into(),
+                spec: serde_json::from_str(bad).unwrap(),
+            };
+            let err = create_role(&tokens, &audit, by, &req).expect_err(bad);
+            assert!(
+                matches!(&err, AdminError::Invalid(m) if m.contains(needle)),
+                "{name} {bad}: {err}"
+            );
+        }
+
+        let mut mint_req = req("hall", &["tablet"]);
+        mint_req.scopes = vec!["status:read".into()];
+        let m = mint(&tokens, &audit, "cli", "cli", None, &mint_req).unwrap();
+        assert_eq!(m.summary.roles, vec!["tablet"]);
+        let listed = role_summaries(&tokens).unwrap();
+        let tablet = listed.iter().find(|r| r.name == "tablet").unwrap();
+        assert_eq!(tablet.tokens, vec![m.token_id.clone()]);
+
+        let edit: RoleSpec =
+            serde_json::from_str(r#"{"grants":[{"actions":["device.list"]}]}"#).unwrap();
+        let r = update_role(&tokens, &audit, by, "tablet", &edit).unwrap();
+        assert_eq!(r.grants, vec!["device.list"]);
+        assert!(matches!(
+            update_role(&tokens, &audit, by, "nope", &edit),
+            Err(AdminError::NotFound(_))
+        ));
+        assert!(matches!(
+            delete_role(&tokens, &audit, by, "tablet", false),
+            Err(AdminError::Conflict(_))
+        ));
+        let gone = delete_role(&tokens, &audit, by, "tablet", true).unwrap();
+        assert_eq!(gone.tokens, vec![m.token_id.clone()]);
+        let list = summaries(&tokens).unwrap();
+        let t = list.iter().find(|t| t.token_id == m.token_id).unwrap();
+        assert!(t.roles[0].ends_with("(deleted)"), "{:?}", t.roles);
+
+        let paths: Vec<String> = audit
+            .query(&AuditQuery::default(), 50)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.decision == "allow")
+            .map(|r| r.path)
+            .collect();
+        for p in [
+            "cli.auth.role.create:tablet",
+            "cli.auth.role.update:tablet",
+            "cli.auth.role.delete-forced:tablet",
+        ] {
+            assert!(paths.iter().any(|x| x == p), "{p}: {paths:?}");
+        }
     }
 }

@@ -52,7 +52,7 @@ use connectrpc::{
 };
 use oxidhome_proto::connect::oxidhome::v1::{
     DevicesServiceExt, EventsServiceExt, HealthServiceExt, InstancesServiceExt, LogsServiceExt,
-    PluginsServiceExt, TokensServiceExt,
+    PluginsServiceExt, RolesServiceExt, TokensServiceExt,
 };
 use oxidhome_proto::proto::oxidhome::v1::{
     Button as ProtoButton, ButtonKind as ProtoButtonKind, CheckRequest, CheckResponse,
@@ -74,8 +74,10 @@ use oxidhome_proto::proto::oxidhome::v1::{
     tail_events_response, value,
 };
 use oxidhome_proto::proto::oxidhome::v1::{
-    CreateTokenRequest, CreateTokenResponse, ListTokensRequest, ListTokensResponse,
-    Token as ProtoToken,
+    CreateRoleRequest, CreateRoleResponse, CreateTokenRequest, CreateTokenResponse,
+    DeleteRoleRequest, DeleteRoleResponse, ListRolesRequest, ListRolesResponse, ListTokensRequest,
+    ListTokensResponse, Role as ProtoRole, RoleDefinition, Selector as ProtoSelector,
+    Token as ProtoToken, UpdateRoleRequest, UpdateRoleResponse,
 };
 
 use crate::Engine;
@@ -447,17 +449,17 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .get(&owner)
             .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("device not found")))?;
 
-        // H6 slice 2: rate limit and `warn` row before a sensitive
-        // command runs.
-        self.engine
+        // H6 slice 2: a sensitive command takes its rate-limit charge
+        // now; its `warn` row is written when it is dispatched.
+        let charge = self
+            .engine
             .sensitive()
-            .discharge_blocking(
+            .reserve(
                 &invocation,
                 Action::DeviceCommand,
                 &req.device_id,
                 &decision,
             )
-            .await
             .map_err(|e| obligation_err(&ctx, &e))?;
         let gate = BytesGate::new(&invocation, &self.engine);
 
@@ -481,12 +483,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             None => invocation,
         };
         let report = handle
-            .execute_command_admitted(
-                invocation,
-                req.device_id.clone(),
-                cmd,
-                decision.obligations.sensitive,
-            )
+            .execute_command_admitted(invocation, req.device_id.clone(), cmd, charge)
             .await;
         // F4 + H5: every routed command is an RPC success carrying
         // its explicit outcome. Record the command id and outcome on
@@ -1515,6 +1512,185 @@ struct OxidHomeTokens {
     engine: Engine,
 }
 
+/// H6 slice 3: `RolesService`, mirroring `/api/v1/roles`. Every RPC
+/// needs `policy.manage`: the owner token only.
+struct OxidHomeRoles {
+    engine: Engine,
+}
+
+fn selector_spec(s: ProtoSelector) -> super::token_admin::SelectorSpec {
+    let none_if_empty = |v: Vec<String>| (!v.is_empty()).then_some(v);
+    super::token_admin::SelectorSpec {
+        actions: s.actions,
+        category: none_if_empty(s.category),
+        devices: none_if_empty(s.devices),
+    }
+}
+
+fn role_spec(d: Option<RoleDefinition>) -> super::token_admin::RoleSpec {
+    let d = d.unwrap_or_default();
+    super::token_admin::RoleSpec {
+        grants: d.grants.into_iter().map(selector_spec).collect(),
+        sensitive: d.sensitive,
+        deny: d.deny.into_iter().map(selector_spec).collect(),
+    }
+}
+
+fn proto_role(s: super::token_admin::RoleSummary) -> ProtoRole {
+    ProtoRole {
+        role_id: s.role_id,
+        name: s.name,
+        grants: s.grants,
+        sensitive: s.sensitive,
+        deny: s.deny,
+        tokens: s.tokens,
+        created_ms: s.created_ms,
+        updated_ms: s.updated_ms,
+        definition_valid: s.definition_valid,
+        ..Default::default()
+    }
+}
+
+/// Run blocking token / role administration off the runtime and map
+/// its error to the Connect code.
+async fn connect_admin<T: Send + 'static>(
+    ctx: &RequestContext,
+    f: impl FnOnce() -> Result<T, super::token_admin::AdminError> + Send + 'static,
+) -> Result<T, ConnectError> {
+    use super::token_admin::AdminError;
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| rpc_err(ctx, ConnectError::internal(e.to_string())))?
+        .map_err(|err| {
+            rpc_err(
+                ctx,
+                match err {
+                    AdminError::Invalid(msg) => ConnectError::invalid_argument(msg),
+                    AdminError::NotFound(name) => {
+                        ConnectError::not_found(format!("no role named `{name}`"))
+                    }
+                    AdminError::Exists(msg) => ConnectError::already_exists(msg),
+                    AdminError::Conflict(msg) => ConnectError::failed_precondition(msg),
+                    AdminError::Store(msg) => {
+                        tracing::error!(target: "api.tokens", error = %msg, "token / role store failed");
+                        ConnectError::internal("the token / role store failed")
+                    }
+                },
+            )
+        })
+}
+
+fn connect_audited(call_id: Option<&str>) -> super::token_admin::Audited<'_> {
+    super::token_admin::Audited {
+        surface: "connect",
+        actor_kind: "api",
+        call_id,
+    }
+}
+
+fn call_id_of(ctx: &RequestContext) -> Option<String> {
+    ctx.extensions()
+        .get::<InvocationContext>()
+        .map(|i| i.call_id().to_owned())
+}
+
+impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
+    async fn list_roles<'a>(
+        &'a self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListRolesRequest>,
+    ) -> ServiceResult<impl Encodable<ListRolesResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let tokens = self.engine.auth_tokens();
+        let roles =
+            connect_admin(&ctx, move || super::token_admin::role_summaries(&tokens)).await?;
+        Response::ok(ListRolesResponse {
+            roles: roles.into_iter().map(proto_role).collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn create_role<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateRoleRequest>,
+    ) -> ServiceResult<impl Encodable<CreateRoleResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        let new = super::token_admin::NewRole {
+            name: req.name,
+            spec: role_spec(req.definition.into_option()),
+        };
+        let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
+        let call_id = call_id_of(&ctx);
+        let role = connect_admin(&ctx, move || {
+            super::token_admin::create_role(
+                &tokens,
+                &audit,
+                connect_audited(call_id.as_deref()),
+                &new,
+            )
+        })
+        .await?;
+        Response::ok(CreateRoleResponse {
+            role: proto_role(role).into(),
+            ..Default::default()
+        })
+    }
+
+    async fn update_role<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateRoleRequest>,
+    ) -> ServiceResult<impl Encodable<UpdateRoleResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        let spec = role_spec(req.definition.into_option());
+        let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
+        let call_id = call_id_of(&ctx);
+        let name = req.name;
+        let role = connect_admin(&ctx, move || {
+            super::token_admin::update_role(
+                &tokens,
+                &audit,
+                connect_audited(call_id.as_deref()),
+                &name,
+                &spec,
+            )
+        })
+        .await?;
+        Response::ok(UpdateRoleResponse {
+            role: proto_role(role).into(),
+            ..Default::default()
+        })
+    }
+
+    async fn delete_role<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeleteRoleRequest>,
+    ) -> ServiceResult<impl Encodable<DeleteRoleResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
+        let call_id = call_id_of(&ctx);
+        let role = connect_admin(&ctx, move || {
+            super::token_admin::delete_role(
+                &tokens,
+                &audit,
+                connect_audited(call_id.as_deref()),
+                &req.name,
+                req.force,
+            )
+        })
+        .await?;
+        Response::ok(DeleteRoleResponse {
+            role: proto_role(role).into(),
+            ..Default::default()
+        })
+    }
+}
+
 fn proto_token(s: super::token_admin::TokenSummary) -> ProtoToken {
     ProtoToken {
         token_id: s.token_id,
@@ -1540,21 +1716,12 @@ impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
     ) -> ServiceResult<impl Encodable<CreateTokenResponse> + Send + use<'a>> {
         require_connect(&ctx, Action::TokenManage, &Resource::Host)?;
         let req = request.to_owned_message();
-        let none_if_empty = |v: Vec<String>| (!v.is_empty()).then_some(v);
         let mint = super::token_admin::MintRequest {
             label: req.label,
             roles: req.roles,
             scopes: req.scopes,
             sensitive: req.sensitive,
-            deny: req
-                .deny
-                .into_iter()
-                .map(|d| super::token_admin::DenySpec {
-                    actions: d.actions,
-                    category: none_if_empty(d.category),
-                    devices: none_if_empty(d.devices),
-                })
-                .collect(),
+            deny: req.deny.into_iter().map(selector_spec).collect(),
         };
         let tokens = self.engine.auth_tokens();
         let audit = self.engine.audit_log();
@@ -1562,20 +1729,10 @@ impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
             .extensions()
             .get::<InvocationContext>()
             .map(|i| i.call_id().to_owned());
-        let minted = tokio::task::spawn_blocking(move || {
+        let minted = connect_admin(&ctx, move || {
             super::token_admin::mint(&tokens, &audit, "connect", "api", call_id.as_deref(), &mint)
         })
-        .await
-        .map_err(|e| rpc_err(&ctx, ConnectError::internal(e.to_string())))?
-        .map_err(|err| match err {
-            super::token_admin::MintError::Invalid(msg) => {
-                rpc_err(&ctx, ConnectError::invalid_argument(msg))
-            }
-            super::token_admin::MintError::Store(msg) => {
-                tracing::error!(target: "api.tokens", error = %msg, "minting a token failed");
-                rpc_err(&ctx, ConnectError::internal("storing the token failed"))
-            }
-        })?;
+        .await?;
         Response::ok(CreateTokenResponse {
             secret: minted.secret,
             token: proto_token(minted.summary).into(),
@@ -1590,13 +1747,7 @@ impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
     ) -> ServiceResult<impl Encodable<ListTokensResponse> + Send + use<'a>> {
         require_connect(&ctx, Action::TokenManage, &Resource::Host)?;
         let tokens = self.engine.auth_tokens();
-        let list = tokio::task::spawn_blocking(move || super::token_admin::summaries(&tokens))
-            .await
-            .map_err(|e| rpc_err(&ctx, ConnectError::internal(e.to_string())))?
-            .map_err(|err| {
-                tracing::error!(target: "api.tokens", error = %err, "listing tokens failed");
-                rpc_err(&ctx, ConnectError::internal("listing tokens failed"))
-            })?;
+        let list = connect_admin(&ctx, move || super::token_admin::summaries(&tokens)).await?;
         Response::ok(ListTokensResponse {
             tokens: list.into_iter().map(proto_token).collect(),
             ..Default::default()
@@ -1627,6 +1778,10 @@ pub fn router(engine: Engine) -> ConnectRouter {
     })
     .register(router);
     let router = Arc::new(OxidHomeTokens {
+        engine: engine.clone(),
+    })
+    .register(router);
+    let router = Arc::new(OxidHomeRoles {
         engine: engine.clone(),
     })
     .register(router);
@@ -1734,7 +1889,7 @@ async fn connect_auth_middleware(
     let outcome_slot = HandlerOutcomeSlot::default();
     let (token_id, actor_kind, invocation) = match state.tokens.verify(&bearer) {
         Ok(rec) => {
-            let actor = actor_from_record(&rec);
+            let actor = actor_from_record(&rec, &state.tokens);
             // Round-3 P1 on PR #147: same reasoning as
             // [`crate::api::auth::require_token`] — a
             // constraint-bearing token has no meaning on

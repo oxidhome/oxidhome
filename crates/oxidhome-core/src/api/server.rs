@@ -95,6 +95,8 @@ pub fn build_router(engine: Engine) -> Router {
             put(set_device_category),
         )
         .route("/api/v1/tokens", get(list_tokens).post(create_token))
+        .route("/api/v1/roles", get(list_roles).post(create_role))
+        .route("/api/v1/roles/{name}", put(update_role).delete(delete_role))
         .route("/api/v1/plugins", get(list_plugins).post(install_plugin))
         .route(
             "/api/v1/plugins/{plugin_id}",
@@ -612,10 +614,12 @@ async fn set_device_category(
 
 // ── Tokens (H6 slice 3) ──────────────────────────────────────────
 
-/// Errors of the `/api/v1/tokens` handlers.
+/// Errors of the `/api/v1/tokens` and `/api/v1/roles` handlers.
 enum TokensError {
     Scope(ScopeDenied),
     BadRequest(String),
+    NotFound(String),
+    Conflict(String),
     Internal,
 }
 
@@ -624,9 +628,35 @@ impl IntoResponse for TokensError {
         match self {
             Self::Scope(s) => s.into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }
+}
+
+impl From<super::token_admin::AdminError> for TokensError {
+    fn from(err: super::token_admin::AdminError) -> Self {
+        use super::token_admin::AdminError;
+        match err {
+            AdminError::Invalid(msg) => Self::BadRequest(msg),
+            AdminError::NotFound(name) => Self::NotFound(format!("no role named `{name}`")),
+            AdminError::Exists(msg) | AdminError::Conflict(msg) => Self::Conflict(msg),
+            AdminError::Store(msg) => {
+                tracing::error!(target: "api.tokens", error = %msg, "token / role store failed");
+                Self::Internal
+            }
+        }
+    }
+}
+
+/// Run blocking token / role administration off the async runtime.
+async fn admin_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, super::token_admin::AdminError> + Send + 'static,
+) -> Result<T, TokensError> {
+    Ok(tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| TokensError::Internal)??)
 }
 
 /// Response of `POST /api/v1/tokens`: the new token's secret (shown
@@ -645,8 +675,8 @@ struct TokensBody {
     tokens: Vec<super::token_admin::TokenSummary>,
 }
 
-/// H6 slice 3: `POST /api/v1/tokens` — mint a token holding role
-/// presets, scopes, sensitive categories and a deny list
+/// H6 slice 3: `POST /api/v1/tokens` — mint a token holding
+/// owner-defined roles, scopes, sensitive categories and a deny list
 /// (`{"label": "tablet", "roles": ["dashboard"]}`, see
 /// [`super::token_admin::MintRequest`]). Returns `201` with the secret,
 /// once. `token.manage`: the owner token only; no scope or role, the
@@ -668,18 +698,10 @@ async fn create_token(
     let tokens = state.engine.auth_tokens();
     let audit = state.engine.audit_log();
     let call_id = ctx.call_id().to_owned();
-    let minted = tokio::task::spawn_blocking(move || {
+    let minted = admin_blocking(move || {
         super::token_admin::mint(&tokens, &audit, "api", "api", Some(&call_id), &req)
     })
-    .await
-    .map_err(|_| TokensError::Internal)?
-    .map_err(|err| match err {
-        super::token_admin::MintError::Invalid(msg) => TokensError::BadRequest(msg),
-        super::token_admin::MintError::Store(msg) => {
-            tracing::error!(target: "api.tokens", error = %msg, "minting a token failed");
-            TokensError::Internal
-        }
-    })?;
+    .await?;
     Ok((
         StatusCode::CREATED,
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -703,14 +725,126 @@ async fn list_tokens(
 ) -> Result<Json<TokensBody>, TokensError> {
     require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Scope)?;
     let tokens = state.engine.auth_tokens();
-    let list = tokio::task::spawn_blocking(move || super::token_admin::summaries(&tokens))
-        .await
-        .map_err(|_| TokensError::Internal)?
-        .map_err(|err| {
-            tracing::error!(target: "api.tokens", error = %err, "listing tokens failed");
-            TokensError::Internal
-        })?;
+    let list = admin_blocking(move || super::token_admin::summaries(&tokens)).await?;
     Ok(Json(TokensBody { tokens: list }))
+}
+
+/// Response of `GET /api/v1/roles`.
+#[derive(Serialize)]
+struct RolesBody {
+    roles: Vec<super::token_admin::RoleSummary>,
+}
+
+/// `?force=true` on `DELETE /api/v1/roles/{name}`.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DeleteRoleQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+/// H6 slice 3: `GET /api/v1/roles` — every owner-defined role with
+/// its grants, sensitive categories, denies and the live tokens
+/// holding it. `policy.manage`: the owner token only.
+///
+/// # Errors
+/// - `403` not the owner.
+/// - `500` the role table couldn't be read.
+async fn list_roles(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+) -> Result<Json<RolesBody>, TokensError> {
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    let tokens = state.engine.auth_tokens();
+    let roles = admin_blocking(move || super::token_admin::role_summaries(&tokens)).await?;
+    Ok(Json(RolesBody { roles }))
+}
+
+/// H6 slice 3: `POST /api/v1/roles` — define a role
+/// (`{"name": "tablet", "grants": [{"actions": ["device.list",
+/// "device.read", "device.command"], "category": ["light"]}]}`, see
+/// [`super::token_admin::NewRole`]). `policy.manage`: the owner only.
+///
+/// # Errors
+/// - `400` malformed body or definition.
+/// - `403` not the owner.
+/// - `409` the name is taken (or the role limit is reached).
+async fn create_role(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    body: Result<Json<super::token_admin::NewRole>, axum::extract::rejection::JsonRejection>,
+) -> Result<impl IntoResponse, TokensError> {
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    let Json(req) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
+    let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
+    let call_id = ctx.call_id().to_owned();
+    let role = admin_blocking(move || {
+        super::token_admin::create_role(&tokens, &audit, rest_admin(&call_id), &req)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(role)))
+}
+
+/// H6 slice 3: `PUT /api/v1/roles/{name}` — replace a role's
+/// definition (body: [`super::token_admin::RoleSpec`]). Every token
+/// holding it sees the new definition from its next request on.
+/// `policy.manage`: the owner only.
+///
+/// # Errors
+/// - `400` malformed body or definition.
+/// - `403` not the owner.
+/// - `404` no such role.
+async fn update_role(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    body: Result<Json<super::token_admin::RoleSpec>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<super::token_admin::RoleSummary>, TokensError> {
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    let Json(spec) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
+    let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
+    let call_id = ctx.call_id().to_owned();
+    let role = admin_blocking(move || {
+        super::token_admin::update_role(&tokens, &audit, rest_admin(&call_id), &name, &spec)
+    })
+    .await?;
+    Ok(Json(role))
+}
+
+/// H6 slice 3: `DELETE /api/v1/roles/{name}[?force=true]` — delete a
+/// role. Refused with `409` while live tokens hold it, unless forced;
+/// a forced delete leaves them a reference that grants nothing. The
+/// response lists the tokens that held it. `policy.manage`: the owner
+/// only.
+///
+/// # Errors
+/// - `400` a bad query.
+/// - `403` not the owner.
+/// - `404` no such role.
+/// - `409` held by live tokens, not forced.
+async fn delete_role(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    query: Result<Query<DeleteRoleQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<super::token_admin::RoleSummary>, TokensError> {
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    let Query(q) = query.map_err(|e| TokensError::BadRequest(format!("invalid query: {e}")))?;
+    let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
+    let call_id = ctx.call_id().to_owned();
+    let role = admin_blocking(move || {
+        super::token_admin::delete_role(&tokens, &audit, rest_admin(&call_id), &name, q.force)
+    })
+    .await?;
+    Ok(Json(role))
+}
+
+fn rest_admin(call_id: &str) -> super::token_admin::Audited<'_> {
+    super::token_admin::Audited {
+        surface: "api",
+        actor_kind: "api",
+        call_id: Some(call_id),
+    }
 }
 
 // ── Device state (H9 host-owned projection) ──────────────────────
@@ -1499,13 +1633,14 @@ async fn send_command(
         .get(&owner)
         .ok_or(CommandError::NotFound)?;
 
-    // H6 slice 2: an allowed sensitive command is rate limited and
-    // leaves a `warn` audit row before it runs.
-    state
+    // H6 slice 2: an allowed sensitive command takes its rate-limit
+    // charge now (a refusal is an immediate 429); its `warn` audit row
+    // is written when the supervisor dispatches it, and a command that
+    // never runs refunds the charge.
+    let charge = state
         .engine
         .sensitive()
-        .discharge_blocking(&invocation, Action::DeviceCommand, &device_id, &decision)
-        .await
+        .reserve(&invocation, Action::DeviceCommand, &device_id, &decision)
         .map_err(CommandError::Obligation)?;
 
     // Build the WIT command. JSON `value` shapes map to typed
@@ -1527,12 +1662,7 @@ async fn send_command(
 
     let gate = BytesGate::new(&invocation, &state.engine);
     let report = handle
-        .execute_command_admitted(
-            invocation,
-            device_id.clone(),
-            cmd,
-            decision.obligations.sensitive,
-        )
+        .execute_command_admitted(invocation, device_id.clone(), cmd, charge)
         .await;
     let blobs = gate.release_report(&device_id, &owner, &report);
 
