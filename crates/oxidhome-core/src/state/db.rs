@@ -2048,6 +2048,7 @@ mod tests {
             db.write(|conn| -> rusqlite::Result<()> {
                 conn.execute_batch(
                     "
+                    DROP TABLE sandbox_removal;
                     DROP TABLE device_meta;
                     ALTER TABLE audit_event DROP COLUMN level;
                     DROP INDEX auth_token_one_owner;
