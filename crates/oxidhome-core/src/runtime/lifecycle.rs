@@ -1649,8 +1649,9 @@ fn give_up_reason(
 //
 // The argument list is wide because the supervisor lends this helper
 // every borrow it needs for one attempt; bundling them into a struct
-// purely for the lint would only move the noise.
-#[allow(clippy::too_many_arguments)]
+// purely for the lint would only move the noise. Its length is the one
+// linear load → init → drain sequence, each step with its own exit.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_one_lifecycle(
     engine: &Engine,
     plugin_dir: &Path,

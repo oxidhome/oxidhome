@@ -815,6 +815,7 @@ impl HopAudit {
         };
         let finalize = Finalize {
             id,
+            finalized_ms: self.log.clock().now_unix_ms(),
             status,
             decision,
             execution_outcome,

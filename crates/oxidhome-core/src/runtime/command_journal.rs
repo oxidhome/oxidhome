@@ -103,6 +103,9 @@ enum Job {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Finalize {
     pub(crate) id: u64,
+    /// Stamped by the caller from its ledger's clock (see
+    /// [`crate::clock`]), not when the journal writes it.
+    pub(crate) finalized_ms: i64,
     pub(crate) status: u16,
     pub(crate) decision: &'static str,
     pub(crate) execution_outcome: Option<&'static str>,
@@ -486,7 +489,7 @@ fn write_batch(db: &Db, batch: &[Job], unwritten: &HashSet<String>) -> Result<()
                 Job::Finalize(f) => {
                     let rows = AuditLog::finalize_row(
                         &tx,
-                        now,
+                        f.finalized_ms,
                         f.id,
                         f.status,
                         f.decision,
@@ -926,6 +929,7 @@ mod tests {
         let journal = CommandJournal::start(Arc::clone(&db)).expect("journal");
         let finalize = |id| Finalize {
             id,
+            finalized_ms: now_unix_ms(),
             status: 503,
             decision: "error",
             execution_outcome: None,
