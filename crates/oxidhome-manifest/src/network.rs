@@ -6,9 +6,10 @@
 //! manifest parser turns each into a [`NetworkRule`] eagerly so a
 //! malformed rule fails install, not first-connect.
 //!
-//! Phase 8 (`streaming-plugin` world) writes the connect-gate against
-//! `Vec<NetworkRule>`; Phase 4 only parses and exposes the types so
-//! plugin authors can declare what they need.
+//! The host enforces the rules for `streaming-plugin` /
+//! `streaming-ai-plugin` instances (`oxidhome-core`'s
+//! `runtime::network`): every connect, send, name lookup and HTTP
+//! request is checked against the resolved IP address.
 //!
 //! ## Grammar
 //!
@@ -268,9 +269,9 @@ fn parse_host(
             .map_err(|e| NetworkRuleParseError::InvalidCidr(host_str.to_owned(), e))?;
         return Ok(HostMatch::Cidr(net));
     }
-    // Bare IP literals are stored as Exact for now — Phase 8 may want
-    // to canonicalize them via IpAddr at the match call. The string
-    // form keeps the manifest readable.
+    // Bare IP literals are stored as Exact; the host parses them back
+    // into a canonical `IpAddr` when it matches. The string form keeps
+    // the manifest readable.
     if let Ok(ip) = host_str.parse::<IpAddr>() {
         return Ok(HostMatch::Exact(ip.to_string()));
     }

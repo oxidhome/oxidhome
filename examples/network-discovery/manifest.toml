@@ -1,0 +1,38 @@
+manifest_version = 1
+
+[plugin]
+id = "example.network-discovery"
+name = "Network Discovery"
+version = "0.1.0"
+authors = ["The OxidHome Contributors"]
+description = "Probes configured LAN addresses over UDP and publishes the replies (streaming-plugin world)."
+source = "https://github.com/oxidhome/oxidhome/tree/main/examples/network-discovery"
+license = "MIT OR Apache-2.0"
+keywords = ["example", "network", "discovery"]
+world = "streaming-plugin"
+sdk_version = "0.1.0"
+
+[runtime]
+wasm = "target/wasm32-wasip2/debug/network_discovery.wasm"
+# Replies are drained on every tick.
+tick_interval_ms = 200
+
+[capabilities]
+# The addresses the plugin may probe, and hear back from. The host
+# refuses anything else, including broadcast and multicast. Edit to
+# match your network (and `targets` below); the installer grants these
+# rules explicitly.
+network = ["udp://192.168.1.0/24:9999"]
+# The reply count.
+storage_quota_kb = 4
+
+[config.targets]
+# Comma-separated `ip:port` unicast addresses to probe on start.
+type = "string"
+default = ""
+description = "Addresses to probe (ip:port, comma-separated)."
+
+[config.probe]
+type = "string"
+default = "discover"
+description = "Probe datagram payload."

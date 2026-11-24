@@ -31,6 +31,10 @@ path = "tests/test_host.rs"
 name = "examples"
 path = "tests/examples.rs"
 
+[[test]]
+name = "network"
+path = "tests/network.rs"
+
 [dependencies]
 # The harness runs plugins on the production runtime: same loader,
 # same host-import impls, same state stores (on a throwaway state

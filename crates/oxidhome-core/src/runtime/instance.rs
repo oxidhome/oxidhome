@@ -680,13 +680,14 @@ impl PluginInstance {
         let mut linker: Linker<PluginState> = Linker::new(engine.raw());
 
         // WASI p2 satisfies the `wasi:cli`, `wasi:io`, `wasi:clocks`
-        // etc. imports the plugin's libstd pulls in. Plugin world
-        // doesn't expose WASI to the plugin author yet (Phase 8
-        // does, via the streaming-plugin world), but the
-        // libstd-driven imports still need a real implementation.
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .map_err(anyhow::Error::from)
-            .context("adding wasi:p2 to linker")?;
+        // etc. imports the plugin's libstd pulls in. Phase 8: only the
+        // streaming worlds also get `wasi:sockets` and `wasi:http`
+        // (plus the `host-media` placeholders); a `plugin`-world
+        // component importing them fails to instantiate.
+        super::network::add_wasi_to_linker(&mut linker, manifest.plugin.world)
+            .context("adding WASI to linker")?;
+        super::network::check_world_exports(&component, engine.raw(), manifest.plugin.world)
+            .with_context(|| format!("rejecting plugin {}", manifest.plugin.id))?;
 
         // Host imports declared by the `plugin` world: host-devices,
         // host-events, host-config, storage, logging. All wired
@@ -975,6 +976,7 @@ impl PluginInstance {
                 )
             })?;
 
+        let manifest_world = manifest.plugin.world;
         let state = PluginState::new(
             instance_id,
             installation_uuid,
@@ -993,6 +995,13 @@ impl PluginInstance {
         .with_granted_capabilities(granted_capabilities)
         .with_audit_log(engine.audit_log())
         .with_pending_commands(engine.pending_commands());
+        // Phase 8: streaming worlds get sockets, checked against the
+        // effective `network` rules set just above.
+        let state = if super::network::is_streaming(manifest_world) {
+            state.with_network_access()
+        } else {
+            state
+        };
         // ADR-0001: the role is in place before any guest code runs,
         // component start functions included.
         let mut state = state;

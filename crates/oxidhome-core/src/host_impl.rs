@@ -30,16 +30,14 @@
 //!   declares the mappings whose interfaces it actually imports —
 //!   `plugin` has none, `streaming-plugin` has the media pair,
 //!   `ai-plugin` has model, and `streaming-ai-plugin` has all three.
-//! - **WASI imports** are *not* remapped, even though they will be in
-//!   Phase 8 when streaming plugins start using sockets/HTTP. Some
+//! - **WASI imports** are *not* remapped: streaming instances are
+//!   linked against `wasmtime-wasi` / `wasmtime-wasi-http` directly
+//!   (`runtime::network`), so these bindings only type-check. Some
 //!   WASI interfaces (`wasi:sockets/network`, `wasi:http/types`) carry
 //!   `@unstable` features whose `add_to_linker` signatures take a
 //!   `LinkOptions` parameter; remapping them via `with:` made our
 //!   bindgen emit 2-arg call sites against the runtime's 3-arg
-//!   functions. Wiring this up correctly belongs with the work that
-//!   actually instantiates plugins against a `Linker` (Phase 2 +
-//!   Phase 8) — bindgen here generates fresh WASI types instead,
-//!   which is fine for the compile-only validation Phase 1 needs.
+//!   functions — bindgen here generates fresh WASI types instead.
 
 #![allow(missing_docs, clippy::all, clippy::pedantic)]
 

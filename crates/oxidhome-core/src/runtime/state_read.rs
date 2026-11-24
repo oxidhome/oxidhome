@@ -47,6 +47,9 @@ const MAX_DEVICE_ID_LEN: usize = 256;
 pub(crate) const STATE_READ_AUDIT_METHOD: &str = "STATE";
 /// Audit `method` for event-history reads (`host-events::read-events`).
 pub(crate) const EVENT_READ_AUDIT_METHOD: &str = "EVENTS";
+/// Audit `method` for refused network access of a `streaming-plugin`
+/// instance (Phase 8): connects, sends, binds, lookups, HTTP requests.
+pub(crate) const NETWORK_AUDIT_METHOD: &str = "NET";
 
 /// What a plugin may see of one entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,7 +115,8 @@ fn to_wit(entry: &DeviceState, vis: Visibility) -> WitDeviceState {
     }
 }
 
-/// One refused read, recorded by [`deny_audit_worker`].
+/// One refused plugin read or network access, recorded by
+/// [`deny_audit_worker`].
 pub(crate) struct DenyAudit {
     log: Arc<crate::state::AuditLog>,
     /// The caller's context; `None` (host-origin) is minted by the
@@ -128,6 +132,15 @@ pub(crate) enum DeniedRead {
     State { device: String },
     /// `host-events::read-events` without `subscribes_events`.
     Events,
+    /// Network access the instance's `[capabilities] network` rules
+    /// don't allow (Phase 8). `op` is `connect` / `send` / `bind` /
+    /// `listen` / `lookup` / `http`; `target` the address, name or
+    /// authority; `reason` the policy's explanation.
+    Network {
+        op: &'static str,
+        target: String,
+        reason: String,
+    },
 }
 
 /// Queue the audit `deny` row for a `get-state` that found state the
@@ -267,6 +280,20 @@ fn deny_audit_worker(
                     "subscribes_events",
                 )
             }
+            // The policy already traced it (rate-limited with the row).
+            DeniedRead::Network { op, target, .. } => (
+                NETWORK_AUDIT_METHOD,
+                format!(
+                    "net.{op}/{}/{}",
+                    invocation::audit_cap(&job.instance_id),
+                    invocation::audit_cap(target)
+                ),
+                "network",
+            ),
+        };
+        let domain_error = match &job.read {
+            DeniedRead::Network { reason, .. } => Some(reason.clone()),
+            DeniedRead::State { .. } | DeniedRead::Events => None,
         };
         let ctx = job
             .ctx
@@ -284,7 +311,7 @@ fn deny_audit_worker(
             decision: "deny".into(),
             required_scope: Some(scope.into()),
             execution_outcome: None,
-            domain_error: None,
+            domain_error,
             credential_fp: None,
             call_id: Some(ctx.call_id().to_owned()),
             invocation: Some(ctx.audit_json()),
