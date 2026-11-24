@@ -472,6 +472,7 @@ impl Engine {
             .context("reading the pending script sandbox purges")?;
         let tls_pins = crate::state::TlsPinStore::open(Arc::clone(&db))
             .context("loading TLS certificate pins")?;
+        purge_tls_pins_of_removed_installations(&db, &tls_pins, &audit_log);
         Ok(Self {
             tls: Arc::new(network::TlsClient::new(Arc::new(tls_pins))),
             inner,
@@ -833,10 +834,9 @@ impl Engine {
                 )))
             })?;
             self.sandboxes.forget_removals_of(uuid);
-            // Phase 8.2: the certificates its instances trusted on first
-            // use go with it, so a reinstall under the same instance id
-            // trusts nothing it didn't see itself.
-            self.purge_tls_pins(plugin_id, uuid)?;
+            // Phase 8.2: no pin write still in flight lands after the
+            // purge below.
+            self.tls.pins().retire(uuid);
         }
         // Tombstone the registry row last. Ordering matters: a
         // crash between purge success and tombstone leaves the
@@ -852,109 +852,25 @@ impl Engine {
             }
             return Err(err);
         }
-        Ok(())
-    }
-
-    /// Delete the TLS pins the installation `uuid`'s instances made,
-    /// each one audited: a durable intent row
-    /// (`net.tls_pin_purge/<instance>/<host>:<port>/sha256:<hex>`) before
-    /// the delete, finalized after it, so a crash in between still
-    /// leaves the record. The installation is retired first, so no pin
-    /// write still in flight lands after the purge.
-    fn purge_tls_pins(
-        &self,
-        plugin_id: &str,
-        uuid: &str,
-    ) -> Result<(), crate::state::UninstallError> {
-        let pins = self.tls.pins();
-        pins.retire(uuid);
-        let result = self.purge_retired_tls_pins(plugin_id, uuid);
-        if result.is_err() {
-            // Still installed: its instances may pin again.
-            pins.unretire(uuid);
-        }
-        result
-    }
-
-    fn purge_retired_tls_pins(
-        &self,
-        plugin_id: &str,
-        uuid: &str,
-    ) -> Result<(), crate::state::UninstallError> {
-        use crate::auth::invocation;
-        let io = |what: String| crate::state::UninstallError::Io(std::io::Error::other(what));
-        let pins = self.tls.pins();
-        let doomed = pins.list_installation(uuid);
-        if doomed.is_empty() {
-            return Ok(());
-        }
-        let ctx = invocation::current_or_host(plugin_id);
-        let root = ctx.root();
-        let mut intents = Vec::with_capacity(doomed.len());
-        for pin in &doomed {
-            let entry = crate::state::AuditEntry {
-                id: 0,
-                intent_ms: 0,
-                finalized_ms: None,
-                token_id: root.audit_token_id().to_owned(),
-                actor_kind: root.kind().as_str().to_owned(),
-                method: state_read::NETWORK_AUDIT_METHOD.to_owned(),
-                path: format!(
-                    "net.tls_pin_purge/{}/{}:{}/sha256:{}",
-                    invocation::audit_cap(&pin.key.instance_id),
-                    invocation::audit_cap(&pin.key.host),
-                    pin.key.port,
-                    pin.fingerprint.to_hex()
-                ),
-                status: 0,
-                decision: "pending".into(),
-                required_scope: None,
-                execution_outcome: None,
-                domain_error: None,
-                credential_fp: None,
-                call_id: Some(ctx.call_id().to_owned()),
-                invocation: Some(ctx.audit_json()),
-                command_id: None,
-                command_outcome: None,
-                level: None,
-            };
-            intents.push(
-                self.audit_log
-                    .record_intent_durable(&entry)
-                    .map_err(|err| {
-                        io(format!(
-                            "auditing the TLS pin purge for install {uuid} failed: {err}"
-                        ))
-                    })?,
+        // Phase 8.2: the certificates its instances trusted on first use
+        // go with it, so a reinstall under the same instance id trusts
+        // nothing it didn't see itself. After the tombstone, so a failed
+        // uninstall never leaves a live installation without its pins; a
+        // purge that fails here (or never ran) is finished at startup.
+        if let Some(uuid) = &installation_uuid
+            && let Err(err) = purge_tls_pins_audited(
+                self.tls.pins(),
+                &self.audit_log,
+                &crate::auth::invocation::current_or_host(plugin_id),
+                uuid,
+            )
+        {
+            tracing::error!(
+                target: "host.network",
+                plugin_id,
+                error = %err,
+                "removing the uninstalled plugin's TLS pins failed; retried at the next start",
             );
-        }
-        let removed = pins
-            .purge_installation(uuid)
-            .map_err(|err| io(format!("TLS pin purge failed for install {uuid}: {err}")))?;
-        tracing::warn!(
-            target: "host.network",
-            plugin_id,
-            removed = removed.len(),
-            "uninstall removed the plugin's TLS certificate pins",
-        );
-        for (pin, id) in doomed.iter().zip(intents) {
-            // A pin an operator reset in between was not this purge's.
-            let finalized = if removed.contains(pin) {
-                self.audit_log
-                    .finalize(id, 200, "allow", Some("network"), None, None)
-            } else {
-                self.audit_log.finalize(
-                    id,
-                    404,
-                    "allow",
-                    Some("network"),
-                    None,
-                    Some("already removed by a reset"),
-                )
-            };
-            if let Err(err) = finalized {
-                tracing::error!(target: "host.audit", error = %err, "finalizing a TLS pin purge row failed");
-            }
         }
         Ok(())
     }
@@ -1790,6 +1706,127 @@ pub fn is_operator_instance_id(instance_id: &str) -> bool {
 /// stays readable.
 const MIGRATION_14: i64 = 14;
 
+/// Delete the TLS pins the (retired or tombstoned) installation
+/// `uuid`'s instances made, each one audited for `ctx`: a durable intent
+/// row (`net.tls_pin_purge/<instance>/<host>:<port>/sha256:<hex>`)
+/// before the delete, finalized after it (or with the failure), so a
+/// crash in between still leaves the record.
+fn purge_tls_pins_audited(
+    pins: &crate::state::TlsPinStore,
+    audit_log: &AuditLog,
+    ctx: &crate::auth::invocation::InvocationContext,
+    uuid: &str,
+) -> Result<(), String> {
+    use crate::auth::invocation;
+    pins.retire(uuid);
+    let doomed = pins.list_installation(uuid);
+    if doomed.is_empty() {
+        return Ok(());
+    }
+    let root = ctx.root();
+    let finalize_all = |ids: &[u64], status: u16, decision: &str, error: Option<&str>| {
+        for id in ids {
+            if let Err(err) =
+                audit_log.finalize(*id, status, decision, Some("network"), None, error)
+            {
+                tracing::error!(target: "host.audit", error = %err, "finalizing a TLS pin purge row failed");
+            }
+        }
+    };
+    let mut intents = Vec::with_capacity(doomed.len());
+    for pin in &doomed {
+        let entry = crate::state::AuditEntry {
+            id: 0,
+            intent_ms: 0,
+            finalized_ms: None,
+            token_id: root.audit_token_id().to_owned(),
+            actor_kind: root.kind().as_str().to_owned(),
+            method: state_read::NETWORK_AUDIT_METHOD.to_owned(),
+            path: format!(
+                "net.tls_pin_purge/{}/{}:{}/sha256:{}",
+                invocation::audit_cap(&pin.key.instance_id),
+                invocation::audit_cap(&pin.key.host),
+                pin.key.port,
+                pin.fingerprint.to_hex()
+            ),
+            status: 0,
+            decision: "pending".into(),
+            required_scope: None,
+            execution_outcome: None,
+            domain_error: None,
+            credential_fp: None,
+            call_id: Some(ctx.call_id().to_owned()),
+            invocation: Some(ctx.audit_json()),
+            command_id: None,
+            command_outcome: None,
+            level: None,
+        };
+        match audit_log.record_intent_durable(&entry) {
+            Ok(id) => intents.push(id),
+            Err(err) => {
+                let err = format!("auditing the TLS pin purge for install {uuid} failed: {err}");
+                finalize_all(&intents, 500, "error", Some(&err));
+                return Err(err);
+            }
+        }
+    }
+    let removed = match pins.purge_installation(uuid) {
+        Ok(removed) => removed,
+        Err(err) => {
+            let err = format!("TLS pin purge failed for install {uuid}: {err}");
+            finalize_all(&intents, 500, "error", Some(&err));
+            return Err(err);
+        }
+    };
+    tracing::warn!(
+        target: "host.network",
+        installation_uuid = uuid,
+        removed = removed.len(),
+        "removed an uninstalled plugin's TLS certificate pins",
+    );
+    for (pin, id) in doomed.iter().zip(intents) {
+        // A pin an operator reset in between was not this purge's.
+        if removed.contains(pin) {
+            finalize_all(&[id], 200, "allow", None);
+        } else {
+            finalize_all(&[id], 404, "allow", Some("already removed by a reset"));
+        }
+    }
+    Ok(())
+}
+
+/// Phase 8.2: finish the TLS pin purges of installations the registry
+/// has tombstoned (an uninstall whose purge failed or was cut short, or
+/// a plugin removed while the host was down), audited as the host.
+fn purge_tls_pins_of_removed_installations(
+    db: &Db,
+    pins: &crate::state::TlsPinStore,
+    audit_log: &AuditLog,
+) {
+    let uuids = db.read(|conn| -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT p.installation_uuid FROM network_tls_pin p \
+             JOIN plugin_installation i ON i.installation_uuid = p.installation_uuid \
+             WHERE i.uninstalled_ms IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    });
+    let uuids = match uuids {
+        Ok(uuids) => uuids,
+        Err(err) => {
+            tracing::error!(target: "host.network", error = %err, "listing stale TLS pins failed");
+            return;
+        }
+    };
+    for uuid in uuids {
+        let ctx = crate::auth::invocation::InvocationContext::host_origin(&uuid);
+        if let Err(err) = purge_tls_pins_audited(pins, audit_log, &ctx, &uuid) {
+            tracing::error!(target: "host.network", error = %err, "removing stale TLS pins failed");
+        }
+    }
+}
+
 /// H2 round-2 F3: reclaim every top-level entry under
 /// `<state_dir>/blobs/`. Called from
 /// [`Engine::with_state_dir`] exactly on the boot where
@@ -1833,6 +1870,67 @@ mod tests {
     /// KV / blob purge behaviour is covered in
     /// `state::kv::tests::purge_installation_*` and
     /// `state::blobs::tests::purge_installation_*`.
+    #[test]
+    fn startup_finishes_the_pin_purge_of_a_removed_installation() {
+        let base = std::env::temp_dir().join(format!(
+            "oxidhome-pin-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        ));
+        let state_dir = base.join("state");
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("manifest.toml"),
+            "manifest_version = 1\n[plugin]\nid = \"example.pins\"\nname = \"Pins\"\n\
+             version = \"0.1.0\"\nworld = \"plugin\"\nsdk_version = \"0.1.0\"\n\
+             [runtime]\nwasm = \"plugin.wasm\"\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        let engine = Engine::with_state_dir(&state_dir).expect("engine");
+        let uuid = engine
+            .installed_plugins()
+            .install(&source)
+            .expect("install")
+            .installation_uuid;
+        let key = crate::state::PinKey {
+            instance_id: "inst-a".into(),
+            host: "camera.lan".into(),
+            port: 443,
+        };
+        let fp = crate::state::Fingerprint::of_der(b"cert");
+        engine.tls_pins().check_or_pin(&key, &uuid, fp).unwrap();
+        // Removed without the engine's purge (as when a purge failed,
+        // or the plugin was removed offline).
+        engine
+            .installed_plugins()
+            .uninstall("example.pins")
+            .expect("tombstone");
+        drop(engine);
+
+        let engine = Engine::with_state_dir(&state_dir).expect("reopen");
+        assert_eq!(
+            engine.tls_pins().list(&crate::state::PinFilter::default()),
+            Vec::new()
+        );
+        let rows = engine
+            .audit_log()
+            .query(&crate::state::AuditQuery::default(), 100)
+            .unwrap();
+        assert!(
+            rows.iter().any(|r| r
+                .path
+                .starts_with("net.tls_pin_purge/inst-a/camera.lan:443/")
+                && r.status == 200),
+            "pin purge audit row"
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn uninstall_plugin_purges_kv_and_blobs_for_installation_uuid() {

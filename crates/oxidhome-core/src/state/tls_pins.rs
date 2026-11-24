@@ -257,7 +257,7 @@ impl TlsPinStore {
                     int(2),
                     text(3),
                     int(4).unwrap_or_default(),
-                    text(5).unwrap_or_default(),
+                    text(5),
                 ))
             })?;
             let mut out = BTreeMap::new();
@@ -266,8 +266,13 @@ impl TlsPinStore {
                 let port = port.and_then(|p| u16::try_from(p).ok());
                 let fingerprint = sha.as_deref().and_then(Fingerprint::from_hex);
                 // A key that doesn't decode couldn't be reset by key.
-                if let (Some(instance_id), Some(host), Some(port), Some(fp)) =
-                    (instance_id, host, port, fingerprint)
+                if let (
+                    Some(instance_id),
+                    Some(host),
+                    Some(port),
+                    Some(fp),
+                    Some(installation_uuid),
+                ) = (instance_id, host, port, fingerprint, installation_uuid)
                 {
                     out.insert(
                         Slot {
