@@ -958,3 +958,41 @@ async fn a_changed_untrusted_certificate_is_audited_as_a_pin_mismatch() {
         "domain_error"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_refused_mid_way_returns_the_refusal() {
+    // The server answers `413` after the request head and never reads the
+    // body: the SDK must stop uploading and return the answer, not block.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        let _ =
+            stream.write_all(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 4\r\n\r\nbig!");
+        // Hold the connection open, reading nothing.
+        std::thread::sleep(Duration::from_secs(20));
+        drop(stream);
+    });
+    let host = TestHost::new().unwrap();
+    let started = Instant::now();
+    let results = probe(
+        &host,
+        "uploader",
+        &[format!("tcp://127.0.0.1:{port}")],
+        &[format!("post 16777216 http://127.0.0.1:{port}/upload")],
+    )
+    .await;
+    assert_eq!(results, ["ok:413:big!"]);
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+}

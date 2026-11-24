@@ -139,7 +139,9 @@ impl Method {
 
 /// A request to send. Build it with [`Request::get`] / [`Request::new`]
 /// and the setters, then [`Request::send`] it.
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows header names and the body's length, never their values.
+#[derive(Clone)]
 pub struct Request {
     method: Method,
     url: String,
@@ -536,7 +538,9 @@ fn redirect_location(status: u16, headers: &[(String, Vec<u8>)]) -> Option<Strin
 }
 
 /// A response with its whole body.
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows header names and the body's length, never their values.
+#[derive(Clone)]
 pub struct Response {
     status: u16,
     headers: Vec<(String, Vec<u8>)>,
@@ -603,6 +607,55 @@ impl Response {
     }
 }
 
+/// Header names only: values may be credentials (`authorization`,
+/// `set-cookie`).
+struct HeaderNames<'a>(&'a [(String, Vec<u8>)]);
+
+impl std::fmt::Debug for HeaderNames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(n, _)| n))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("url", &redact_userinfo(&self.url))
+            .field("headers", &HeaderNames(&self.headers))
+            .field("body_len", &self.body.len())
+            .field("timeout", &self.timeout)
+            .field("max_body", &self.max_body)
+            .field("max_redirects", &self.max_redirects)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &HeaderNames(&self.headers))
+            .field("body_len", &self.body.len())
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+/// `raw` with any `user:password@` in its authority replaced by `***@`.
+fn redact_userinfo(raw: &str) -> String {
+    let start = raw.find("://").map_or(0, |i| i + 3);
+    let end = raw[start..]
+        .find(['/', '?', '#'])
+        .map_or(raw.len(), |i| start + i);
+    match raw[start..end].rfind('@') {
+        Some(at) => format!("{}***{}", &raw[..start], &raw[start + at..]),
+        None => raw.to_owned(),
+    }
+}
+
 /// An absolute `http(s)` URL, split the way `wasi:http` takes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Url {
@@ -615,7 +668,7 @@ struct Url {
 
 impl Url {
     fn parse(raw: &str) -> Result<Self, Error> {
-        let invalid = || Error::InvalidUrl(raw.to_owned());
+        let invalid = || Error::InvalidUrl(redact_userinfo(raw));
         let (scheme, rest) = raw.split_once("://").ok_or_else(invalid)?;
         let https = if scheme.eq_ignore_ascii_case("https") {
             true
@@ -806,6 +859,25 @@ mod tests {
         ] {
             assert!(Url::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn debug_and_errors_hide_credentials() {
+        let request = Request::get("https://u:pw@cam.lan/x")
+            .header("Authorization", "Bearer s3cret")
+            .body("token=s3cret");
+        let shown = format!("{request:?}");
+        assert!(
+            !shown.contains("s3cret") && !shown.contains("pw"),
+            "{shown}"
+        );
+        assert!(shown.contains("authorization"), "{shown}");
+        let err = Url::parse("https://u:pw@cam.lan/x").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidUrl(u) if u == "https://***@cam.lan/x"),
+            "{err:?}"
+        );
+        assert_eq!(redact_userinfo("http://cam.lan/a@b"), "http://cam.lan/a@b");
     }
 
     #[test]
