@@ -21,6 +21,12 @@ env:
 
 permissions: read-all
 
+# One run at a time, so two runs can't both miss the open PR and
+# regenerate its branch.
+concurrency:
+  group: wasm-toolchain
+  cancel-in-progress: false
+
 jobs:
   Update:
     name: Bump the wasm toolchain

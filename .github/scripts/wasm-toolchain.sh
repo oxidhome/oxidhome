@@ -108,12 +108,12 @@ releases() {
   cat "$file"
 }
 
-# Whether crate $1's release $2 (any version form) was published by
-# $CUTOFF.
-out_of_quarantine() {
+# Whether crate $1's release $2 (any version form) is not yanked and
+# was published by $CUTOFF.
+eligible() {
   index_entries "$1" |
     jq -e --arg v "$2" --arg cutoff "$CUTOFF" \
-      'any(.[]; .vers == $v and .pubtime != null and .pubtime <= $cutoff)' >/dev/null
+      'any(.[]; .vers == $v and (.yanked | not) and .pubtime != null and .pubtime <= $cutoff)' >/dev/null
 }
 
 # OSV advisory ids (space-separated, empty if none) for crate $1 @ $2.
@@ -129,7 +129,8 @@ advisories() {
          + (if $t == "" then {} else {page_token: $t} end)' |
         curl -fsS --retry 3 --max-time 60 -A 'oxidhome-wasm-toolchain-bump' \
           -H 'Content-Type: application/json' --data-binary @- "$OSV_API/v1/query" |
-        jq -s 'if length == 1 and (.[0] | type) == "object" then .[0]
+        jq -s 'if length == 1 and (.[0] | type) == "object"
+                  and ((.[0].vulns // []) | type) == "array" then .[0]
                else error("not an OSV query result") end' >"$page" ||
         die "cannot query OSV for $1 $2"
       ids+=" $(jq -r '[.vulns[]? | select(.withdrawn == null) | .id] | join(" ")' "$page")"
@@ -373,7 +374,10 @@ scan_lockfiles() {
   local args=() lock json rc=0
   for lock in "$ROOT"/Cargo.lock "$ROOT"/examples/*/Cargo.lock; do args+=(--lockfile "$lock"); done
   json="$CACHE/osv-scan.json"
-  osv-scanner scan source --format json "${args[@]}" >"$json" || rc=$?
+  # An empty config: osv-scanner.toml's accepted advisories must not hide
+  # one the update adds.
+  : >"$CACHE/osv-scanner.toml"
+  osv-scanner scan source --config "$CACHE/osv-scanner.toml" --format json "${args[@]}" >"$json" || rc=$?
   ((rc == 0 || rc == 1)) || die "osv-scanner failed (exit $rc)"
   jq -r --arg root "$ROOT/" '.results[]? | (.source.path | ltrimstr($root)) as $f
          | .packages[]? | .package as $p | .vulnerabilities[]?
@@ -443,9 +447,14 @@ apply() {
   local locked_before
   locked_before="$(locked_packages)"
 
-  # Restore the manifest if the lockfile update fails, so a rerun sees
-  # the old pins and tries again.
-  cp "$MANIFEST" "$CACHE/Cargo.toml.orig"
+  # Restore the manifest and lockfiles if the lockfile update fails, so a
+  # rerun starts from the same state.
+  local backup="$CACHE/backup" lock
+  mkdir -p "$backup"
+  for lock in "$MANIFEST" "$ROOT"/Cargo.lock "$ROOT"/examples/*/Cargo.lock; do
+    mkdir -p "$backup/$(dirname "${lock#"$ROOT"/}")"
+    cp "$lock" "$backup/${lock#"$ROOT"/}"
+  done
   while read -r _ c old new; do
     [[ $c == wasmtime ]] && wt="$new"
     [[ $c == wit-bindgen ]] && wb="$new"
@@ -457,8 +466,8 @@ apply() {
   done < <(grep '^pin ' <<<"$p")
 
   if ! update_lockfiles; then
-    cp "$CACHE/Cargo.toml.orig" "$MANIFEST"
-    die "cargo update failed; Cargo.toml restored"
+    (cd "$backup" && find . -type f -exec cp {} "$ROOT/{}" \;)
+    die "cargo update failed; Cargo.toml and the lockfiles restored"
   fi
 
   # Cargo resolves every unpinned crate the bump adds or moves (wasmparser,
@@ -467,24 +476,24 @@ apply() {
   local fresh="" f n v
   while read -r f n v; do
     [[ -z $n ]] && continue
-    out_of_quarantine "$n" "$v" || fresh+="$f $n $v"$'\n'
+    eligible "$n" "$v" || fresh+="$f $n $v"$'\n'
   done < <(comm -13 <(printf '%s\n' "$locked_before") <(locked_packages))
+  after="$(scan_lockfiles)"
+  added="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
+
   if [[ -n $fresh ]]; then
-    log "the bump locks releases still in quarantine (lockfile package version); no PR:"
+    log "the bump locks yanked releases or releases still in quarantine (lockfile package version); no PR:"
     while read -r f n v; do
       [[ -n $n ]] && echo "::warning title=release in quarantine::$f: $n $v"
     done <<<"$fresh"
-    if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=false" >>"$GITHUB_OUTPUT"; fi
-    return 0
   fi
-
-  after="$(scan_lockfiles)"
-  added="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
   if [[ -n $added ]]; then
     log "the bump adds vulnerabilities (lockfile package version advisory); no PR:"
     while read -r f pkg ver id; do
       echo "::error title=wasm toolchain bump adds a vulnerability::$f: $pkg $ver: $id"
     done <<<"$added"
+  fi
+  if [[ -n $fresh || -n $added ]]; then
     if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=false" >>"$GITHUB_OUTPUT"; fi
     return 0
   fi
