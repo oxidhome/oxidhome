@@ -1759,7 +1759,9 @@ fn purge_tls_pins_audited(
                 "net.tls_pin_purge/{}/{}/{}:{}/sha256:{}",
                 invocation::audit_cap(uuid),
                 invocation::audit_cap(&pin.key.instance_id),
-                invocation::audit_cap(&pin.key.host),
+                // Whole: pins bound hosts to a DNS name's length, and a
+                // cut name could match another pin's.
+                pin.key.host,
                 pin.key.port,
                 pin.fingerprint.to_hex()
             ),

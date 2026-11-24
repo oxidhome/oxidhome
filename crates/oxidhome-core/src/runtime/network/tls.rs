@@ -243,10 +243,15 @@ impl ServerCertVerifier for Verifier {
             // Only a self-signed leaf, and only once the rest checks out
             // with it trusted: an expired certificate, one for another
             // name or use, or one from an unknown CA is refused like
-            // anywhere else. Checked whatever the roots objected to (a
-            // root sharing the leaf's subject name fails as a bad
-            // signature, not an unknown issuer).
-            Err(err @ rustls::Error::InvalidCertificate(_)) if self.tofu => {
+            // anywhere else. An unknown issuer, or a bad signature (a
+            // root sharing the leaf's subject name with another key);
+            // any other objection (a root's name constraints) stands.
+            Err(
+                err @ rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer
+                    | rustls::CertificateError::BadSignature,
+                ),
+            ) if self.tofu => {
                 if self
                     .verify_self_signed(end_entity, server_name, ocsp_response, now)
                     .is_err()
