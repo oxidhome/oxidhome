@@ -124,7 +124,12 @@ pub enum NetworkRuleParseError {
     InvalidHost(String),
     #[error("invalid token `{0}` in rule `{1}`: whitespace not allowed")]
     WhitespaceInToken(String, String),
+    #[error("host `{0}…` is longer than {MAX_RULE_HOST_LEN} bytes")]
+    HostTooLong(String),
 }
+
+/// Longest rule host: a 253-byte DNS name behind `*.`.
+pub const MAX_RULE_HOST_LEN: usize = 255;
 
 impl FromStr for NetworkRule {
     type Err = NetworkRuleParseError;
@@ -241,6 +246,14 @@ fn parse_host(
 ) -> Result<HostMatch, NetworkRuleParseError> {
     if host_str.is_empty() {
         return Err(NetworkRuleParseError::EmptyHost(full.to_owned()));
+    }
+    if host_str.len() > MAX_RULE_HOST_LEN {
+        let head = host_str
+            .char_indices()
+            .take_while(|(i, _)| *i < 32)
+            .map(|(_, c)| c)
+            .collect();
+        return Err(NetworkRuleParseError::HostTooLong(head));
     }
     if bracketed {
         // Inside brackets: IPv6 only.
@@ -596,6 +609,21 @@ mod tests {
     fn empty_host() {
         let err = "tcp://:1883".parse::<NetworkRule>().unwrap_err();
         assert!(matches!(err, NetworkRuleParseError::EmptyHost(_)));
+    }
+
+    #[test]
+    fn hosts_are_bounded() {
+        let name = format!("{}lan", "a.".repeat(125));
+        assert_eq!(name.len(), 253);
+        assert!(format!("tcp://{name}:1").parse::<NetworkRule>().is_ok());
+        assert!(format!("tcp://*.{name}:1").parse::<NetworkRule>().is_ok());
+        let err = format!("tcp://*.a{name}:1")
+            .parse::<NetworkRule>()
+            .unwrap_err();
+        assert!(
+            matches!(err, NetworkRuleParseError::HostTooLong(_)),
+            "{err}"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::config::{ConfigField, ConfigFieldType};
 use crate::extension::ExtensionId;
-use crate::manifest::PluginManifest;
+use crate::manifest::{PluginManifest, World};
 
 /// One validator finding. Variants carry the field-specific context
 /// needed for an error message to point at what to fix:
@@ -122,9 +122,15 @@ pub enum ValidationError {
     #[error(
         "capabilities.network has {count} rules, but world `{world}` has no network \
          access; only `streaming-plugin` and `streaming-ai-plugin` do. Set \
-         `[plugin] world = \"streaming-plugin\"` or remove the rules."
+         `[plugin] world = \"{suggested}\"` (the component must then target that \
+         world and export `oxidhome:plugin/streaming`) or remove the rules."
     )]
-    NetworkRulesWithoutNetworkWorld { world: &'static str, count: usize },
+    NetworkRulesWithoutNetworkWorld {
+        world: &'static str,
+        /// The streaming world with the same exports plus network access.
+        suggested: &'static str,
+        count: usize,
+    },
 
     #[error("plugin.keywords[{index}] `{got}` is invalid: {reason}")]
     InvalidKeyword {
@@ -665,8 +671,14 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
     }
 
     if !m.capabilities.network.is_empty() && !m.plugin.world.has_network() {
+        let suggested = if m.plugin.world == World::AiPlugin {
+            World::StreamingAiPlugin
+        } else {
+            World::StreamingPlugin
+        };
         errors.push(ValidationError::NetworkRulesWithoutNetworkWorld {
             world: m.plugin.world.as_str(),
+            suggested: suggested.as_str(),
             count: m.capabilities.network.len(),
         });
     }
@@ -1429,7 +1441,10 @@ mod tests {
     #[test]
     fn network_rules_need_a_streaming_world() {
         let rule: crate::NetworkRule = "tcp://192.168.1.2:1883".parse().unwrap();
-        for world in [crate::World::Plugin, crate::World::AiPlugin] {
+        for (world, suggested) in [
+            (crate::World::Plugin, "streaming-plugin"),
+            (crate::World::AiPlugin, "streaming-ai-plugin"),
+        ] {
             let mut m = ok_manifest();
             m.plugin.world = world;
             assert!(validate(&m).is_ok(), "{world:?} without rules");
@@ -1438,8 +1453,11 @@ mod tests {
             assert!(
                 errs.iter().any(|e| matches!(
                     e,
-                    ValidationError::NetworkRulesWithoutNetworkWorld { world: w, count: 1 }
-                        if *w == world.as_str()
+                    ValidationError::NetworkRulesWithoutNetworkWorld {
+                        world: w,
+                        suggested: s,
+                        count: 1,
+                    } if *w == world.as_str() && *s == suggested
                 )),
                 "{errs:?}"
             );

@@ -43,7 +43,9 @@ pub use manifest::{
     CapabilitiesSection, PluginManifest, PluginSection, RestartPolicy, RuntimeSection,
     ServiceGrant, StateGrant, UiPermissions, UiSection, World,
 };
-pub use network::{HostMatch, NetworkRule, NetworkRuleParseError, PortMatch, Proto};
+pub use network::{
+    HostMatch, MAX_RULE_HOST_LEN, NetworkRule, NetworkRuleParseError, PortMatch, Proto,
+};
 pub use validate::{
     ValidationError, WasmPathProblem, check_capability_limits, check_capability_limits_owned,
     validate,
