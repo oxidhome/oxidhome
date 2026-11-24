@@ -39,7 +39,7 @@ use crate::state::tls_pins::{Fingerprint, PinCheck, PinKey, TlsPinStore};
 #[derive(Debug, Clone)]
 enum Roots {
     Loading,
-    Loaded(Option<Arc<WebPkiServerVerifier>>),
+    Loaded(Option<Arc<SystemRoots>>),
 }
 
 /// Host-wide TLS client state: the root verifier (built on first use) and
@@ -93,7 +93,7 @@ impl TlsClient {
         &self.pins
     }
 
-    async fn root_verifier(&self) -> Option<Arc<WebPkiServerVerifier>> {
+    async fn root_verifier(&self) -> Option<Arc<SystemRoots>> {
         let mut loaded = self.roots.subscribe();
         if !self.roots_started.swap(true, Ordering::AcqRel) {
             let roots = Arc::clone(&self.roots);
@@ -140,10 +140,19 @@ fn is_nat64(ip: IpAddr) -> bool {
     }
 }
 
+/// The system roots: their verifier, and their public keys.
+#[derive(Debug)]
+struct SystemRoots {
+    verifier: Arc<WebPkiServerVerifier>,
+    /// Every root's `SubjectPublicKeyInfo`: a self-signed leaf with one
+    /// of these keys is a root's, and keeps the root's constraints.
+    keys: std::collections::HashSet<Vec<u8>>,
+}
+
 fn build_root_verifier(
     provider: &Arc<CryptoProvider>,
     extra: Vec<CertificateDer<'static>>,
-) -> Option<Arc<WebPkiServerVerifier>> {
+) -> Option<Arc<SystemRoots>> {
     let native = rustls_native_certs::load_native_certs();
     if !native.errors.is_empty() {
         tracing::warn!(
@@ -164,12 +173,18 @@ fn build_root_verifier(
         );
         return None;
     }
+    let keys = store
+        .roots
+        .iter()
+        .map(|root| root.subject_public_key_info.as_ref().to_vec())
+        .collect();
     WebPkiServerVerifier::builder_with_provider(Arc::new(store), Arc::clone(provider))
         .build()
         .map_err(|err| {
             tracing::warn!(target: "host.network", error = %err, "building the TLS root verifier failed");
         })
         .ok()
+        .map(|verifier| Arc::new(SystemRoots { verifier, keys }))
 }
 
 /// What the handshake's certificate check concluded.
@@ -184,7 +199,7 @@ enum Trust {
 /// One connection's certificate verifier.
 #[derive(Debug)]
 struct Verifier {
-    roots: Option<Arc<WebPkiServerVerifier>>,
+    roots: Option<Arc<SystemRoots>>,
     provider: Arc<CryptoProvider>,
     tofu: bool,
     trust: Mutex<Option<Trust>>,
@@ -207,6 +222,16 @@ impl Verifier {
     ) -> Result<(), rustls::Error> {
         let mut roots = RootCertStore::empty();
         roots.add(end_entity.clone().into_owned())?;
+        // A system root's own key keeps that root's verdict (its name
+        // constraints included): trust on first use is for keys no root
+        // knows.
+        if let (Some(system), Some(leaf)) = (&self.roots, roots.roots.first())
+            && system.keys.contains(leaf.subject_public_key_info.as_ref())
+        {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
         WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&self.provider))
             .build()
             .map_err(|err| rustls::Error::General(err.to_string()))?
@@ -227,9 +252,13 @@ impl ServerCertVerifier for Verifier {
         *self.seen.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(Fingerprint::of_der(end_entity));
         let verdict = match &self.roots {
-            Some(roots) => {
-                roots.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-            }
+            Some(roots) => roots.verifier.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ),
             None => Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer,
             )),
@@ -243,15 +272,12 @@ impl ServerCertVerifier for Verifier {
             // Only a self-signed leaf, and only once the rest checks out
             // with it trusted: an expired certificate, one for another
             // name or use, or one from an unknown CA is refused like
-            // anywhere else. An unknown issuer, or a bad signature (a
-            // root sharing the leaf's subject name with another key);
-            // any other objection (a root's name constraints) stands.
-            Err(
-                err @ rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::UnknownIssuer
-                    | rustls::CertificateError::BadSignature,
-                ),
-            ) if self.tofu => {
+            // anywhere else. Whatever the roots objected to (a root that
+            // shares the leaf's subject with another key fails it as a
+            // bad signature or an unsupported algorithm), unless the
+            // leaf's key is a root's: then that root's objection (its
+            // name constraints) stands.
+            Err(err @ rustls::Error::InvalidCertificate(_)) if self.tofu => {
                 if self
                     .verify_self_signed(end_entity, server_name, ocsp_response, now)
                     .is_err()
