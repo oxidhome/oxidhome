@@ -1909,7 +1909,10 @@ fn io_gate_after(clock: &Clock, last_tick: Option<Instant>) -> Option<Sleep> {
 /// after which the serve loop waits again.
 ///
 /// The serve loop creates each gate as soon as the tick returns, so a
-/// virtual clock sees it registered without a gap. When the gate is
+/// virtual clock sees it registered without a gap. Like the tick
+/// interval, a gate that falls due while the loop runs other guest work
+/// (a command, event delivery) keeps a virtual clock unsettled until the
+/// loop comes back to it. When the gate is
 /// what held a ready socket back, the fired gate is returned and kept
 /// until the tick it triggers is done (a virtual clock then waits for
 /// that tick, see [`Clock::sleep_until`]). A wait that then goes on for
@@ -2013,9 +2016,6 @@ async fn serve_loop(
         let outcome: anyhow::Result<LoopAction> = match wakeup {
             Wakeup::Stop => Ok(shutdown_on_request(instance, state_tx, instance_id).await),
             Wakeup::Control(ctrl) => {
-                // Not held across the command: a virtual clock would wait
-                // for it. `io_ready` rebuilds it from `last_tick`.
-                next_gate = None;
                 handle_control(instance, state_tx, stop, instance_id, ctrl).await
             }
             Wakeup::Tick => {

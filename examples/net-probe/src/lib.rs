@@ -88,14 +88,16 @@ impl Plugin for NetProbe {
         }
         // A stream at its end is dropped: the host keeps waking a
         // plugin whose socket stays readable.
-        self.tcp.retain_mut(|stream| loop {
-            match stream.read(&mut buf) {
-                Ok(0) => return false,
-                Ok(n) => {
-                    last = Some(String::from_utf8_lossy(&buf[..n]).trim_end().to_owned());
-                    self.received += 1;
+        self.tcp.retain_mut(|stream| {
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => return false,
+                    Ok(n) => {
+                        last = Some(String::from_utf8_lossy(&buf[..n]).trim_end().to_owned());
+                        self.received += 1;
+                    }
+                    Err(e) => return e.kind() == ErrorKind::WouldBlock,
                 }
-                Err(e) => return e.kind() == ErrorKind::WouldBlock,
             }
         });
         // `received` last: a test that sees it can read `last`.
@@ -117,8 +119,12 @@ fn hold_udp(target: &str) -> Result<UdpSocket, String> {
         .map_err(io_err)?
         .next()
         .ok_or("no address")?;
-    let socket = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
-        .map_err(io_err)?;
+    let socket = UdpSocket::bind(if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .map_err(io_err)?;
     socket.set_nonblocking(true).map_err(io_err)?;
     socket.send_to(b"ping", addr).map_err(io_err)?;
     Ok(socket)

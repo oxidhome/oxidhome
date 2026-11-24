@@ -134,6 +134,17 @@ async fn wait_for(storage: &StorageView, key: &str, at_least: i64) {
     }
 }
 
+/// Wait (real time, bounded) until the rate gate after the first tick
+/// is registered, i.e. that tick returned at virtual time zero.
+async fn wait_for_gate(host: &TestHost) {
+    let clock = host.virtual_clock().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while clock.next_deadline() != Some(GAP) {
+        assert!(Instant::now() < deadline, "no rate gate: {clock:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_udp_reply_wakes_the_plugin_before_its_tick() {
     let host = TestHost::with_virtual_clock().unwrap();
@@ -160,6 +171,7 @@ async fn a_tcp_reply_wakes_the_plugin_before_its_tick() {
     wait_for(&storage, "received", 1).await;
     assert_eq!(string(&storage, "last"), "pong");
     assert_eq!(int(&storage, "ticks"), 1);
+    wait_for_gate(&host).await;
     // Drained and still open: nothing more to wake it for.
     host.advance(GAP * 5).await.unwrap();
     assert_eq!(int(&storage, "ticks"), 1);
@@ -190,13 +202,7 @@ async fn a_flood_is_coalesced_into_one_rate_bounded_wakeup() {
     tokio::time::sleep(QUIET).await;
     assert_eq!(int(&storage, "ticks"), 1);
 
-    // The gate after the first tick is registered (the tick returned).
-    let clock = host.virtual_clock().unwrap();
-    let deadline = Instant::now() + WAIT;
-    while clock.next_deadline() != Some(GAP) {
-        assert!(Instant::now() < deadline, "no rate gate: {clock:?}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_gate(&host).await;
     // Not a moment before the gap ends.
     host.advance(Duration::from_millis(99)).await.unwrap();
     assert_eq!(int(&storage, "ticks"), 1);
