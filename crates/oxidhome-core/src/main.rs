@@ -909,11 +909,14 @@ fn run_device() -> anyhow::Result<()> {
 
 /// Phase 8: `oxidhome tls-pin list [<instance>]` /
 /// `oxidhome tls-pin reset <instance> [<host> [<port>]]` /
+/// `oxidhome tls-pin reset --instance <instance> [<host> [<port>]]` /
 /// `oxidhome tls-pin reset --all`. Offline.
+#[allow(clippy::too_many_lines)]
 fn run_tls_pin() -> anyhow::Result<()> {
     const USAGE: &str = "usage: oxidhome tls-pin list [<instance>]\n       \
-         oxidhome tls-pin reset <instance> [<host> [<port>]]\n       \
-         oxidhome tls-pin reset --all";
+         oxidhome tls-pin reset [--instance] <instance> [<host> [<port>]]\n       \
+         oxidhome tls-pin reset --all\n\
+         (scripts: use --instance, which takes any instance id literally)";
     let args: Vec<String> = std::env::args().skip(2).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let filter = |instance: Option<&str>, host: Option<&str>, port: Option<&str>| {
@@ -935,6 +938,10 @@ fn run_tls_pin() -> anyhow::Result<()> {
         ["list"] => (false, filter(None, None, None)?),
         ["list", instance] => (false, filter(Some(instance), None, None)?),
         ["reset", "--all"] => (true, filter(None, None, None)?),
+        ["reset", "--instance", instance, rest @ ..] if rest.len() <= 2 => (
+            true,
+            filter(Some(instance), rest.first().copied(), rest.get(1).copied())?,
+        ),
         ["reset", instance] if !instance.starts_with('-') => {
             (true, filter(Some(instance), None, None)?)
         }

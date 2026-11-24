@@ -338,26 +338,24 @@ impl Request {
             .write()
             .map_err(|()| fail("body stream"))
             .and_then(|stream| write_body(&stream, &self.body, &pending));
-        let upload = match written {
-            Ok(true) => {
+        let (early, upload) = match written {
+            Ok(Written::All(early)) => {
                 let _ = OutgoingBody::finish(outgoing, None);
-                None
+                (early, None)
             }
-            // Answered mid-upload: the unfinished body stays open until
+            // Refused mid-upload: the unfinished body stays open until
             // the response body is read, since dropping it aborts the
             // exchange.
-            Ok(false) => Some(outgoing),
+            Ok(Written::Refused(response)) => (Some(response), Some(outgoing)),
             // Dropped unfinished: ends the request instead of leaving the
             // host waiting for the rest of the body.
-            Err(_) => None,
+            Err(_) => (None, None),
         };
 
-        pending.subscribe().block();
-        let response = pending
-            .get()
-            .ok_or_else(|| Error::Request("response not ready".into()))?
-            .map_err(|()| Error::Request("response already taken".into()))?
-            .map_err(Error::Http)?;
+        let response = match early {
+            Some(response) => response,
+            None => take_response(&pending)?,
+        };
         let status = response.status();
         let headers = {
             let fields = response.headers();
@@ -407,31 +405,57 @@ impl Head {
     }
 }
 
-/// Write `body` and flush it. Returns `false` when the response arrived
-/// first: a server that answers mid-upload and stops reading would
-/// otherwise block the write for good.
+/// Wait for and take the response.
+fn take_response(pending: &FutureIncomingResponse) -> Result<IncomingResponse, Error> {
+    pending.subscribe().block();
+    pending
+        .get()
+        .ok_or_else(|| Error::Request("response not ready".into()))?
+        .map_err(|()| Error::Request("response already taken".into()))?
+        .map_err(Error::Http)
+}
+
+/// How an upload ended.
+enum Written {
+    /// Whole body sent, with the response if it came first.
+    All(Option<IncomingResponse>),
+    /// The server refused (`3xx` and up) mid-upload; the rest is not sent.
+    Refused(IncomingResponse),
+}
+
+/// Write `body` and flush it. A response that arrives while the write is
+/// blocked is taken: a refusal (`413`) stops the upload, since such a
+/// server may never read the rest; an early `1xx`/`2xx` doesn't, since
+/// such a server may still be reading it.
 fn write_body(
     stream: &OutputStream,
     body: &[u8],
     pending: &FutureIncomingResponse,
-) -> Result<bool, Error> {
+) -> Result<Written, Error> {
     let failed = |e: StreamError| Error::Request(format!("writing the body: {e:?}"));
     let writable = stream.subscribe();
     let answered = pending.subscribe();
+    let mut early = None;
     let mut rest = body;
     let mut flushed = false;
     loop {
         let room = stream.check_write().map_err(failed)?;
         if room == 0 {
-            if crate::bindings::wasi::io::poll::poll(&[&writable, &answered]).contains(&1) {
-                return Ok(false);
+            if early.is_some() {
+                writable.block();
+            } else if crate::bindings::wasi::io::poll::poll(&[&writable, &answered]).contains(&1) {
+                let response = take_response(pending)?;
+                if response.status() >= 300 {
+                    return Ok(Written::Refused(response));
+                }
+                early = Some(response);
             }
             continue;
         }
         if rest.is_empty() {
             // `check-write` is 0 until a flush completes.
             if flushed {
-                return Ok(true);
+                return Ok(Written::All(early));
             }
             stream.flush().map_err(failed)?;
             flushed = true;
