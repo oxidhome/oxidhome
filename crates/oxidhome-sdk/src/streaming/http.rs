@@ -334,22 +334,22 @@ impl Request {
         // (`HTTP-request-denied`, a TLS error) or carries what the server
         // answered anyway (a `413` mid-upload); the write error itself
         // adds nothing.
-        let written = outgoing
-            .write()
-            .map_err(|()| fail("body stream"))
-            .and_then(|stream| write_body(&stream, &self.body, &pending));
+        let written = match outgoing.write() {
+            Ok(stream) => write_body(&stream, &self.body, &pending, self.timeout)?,
+            Err(()) => Written::Broken,
+        };
         let (early, upload) = match written {
-            Ok(Written::All(early)) => {
+            Written::All(early) => {
                 let _ = OutgoingBody::finish(outgoing, None);
                 (early, None)
             }
             // Refused mid-upload: the unfinished body stays open until
             // the response body is read, since dropping it aborts the
             // exchange.
-            Ok(Written::Refused(response)) => (Some(response), Some(outgoing)),
+            Written::Refused(response) => (Some(response), Some(outgoing)),
             // Dropped unfinished: ends the request instead of leaving the
             // host waiting for the rest of the body.
-            Err(_) => (None, None),
+            Written::Broken => (None, None),
         };
 
         let response = match early {
@@ -421,29 +421,42 @@ enum Written {
     All(Option<IncomingResponse>),
     /// The server refused (`3xx` and up) mid-upload; the rest is not sent.
     Refused(IncomingResponse),
+    /// The body stream failed; the response says why.
+    Broken,
 }
 
 /// Write `body` and flush it. A response that arrives while the write is
 /// blocked is taken: a refusal (`413`) stops the upload, since such a
 /// server may never read the rest; an early `1xx`/`2xx` doesn't, since
-/// such a server may still be reading it.
+/// such a server may still be reading it, but once answered, the upload
+/// must keep moving: `timeout` without progress fails it.
+///
+/// An `Err` is the request's outcome (the host's error code, the stall).
 fn write_body(
     stream: &OutputStream,
     body: &[u8],
     pending: &FutureIncomingResponse,
+    timeout: Duration,
 ) -> Result<Written, Error> {
-    let failed = |e: StreamError| Error::Request(format!("writing the body: {e:?}"));
+    use crate::bindings::wasi::clocks::monotonic_clock;
+    use crate::bindings::wasi::io::poll::poll;
     let writable = stream.subscribe();
     let answered = pending.subscribe();
+    let stall = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
     let mut early = None;
     let mut rest = body;
     let mut flushed = false;
     loop {
-        let room = stream.check_write().map_err(failed)?;
+        let Ok(room) = stream.check_write() else {
+            return Ok(Written::Broken);
+        };
         if room == 0 {
             if early.is_some() {
-                writable.block();
-            } else if crate::bindings::wasi::io::poll::poll(&[&writable, &answered]).contains(&1) {
+                let timer = monotonic_clock::subscribe_duration(stall);
+                if !poll(&[&writable, &timer]).contains(&0) {
+                    return Err(Error::Http(ErrorCode::ConnectionWriteTimeout));
+                }
+            } else if poll(&[&writable, &answered]).contains(&1) {
                 let response = take_response(pending)?;
                 if response.status() >= 300 {
                     return Ok(Written::Refused(response));
@@ -457,7 +470,9 @@ fn write_body(
             if flushed {
                 return Ok(Written::All(early));
             }
-            stream.flush().map_err(failed)?;
+            if stream.flush().is_err() {
+                return Ok(Written::Broken);
+            }
             flushed = true;
             continue;
         }
@@ -465,7 +480,9 @@ fn write_body(
             .unwrap_or(usize::MAX)
             .min(rest.len())
             .min(WRITE_CHUNK);
-        stream.write(&rest[..n]).map_err(failed)?;
+        if stream.write(&rest[..n]).is_err() {
+            return Ok(Written::Broken);
+        }
         rest = &rest[n..];
     }
 }
