@@ -191,14 +191,10 @@ pub(crate) enum PreVerifiedBearer {
 #[derive(Clone)]
 pub(crate) struct PreAdmissionInflight(pub(crate) Arc<Semaphore>);
 
-/// Per-token leaky bucket. `tokens` is fractional so refill
-/// under low load isn't rounded to zero. `last_observed`
-/// doubles as the LRU stamp for eviction.
-#[derive(Debug)]
-struct TokenBucket {
-    tokens: f64,
-    last_observed: Instant,
-}
+/// Per-token leaky bucket: the shared [`crate::rate_bucket::Bucket`].
+/// `tokens` is fractional so refill under low load isn't rounded to
+/// zero. `last_observed` doubles as the LRU stamp for eviction.
+type TokenBucket = crate::rate_bucket::Bucket;
 
 /// Shared state the [`rate_limit`] middleware pulls out via
 /// `State`. Cheap to clone (single `Arc`).
@@ -350,10 +346,10 @@ impl RateLimiterState {
         Self {
             inner: Arc::new(RateLimiterInner {
                 buckets: Mutex::new(HashMap::new()),
-                ingress: Mutex::new(TokenBucket {
-                    tokens: f64::from(ingress_capacity),
-                    last_observed: Instant::now(),
-                }),
+                ingress: Mutex::new(TokenBucket::full(
+                    f64::from(ingress_capacity),
+                    Instant::now(),
+                )),
                 ingress_capacity: f64::from(ingress_capacity),
                 ingress_refill_per_second,
                 capacity: f64::from(capacity),
@@ -380,19 +376,11 @@ impl RateLimiterState {
             .ingress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let elapsed_secs = now.duration_since(bucket.last_observed).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed_secs * self.inner.ingress_refill_per_second)
-            .min(self.inner.ingress_capacity);
-        bucket.last_observed = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            Ok(())
-        } else {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let wait_secs =
-                ((1.0 - bucket.tokens) / self.inner.ingress_refill_per_second).ceil() as u64;
-            Err(wait_secs.max(1))
-        }
+        bucket.try_take(
+            now,
+            self.inner.ingress_capacity,
+            self.inner.ingress_refill_per_second,
+        )
     }
 
     /// Refill the caller's bucket based on wall-clock elapsed
@@ -416,27 +404,14 @@ impl RateLimiterState {
             evict_one_lru(&mut buckets);
         }
 
-        let bucket = buckets.entry(key.to_string()).or_insert(TokenBucket {
-            tokens: self.inner.capacity,
-            last_observed: now,
-        });
+        let bucket = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket::full(self.inner.capacity, now));
 
-        let elapsed_secs = now.duration_since(bucket.last_observed).as_secs_f64();
-        bucket.tokens =
-            (bucket.tokens + elapsed_secs * self.inner.refill_per_second).min(self.inner.capacity);
-        bucket.last_observed = now;
-
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            Ok(())
-        } else {
-            // Suggest a retry after enough time to refill one
-            // token. Rounded up to the nearest second; a
-            // client polling faster than that just re-hits 429.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let wait_secs = ((1.0 - bucket.tokens) / self.inner.refill_per_second).ceil() as u64;
-            Err(wait_secs.max(1))
-        }
+        // On a miss, suggest a retry after enough time to refill one
+        // token, rounded up to the nearest second; a client polling
+        // faster than that just re-hits 429.
+        bucket.try_take(now, self.inner.capacity, self.inner.refill_per_second)
     }
 }
 

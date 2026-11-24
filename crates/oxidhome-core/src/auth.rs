@@ -36,17 +36,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod authorize;
+pub mod category;
 pub mod invocation;
 pub mod policy;
+pub mod sensitive;
 
 pub use authorize::{
     Action, AuditLevel, Authority, Decision, Obligations, Reason, Resource, ResourceKind, authorize,
 };
+pub use category::{DeviceCategory, DeviceClass, SensitiveCategory, SensitiveSet};
 pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
 #[cfg(test)]
 pub use policy::authorize_device_command;
 pub use policy::{
-    DEVICE_COMMAND_ENFORCED, EnforcedConstraint, TokenPolicy, ToolConstraint, parse_policy,
+    DEVICE_COMMAND_ENFORCED, EnforcedConstraint, SensitiveGrant, TokenPolicy, ToolConstraint,
+    parse_policy,
 };
 
 /// What kind of caller this `Actor` represents. Drives where the
@@ -102,6 +106,13 @@ struct ActorInner {
     // shape). Empty allocation is one small
     // heap word, not per-actor overhead.
     constraints: HashMap<String, policy::ToolConstraint>,
+    // H6 slice 2: explicit sensitive-category grants from the token
+    // policy (or the `mcp-stdio` operator flag). Empty for plugins.
+    sensitive: Vec<policy::SensitiveGrant>,
+    // H6 slice 2: the token is the host-recorded owner (bootstrap or
+    // `recover-admin-token`), read from `auth_token.owner`. Never set
+    // from a label or from caller input.
+    owner: bool,
 }
 
 impl Actor {
@@ -121,6 +132,8 @@ impl Actor {
                 // gating consults the manifest directly.
                 scopes: Vec::new(),
                 constraints: HashMap::new(),
+                sensitive: Vec::new(),
+                owner: false,
             }),
         }
     }
@@ -158,8 +171,60 @@ impl Actor {
                 id: token_id.into(),
                 scopes,
                 constraints,
+                sensitive: Vec::new(),
+                owner: false,
             }),
         }
+    }
+
+    /// Construct an external `Actor` from a verified token's whole
+    /// policy: scopes, 14.4 constraints and sensitive grants. `owner`
+    /// is the token's host-recorded owner flag (`auth_token.owner`).
+    #[must_use]
+    pub fn from_token_policy(
+        token_id: impl Into<String>,
+        policy: policy::TokenPolicy,
+        owner: bool,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ActorInner {
+                kind: ActorKind::Api,
+                id: token_id.into(),
+                scopes: policy.scopes,
+                constraints: policy.constraints,
+                sensitive: policy.sensitive,
+                owner,
+            }),
+        }
+    }
+
+    /// A copy of this actor with `grants` as its sensitive grants.
+    /// The `mcp-stdio` session uses it for the operator's
+    /// `--allow-sensitive` flag.
+    #[must_use]
+    pub fn with_sensitive(&self, grants: Vec<policy::SensitiveGrant>) -> Self {
+        Self {
+            inner: Arc::new(ActorInner {
+                kind: self.inner.kind,
+                id: self.inner.id.clone(),
+                scopes: self.inner.scopes.clone(),
+                constraints: self.inner.constraints.clone(),
+                sensitive: grants,
+                owner: self.inner.owner,
+            }),
+        }
+    }
+
+    /// Explicit sensitive-category grants (H6 slice 2).
+    #[must_use]
+    pub fn sensitive_grants(&self) -> &[policy::SensitiveGrant] {
+        &self.inner.sensitive
+    }
+
+    /// `true` when this actor's token is the host-recorded owner.
+    #[must_use]
+    pub fn is_owner(&self) -> bool {
+        self.inner.owner
     }
 
     /// What kind of caller this is.

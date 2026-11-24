@@ -74,6 +74,11 @@ pub struct TokenRecord {
     pub created_ms: i64,
     pub last_used_ms: Option<i64>,
     pub revoked_ms: Option<i64>,
+    /// H6 slice 2: `true` for the owner token, the one the host minted
+    /// at first-run bootstrap or with `recover-admin-token`. Set only
+    /// by those two code paths (and the migration's backfill from
+    /// their audit rows); never from a label or an API call.
+    pub owner: bool,
 }
 
 /// Newly-minted token. The plaintext field is the **only** copy of
@@ -151,7 +156,7 @@ impl TokenStore {
             .db
             .read(move |conn| -> Result<Option<TokenRecord>, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token WHERE id = ?1",
                 )?;
                 let row = stmt
@@ -174,7 +179,7 @@ impl TokenStore {
             .db
             .read(|conn| -> Result<Vec<TokenRecord>, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token ORDER BY created_ms ASC",
                 )?;
                 let iter = stmt.query_map([], row_to_record)?;
@@ -229,7 +234,7 @@ impl TokenStore {
         self.db
             .read(move |conn| -> Result<TokenRecord, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms \
+                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token WHERE hash = ?1",
                 )?;
                 let row = stmt
@@ -333,7 +338,7 @@ impl TokenStore {
     }
 
     /// Row count. Used by tests + the CLI's future `token list`.
-    /// (Bootstrap goes through [`Self::insert_if_empty`] so the
+    /// (Bootstrap goes through [`Self::insert_owner_if_empty`] so the
     /// check-then-insert race doesn't matter.)
     pub fn count(&self) -> Result<u64, TokenError> {
         let n = self.db.read(|conn| -> Result<i64, TokenError> {
@@ -358,7 +363,7 @@ impl TokenStore {
         scope_json: &[u8],
     ) -> Result<Option<IssuedToken>, TokenError> {
         let issued = Self::generate();
-        Ok(if self.insert_if_empty(&issued, label, scope_json)? {
+        Ok(if self.insert_first(&issued, label, scope_json, false)? {
             Some(issued)
         } else {
             None
@@ -372,7 +377,7 @@ impl TokenStore {
     /// committed, so the plaintext can be durably written to disk
     /// first. A row whose secret was never delivered is exactly
     /// the unrecoverable state M4 removes. Pair with
-    /// [`Self::insert_if_empty`] or [`Self::insert_and_revoke`].
+    /// [`Self::insert_owner_if_empty`] or [`Self::insert_owner_and_revoke`].
     #[must_use]
     pub fn generate() -> IssuedToken {
         let secret = generate_secret();
@@ -381,8 +386,9 @@ impl TokenStore {
         IssuedToken { id, plaintext }
     }
 
-    /// Insert a token produced by [`Self::generate`] iff the table
-    /// is empty, inside one `BEGIN IMMEDIATE` transaction (see
+    /// Insert a token produced by [`Self::generate`] **as the owner**
+    /// (when `scope_json` is the minted `["*"]`) iff the table is
+    /// empty — the first-run bootstrap — inside one `BEGIN IMMEDIATE` transaction (see
     /// [`Self::create_if_empty`] for the race argument). Returns
     /// `true` if the row was inserted.
     ///
@@ -390,13 +396,23 @@ impl TokenStore {
     ///
     /// [`TokenError::Malformed`] if `issued.plaintext` isn't a token
     /// this module produced; [`TokenError::Sqlite`] on DB failure.
-    pub fn insert_if_empty(
+    pub fn insert_owner_if_empty(
         &self,
         issued: &IssuedToken,
         label: &str,
         scope_json: &[u8],
     ) -> Result<bool, TokenError> {
-        let row = PendingRow::new(issued, label, scope_json)?;
+        self.insert_first(issued, label, scope_json, true)
+    }
+
+    fn insert_first(
+        &self,
+        issued: &IssuedToken,
+        label: &str,
+        scope_json: &[u8],
+        owner: bool,
+    ) -> Result<bool, TokenError> {
+        let row = PendingRow::new(issued, label, scope_json, owner)?;
         self.durable_write(move |conn| -> Result<bool, TokenError> {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let existing: i64 =
@@ -411,9 +427,14 @@ impl TokenStore {
         })
     }
 
-    /// Insert a token produced by [`Self::generate`] and revoke
-    /// every still-active id in `revoke_ids`, all in one
+    /// Insert a token produced by [`Self::generate`] **as the owner**
+    /// and revoke every still-active id in `revoke_ids`, all in one
     /// transaction — the offline recovery command's rotation step.
+    /// Any other live owner is revoked in the same transaction and
+    /// listed in the result. The row is marked owner only when
+    /// `scope_json` is the minted `["*"]`; this and [`Self::insert_owner_if_empty`] are the only
+    /// owner-minting inserts (H6 slice 2): every other insert
+    /// ([`Self::create`], [`Self::create_if_empty`]) is a plain token.
     /// Either the new token exists *and* the old ones are revoked,
     /// or nothing changed. Returns the ids that were newly revoked
     /// (already-revoked or unknown ids are skipped).
@@ -422,14 +443,14 @@ impl TokenStore {
     ///
     /// [`TokenError::Malformed`] if `issued.plaintext` isn't a token
     /// this module produced; [`TokenError::Sqlite`] on DB failure.
-    pub fn insert_and_revoke(
+    pub fn insert_owner_and_revoke(
         &self,
         issued: &IssuedToken,
         label: &str,
         scope_json: &[u8],
         revoke_ids: &[String],
     ) -> Result<Vec<String>, TokenError> {
-        let row = PendingRow::new(issued, label, scope_json)?;
+        let row = PendingRow::new(issued, label, scope_json, true)?;
         let revoke_ids = revoke_ids.to_vec();
         let now = row.created_ms;
         self.durable_write(move |conn| -> Result<Vec<String>, TokenError> {
@@ -445,9 +466,48 @@ impl TokenStore {
                     revoked.push(id);
                 }
             }
+            // One owner at a time: a still-live previous owner is
+            // revoked with the rotation even when the caller didn't
+            // name it (H6 slice 2; a unique index enforces it too).
+            if row.is_owner() {
+                let previous: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id FROM auth_token WHERE owner = 1 AND revoked_ms IS NULL",
+                    )?;
+                    stmt.query_map([], |r| r.get(0))?
+                        .collect::<Result<_, _>>()?
+                };
+                for id in previous {
+                    tx.execute(
+                        "UPDATE auth_token SET revoked_ms = ?1 WHERE id = ?2",
+                        params![now, id],
+                    )?;
+                    revoked.push(id);
+                }
+            }
             row.insert(&tx)?;
             tx.commit()?;
             Ok(revoked)
+        })
+    }
+
+    /// Replace a token's policy blob (`scope_json`). The offline
+    /// `oxidhome token grant-sensitive` / `revoke-sensitive` commands
+    /// use it; the API never does. Returns `false` when no live token
+    /// has that id.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Sqlite`] on DB failure.
+    pub fn set_policy(&self, token_id: &str, scope_json: &[u8]) -> Result<bool, TokenError> {
+        let id_owned = token_id.to_string();
+        let blob = scope_json.to_vec();
+        self.durable_write(move |conn| -> Result<bool, TokenError> {
+            let n = conn.execute(
+                "UPDATE auth_token SET scope_json = ?2 WHERE id = ?1 AND revoked_ms IS NULL",
+                params![id_owned, blob],
+            )?;
+            Ok(n > 0)
         })
     }
 
@@ -526,10 +586,16 @@ struct PendingRow {
     hash: Vec<u8>,
     scope_json: Vec<u8>,
     created_ms: i64,
+    owner: bool,
 }
 
 impl PendingRow {
-    fn new(issued: &IssuedToken, label: &str, scope_json: &[u8]) -> Result<Self, TokenError> {
+    fn new(
+        issued: &IssuedToken,
+        label: &str,
+        scope_json: &[u8],
+        owner: bool,
+    ) -> Result<Self, TokenError> {
         let secret = parse_token(&issued.plaintext).ok_or(TokenError::Malformed)?;
         let hash = sha256(&secret);
         let id = derive_id(&hash);
@@ -542,20 +608,31 @@ impl PendingRow {
             hash: hash.to_vec(),
             scope_json: scope_json.to_vec(),
             created_ms: now_ms(),
+            owner,
         })
     }
 
+    /// Whether the row is inserted as the owner.
+    fn is_owner(&self) -> bool {
+        self.owner && self.scope_json.as_slice() == br#"["*"]"#
+    }
+
+    /// Insert the row, as the owner token when it was built for one
+    /// (bootstrap or recovery, H6 slice 2) and its scope is the minted
+    /// `["*"]`.
     fn insert(&self, conn: &rusqlite::Connection) -> Result<(), TokenError> {
+        let owner = self.is_owner();
         conn.execute(
             "INSERT INTO auth_token \
-               (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+               (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms, owner) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
             params![
                 self.id,
                 self.label,
                 self.hash,
                 self.scope_json,
-                self.created_ms
+                self.created_ms,
+                owner
             ],
         )?;
         Ok(())
@@ -570,6 +647,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRecord> {
         created_ms: row.get(3)?,
         last_used_ms: row.get(4)?,
         revoked_ms: row.get(5)?,
+        owner: row.get::<_, i64>(6)? != 0,
     })
 }
 
@@ -866,6 +944,8 @@ mod tests {
             .expect("first call");
         assert!(first.is_some(), "first call should mint");
         assert_eq!(store.count().unwrap(), 1);
+        // A generic insert is never the owner (H6 slice 2).
+        assert!(!store.list().unwrap()[0].owner);
 
         let second = store
             .create_if_empty("admin", b"[\"*\"]")
@@ -875,13 +955,13 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_revoke_is_atomic_rotation() {
+    fn insert_owner_and_revoke_is_atomic_rotation() {
         let store = TokenStore::new(fresh());
         let old = store.create("admin", b"[\"*\"]").unwrap();
         let other = store.create("ci", b"[]").unwrap();
         let new = TokenStore::generate();
         let revoked = store
-            .insert_and_revoke(
+            .insert_owner_and_revoke(
                 &new,
                 "admin",
                 b"[\"*\"]",
@@ -917,19 +997,19 @@ mod tests {
 
         reset();
         let first = TokenStore::generate();
-        assert!(store.insert_if_empty(&first, "admin", b"[]").unwrap());
-        assert_eq!(sync(), 1, "insert_if_empty");
+        assert!(store.insert_owner_if_empty(&first, "admin", b"[]").unwrap());
+        assert_eq!(sync(), 1, "insert_owner_if_empty");
 
         reset();
         store
-            .insert_and_revoke(
+            .insert_owner_and_revoke(
                 &TokenStore::generate(),
                 "admin",
                 b"[]",
                 std::slice::from_ref(&first.id),
             )
             .unwrap();
-        assert_eq!(sync(), 1, "insert_and_revoke");
+        assert_eq!(sync(), 1, "insert_owner_and_revoke");
 
         reset();
         let unused = store.create("x", b"[]").unwrap();
@@ -947,7 +1027,7 @@ mod tests {
         reset();
         assert!(
             store
-                .insert_and_revoke(&TokenStore::generate(), "admin", b"[]", &[])
+                .insert_owner_and_revoke(&TokenStore::generate(), "admin", b"[]", &[])
                 .is_err()
         );
         assert_eq!(sync(), 1, "error path");
@@ -959,7 +1039,7 @@ mod tests {
         let mut forged = TokenStore::generate();
         forged.id = "not-the-derived-id".into();
         assert!(matches!(
-            store.insert_if_empty(&forged, "admin", b"[]"),
+            store.insert_owner_if_empty(&forged, "admin", b"[]"),
             Err(TokenError::Malformed)
         ));
         assert_eq!(store.count().unwrap(), 0);

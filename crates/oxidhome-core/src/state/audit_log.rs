@@ -172,7 +172,15 @@ pub struct AuditEntry {
     /// which keeps its coarse `success` / `failed` meaning.
     #[serde(default)]
     pub command_outcome: Option<String>,
+    /// H6 slice 2: `Some("warn")` on the extra row an allowed sensitive
+    /// action writes (lock, opener, alarm commands; camera bytes);
+    /// `None` (info) everywhere else.
+    #[serde(default)]
+    pub level: Option<String>,
 }
+
+/// Audit `level` of the row an allowed sensitive action writes.
+pub const AUDIT_LEVEL_WARN: &str = "warn";
 
 /// Query shape for [`AuditLog::query`]. Every field is optional and
 /// AND-combined; `None` everywhere returns the most recent `limit`
@@ -196,6 +204,9 @@ pub struct AuditQuery {
     /// Exact `call_id` match (H6): every row one invocation produced —
     /// the entry point's row plus its delegated `call-service` hops.
     pub call_id: Option<String>,
+    /// Exact `level` match (H6 slice 2): `warn` returns the rows of
+    /// allowed sensitive actions.
+    pub level: Option<String>,
     /// Cursor-based pagination floor: return only rows strictly
     /// *older* than `(before.0, before.1)` in `(intent_ms, id)`
     /// order. The default `ORDER BY intent_ms DESC, id DESC LIMIT
@@ -490,9 +501,35 @@ impl AuditLog {
     ///
     /// Forwards any `rusqlite` error.
     pub fn record_completed(&self, entry: &AuditEntry) -> Result<u64, AuditLogError> {
+        self.insert_completed(entry, false)
+    }
+
+    /// [`Self::record_completed`] committed at `synchronous = FULL`:
+    /// for a row that must survive power loss once the action it
+    /// records has happened (H6 slice 2: a sensitive command's `warn`
+    /// row).
+    ///
+    /// # Errors
+    ///
+    /// Forwards any `rusqlite` error.
+    pub fn record_completed_durable(&self, entry: &AuditEntry) -> Result<u64, AuditLogError> {
+        self.insert_completed(entry, true)
+    }
+
+    fn insert_completed(&self, entry: &AuditEntry, durable: bool) -> Result<u64, AuditLogError> {
         let now = now_unix_ms();
         let id = self.db.write(|conn| -> Result<i64, AuditLogError> {
-            Self::insert_completed_row(conn, now, entry)
+            if durable {
+                conn.pragma_update(None, "synchronous", "FULL")?;
+            }
+            let result = Self::insert_completed_row(conn, now, entry);
+            if durable && let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                tracing::warn!(
+                    error = %err,
+                    "failed to restore synchronous = NORMAL after durable audit row",
+                );
+            }
+            result
         })?;
         #[allow(clippy::cast_sign_loss)]
         Ok(id as u64)
@@ -509,8 +546,8 @@ impl AuditLog {
     ) -> Result<i64, AuditLogError> {
         conn.execute(
             "INSERT INTO audit_event \
-             (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome) \
-             VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, level) \
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 now,
                 &entry.token_id,
@@ -527,6 +564,7 @@ impl AuditLog {
                 scrub_opt(entry.invocation.as_deref()),
                 &entry.command_id,
                 &entry.command_outcome,
+                &entry.level,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -552,7 +590,7 @@ impl AuditLog {
         use std::fmt::Write as _;
 
         let mut sql = String::from(
-            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome \
+            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, level \
              FROM audit_event WHERE 1=1",
         );
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -580,6 +618,15 @@ impl AuditLog {
         }
         if let Some(c) = &filter.call_id {
             push(&mut binds, &mut sql, "call_id =", c.clone().into());
+        }
+        if let Some(l) = &filter.level {
+            // Ordinary rows store NULL for `info`.
+            push(
+                &mut binds,
+                &mut sql,
+                "COALESCE(level, 'info') =",
+                l.clone().into(),
+            );
         }
         // Cursor pagination — lexicographic `(intent_ms, id) <
         // (before_ms, before_id)`. SQLite's row-value comparison
@@ -639,6 +686,7 @@ impl AuditLog {
                     invocation: row.get(14)?,
                     command_id: row.get(15)?,
                     command_outcome: row.get(16)?,
+                    level: row.get(17)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -766,6 +814,8 @@ mod tests {
             invocation: None,
             command_id: None,
             command_outcome: None,
+
+            level: None,
         }
     }
 
@@ -930,6 +980,8 @@ mod tests {
             invocation: None,
             command_id: None,
             command_outcome: None,
+
+            level: None,
         };
         log.record_completed(&entry).unwrap();
         let rows = log.query(&AuditQuery::default(), 1).unwrap();
@@ -962,6 +1014,8 @@ mod tests {
                 invocation: None,
                 command_id: None,
                 command_outcome: None,
+
+                level: None,
             }
         }
         let log = store();
@@ -1004,6 +1058,49 @@ mod tests {
         assert_eq!(log.count().unwrap(), 5);
     }
 
+    /// `level=info` finds ordinary rows (stored as NULL); `level=warn`
+    /// only warn rows.
+    #[test]
+    fn level_filter_treats_null_as_info() {
+        let log = AuditLog::new(Arc::new(Db::open_in_memory().unwrap()));
+        let entry = |level: Option<&str>| AuditEntry {
+            id: 0,
+            intent_ms: 0,
+            finalized_ms: None,
+            token_id: "tok".into(),
+            actor_kind: "api".into(),
+            method: "GET".into(),
+            path: "/x".into(),
+            status: 200,
+            decision: "allow".into(),
+            required_scope: None,
+            execution_outcome: None,
+            domain_error: None,
+            credential_fp: None,
+            call_id: None,
+            invocation: None,
+            command_id: None,
+            command_outcome: None,
+            level: level.map(str::to_owned),
+        };
+        log.record_completed(&entry(None)).unwrap();
+        log.record_completed(&entry(Some(AUDIT_LEVEL_WARN)))
+            .unwrap();
+        let count = |level: &str| {
+            log.query(
+                &AuditQuery {
+                    level: Some(level.into()),
+                    ..AuditQuery::default()
+                },
+                10,
+            )
+            .unwrap()
+            .len()
+        };
+        assert_eq!(count("info"), 1);
+        assert_eq!(count("warn"), 1);
+    }
+
     /// `record_intent_durable` writes the same pending row as
     /// `record_intent` and restores `synchronous = NORMAL`.
     #[test]
@@ -1030,6 +1127,8 @@ mod tests {
             invocation: None,
             command_id: None,
             command_outcome: None,
+
+            level: None,
         };
         let id = log.record_intent_durable(&entry).unwrap();
         let sync: i64 = db

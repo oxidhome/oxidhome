@@ -621,6 +621,29 @@ pub struct Device {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
+    /// Host-derived category (`lock`, `opener`, `alarm`, `camera`,
+    /// `light`, `climate`, `media`, `switch`, `sensor` or `other`), after
+    /// any operator raise.
+    ///
+    /// Field 4: `category`
+    #[serde(
+        rename = "category",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub category: ::buffa::alloc::string::String,
+    /// Sensitive categories the device falls under (`lock`, `opener`,
+    /// `alarm`, `camera`). A token needs an explicit grant for each: no
+    /// scope, the wildcard included, reaches a command on a lock, opener
+    /// or alarm, or a camera's bytes.
+    ///
+    /// Field 5: `sensitive`
+    #[serde(
+        rename = "sensitive",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -631,6 +654,8 @@ impl ::core::fmt::Debug for Device {
             .field("device_id", &self.device_id)
             .field("owner_instance", &self.owner_instance)
             .field("name", &self.name)
+            .field("category", &self.category)
+            .field("sensitive", &self.sensitive)
             .finish()
     }
 }
@@ -672,6 +697,12 @@ impl ::buffa::Message for Device {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
+        if !self.category.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.category) as u64;
+        }
+        for v in &self.sensitive {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -690,6 +721,12 @@ impl ::buffa::Message for Device {
         }
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(3u32, &self.name, buf);
+        }
+        if !self.category.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.category, buf);
+        }
+        for v in &self.sensitive {
+            ::buffa::types::put_string_field(5u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -725,6 +762,24 @@ impl ::buffa::Message for Device {
                 )?;
                 ::buffa::types::merge_string(&mut self.name, buf)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.category, buf)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::decode_string(buf)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                self.sensitive.push(__elem);
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -736,6 +791,8 @@ impl ::buffa::Message for Device {
         self.device_id.clear();
         self.owner_instance.clear();
         self.name.clear();
+        self.category.clear();
+        self.sensitive.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

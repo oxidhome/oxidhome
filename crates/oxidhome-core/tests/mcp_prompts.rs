@@ -610,13 +610,14 @@ async fn get_prompt_draft_automation_body_references_devices_and_correct_scope()
 /// `motion-sensor` as example capability names, but the
 /// resource never serialises those — built-ins are `switch`,
 /// `dimmer`, `color-light`, `sensor`, `button`,
-/// `video-stream`, `audio-stream`, and anything else appears
+/// `video-stream`, `audio-stream` (and, since H6 slice 2, `lock`,
+/// `opener`, `alarm-panel`, `siren`), and anything else appears
 /// as `extension(<namespace>/<name>@<version>)` (see `capability_name` in
 /// `runtime/state.rs`). Locking in that the body only mentions
 /// real built-in names AND explicitly calls out the
 /// `extension(...)` wire form for anything else, so a
-/// planner can't emit `capability: "lock"` when the actual
-/// wire value would be `extension(com.acme/lock@1)`.
+/// planner can't emit a bare custom name when the actual
+/// wire value would be `extension(com.acme/sprinkler@1)`.
 #[tokio::test(flavor = "current_thread")]
 async fn get_prompt_draft_automation_body_uses_real_capability_wire_names() {
     let engine = Engine::new().expect("engine");
@@ -646,7 +647,14 @@ async fn get_prompt_draft_automation_body_uses_real_capability_wire_names() {
         "body must document the extension(...) wire form; got:\n{text}",
     );
     // Body MUST reference real built-in names.
-    for real_name in ["switch", "dimmer", "color-light", "sensor"] {
+    for real_name in [
+        "switch",
+        "dimmer",
+        "color-light",
+        "sensor",
+        "lock",
+        "alarm-panel",
+    ] {
         assert!(
             text.contains(real_name),
             "body must reference the real built-in capability `{real_name}`; got:\n{text}",

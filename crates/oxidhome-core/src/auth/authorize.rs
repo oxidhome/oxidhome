@@ -9,12 +9,14 @@
 //! [`Obligations`] that come with an allow.
 //!
 //! The decision is made against the root principal's resolved
-//! [`Authority`] carried on the [`InvocationContext`]: its scopes and
-//! its 14.4 constraints. Nothing is read from the request itself.
+//! [`Authority`] carried on the [`InvocationContext`]: its scopes, its
+//! 14.4 constraints, its sensitive grants and owner flag. Nothing is
+//! read from the request itself.
 //!
 //! # Evaluator
 //!
-//! The evaluator reproduces the token scope semantics exactly:
+//! The evaluator reproduces the token scope semantics, then adds the
+//! sensitive-category rule:
 //!
 //! 1. Each action maps to the one scope that has always gated it
 //!    (`Action::legacy_scope`). A token holds the action when its scope
@@ -28,6 +30,24 @@
 //!    constraint only applies to a resource that names its target; a
 //!    collection-level check ([`Resource::Collection`], [`Resource::Host`])
 //!    is the flat scope alone.
+//! 3. **Sensitive categories.** A command on a device whose class
+//!    ([`DeviceClass`], host-derived) includes `lock`, `opener` or
+//!    `alarm`, and `blob.read` of camera bytes (a camera device, or a
+//!    blob of a camera instance), additionally need a
+//!    [`SensitiveGrant`] covering every such category and the device
+//!    ([`Reason::MissingSensitive`], label `sensitive:<category>`).
+//!    The wildcard scope never satisfies this; the owner token
+//!    ([`Authority::is_owner`]) does. An allow carries
+//!    [`Obligations`] — `warn` audit level, the categories, and a
+//!    per-category [`RateLimit`] for non-owners — which the caller
+//!    meets with [`crate::auth::sensitive::SensitiveGuard`] before it
+//!    acts. Collection-level checks are never sensitive.
+//! 4. [`Action::PolicyManage`] (category overrides) is the owner's
+//!    alone; no scope grants it.
+//!
+//! The parity tests (`parity.rs`) pin that steps 1 and 2 match the
+//! checks they replaced on non-sensitive targets, and list each
+//! intentional departure on sensitive ones.
 //!
 //! Plugin principals are still authorized by their manifest grants at
 //! their own call sites (`consumes_services`, `reads_state`,
@@ -46,8 +66,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::Actor;
+use super::category::{DeviceClass, SensitiveCategory, SensitiveSet};
 use super::invocation::InvocationContext;
-use super::policy::{DEVICE_COMMAND_DENIED_SENTINEL, DEVICE_COMMAND_ENFORCED, ToolConstraint};
+use super::policy::{
+    DEVICE_COMMAND_DENIED_SENTINEL, DEVICE_COMMAND_ENFORCED, SensitiveGrant, ToolConstraint,
+};
 use crate::api::scopes::{self, Scope};
 
 /// What the caller wants to do. Closed: a new action is a host change,
@@ -234,10 +257,17 @@ pub enum Resource {
 }
 
 impl Resource {
-    /// One device, addressed by its host-minted `dev-…` id.
+    /// One device, addressed by its host-minted `dev-…` id, with the
+    /// class the host derived for it. Build it with
+    /// [`crate::state::DeviceRegistry::resource`], which reads the
+    /// class from the registry and the durable `device_meta` floor;
+    /// never from caller input.
     #[must_use]
-    pub fn device(id: impl Into<String>) -> Self {
-        Self::Device(DeviceResource { id: id.into() })
+    pub fn device(id: impl Into<String>, class: DeviceClass) -> Self {
+        Self::Device(DeviceResource {
+            id: id.into(),
+            class,
+        })
     }
 
     /// One installed plugin.
@@ -257,12 +287,16 @@ impl Resource {
         })
     }
 
-    /// One blob owned by `instance_id`.
+    /// One blob owned by `instance_id`. `camera` is the host's
+    /// classification of the owning instance: `true` when it has ever
+    /// registered a camera-category device (blobs carry no provenance
+    /// of their own, so a camera plugin's blobs are all camera blobs).
     #[must_use]
-    pub fn blob(instance_id: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn blob(instance_id: impl Into<String>, name: impl Into<String>, camera: bool) -> Self {
         Self::Blob(BlobResource {
             instance_id: instance_id.into(),
             name: name.into(),
+            camera,
         })
     }
 
@@ -284,7 +318,9 @@ impl Resource {
         Self::Collection(ResourceKind::Event)
     }
 
-    /// Blob payloads in general (M7 byte withholding).
+    /// Blob payloads in general: the `blobs:read` pre-check. Never
+    /// sensitive, so it never decides whether a camera's bytes are
+    /// released; that is `blob.read` on the device or blob itself.
     #[must_use]
     pub const fn blobs() -> Self {
         Self::Collection(ResourceKind::Blob)
@@ -309,10 +345,12 @@ impl Resource {
     }
 }
 
-/// Device attributes the host decides on. Today: the id.
+/// Device attributes the host decides on: the id and the
+/// host-derived class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceResource {
     id: String,
+    class: DeviceClass,
 }
 
 impl DeviceResource {
@@ -320,6 +358,12 @@ impl DeviceResource {
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Host-derived category and sensitive set.
+    #[must_use]
+    pub fn class(&self) -> DeviceClass {
+        self.class
     }
 }
 
@@ -363,6 +407,7 @@ impl InstanceResource {
 pub struct BlobResource {
     instance_id: String,
     name: String,
+    camera: bool,
 }
 
 impl BlobResource {
@@ -376,6 +421,12 @@ impl BlobResource {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// `true` when the owning instance is a camera source.
+    #[must_use]
+    pub fn is_camera(&self) -> bool {
+        self.camera
     }
 }
 
@@ -427,6 +478,8 @@ struct AuthorityInner {
     token_id: Option<String>,
     scopes: Vec<String>,
     constraints: HashMap<String, ToolConstraint>,
+    sensitive: Vec<SensitiveGrant>,
+    owner: bool,
 }
 
 impl PartialEq for Authority {
@@ -434,6 +487,8 @@ impl PartialEq for Authority {
         self.token_id() == other.token_id()
             && self.scopes() == other.scopes()
             && self.constraints() == other.constraints()
+            && self.sensitive_grants() == other.sensitive_grants()
+            && self.owner_flag() == other.owner_flag()
     }
 }
 
@@ -459,6 +514,8 @@ impl Authority {
                 token_id,
                 scopes,
                 constraints,
+                sensitive: Vec::new(),
+                owner: false,
             })),
         }
     }
@@ -519,6 +576,34 @@ impl Authority {
             Source::Actor { actor, .. } => actor.constraints(),
         }
     }
+
+    /// Explicit sensitive-category grants (H6 slice 2).
+    #[must_use]
+    pub fn sensitive_grants(&self) -> &[SensitiveGrant] {
+        match &self.source {
+            Source::Owned(inner) => &inner.sensitive,
+            Source::Actor { actor, .. } => actor.sensitive_grants(),
+        }
+    }
+
+    fn owner_flag(&self) -> bool {
+        match &self.source {
+            Source::Owned(inner) => inner.owner,
+            // A local-process grant is never the owner, whatever the
+            // actor says: the owner is a token the host minted.
+            Source::Actor { actor, token } => *token && actor.is_owner(),
+        }
+    }
+
+    /// `true` for the owner token: the token the host recorded as the
+    /// bootstrap or `recover-admin-token` admin (`auth_token.owner`),
+    /// still holding the wildcard scope. The owner holds every
+    /// sensitive category. A token's label is not proof, and no
+    /// caller input can set this.
+    #[must_use]
+    pub fn is_owner(&self) -> bool {
+        self.owner_flag() && self.scopes().iter().any(|s| s == scopes::WILDCARD)
+    }
 }
 
 /// Why a decision came out the way it did. Not `Copy`: later slices
@@ -549,6 +634,25 @@ pub enum Reason {
     },
     /// Denied: no scope grants this action.
     NoPermit,
+    /// Allowed on a sensitive resource: the token holds `scope` and
+    /// either an explicit grant for every sensitive category the
+    /// resource falls under, or is the owner.
+    Sensitive {
+        /// Scope that granted the action.
+        scope: &'static str,
+        /// The sensitive categories the resource falls under.
+        categories: SensitiveSet,
+        /// `true` when the owner token's standing grant decided.
+        owner: bool,
+    },
+    /// Denied: the token holds the scope, but no explicit grant covers
+    /// `category` on this resource. A wildcard scope never does.
+    MissingSensitive {
+        /// The first category without a grant.
+        category: SensitiveCategory,
+    },
+    /// Allowed: an owner-only host action (`policy.manage`).
+    Owner,
 }
 
 /// Audit label for [`Reason::NoPermit`].
@@ -561,10 +665,11 @@ impl Reason {
     #[must_use]
     pub fn audit_label(&self) -> Option<&'static str> {
         match self {
-            Reason::Scope { .. } => None,
+            Reason::Scope { .. } | Reason::Sensitive { .. } | Reason::Owner => None,
             Reason::MissingScope { scope } => Some(*scope),
             Reason::Constraint { sentinel, .. } => Some(*sentinel),
             Reason::NoPermit => Some(NO_PERMIT_LABEL),
+            Reason::MissingSensitive { category } => Some(category.deny_label()),
         }
     }
 }
@@ -575,11 +680,13 @@ pub enum AuditLevel {
     /// The transport's ordinary per-request row.
     #[default]
     Info,
-    /// A row at `warn` (sensitive allows; not produced yet).
+    /// An extra row at `warn`, written before the action runs:
+    /// every allowed sensitive action.
     Warn,
 }
 
-/// A rate limit an allowed action must pass. Not produced yet.
+/// A rate limit an allowed action must pass, per principal and per
+/// sensitive category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimit {
     /// Allowed calls per window.
@@ -588,15 +695,33 @@ pub struct RateLimit {
     pub per: Duration,
 }
 
-/// What the caller must do on top of an allow. Only `audit_level` is
-/// set today, always [`AuditLevel::Info`]; `rate_limit` and
-/// `require_confirmation` stay unset until sensitive categories land.
+impl RateLimit {
+    /// The limit for one sensitive category: 10 commands per 10
+    /// minutes for locks, openers and alarms; 120 camera byte releases
+    /// per 10 minutes.
+    #[must_use]
+    pub const fn for_category(category: SensitiveCategory) -> Self {
+        Self {
+            max: if category.guards_commands() { 10 } else { 120 },
+            per: Duration::from_mins(10),
+        }
+    }
+}
+
+/// What the caller must do on top of an allow. A sensitive allow sets
+/// `audit_level` to [`AuditLevel::Warn`] and names its `sensitive`
+/// categories; a non-owner sensitive allow also carries a
+/// `rate_limit` (the owner is not rate limited). Confirmation is not
+/// produced yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Obligations {
     /// How the allow is audited.
     pub audit_level: AuditLevel,
-    /// Rate limit to apply, if any.
+    /// Rate limit to apply, if any: each category in `sensitive` is
+    /// charged against its own [`RateLimit::for_category`] bucket.
     pub rate_limit: Option<RateLimit>,
+    /// The sensitive categories this allow touched.
+    pub sensitive: SensitiveSet,
     /// Whether the request must carry a fresh confirmation.
     pub require_confirmation: bool,
 }
@@ -655,6 +780,11 @@ pub fn authorize(ctx: &InvocationContext, action: Action, resource: &Resource) -
 #[must_use]
 pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resource) -> Decision {
     let Some(scope) = action.legacy_scope() else {
+        // Owner-only host actions: no scope grants them, so a wildcard
+        // admin token can't either.
+        if action == Action::PolicyManage && authority.is_owner() {
+            return Decision::allow(Reason::Owner);
+        }
         return Decision::deny(Reason::NoPermit);
     };
     if !scope.satisfied_by(authority.scopes()) {
@@ -672,9 +802,72 @@ pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resourc
             sentinel: rule.sentinel,
         });
     }
-    Decision::allow(Reason::Scope {
-        scope: scope.name(),
-    })
+    let (categories, device_id) = sensitive_requirement(action, resource);
+    if categories.is_empty() {
+        return Decision::allow(Reason::Scope {
+            scope: scope.name(),
+        });
+    }
+    let owner = authority.is_owner();
+    if !owner {
+        for category in categories.iter() {
+            let granted = authority
+                .sensitive_grants()
+                .iter()
+                .any(|g| g.covers(category, device_id));
+            if !granted {
+                return Decision::deny(Reason::MissingSensitive { category });
+            }
+        }
+    }
+    let rate_limit = (!owner).then(|| {
+        categories
+            .iter()
+            .map(RateLimit::for_category)
+            .min_by_key(|r| r.max)
+            .unwrap_or(RateLimit::for_category(SensitiveCategory::Lock))
+    });
+    Decision {
+        allow: true,
+        reason: Reason::Sensitive {
+            scope: scope.name(),
+            categories,
+            owner,
+        },
+        obligations: Obligations {
+            audit_level: AuditLevel::Warn,
+            rate_limit,
+            sensitive: categories,
+            require_confirmation: false,
+        },
+    }
+}
+
+/// The sensitive categories `action` on `resource` needs a grant for,
+/// and the device the resource names (for device-narrowed grants).
+/// Commands on a lock, opener or alarm; `blob.read` on a camera's
+/// bytes or a camera instance's blob. Collection-level checks are
+/// never sensitive: they are pre-checks, and the per-target check
+/// that follows decides.
+fn sensitive_requirement(action: Action, resource: &Resource) -> (SensitiveSet, Option<&str>) {
+    match (action, resource) {
+        (Action::DeviceCommand, Resource::Device(d)) => (
+            d.class
+                .sensitive()
+                .iter()
+                .filter(|c| c.guards_commands())
+                .collect(),
+            Some(d.id.as_str()),
+        ),
+        (Action::BlobRead, Resource::Device(d)) if d.class.is_camera() => (
+            [SensitiveCategory::Camera].into_iter().collect(),
+            Some(d.id.as_str()),
+        ),
+        (Action::BlobRead, Resource::Blob(b)) if b.camera => {
+            ([SensitiveCategory::Camera].into_iter().collect(), None)
+        }
+        _ => (SensitiveSet::empty(), None),
+    }
 }
 
 /// Which [`ToolConstraint`] field a rule consults.

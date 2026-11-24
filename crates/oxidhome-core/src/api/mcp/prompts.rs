@@ -275,10 +275,13 @@ fn draft_automation_message(trigger: &str, action: &str) -> String {
          gives you the real `device_id` and the `capabilities: []` list — an array of \
          capability *names* the device exposes. The host's built-in capability names are: \
          `switch`, `dimmer`, `color-light`, `sensor`, `button`, `video-stream`, \
-         `audio-stream`. Anything else appears in the list as \
-         `extension(<namespace>/<name>@<version>)` — that literal wrapped form is what you \
-         must pass as the `capability` argument (a plugin that declares a custom `lock` \
-         capability shows up as e.g. `extension(com.acme/lock@1)`, NOT bare `lock`). Ground the draft in the exact strings the resource returned — never invent \
+         `audio-stream`, `lock`, `opener`, `alarm-panel`, `siren`. Anything else appears in \
+         the list as `extension(<namespace>/<name>@<version>)` — that literal wrapped form is \
+         what you must pass as the `capability` argument (a plugin that declares a custom \
+         `sprinkler` capability shows up as e.g. `extension(com.acme/sprinkler@1)`, NOT bare \
+         `sprinkler`). Commands on a lock, opener or alarm device (its `sensitive` list in \
+         `oxidhome://devices`) need an explicit grant your token may not hold; draft them \
+         anyway, and say so. Ground the draft in the exact strings the resource returned — never invent \
          a `device_id` or a capability name that isn't in the list.\n\
          \n\
          IMPORTANT — action verbs are NOT enumerable from the host: `device.send_command` \

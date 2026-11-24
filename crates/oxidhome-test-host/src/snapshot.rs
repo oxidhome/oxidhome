@@ -301,6 +301,10 @@ fn render_spec(spec: &CapabilitySpec) -> String {
         CapabilitySpec::Button => "button".to_owned(),
         CapabilitySpec::VideoStream => "video-stream".to_owned(),
         CapabilitySpec::AudioStream => "audio-stream".to_owned(),
+        CapabilitySpec::Lock => "lock".to_owned(),
+        CapabilitySpec::Opener(_) => "opener".to_owned(),
+        CapabilitySpec::AlarmPanel(_) => "alarm-panel".to_owned(),
+        CapabilitySpec::Siren => "siren".to_owned(),
         CapabilitySpec::Extension(ext) => {
             format!(
                 "extension({}/{}@{})",

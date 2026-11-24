@@ -520,6 +520,19 @@ pub struct DeviceView<'a> {
     ///
     /// Field 3: `name`
     pub name: &'a str,
+    /// Host-derived category (`lock`, `opener`, `alarm`, `camera`,
+    /// `light`, `climate`, `media`, `switch`, `sensor` or `other`), after
+    /// any operator raise.
+    ///
+    /// Field 4: `category`
+    pub category: &'a str,
+    /// Sensitive categories the device falls under (`lock`, `opener`,
+    /// `alarm`, `camera`). A token needs an explicit grant for each: no
+    /// scope, the wildcard included, reaches a command on a lock, opener
+    /// or alarm, or a camera's bytes.
+    ///
+    /// Field 5: `sensitive`
+    pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for DeviceView<'a> {
@@ -571,6 +584,24 @@ impl<'a> ::buffa::MessageView<'a> for DeviceView<'a> {
                 )?;
                 view.name = ::buffa::types::borrow_str(&mut cur)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.category = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::borrow_str(&mut cur)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                view.sensitive.push(__elem);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -596,6 +627,8 @@ impl<'a> ::buffa::MessageView<'a> for DeviceView<'a> {
             device_id: self.device_id.to_string(),
             owner_instance: self.owner_instance.to_string(),
             name: self.name.to_string(),
+            category: self.category.to_string(),
+            sensitive: self.sensitive.iter().map(|s| s.to_string()).collect(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -618,6 +651,12 @@ impl<'a> ::buffa::ViewEncode<'a> for DeviceView<'a> {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
+        if !self.category.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.category) as u64;
+        }
+        for v in &self.sensitive {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -637,6 +676,12 @@ impl<'a> ::buffa::ViewEncode<'a> for DeviceView<'a> {
         }
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(3u32, &self.name, buf);
+        }
+        if !self.category.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.category, buf);
+        }
+        for v in &self.sensitive {
+            ::buffa::types::put_string_field(5u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -667,6 +712,12 @@ impl<'__a> ::serde::Serialize for DeviceView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
             __map.serialize_entry("name", self.name)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.category) {
+            __map.serialize_entry("category", self.category)?;
+        }
+        if !self.sensitive.is_empty() {
+            __map.serialize_entry("sensitive", &*self.sensitive)?;
         }
         __map.end()
     }
@@ -777,6 +828,25 @@ impl DeviceOwnedView {
     #[must_use]
     pub fn name(&self) -> &'_ str {
         self.0.reborrow().name
+    }
+    /// Host-derived category (`lock`, `opener`, `alarm`, `camera`,
+    /// `light`, `climate`, `media`, `switch`, `sensor` or `other`), after
+    /// any operator raise.
+    ///
+    /// Field 4: `category`
+    #[must_use]
+    pub fn category(&self) -> &'_ str {
+        self.0.reborrow().category
+    }
+    /// Sensitive categories the device falls under (`lock`, `opener`,
+    /// `alarm`, `camera`). A token needs an explicit grant for each: no
+    /// scope, the wildcard included, reaches a command on a lock, opener
+    /// or alarm, or a camera's bytes.
+    ///
+    /// Field 5: `sensitive`
+    #[must_use]
+    pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().sensitive
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<DeviceView<'static>>> for DeviceOwnedView {

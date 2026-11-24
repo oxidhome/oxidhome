@@ -986,6 +986,8 @@ fn resolution_entry(
         invocation: Some(ctx.audit_json()),
         command_id: Some(audit_cap(command_id).to_owned()),
         command_outcome: Some(outcome.as_str().to_owned()),
+
+        level: None,
     })
 }
 

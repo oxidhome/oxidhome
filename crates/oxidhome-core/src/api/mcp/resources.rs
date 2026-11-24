@@ -53,7 +53,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::Engine;
-use crate::api::scopes::can_read_blobs;
+use crate::api::bytes::BytesGate;
 use crate::auth::{Action, Actor, InvocationContext, Resource as AuthResource, authorize};
 use crate::state::audit_log::AuditEntry;
 use crate::state::event_log::now_unix_ms;
@@ -105,6 +105,11 @@ pub(super) const RESOURCE_BUSY_CODE: ErrorCode = ErrorCode(-32004);
 /// `data` is `{"cursor_expired": {after_id, oldest_id, head_id}}`, the
 /// same body the REST history and the event tails return.
 pub(super) const CURSOR_EXPIRED_CODE: ErrorCode = ErrorCode(-32005);
+
+/// H6 slice 2: the principal has used up its allowance for a
+/// sensitive category (lock, opener, alarm, camera). Retriable after
+/// the delay in the message; audits as HTTP 429.
+pub(super) const SENSITIVE_RATE_LIMITED_CODE: ErrorCode = ErrorCode(-32006);
 
 /// [`AuditEntry::actor_kind`] value we stamp on every MCP row.
 /// Matches [`crate::auth::ActorKind::Mcp`]'s `as_str()` — kept
@@ -306,7 +311,7 @@ pub(super) async fn read(
     // (ledger unreachable, disk full, read-only DB, …) refuse
     // the read.
     let audit_log = engine.audit_log();
-    let audit_entry = new_audit_entry(&token_id, family, &outcome);
+    let audit_entry = new_audit_entry(&token_id, family, &outcome, ctx.call_id());
     let audit_result = tokio::task::spawn_blocking(move || {
         // Move the permit into the closure so it drops when
         // the actual audit write completes — not when the
@@ -447,6 +452,10 @@ enum ReadOutcome {
     Denied {
         required: &'static str,
     },
+    /// H6 slice 2: a camera blob read over the principal's camera
+    /// allowance. Reported as [`SENSITIVE_RATE_LIMITED_CODE`] and
+    /// audited as HTTP 429.
+    RateLimited(String),
     Internal(String),
 }
 
@@ -482,6 +491,9 @@ impl ReadOutcome {
                 "scope denied for MCP resource",
                 None,
             )),
+            Self::RateLimited(reason) => {
+                Err(McpError::new(SENSITIVE_RATE_LIMITED_CODE, reason, None))
+            }
             Self::Internal(reason) => Err(McpError::internal_error(reason, None)),
         }
     }
@@ -494,6 +506,7 @@ impl ReadOutcome {
             Self::TooLarge(_) => 413,
             Self::Busy(_) => 503,
             Self::CursorExpired(_) => 410,
+            Self::RateLimited(_) => 429,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -519,7 +532,8 @@ impl ReadOutcome {
             | Self::Denied { .. }
             | Self::InvalidParams(_)
             | Self::TooLarge(_)
-            | Self::CursorExpired(_) => "deny",
+            | Self::CursorExpired(_)
+            | Self::RateLimited(_) => "deny",
             Self::Internal(_) | Self::Busy(_) => "error",
         }
     }
@@ -558,11 +572,13 @@ enum Kind<'a> {
 }
 
 impl Kind<'_> {
-    /// What the read targets, for [`authorize`].
-    fn resource(&self) -> AuthResource {
+    /// What the read targets, for [`authorize`]. A blob's class comes
+    /// from its instance: a camera plugin's blobs are camera bytes
+    /// (H6 slice 2).
+    fn resource(&self, engine: &Engine) -> AuthResource {
         match self {
             Kind::DevicesList => AuthResource::devices(),
-            Kind::DevicesDetail(id) => AuthResource::device(*id),
+            Kind::DevicesDetail(id) => engine.devices().resource(id),
             // The detail read is checked against the plugin collection:
             // `plugin.read` on `oxidhome://plugins/{id}` has always been
             // the flat `plugins:list` scope, and naming the plugin here
@@ -570,7 +586,7 @@ impl Kind<'_> {
             Kind::PluginsList | Kind::PluginsDetail(_) => AuthResource::plugins(),
             Kind::Events => AuthResource::events(),
             Kind::Logs | Kind::Status | Kind::Config => AuthResource::Host,
-            Kind::Blob(instance, name) => AuthResource::blob(*instance, *name),
+            Kind::Blob(instance, name) => blob_resource(engine, instance, name),
         }
     }
 }
@@ -750,10 +766,27 @@ async fn read_inner(
         Route::Terminal { family, outcome } => return (family, outcome),
     };
 
-    if let Err(required) = authorize(ctx, action, &kind.resource()).into_result() {
+    // A blob instance segment that doesn't decode: the collection
+    // grant decides first, then the URI is malformed (not a camera
+    // grant the caller lacks).
+    if let Kind::Blob(instance, name) = &kind
+        && let Err(err) = percent_decode_segment(instance)
+    {
+        let collection = AuthResource::blob((*instance).to_owned(), *name, false);
+        if let Err(required) = authorize(ctx, action, &collection).into_result() {
+            return (family, ReadOutcome::Denied { required });
+        }
+        return (
+            family,
+            ReadOutcome::InvalidParams(format!(
+                "malformed `instance_id` segment `{instance}`: {err}"
+            )),
+        );
+    }
+    let decision = authorize(ctx, action, &kind.resource(&engine));
+    if let Err(required) = decision.clone().into_result() {
         return (family, ReadOutcome::Denied { required });
     }
-
     let outcome = match kind {
         Kind::DevicesList => devices_list(&engine),
         Kind::DevicesDetail(id) => devices_detail(&engine, id),
@@ -761,19 +794,93 @@ async fn read_inner(
         Kind::PluginsDetail(id) => plugins_detail(&engine, id),
         // Events + logs hit `SQLite`, so parse the query
         // and run the read under `spawn_blocking`.
-        Kind::Events => events_read(engine, query_str, can_read_blobs(ctx)).await,
+        Kind::Events => {
+            let gate = BytesGate::deferred(ctx, &engine);
+            events_read(engine, query_str, gate).await
+        }
         Kind::Logs => logs_read(engine, query_str).await,
         Kind::Status => status_read(engine.clone()).await,
         Kind::Config => encode(&super::config::config_body(), "config"),
         // Blob reads also hit `SQLite` (the blob index) plus
         // a filesystem `read()`, so run under `spawn_blocking`
         // like the events / logs paths.
-        Kind::Blob(instance, name) => blob_read(engine, instance, name).await,
+        Kind::Blob(instance, name) => {
+            let outcome = blob_read(engine.clone(), instance, name).await;
+            // Classed after the read, not before.
+            let resource = blob_resource(&engine, instance, name);
+            release_blob(&engine, ctx, action, resource, outcome).await
+        }
     };
     (family, outcome)
 }
 
-fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> AuditEntry {
+/// The blob resource for a `oxidhome://blobs/{instance}/{name}` read,
+/// classed by the percent-decoded instance `blob_read` looks up, so an
+/// encoded spelling of a camera instance can't dodge the camera check.
+/// A segment that doesn't decode is refused by `blob_read`; it is
+/// classed as a camera meanwhile.
+fn blob_resource(engine: &Engine, instance: &str, name: &str) -> AuthResource {
+    let decoded = percent_decode_segment(instance);
+    let camera = decoded
+        .as_deref()
+        .map_or(true, |i| engine.devices().instance_is_camera(i));
+    AuthResource::blob(
+        decoded.unwrap_or_else(|_| instance.to_owned()),
+        name,
+        camera,
+    )
+}
+
+/// H6 slice 2: hand back a blob read only under the instance's class
+/// as it is now. The instance may have registered a camera while the
+/// read ran, so the read is authorized again; an allowed camera read
+/// is then rate limited and leaves its `warn` row. Only a successful
+/// read is charged.
+async fn release_blob(
+    engine: &Engine,
+    ctx: &InvocationContext,
+    action: Action,
+    resource: AuthResource,
+    outcome: ReadOutcome,
+) -> ReadOutcome {
+    if !matches!(outcome, ReadOutcome::OkBlob { .. }) {
+        return outcome;
+    }
+    let decision = authorize(ctx, action, &resource);
+    if let Err(required) = decision.clone().into_result() {
+        return ReadOutcome::Denied { required };
+    }
+    let target = match &resource {
+        AuthResource::Blob(b) => format!("{}/{}", b.instance_id(), b.name()),
+        _ => String::new(),
+    };
+    match engine
+        .sensitive()
+        .discharge_blocking(ctx, action, &target, &decision)
+        .await
+    {
+        Ok(()) => outcome,
+        Err(e) => {
+            use crate::auth::sensitive::ObligationError;
+            match e {
+                ObligationError::RateLimited { .. } => ReadOutcome::RateLimited(e.to_string()),
+                ObligationError::Audit(_) | ObligationError::Join(_) => {
+                    tracing::error!(target: "auth.sensitive", error = %e, "camera blob read refused");
+                    ReadOutcome::Internal("sensitive read refused".into())
+                }
+            }
+        }
+    }
+}
+
+/// `call_id` joins the row to any `warn` row the read's sensitive
+/// release wrote (H6 slice 2).
+fn new_audit_entry(
+    token_id: &str,
+    family: &str,
+    outcome: &ReadOutcome,
+    call_id: &str,
+) -> AuditEntry {
     AuditEntry {
         id: 0,
         intent_ms: 0,
@@ -788,10 +895,11 @@ fn new_audit_entry(token_id: &str, family: &str, outcome: &ReadOutcome) -> Audit
         execution_outcome: None,
         domain_error: None,
         credential_fp: None,
-        call_id: None,
+        call_id: Some(call_id.to_owned()),
         invocation: None,
         command_id: None,
         command_outcome: None,
+        level: None,
     }
 }
 
@@ -809,6 +917,9 @@ struct DeviceListEntry {
     device_id: String,
     owner_instance: String,
     name: String,
+    /// H6 slice 2: host-derived category and sensitive categories.
+    #[serde(flatten)]
+    class: crate::api::server::WireDeviceClass,
 }
 
 #[derive(Serialize)]
@@ -825,6 +936,7 @@ fn devices_list(engine: &Engine) -> ReadOutcome {
             device_id: meta.id.clone(),
             owner_instance: meta.owner_instance.clone(),
             name: meta.info.name.clone(),
+            class: engine.devices().class_of_meta(&meta).into(),
         })
         .collect();
     encode(&DeviceListBody { devices }, "devices list")
@@ -843,6 +955,9 @@ struct DeviceDetail {
     manufacturer: Option<String>,
     model: Option<String>,
     capabilities: Vec<String>,
+    /// H6 slice 2: host-derived category and sensitive categories.
+    #[serde(flatten)]
+    class: crate::api::server::WireDeviceClass,
 }
 
 fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
@@ -861,6 +976,7 @@ fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
             .iter()
             .map(crate::runtime::capability_name)
             .collect(),
+        class: engine.devices().class_of_meta(&meta).into(),
     };
     encode(&detail, "device detail")
 }
@@ -1055,7 +1171,7 @@ const EVENTS_KNOWN_KEYS: &[&str] = &[
     "until",
 ];
 
-async fn events_read(engine: Engine, raw_query: &str, blobs: bool) -> ReadOutcome {
+async fn events_read(engine: Engine, raw_query: &str, gate: BytesGate) -> ReadOutcome {
     let query = match parse_query(raw_query) {
         Ok(q) => q,
         Err(err) => return ReadOutcome::InvalidParams(err),
@@ -1151,9 +1267,12 @@ async fn events_read(engine: Engine, raw_query: &str, blobs: bool) -> ReadOutcom
     };
     let events: Vec<_> = rows
         .into_iter()
-        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
-    encode(&EventsBody { events }, "events")
+    let outcome = encode(&EventsBody { events }, "events");
+    // A camera release counts only if the page goes out.
+    gate.settle(matches!(outcome, ReadOutcome::OkText { .. }));
+    outcome
 }
 
 // ── Logs ──────────────────────────────────────────────────────────
@@ -2409,5 +2528,69 @@ mod redaction_tests {
             panic!("fits under a larger cap");
         };
         assert_eq!(v[0], json!({"pin": "***"}));
+    }
+}
+
+#[cfg(test)]
+mod release_blob_tests {
+    use super::{AuthResource, ReadOutcome, release_blob};
+    use crate::Engine;
+    use crate::auth::policy::SensitiveGrant;
+    use crate::auth::{
+        Action, Actor, ActorKind, InvocationContext, Principal, SensitiveCategory, Transport,
+    };
+    use crate::state::AuditQuery;
+
+    fn viewer() -> InvocationContext {
+        let actor = Actor::api("viewer", vec!["blobs:read".into()])
+            .with_sensitive(vec![SensitiveGrant::all(SensitiveCategory::Camera)]);
+        InvocationContext::external(Principal::token(ActorKind::Mcp, &actor, Transport::McpHttp))
+    }
+
+    fn warn_rows(engine: &Engine) -> Vec<crate::state::AuditEntry> {
+        engine
+            .audit_log()
+            .query(
+                &AuditQuery {
+                    level: Some("warn".into()),
+                    ..AuditQuery::default()
+                },
+                10,
+            )
+            .unwrap()
+    }
+
+    /// Only a successful camera read is charged and audited, under the
+    /// read's call id; a camera read without the grant is refused even
+    /// after the bytes were fetched.
+    #[tokio::test]
+    async fn only_a_released_camera_blob_is_charged() {
+        let engine = Engine::new().expect("engine");
+        let ctx = viewer();
+        let camera = || AuthResource::blob("cam", "snap.jpg", true);
+
+        let missing = ReadOutcome::NotFound("no blob".into());
+        let out = release_blob(&engine, &ctx, Action::BlobRead, camera(), missing).await;
+        assert!(matches!(out, ReadOutcome::NotFound(_)));
+        assert_eq!(warn_rows(&engine).len(), 0);
+
+        let found = || ReadOutcome::OkBlob {
+            blob_b64: "AA==".into(),
+            mime: None,
+        };
+        let out = release_blob(&engine, &ctx, Action::BlobRead, camera(), found()).await;
+        assert!(matches!(out, ReadOutcome::OkBlob { .. }));
+        let warn = warn_rows(&engine);
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert_eq!(warn[0].call_id.as_deref(), Some(ctx.call_id()));
+
+        let reader = Actor::api("reader", vec!["blobs:read".into()]);
+        let reader = InvocationContext::external(Principal::token(
+            ActorKind::Mcp,
+            &reader,
+            Transport::McpHttp,
+        ));
+        let out = release_blob(&engine, &reader, Action::BlobRead, camera(), found()).await;
+        assert!(matches!(out, ReadOutcome::Denied { .. }));
     }
 }

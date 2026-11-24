@@ -128,6 +128,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::category::SensitiveCategory;
+
 /// A decoded token policy. Constructed via [`parse_policy`];
 /// see the module-level doc for the accepted JSON shapes.
 ///
@@ -147,6 +149,103 @@ pub struct TokenPolicy {
     /// Per-tool constraints; key is the tool name
     /// (`device.send_command`, `plugins.install`, …).
     pub constraints: HashMap<String, ToolConstraint>,
+    /// H6 slice 2: explicit sensitive-category grants. A wildcard
+    /// scope never reaches a lock, opener, alarm or camera bytes; one
+    /// of these does, on top of the scope and constraints the action
+    /// already needs.
+    pub sensitive: Vec<SensitiveGrant>,
+}
+
+impl TokenPolicy {
+    /// Serialize to the `scope_json` form: the legacy bare array when
+    /// there are no constraints and no sensitive grants, the extended
+    /// object otherwise. Round-trips through [`parse_policy`].
+    #[must_use]
+    pub fn to_json(&self) -> Vec<u8> {
+        if self.constraints.is_empty() && self.sensitive.is_empty() {
+            return serde_json::to_vec(&self.scopes).unwrap_or_default();
+        }
+        let mut constraints: Vec<(&String, &ToolConstraint)> = self.constraints.iter().collect();
+        constraints.sort_by_key(|(k, _)| *k);
+        let constraints: serde_json::Map<String, serde_json::Value> = constraints
+            .into_iter()
+            .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+            .collect();
+        let mut obj = serde_json::Map::new();
+        obj.insert("scopes".into(), serde_json::json!(self.scopes));
+        if !constraints.is_empty() {
+            obj.insert("constraints".into(), serde_json::Value::Object(constraints));
+        }
+        if !self.sensitive.is_empty() {
+            obj.insert(
+                "sensitive".into(),
+                serde_json::Value::Array(
+                    self.sensitive.iter().map(SensitiveGrant::to_json).collect(),
+                ),
+            );
+        }
+        serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default()
+    }
+}
+
+/// One explicit sensitive-category grant on a token (H6 slice 2).
+///
+/// Wire shape inside the extended policy object, either a bare
+/// category name or an object narrowed to devices:
+///
+/// ```json
+/// "sensitive": ["lock", {"category": "camera", "devices": ["dev-a1b2c3d4*"]}]
+/// ```
+///
+/// The grant is bound to its scope: it only adds the category on top
+/// of what the token's scopes and 14.4 constraints already permit,
+/// and a `devices` list narrows it further to those ids (same
+/// literal / `prefix*` patterns as [`ToolConstraint::devices`]). A
+/// device-narrowed grant never covers a resource that names no device
+/// (a blob addressed by instance and name). An unknown category name
+/// makes the whole policy fail to parse, which the bearer middleware
+/// treats as deny-all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitiveGrant {
+    /// The category granted.
+    pub category: SensitiveCategory,
+    /// Device-id allowlist; `None` covers every device of the category.
+    pub devices: Option<Vec<String>>,
+}
+
+impl SensitiveGrant {
+    /// A grant of `category` on every device.
+    #[must_use]
+    pub fn all(category: SensitiveCategory) -> Self {
+        Self {
+            category,
+            devices: None,
+        }
+    }
+
+    /// Does this grant cover `category` on `device_id` (`None` when the
+    /// resource names no device)?
+    #[must_use]
+    pub fn covers(&self, category: SensitiveCategory, device_id: Option<&str>) -> bool {
+        if self.category != category {
+            return false;
+        }
+        match (&self.devices, device_id) {
+            (None, _) => true,
+            (Some(patterns), Some(id)) => patterns.iter().any(|p| match_pattern(p, id)),
+            (Some(_), None) => false,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match &self.devices {
+            None => serde_json::Value::String(self.category.as_str().to_owned()),
+            Some(devices) => serde_json::json!({
+                "category": self.category.as_str(),
+                "devices": devices,
+            }),
+        }
+    }
 }
 
 /// Per-tool constraint blob. Fields are additive — a call
@@ -266,6 +365,9 @@ enum PolicyWire {
 #[serde(deny_unknown_fields)]
 struct ExtendedPolicy {
     scopes: Vec<String>,
+    /// H6 slice 2 sensitive grants; see [`SensitiveGrant`].
+    #[serde(default)]
+    sensitive: Vec<SensitiveGrantWire>,
     // Round-7 P1 on PR #147: reject duplicate JSON keys. The
     // default `HashMap` deserializer accepts them and keeps
     // the last value; once enforcement lands, a bearer with
@@ -276,6 +378,36 @@ struct ExtendedPolicy {
     // parse time so the fail-closed contract holds.
     #[serde(default, deserialize_with = "deserialize_unique_map")]
     constraints: HashMap<String, ToolConstraint>,
+}
+
+/// Wire form of a [`SensitiveGrant`]: a bare category name or an
+/// object with `category` and optional `devices`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SensitiveGrantWire {
+    Name(String),
+    Narrowed(NarrowedGrantWire),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NarrowedGrantWire {
+    category: String,
+    #[serde(default)]
+    devices: Option<Vec<String>>,
+}
+
+impl SensitiveGrantWire {
+    fn into_grant(self) -> Option<SensitiveGrant> {
+        let (category, devices) = match self {
+            SensitiveGrantWire::Name(name) => (name, None),
+            SensitiveGrantWire::Narrowed(n) => (n.category, n.devices),
+        };
+        Some(SensitiveGrant {
+            category: category.parse().ok()?,
+            devices,
+        })
+    }
 }
 
 fn deserialize_unique_map<'de, D>(
@@ -419,10 +551,18 @@ pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
         PolicyWire::Legacy(scopes) => TokenPolicy {
             scopes,
             constraints: HashMap::new(),
+            sensitive: Vec::new(),
         },
         PolicyWire::Extended(ext) => TokenPolicy {
             scopes: ext.scopes,
             constraints: ext.constraints,
+            // An unknown category fails the whole parse (deny-all)
+            // rather than silently dropping the grant.
+            sensitive: ext
+                .sensitive
+                .into_iter()
+                .map(SensitiveGrantWire::into_grant)
+                .collect::<Option<Vec<_>>>()?,
         },
     })
 }
@@ -513,6 +653,46 @@ mod tests {
         assert!(parse_policy(br#"{"scopes":[],"constraints":{"t":{"unknown":true}}}"#).is_none());
         // Non-array `devices` inside a constraint.
         assert!(parse_policy(br#"{"scopes":[],"constraints":{"t":{"devices":"x"}}}"#).is_none());
+    }
+
+    #[test]
+    fn sensitive_grants_parse_and_round_trip() {
+        let blob = br#"{
+            "scopes": ["*"],
+            "sensitive": ["lock", {"category": "camera", "devices": ["dev-a1*"]}]
+        }"#;
+        let policy = parse_policy(blob).expect("parse");
+        assert_eq!(
+            policy.sensitive,
+            vec![
+                SensitiveGrant::all(SensitiveCategory::Lock),
+                SensitiveGrant {
+                    category: SensitiveCategory::Camera,
+                    devices: Some(vec!["dev-a1*".into()]),
+                },
+            ]
+        );
+        assert_eq!(parse_policy(&policy.to_json()), Some(policy.clone()));
+        let lock = &policy.sensitive[0];
+        assert!(lock.covers(SensitiveCategory::Lock, Some("dev-ff")));
+        assert!(lock.covers(SensitiveCategory::Lock, None));
+        assert!(!lock.covers(SensitiveCategory::Opener, Some("dev-ff")));
+        let cam = &policy.sensitive[1];
+        assert!(cam.covers(SensitiveCategory::Camera, Some("dev-a1b2")));
+        assert!(!cam.covers(SensitiveCategory::Camera, Some("dev-b1b2")));
+        assert!(!cam.covers(SensitiveCategory::Camera, None));
+        // Legacy shape stays a bare array.
+        let legacy = parse_policy(br#"["devices:list"]"#).expect("parse");
+        assert_eq!(legacy.to_json(), br#"["devices:list"]"#.to_vec());
+    }
+
+    #[test]
+    fn unknown_sensitive_category_rejects_the_policy() {
+        assert!(parse_policy(br#"{"scopes":["*"],"sensitive":["door"]}"#).is_none());
+        assert!(
+            parse_policy(br#"{"scopes":["*"],"sensitive":[{"category":"lock","x":1}]}"#).is_none()
+        );
+        assert!(parse_policy(br#"{"scopes":["*"],"sensitive":"lock"}"#).is_none());
     }
 
     #[test]

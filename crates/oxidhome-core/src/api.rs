@@ -21,10 +21,12 @@
 
 pub(crate) mod auth;
 mod bootstrap;
+pub(crate) mod bytes;
 mod connect_rpc;
 pub mod mcp;
 pub(crate) mod scopes;
-mod server;
+pub mod sensitive_admin;
+pub(crate) mod server;
 mod ui_ticket;
 
 pub use bootstrap::{

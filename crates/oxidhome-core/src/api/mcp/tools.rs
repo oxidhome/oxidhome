@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::Engine;
-use crate::api::scopes::can_read_blobs;
+use crate::api::bytes::BytesGate;
 use crate::api::server::WireCommandReport;
 use crate::auth::{Action, Actor, InvocationContext, Resource, authorize};
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
@@ -78,8 +78,8 @@ use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
     AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, EncodedBody, MAX_TOOL_BODY_BYTES, MCP_ACTOR_KIND,
-    RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, STORE_QUERY_MAX,
-    STORE_QUERY_SEMAPHORE,
+    RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, SENSITIVE_RATE_LIMITED_CODE,
+    STORE_QUERY_MAX, STORE_QUERY_SEMAPHORE,
 };
 
 /// Publicly-visible catalogue of tools this handler exposes.
@@ -702,7 +702,7 @@ pub(super) async fn call(
             events_history_call(
                 engine.clone(),
                 request.arguments,
-                can_read_blobs(&invocation),
+                BytesGate::deferred(&invocation, &engine),
             )
             .await
         }
@@ -711,7 +711,7 @@ pub(super) async fn call(
                 engine.clone(),
                 request.arguments,
                 cancelled,
-                can_read_blobs(&invocation),
+                BytesGate::deferred(&invocation, &engine),
             )
             .await
         }
@@ -1050,8 +1050,26 @@ enum ToolOutcome {
     UnknownTool(String),
     /// Scope check failed. Maps to [`SCOPE_DENIED_CODE`].
     Denied { required: &'static str },
+    /// H6 slice 2: a sensitive action over the principal's per-category
+    /// allowance. Maps to [`SENSITIVE_RATE_LIMITED_CODE`] and audits as
+    /// HTTP 429.
+    RateLimited(String),
     /// Server-side failure. Maps to `-32603`.
     Internal(String),
+}
+
+impl ToolOutcome {
+    /// H6 slice 2: a sensitive action whose obligations weren't met.
+    fn from_obligation(err: &crate::auth::sensitive::ObligationError) -> Self {
+        use crate::auth::sensitive::ObligationError;
+        match err {
+            ObligationError::RateLimited { .. } => Self::RateLimited(err.to_string()),
+            ObligationError::Audit(_) | ObligationError::Join(_) => {
+                tracing::error!(target: "auth.sensitive", error = %err, "sensitive action refused");
+                Self::Internal("sensitive action refused".into())
+            }
+        }
+    }
 }
 
 impl ToolOutcome {
@@ -1111,6 +1129,9 @@ impl ToolOutcome {
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
             Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
+            Self::RateLimited(reason) => {
+                Err(McpError::new(SENSITIVE_RATE_LIMITED_CODE, reason, None))
+            }
             Self::UnknownTool(reason) => Err(McpError::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 reason,
@@ -1139,6 +1160,7 @@ impl ToolOutcome {
             Self::InvalidParams(_) => 400,
             Self::TooLarge(_) => 413,
             Self::Busy(_) => 503,
+            Self::RateLimited(_) => 429,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -1150,7 +1172,8 @@ impl ToolOutcome {
             Self::UnknownTool(_)
             | Self::Denied { .. }
             | Self::InvalidParams(_)
-            | Self::TooLarge(_) => "deny",
+            | Self::TooLarge(_)
+            | Self::RateLimited(_) => "deny",
             // Match the REST auth classifier: 5xx → "error"
             // (Busy is 503; Internal is 500).
             Self::Internal(_) | Self::Busy(_) => "error",
@@ -1181,10 +1204,9 @@ fn authorize_target(
     invocation: &InvocationContext,
     action: Action,
     resource: &Resource,
-) -> Result<(), ToolOutcome> {
+) -> Result<crate::auth::Decision, ToolOutcome> {
     authorize(invocation, action, resource)
         .into_result()
-        .map(drop)
         .map_err(|required| ToolOutcome::Denied { required })
 }
 
@@ -1226,13 +1248,16 @@ async fn device_send_command_call(
     //
     // H6: `device.command` on the addressed device, through
     // `crate::auth::authorize` like the REST and Connect handlers.
-    if let Err(denied) = authorize_target(
+    // Slice 2: the device's class decides whether a sensitive
+    // category grant is needed too.
+    let decision = match authorize_target(
         &invocation,
         Action::DeviceCommand,
-        &Resource::device(args.device_id.as_str()),
+        &engine.devices().resource(&args.device_id),
     ) {
-        return denied;
-    }
+        Ok(decision) => decision,
+        Err(denied) => return denied,
+    };
 
     // Resolve device → owning instance the same way the REST
     // handler does. `NotFound` is deliberately indistinct
@@ -1253,6 +1278,21 @@ async fn device_send_command_call(
         };
     };
 
+    // H6 slice 2: rate limit and `warn` row before a sensitive
+    // command runs.
+    if let Err(e) = engine
+        .sensitive()
+        .discharge_blocking(
+            &invocation,
+            Action::DeviceCommand,
+            &args.device_id,
+            &decision,
+        )
+        .await
+    {
+        return ToolOutcome::from_obligation(&e);
+    }
+
     // The supervisor handle mints `id` (H5).
     let cmd = Command {
         id: String::new(),
@@ -1268,10 +1308,16 @@ async fn device_send_command_call(
             .collect(),
     };
 
-    let blobs = can_read_blobs(&invocation);
+    let gate = BytesGate::new(&invocation, &engine);
     let report = handle
-        .execute_command_in(invocation, args.device_id, cmd)
+        .execute_command_admitted(
+            invocation,
+            args.device_id.clone(),
+            cmd,
+            decision.obligations.sensitive,
+        )
         .await;
+    let blobs = gate.release_report(&args.device_id, &owner, &report);
 
     // Round-1 F2 on PR #123: plugin-supplied text is already capped
     // (`runtime::command::cap_plugin_text`) before any wire copy.
@@ -1579,7 +1625,7 @@ struct EventsHistoryArgs {
 async fn events_history_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    blobs: bool,
+    gate: BytesGate,
 ) -> ToolOutcome {
     // `arguments = None` → empty filter, latest 100 rows.
     let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
@@ -1716,10 +1762,14 @@ async fn events_history_call(
 
     let events: Vec<_> = rows
         .into_iter()
-        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
     let body = super::resources::EventsBody { events };
-    match super::resources::encode_body_capped(&body, "events.history", MAX_TOOL_BODY_BYTES) {
+    let encoded =
+        super::resources::encode_body_capped(&body, "events.history", MAX_TOOL_BODY_BYTES);
+    // A camera release counts only if the page goes out.
+    gate.settle(matches!(encoded, EncodedBody::Value(_)));
+    match encoded {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
             // Pure host-state read — plugin was never reached,
@@ -1885,7 +1935,7 @@ async fn events_subscribe_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
     mut cancelled: CancelSignal,
-    blobs: bool,
+    gate: BytesGate,
 ) -> ToolOutcome {
     let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
     let args: EventsSubscribeArgs = match serde_json::from_value(args_value) {
@@ -2181,10 +2231,13 @@ async fn events_subscribe_call(
 
     let events: Vec<_> = rows
         .into_iter()
-        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
     let body = super::resources::EventsBody { events };
-    match super::resources::encode_body_capped(&body, "events.subscribe", MAX_TOOL_BODY_BYTES) {
+    let encoded =
+        super::resources::encode_body_capped(&body, "events.subscribe", MAX_TOOL_BODY_BYTES);
+    gate.settle(matches!(encoded, EncodedBody::Value(_)));
+    match encoded {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
             plugin_reached: false,
@@ -3166,6 +3219,8 @@ fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     }
 }
 
@@ -3193,6 +3248,8 @@ fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     }
 }
 

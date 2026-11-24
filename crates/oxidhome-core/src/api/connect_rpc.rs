@@ -88,7 +88,8 @@ use crate::state::{
 use super::auth::{
     AuthState, actor_from_record, extract_bearer, finalize_audit, record_anonymous_probe,
 };
-use super::scopes::{ScopeDenied, can_read_blobs, require};
+use super::bytes::BytesGate;
+use super::scopes::{ScopeDenied, require};
 
 /// `HealthService` implementation. Anonymous; reads only the
 /// in-memory event-log mirror health (H3) and device-state flush
@@ -206,12 +207,13 @@ impl HandlerOutcomeSlot {
     }
 }
 
-/// M7: may the request's root read blob bytes (see
-/// [`can_read_blobs`])? `false` when the extension is missing.
-fn ctx_can_read_blobs(ctx: &RequestContext) -> bool {
-    ctx.extensions()
-        .get::<InvocationContext>()
-        .is_some_and(can_read_blobs)
+/// M7 / H6 slice 2: the request's [`BytesGate`]. Without the
+/// invocation context (a pipeline bug) the gate releases nothing.
+fn ctx_bytes_gate(ctx: &RequestContext, engine: &Engine) -> BytesGate {
+    match ctx.extensions().get::<InvocationContext>() {
+        Some(invocation) => BytesGate::new(invocation, engine),
+        None => BytesGate::deny_all(engine),
+    }
 }
 
 /// Wrap a [`ConnectError`] on the error-return site so the audit
@@ -251,7 +253,7 @@ fn require_connect(
     ctx: &RequestContext,
     action: Action,
     resource: &Resource,
-) -> Result<(), ConnectError> {
+) -> Result<crate::auth::Decision, ConnectError> {
     // If the middleware failed to stamp the context into extensions,
     // wrap the internal error through `rpc_err` too — otherwise a
     // gRPC / gRPC-Web caller of a scoped RPC in a broken pipeline
@@ -264,7 +266,12 @@ fn require_connect(
             ConnectError::internal("connect handler ran without an invocation context"),
         )
     })?;
-    if let Err(ScopeDenied { required }) = require(invocation, action, resource) {
+    let denied = match require(invocation, action, resource) {
+        Ok(decision) => return Ok(decision),
+        Err(denied) => denied,
+    };
+    {
+        let ScopeDenied { required } = denied;
         if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
             slot.set(HandlerOutcome {
                 status: Some(axum::http::StatusCode::FORBIDDEN),
@@ -272,11 +279,28 @@ fn require_connect(
                 command: None,
             });
         }
-        return Err(ConnectError::permission_denied(format!(
+        Err(ConnectError::permission_denied(format!(
             "scope {required} required"
-        )));
+        )))
     }
-    Ok(())
+}
+
+/// H6 slice 2: the error for a sensitive action whose obligations
+/// weren't met — `resource_exhausted` when rate limited, `internal`
+/// when the `warn` audit row couldn't be written.
+fn obligation_err(
+    ctx: &RequestContext,
+    err: &crate::auth::sensitive::ObligationError,
+) -> ConnectError {
+    use crate::auth::sensitive::ObligationError;
+    let e = match err {
+        ObligationError::RateLimited { .. } => ConnectError::resource_exhausted(err.to_string()),
+        ObligationError::Audit(_) | ObligationError::Join(_) => {
+            tracing::error!(target: "auth.sensitive", error = %err, "sensitive action refused");
+            ConnectError::internal("sensitive action refused")
+        }
+    };
+    rpc_err(ctx, e)
 }
 
 // ── Read-service implementations (Instances / Devices / Plugins / Logs) ──
@@ -336,11 +360,21 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .devices()
             .list()
             .into_iter()
-            .map(|meta| Device {
-                device_id: meta.id.clone(),
-                owner_instance: meta.owner_instance.clone(),
-                name: meta.info.name.clone(),
-                ..Default::default()
+            .map(|meta| {
+                // One read, so `category` and `sensitive` agree.
+                let class = self.engine.devices().class_of_meta(&meta);
+                Device {
+                    device_id: meta.id.clone(),
+                    owner_instance: meta.owner_instance.clone(),
+                    name: meta.info.name.clone(),
+                    category: class.category().as_str().to_owned(),
+                    sensitive: class
+                        .sensitive()
+                        .iter()
+                        .map(|c| c.as_str().to_owned())
+                        .collect(),
+                    ..Default::default()
+                }
             })
             .collect();
         Response::ok(ListDevicesResponse {
@@ -360,10 +394,10 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         // lookup so a refused token can't probe ids.
         require_connect(&ctx, Action::DeviceCommand, &Resource::devices())?;
         let req = request.to_owned_message();
-        require_connect(
+        let decision = require_connect(
             &ctx,
             Action::DeviceCommand,
-            &Resource::device(req.device_id.as_str()),
+            &self.engine.devices().resource(&req.device_id),
         )?;
         let invocation = ctx
             .extensions()
@@ -394,6 +428,20 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .get(&owner)
             .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("device not found")))?;
 
+        // H6 slice 2: rate limit and `warn` row before a sensitive
+        // command runs.
+        self.engine
+            .sensitive()
+            .discharge_blocking(
+                &invocation,
+                Action::DeviceCommand,
+                &req.device_id,
+                &decision,
+            )
+            .await
+            .map_err(|e| obligation_err(&ctx, &e))?;
+        let gate = BytesGate::new(&invocation, &self.engine);
+
         // The supervisor handle mints `id` (H5).
         let cmd = Command {
             id: String::new(),
@@ -414,7 +462,12 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             None => invocation,
         };
         let report = handle
-            .execute_command_in(invocation, req.device_id.clone(), cmd)
+            .execute_command_admitted(
+                invocation,
+                req.device_id.clone(),
+                cmd,
+                decision.obligations.sensitive,
+            )
             .await;
         // F4 + H5: every routed command is an RPC success carrying
         // its explicit outcome. Record the command id and outcome on
@@ -422,7 +475,8 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         // authorization decision. Mirrors the JSON side's
         // `DomainOutcome` response-extension smuggle.
         record_domain_outcome(&ctx, &report);
-        Response::ok(command_report_to_proto(report, ctx_can_read_blobs(&ctx)))
+        let blobs = gate.release_report(&req.device_id, &owner, &report);
+        Response::ok(command_report_to_proto(report, blobs))
     }
 
     async fn get_device_state<'a>(
@@ -444,16 +498,16 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         require_connect(
             &ctx,
             Action::DeviceRead,
-            &Resource::device(device_id.as_str()),
+            &self.engine.devices().resource(&device_id),
         )?;
-        let blobs = ctx_can_read_blobs(&ctx);
+        let gate = ctx_bytes_gate(&ctx, &self.engine);
         let (epoch, revision, mut entries) = self
             .engine
             .device_state()
             .snapshot_device_with_revision(&device_id);
         entries.sort_by(|a, b| a.capability.cmp(&b.capability));
         Response::ok(GetDeviceStateResponse {
-            state: device_snapshot_to_proto(device_id, &entries, &epoch, revision, blobs).into(),
+            state: device_snapshot_to_proto(device_id, &entries, &epoch, revision, &gate).into(),
             ..Default::default()
         })
     }
@@ -468,7 +522,8 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             MAX_ALL_DEVICES_STATE_SCAN, MAX_STATE_PAGE_WIRE_BYTES,
         };
         require_connect(&ctx, Action::DeviceRead, &Resource::devices())?;
-        let blobs = ctx_can_read_blobs(&ctx);
+        let gate = ctx_bytes_gate(&ctx, &self.engine);
+        let blobs = gate.general();
         let req = request.to_owned_message();
         let limit = match usize::try_from(req.limit).unwrap_or(usize::MAX) {
             0 => DEFAULT_ALL_DEVICES_STATE_LIMIT,
@@ -519,7 +574,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
                 let id = caps
                     .first()
                     .map_or_else(String::new, |c| c.device_id.clone());
-                device_snapshot_to_proto(id, caps, &page.epoch, revision, blobs)
+                device_snapshot_to_proto(id, caps, &page.epoch, revision, &gate)
             })
             .collect();
         let next_cursor = page
@@ -544,7 +599,8 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             DEFAULT_STATE_CHANGES_LIMIT, MAX_STATE_CHANGES_LIMIT, MAX_STATE_PAGE_WIRE_BYTES,
         };
         require_connect(&ctx, Action::DeviceRead, &Resource::devices())?;
-        let blobs = ctx_can_read_blobs(&ctx);
+        let gate = ctx_bytes_gate(&ctx, &self.engine);
+        let blobs = gate.general();
         let req = request.to_owned_message();
         let limit = match usize::try_from(req.limit).unwrap_or(usize::MAX) {
             0 => DEFAULT_STATE_CHANGES_LIMIT,
@@ -562,7 +618,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             changes: page
                 .entries
                 .iter()
-                .map(|e| device_state_to_proto(e, blobs))
+                .map(|e| device_state_to_proto(e, &gate))
                 .collect(),
             reset_required: page.reset_required,
             truncated: page.truncated,
@@ -610,11 +666,14 @@ fn proto_key_value_to_wit(kv: ProtoKeyValue) -> KeyValue {
     KeyValue { key: kv.key, value }
 }
 
-/// H2: one projected entry on the wire. `blobs` is the caller's
-/// `blobs:read`; without it `bytes_val` fields are withheld (M7).
-fn device_state_to_proto(state: &crate::state::DeviceState, blobs: bool) -> ProtoDeviceStateEntry {
+/// H2: one projected entry on the wire. `bytes_val` fields the
+/// caller's [`BytesGate`] doesn't release are withheld (M7).
+fn device_state_to_proto(
+    state: &crate::state::DeviceState,
+    gate: &BytesGate,
+) -> ProtoDeviceStateEntry {
     let mut fields = state.fields.clone();
-    if !blobs {
+    if !gate.release_state(state) {
         crate::redact::withhold_bytes_in_kvs(&mut fields);
     }
     ProtoDeviceStateEntry {
@@ -647,7 +706,7 @@ fn device_snapshot_to_proto(
     entries: &[std::sync::Arc<crate::state::DeviceState>],
     epoch: &str,
     revision: u64,
-    blobs: bool,
+    gate: &BytesGate,
 ) -> ProtoDeviceStateSnapshot {
     ProtoDeviceStateSnapshot {
         device_id,
@@ -655,7 +714,7 @@ fn device_snapshot_to_proto(
         revision,
         capabilities: entries
             .iter()
-            .map(|e| device_state_to_proto(e, blobs))
+            .map(|e| device_state_to_proto(e, gate))
             .collect(),
         ..Default::default()
     }
@@ -676,8 +735,8 @@ fn wit_value_to_proto(value: Value) -> ProtoValue {
     }
 }
 
-/// M7: `blobs` is the caller's `blobs:read`; without it returned
-/// `bytes-val` state is withheld.
+/// M7: `blobs` is the caller's [`BytesGate`] answer for the device;
+/// without it returned `bytes-val` state is withheld.
 fn command_report_to_proto(mut report: CommandReport, blobs: bool) -> ExecuteCommandResponse {
     if !blobs {
         report.withhold_bytes();
@@ -1262,48 +1321,54 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         // state, so the bus slot is freed when the stream ends.
         // M7: live and replayed events alike withhold `bytes-val`
         // payloads unless the caller holds `blobs:read`.
-        let blobs = ctx_can_read_blobs(&ctx);
-        let response_stream = futures_util::stream::unfold(Some(tail), move |tail| async move {
-            use crate::state::TailItem;
-            let mut tail = tail?;
-            let body = match tail.next().await {
-                Ok(Some(TailItem::Event(event))) => tail_events_response::Body::Event(Box::new(
-                    wit_event_to_proto(std::sync::Arc::unwrap_or_clone(event), blobs),
-                )),
-                Ok(Some(TailItem::Lagged {
-                    skipped,
-                    resume_after_id,
-                })) => tail_events_response::Body::Lagged(Box::new(ProtoLagged {
-                    skipped,
-                    resume_after_id,
-                    ..Default::default()
-                })),
-                Ok(Some(TailItem::CursorExpired(expired))) => {
-                    tail_events_response::Body::CursorExpired(Box::new(ProtoCursorExpired {
-                        after_id: expired.after_id,
-                        oldest_id: expired.oldest_id,
-                        head_id: expired.head_id,
+        let gate = std::sync::Arc::new(ctx_bytes_gate(&ctx, &self.engine));
+        let response_stream = futures_util::stream::unfold(Some(tail), move |tail| {
+            let gate = std::sync::Arc::clone(&gate);
+            async move {
+                use crate::state::TailItem;
+                let mut tail = tail?;
+                let body = match tail.next().await {
+                    Ok(Some(TailItem::Event(event))) => {
+                        tail_events_response::Body::Event(Box::new(wit_event_to_proto(
+                            std::sync::Arc::unwrap_or_clone(event),
+                            &gate,
+                        )))
+                    }
+                    Ok(Some(TailItem::Lagged {
+                        skipped,
+                        resume_after_id,
+                    })) => tail_events_response::Body::Lagged(Box::new(ProtoLagged {
+                        skipped,
+                        resume_after_id,
                         ..Default::default()
-                    }))
-                }
-                // Bus gone (engine shutting down), or the
-                // stream already sent `CursorExpired`.
-                Ok(None) => return None,
-                Err(err) => {
-                    tracing::error!(target: "api.events", error = %err, "connect events tail stopped");
-                    return Some((
-                        Err(ConnectError::unavailable("event history unavailable")),
-                        None,
-                    ));
-                }
-            };
-            Some((
-                Ok(TailEventsResponse {
-                    body: Some(body),
-                    ..Default::default()
-                }),
-                Some(tail),
-            ))
+                    })),
+                    Ok(Some(TailItem::CursorExpired(expired))) => {
+                        tail_events_response::Body::CursorExpired(Box::new(ProtoCursorExpired {
+                            after_id: expired.after_id,
+                            oldest_id: expired.oldest_id,
+                            head_id: expired.head_id,
+                            ..Default::default()
+                        }))
+                    }
+                    // Bus gone (engine shutting down), or the
+                    // stream already sent `CursorExpired`.
+                    Ok(None) => return None,
+                    Err(err) => {
+                        tracing::error!(target: "api.events", error = %err, "connect events tail stopped");
+                        return Some((
+                            Err(ConnectError::unavailable("event history unavailable")),
+                            None,
+                        ));
+                    }
+                };
+                Some((
+                    Ok(TailEventsResponse {
+                        body: Some(body),
+                        ..Default::default()
+                    }),
+                    Some(tail),
+                ))
+            }
         });
         // H4: acknowledge an accepted cursor, so a client can tell a
         // resumed stream from a server that ignored `after_id`.
@@ -1315,10 +1380,10 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
     }
 }
 
-/// M7: `blobs` is the subscriber's `blobs:read`; without it
-/// `bytes-val` state-change fields are withheld.
-fn wit_event_to_proto(mut event: WitEvent, blobs: bool) -> ProtoEvent {
-    if !blobs {
+/// M7: `bytes-val` state-change fields the subscriber's [`BytesGate`]
+/// doesn't release are withheld.
+fn wit_event_to_proto(mut event: WitEvent, gate: &BytesGate) -> ProtoEvent {
+    if !gate.release_event(&event) {
         crate::redact::withhold_bytes_in_event(&mut event.payload);
     }
     let payload = match event.payload {
@@ -1568,6 +1633,8 @@ async fn connect_auth_middleware(
                     invocation: None,
                     command_id: None,
                     command_outcome: None,
+
+                    level: None,
                 };
                 super::auth::record_authenticated_denial(&state.audit_log, None, entry).await;
                 return connect_error_response(
@@ -1628,6 +1695,8 @@ async fn connect_auth_middleware(
         invocation: Some(invocation.audit_json()),
         command_id: None,
         command_outcome: None,
+
+        level: None,
     };
     let audit_id = {
         let al = Arc::clone(&state.audit_log);

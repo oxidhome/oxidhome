@@ -166,7 +166,7 @@ pub fn ensure_admin_token(
         }
     };
 
-    match tokens.insert_if_empty(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON) {
+    match tokens.insert_owner_if_empty(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON) {
         Ok(true) => {}
         Ok(false) => {
             remove_quietly(&pending);
@@ -326,8 +326,8 @@ fn stale_subject(secret: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RevokeScope {
     /// Revoke every active token labelled `ADMIN_TOKEN_LABEL` —
-    /// the previous bootstrap / recovery tokens. Other tokens keep
-    /// working.
+    /// the previous bootstrap / recovery tokens — and the owner
+    /// token. Other tokens keep working.
     #[default]
     AdminTokens,
     /// Revoke every active token (credential-compromise response).
@@ -401,7 +401,9 @@ pub fn recover_admin_token(
         .context("listing tokens")?
         .into_iter()
         .filter(|t| t.revoked_ms.is_none())
-        .filter(|t| scope == RevokeScope::All || t.label == ADMIN_TOKEN_LABEL)
+        // H6 slice 2: the previous owner too, whatever its label, so
+        // recovery leaves exactly one owner.
+        .filter(|t| scope == RevokeScope::All || t.label == ADMIN_TOKEN_LABEL || t.owner)
         .map(|t| t.id)
         .collect();
 
@@ -427,23 +429,27 @@ pub fn recover_admin_token(
         return Err(err.context("recording recovery audit intent"));
     }
 
-    let revoked =
-        match tokens.insert_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &to_revoke) {
-            Ok(revoked) => revoked,
-            Err(err) => {
-                // Keep the pending file — see the matching branch in
-                // `ensure_admin_token`: the commit may have landed.
-                for id in intents {
-                    finalize(audit, id, Outcome::Error);
-                }
-                return Err(anyhow::Error::new(err).context(format!(
-                    "minting recovery admin token failed; if the change did commit, the new \
+    let revoked = match tokens.insert_owner_and_revoke(
+        &issued,
+        ADMIN_TOKEN_LABEL,
+        ADMIN_SCOPE_JSON,
+        &to_revoke,
+    ) {
+        Ok(revoked) => revoked,
+        Err(err) => {
+            // Keep the pending file — see the matching branch in
+            // `ensure_admin_token`: the commit may have landed.
+            for id in intents {
+                finalize(audit, id, Outcome::Error);
+            }
+            return Err(anyhow::Error::new(err).context(format!(
+                "minting recovery admin token failed; if the change did commit, the new \
                      secret is in {} and the next daemon start promotes it (otherwise it is \
                      discarded) — re-running recovery is also safe",
-                    pending.display()
-                )));
-            }
-        };
+                pending.display()
+            )));
+        }
+    };
     // The mutation is committed: finalize as allowed regardless of
     // the delivery step (the pending file already holds the secret).
     for id in intents {
@@ -620,6 +626,8 @@ fn record_intent(
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     };
     // Durable: every caller follows the intent with a durable
     // filesystem or token change that must not outlive its evidence.
@@ -643,7 +651,7 @@ fn finalize(audit: &AuditLog, id: u64, outcome: Outcome) {
 }
 
 /// Two-phase audit around a single local action.
-fn audited<T>(
+pub(super) fn audited<T>(
     audit: &AuditLog,
     actor_kind: &str,
     token_id: &str,
@@ -861,7 +869,7 @@ mod tests {
         let issued = TokenStore::generate();
         write_new_secret(&pending_path(fx.dir.path(), &issued.id), &issued.plaintext).unwrap();
         fx.tokens
-            .insert_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &[])
+            .insert_owner_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &[])
             .unwrap();
         fx.reconcile().unwrap();
         assert_eq!(
@@ -924,7 +932,7 @@ mod tests {
         write_new_secret(&pending_path(fx.dir.path(), &live.id), &live.plaintext).unwrap();
         assert!(
             fx.tokens
-                .insert_if_empty(&live, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
+                .insert_owner_if_empty(&live, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
                 .unwrap()
         );
         // Crash before the insert: never committed.
