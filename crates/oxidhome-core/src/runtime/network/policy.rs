@@ -271,7 +271,8 @@ fn is_local_name(name: &str) -> bool {
 /// widening anything.
 ///
 /// - Proto: equal, or `wide` is `any`.
-/// - Port: `wide`'s ports include all of `narrow`'s.
+/// - Port: `wide`'s ports include all of `narrow`'s (`1-65535` covers
+///   `*`).
 /// - Name hosts: an exact name is covered by itself or a `*.suffix` it
 ///   matches; `*.a.b` by `*.b` (or itself). A local-only name is covered
 ///   only by a local-only rule, since it may grant private addresses.
@@ -285,7 +286,11 @@ pub(crate) fn covers(wide: &NetworkRule, narrow: &NetworkRule) -> bool {
     let proto = wide.proto == Proto::Any || wide.proto == narrow.proto;
     let port = match (wide.port, narrow.port) {
         (PortMatch::Any, _) => true,
-        (_, PortMatch::Any) => false,
+        // Port 0 is never connectable, so `1-65535` covers `*`.
+        (wide, PortMatch::Any) => {
+            let range = port_range(wide);
+            range.contains(&1) && range.contains(&u16::MAX)
+        }
         (wide, PortMatch::Exact(p)) => port_range(wide).contains(&p),
         (wide, PortMatch::Range(lo, hi)) => {
             let range = port_range(wide);
@@ -1091,6 +1096,8 @@ mod tests {
             ("tcp://[fd00::/8]:*", "tcp://[fd00::1]:22"),
             ("tcp://[::ffff:192.168.1.0/120]:*", "tcp://192.168.1.7:80"),
             ("tcp://a.example.com:80", "tcp://a.example.com:80"),
+            ("any://192.168.1.2:1-65535", "tcp://192.168.1.2:*"),
+            ("any://192.168.1.2:0-65535", "udp://192.168.1.2:*"),
         ] {
             assert!(covers_str(wide, narrow), "{wide} ⊇ {narrow}");
         }
@@ -1104,6 +1111,7 @@ mod tests {
             ("tcp://192.168.1.0/24:*", "tcp://192.168.0.0/16:*"),
             ("tcp://192.168.0.0/16:80", "tcp://192.168.1.2:*"),
             ("tcp://192.168.0.0/16:80-90", "tcp://192.168.1.2:85-95"),
+            ("tcp://192.168.1.2:2-65535", "tcp://192.168.1.2:*"),
             ("tcp://192.168.0.0/16:*", "udp://192.168.1.2:80"),
             ("tcp://192.168.0.0/16:*", "any://192.168.1.2:80"),
             ("https://10.0.0.0/8", "tcp://10.0.0.1:443"),
