@@ -24,6 +24,8 @@
 # the PR body to $PR_BODY_FILE (default: wasm-toolchain-pr.md in
 # $RUNNER_TEMP or the system temp directory).
 set -euo pipefail
+# Command substitutions below carry most of the logic; fail in them too.
+shopt -s inherit_errexit
 
 INDEX="${CRATES_INDEX:-https://index.crates.io}"
 ROOT="$(git rev-parse --show-toplevel)"
@@ -68,13 +70,14 @@ releases() {
 }
 
 # jq prelude: semver ordering and the compatibility line of a version or
-# a caret / exact requirement ("^0.263.0" and "0.263.1" -> "0.263",
-# "^1.2" -> "1").
+# a caret requirement ("^0.263.0" and "0.263.1" -> "0.263", "^1.2" ->
+# "1"). Any other requirement (exact, tilde, range) stops the run: the
+# newest-release-on-the-line pick assumes caret semantics.
 JQ_LIB='
 def nums: split(".") | map(tonumber);
-def line: if test("^[\\^=]?[0-9]+\\.[0-9]+(\\.[0-9]+)?$") | not
+def line: if test("^\\^?[0-9]+\\.[0-9]+(\\.[0-9]+)?$") | not
           then error("unsupported requirement \(.)") else . end
-  | ltrimstr("^") | ltrimstr("=") | split(".")
+  | ltrimstr("^") | split(".")
   | if .[0] == "0" then "0." + .[1] else .[0] end;
 '
 
@@ -193,19 +196,20 @@ plan() {
 }
 
 apply() {
-  local p status line c old new wt="" table=""
+  local p status line c old new wt="" wb="" table=""
   p="$(plan)"
   printf '%s\n' "$p"
   status="$(awk '$1 == "status" { print $2 }' <<<"$p")"
   if [[ $status != bump ]]; then
     log "nothing to bump ($status)"
-    [[ -n ${GITHUB_OUTPUT:-} ]] && echo "changed=false" >>"$GITHUB_OUTPUT"
-    return
+    if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=false" >>"$GITHUB_OUTPUT"; fi
+    return 0
   fi
   line="$(awk '$1 == "line" { print $2 }' <<<"$p")"
 
   while read -r _ c old new; do
     [[ $c == wasmtime ]] && wt="$new"
+    [[ $c == wit-bindgen ]] && wb="$new"
     table+="| \`$c\` | $old | $new |"$'\n'
     [[ $old == "$new" ]] && continue
     sed -i.bak -E "s/^($c = (\\{ *version = )?\")=$old\"/\\1=$new\"/" "$MANIFEST"
@@ -220,7 +224,7 @@ apply() {
     (cd "$(dirname "$lock")" && cargo update --workspace)
   done
 
-  local title="build(deps): bump wasm toolchain to wasmtime $wt"
+  local title="build(deps): bump wasm toolchain to wasmtime $wt, wit-bindgen $wb"
   local body_file="${PR_BODY_FILE:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/wasm-toolchain-pr.md}"
   cat >"$body_file" <<EOF
 Bumps the exact-pinned wasm toolchain together onto wasm-tools $line, the line wasmtime $wt is built on. wit-bindgen moves to its newest release on the same line, so the host and the guest bindings share one wasm-tools version.

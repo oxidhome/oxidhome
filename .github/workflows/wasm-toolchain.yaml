@@ -27,8 +27,25 @@ jobs:
       - name: Bump pins and lockfiles
         id: bump
         run: .github/scripts/wasm-toolchain.sh apply
-      - name: Open pull request
+      # A rerun regenerates the branch from main, which would drop any
+      # baseline or binding fixes pushed to the open PR for the same bump
+      # (the title names both target versions).
+      - name: Check for an open PR with this bump
+        id: open
         if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ steps.bump.outputs.title }}
+        run: |
+          open_title=$(gh pr list --head chore/update-wasm-toolchain --state open --json title --jq '.[0].title // ""')
+          if [ "$open_title" = "$TITLE" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "An open PR already makes this bump; leaving it alone."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Open pull request
+        if: steps.bump.outputs.changed == 'true' && steps.open.outputs.exists == 'false'
         uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
         with:
           branch: chore/update-wasm-toolchain
@@ -38,6 +55,7 @@ jobs:
             Cargo.lock
             examples/*/Cargo.lock
           commit-message: ${{ steps.bump.outputs.title }}
+          signoff: true
           title: ${{ steps.bump.outputs.title }}
           body-path: ${{ steps.bump.outputs.body-file }}
           labels: |

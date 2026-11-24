@@ -86,8 +86,7 @@ libc = "0.2.189"
 # Pinned exact on the wasm-tools line `wasmtime` pulls in (they share
 # `wit_parser` types, so a skew fails to compile), so the host graph
 # keeps one copy; the toolchain job above moves them. (The dev-only
-# `dummy-module` / `semver-check` features add `wat` and a newer
-# `wasmparser` to test builds.)
+# `dummy-module` / `semver-check` features add `wat` to test builds.)
 wit-parser = { version = "=0.263.0", default-features = false, features = ["std", "decoding"] }
 wit-component = { version = "=0.263.0", default-features = false }
 anyhow = "1.0.102"
