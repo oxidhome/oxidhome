@@ -194,19 +194,29 @@ impl TlsPinStore {
             let mut stmt = conn.prepare(
                 "SELECT instance_id, host, port, sha256, pinned_ms FROM network_tls_pin",
             )?;
+            // Columns read loosely: a row of the wrong types is skipped
+            // (and re-pinned over), never a reason to refuse to start.
             let rows = stmt.query_map([], |r| {
+                let text = |i| {
+                    r.get_ref(i)
+                        .ok()
+                        .and_then(|v| v.as_str().ok().map(str::to_owned))
+                };
+                let int = |i| r.get_ref(i).ok().and_then(|v| v.as_i64().ok());
                 Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
+                    text(0).unwrap_or_default(),
+                    text(1).unwrap_or_default(),
+                    int(2),
+                    text(3),
+                    int(4).unwrap_or_default(),
                 ))
             })?;
             let mut out = BTreeMap::new();
             for row in rows {
                 let (instance_id, host, port, sha, pinned_ms) = row?;
-                if let (Ok(port), Some(fp)) = (u16::try_from(port), Fingerprint::from_hex(&sha)) {
+                let port = port.and_then(|p| u16::try_from(p).ok());
+                let fingerprint = sha.as_deref().and_then(Fingerprint::from_hex);
+                if let (Some(port), Some(fp)) = (port, fingerprint) {
                     out.insert(
                         PinKey {
                             instance_id,

@@ -268,8 +268,10 @@ impl Request {
                 self.method = Method::Get;
             }
             self.body.clear();
-            self.headers
-                .retain(|(name, _)| name != "content-type" && name != "content-length");
+            // Headers describing the dropped body go with it.
+            self.headers.retain(|(name, _)| {
+                !name.starts_with("content-") && name != "digest" && name != "repr-digest"
+            });
         }
         if !from.same_origin(to) {
             self.headers
@@ -288,7 +290,11 @@ impl Request {
                 .append(name, value)
                 .map_err(|e| Error::Request(format!("header `{name}`: {e:?}")))?;
         }
-        if !self.body.is_empty() {
+        // An empty POST / PUT / PATCH still says so: some servers refuse a
+        // chunked request without a length (`411`).
+        if !self.body.is_empty()
+            || matches!(self.method, Method::Post | Method::Put | Method::Patch)
+        {
             headers
                 .append("content-length", self.body.len().to_string().as_bytes())
                 .map_err(|e| Error::Request(format!("content-length: {e:?}")))?;
@@ -533,12 +539,12 @@ impl Url {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
             if is_scheme {
-                return Self::parse(location);
+                return Self::parse(location).map(Self::without_dot_segments);
             }
         }
         let scheme = if self.https { "https" } else { "http" };
         if let Some(rest) = location.strip_prefix("//") {
-            return Self::parse(&format!("{scheme}://{rest}"));
+            return Self::parse(&format!("{scheme}://{rest}")).map(Self::without_dot_segments);
         }
         let location = location.split('#').next().unwrap_or_default();
         let (base_path, _) = self
@@ -567,23 +573,45 @@ impl Url {
         Self::parse(&format!("{scheme}://{}{path_and_query}", self.authority))
     }
 
-    fn same_origin(&self, other: &Self) -> bool {
-        self.https == other.https
-            && self
-                .authority_with_port()
-                .eq_ignore_ascii_case(&other.authority_with_port())
+    /// This URL with `.` and `..` segments resolved (RFC 3986 §5.2.4).
+    fn without_dot_segments(mut self) -> Self {
+        let (path, query) = match self.path_and_query.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (self.path_and_query.as_str(), None),
+        };
+        let path = remove_dot_segments(path);
+        self.path_and_query = match query {
+            Some(q) => format!("{path}?{q}"),
+            None => path,
+        };
+        self
     }
 
-    fn authority_with_port(&self) -> String {
-        let has_port = match self.authority.rfind(']') {
-            Some(close) => self.authority[close..].contains(':'),
-            None => self.authority.contains(':'),
+    fn same_origin(&self, other: &Self) -> bool {
+        self.https == other.https && self.origin() == other.origin()
+    }
+
+    /// Host (lowercase; an IP literal in one spelling) and effective port.
+    fn origin(&self) -> (String, String) {
+        let (host, port) = match self.authority.rfind(']') {
+            Some(close) => {
+                let (host, rest) = self.authority.split_at(close + 1);
+                (host, rest.strip_prefix(':'))
+            }
+            None => match self.authority.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (self.authority.as_str(), None),
+            },
         };
-        if has_port {
-            self.authority.clone()
-        } else {
-            format!("{}:{}", self.authority, if self.https { 443 } else { 80 })
-        }
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let host = bare
+            .parse::<std::net::IpAddr>()
+            .map_or_else(|_| bare.to_ascii_lowercase(), |ip| ip.to_string());
+        let port = port.map_or_else(
+            || if self.https { "443" } else { "80" }.to_owned(),
+            str::to_owned,
+        );
+        (host, port)
     }
 }
 
@@ -669,6 +697,12 @@ mod tests {
         ] {
             assert_eq!(base.join(location).expect(location).to_string(), expected);
         }
+        for (location, expected) in [
+            ("https://cam.lan/api/../status", "https://cam.lan/status"),
+            ("//cam.lan/a/./b/../c?q=../x", "https://cam.lan/a/c?q=../x"),
+        ] {
+            assert_eq!(base.join(location).expect(location).to_string(), expected);
+        }
         for location in ["mailto:help@example.org", "ftp://cam.lan/x", "https:x"] {
             assert!(base.join(location).is_err(), "{location}");
         }
@@ -680,6 +714,7 @@ mod tests {
         assert!(!url("https://h/a").same_origin(&url("http://h/a")));
         assert!(!url("https://h/a").same_origin(&url("https://h:8443/a")));
         assert!(url("http://[::1]/").same_origin(&url("http://[::1]:80/")));
+        assert!(url("https://[fd00::1]/a").same_origin(&url("https://[fd00:0:0:0:0:0:0:1]:443/b")));
     }
 
     #[test]
@@ -691,6 +726,7 @@ mod tests {
             Request::post("https://a.example/x")
                 .header("Authorization", "secret")
                 .header("content-type", "text/plain")
+                .header("Content-Encoding", "identity")
                 .body("hi")
         };
 

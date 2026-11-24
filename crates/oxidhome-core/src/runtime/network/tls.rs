@@ -20,7 +20,8 @@
 //!   Nothing of the request is sent before that check.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -33,15 +34,23 @@ use super::policy::NetworkPolicy;
 use crate::native_policy::endpoint::{AddressClass, classify};
 use crate::state::tls_pins::{Fingerprint, PinCheck, PinKey, TlsPinStore};
 
+/// The system roots, once loaded: `None` when the system has none usable.
+#[derive(Debug, Clone)]
+enum Roots {
+    Loading,
+    Loaded(Option<Arc<WebPkiServerVerifier>>),
+}
+
 /// Host-wide TLS client state: the root verifier (built on first use) and
 /// the pin store. One per [`Engine`](crate::Engine).
 pub(crate) struct TlsClient {
     provider: Arc<CryptoProvider>,
     /// `None` when the system has no usable roots: only pinned LAN
     /// devices can then be reached.
-    /// Built once on a blocking thread; requests that give up waiting
-    /// leave the one load running rather than starting more.
-    roots: Arc<OnceLock<Option<Arc<WebPkiServerVerifier>>>>,
+    /// `Some` once loaded. One detached blocking job loads it; requests
+    /// wait on the channel, so one that gives up holds no thread.
+    roots: Arc<tokio::sync::watch::Sender<Roots>>,
+    roots_started: AtomicBool,
     extra_roots: Vec<CertificateDer<'static>>,
     pins: Arc<TlsPinStore>,
     /// Test hook: also trust loopback servers on first use.
@@ -63,7 +72,8 @@ impl TlsClient {
     pub(crate) fn new(pins: Arc<TlsPinStore>) -> Self {
         Self {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
-            roots: Arc::new(OnceLock::new()),
+            roots: Arc::new(tokio::sync::watch::Sender::new(Roots::Loading)),
+            roots_started: AtomicBool::new(false),
             extra_roots: Vec::new(),
             pins,
             tofu_loopback: false,
@@ -93,20 +103,25 @@ impl TlsClient {
     }
 
     async fn root_verifier(&self) -> Option<Arc<WebPkiServerVerifier>> {
-        if let Some(roots) = self.roots.get() {
-            return roots.clone();
+        let mut loaded = self.roots.subscribe();
+        if !self.roots_started.swap(true, Ordering::AcqRel) {
+            let roots = Arc::clone(&self.roots);
+            let extra = self.extra_roots.clone();
+            let provider = Arc::clone(&self.provider);
+            // Detached: a request that stops waiting neither stops nor
+            // repeats the load.
+            drop(tokio::task::spawn_blocking(move || {
+                roots.send_replace(Roots::Loaded(build_root_verifier(&provider, extra)));
+            }));
         }
-        let roots = Arc::clone(&self.roots);
-        let extra = self.extra_roots.clone();
-        let provider = Arc::clone(&self.provider);
-        tokio::task::spawn_blocking(move || {
-            roots
-                .get_or_init(|| build_root_verifier(&provider, extra))
-                .clone()
-        })
-        .await
-        .ok()
-        .flatten()
+        match &*loaded
+            .wait_for(|roots| matches!(roots, Roots::Loaded(_)))
+            .await
+            .ok()?
+        {
+            Roots::Loaded(verifier) => verifier.clone(),
+            Roots::Loading => None,
+        }
     }
 
     /// Whether a server at `addr` may be trusted on first use.
@@ -183,6 +198,8 @@ struct Verifier {
     provider: Arc<CryptoProvider>,
     tofu: bool,
     trust: Mutex<Option<Trust>>,
+    /// The leaf the server presented, whatever the verdict.
+    seen: Mutex<Option<Fingerprint>>,
 }
 
 impl ServerCertVerifier for Verifier {
@@ -194,6 +211,8 @@ impl ServerCertVerifier for Verifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        *self.seen.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Fingerprint::of_der(end_entity));
         let verdict = match &self.roots {
             Some(roots) => {
                 roots.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
@@ -302,7 +321,13 @@ pub(super) async fn connect(
         provider: Arc::clone(&client.provider),
         tofu: client.tofu_allowed(peer),
         trust: Mutex::new(None),
+        seen: Mutex::new(None),
     });
+    let key = PinKey {
+        instance_id: policy.instance_id().to_owned(),
+        host: crate::state::tls_pins::normalize_host(host),
+        port,
+    };
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&client.provider))
         .with_safe_default_protocol_versions()
         .map_err(|_| Error::TlsProtocolError)?
@@ -310,19 +335,30 @@ pub(super) async fn connect(
         .with_custom_certificate_verifier(Arc::clone(&verifier) as Arc<dyn ServerCertVerifier>)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+    let tls = match tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(server_name, stream)
         .await
-        .map_err(|err| tls_error(&err))?;
+    {
+        Ok(tls) => tls,
+        Err(err) => {
+            // A pinned key presenting another certificate is a pin
+            // refusal (audited), whatever else failed with it.
+            let seen = *verifier.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            return match (seen, client.pins.pinned(&key)) {
+                (Some(seen), Some(pinned)) if seen != pinned => {
+                    Ok(Connected::Refused(PinDenial::Mismatch {
+                        seen: seen.to_hex(),
+                        pinned: pinned.to_hex(),
+                    }))
+                }
+                _ => Err(tls_error(&err)),
+            };
+        }
+    };
     let trust = *verifier
         .trust
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let key = PinKey {
-        instance_id: policy.instance_id().to_owned(),
-        host: crate::state::tls_pins::normalize_host(host),
-        port,
-    };
     match trust {
         Some(Trust::Roots(seen)) => {
             // A pinned key stays pinned until the operator resets it,

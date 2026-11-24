@@ -917,3 +917,44 @@ async fn a_pin_holds_against_a_root_vouched_replacement() {
     )
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_untrusted_certificate_is_audited_as_a_pin_mismatch() {
+    // No trust on first use here (as for a public address): the
+    // certificate fails verification anyway, but against a pin that is
+    // the event the operator needs to see.
+    let host = TestHost::new()
+        .unwrap()
+        .with_tls_for_tests(Vec::new(), false);
+    let server = TlsServer::start(&self_signed(&["127.0.0.1"]), |_| http_ok("no"));
+    host.engine()
+        .tls_pins()
+        .check_or_pin(
+            &oxidhome_core::state::PinKey {
+                instance_id: "moved".into(),
+                host: "127.0.0.1".into(),
+                port: server.port(),
+            },
+            oxidhome_core::state::Fingerprint::of_der(b"the device's old certificate"),
+        )
+        .unwrap();
+    let results = probe(
+        &host,
+        "moved",
+        &[format!("https://127.0.0.1:{}", server.port())],
+        &[format!("get https://127.0.0.1:{}/", server.port())],
+    )
+    .await;
+    assert_eq!(results, ["err:Http(ErrorCode::TlsCertificateError)"]);
+    let row = wait_for_deny(
+        &host,
+        "tls",
+        "moved",
+        &format!("127.0.0.1:{}", server.port()),
+    )
+    .await;
+    assert!(
+        row.domain_error.is_some_and(|e| e.contains("pinned")),
+        "domain_error"
+    );
+}
