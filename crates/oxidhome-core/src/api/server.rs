@@ -16,13 +16,13 @@ use axum::{
     http::StatusCode,
     middleware::from_fn_with_state,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::Engine;
-use crate::auth::{Actor, InvocationContext};
+use crate::auth::{Action, InvocationContext, Resource};
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
@@ -34,12 +34,8 @@ use crate::state::{
 };
 
 use super::auth::{AuthState, require_token};
-use super::scopes::{
-    AUDIT_READ, DASHBOARDS_READ, DASHBOARDS_WRITE, DEVICES_COMMAND, DEVICES_LIST, DEVICES_READ,
-    EVENTS_READ, EVENTS_TAIL, INSTANCES_LIST, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST,
-    PLUGINS_START, PLUGINS_STOP, PLUGINS_UI, PLUGINS_UNINSTALL, STATUS_READ, ScopeDenied,
-    can_read_blobs, require_scope,
-};
+use super::bytes::BytesGate;
+use super::scopes::{ScopeDenied, require};
 use super::ui_ticket;
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
@@ -75,7 +71,7 @@ pub fn build_router(engine: Engine) -> Router {
         audit_log: engine.audit_log(),
         // H6: `POST /api/v1/devices/{id}/command` applies the
         // `device.send_command` per-device allowlist through the
-        // shared `authorize_device_command` check, same as Connect
+        // shared `crate::auth::authorize` decision, same as Connect
         // and MCP. Every other constraint key is still refused here.
         // See [`AuthState::enforced_constraints`] docs.
         enforced_constraints: &[crate::auth::DEVICE_COMMAND_ENFORCED],
@@ -94,6 +90,10 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/devices/state", get(get_all_device_state))
         .route("/api/v1/devices/{device_id}/state", get(get_device_state))
         .route("/api/v1/devices/{device_id}/command", post(send_command))
+        .route(
+            "/api/v1/devices/{device_id}/category",
+            put(set_device_category),
+        )
         .route("/api/v1/plugins", get(list_plugins).post(install_plugin))
         .route(
             "/api/v1/plugins/{plugin_id}",
@@ -202,9 +202,9 @@ pub fn build_router(engine: Engine) -> Router {
 /// `status:read`: operational metadata next to the status surface, no
 /// secrets.
 async fn get_config(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
 ) -> Result<Json<serde_json::Value>, ScopeDenied> {
-    require_scope(&actor, STATUS_READ)?;
+    require(&ctx, Action::HostStatus, &Resource::Host)?;
     Ok(Json(super::mcp::config_json()))
 }
 
@@ -393,10 +393,10 @@ struct InstanceSummary {
 /// on the `instances:list` scope; the admin / wildcard token
 /// satisfies it via [`crate::api::scopes::WILDCARD`].
 async fn list_instances(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<InstancesBody>, ScopeDenied> {
-    require_scope(&actor, INSTANCES_LIST)?;
+    require(&ctx, Action::InstanceRead, &Resource::instances())?;
     let mut instances = Vec::new();
     for handle in state.engine.instances().list() {
         instances.push(InstanceSummary {
@@ -424,6 +424,32 @@ struct DeviceSummary {
     owner_instance: String,
     /// Human-readable name from the registration `DeviceInfo`.
     name: String,
+    /// H6 slice 2: host-derived category (`lock`, `light`, … or
+    /// `other`), after any operator raise.
+    category: &'static str,
+    /// Sensitive categories the device falls under (`lock`, `opener`,
+    /// `alarm`, `camera`); a token needs an explicit grant for each.
+    sensitive: Vec<&'static str>,
+}
+
+/// H6 slice 2: a device's classification on the wire.
+#[derive(Serialize)]
+pub(crate) struct WireDeviceClass {
+    pub(crate) category: &'static str,
+    pub(crate) sensitive: Vec<&'static str>,
+}
+
+impl From<crate::auth::DeviceClass> for WireDeviceClass {
+    fn from(class: crate::auth::DeviceClass) -> Self {
+        Self {
+            category: class.category().as_str(),
+            sensitive: class
+                .sensitive()
+                .iter()
+                .map(crate::auth::SensitiveCategory::as_str)
+                .collect(),
+        }
+    }
 }
 
 /// Authenticated `GET /api/v1/devices`. Lists every device any
@@ -435,22 +461,136 @@ struct DeviceSummary {
 /// state-vector projection lands in a later slice once we have a
 /// concrete UI/CLI consumer.
 async fn list_devices(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<DevicesBody>, ScopeDenied> {
-    require_scope(&actor, DEVICES_LIST)?;
+    require(&ctx, Action::DeviceList, &Resource::devices())?;
     let devices = state
         .engine
         .devices()
         .list()
         .into_iter()
-        .map(|meta| DeviceSummary {
-            device_id: meta.id.clone(),
-            owner_instance: meta.owner_instance.clone(),
-            name: meta.info.name.clone(),
+        .map(|meta| {
+            let class = WireDeviceClass::from(state.engine.devices().class_of_meta(&meta));
+            DeviceSummary {
+                device_id: meta.id.clone(),
+                owner_instance: meta.owner_instance.clone(),
+                name: meta.info.name.clone(),
+                category: class.category,
+                sensitive: class.sensitive,
+            }
         })
         .collect();
     Ok(Json(DevicesBody { devices }))
+}
+
+/// Body of `PUT /api/v1/devices/{device_id}/category`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CategoryBody {
+    /// A category name, or `null` to clear the override. Required:
+    /// `{}` is a 400/422, not a silent clear.
+    #[serde(deserialize_with = "nullable")]
+    category: Option<String>,
+}
+
+/// `Option` without serde's "missing means `None`": with a
+/// `deserialize_with`, an absent field is an error.
+fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    <Option<String> as Deserialize>::deserialize(d)
+}
+
+/// Response of `PUT /api/v1/devices/{device_id}/category`.
+#[derive(Serialize)]
+struct CategoryResponse {
+    device_id: String,
+    /// The operator override now stored, if any.
+    category_override: Option<&'static str>,
+    #[serde(flatten)]
+    class: WireDeviceClass,
+}
+
+enum CategoryError {
+    Scope(ScopeDenied),
+    BadRequest(String),
+    Internal,
+}
+
+impl IntoResponse for CategoryError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+}
+
+/// H6 slice 2: `PUT /api/v1/devices/{device_id}/category` — the
+/// operator raises a device's category (`{"category": "lock"}`) or
+/// clears the raise (`{"category": null}`). A raise only ever adds
+/// protection: the host-derived category and every sensitive category
+/// the host has seen for the device stay. The device need not be
+/// registered right now (an override survives restarts).
+///
+/// `policy.manage`: the owner token only; no scope, the wildcard
+/// included, grants it.
+///
+/// # Errors
+/// - `400` malformed device id or unknown category.
+/// - `403` not the owner.
+/// - `500` the override couldn't be stored.
+async fn set_device_category(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(device_id): Path<String>,
+    Json(body): Json<CategoryBody>,
+) -> Result<Json<CategoryResponse>, CategoryError> {
+    require(
+        &ctx,
+        Action::PolicyManage,
+        &state.engine.devices().resource(&device_id),
+    )
+    .map_err(CategoryError::Scope)?;
+    if !crate::state::is_device_id(&device_id) {
+        return Err(CategoryError::BadRequest("malformed device id".into()));
+    }
+    let category = match body.category.as_deref() {
+        None => None,
+        Some(name) => Some(
+            name.parse::<crate::auth::DeviceCategory>()
+                .map_err(|e| CategoryError::BadRequest(e.to_string()))?,
+        ),
+    };
+    let devices = state.engine.devices();
+    let id = device_id.clone();
+    let stored = tokio::task::spawn_blocking(move || devices.set_category(&id, category))
+        .await
+        .map_err(|_| CategoryError::Internal)?
+        .map_err(|err| match err {
+            crate::state::DeviceMetaError::UnknownOwner(_)
+            | crate::state::DeviceMetaError::TooMany => CategoryError::BadRequest(err.to_string()),
+            err => {
+                tracing::error!(target: "api.devices", error = %err, "storing a category override failed");
+                CategoryError::Internal
+            }
+        })?;
+    tracing::warn!(
+        target: "auth.sensitive",
+        device_id = %device_id,
+        category = category.map_or("(cleared)", crate::auth::DeviceCategory::as_str),
+        "device category override changed",
+    );
+    // From the row this request stored, so the response can't mix
+    // its override with a concurrent request's.
+    let class = state.engine.devices().class_with(&device_id, &stored);
+    Ok(Json(CategoryResponse {
+        device_id,
+        category_override: stored
+            .category_override
+            .map(crate::auth::DeviceCategory::as_str),
+        class: class.into(),
+    }))
 }
 
 // ── Device state (H9 host-owned projection) ──────────────────────
@@ -525,7 +665,7 @@ impl DeviceStateSnapshot {
         caps: &[Arc<crate::state::DeviceState>],
         epoch: &str,
         revision: u64,
-        blobs: bool,
+        gate: &BytesGate,
     ) -> Self {
         Self {
             device_id: caps
@@ -535,16 +675,17 @@ impl DeviceStateSnapshot {
             revision,
             capabilities: caps
                 .iter()
-                .map(|c| DeviceStateEntry::from_state(c, blobs))
+                .map(|c| DeviceStateEntry::from_state(c, gate))
                 .collect(),
         }
     }
 }
 
 impl DeviceStateEntry {
-    /// `blobs` is [`can_read_blobs`] for the caller: without it, every
-    /// `bytes-val` field is withheld (M7).
-    fn from_state(state: &crate::state::DeviceState, blobs: bool) -> Self {
+    /// `bytes-val` fields the caller's [`BytesGate`] doesn't release
+    /// are withheld (M7, H6 slice 2).
+    fn from_state(state: &crate::state::DeviceState, gate: &BytesGate) -> Self {
+        let blobs = gate.release_state(state);
         Self {
             device_id: state.device_id.clone(),
             capability: state.capability.clone(),
@@ -577,12 +718,16 @@ impl DeviceStateEntry {
 /// # Errors
 /// - `403` scope check failed.
 async fn get_device_state(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(device_id): Path<String>,
 ) -> Result<Json<DeviceStateSnapshot>, ScopeDenied> {
-    require_scope(&actor, DEVICES_READ)?;
-    let blobs = can_read_blobs(&actor);
+    require(
+        &ctx,
+        Action::DeviceRead,
+        &state.engine.devices().resource(&device_id),
+    )?;
+    let gate = BytesGate::new(&ctx, &state.engine);
     // H9 round-3 finding 3: read `revision` and `entries` **under
     // one lock**. The pre-fix shape called `current_revision()`
     // then `snapshot_device()` in two separate lock acquires, so
@@ -596,7 +741,7 @@ async fn get_device_state(
         .snapshot_device_with_revision(&device_id);
     let mut capabilities: Vec<DeviceStateEntry> = entries
         .iter()
-        .map(|s| DeviceStateEntry::from_state(s, blobs))
+        .map(|s| DeviceStateEntry::from_state(s, &gate))
         .collect();
     // Deterministic ordering so a client can eyeball snapshots.
     capabilities.sort_by(|a, b| a.capability.cmp(&b.capability));
@@ -787,12 +932,13 @@ impl From<ScopeDenied> for AllDevicesStateError {
 ///   request.
 #[allow(clippy::too_many_lines)]
 async fn get_all_device_state(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<AllDevicesStateParams>,
 ) -> Result<Json<AllDevicesStateSnapshot>, AllDevicesStateError> {
-    require_scope(&actor, DEVICES_READ)?;
-    let blobs = can_read_blobs(&actor);
+    require(&ctx, Action::DeviceRead, &Resource::devices())?;
+    let gate = BytesGate::new(&ctx, &state.engine);
+    let blobs = gate.general();
     let limit = params
         .limit
         .filter(|n| *n > 0)
@@ -844,7 +990,7 @@ async fn get_all_device_state(
     let devices: Vec<DeviceStateSnapshot> = page
         .devices
         .into_iter()
-        .map(|caps| DeviceStateSnapshot::from_entries(&caps, &epoch, revision, blobs))
+        .map(|caps| DeviceStateSnapshot::from_entries(&caps, &epoch, revision, &gate))
         .collect();
     let next_cursor = page
         .resume_after
@@ -947,12 +1093,13 @@ pub(crate) const MAX_STATE_CHANGES_LIMIT: usize = 1024;
 /// # Errors
 /// - `403` scope check failed.
 async fn query_device_state_changes(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<StateChangesParams>,
 ) -> Result<Json<StateChangesBody>, ScopeDenied> {
-    require_scope(&actor, DEVICES_READ)?;
-    let blobs = can_read_blobs(&actor);
+    require(&ctx, Action::DeviceRead, &Resource::devices())?;
+    let gate = BytesGate::new(&ctx, &state.engine);
+    let blobs = gate.general();
     let limit = params
         .limit
         .filter(|n| *n > 0)
@@ -974,7 +1121,7 @@ async fn query_device_state_changes(
     let changes: Vec<DeviceStateEntry> = page
         .entries
         .iter()
-        .map(|s| DeviceStateEntry::from_state(s, blobs))
+        .map(|s| DeviceStateEntry::from_state(s, &gate))
         .collect();
     Ok(Json(StateChangesBody {
         epoch: page.epoch,
@@ -1086,8 +1233,8 @@ pub(crate) struct WireCommandReport {
 }
 
 impl WireCommandReport {
-    /// Without `blobs` (the caller's [`can_read_blobs`]), returned
-    /// `bytes-val` state is withheld (M7).
+    /// Without `blobs` (the caller's [`BytesGate`] for the device),
+    /// returned `bytes-val` state is withheld (M7).
     pub(crate) fn from_report(mut report: CommandReport, blobs: bool) -> Self {
         if !blobs {
             report.withhold_bytes();
@@ -1194,17 +1341,21 @@ impl From<WitError> for WireWitError {
 /// audit row records `command_id` and `command_outcome`, with
 /// `decision = "allow"` whatever the outcome status.
 async fn send_command(
-    Extension(actor): Extension<Actor>,
     Extension(invocation): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(device_id): Path<String>,
     Json(body): Json<CommandBody>,
 ) -> Result<axum::response::Response, CommandError> {
-    require_scope(&actor, DEVICES_COMMAND).map_err(CommandError::Scope)?;
-    // H6: per-device resource check, shared with Connect and MCP.
-    // Before the lookup so a refused token can't probe device ids.
-    crate::auth::authorize_device_command(&actor, &device_id)
-        .map_err(|required| CommandError::Scope(ScopeDenied { required }))?;
+    // H6: `device.command` on the addressed device — the scope, the
+    // token's per-device allowlist and (slice 2) the sensitive-category
+    // grant, shared with Connect and MCP. Before the lookup so a
+    // refused token can't probe device ids.
+    let decision = require(
+        &invocation,
+        Action::DeviceCommand,
+        &state.engine.devices().resource(&device_id),
+    )
+    .map_err(CommandError::Scope)?;
 
     // Resolve device → owning instance via the registry's
     // cross-instance owner-only lookup (mirrors the dispatcher's
@@ -1221,6 +1372,15 @@ async fn send_command(
         .instances()
         .get(&owner)
         .ok_or(CommandError::NotFound)?;
+
+    // H6 slice 2: an allowed sensitive command is rate limited and
+    // leaves a `warn` audit row before it runs.
+    state
+        .engine
+        .sensitive()
+        .discharge_blocking(&invocation, Action::DeviceCommand, &device_id, &decision)
+        .await
+        .map_err(CommandError::Obligation)?;
 
     // Build the WIT command. JSON `value` shapes map to typed
     // `Value` variants via the `From<WireValue>` impl. The supervisor
@@ -1239,21 +1399,24 @@ async fn send_command(
             .collect(),
     };
 
-    let report = handle.execute_command_in(invocation, device_id, cmd).await;
+    let gate = BytesGate::new(&invocation, &state.engine);
+    let report = handle
+        .execute_command_admitted(
+            invocation,
+            device_id.clone(),
+            cmd,
+            decision.obligations.sensitive,
+        )
+        .await;
+    let blobs = gate.release_report(&device_id, &owner, &report);
 
     // F4 + H5: the authorization decision stays `allow` whatever the
     // command outcome; the outcome and command id ride to the audit
     // middleware on a response extension.
     let status = command_outcome_status(&report.outcome);
     let domain_outcome = crate::api::auth::DomainOutcome::from_report(&report);
-    let mut response = (
-        status,
-        Json(WireCommandReport::from_report(
-            report,
-            can_read_blobs(&actor),
-        )),
-    )
-        .into_response();
+    let mut response =
+        (status, Json(WireCommandReport::from_report(report, blobs))).into_response();
     response.extensions_mut().insert(domain_outcome);
     Ok(response)
 }
@@ -1261,6 +1424,7 @@ async fn send_command(
 enum CommandError {
     Scope(ScopeDenied),
     NotFound,
+    Obligation(crate::auth::sensitive::ObligationError),
 }
 
 impl IntoResponse for CommandError {
@@ -1268,6 +1432,41 @@ impl IntoResponse for CommandError {
         match self {
             CommandError::Scope(s) => s.into_response(),
             CommandError::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
+            CommandError::Obligation(e) => obligation_response(&e),
+        }
+    }
+}
+
+/// H6 slice 2: the response for a sensitive action whose obligations
+/// weren't met — `429` with `Retry-After` when rate limited, `500` when
+/// the `warn` audit row couldn't be written (the action didn't run).
+pub(crate) fn obligation_response(
+    err: &crate::auth::sensitive::ObligationError,
+) -> axum::response::Response {
+    use crate::auth::sensitive::ObligationError;
+    match err {
+        ObligationError::RateLimited {
+            category,
+            retry_after_secs,
+        } => {
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "rate_limited",
+                    "category": category.as_str(),
+                    "retry_after_secs": retry_after_secs,
+                })),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(*retry_after_secs),
+            );
+            resp
+        }
+        ObligationError::Audit(_) | ObligationError::Join(_) => {
+            tracing::error!(target: "auth.sensitive", error = %err, "sensitive action refused");
+            (StatusCode::INTERNAL_SERVER_ERROR, "").into_response()
         }
     }
 }
@@ -1305,10 +1504,10 @@ struct PluginSummary {
 /// [`InstanceRegistry::list`] by `plugin_id`. Gated on
 /// `plugins:list`. Sorted by plugin id for stable CLI output.
 async fn list_plugins(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<PluginsBody>, ScopeDenied> {
-    require_scope(&actor, PLUGINS_LIST)?;
+    require(&ctx, Action::PluginRead, &Resource::plugins())?;
     // First, count running instances by plugin id.
     let mut by_plugin: HashMap<String, u32> = HashMap::new();
     for handle in state.engine.instances().list() {
@@ -1393,11 +1592,15 @@ struct PluginSchemaBody {
 ///   the installer guarantees a valid manifest, so an
 ///   unreadable one is a host-side integrity failure.
 async fn get_plugin_schema(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
 ) -> Result<Json<PluginSchemaBody>, PluginSchemaError> {
-    require_scope(&actor, PLUGINS_LIST)?;
+    require(
+        &ctx,
+        Action::PluginRead,
+        &Resource::plugin(plugin_id.as_str()),
+    )?;
     // Round-2 F4 + round-9 F1: hold the per-plugin
     // lifecycle lock across the registry lookup + the
     // package re-read + the digest verification. Without it,
@@ -1537,11 +1740,11 @@ struct InstalledRow {
 /// would surprise an operator who wanted to inspect the staged
 /// install before letting it run.
 async fn install_plugin(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Json(body): Json<InstallBody>,
 ) -> Result<Json<InstalledRow>, PluginLifecycleError> {
-    require_scope(&actor, PLUGINS_INSTALL)?;
+    require(&ctx, Action::PluginInstall, &Resource::Host)?;
     // The registry's install is sync (filesystem + manifest read
     // is fast enough not to need tokio::fs). Wrap in `spawn_blocking`
     // so a slow disk doesn't stall the axum runtime; a `cp -r` of a
@@ -1583,13 +1786,18 @@ struct StartedRow {
 /// instance of an installed plugin. Returns once the instance
 /// reaches `Running` (or fails to). Gated on `plugins:start`.
 async fn start_plugin_instance(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
     body: Option<Json<StartBody>>,
 ) -> Result<Json<StartedRow>, PluginLifecycleError> {
-    require_scope(&actor, PLUGINS_START)?;
     let body = body.map_or_default(|Json(b)| b);
+    require(&ctx, Action::InstanceStart, &Resource::instances())?;
+    require(
+        &ctx,
+        Action::InstanceStart,
+        &Resource::instance(plugin_id.as_str(), body.instance_id.clone()),
+    )?;
     let instance_id = body
         .instance_id
         .clone()
@@ -1673,13 +1881,18 @@ struct StoppedRow {
 /// `{"error": "stop_timed_out", "stopped": [...], "stopping": [...]}`,
 /// and the `stopping` instances finish stopping in the background.
 async fn stop_plugin_instances(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
     body: Option<Json<StopBody>>,
 ) -> Result<Json<StoppedRow>, PluginLifecycleError> {
-    require_scope(&actor, PLUGINS_STOP)?;
     let body = body.map_or_default(|Json(b)| b);
+    require(&ctx, Action::InstanceStop, &Resource::instances())?;
+    require(
+        &ctx,
+        Action::InstanceStop,
+        &Resource::instance(plugin_id.as_str(), body.instance_id.clone()),
+    )?;
     let handles = state
         .engine
         .instances()
@@ -1716,11 +1929,15 @@ struct UninstalledRow {
 /// operator must `POST .../stop` first. Gated on
 /// `plugins:uninstall` (sensitive).
 async fn uninstall_plugin(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
 ) -> Result<Json<UninstalledRow>, PluginLifecycleError> {
-    require_scope(&actor, PLUGINS_UNINSTALL)?;
+    require(
+        &ctx,
+        Action::PluginUninstall,
+        &Resource::plugin(plugin_id.as_str()),
+    )?;
     // H2 round-2 F1 + H3 round-2 F1: hold the per-plugin_id
     // lifecycle lock across the running-instances check + the
     // compose uninstall, and — crucially — MOVE the guard into
@@ -1935,11 +2152,15 @@ impl IntoResponse for PluginLifecycleError {
 /// - `403` scope check failed.
 /// - `404` no such installed plugin.
 async fn post_plugin_ui_session(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(plugin_id): Path<String>,
 ) -> Result<Response, PluginUiError> {
-    require_scope(&actor, PLUGINS_UI)?;
+    require(
+        &ctx,
+        Action::PluginUi,
+        &Resource::plugin(plugin_id.as_str()),
+    )?;
     let Some(installed) = state.engine.installed_plugins().get(&plugin_id) else {
         return Err(PluginUiError::NotFound);
     };
@@ -2444,14 +2665,14 @@ fn js_string_escape(input: &str) -> String {
 /// to record. Documenting so a future audit-completeness audit
 /// doesn't read it as a gap.
 async fn tail_events(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     upgrade: WebSocketUpgrade,
     Query(params): Query<TailParams>,
 ) -> Result<axum::response::Response, ScopeDenied> {
-    require_scope(&actor, EVENTS_TAIL)?;
+    require(&ctx, Action::EventSubscribe, &Resource::events())?;
     if params.after_id.is_some() {
-        require_scope(&actor, EVENTS_READ)?;
+        require(&ctx, Action::EventRead, &Resource::events())?;
     }
     // H5 review P1 F1: subscribe to the bus BEFORE the 101 upgrade
     // response goes back to the client, so a client that saw 101
@@ -2477,8 +2698,8 @@ async fn tail_events(
     let resume_after_id = tail.resume_after_id();
     // M7: live and replayed events alike withhold `bytes-val`
     // payloads unless the caller holds `blobs:read`.
-    let blobs = can_read_blobs(&actor);
-    let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail, blobs));
+    let gate = BytesGate::new(&ctx, &state.engine);
+    let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail, gate));
     if let Some(id) = resume_after_id {
         response
             .headers_mut()
@@ -2515,7 +2736,7 @@ async fn tail_step(
     (tail, item)
 }
 
-async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail, blobs: bool) {
+async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail, gate: BytesGate) {
     use crate::state::TailItem;
     use axum::extract::ws::{CloseFrame, Message};
     // C2e: per-subscriber mpsc queue. The tail ends when the bus
@@ -2538,7 +2759,7 @@ async fn tail_events_loop(mut socket: WebSocket, tail: crate::state::EventTail, 
                 step = Box::pin(tail_step(tail));
                 let text = match item {
                     Ok(Some(TailItem::Event(event))) => {
-                        match serde_json::to_string(&WireEvent::from_host(&event, blobs)) {
+                        match serde_json::to_string(&WireEvent::from_host(&event, &gate)) {
                             Ok(text) => text,
                             Err(_) => continue,
                         }
@@ -2686,7 +2907,7 @@ impl WireKeyValue {
     /// conversion so a single value decoder covers both storage
     /// and event surfaces.
     ///
-    /// M7: without `blobs` (the caller's [`can_read_blobs`]) a
+    /// M7: without `blobs` (the caller's [`BytesGate`] answer) a
     /// `bytes-val` is replaced by the withheld marker.
     fn from_wit(mut kv: KeyValue, blobs: bool) -> Self {
         if !blobs {
@@ -2700,7 +2921,8 @@ impl WireKeyValue {
 }
 
 impl WireEvent {
-    fn from_host(event: &Event, blobs: bool) -> Self {
+    fn from_host(event: &Event, gate: &BytesGate) -> Self {
+        let blobs = gate.release_event(event);
         let id = event.row_id;
         let (topic, payload) = match &event.payload {
             EventPayload::StateChanged(sc) => (
@@ -2794,11 +3016,11 @@ const LOGS_QUERY_MAX_LIMIT: u32 = 1_000;
 /// `LogStore` `SQLite` table. Gated on `logs:read`. Returns rows
 /// newest-first (the store's native order).
 async fn query_logs(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<LogsParams>,
 ) -> Result<Json<LogsBody>, LogsError> {
-    require_scope(&actor, LOGS_READ).map_err(LogsError::Scope)?;
+    require(&ctx, Action::HostLogs, &Resource::Host).map_err(LogsError::Scope)?;
     let limit = params
         .limit
         .unwrap_or(LOGS_QUERY_DEFAULT_LIMIT)
@@ -2950,11 +3172,11 @@ static EVENTS_QUERY_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 /// so a client that saved the last-seen tail id can resume
 /// from `since_ms` or reconcile against `id`.
 async fn query_events(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<EventsParams>,
 ) -> Result<Json<EventsBody>, EventsError> {
-    require_scope(&actor, EVENTS_READ).map_err(EventsError::Scope)?;
+    require(&ctx, Action::EventRead, &Resource::events()).map_err(EventsError::Scope)?;
     let limit = params
         .limit
         .unwrap_or(EVENTS_QUERY_DEFAULT_LIMIT)
@@ -3010,9 +3232,10 @@ async fn query_events(
     .map_err(|_| EventsError::Join)?
     .map_err(EventsError::Storage)?
     .map_err(EventsError::CursorExpired)?;
+    let gate = BytesGate::new(&ctx, &state.engine);
     let events = rows
         .into_iter()
-        .map(|row| WireHistoricalEvent::from_row(row, can_read_blobs(&actor)))
+        .map(|row| WireHistoricalEvent::from_row(row, &gate))
         .collect();
     Ok(Json(EventsBody { events }))
 }
@@ -3076,7 +3299,7 @@ pub(crate) struct WireHistoricalEvent {
 }
 
 impl WireHistoricalEvent {
-    pub(crate) fn from_row(row: HistoricalEvent, blobs: bool) -> Self {
+    pub(crate) fn from_row(row: HistoricalEvent, gate: &BytesGate) -> Self {
         // Build a scratch `Event` so `WireEvent::from_host`'s
         // payload-projection logic can be reused. The event's
         // `origin_*` / `timestamp` fields are populated from
@@ -3094,7 +3317,7 @@ impl WireHistoricalEvent {
         };
         // Reuse the tail-side payload projection so a single
         // client codec handles both live tail + history reads.
-        let wire = WireEvent::from_host(&ev, blobs);
+        let wire = WireEvent::from_host(&ev, gate);
         Self {
             id: row.id,
             received_ms: row.received_ms,
@@ -3134,6 +3357,9 @@ struct AuditParams {
     /// Exact `call_id` match (H6) — the entry point's row plus every
     /// delegated `call-service` hop it caused.
     call_id: Option<String>,
+    /// Exact `level` match (H6 slice 2): `level=warn` lists the rows
+    /// allowed sensitive actions wrote.
+    level: Option<String>,
     /// Cursor for lossless pagination. Opaque `"<intent_ms>:<id>"`
     /// string returned as `next_cursor` on the previous page.
     /// Callers should not construct it by hand — pass the previous
@@ -3150,12 +3376,12 @@ const AUDIT_QUERY_MAX_LIMIT: u32 = 1_000;
 /// `audit:read`. Returns rows newest-first with a `next_cursor`
 /// for lossless pagination.
 async fn query_audit(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     Extension(self_id): Extension<crate::api::auth::AuditIntentId>,
     State(state): State<ApiState>,
     Query(params): Query<AuditParams>,
 ) -> Result<Json<AuditBody>, AuditError> {
-    require_scope(&actor, AUDIT_READ).map_err(AuditError::Scope)?;
+    require(&ctx, Action::HostAudit, &Resource::Host).map_err(AuditError::Scope)?;
     let limit = params
         .limit
         .unwrap_or(AUDIT_QUERY_DEFAULT_LIMIT)
@@ -3176,6 +3402,7 @@ async fn query_audit(
         decision: params.decision,
         path: params.path,
         call_id: params.call_id,
+        level: params.level,
         before,
         // F3 self-exclusion: hide the query's own pending intent
         // row from its results.
@@ -3292,6 +3519,10 @@ struct WireAuditEntry {
     /// H5 explicit command outcome for `command_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     command_outcome: Option<String>,
+    /// H6 slice 2: `warn` on the row an allowed sensitive action
+    /// wrote; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
 }
 
 impl WireAuditEntry {
@@ -3317,6 +3548,7 @@ impl WireAuditEntry {
                 .and_then(|j| serde_json::from_str(j).ok()),
             command_id: row.command_id,
             command_outcome: row.command_outcome,
+            level: row.level,
         }
     }
 }
@@ -3426,10 +3658,10 @@ struct DashboardsBody {
 /// # Errors
 /// - `403` scope check failed.
 async fn list_dashboards(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<DashboardsBody>, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_READ)?;
+    require(&ctx, Action::DashboardRead, &Resource::dashboards())?;
     let rows = tokio::task::spawn_blocking(move || {
         state
             .engine
@@ -3452,11 +3684,11 @@ async fn list_dashboards(
 /// - `403` scope check failed.
 /// - `409` the owner is already at `MAX_DASHBOARDS_PER_OWNER`.
 async fn create_dashboard(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Json(body): Json<DashboardInputBody>,
 ) -> Result<Json<WireDashboard>, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_WRITE)?;
+    require(&ctx, Action::DashboardWrite, &Resource::dashboards())?;
     let layout_json =
         serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
     let input = crate::state::DashboardInput {
@@ -3480,11 +3712,11 @@ async fn create_dashboard(
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn get_dashboard(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<WireDashboard>, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_READ)?;
+    require(&ctx, Action::DashboardRead, &Resource::dashboard(id))?;
     let row = tokio::task::spawn_blocking(move || {
         state
             .engine
@@ -3510,12 +3742,12 @@ async fn get_dashboard(
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn update_dashboard(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
     Json(body): Json<DashboardInputBody>,
 ) -> Result<Json<WireDashboard>, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_WRITE)?;
+    require(&ctx, Action::DashboardWrite, &Resource::dashboard(id))?;
     let layout_json =
         serde_json::to_vec(&body.layout).map_err(|err| DashboardsError::Internal(err.into()))?;
     let input = crate::state::DashboardInput {
@@ -3546,11 +3778,11 @@ async fn update_dashboard(
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn delete_dashboard(
-    Extension(actor): Extension<Actor>,
+    Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, DashboardsError> {
-    require_scope(&actor, DASHBOARDS_WRITE)?;
+    require(&ctx, Action::DashboardWrite, &Resource::dashboard(id))?;
     let removed = tokio::task::spawn_blocking(move || {
         state
             .engine
@@ -3817,7 +4049,10 @@ mod tests {
                 row_id: None,
                 payload: EventPayload::Button(input),
             };
-            let wire = WireEvent::from_host(&event, true);
+            let wire = WireEvent::from_host(
+                &event,
+                &BytesGate::deny_all(&crate::Engine::new().expect("engine")),
+            );
             match wire.payload {
                 WireEventPayload::Button { variant, delta } => {
                     assert_eq!(variant, expected_variant, "variant mismatch for {input:?}");
@@ -3849,7 +4084,10 @@ mod tests {
                 },
             ),
         };
-        let wire = WireEvent::from_host(&event, true);
+        let wire = WireEvent::from_host(
+            &event,
+            &BytesGate::deny_all(&crate::Engine::new().expect("engine")),
+        );
         assert_eq!(wire.origin_plugin_id, "com.example.publisher");
         assert_eq!(wire.origin_instance_id, "publisher-42");
         // The origin fields serialize into the wire JSON so a

@@ -3733,3 +3733,196 @@ async fn events_cursor_pruned_by_retention_reports_cursor_expired() {
         assert!(rows.iter().any(|r| r.path == path), "{path} audited");
     }
 }
+
+// ── H6 slice 2: `authorize()` deny reasons in the audit ledger ──
+
+/// MCP tools now ask `auth::authorize` for both the route pre-check
+/// and the per-target 14.4 constraint. Each deny still writes one
+/// `deny` row whose `required_scope` is the missing scope or the
+/// `constraint:<tool>:<field>` sentinel, as the inline checks did.
+#[tokio::test(flavor = "current_thread")]
+async fn tool_denials_record_scope_and_constraint_sentinels() {
+    let engine = Engine::new().expect("engine");
+    let constrained = mint_bearer_with_constraint(
+        &engine,
+        "constrained-all",
+        r#"{
+            "device.send_command": {"devices": ["dev-a1b2*"]},
+            "plugins.show": {"plugins": ["acme.*"]},
+            "plugins.stop": {"plugins": ["acme.*"]},
+            "plugins.uninstall": {"plugins": ["acme.*"]},
+            "plugins.start": {"plugins": ["acme.*"]}
+        }"#,
+    );
+    let logs_only = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let router = build_router(engine.clone());
+
+    let (router, session) = handshake(router, &constrained).await;
+    let calls = [
+        (
+            "device.send_command",
+            json!({"device_id": "dev-ffff000000000000", "capability": "switch", "action": "toggle"}),
+            "constraint:device.send_command:devices",
+        ),
+        (
+            "plugins.show",
+            json!({"plugin_id": "outside.p"}),
+            "constraint:plugins.show:plugins",
+        ),
+        (
+            "plugins.stop",
+            json!({"plugin_id": "outside.p"}),
+            "constraint:plugins.stop:plugins",
+        ),
+        (
+            "plugins.uninstall",
+            json!({"plugin_id": "outside.p"}),
+            "constraint:plugins.uninstall:plugins",
+        ),
+        (
+            "plugins.start",
+            json!({"plugin_id": "outside.p"}),
+            "constraint:plugins.start:plugins",
+        ),
+    ];
+    for (tool, args, _) in &calls {
+        let response = call(
+            &router,
+            &constrained,
+            &session,
+            "tools/call",
+            json!({"name": tool, "arguments": args}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32001, "{tool}: {response}");
+    }
+
+    let (router, session) = handshake(router, &logs_only).await;
+    let response = call(
+        &router,
+        &logs_only,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.list", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32001, "{response}");
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 256))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    // One request per tool path: exactly one row each, no stray
+    // pending intent or duplicate denial.
+    let deny_for = |path: &str| {
+        let matching: Vec<_> = rows.iter().filter(|r| r.path == path).collect();
+        assert_eq!(matching.len(), 1, "{path}: {matching:?}");
+        assert_eq!(matching[0].decision, "deny", "{path}");
+        matching[0]
+    };
+    for (tool, _, sentinel) in &calls {
+        let row = deny_for(&format!("mcp.tool.{tool}"));
+        assert_eq!(row.status, 403, "{tool}");
+        assert_eq!(row.required_scope.as_deref(), Some(*sentinel), "{tool}");
+    }
+    let row = deny_for("mcp.tool.plugins.list");
+    assert_eq!(row.required_scope.as_deref(), Some("plugins:list"));
+}
+
+/// The `plugins.show` allowlist narrows the `plugins.show` tool only:
+/// the `oxidhome://plugins/{id}` resource read has always been gated by
+/// the flat `plugins:list` scope, and still is. Pins the resource the
+/// production handler authorizes, which the parity table can't see.
+#[tokio::test(flavor = "current_thread")]
+async fn plugins_show_allowlist_does_not_narrow_the_plugin_resource() {
+    let engine = Engine::new().expect("engine");
+    let bearer = mint_bearer_with_constraint(
+        &engine,
+        "show-allowlist",
+        r#"{"plugins.show":{"plugins":["acme.*"]}}"#,
+    );
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+
+    let tool = call(
+        &router,
+        &bearer,
+        &session,
+        "tools/call",
+        json!({"name": "plugins.show", "arguments": {"plugin_id": "outside.p"}}),
+    )
+    .await;
+    assert_eq!(tool["error"]["code"], -32001, "{tool}");
+
+    let read = call(
+        &router,
+        &bearer,
+        &session,
+        "resources/read",
+        json!({"uri": "oxidhome://plugins/outside.p"}),
+    )
+    .await;
+    assert_ne!(read["error"]["code"], -32001, "{read}");
+
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let tool_row = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.plugins.show")
+        .expect("tool row");
+    assert_eq!(
+        tool_row.required_scope.as_deref(),
+        Some("constraint:plugins.show:plugins")
+    );
+    let read_row = rows
+        .iter()
+        .find(|r| r.path == "mcp.resource.plugins.detail")
+        .expect("resource row");
+    // Authorized, then not found: a 404 row with no `required_scope`.
+    assert_eq!(read_row.status, 404, "{read_row:?}");
+    assert!(read_row.required_scope.is_none(), "{read_row:?}");
+}
+
+/// MCP `events.subscribe` is a history poll, so it is gated by
+/// `events:read`, not the `events:tail` that gates the REST / Connect
+/// live tail: `events:read` alone succeeds, `events:tail` alone is
+/// denied with `events:read` in the audit row.
+#[tokio::test(flavor = "current_thread")]
+async fn events_subscribe_is_gated_by_events_read_not_events_tail() {
+    let engine = oxidhome_core::Engine::new().expect("engine");
+    for (label, scope, denied) in [
+        ("read-only", "events:read", false),
+        ("tail-only", "events:tail", true),
+    ] {
+        let bearer = mint_bearer_with_scopes(&engine, label, &[scope]);
+        let (router, session) = handshake(build_router(engine.clone()), &bearer).await;
+        let response = call(
+            &router,
+            &bearer,
+            &session,
+            "tools/call",
+            json!({"name": "events.subscribe", "arguments": {"timeout_ms": 0}}),
+        )
+        .await;
+        if denied {
+            assert_eq!(response["error"]["code"], -32001, "{label}: {response}");
+        } else {
+            assert!(response.get("error").is_none(), "{label}: {response}");
+            assert_ne!(response["result"]["isError"], true, "{label}: {response}");
+        }
+    }
+    let audit = engine.audit_log();
+    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
+        .await
+        .expect("audit query join")
+        .expect("audit query");
+    let deny = rows
+        .iter()
+        .find(|r| r.path == "mcp.tool.events.subscribe" && r.decision == "deny")
+        .expect("deny row");
+    assert_eq!(deny.required_scope.as_deref(), Some("events:read"));
+}

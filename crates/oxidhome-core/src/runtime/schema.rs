@@ -17,7 +17,7 @@
 //!   host keeps apart (`unit = "other"`, `unit_label = <label>`) and
 //!   refuses when the label spells a named code. Every sensor
 //!   `state-changed` delta and `ok-with-state` reply must carry the
-//!   spec's unit ([`check_sensor_fields`]).
+//!   spec's unit ([`check_state_fields`]).
 //! - **Service commands** carry `params` / `returns` field schemas.
 //!   [`check_service_info`] validates them at `register-service` /
 //!   `update-service`; [`check_args`] gates every `call-service`
@@ -26,7 +26,8 @@
 use std::collections::HashSet;
 
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::{
-    CapabilitySpec, CapabilityState, ExtensionSpec, SensorSpec, Unit,
+    AlarmState, CapabilitySpec, CapabilityState, ExtensionSpec, LockState, OpenerState, SensorSpec,
+    Unit,
 };
 use crate::host_impl::plugin::oxidhome::plugin::devices::{CommandResult, DeviceInfo};
 use crate::host_impl::plugin::oxidhome::plugin::services::{
@@ -203,17 +204,78 @@ pub(crate) fn sensor_unit_changed(old: &DeviceInfo, new: &DeviceInfo) -> bool {
     }
 }
 
+/// [`check_state_fields`] for a full snapshot (an `ok-with-state`
+/// reply, which replaces the slot): a lock, opener, alarm panel or
+/// siren snapshot must also carry its `state`.
+pub(crate) fn check_snapshot_fields(
+    info: &DeviceInfo,
+    capability: &str,
+    fields: &[KeyValue],
+) -> Result<(), String> {
+    check_state_fields(info, capability, fields)?;
+    if needs_snapshot_state(capability) && !fields.iter().any(|kv| kv.key == "state") {
+        return Err(format!("a {capability} snapshot must include `state`"));
+    }
+    Ok(())
+}
+
+/// The capabilities whose projected slot must always carry `state`:
+/// lock, opener, alarm panel and siren.
+pub(crate) fn needs_snapshot_state(capability: &str) -> bool {
+    matches!(capability, "lock" | "opener" | "alarm-panel" | "siren")
+}
+
+/// `true` when an `update-device` takes away its opener's position
+/// support: the projected `position` is then no longer valid.
+pub(crate) fn opener_position_dropped(old: &DeviceInfo, new: &DeviceInfo) -> bool {
+    opener_supports_position(old) && !opener_supports_position(new)
+}
+
 /// Every sensor `state-changed` delta and `ok-with-state` reply must
 /// carry the device's unit: `unit` (the spec's code) and, for the
 /// `other` fallback, `unit_label`, both exactly as the spec declares
 /// them. A reading can't then reach the projection without its unit
 /// (a delta into an empty or `Stale` slot replaces it) or with a
-/// free-form one. No-op for other capabilities.
-pub(crate) fn check_sensor_fields(
+/// free-form one. An opener's `position` must be a number in 0.0 to
+/// 1.0, as at registration. No-op for other capabilities.
+pub(crate) fn check_state_fields(
     info: &DeviceInfo,
     capability: &str,
     fields: &[KeyValue],
 ) -> Result<(), String> {
+    // The typed sensitive capabilities: `state` keeps its documented
+    // shape on every update (partial deltas without it are fine).
+    let state_ok = |ok: &dyn Fn(&Value) -> bool, what: &str| -> Result<(), String> {
+        // Every occurrence: the projection keeps the last duplicate.
+        if fields.iter().any(|kv| kv.key == "state" && !ok(&kv.value)) {
+            Err(format!("{capability} `state` must be {what}"))
+        } else {
+            Ok(())
+        }
+    };
+    let one_of = |names: &'static [&'static str]| move |v: &Value| matches!(v, Value::StringVal(s) if names.contains(&s.as_str()));
+    match capability {
+        "lock" => state_ok(&one_of(LOCK_STATES), "a `lock-state` case name")?,
+        "opener" => state_ok(&one_of(OPENER_STATES), "an `opener-state` case name")?,
+        "alarm-panel" => state_ok(&one_of(ALARM_STATES), "an `alarm-state` case name")?,
+        "siren" => state_ok(&|v| matches!(v, Value::BoolVal(_)), "a bool")?,
+        _ => {}
+    }
+    if capability == "opener" {
+        let supports_position = opener_supports_position(info);
+        for kv in fields.iter().filter(|kv| kv.key == "position") {
+            match kv.value {
+                _ if !supports_position => {
+                    return Err(
+                        "opener reports a `position` but its spec doesn't support one".into(),
+                    );
+                }
+                Value::FloatVal(p) if p.is_finite() && (0.0..=1.0).contains(&p) => {}
+                _ => return Err("opener `position` must be a number from 0.0 to 1.0".into()),
+            }
+        }
+        return Ok(());
+    }
     if capability != "sensor" {
         return Ok(());
     }
@@ -250,6 +312,13 @@ pub(crate) fn check_sensor_fields(
         )),
         None => Ok(()),
     }
+}
+
+/// `supports-position` of `info`'s opener spec (`false` without one).
+fn opener_supports_position(info: &DeviceInfo) -> bool {
+    info.capabilities
+        .iter()
+        .any(|c| matches!(c, CapabilitySpec::Opener(o) if o.supports_position))
 }
 
 fn check_unit(unit: &Unit) -> Result<(), String> {
@@ -292,6 +361,59 @@ fn check_sensor_spec(spec: &SensorSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Most armed modes an `alarm-panel-spec` may list.
+pub(crate) const MAX_ALARM_MODES: usize = 8;
+
+/// Every projected lock / opener / alarm `state` string.
+const LOCK_STATES: &[&str] = &["locked", "unlocked", "locking", "unlocking", "jammed"];
+const OPENER_STATES: &[&str] = &["open", "closed", "opening", "closing", "stopped"];
+const ALARM_STATES: &[&str] = &[
+    "disarmed",
+    "armed-home",
+    "armed-away",
+    "armed-night",
+    "armed-vacation",
+    "arming",
+    "pending",
+    "triggered",
+];
+
+/// The projected `state` string of a lock: the WIT case name.
+pub(crate) fn lock_state_name(state: LockState) -> &'static str {
+    match state {
+        LockState::Locked => "locked",
+        LockState::Unlocked => "unlocked",
+        LockState::Locking => "locking",
+        LockState::Unlocking => "unlocking",
+        LockState::Jammed => "jammed",
+    }
+}
+
+/// The projected `state` string of an opener: the WIT case name.
+pub(crate) fn opener_state_name(state: OpenerState) -> &'static str {
+    match state {
+        OpenerState::Open => "open",
+        OpenerState::Closed => "closed",
+        OpenerState::Opening => "opening",
+        OpenerState::Closing => "closing",
+        OpenerState::Stopped => "stopped",
+    }
+}
+
+/// The projected `state` string of an alarm panel: the WIT case name.
+pub(crate) fn alarm_state_name(state: AlarmState) -> &'static str {
+    match state {
+        AlarmState::Disarmed => "disarmed",
+        AlarmState::ArmedHome => "armed-home",
+        AlarmState::ArmedAway => "armed-away",
+        AlarmState::ArmedNight => "armed-night",
+        AlarmState::ArmedVacation => "armed-vacation",
+        AlarmState::Arming => "arming",
+        AlarmState::Pending => "pending",
+        AlarmState::Triggered => "triggered",
+    }
+}
+
 /// Validate the typed parts of a `register-device` / `update-device`
 /// payload: extension identities, sensor units and ranges, and that a
 /// sensor's `initial-state` reading uses its spec's unit. Every
@@ -324,10 +446,32 @@ pub(crate) fn check_device_info(info: &DeviceInfo) -> Result<(), WitError> {
                 check_sensor_spec(sensor).map_err(invalid)?;
                 sensor_unit = Some(&sensor.unit);
             }
+            CapabilitySpec::AlarmPanel(spec)
+                if spec.modes.is_empty() || spec.modes.len() > MAX_ALARM_MODES =>
+            {
+                return Err(invalid(format!(
+                    "alarm-panel spec lists {} armed modes; it must list 1 to {MAX_ALARM_MODES}",
+                    spec.modes.len(),
+                )));
+            }
             _ => {}
         }
     }
     for state in &info.initial_state {
+        if let CapabilityState::Opener(o) = state
+            && let Some(position) = o.position
+        {
+            if !opener_supports_position(info) {
+                return Err(invalid(
+                    "opener initial state has a position but its spec doesn't support one".into(),
+                ));
+            }
+            if !(position.is_finite() && (0.0..=1.0).contains(&position)) {
+                return Err(invalid(format!(
+                    "opener position {position} is outside 0.0 to 1.0"
+                )));
+            }
+        }
         if let CapabilityState::Sensor(m) = state {
             check_unit(&m.unit).map_err(invalid)?;
             // A missing sensor spec is refused by the declaration gate
@@ -814,7 +958,7 @@ mod tests {
             key: "value".into(),
             value: Value::FloatVal(1.0),
         };
-        check_sensor_fields(&info, "sensor", &[value.clone(), unit("celsius")]).unwrap();
+        check_state_fields(&info, "sensor", &[value.clone(), unit("celsius")]).unwrap();
         for bad in [
             vec![value.clone()],
             vec![value.clone(), unit("fahrenheit")],
@@ -828,12 +972,12 @@ mod tests {
             ],
         ] {
             assert!(
-                check_sensor_fields(&info, "sensor", &bad).is_err(),
+                check_state_fields(&info, "sensor", &bad).is_err(),
                 "{bad:?} should be refused"
             );
         }
         // Other capabilities are not the sensor's business.
-        check_sensor_fields(&info, "switch", &[unit("anything")]).unwrap();
+        check_state_fields(&info, "switch", &[unit("anything")]).unwrap();
 
         let other = device(
             vec![sensor(Unit::Other("steps".into()), None, None)],
@@ -843,12 +987,123 @@ mod tests {
             key: "unit_label".into(),
             value: Value::StringVal(v.into()),
         };
-        check_sensor_fields(&other, "sensor", &[value, unit("other"), label("steps")]).unwrap();
+        check_state_fields(&other, "sensor", &[value, unit("other"), label("steps")]).unwrap();
         assert!(
-            check_sensor_fields(&other, "sensor", &[unit("other")]).is_err(),
+            check_state_fields(&other, "sensor", &[unit("other")]).is_err(),
             "an `other` reading must carry its label"
         );
-        assert!(check_sensor_fields(&other, "sensor", &[unit("other"), label("paces")]).is_err());
+        assert!(check_state_fields(&other, "sensor", &[unit("other"), label("paces")]).is_err());
+    }
+
+    #[test]
+    fn opener_position_is_checked_on_every_update() {
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::{OpenerKind, OpenerSpec};
+        let opener = |supports_position| {
+            CapabilitySpec::Opener(OpenerSpec {
+                kind: OpenerKind::Gate,
+                supports_position,
+            })
+        };
+        let mut info = DeviceInfo {
+            local_id: "o".into(),
+            name: String::new(),
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            capabilities: vec![opener(true)],
+            initial_state: Vec::new(),
+            metadata: Vec::new(),
+        };
+        let pos = |v: Value| {
+            vec![KeyValue {
+                key: "position".into(),
+                value: v,
+            }]
+        };
+        assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(0.5))).is_ok());
+        assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(1.5))).is_err());
+        assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(f64::NAN))).is_err());
+        assert!(check_state_fields(&info, "opener", &pos(Value::StringVal("x".into()))).is_err());
+        assert!(check_state_fields(&info, "switch", &pos(Value::FloatVal(9.0))).is_ok());
+        // No position support: no position at all.
+        let with = info.clone();
+        info.capabilities = vec![opener(false)];
+        assert!(check_state_fields(&info, "opener", &pos(Value::FloatVal(0.5))).is_err());
+        // `state` keeps its documented shape on every update.
+        let st = |v: Value| {
+            vec![KeyValue {
+                key: "state".into(),
+                value: v,
+            }]
+        };
+        assert!(check_state_fields(&info, "lock", &st(Value::StringVal("jammed".into()))).is_ok());
+        assert!(check_state_fields(&info, "lock", &st(Value::BoolVal(true))).is_err());
+        assert!(check_state_fields(&info, "opener", &st(Value::StringVal("ajar".into()))).is_err());
+        assert!(
+            check_state_fields(
+                &info,
+                "alarm-panel",
+                &st(Value::StringVal("armed-away".into()))
+            )
+            .is_ok()
+        );
+        assert!(check_state_fields(&info, "siren", &st(Value::StringVal("on".into()))).is_err());
+        assert!(
+            check_state_fields(&info, "lock", &[]).is_ok(),
+            "partial delta"
+        );
+        let mut dup = st(Value::StringVal("locked".into()));
+        dup.extend(st(Value::BoolVal(false)));
+        assert!(
+            check_state_fields(&info, "lock", &dup).is_err(),
+            "every duplicate"
+        );
+        assert!(
+            check_snapshot_fields(&info, "lock", &[]).is_err(),
+            "snapshot needs state"
+        );
+        assert!(
+            check_snapshot_fields(&info, "lock", &st(Value::StringVal("locked".into()))).is_ok()
+        );
+        // Dropping the support invalidates the projected position.
+        assert!(opener_position_dropped(&with, &info));
+        assert!(!opener_position_dropped(&info, &with));
+    }
+
+    #[test]
+    fn sensitive_capability_checks() {
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::{
+            AlarmMode, AlarmPanelSpec, OpenerKind, OpenerSpec, OpenerStatus,
+        };
+        let panel = |modes: Vec<AlarmMode>| {
+            CapabilitySpec::AlarmPanel(AlarmPanelSpec {
+                modes,
+                code_required: false,
+            })
+        };
+        check_device_info(&device(vec![panel(vec![AlarmMode::ArmedAway])], vec![])).unwrap();
+        assert!(check_device_info(&device(vec![panel(vec![])], vec![])).is_err());
+        assert!(
+            check_device_info(&device(vec![panel(vec![AlarmMode::ArmedHome; 9])], vec![])).is_err()
+        );
+        let opener = CapabilitySpec::Opener(OpenerSpec {
+            kind: OpenerKind::Gate,
+            supports_position: true,
+        });
+        let at = |position| {
+            CapabilityState::Opener(OpenerStatus {
+                state: OpenerState::Stopped,
+                position,
+            })
+        };
+        check_device_info(&device(vec![opener.clone()], vec![at(Some(0.5))])).unwrap();
+        check_device_info(&device(vec![opener.clone()], vec![at(None)])).unwrap();
+        for bad in [-0.1, 1.5, f64::NAN] {
+            assert!(check_device_info(&device(vec![opener.clone()], vec![at(Some(bad))])).is_err());
+        }
+        assert_eq!(lock_state_name(LockState::Jammed), "jammed");
+        assert_eq!(opener_state_name(OpenerState::Closing), "closing");
+        assert_eq!(alarm_state_name(AlarmState::ArmedNight), "armed-night");
     }
 
     #[test]

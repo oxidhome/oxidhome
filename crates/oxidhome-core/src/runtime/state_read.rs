@@ -317,6 +317,8 @@ fn deny_audit_worker(
             invocation: Some(ctx.audit_json()),
             command_id: None,
             command_outcome: None,
+
+            level: None,
         };
         if let Err(err) = job.log.record_completed(&entry) {
             tracing::error!(target: "host.audit", method, error = %err, "plugin-read deny row failed");

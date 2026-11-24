@@ -674,6 +674,8 @@ mod tests {
             invocation: None,
             command_id: command.map(|(id, _)| id.into()),
             command_outcome: command.map(|(_, o)| o.into()),
+
+            level: None,
         }
     }
 

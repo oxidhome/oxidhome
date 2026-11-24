@@ -1186,6 +1186,8 @@ fn record_restore(state_dir: &Path, archive_created_ms: u64) -> anyhow::Result<(
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     };
     // Durable (`synchronous = FULL`): the audit-pending marker is
     // removed right after, so the row must survive a power loss. The

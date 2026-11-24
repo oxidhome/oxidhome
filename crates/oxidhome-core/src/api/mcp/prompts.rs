@@ -29,8 +29,9 @@
 //! # Scope gating
 //!
 //! `prompts/list` is public — every session sees the full
-//! catalogue regardless of scope. `prompts/get` enforces the
-//! per-prompt required scopes and lands scope failures as
+//! catalogue regardless of scope. `prompts/get` authorizes the
+//! actions the prompt's resources need (through
+//! [`crate::auth::authorize()`]) and lands denials as
 //! `ScopeDenied` (`-32001`), matching the resource + tool
 //! surface's shape. The rationale: a prompt template is not
 //! itself sensitive (it's a documented pattern for using the
@@ -45,8 +46,7 @@ use rmcp::model::{
     PromptMessage, Role,
 };
 
-use crate::api::scopes::{DEVICES_LIST, EVENTS_READ, LOGS_READ, Scope, require_scope};
-use crate::auth::Actor;
+use crate::auth::{Action, InvocationContext, Resource, authorize};
 
 use super::resources::SCOPE_DENIED_CODE;
 
@@ -139,12 +139,12 @@ pub(super) fn canonical_prompt_name(name: &str) -> &'static str {
 
 pub(super) fn get(
     request: &GetPromptRequestParams,
-    actor: &Actor,
+    ctx: &InvocationContext,
 ) -> Result<GetPromptResult, McpError> {
     let name = request.name.as_str();
     let (required_scopes, description, message_text) = match name {
         "summarize_today" => (
-            &[EVENTS_READ, LOGS_READ][..],
+            &[EVENTS, LOGS][..],
             "Summarize today's household activity.",
             summarize_today_message(),
         ),
@@ -163,7 +163,7 @@ pub(super) fn get(
                 // `devices:read` on top of this, which
                 // rejected correctly-scoped least-privilege
                 // tokens.
-                &[DEVICES_LIST][..],
+                &[DEVICES][..],
                 "Draft an automation rule from a trigger and action.",
                 draft_automation_message(&trigger, &action),
             )
@@ -175,7 +175,7 @@ pub(super) fn get(
             // evidence; command-outcome failures would need the
             // audit ledger, which the MCP surface doesn't yet
             // expose.
-            &[LOGS_READ][..],
+            &[LOGS][..],
             "Explain recent errors from logs.",
             explain_recent_errors_message(),
         ),
@@ -187,10 +187,10 @@ pub(super) fn get(
         }
     };
 
-    if let Some(scope) = first_missing_scope(actor, required_scopes) {
+    if let Some(scope) = first_denied(ctx, required_scopes) {
         return Err(McpError::new(
             SCOPE_DENIED_CODE,
-            format!("scope `{}` required for prompt `{name}`", scope.name()),
+            format!("scope `{scope}` required for prompt `{name}`"),
             None,
         ));
     }
@@ -200,13 +200,17 @@ pub(super) fn get(
     Ok(result)
 }
 
-fn first_missing_scope(actor: &Actor, required: &[Scope]) -> Option<Scope> {
-    for scope in required {
-        if require_scope(actor, *scope).is_err() {
-            return Some(*scope);
-        }
-    }
-    None
+/// What a prompt's referenced resources need: `oxidhome://events`,
+/// `oxidhome://logs`, `oxidhome://devices`.
+const EVENTS: (Action, Resource) = (Action::EventRead, Resource::events());
+const LOGS: (Action, Resource) = (Action::HostLogs, Resource::Host);
+const DEVICES: (Action, Resource) = (Action::DeviceList, Resource::devices());
+
+/// The audit label (the missing scope) of the first denied action.
+fn first_denied(ctx: &InvocationContext, required: &[(Action, Resource)]) -> Option<&'static str> {
+    required
+        .iter()
+        .find_map(|(action, resource)| authorize(ctx, *action, resource).into_result().err())
 }
 
 fn draft_automation_args(
@@ -271,10 +275,13 @@ fn draft_automation_message(trigger: &str, action: &str) -> String {
          gives you the real `device_id` and the `capabilities: []` list — an array of \
          capability *names* the device exposes. The host's built-in capability names are: \
          `switch`, `dimmer`, `color-light`, `sensor`, `button`, `video-stream`, \
-         `audio-stream`. Anything else appears in the list as \
-         `extension(<namespace>/<name>@<version>)` — that literal wrapped form is what you \
-         must pass as the `capability` argument (a plugin that declares a custom `lock` \
-         capability shows up as e.g. `extension(com.acme/lock@1)`, NOT bare `lock`). Ground the draft in the exact strings the resource returned — never invent \
+         `audio-stream`, `lock`, `opener`, `alarm-panel`, `siren`. Anything else appears in \
+         the list as `extension(<namespace>/<name>@<version>)` — that literal wrapped form is \
+         what you must pass as the `capability` argument (a plugin that declares a custom \
+         `sprinkler` capability shows up as e.g. `extension(com.acme/sprinkler@1)`, NOT bare \
+         `sprinkler`). Commands on a lock, opener or alarm device (its `sensitive` list in \
+         `oxidhome://devices`) need an explicit grant your token may not hold; draft them \
+         anyway, and say so. Ground the draft in the exact strings the resource returned — never invent \
          a `device_id` or a capability name that isn't in the list.\n\
          \n\
          IMPORTANT — action verbs are NOT enumerable from the host: `device.send_command` \

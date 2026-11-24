@@ -47,6 +47,7 @@ use rand::TryRng;
 use tokio::task_local;
 use tokio::time::Instant;
 
+use super::authorize::Authority;
 use super::{Actor, ActorKind};
 
 /// Deadline budget granted to an externally-rooted invocation. Bounds
@@ -94,18 +95,37 @@ impl Transport {
 /// There is no per-person identity yet, so for bearer tokens the
 /// subject is the token id; a future user model changes the subject
 /// without touching `credential_id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It also carries the principal's resolved [`Authority`] (scopes and
+/// 14.4 constraints) that [`crate::auth::authorize()`] decides on. The
+/// authority is host-only: [`InvocationContext::audit_json`] does not
+/// include it, and equality ignores it: two principals are equal when
+/// they name the same caller, as before the authority was added.
+#[derive(Debug, Clone)]
 pub struct Principal {
     kind: ActorKind,
     subject: String,
     credential_id: Option<String>,
     transport: Transport,
+    authority: Authority,
 }
+
+impl PartialEq for Principal {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.subject == other.subject
+            && self.credential_id == other.credential_id
+            && self.transport == other.transport
+    }
+}
+
+impl Eq for Principal {}
 
 impl Principal {
     /// Principal for a caller that authenticated with a bearer token.
     /// `kind` is the audit actor kind the transport records (`api` for
-    /// REST / Connect, `mcp` for MCP tool calls).
+    /// REST / Connect, `mcp` for MCP tool calls). The token's scopes and
+    /// constraints become the principal's [`Authority`].
     #[must_use]
     pub fn token(kind: ActorKind, actor: &Actor, transport: Transport) -> Self {
         Self {
@@ -113,11 +133,13 @@ impl Principal {
             subject: actor.id().to_owned(),
             credential_id: Some(actor.id().to_owned()),
             transport,
+            authority: Authority::of_token(actor),
         }
     }
 
     /// Principal for a caller authorized by the local process boundary
-    /// rather than a credential (MCP stdio).
+    /// rather than a credential (MCP stdio). It holds no authority until
+    /// [`Self::with_authority`] grants one.
     #[must_use]
     pub fn local_process(
         kind: ActorKind,
@@ -129,7 +151,15 @@ impl Principal {
             subject: subject.into(),
             credential_id: None,
             transport,
+            authority: Authority::none(),
         }
+    }
+
+    /// The same principal with `authority` as its resolved authority.
+    #[must_use]
+    pub fn with_authority(mut self, authority: Authority) -> Self {
+        self.authority = authority;
+        self
     }
 
     /// Principal for work that starts inside the host on behalf of a
@@ -141,6 +171,7 @@ impl Principal {
             subject: instance_id.into(),
             credential_id: None,
             transport: Transport::Host,
+            authority: Authority::none(),
         }
     }
 
@@ -166,6 +197,13 @@ impl Principal {
     #[must_use]
     pub fn transport(&self) -> Transport {
         self.transport
+    }
+
+    /// Resolved scopes and constraints [`crate::auth::authorize()`]
+    /// decides on. Empty for host-origin principals.
+    #[must_use]
+    pub fn authority(&self) -> &Authority {
+        &self.authority
     }
 
     /// `true` for principals that came from outside the host. Only
@@ -446,6 +484,20 @@ mod tests {
             target_instance: target.into(),
             target_service: "svc".into(),
         }
+    }
+
+    #[test]
+    fn principal_equality_ignores_authority() {
+        let a = Actor::api("tok-1", vec!["devices:list".into(), "logs:read".into()]);
+        let b = Actor::api("tok-1", vec!["logs:read".into(), "devices:list".into()]);
+        assert_eq!(
+            Principal::token(ActorKind::Api, &a, Transport::Rest),
+            Principal::token(ActorKind::Api, &b, Transport::Rest),
+        );
+        assert_ne!(
+            Principal::token(ActorKind::Api, &a, Transport::Rest),
+            Principal::token(ActorKind::Api, &a, Transport::Connect),
+        );
     }
 
     #[test]

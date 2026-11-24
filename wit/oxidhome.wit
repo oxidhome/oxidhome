@@ -205,6 +205,85 @@ interface capabilities {
     max: option<f64>,
   }
 
+  /// State of a door lock.
+  enum lock-state {
+    locked,
+    unlocked,
+    /// Moving towards `locked`.
+    locking,
+    /// Moving towards `unlocked`.
+    unlocking,
+    /// The bolt is stuck; the lock could not reach the requested state.
+    jammed,
+  }
+
+  /// What an opener drives. Informational: every kind is the same
+  /// `opener` capability and the same sensitive category to the host.
+  enum opener-kind {
+    garage-door,
+    gate,
+    door,
+    window,
+    other,
+  }
+
+  /// Spec for an opener (garage door, gate, motorized door or window).
+  record opener-spec {
+    kind: opener-kind,
+    /// Whether the opener reports and accepts a `position`.
+    supports-position: bool,
+  }
+
+  /// Motion state of an opener.
+  enum opener-state {
+    open,
+    closed,
+    opening,
+    closing,
+    /// Stopped part-way.
+    stopped,
+  }
+
+  /// Current state of an opener.
+  record opener-status {
+    state: opener-state,
+    /// 0.0 (closed) to 1.0 (fully open), when the spec sets
+    /// `supports-position`. The host refuses a value outside that
+    /// range or a non-finite one.
+    position: option<f64>,
+  }
+
+  /// An armed mode an alarm panel supports.
+  enum alarm-mode {
+    armed-home,
+    armed-away,
+    armed-night,
+    armed-vacation,
+  }
+
+  /// Spec for an alarm panel.
+  record alarm-panel-spec {
+    /// Armed modes the panel accepts. The host refuses an empty list
+    /// or more than eight entries.
+    modes: list<alarm-mode>,
+    /// Whether arming or disarming needs a user code argument.
+    code-required: bool,
+  }
+
+  /// State of an alarm panel.
+  enum alarm-state {
+    disarmed,
+    armed-home,
+    armed-away,
+    armed-night,
+    armed-vacation,
+    /// Exit delay running after an arm command.
+    arming,
+    /// Entry delay running; the alarm triggers unless disarmed.
+    pending,
+    triggered,
+  }
+
   /// Identity of a plugin-defined capability: a namespaced name plus
   /// an explicit schema version. The host refuses malformed ids at
   /// `register-device`, and the manifest declares the same identity
@@ -227,6 +306,14 @@ interface capabilities {
   /// What a device CAN do. Lists at registration time; describes shape, not
   /// current value. Open-ended via the `extension` arm so plugin authors
   /// can add new capability kinds without waiting for the core spec.
+  ///
+  /// The host derives a device's category from its capabilities.
+  /// `lock`, `opener`, `alarm-panel` and `siren` make a device
+  /// sensitive: commanding it needs an explicit grant for its
+  /// category, and a wildcard token scope does not cover it.
+  /// `video-stream` makes the device a camera, whose bytes need an
+  /// explicit grant. A plugin cannot lower a category it once
+  /// reported for a device by dropping the capability later.
   variant capability-spec {
     switch,
     dimmer,
@@ -238,6 +325,23 @@ interface capabilities {
     video-stream,
     /// The device exposes an audio stream. See video-stream.
     audio-stream,
+    /// A door lock. Commands: `lock`, `unlock`. State field `state`
+    /// (string: a `lock-state` case name).
+    lock,
+    /// A garage door, gate or other motorized opening. Commands:
+    /// `open`, `close`, `stop`, and `set` with a float `position` when
+    /// the spec supports it. State fields `state` (string: an
+    /// `opener-state` case name) and optional float `position`.
+    opener(opener-spec),
+    /// An alarm panel. Commands: `arm` with a string `mode` (an
+    /// `alarm-mode` case name), `disarm`, and a string `pin` argument
+    /// when the spec requires it (named `pin` so the host's log
+    /// redaction masks it). State field `state` (string: an
+    /// `alarm-state` case name).
+    alarm-panel(alarm-panel-spec),
+    /// A siren. Commands: `set` with a bool `state`, `toggle`. State
+    /// field `state` (bool).
+    siren,
     /// Plugin-defined capability, identified by namespace, name, and
     /// schema version. Consumers that don't recognize the identity
     /// simply ignore the capability.
@@ -255,6 +359,10 @@ interface capabilities {
     dimmer(dimmable),
     color-light(color),
     sensor(measurement),
+    lock(lock-state),
+    opener(opener-status),
+    alarm-panel(alarm-state),
+    siren(switchable),
   }
 }
 

@@ -1,37 +1,47 @@
-//! Phase 12-API-b — scope-policy matcher + axum extractor.
+//! Token scopes and the REST adapter for [`crate::auth::authorize()`].
 //!
 //! A **scope** is a free-form string like `"devices:list"` or
 //! `"instances:start"`. Each token carries a list of authorized
 //! scopes in its `scope_json` blob (see
-//! [`crate::api::parse_scopes`]); a handler declares the scope it
-//! requires by adding a [`RequireScope`] extractor to its signature.
+//! [`crate::auth::parse_policy`]). Handlers don't check scopes
+//! directly: they call [`require`] with an
+//! [`Action`](crate::auth::Action) and a
+//! [`Resource`](crate::auth::Resource), and the
+//! [`crate::auth::authorize()`] evaluator maps the action to the scope
+//! below that has always gated it
+//! (`Action::legacy_scope`).
 //!
 //! ## Matching rules (v1, deliberately simple)
 //!
-//! - **Literal match.** A token with `["devices:list"]` satisfies a
-//!   handler declaring `RequireScope::new("devices:list")`.
+//! - **Literal match.** A token with `["devices:list"]` satisfies
+//!   `devices:list`.
 //! - **Wildcard.** A token whose scope list contains the single
 //!   element `"*"` satisfies every required scope. This is the
 //!   first-run bootstrap admin token's shape (`ADMIN_SCOPE_JSON`).
+//! - **Sensitive categories (H6 slice 2).** No scope, the wildcard
+//!   included, reaches a command on a lock, opener or alarm device or
+//!   camera bytes: those need an explicit grant in the token's policy
+//!   (`"sensitive": ["lock"]`, see [`crate::auth::SensitiveGrant`]).
+//!   The bootstrap / recovered owner token holds every category.
 //!
 //! Hierarchical / glob matching (`devices:*` matches `devices:list`
-//! *and* `devices:write`) is **not** in v1. The extension point is
-//! the body of [`Scope::satisfied_by`]; adding it later won't
-//! require rewriting the call sites.
+//! *and* `devices:write`) is **not** in v1.
 //!
 //! ## Audit shape
 //!
-//! [`RequireScope`] denies with `403 Forbidden`. The auth middleware
-//! emits one `tracing::info!` audit event per request after the
-//! response — `target = "api.<path>"`, structured fields
-//! `{token_id, actor_kind, status, decision}`. A `decision=deny`
-//! audit row with `status=403` is the post-fix signal an operator
-//! greps for. See [`crate::api::auth`] for the emission site.
+//! A deny becomes [`ScopeDenied`], a `403 Forbidden` with an empty
+//! body. The auth middleware records one audit row per request after
+//! the response; a `decision=deny` row with `status=403` carries the
+//! deny's audit label (the missing scope or a `constraint:…`
+//! sentinel) in `required_scope`. See [`crate::api::auth`] for the
+//! emission site.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+#[cfg(test)]
 use crate::auth::Actor;
+use crate::auth::{Action, Decision, InvocationContext, Resource, authorize};
 
 /// Wildcard sentinel — a token whose scope list contains exactly this
 /// element satisfies every required scope.
@@ -62,18 +72,14 @@ impl Scope {
     }
 }
 
-/// Handler-level denial response. Handlers pull `Extension<Actor>`,
-/// call [`require_scope`], and propagate the `Err` with `?`; the
-/// `IntoResponse` impl below turns the failure into a 403 with an
-/// empty body. The required scope name travels back to the auth
-/// middleware via a [`DeniedScope`] response extension so the audit
-/// event can record *which* scope was missing — we deliberately
-/// don't include it in the response body so a probing caller can't
-/// enumerate required scopes.
-///
-/// We don't expose a per-scope axum extractor (would require
-/// `const &str` generics that aren't stable yet); the
-/// `require_scope` helper keeps handler signatures readable.
+/// Handler-level denial response. Handlers pull
+/// `Extension<InvocationContext>`, call [`require`], and propagate the
+/// `Err` with `?`; the `IntoResponse` impl below turns the failure into
+/// a 403 with an empty body. The deny's audit label travels back to the
+/// auth middleware via a [`DeniedScope`] response extension so the
+/// audit event can record *why* the request was refused — we
+/// deliberately don't include it in the response body so a probing
+/// caller can't enumerate required scopes.
 #[derive(Debug)]
 pub(crate) struct ScopeDenied {
     pub(crate) required: &'static str,
@@ -97,18 +103,31 @@ impl IntoResponse for ScopeDenied {
     }
 }
 
-/// Handler-side helper. Reads the [`Actor`] off the request and
-/// checks `required` against its scopes. Use in handlers as:
+/// Handler-side check: ask [`authorize`] whether the invocation's root
+/// may perform `action` on `resource`. Use in handlers as:
 ///
 /// ```ignore
 /// async fn list_instances(
-///     Extension(actor): Extension<Actor>,
+///     Extension(ctx): Extension<InvocationContext>,
 ///     ...
 /// ) -> Result<Json<...>, ScopeDenied> {
-///     require_scope(&actor, INSTANCES_LIST)?;
+///     require(&ctx, Action::InstanceRead, &Resource::instances())?;
 ///     ...
 /// }
 /// ```
+pub(crate) fn require(
+    ctx: &InvocationContext,
+    action: Action,
+    resource: &Resource,
+) -> Result<Decision, ScopeDenied> {
+    authorize(ctx, action, resource)
+        .into_result()
+        .map_err(|required| ScopeDenied { required })
+}
+
+/// The pre-`authorize()` route check, kept as the reference the parity
+/// tests compare [`authorize`] against.
+#[cfg(test)]
 pub(crate) fn require_scope(actor: &Actor, required: Scope) -> Result<(), ScopeDenied> {
     if required.satisfied_by(actor.scopes()) {
         Ok(())
@@ -218,16 +237,10 @@ pub(crate) const STATUS_READ: Scope = Scope::new("status:read");
 /// name.
 pub(crate) const BLOBS_READ: Scope = Scope::new("blobs:read");
 
-/// M7: may this caller see raw `bytes-val` payloads? Camera
-/// snapshots, audio clips and inference frames ride device state,
-/// events and command results as `bytes-val`; a token needs
-/// `blobs:read` (or the wildcard) to receive them. Without it every
-/// read surface (REST, Connect, MCP) replaces the bytes with a
-/// `json-val` marker naming the size and this scope, see
-/// [`crate::redact::withhold_bytes`].
-pub(crate) fn can_read_blobs(actor: &Actor) -> bool {
-    BLOBS_READ.satisfied_by(actor.scopes())
-}
+// M7: who may see raw `bytes-val` payloads in state, events and
+// command results is decided per source by `crate::api::bytes::BytesGate`
+// (H6 slice 2: a camera source needs the camera grant on top of
+// `blobs:read`).
 
 /// C6: `plugins:ui` — see `GET /api/v1/plugins/{plugin_id}/ui`.
 /// Gates the sandboxed-iframe wrapper endpoint that hosts the

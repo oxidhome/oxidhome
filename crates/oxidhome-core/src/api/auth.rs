@@ -175,7 +175,7 @@ pub(crate) struct AuthState {
     /// side effect). H6 adds
     /// [`crate::auth::DEVICE_COMMAND_ENFORCED`] to REST and
     /// Connect, whose device-command handlers call the shared
-    /// [`crate::auth::authorize_device_command`].
+    /// `crate::auth::authorize`.
     ///
     /// Round-6 P1 on PR #147 replaced the per-key-only set
     /// with per-(key, field) entries — a plain key set would
@@ -333,6 +333,8 @@ pub(crate) async fn require_token(
                     invocation: None,
                     command_id: None,
                     command_outcome: None,
+
+                    level: None,
                 };
                 record_authenticated_denial(&state.audit_log, inflight.as_ref(), entry).await;
                 return (StatusCode::FORBIDDEN, "").into_response();
@@ -394,6 +396,8 @@ pub(crate) async fn require_token(
         invocation: Some(invocation.audit_json()),
         command_id: None,
         command_outcome: None,
+
+        level: None,
     };
     let audit_id = match record_intent_blocking(&state.audit_log, intent, inflight.as_ref()).await {
         Ok(id) => id,
@@ -503,6 +507,8 @@ async fn try_best_effort_probe(
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     };
     let al = Arc::clone(audit_log);
     // Round-7 P2 on PR #140: preserve the original
@@ -547,7 +553,7 @@ async fn try_best_effort_probe(
 /// couldn't tell an unknown-key case from a supported-key /
 /// unsupported-field case. The variants preserve that
 /// distinction.
-pub(super) enum ConstraintRefusal<'a> {
+pub(crate) enum ConstraintRefusal<'a> {
     /// Tool name is outside the transport's enforced set —
     /// either an unknown key or one this transport doesn't
     /// consume.
@@ -580,7 +586,7 @@ impl ConstraintRefusal<'_> {
     /// preserved verbatim (`parse_policy` accepts arbitrary
     /// forward-compat keys), so no character in the key
     /// itself is reserved.
-    pub(super) fn audit_sentinel(&self) -> String {
+    pub(crate) fn audit_sentinel(&self) -> String {
         match self {
             Self::KeyNotEnforced { key } => {
                 format!("<constraint-key-unenforced:{key}>")
@@ -610,7 +616,7 @@ impl ConstraintRefusal<'_> {
 /// (bounded by the number of MCP tools), so an inner linear
 /// scan is fine and keeps the enforced-declaration site a
 /// plain `&'static [EnforcedConstraint]`.
-pub(super) fn first_constraint_refusal<'a>(
+pub(crate) fn first_constraint_refusal<'a>(
     actor: &'a Actor,
     enforced: &[crate::auth::EnforcedConstraint],
 ) -> Option<ConstraintRefusal<'a>> {
@@ -753,6 +759,8 @@ pub(super) async fn record_anonymous_probe(
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     };
     let al = Arc::clone(audit_log);
     let join = tokio::task::spawn_blocking(move || al.record_completed(&entry)).await;
@@ -941,7 +949,10 @@ pub(super) fn actor_from_record(rec: &TokenRecord) -> Actor {
         );
         crate::auth::TokenPolicy::default()
     });
-    Actor::api_with_policy(rec.id.clone(), policy.scopes, policy.constraints)
+    // H6 slice 2: the sensitive-category grants ride the policy; the
+    // owner flag is the durable `auth_token.owner` column, never the
+    // policy blob.
+    Actor::from_token_policy(rec.id.clone(), policy, rec.owner)
 }
 
 /// Legacy scope-array parser retained as a thin shim over
@@ -1031,6 +1042,7 @@ mod tests {
             created_ms: 0,
             last_used_ms: None,
             revoked_ms: None,
+            owner: false,
         };
         let actor = actor_from_record(&rec);
         assert_eq!(actor.scopes(), &["devices:command".to_string()]);
@@ -1051,6 +1063,7 @@ mod tests {
             created_ms: 0,
             last_used_ms: None,
             revoked_ms: None,
+            owner: false,
         };
         let actor = actor_from_record(&rec);
         assert_eq!(
@@ -1183,6 +1196,7 @@ mod tests {
             created_ms: 0,
             last_used_ms: None,
             revoked_ms: None,
+            owner: false,
         };
         let actor = actor_from_record(&rec);
         assert_eq!(actor.scopes(), Vec::<String>::new());

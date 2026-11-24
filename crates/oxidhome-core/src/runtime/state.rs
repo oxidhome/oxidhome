@@ -723,6 +723,10 @@ pub(crate) fn capability_name(spec: &capabilities::CapabilitySpec) -> String {
         capabilities::CapabilitySpec::Button => "button".into(),
         capabilities::CapabilitySpec::VideoStream => "video-stream".into(),
         capabilities::CapabilitySpec::AudioStream => "audio-stream".into(),
+        capabilities::CapabilitySpec::Lock => "lock".into(),
+        capabilities::CapabilitySpec::Opener(_) => "opener".into(),
+        capabilities::CapabilitySpec::AlarmPanel(_) => "alarm-panel".into(),
+        capabilities::CapabilitySpec::Siren => "siren".into(),
         capabilities::CapabilitySpec::Extension(ext) => {
             super::schema::extension_capability_key(ext)
         }
@@ -741,6 +745,10 @@ fn capability_state_name(state: &capabilities::CapabilityState) -> &'static str 
         capabilities::CapabilityState::Dimmer(_) => "dimmer",
         capabilities::CapabilityState::ColorLight(_) => "color-light",
         capabilities::CapabilityState::Sensor(_) => "sensor",
+        capabilities::CapabilityState::Lock(_) => "lock",
+        capabilities::CapabilityState::Opener(_) => "opener",
+        capabilities::CapabilityState::AlarmPanel(_) => "alarm-panel",
+        capabilities::CapabilityState::Siren(_) => "siren",
     }
 }
 
@@ -757,7 +765,8 @@ fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
         .map(|state| {
             let name = capability_state_name(state).to_string();
             let fields = match state {
-                capabilities::CapabilityState::Switch(s) => vec![KeyValue {
+                capabilities::CapabilityState::Switch(s)
+                | capabilities::CapabilityState::Siren(s) => vec![KeyValue {
                     key: "state".into(),
                     value: Value::BoolVal(s.state),
                 }],
@@ -791,6 +800,27 @@ fn seed_state_from_initial(info: &DeviceInfo) -> Vec<(String, Vec<KeyValue>)> {
                 capabilities::CapabilityState::Sensor(m) => {
                     super::schema::measurement_fields(m.value, &m.unit)
                 }
+                capabilities::CapabilityState::Lock(l) => vec![KeyValue {
+                    key: "state".into(),
+                    value: Value::StringVal(super::schema::lock_state_name(*l).into()),
+                }],
+                capabilities::CapabilityState::Opener(o) => {
+                    let mut fields = vec![KeyValue {
+                        key: "state".into(),
+                        value: Value::StringVal(super::schema::opener_state_name(o.state).into()),
+                    }];
+                    if let Some(position) = o.position {
+                        fields.push(KeyValue {
+                            key: "position".into(),
+                            value: Value::FloatVal(position),
+                        });
+                    }
+                    fields
+                }
+                capabilities::CapabilityState::AlarmPanel(a) => vec![KeyValue {
+                    key: "state".into(),
+                    value: Value::StringVal(super::schema::alarm_state_name(*a).into()),
+                }],
             };
             (name, fields)
         })
@@ -1027,6 +1057,7 @@ impl host_devices::Host for PluginState {
         // check-then-insert can't overshoot. Refusal returns
         // `Unavailable` — the plugin can retry after removing
         // some devices.
+        let existed = self.devices.get_any(&would_be_id).is_some();
         let id =
             match self
                 .devices
@@ -1037,8 +1068,14 @@ impl host_devices::Host for PluginState {
                     tracing::warn!(
                         instance_id = %self.instance_id,
                         error = %err,
-                        "register-device denied (per-instance device cap)",
+                        "register-device denied",
                     );
+                    // A refused re-registration dropped the earlier
+                    // entry (fail closed); its state goes stale like
+                    // a `remove-device`.
+                    if existed && self.devices.get_any(&would_be_id).is_none() {
+                        self.device_state.mark_device_stale(&would_be_id);
+                    }
                     return Err(err);
                 }
             };
@@ -1100,20 +1137,31 @@ impl host_devices::Host for PluginState {
         // but its projected reading (and `unit` / `unit_label`) is in
         // the old unit. Treat it as dropped so it flips `Stale` and
         // the next reading replaces it instead of merging into it.
-        let unit_changed = self
-            .devices
-            .get(&self.instance_id, &id)
-            .is_ok_and(|old| super::schema::sensor_unit_changed(&old.info, &info));
+        let old = self.devices.get(&self.instance_id, &id).ok();
+        let unit_changed = old
+            .as_ref()
+            .is_some_and(|old| super::schema::sensor_unit_changed(&old.info, &info));
+        // Likewise an opener that stops supporting a position: its
+        // projected `position` would otherwise stay `Fresh`.
+        let position_dropped = old
+            .as_ref()
+            .is_some_and(|old| super::schema::opener_position_dropped(&old.info, &info));
         let live_capabilities: Vec<String> = info
             .capabilities
             .iter()
             .map(capability_name)
             .filter(|name| !(unit_changed && name == "sensor"))
+            .filter(|name| !(position_dropped && name == "opener"))
             .collect();
         let outcome = self.devices.update(&self.instance_id, &id, info);
         if outcome.is_ok() {
             self.device_state
                 .reconcile_capabilities(&id, &live_capabilities);
+        } else if old.is_some() && self.devices.get_any(&id).is_none() {
+            // A refused floor write dropped the device (fail closed);
+            // its state goes stale like a `remove-device`. Only then:
+            // an ordinary `NotFound` mustn't sweep the projection.
+            self.device_state.mark_device_stale(&id);
         }
         outcome
     }
@@ -1402,12 +1450,13 @@ fn require_publish_authorized(
                 )));
             }
             if let EventPayload::StateChanged(sc) = payload {
-                super::schema::check_sensor_fields(&meta.info, &sc.capability, &sc.fields)
-                    .map_err(|e| {
+                super::schema::check_state_fields(&meta.info, &sc.capability, &sc.fields).map_err(
+                    |e| {
                         WitError::InvalidArgument(format!(
                             "publish-event: device `{device_id}`: {e}"
                         ))
-                    })?;
+                    },
+                )?;
             }
             Ok(())
         }
@@ -1437,6 +1486,24 @@ impl host_events::Host for PluginState {
         //    `inference` and `custom` carry no capability contract
         //    of their own, so their capability check is a no-op.
         require_publish_authorized(&self.devices, &self.instance_id, &ev)?;
+        // H6 slice 2: a lock, opener, alarm-panel or siren delta
+        // without `state` may only update a live slot that has one;
+        // it can't start the projection without its state.
+        if let (Some(device_id), EventPayload::StateChanged(sc)) = (&ev.device, &ev.payload)
+            && super::schema::needs_snapshot_state(&sc.capability)
+            && !sc.fields.iter().any(|kv| kv.key == "state")
+            && !self.device_state.has_live_field(
+                device_id,
+                &self.instance_id,
+                &sc.capability,
+                "state",
+            )
+        {
+            return Err(WitError::InvalidArgument(format!(
+                "publish-event: device `{device_id}` has no current {} `state`; include it",
+                sc.capability
+            )));
+        }
 
         // Architecture-review C2b: stamp the event's origin from the
         // publisher's own instance / manifest identity. Any value the
@@ -1612,14 +1679,29 @@ impl host_events::Host for PluginState {
             crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
         ) = (ev.device.clone(), &ev.payload)
         {
-            self.device_state.apply_delta(
-                device_id,
-                self.instance_id.clone(),
-                sc.capability.clone(),
-                sc.fields.clone(),
-                ev.timestamp,
-                crate::state::event_log::now_unix_ms(),
-            );
+            let received = crate::state::event_log::now_unix_ms();
+            if super::schema::needs_snapshot_state(&sc.capability) {
+                // Rechecked under the store lock: the slot may have
+                // gone stale since the check above.
+                let _applied = self.device_state.apply_delta_requiring(
+                    device_id,
+                    self.instance_id.clone(),
+                    sc.capability.clone(),
+                    sc.fields.clone(),
+                    ev.timestamp,
+                    received,
+                    "state",
+                );
+            } else {
+                self.device_state.apply_delta(
+                    device_id,
+                    self.instance_id.clone(),
+                    sc.capability.clone(),
+                    sc.fields.clone(),
+                    ev.timestamp,
+                    received,
+                );
+            }
         }
 
         // Admission already consumed (pre-persistence). The bus's

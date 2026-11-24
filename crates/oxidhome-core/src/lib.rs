@@ -18,6 +18,7 @@ pub mod backup;
 pub mod exclusive_lock;
 pub mod host_impl;
 pub mod native_policy;
+pub(crate) mod rate_bucket;
 pub mod redact;
 pub mod runtime;
 pub mod state;

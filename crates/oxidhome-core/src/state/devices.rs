@@ -51,6 +51,8 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use sha2::{Digest, Sha256};
 
+use super::device_meta::DeviceMetaStore;
+use crate::auth::{DeviceClass, Resource};
 use crate::host_impl::plugin::oxidhome::plugin::devices::DeviceInfo;
 use crate::host_impl::plugin::oxidhome::plugin::types::{DeviceId, Error as WitError};
 
@@ -80,6 +82,9 @@ pub struct DeviceMeta {
 #[derive(Default, Debug)]
 pub struct DeviceRegistry {
     inner: RwLock<HashMap<DeviceId, Arc<DeviceMeta>>>,
+    /// H6 slice 2: the durable category floor and operator overrides.
+    /// Every registration and update reports its derived class here.
+    meta: Arc<DeviceMetaStore>,
 }
 
 /// Compute the deterministic host-side device id for an
@@ -155,6 +160,102 @@ impl DeviceRegistry {
         Self::default()
     }
 
+    /// A registry whose device classes persist in `meta` (the
+    /// engine's `device_meta` table).
+    #[must_use]
+    pub fn with_meta(meta: Arc<DeviceMetaStore>) -> Self {
+        Self {
+            inner: RwLock::default(),
+            meta,
+        }
+    }
+
+    /// The durable floor / override store behind [`Self::class_of`].
+    #[must_use]
+    pub fn meta(&self) -> &Arc<DeviceMetaStore> {
+        &self.meta
+    }
+
+    /// The host-owned class of `id`: derived from its registered
+    /// capabilities (when it is registered right now), widened by the
+    /// durable floor and the operator's override. An id the host knows
+    /// nothing about is `other`.
+    #[must_use]
+    pub fn class_of(&self, id: &str) -> DeviceClass {
+        let derived = self.read().get(id).map_or_else(DeviceClass::other, |m| {
+            DeviceClass::derive(&m.info.capabilities)
+        });
+        match self.meta.get(id) {
+            Some(row) => row.apply(derived),
+            None => derived,
+        }
+    }
+
+    /// The class of `id` with `row` (rather than the stored row) on
+    /// top of its derived class: for reporting a write's result
+    /// without a second, racing read of the override.
+    #[must_use]
+    pub fn class_with(&self, id: &str, row: &super::DeviceMetaRow) -> DeviceClass {
+        let derived = self.read().get(id).map_or_else(DeviceClass::other, |m| {
+            DeviceClass::derive(&m.info.capabilities)
+        });
+        row.apply(derived)
+    }
+
+    /// The class of `meta` (a registration already read), widened by
+    /// its stored floor and override: one registration per answer, so
+    /// a listing can't pair one registration's capabilities with
+    /// another's class.
+    #[must_use]
+    pub fn class_of_meta(&self, meta: &DeviceMeta) -> DeviceClass {
+        let derived = DeviceClass::derive(&meta.info.capabilities);
+        match self.meta.get(&meta.id) {
+            Some(row) => row.apply(derived),
+            None => derived,
+        }
+    }
+
+    /// The authorization resource for device `id`, with its class.
+    #[must_use]
+    pub fn resource(&self, id: &str) -> Resource {
+        Resource::device(id, self.class_of(id))
+    }
+
+    /// `true` when `instance_id` owns, or has ever registered, a camera
+    /// device. Its blobs are then camera blobs.
+    #[must_use]
+    pub fn instance_is_camera(&self, instance_id: &str) -> bool {
+        // One lookup: every registered camera has a `device_meta` row
+        // naming its owner (`observe` records it before the device is
+        // registered, and a registration whose row can't be stored is
+        // refused), as does every `camera` raise.
+        self.meta.instance_is_camera(instance_id)
+    }
+
+    /// Set (or clear) the operator's category override for `id`,
+    /// recording the device's current owner with it so a raise to
+    /// `camera` classes that instance's blobs and bytes too.
+    ///
+    /// # Errors
+    ///
+    /// As [`DeviceMetaStore::set_override`].
+    pub fn set_category(
+        &self,
+        id: &str,
+        category: Option<crate::auth::DeviceCategory>,
+    ) -> Result<super::DeviceMetaRow, super::DeviceMetaError> {
+        let owner = self.read().get(id).map(|m| m.owner_instance.clone());
+        self.meta.set_override(id, category, owner.as_deref())
+    }
+
+    /// Report `info`'s derived class to the durable floor. Refused
+    /// when the instance's floor rows are at their cap.
+    fn observe(&self, id: &str, owner_instance: &str, info: &DeviceInfo) -> Result<(), WitError> {
+        self.meta
+            .observe(id, owner_instance, DeviceClass::derive(&info.capabilities))
+            .map_err(|e| WitError::Unavailable(format!("instance `{owner_instance}`: {e}")))
+    }
+
     // Poison-tolerant accessors — see the matching note on
     // `ServiceRegistry::services_read`. The critical sections are
     // atomic `HashMap` ops + Arc / String clones, so recovering the
@@ -199,6 +300,18 @@ impl DeviceRegistry {
         info: DeviceInfo,
     ) -> DeviceId {
         let id = stable_device_id(installation_uuid, &owner_instance, &info.local_id);
+        // Unchecked path (tests and embedders; plugins go through
+        // `try_register`). A refused floor write fails closed: the
+        // device is not registered (and so can't be commanded or
+        // read; an earlier registration of the same id is dropped),
+        // the error is logged, and the id is still returned.
+        if let Err(err) = self.observe(&id, &owner_instance, &info) {
+            tracing::error!(target: "auth.device_meta", device_id = %id, ?err, "floor not recorded; device not registered");
+            // A re-registration must not leave the previous entry
+            // commandable under its old class.
+            self.write().remove(&id);
+            return id;
+        }
         let meta = Arc::new(DeviceMeta {
             id: id.clone(),
             owner_instance,
@@ -232,7 +345,35 @@ impl DeviceRegistry {
         info: DeviceInfo,
     ) -> Result<DeviceId, WitError> {
         let id = stable_device_id(installation_uuid, &owner_instance, &info.local_id);
+        let guard = self.write();
+        if !guard.contains_key(&id) {
+            let owned = guard
+                .values()
+                .filter(|m| m.owner_instance == owner_instance)
+                .count();
+            if owned >= MAX_DEVICES_PER_INSTANCE {
+                return Err(WitError::Unavailable(format!(
+                    "instance `{owner_instance}` has {owned} devices registered; \
+                     the per-instance cap is {MAX_DEVICES_PER_INSTANCE}"
+                )));
+            }
+        }
+        drop(guard);
+        // Floor first, so the class never reads lower than what the
+        // new registration says, even for a moment. A single instance
+        // registers serially (see above), so releasing the lock for
+        // the floor write doesn't race the quota check.
+        if let Err(err) = self.observe(&id, &owner_instance, &info) {
+            // Fail closed: a re-registration that can't record its
+            // floor drops the earlier entry rather than leave it
+            // commandable under its old class.
+            self.write().remove(&id);
+            return Err(err);
+        }
         let mut guard = self.write();
+        // Re-check under the insertion lock: the lock was released for
+        // the floor write, so a concurrent caller may have taken the
+        // last slot meanwhile.
         if !guard.contains_key(&id) {
             let owned = guard
                 .values()
@@ -298,6 +439,17 @@ impl DeviceRegistry {
                     owner_instance: meta.owner_instance.clone(),
                     info,
                 });
+                // The floor write happens under the registry lock here:
+                // releasing it would let a concurrent `remove` + register
+                // interleave. Floor writes are rare (only on a new
+                // sensitive category) and bounded.
+                if let Err(err) = self.observe(id, owner_instance, &new.info) {
+                    // Fail closed, as `try_register`: an update whose
+                    // floor can't be recorded drops the device rather
+                    // than leave it commandable under its old class.
+                    guard.remove(id);
+                    return Err(err);
+                }
                 guard.insert(id.clone(), new);
                 Ok(())
             }
@@ -610,5 +762,62 @@ mod tests {
         other.local_id = "hello".into();
         reg.try_register("plugin.a", "beta".into(), other)
             .expect("other instance has its own count");
+    }
+
+    /// An operator's raise to `camera` on a registered device classes
+    /// its instance as a camera source, live and after a restart.
+    #[test]
+    fn camera_override_classes_the_owning_instance() {
+        use crate::auth::DeviceCategory;
+        let db = Arc::new(crate::state::Db::open_in_memory().expect("db"));
+        let reg = DeviceRegistry::with_meta(Arc::new(
+            DeviceMetaStore::open(Arc::clone(&db)).expect("meta"),
+        ));
+        let id = reg.register("u", "inst".into(), empty_info());
+        assert!(!reg.instance_is_camera("inst"));
+        reg.set_category(&id, Some(DeviceCategory::Camera))
+            .expect("override");
+        assert!(reg.instance_is_camera("inst"));
+        assert!(!reg.instance_is_camera("other"));
+
+        let reopened =
+            DeviceRegistry::with_meta(Arc::new(DeviceMetaStore::open(db).expect("reopen")));
+        assert!(reopened.instance_is_camera("inst"), "offline, from the row");
+    }
+
+    /// A re-registration whose floor can't be recorded drops the old
+    /// entry instead of leaving it commandable under its old class.
+    #[test]
+    fn refused_reregistration_fails_closed() {
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::CapabilitySpec;
+        let reg = DeviceRegistry::new();
+        let mut lamp = empty_info();
+        lamp.local_id = "lamp".into();
+        let id = reg.register("u", "inst".into(), lamp.clone());
+        // Fill the instance's floor rows with other sensitive ids.
+        for i in 0..super::super::device_meta::MAX_FLOOR_ROWS_PER_INSTANCE {
+            reg.meta()
+                .observe(
+                    &format!("dev-{i:016x}"),
+                    "inst",
+                    DeviceClass::derive(&[CapabilitySpec::Lock]),
+                )
+                .expect("room");
+        }
+        lamp.capabilities = vec![CapabilitySpec::Lock];
+        assert_eq!(reg.register("u", "inst".into(), lamp.clone()), id);
+        assert!(reg.get_any(&id).is_none(), "old switch entry dropped");
+
+        // The plugin paths fail closed the same way.
+        let mut plain = lamp.clone();
+        plain.capabilities = Vec::new();
+        reg.try_register("u", "inst".into(), plain.clone())
+            .expect("a non-sensitive registration needs no floor row");
+        assert!(reg.try_register("u", "inst".into(), lamp.clone()).is_err());
+        assert!(reg.get_any(&id).is_none(), "try_register dropped it");
+        reg.try_register("u", "inst".into(), plain)
+            .expect("re-register");
+        assert!(reg.update("inst", &id, lamp).is_err());
+        assert!(reg.get_any(&id).is_none(), "update dropped it");
     }
 }

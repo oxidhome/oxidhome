@@ -872,6 +872,67 @@ const MIGRATIONS: &[&str] = &[
         invocation_json  TEXT NOT NULL
     ) WITHOUT ROWID;
     ",
+    // 21 — H6 slice 2: sensitive device categories.
+    //
+    // - `auth_token.owner` marks the owner token: the one the host
+    //   minted at first-run bootstrap or with `recover-admin-token`.
+    //   The owner holds every sensitive category; every other
+    //   wildcard token loses them. The flag is backfilled from the
+    //   host's own audit rows for those two actions (`method = LOCAL`,
+    //   which no API, Connect or MCP request can produce) on tokens
+    //   that still hold exactly the minted `["*"]` scope, and set at
+    //   insert by those two code paths from now on. Only the newest
+    //   live candidate becomes the owner, and a partial unique index
+    //   keeps it to one live owner. It is a column
+    //   rather than a lookup because audit retention prunes the rows.
+    // - `audit_event.level`: `warn` on the extra row every allowed
+    //   sensitive action writes; NULL (info) otherwise.
+    // - `device_meta`: per device id, the sensitive categories the host
+    //   has ever derived (a floor a plugin can't lower), the operator's
+    //   category raise, and the registering instance. See
+    //   `state::device_meta`. Backfilled with a `camera` floor for
+    //   every device whose `video-stream` state or state-change
+    //   events (a `StateChanged` payload, not a custom event that
+    //   happens to share the topic) are persisted, so the
+    //   state restored before plugins load (and the instance's blobs)
+    //   is camera data from the first read after upgrade. The other
+    //   sensitive capabilities are new in this version.
+    "
+    ALTER TABLE auth_token ADD COLUMN owner INTEGER NOT NULL DEFAULT 0;
+    UPDATE auth_token SET owner = 1
+     WHERE id = (
+       SELECT id FROM auth_token
+        WHERE CAST(scope_json AS TEXT) = '[\"*\"]'
+          AND revoked_ms IS NULL
+          AND id IN (
+            SELECT token_id FROM audit_event
+             WHERE method = 'LOCAL'
+               AND ((actor_kind = 'host' AND path = 'host.auth.bootstrap')
+                 OR (actor_kind = 'cli' AND path = 'cli.auth.recover')))
+        ORDER BY created_ms DESC, id DESC
+        LIMIT 1);
+    CREATE UNIQUE INDEX auth_token_one_owner ON auth_token(owner)
+     WHERE owner = 1 AND revoked_ms IS NULL;
+    ALTER TABLE audit_event ADD COLUMN level TEXT;
+    CREATE TABLE device_meta (
+        device_id          TEXT PRIMARY KEY NOT NULL,
+        owner_instance     TEXT,
+        sensitive_floor    TEXT NOT NULL,
+        category_override  TEXT,
+        updated_ms         INTEGER NOT NULL
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO device_meta(device_id, owner_instance, sensitive_floor, category_override, updated_ms)
+    SELECT device_id, owner_instance, 'camera', NULL, 0
+      FROM device_state WHERE capability = 'video-stream';
+    INSERT OR IGNORE INTO device_meta(device_id, owner_instance, sensitive_floor, category_override, updated_ms)
+    SELECT device_id, MIN(instance_id), 'camera', NULL, 0
+      FROM event_log
+     WHERE topic = 'video-stream' AND device_id IS NOT NULL
+       AND json_valid(payload_blob)
+       AND json_extract(payload_blob, '$.t') = 'StateChanged'
+       AND json_extract(payload_blob, '$.v.capability') = 'video-stream'
+     GROUP BY device_id;
+    ",
 ];
 
 /// File name of the host database inside the state dir.
@@ -1967,6 +2028,90 @@ mod tests {
     // the "same file, closed and reopened, migration ran"
     // narrative the test depends on.
     #[test]
+    fn migration_21_backfills_the_owner_from_bootstrap_audit_rows() {
+        let dir = tempdir_for_test();
+        {
+            let db = Db::open_file(dir.path()).expect("open");
+            db.write(|conn| -> rusqlite::Result<()> {
+                conn.execute_batch(
+                    "
+                    DROP TABLE device_meta;
+                    ALTER TABLE audit_event DROP COLUMN level;
+                    DROP INDEX auth_token_one_owner;
+                    ALTER TABLE auth_token DROP COLUMN owner;
+                    INSERT INTO auth_token(id, label, hash, scope_json, created_ms)
+                    VALUES ('boot', 'admin', X'01', CAST('[\"*\"]' AS BLOB), 1),
+                           ('recovered', 'admin', X'02', CAST('[\"*\"]' AS BLOB), 2),
+                           ('minted', 'admin', X'03', CAST('[\"*\"]' AS BLOB), 3),
+                           ('spoof', 'x', X'04', CAST('[\"*\"]' AS BLOB), 4),
+                           ('narrowed', 'x', X'05', CAST('[\"devices:list\"]' AS BLOB), 5);
+                    INSERT INTO audit_event(intent_ms, token_id, actor_kind, method, path, status, decision)
+                    VALUES (1, 'boot', 'host', 'LOCAL', 'host.auth.bootstrap', 200, 'allow'),
+                           (2, 'recovered', 'cli', 'LOCAL', 'cli.auth.recover', 200, 'allow'),
+                           -- Wrong actor or method: an API request can't
+                           -- forge the owner by its path.
+                           (3, 'spoof', 'api', 'POST', 'host.auth.bootstrap', 200, 'allow'),
+                           (4, 'spoof', 'api', 'LOCAL', 'host.auth.bootstrap', 200, 'allow'),
+                           (5, 'narrowed', 'host', 'LOCAL', 'host.auth.bootstrap', 200, 'allow');
+                    INSERT INTO device_state(device_id, capability, owner_instance, owner_plugin,
+                        owner_install, fields_blob, global_revision, received_ms, observed_ms,
+                        source_generation, quality)
+                    VALUES ('dev-00000000000000aa', 'video-stream', 'cam', 'p', 'u', X'00', 1, 1, 1, 1, 'ok'),
+                           ('dev-00000000000000bb', 'on-off', 'cam', 'p', 'u', X'00', 2, 1, 1, 1, 'ok');
+                    -- State evicted, history kept.
+                    INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
+                    VALUES (1, 1, 'dev-00000000000000cc', 'cam2', 'p', 'video-stream',
+                            CAST('{\"t\":\"StateChanged\",\"v\":{\"capability\":\"video-stream\",\"fields\":[]}}' AS BLOB)),
+                           (2, 2, 'dev-00000000000000aa', 'cam', 'p', 'video-stream',
+                            CAST('{\"t\":\"StateChanged\",\"v\":{\"capability\":\"video-stream\",\"fields\":[]}}' AS BLOB)),
+                           (3, 3, 'dev-00000000000000dd', 'lamp', 'p', 'on-off', X'00'),
+                           -- A custom event sharing the topic is not a camera.
+                           (4, 4, 'dev-00000000000000ee', 'lamp', 'p', 'video-stream',
+                            CAST('{\"t\":\"Custom\",\"v\":{\"topic\":\"video-stream\"}}' AS BLOB));
+                    PRAGMA user_version = 20;
+                    ",
+                )
+            })
+            .expect("rewind to v20");
+        }
+        let db = Db::open_file(dir.path()).expect("reopen");
+        let owners: Vec<String> = db
+            .read(|c| {
+                let mut stmt =
+                    c.prepare("SELECT id FROM auth_token WHERE owner = 1 ORDER BY id")?;
+                stmt.query_map([], |r| r.get(0))?.collect()
+            })
+            .expect("owners");
+        // One live owner: the newest candidate.
+        assert_eq!(owners, vec!["recovered".to_string()]);
+        let floors: Vec<(String, String, String)> = db
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT device_id, owner_instance, sensitive_floor FROM device_meta \
+                     ORDER BY device_id",
+                )?;
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect()
+            })
+            .expect("floors");
+        assert_eq!(
+            floors,
+            vec![
+                (
+                    "dev-00000000000000aa".to_string(),
+                    "cam".to_string(),
+                    "camera".to_string()
+                ),
+                (
+                    "dev-00000000000000cc".to_string(),
+                    "cam2".to_string(),
+                    "camera".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn migration_16_from_v15_preserves_ids_and_enables_autoincrement() {
         let dir = tempdir_for_test();
@@ -1981,6 +2126,12 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 21 (H6 slice 2): owner flag, audit level,
+                    -- device categories.
+                    DROP TABLE device_meta;
+                    ALTER TABLE audit_event DROP COLUMN level;
+                    DROP INDEX auth_token_one_owner;
+                    ALTER TABLE auth_token DROP COLUMN owner;
                     -- 20 (H5): pending commands.
                     DROP TABLE pending_command;
                     -- 19 (H2): device-state tables.

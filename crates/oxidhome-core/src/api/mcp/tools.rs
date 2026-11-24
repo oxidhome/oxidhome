@@ -66,12 +66,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::Engine;
-use crate::api::scopes::{
-    DEVICES_COMMAND, EVENTS_READ, LOGS_READ, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_START,
-    PLUGINS_STOP, PLUGINS_UNINSTALL, can_read_blobs, require_scope,
-};
+use crate::api::bytes::BytesGate;
 use crate::api::server::WireCommandReport;
-use crate::auth::Actor;
+use crate::auth::{Action, Actor, InvocationContext, Resource, authorize};
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::EventFilter as BusEventFilter;
 use crate::host_impl::plugin::oxidhome::plugin::types::KeyValue;
@@ -81,8 +78,8 @@ use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
     AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, EncodedBody, MAX_TOOL_BODY_BYTES, MCP_ACTOR_KIND,
-    RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, STORE_QUERY_MAX,
-    STORE_QUERY_SEMAPHORE,
+    RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, SENSITIVE_RATE_LIMITED_CODE,
+    STORE_QUERY_MAX, STORE_QUERY_SEMAPHORE,
 };
 
 /// Publicly-visible catalogue of tools this handler exposes.
@@ -604,33 +601,51 @@ pub(super) async fn call(
     let token_id = actor.id().to_string();
     let name = request.name.as_ref();
 
-    // Route → (family, required scope). Scope + tool-name
-    // problems land here without the tool ever executing;
-    // no reason to write an intent row for them. They're
-    // audited as single-shot `record_completed` rows below.
+    // H6: one invocation per tool call. Its id lands on the intent
+    // row and on every downstream row the tool causes; its root
+    // carries the caller's authority for `authorize`.
+    let invocation = InvocationContext::external(principal);
+
+    // Route → (family, action, collection). Authorization +
+    // tool-name problems land here without the tool ever
+    // executing; no reason to write an intent row for them.
+    // They're audited as single-shot `record_completed` rows
+    // below. This is the coarse pre-check, made before the
+    // arguments are parsed: a tool that targets one device or
+    // plugin authorizes that target again once it knows it.
     // Kept as `match` (not `if`) because every follow-up
     // tool will land as another arm here.
     #[allow(clippy::single_match_else)]
-    let (family, required) = match name {
-        "device.send_command" => ("device.send_command", DEVICES_COMMAND),
-        "logs.query" => ("logs.query", LOGS_READ),
-        "events.history" => ("events.history", EVENTS_READ),
-        "events.subscribe" => ("events.subscribe", EVENTS_READ),
-        "plugins.list" => ("plugins.list", PLUGINS_LIST),
-        "plugins.show" => ("plugins.show", PLUGINS_LIST),
-        "plugins.stop" => ("plugins.stop", PLUGINS_STOP),
-        "plugins.uninstall" => ("plugins.uninstall", PLUGINS_UNINSTALL),
-        "plugins.start" => ("plugins.start", PLUGINS_START),
-        "plugins.install" => ("plugins.install", PLUGINS_INSTALL),
+    let (family, action, collection) = match name {
+        "device.send_command" => (
+            "device.send_command",
+            Action::DeviceCommand,
+            Resource::devices(),
+        ),
+        "logs.query" => ("logs.query", Action::HostLogs, Resource::Host),
+        "events.history" => ("events.history", Action::EventRead, Resource::events()),
+        "events.subscribe" => ("events.subscribe", Action::EventRead, Resource::events()),
+        "plugins.list" => ("plugins.list", Action::PluginRead, Resource::plugins()),
+        "plugins.show" => ("plugins.show", Action::PluginRead, Resource::plugins()),
+        "plugins.stop" => ("plugins.stop", Action::InstanceStop, Resource::instances()),
+        "plugins.uninstall" => (
+            "plugins.uninstall",
+            Action::PluginUninstall,
+            Resource::plugins(),
+        ),
+        "plugins.start" => (
+            "plugins.start",
+            Action::InstanceStart,
+            Resource::instances(),
+        ),
+        "plugins.install" => ("plugins.install", Action::PluginInstall, Resource::Host),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
         }
     };
-    if require_scope(actor, required).is_err() {
-        let outcome = ToolOutcome::Denied {
-            required: required.name(),
-        };
+    if let Err(required) = authorize(&invocation, action, &collection).into_result() {
+        let outcome = ToolOutcome::Denied { required };
         return finalize_synchronous(engine, &token_id, family, outcome, audit_permit).await;
     }
 
@@ -643,9 +658,6 @@ pub(super) async fn call(
     // still queued. Without this, a disconnect-flooded caller
     // could enqueue unbounded writers even though the
     // semaphore's `try_acquire` above returned successfully.
-    // H6: one invocation per dispatched tool call. Its id lands on
-    // the intent row and on every downstream row the tool causes.
-    let invocation = crate::auth::InvocationContext::external(principal);
     let mut intent_entry = new_pending_audit_entry(&token_id, family);
     intent_entry.call_id = Some(invocation.call_id().to_owned());
     intent_entry.invocation = Some(invocation.audit_json());
@@ -683,29 +695,36 @@ pub(super) async fn call(
     // Actually dispatch.
     let outcome = match name {
         "device.send_command" => {
-            device_send_command_call(engine.clone(), request.arguments, actor, invocation).await
+            device_send_command_call(engine.clone(), request.arguments, invocation).await
         }
         "logs.query" => logs_query_call(engine.clone(), request.arguments).await,
         "events.history" => {
-            events_history_call(engine.clone(), request.arguments, can_read_blobs(actor)).await
+            events_history_call(
+                engine.clone(),
+                request.arguments,
+                BytesGate::deferred(&invocation, &engine),
+            )
+            .await
         }
         "events.subscribe" => {
             events_subscribe_call(
                 engine.clone(),
                 request.arguments,
                 cancelled,
-                can_read_blobs(actor),
+                BytesGate::deferred(&invocation, &engine),
             )
             .await
         }
         "plugins.list" => plugins_list_call(&engine, request.arguments),
-        "plugins.show" => plugins_show_call(&engine, request.arguments, actor),
-        "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments, actor).await,
+        "plugins.show" => plugins_show_call(&engine, request.arguments, &invocation),
+        "plugins.stop" => plugins_stop_call(engine.clone(), request.arguments, &invocation).await,
         "plugins.uninstall" => {
-            plugins_uninstall_call(engine.clone(), request.arguments, actor).await
+            plugins_uninstall_call(engine.clone(), request.arguments, &invocation).await
         }
-        "plugins.start" => plugins_start_call(engine.clone(), request.arguments, actor).await,
-        "plugins.install" => plugins_install_call(engine.clone(), request.arguments, actor).await,
+        "plugins.start" => plugins_start_call(engine.clone(), request.arguments, &invocation).await,
+        "plugins.install" => {
+            plugins_install_call(engine.clone(), request.arguments, &invocation).await
+        }
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -1031,8 +1050,26 @@ enum ToolOutcome {
     UnknownTool(String),
     /// Scope check failed. Maps to [`SCOPE_DENIED_CODE`].
     Denied { required: &'static str },
+    /// H6 slice 2: a sensitive action over the principal's per-category
+    /// allowance. Maps to [`SENSITIVE_RATE_LIMITED_CODE`] and audits as
+    /// HTTP 429.
+    RateLimited(String),
     /// Server-side failure. Maps to `-32603`.
     Internal(String),
+}
+
+impl ToolOutcome {
+    /// H6 slice 2: a sensitive action whose obligations weren't met.
+    fn from_obligation(err: &crate::auth::sensitive::ObligationError) -> Self {
+        use crate::auth::sensitive::ObligationError;
+        match err {
+            ObligationError::RateLimited { .. } => Self::RateLimited(err.to_string()),
+            ObligationError::Audit(_) | ObligationError::Join(_) => {
+                tracing::error!(target: "auth.sensitive", error = %err, "sensitive action refused");
+                Self::Internal("sensitive action refused".into())
+            }
+        }
+    }
 }
 
 impl ToolOutcome {
@@ -1092,6 +1129,9 @@ impl ToolOutcome {
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
             Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
+            Self::RateLimited(reason) => {
+                Err(McpError::new(SENSITIVE_RATE_LIMITED_CODE, reason, None))
+            }
             Self::UnknownTool(reason) => Err(McpError::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 reason,
@@ -1120,6 +1160,7 @@ impl ToolOutcome {
             Self::InvalidParams(_) => 400,
             Self::TooLarge(_) => 413,
             Self::Busy(_) => 503,
+            Self::RateLimited(_) => 429,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -1131,7 +1172,8 @@ impl ToolOutcome {
             Self::UnknownTool(_)
             | Self::Denied { .. }
             | Self::InvalidParams(_)
-            | Self::TooLarge(_) => "deny",
+            | Self::TooLarge(_)
+            | Self::RateLimited(_) => "deny",
             // Match the REST auth classifier: 5xx → "error"
             // (Busy is 503; Internal is 500).
             Self::Internal(_) | Self::Busy(_) => "error",
@@ -1151,31 +1193,27 @@ impl ToolOutcome {
 
 // ── device.send_command ─────────────────────────────────────────
 
-/// Phase 14.4b/c: `required_scope` sentinels written to the
-/// audit ledger when a per-tool `ToolConstraint` refuses a
-/// call. Format: `constraint:<tool>:<field>` — distinct from
-/// the flat-scope sentinels so operators can slice
-/// constraint refusals from scope refusals.
-///
-/// Each constant is kept in sync with the matching
-/// `EnforcedConstraint` entry in
-/// `api::mcp::server::mount_inner` — adding an entry there
-/// without a matching sentinel (or vice versa) would drift
-/// the audit shape from the enforcement shape. The
-/// `device.send_command` sentinel lives with the shared check in
-/// `crate::auth::policy::DEVICE_COMMAND_DENIED_SENTINEL` (H6).
-pub(super) const CONSTRAINT_PLUGINS_SHOW_PLUGINS: &str = "constraint:plugins.show:plugins";
-pub(super) const CONSTRAINT_PLUGINS_STOP_PLUGINS: &str = "constraint:plugins.stop:plugins";
-pub(super) const CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS: &str =
-    "constraint:plugins.uninstall:plugins";
-pub(super) const CONSTRAINT_PLUGINS_START_PLUGINS: &str = "constraint:plugins.start:plugins";
-pub(super) const CONSTRAINT_PLUGINS_INSTALL_PLUGINS: &str = "constraint:plugins.install:plugins";
+/// Authorize `action` on one target the tool has parsed out of its
+/// arguments. The flat scope already passed the pre-check in
+/// [`call`]; this adds the token's 14.4 constraint for the target, if
+/// it carries one. A refusal is a scope-shape denial whose
+/// `required_scope` is the constraint sentinel
+/// (`constraint:<tool>:<field>`), distinct from a flat-scope refusal
+/// so operators can slice constraint enforcement separately.
+fn authorize_target(
+    invocation: &InvocationContext,
+    action: Action,
+    resource: &Resource,
+) -> Result<crate::auth::Decision, ToolOutcome> {
+    authorize(invocation, action, resource)
+        .into_result()
+        .map_err(|required| ToolOutcome::Denied { required })
+}
 
 async fn device_send_command_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    actor: &Actor,
-    invocation: crate::auth::InvocationContext,
+    invocation: InvocationContext,
 ) -> ToolOutcome {
     let args: DeviceSendCommandArgs = match arguments {
         Some(map) => match serde_json::from_value(JsonValue::Object(map)) {
@@ -1208,11 +1246,18 @@ async fn device_send_command_call(
     // id exists — the constraint is a pure string match on
     // caller input and independent of registry state.
     //
-    // H6: the check is `crate::auth::authorize_device_command`, shared
-    // with the REST and Connect device-command handlers.
-    if let Err(required) = crate::auth::authorize_device_command(actor, &args.device_id) {
-        return ToolOutcome::Denied { required };
-    }
+    // H6: `device.command` on the addressed device, through
+    // `crate::auth::authorize` like the REST and Connect handlers.
+    // Slice 2: the device's class decides whether a sensitive
+    // category grant is needed too.
+    let decision = match authorize_target(
+        &invocation,
+        Action::DeviceCommand,
+        &engine.devices().resource(&args.device_id),
+    ) {
+        Ok(decision) => decision,
+        Err(denied) => return denied,
+    };
 
     // Resolve device → owning instance the same way the REST
     // handler does. `NotFound` is deliberately indistinct
@@ -1233,6 +1278,21 @@ async fn device_send_command_call(
         };
     };
 
+    // H6 slice 2: rate limit and `warn` row before a sensitive
+    // command runs.
+    if let Err(e) = engine
+        .sensitive()
+        .discharge_blocking(
+            &invocation,
+            Action::DeviceCommand,
+            &args.device_id,
+            &decision,
+        )
+        .await
+    {
+        return ToolOutcome::from_obligation(&e);
+    }
+
     // The supervisor handle mints `id` (H5).
     let cmd = Command {
         id: String::new(),
@@ -1248,9 +1308,16 @@ async fn device_send_command_call(
             .collect(),
     };
 
+    let gate = BytesGate::new(&invocation, &engine);
     let report = handle
-        .execute_command_in(invocation, args.device_id, cmd)
+        .execute_command_admitted(
+            invocation,
+            args.device_id.clone(),
+            cmd,
+            decision.obligations.sensitive,
+        )
         .await;
+    let blobs = gate.release_report(&args.device_id, &owner, &report);
 
     // Round-1 F2 on PR #123: plugin-supplied text is already capped
     // (`runtime::command::cap_plugin_text`) before any wire copy.
@@ -1259,10 +1326,7 @@ async fn device_send_command_call(
         report.outcome,
         CommandOutcome::Completed { .. } | CommandOutcome::Accepted
     );
-    match serde_json::to_value(WireCommandReport::from_report(
-        report,
-        can_read_blobs(actor),
-    )) {
+    match serde_json::to_value(WireCommandReport::from_report(report, blobs)) {
         Ok(value) => ToolOutcome::Command {
             value,
             is_error,
@@ -1561,7 +1625,7 @@ struct EventsHistoryArgs {
 async fn events_history_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    blobs: bool,
+    gate: BytesGate,
 ) -> ToolOutcome {
     // `arguments = None` → empty filter, latest 100 rows.
     let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
@@ -1698,10 +1762,14 @@ async fn events_history_call(
 
     let events: Vec<_> = rows
         .into_iter()
-        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
     let body = super::resources::EventsBody { events };
-    match super::resources::encode_body_capped(&body, "events.history", MAX_TOOL_BODY_BYTES) {
+    let encoded =
+        super::resources::encode_body_capped(&body, "events.history", MAX_TOOL_BODY_BYTES);
+    // A camera release counts only if the page goes out.
+    gate.settle(matches!(encoded, EncodedBody::Value(_)));
+    match encoded {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
             // Pure host-state read — plugin was never reached,
@@ -1867,7 +1935,7 @@ async fn events_subscribe_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
     mut cancelled: CancelSignal,
-    blobs: bool,
+    gate: BytesGate,
 ) -> ToolOutcome {
     let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
     let args: EventsSubscribeArgs = match serde_json::from_value(args_value) {
@@ -2163,10 +2231,13 @@ async fn events_subscribe_call(
 
     let events: Vec<_> = rows
         .into_iter()
-        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, blobs))
+        .map(|row| super::super::server::WireHistoricalEvent::from_row(row, &gate))
         .collect();
     let body = super::resources::EventsBody { events };
-    match super::resources::encode_body_capped(&body, "events.subscribe", MAX_TOOL_BODY_BYTES) {
+    let encoded =
+        super::resources::encode_body_capped(&body, "events.subscribe", MAX_TOOL_BODY_BYTES);
+    gate.settle(matches!(encoded, EncodedBody::Value(_)));
+    match encoded {
         EncodedBody::Value(v) => ToolOutcome::Ok {
             value: v,
             plugin_reached: false,
@@ -2261,7 +2332,7 @@ struct PluginsShowArgs {
 fn plugins_show_call(
     engine: &Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    actor: &Actor,
+    invocation: &InvocationContext,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams("plugins.show requires a `plugin_id` argument".into());
@@ -2282,12 +2353,12 @@ fn plugins_show_call(
     // detail lookup so the not-installed / not-installed
     // paths can't be used to probe an id the operator's
     // policy hides.
-    if let Some(cx) = actor.constraint("plugins.show")
-        && !cx.allows_plugin(&args.plugin_id)
-    {
-        return ToolOutcome::Denied {
-            required: CONSTRAINT_PLUGINS_SHOW_PLUGINS,
-        };
+    if let Err(denied) = authorize_target(
+        invocation,
+        Action::PluginRead,
+        &Resource::plugin(args.plugin_id.as_str()),
+    ) {
+        return denied;
     }
 
     let Some(body) = super::resources::plugins_detail_body(engine, &args.plugin_id) else {
@@ -2387,7 +2458,7 @@ struct PluginsStopTimedOutBody {
 async fn plugins_stop_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    actor: &Actor,
+    invocation: &InvocationContext,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams("plugins.stop requires a `plugin_id` argument".into());
@@ -2412,12 +2483,12 @@ async fn plugins_stop_call(
     // Phase 14.4c: enforce `plugins` allowlist BEFORE
     // touching the instance registry so a disallowed id
     // can't infer running-state through timing / semantics.
-    if let Some(cx) = actor.constraint("plugins.stop")
-        && !cx.allows_plugin(&args.plugin_id)
-    {
-        return ToolOutcome::Denied {
-            required: CONSTRAINT_PLUGINS_STOP_PLUGINS,
-        };
+    if let Err(denied) = authorize_target(
+        invocation,
+        Action::InstanceStop,
+        &Resource::instance(args.plugin_id.as_str(), args.instance_id.clone()),
+    ) {
+        return denied;
     }
 
     // Mirror the REST handler: stop every matching instance at once
@@ -2527,7 +2598,7 @@ struct PluginsUninstallBody {
 async fn plugins_uninstall_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    actor: &Actor,
+    invocation: &InvocationContext,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams(
@@ -2549,12 +2620,12 @@ async fn plugins_uninstall_call(
     // Phase 14.4c: enforce `plugins` allowlist BEFORE
     // acquiring the lifecycle lock so a disallowed id can't
     // starve a concurrent lookup for the same key.
-    if let Some(cx) = actor.constraint("plugins.uninstall")
-        && !cx.allows_plugin(&args.plugin_id)
-    {
-        return ToolOutcome::Denied {
-            required: CONSTRAINT_PLUGINS_UNINSTALL_PLUGINS,
-        };
+    if let Err(denied) = authorize_target(
+        invocation,
+        Action::PluginUninstall,
+        &Resource::plugin(args.plugin_id.as_str()),
+    ) {
+        return denied;
     }
 
     // Mirror REST's uninstall: hold the per-plugin_id
@@ -2758,7 +2829,7 @@ struct PluginsStartBody {
 async fn plugins_start_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    actor: &Actor,
+    invocation: &InvocationContext,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams("plugins.start requires a `plugin_id` argument".into());
@@ -2784,12 +2855,12 @@ async fn plugins_start_call(
     // manifest scan / supervisor spawn — a disallowed id
     // shouldn't observably touch the FS or the process
     // table.
-    if let Some(cx) = actor.constraint("plugins.start")
-        && !cx.allows_plugin(&args.plugin_id)
-    {
-        return ToolOutcome::Denied {
-            required: CONSTRAINT_PLUGINS_START_PLUGINS,
-        };
+    if let Err(denied) = authorize_target(
+        invocation,
+        Action::InstanceStart,
+        &Resource::instance(args.plugin_id.as_str(), args.instance_id.clone()),
+    ) {
+        return denied;
     }
 
     let instance_id = args.instance_id.unwrap_or_else(|| args.plugin_id.clone());
@@ -2937,7 +3008,7 @@ struct PluginsInstallBody {
 async fn plugins_install_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    actor: &Actor,
+    invocation: &InvocationContext,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams(
@@ -2970,18 +3041,15 @@ async fn plugins_install_call(
         ));
     }
 
-    // Phase 14.4d: build the gate against the actor's
-    // `plugins.install` constraint. It runs inside
-    // `install_gated` against the manifest-derived id BEFORE
-    // any FS/SQL side effect, so a refuse leaves no orphan
-    // state. `None` = no constraint (unrestricted subject to
-    // flat scope).
+    // Phase 14.4d: the gate authorizes `plugin.install` on the
+    // manifest-derived plugin id, which applies the token's
+    // `plugins.install` constraint if it carries one. It runs
+    // inside `install_gated` BEFORE any FS/SQL side effect, so a
+    // refuse leaves no orphan state.
     //
-    // Cloned into the spawn_blocking below because the gate
-    // captures the constraint reference; the whole closure
-    // must be 'static + Send. Constraint blobs are small
-    // (a couple of Vec<String>).
-    let constraint = actor.constraint("plugins.install").cloned();
+    // The context is cloned into the spawn_blocking below because
+    // the whole closure must be 'static + Send (an `Arc` clone).
+    let gate_ctx = invocation.clone();
 
     // REST wraps the sync install in `spawn_blocking` so a slow
     // disk doesn't stall the axum runtime — same reasoning
@@ -2990,12 +3058,13 @@ async fn plugins_install_call(
     let installed_registry = engine.installed_plugins();
     let join = tokio::task::spawn_blocking(move || {
         installed_registry.install_gated(&source, |plugin_id| {
-            if let Some(cx) = &constraint
-                && !cx.allows_plugin(plugin_id)
-            {
-                return Err(CONSTRAINT_PLUGINS_INSTALL_PLUGINS);
-            }
-            Ok(())
+            authorize(
+                &gate_ctx,
+                Action::PluginInstall,
+                &Resource::plugin(plugin_id),
+            )
+            .into_result()
+            .map(drop)
         })
     })
     .await;
@@ -3150,6 +3219,8 @@ fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     }
 }
 
@@ -3177,6 +3248,8 @@ fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome
         invocation: None,
         command_id: None,
         command_outcome: None,
+
+        level: None,
     }
 }
 

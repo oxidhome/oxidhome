@@ -20,6 +20,7 @@ pub mod auth_token;
 pub mod blobs;
 pub mod dashboards;
 pub mod db;
+pub mod device_meta;
 pub mod device_state;
 pub mod devices;
 pub mod event_log;
@@ -38,6 +39,9 @@ pub use dashboards::{
     Dashboard, DashboardError, DashboardInput, DashboardStore, SharedDashboardStore,
 };
 pub use db::Db;
+pub use device_meta::{
+    DeviceMetaError, DeviceMetaRow, DeviceMetaStore, ObserveError, is_device_id,
+};
 pub use device_state::{
     CappedPage, CursorError, DeltaPage, DeviceState, DeviceStateHealth, DeviceStateStore,
     MAX_BYTES_PER_SLOT, MAX_FIELDS_PER_SLOT, MAX_PROJECTED_BYTES_PER_INSTANCE, MAX_STALE_ENTRIES,

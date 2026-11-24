@@ -20,10 +20,13 @@
 //! plugin actors get a minimal scope set derived from their manifest's
 //! `[capabilities]` block.
 //!
-//! What happens *after* the route check — the root principal, call
-//! id, deadline and delegation chain that follow a request into plugin
-//! dispatch — lives in [`invocation::InvocationContext`] (H6). `Actor`
-//! stays the credential-scoped authorization view.
+//! What happens *after* authentication — the root principal with its
+//! resolved authority, call id, deadline and delegation chain that
+//! follow a request into plugin dispatch — lives in
+//! [`invocation::InvocationContext`] (H6). Every REST, Connect and MCP
+//! token-scope check is made by [`authorize()`] against that root
+//! authority; plugin manifest grants are still checked at their own
+//! call sites.
 //!
 //! See `ARCHITECTURE.md` "Auth & actor identity" for the
 //! cross-cutting design and `00_OVERVIEW.md` for the per-phase
@@ -32,13 +35,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod authorize;
+pub mod category;
 pub mod invocation;
 pub mod policy;
+pub mod sensitive;
 
+pub use authorize::{
+    Action, AuditLevel, Authority, Decision, Obligations, Reason, Resource, ResourceKind, authorize,
+};
+pub use category::{DeviceCategory, DeviceClass, SensitiveCategory, SensitiveSet};
 pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
+#[cfg(test)]
+pub use policy::authorize_device_command;
 pub use policy::{
-    DEVICE_COMMAND_ENFORCED, EnforcedConstraint, TokenPolicy, ToolConstraint,
-    authorize_device_command, parse_policy,
+    DEVICE_COMMAND_ENFORCED, EnforcedConstraint, SensitiveGrant, TokenPolicy, ToolConstraint,
+    parse_policy,
 };
 
 /// What kind of caller this `Actor` represents. Drives where the
@@ -94,6 +106,13 @@ struct ActorInner {
     // shape). Empty allocation is one small
     // heap word, not per-actor overhead.
     constraints: HashMap<String, policy::ToolConstraint>,
+    // H6 slice 2: explicit sensitive-category grants from the token
+    // policy (or the `mcp-stdio` operator flag). Empty for plugins.
+    sensitive: Vec<policy::SensitiveGrant>,
+    // H6 slice 2: the token is the host-recorded owner (bootstrap or
+    // `recover-admin-token`), read from `auth_token.owner`. Never set
+    // from a label or from caller input.
+    owner: bool,
 }
 
 impl Actor {
@@ -113,6 +132,8 @@ impl Actor {
                 // gating consults the manifest directly.
                 scopes: Vec::new(),
                 constraints: HashMap::new(),
+                sensitive: Vec::new(),
+                owner: false,
             }),
         }
     }
@@ -150,8 +171,60 @@ impl Actor {
                 id: token_id.into(),
                 scopes,
                 constraints,
+                sensitive: Vec::new(),
+                owner: false,
             }),
         }
+    }
+
+    /// Construct an external `Actor` from a verified token's whole
+    /// policy: scopes, 14.4 constraints and sensitive grants. `owner`
+    /// is the token's host-recorded owner flag (`auth_token.owner`).
+    #[must_use]
+    pub fn from_token_policy(
+        token_id: impl Into<String>,
+        policy: policy::TokenPolicy,
+        owner: bool,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ActorInner {
+                kind: ActorKind::Api,
+                id: token_id.into(),
+                scopes: policy.scopes,
+                constraints: policy.constraints,
+                sensitive: policy.sensitive,
+                owner,
+            }),
+        }
+    }
+
+    /// A copy of this actor with `grants` as its sensitive grants.
+    /// The `mcp-stdio` session uses it for the operator's
+    /// `--allow-sensitive` flag.
+    #[must_use]
+    pub fn with_sensitive(&self, grants: Vec<policy::SensitiveGrant>) -> Self {
+        Self {
+            inner: Arc::new(ActorInner {
+                kind: self.inner.kind,
+                id: self.inner.id.clone(),
+                scopes: self.inner.scopes.clone(),
+                constraints: self.inner.constraints.clone(),
+                sensitive: grants,
+                owner: self.inner.owner,
+            }),
+        }
+    }
+
+    /// Explicit sensitive-category grants (H6 slice 2).
+    #[must_use]
+    pub fn sensitive_grants(&self) -> &[policy::SensitiveGrant] {
+        &self.inner.sensitive
+    }
+
+    /// `true` when this actor's token is the host-recorded owner.
+    #[must_use]
+    pub fn is_owner(&self) -> bool {
+        self.inner.owner
     }
 
     /// What kind of caller this is.
@@ -181,20 +254,19 @@ impl Actor {
     /// **unrestricted** for this actor (subject to the flat
     /// scope check upstream).
     ///
-    /// Callers combine this with the flat scope check — a
-    /// dispatch site first calls
-    /// `crate::api::scopes::require_scope` to confirm the
-    /// actor holds `<tool>:...`, then, if a constraint
-    /// exists, checks the tool's argument shape against
-    /// [`ToolConstraint::allows_device`] /
-    /// [`ToolConstraint::allows_plugin`].
-    ///
-    /// Introduced in Phase 14.4a; enforcement lands per-tool
-    /// in follow-up slices — no dispatch site consults this
-    /// yet.
+    /// Dispatch sites don't consult this directly: the invocation's
+    /// root [`authorize::Authority`] shares this actor's `Arc`, and
+    /// [`authorize()`] applies the constraint.
     #[must_use]
     pub fn constraint(&self, tool_name: &str) -> Option<&policy::ToolConstraint> {
         self.inner.constraints.get(tool_name)
+    }
+
+    /// The full per-tool constraint map, keyed by tool name. The root
+    /// [`Authority`] of an invocation reads this same map.
+    #[must_use]
+    pub fn constraints(&self) -> &HashMap<String, policy::ToolConstraint> {
+        &self.inner.constraints
     }
 
     /// `true` when this actor's token carried any per-tool

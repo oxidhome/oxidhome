@@ -555,6 +555,8 @@ fn reconciled_entry(row: &PendingRow, reason: &str) -> AuditEntry {
         invocation: Some(row.invocation_json.clone()),
         command_id: Some(row.command_id.clone()),
         command_outcome: Some("outcome_unknown".to_owned()),
+
+        level: None,
     }
 }
 

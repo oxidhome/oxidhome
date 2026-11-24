@@ -97,7 +97,7 @@ pub use oxidhome_wit::streaming_plugin as bindings;
 compile_error!("oxidhome-sdk needs a world feature: `plugin` (default) or `streaming-plugin`");
 
 mod device;
-pub use device::Device;
+pub use device::{Device, alarm_fields, lock_fields, opener_fields};
 
 /// Sensor unit (re-exported from the WIT `capabilities` interface).
 /// The named cases are the contract; `Unit::Other(label)` is a

@@ -100,6 +100,10 @@ name = "command_outcomes"
 path = "tests/command_outcomes.rs"
 
 [[test]]
+name = "sensitive_categories"
+path = "tests/sensitive_categories.rs"
+
+[[test]]
 name = "api_skeleton"
 path = "tests/api_skeleton.rs"
 

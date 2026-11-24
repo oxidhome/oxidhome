@@ -38,19 +38,35 @@ share one axum listener, so a household hub only exposes one endpoint.
   read history; `plugins:list` reads plugin metadata; `plugins:install` /
   `plugins:start` / `plugins:stop` / `plugins:uninstall` drive the plugin
   lifecycle. See `crates/oxidhome-core/src/api/scopes.rs` for the full list.
+- **Sensitive categories**: commands on `lock`, `opener` and `alarm`
+  devices and camera bytes need an explicit grant on top of the scope; no
+  scope reaches them, `*` included. Only the first-run (or recovered) admin
+  token, the owner, holds every category. Grant one offline with
+  `oxidhome token grant-sensitive <token-id> <lock|opener|alarm|camera>
+  [--device <dev-id>]...` (`oxidhome token list` shows tokens and grants);
+  allowed sensitive actions are audited at `warn`
+  (`GET /api/v1/audit?level=warn`) and, except for the owner's, rate
+  limited per token and category. The daemon warns at startup about
+  wildcard tokens that lost this access. `oxidhome mcp-stdio` reaches a
+  sensitive category only with `--allow-sensitive <category>`. The owner can
+  raise a device's category with `PUT /api/v1/devices/{id}/category`
+  (`{"category": "lock"}`) or offline with `oxidhome device set-category`.
+  **Upgrading:** this release adds the `lock`, `opener`, `alarm-panel` and
+  `siren` capability cases to the WIT contract, so device plugins must be
+  rebuilt against the new SDK and redeployed with the host.
 
 ### Surface at a glance
 
 | Kind | Name | Scope | Notes |
 | --- | --- | --- | --- |
-| Resource | `oxidhome://devices` [+ `/{id}`] | `devices:list` | Registered devices + registration detail. |
+| Resource | `oxidhome://devices` [+ `/{id}`] | `devices:list` | Registered devices + registration detail, with the host-derived `category` and `sensitive` categories. |
 | Resource | `oxidhome://events` | `events:read` | Historical event log with filter URI params. |
 | Resource | `oxidhome://logs` | `logs:read` | Structured logs with `since`/`level`/`plugin`/… filters. |
 | Resource | `oxidhome://plugins` [+ `/{id}`] | `plugins:list` | Installed + running plugins; per-plugin detail. |
 | Resource | `oxidhome://status` | `status:read` | Version, uptime, DB ping, counts. |
 | Resource | `oxidhome://config` | `status:read` | Daemon's effective configuration (state dir, listen address, retention, log filter, MCP limits), each value tagged with its source (`default` / `env` / `flag`), plus build, SDK and WIT versions. No secrets. REST: `GET /api/v1/config`. |
-| Resource | `oxidhome://blobs/{instance}/{name}` | `blobs:read` | Base64-encoded blob store entries. `blobs:read` also unlocks raw `bytes-val` fields in events, device state, and command results on every surface; without it they come back as a `json-val` "withheld" marker. |
-| Tool | `device.send_command` | `devices:command` | Dispatch a capability command; sensitive. |
+| Resource | `oxidhome://blobs/{instance}/{name}` | `blobs:read` | Base64-encoded blob store entries. `blobs:read` also unlocks raw `bytes-val` fields in events, device state, and command results on every surface; without it they come back as a `json-val` "withheld" marker. A camera instance's blobs and a camera's bytes also need the `camera` grant. |
+| Tool | `device.send_command` | `devices:command` | Dispatch a capability command; a lock, opener or alarm also needs the category grant. |
 | Tool | `logs.query` | `logs:read` | Tool-shape of `oxidhome://logs`. |
 | Tool | `events.history` | `events:read` | Tool-shape of `oxidhome://events`. |
 | Tool | `events.subscribe` | `events:read` | Long-poll for events past an `after_id` cursor (`timeout_ms` default 5 s, cap 30 s). |
