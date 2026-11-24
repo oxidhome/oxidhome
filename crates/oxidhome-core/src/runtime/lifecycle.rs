@@ -14,7 +14,11 @@
 //!   the loop, which then runs [`PluginInstance::drain_events`] to
 //!   deliver matching events into the plugin's `on-event`. This is the
 //!   subscriber-only-plugin path: such a plugin never ticks, so a
-//!   `select!` arm on the bus is what makes its events arrive.
+//!   `select!` arm on the bus is what makes its events arrive;
+//! - **readable sockets** — for a streaming instance with a tick
+//!   cadence, a socket the guest holds open becoming readable runs
+//!   `tick` early, coalesced and rate-bounded (see
+//!   [`super::io_wakeup`]).
 //!
 //! The state machine is `Loading → Inited → Running`, with
 //! `Stopping → Stopped` on a clean shutdown. A crash goes
@@ -37,7 +41,7 @@ use tokio::time::Instant;
 use crate::Engine;
 use crate::auth::SensitiveSet;
 use crate::auth::invocation::{self, InvocationContext};
-use crate::clock::Interval;
+use crate::clock::{Clock, Interval, Sleep};
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::types::{
     DeviceId, Error as WitError, KeyValue, ServiceId,
@@ -1883,6 +1887,48 @@ enum Wakeup {
     Control(Option<ControlCommand>),
     Tick,
     Event,
+    /// A socket the guest holds open is readable: tick early. Carries
+    /// the rate-gate sleep when that is what let the wakeup through, so
+    /// a virtual clock counts the tick it triggered as in progress.
+    Io(Option<Sleep>),
+}
+
+/// Wait until a socket the guest holds open is readable, but not
+/// before [`super::io_wakeup::IO_WAKE_MIN_GAP`] after `last_tick`
+/// ended. Never completes while the guest holds no socket: it can only
+/// open one in a call, after which the serve loop waits again.
+///
+/// When the gap is what held a ready socket back, the fired gate sleep
+/// is returned and kept until the tick it triggers is done (a virtual
+/// clock then waits for that tick, see [`Clock::sleep_until`]). A wait
+/// that then goes on for real I/O drops it first: the clock didn't
+/// trigger what follows.
+async fn io_ready(
+    instance: &mut PluginInstance,
+    clock: &Clock,
+    last_tick: Option<Instant>,
+) -> Option<Sleep> {
+    let mut readable = instance.io_readable();
+    if readable.is_empty() {
+        return std::future::pending().await;
+    }
+    let mut gate = last_tick
+        .map(|at| at + super::io_wakeup::IO_WAKE_MIN_GAP)
+        .filter(|at| *at > clock.instant())
+        .map(|at| clock.sleep_until(at));
+    if let Some(sleep) = gate.as_mut() {
+        sleep.await;
+    }
+    let now = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::pin::Pin::new(&mut readable).poll(cx))
+    })
+    .await;
+    if now.is_ready() {
+        return gate;
+    }
+    drop(gate);
+    readable.await;
+    None
 }
 
 /// Deliver the plugin's pending events as a [`guest_call`]. A stop
@@ -1910,7 +1956,15 @@ async fn serve_loop(
     instance_id: &str,
     mut tick: Option<Interval>,
 ) -> ServeOutcome {
+    let io_wakeups = instance.io_wakeups();
+    let clock = instance.clock().clone();
+    // When the last tick returned: an early tick waits out the gap
+    // after it. None until the first, so a socket readable straight
+    // after `init` is served at once.
+    let mut last_tick: Option<Instant> = None;
     loop {
+        // The gate of an early tick, held until its drain is done.
+        let mut io_gate: Option<Sleep> = None;
         let next = async {
             tokio::select! {
                 ctrl = control_rx.recv() => Wakeup::Control(ctrl),
@@ -1925,6 +1979,7 @@ async fn serve_loop(
                 // matching publishes drains together in one pass —
                 // exactly the behaviour we want.
                 () = wake.notified() => Wakeup::Event,
+                gate = io_ready(instance, &clock, last_tick), if io_wakeups => Wakeup::Io(gate),
             }
         };
         // A requested stop goes first: queued commands are then refused
@@ -1940,10 +1995,12 @@ async fn serve_loop(
             Wakeup::Control(ctrl) => {
                 handle_control(instance, state_tx, stop, instance_id, ctrl).await
             }
-            Wakeup::Tick => match guest_call(stop, instance.tick()).await {
-                Some(result) => result.map(|()| LoopAction::Continue),
-                None => Ok(LoopAction::Cancelled),
-            },
+            Wakeup::Tick => tick_now(instance, stop, &clock, &mut last_tick).await,
+            Wakeup::Io(gate) => {
+                tracing::trace!(instance_id, "socket readable: ticking early");
+                io_gate = gate;
+                tick_now(instance, stop, &clock, &mut last_tick).await
+            }
             Wakeup::Event => Ok(LoopAction::Continue),
         };
 
@@ -1970,6 +2027,22 @@ async fn serve_loop(
             }
             Err(e) => return ServeOutcome::Crashed(classify_post_init_trap(&e)),
         }
+        drop(io_gate);
+    }
+}
+
+/// Run `tick` as a [`guest_call`] and note when it returned.
+async fn tick_now(
+    instance: &mut PluginInstance,
+    stop: &mut watch::Receiver<bool>,
+    clock: &Clock,
+    last_tick: &mut Option<Instant>,
+) -> anyhow::Result<LoopAction> {
+    let result = guest_call(stop, instance.tick()).await;
+    *last_tick = Some(clock.instant());
+    match result {
+        Some(result) => result.map(|()| LoopAction::Continue),
+        None => Ok(LoopAction::Cancelled),
     }
 }
 

@@ -1111,8 +1111,10 @@ impl PluginInstance {
     ///
     /// Phase 6's per-instance supervisor drives this off a
     /// `tokio::time::interval` whose cadence is the manifest's
-    /// `runtime.tick_interval_ms`. Plugins that declare no interval
-    /// are never ticked.
+    /// `runtime.tick_interval_ms`, and runs it early for a streaming
+    /// instance whose socket became readable (see
+    /// [`super::io_wakeup`]). Plugins that declare no interval are never
+    /// ticked.
     pub async fn tick(&mut self) -> anyhow::Result<()> {
         let data = self.store.data();
         let span = info_span!(
@@ -1579,6 +1581,20 @@ impl PluginInstance {
     #[must_use]
     pub fn clock(&self) -> &crate::clock::Clock {
         &self.store.data().clock
+    }
+
+    /// Whether a readable socket wakes this instance early (see
+    /// [`super::io_wakeup`]): a streaming world with a tick cadence.
+    pub(crate) fn io_wakeups(&self) -> bool {
+        let manifest = self.manifest();
+        super::network::is_streaming(manifest.plugin.world)
+            && manifest.runtime.tick_interval_ms.is_some()
+    }
+
+    /// Completes once a socket the guest holds open is readable (see
+    /// [`super::io_wakeup`]). Only for the supervisor, between calls.
+    pub(crate) fn io_readable(&mut self) -> super::io_wakeup::Readable<'_> {
+        super::io_wakeup::readable(&mut self.store.data_mut().table)
     }
 }
 

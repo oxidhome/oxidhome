@@ -14,8 +14,9 @@ sdk_version = "0.1.0"
 
 [runtime]
 wasm = "target/wasm32-wasip2/debug/network_discovery.wasm"
-# Replies are drained on every tick.
-tick_interval_ms = 200
+# Replies are drained on every tick. The host ticks the plugin early as
+# soon as a reply is readable, so the cadence is only a fallback.
+tick_interval_ms = 60000
 
 [capabilities]
 # The addresses the plugin may probe, and hear back from. The host

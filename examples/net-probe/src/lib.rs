@@ -4,8 +4,14 @@
 //! each result in plugin storage (`op/<index>` = `ok:<detail>` or
 //! `err:<detail>`), so a host test can assert what the network policy let
 //! through. See `manifest.toml` for the operation syntax.
+//!
+//! The `hold-*` operations keep their socket open. Each `tick` counts
+//! itself (`ticks`) and drains the held sockets without blocking: the
+//! number of messages read so far goes to `received` and the last one to
+//! `last`, so a host test can see when, and how often, the host woke the
+//! plugin for a reply.
 
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -26,7 +32,13 @@ const POLL_WAIT: Duration = Duration::from_secs(5);
 const MAX_REDIRECTS: usize = 3;
 
 #[derive(Default)]
-struct NetProbe;
+struct NetProbe {
+    /// Sockets the `hold-*` operations keep open.
+    udp: Vec<UdpSocket>,
+    tcp: Vec<TcpStream>,
+    ticks: i64,
+    received: i64,
+}
 
 impl Plugin for NetProbe {
     fn init(&mut self) -> Result<(), String> {
@@ -40,7 +52,18 @@ impl Plugin for NetProbe {
             .filter(|op| !op.is_empty())
             .enumerate()
         {
-            let result = match run(op) {
+            let result = match op.split_once(' ') {
+                Some(("hold-udp", target)) => hold_udp(target).map(|s| {
+                    self.udp.push(s);
+                    "held".to_owned()
+                }),
+                Some(("hold-tcp", target)) => hold_tcp(target).map(|s| {
+                    self.tcp.push(s);
+                    "held".to_owned()
+                }),
+                _ => run(op),
+            };
+            let result = match result {
                 Ok(detail) => format!("ok:{detail}"),
                 Err(detail) => format!("err:{detail}"),
             };
@@ -51,6 +74,61 @@ impl Plugin for NetProbe {
     }
 
     fn shutdown(&mut self) {}
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+        set_int("ticks", self.ticks);
+        let mut last = None;
+        let mut buf = [0u8; 512];
+        for socket in &self.udp {
+            while let Ok((n, _)) = socket.recv_from(&mut buf) {
+                last = Some(String::from_utf8_lossy(&buf[..n]).into_owned());
+                self.received += 1;
+            }
+        }
+        // A stream at its end is dropped: the host keeps waking a
+        // plugin whose socket stays readable.
+        self.tcp.retain_mut(|stream| loop {
+            match stream.read(&mut buf) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    last = Some(String::from_utf8_lossy(&buf[..n]).trim_end().to_owned());
+                    self.received += 1;
+                }
+                Err(e) => return e.kind() == ErrorKind::WouldBlock,
+            }
+        });
+        if let Some(last) = last {
+            set_int("received", self.received);
+            let _ = storage::set("last", &Value::StringVal(last));
+        }
+    }
+}
+
+fn set_int(key: &str, value: i64) {
+    let _ = storage::set(key, &Value::IntVal(value));
+}
+
+/// Send `ping` to `target` from a non-blocking UDP socket and keep it.
+fn hold_udp(target: &str) -> Result<UdpSocket, String> {
+    let addr = target
+        .to_socket_addrs()
+        .map_err(io_err)?
+        .next()
+        .ok_or("no address")?;
+    let socket = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
+        .map_err(io_err)?;
+    socket.set_nonblocking(true).map_err(io_err)?;
+    socket.send_to(b"ping", addr).map_err(io_err)?;
+    Ok(socket)
+}
+
+/// Connect to `target`, send `ping\n`, and keep the non-blocking stream.
+fn hold_tcp(target: &str) -> Result<TcpStream, String> {
+    let mut stream = TcpStream::connect(target).map_err(io_err)?;
+    stream.write_all(b"ping\n").map_err(io_err)?;
+    stream.set_nonblocking(true).map_err(io_err)?;
+    Ok(stream)
 }
 
 impl StreamingPlugin for NetProbe {}

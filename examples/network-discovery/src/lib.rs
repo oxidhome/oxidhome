@@ -6,6 +6,8 @@
 //! every address in its `targets` config. On each `tick` it drains the
 //! replies without blocking and publishes each one as a
 //! `network-discovery.reply` custom event (`<addr>:<port> <payload>`).
+//! The host runs `tick` early when a reply is readable, so the manifest's
+//! cadence is only a fallback.
 //!
 //! Everything goes through plain `std::net`. The host decides each send
 //! and each received datagram against the manifest's

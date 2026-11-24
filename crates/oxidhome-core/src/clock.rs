@@ -6,7 +6,8 @@
 //! - wall-clock stamps: event receive times, device-state
 //!   `received_ms`, audit-ledger `intent_ms` / `finalized_ms`;
 //! - the guest's `wasi:clocks` wall and monotonic clocks;
-//! - the supervisor's `tick_interval_ms` schedule;
+//! - the supervisor's `tick_interval_ms` schedule, and the gap before a
+//!   streaming instance's early tick (`runtime::io_wakeup`);
 //! - the `accepted`-command TTL (H5);
 //! - the event bus's per-instance publish rate buckets, the
 //!   per-instance plugin log rate bucket, and the sensitive-action

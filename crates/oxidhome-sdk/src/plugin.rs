@@ -77,8 +77,10 @@ pub trait Plugin: Default + 'static {
         ))
     }
 
-    /// Called on the cadence the manifest's `tick_interval_ms` requests.
-    /// Default no-op for plugins that don't poll.
+    /// Called on the cadence the manifest's `tick_interval_ms` requests,
+    /// and, in the streaming worlds, early when a socket the plugin holds
+    /// open becomes readable (see the `streaming` module). Default no-op
+    /// for plugins that don't poll.
     fn tick(&mut self) {}
 }
 
