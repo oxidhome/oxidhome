@@ -1,0 +1,90 @@
+name: Wasm toolchain
+
+# Bumps wasmtime, wit-bindgen and the wasm-tools crates together onto one
+# wasm-tools release (Dependabot ignores them), using only releases out of
+# a 7-day quarantine (Dependabot's cooldown) and without OSV advisories.
+# The logic lives in .github/scripts/wasm-toolchain.sh; `wasm-toolchain.sh
+# plan` is its dry run.
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"   # Mondays 05:00 UTC
+  workflow_dispatch:
+    inputs:
+      quarantine-days:
+        description: "Only consider releases published at least this many days ago (7 or more)"
+        required: false
+        default: "7"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: read-all
+
+# One run at a time, so two runs can't both miss the open PR and
+# regenerate its branch.
+concurrency:
+  group: wasm-toolchain
+  cancel-in-progress: false
+
+jobs:
+  Update:
+    name: Bump the wasm toolchain
+    # The PR branch is cut from the checkout; never from a feature branch.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+      # Same osv-scanner release as the OSV jobs in checks.yaml.
+      - name: Install osv-scanner
+        run: |
+          go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Bump pins and lockfiles
+        id: bump
+        env:
+          # Empty on the schedule: the script's default (7) applies.
+          QUARANTINE_DAYS: ${{ inputs.quarantine-days }}
+        run: .github/scripts/wasm-toolchain.sh apply
+      # A rerun regenerates the branch from main, which would drop any
+      # baseline or binding fixes pushed to the open PR for the same bump
+      # (the body carries every target pin in a marker). A failed lookup
+      # fails the job rather than risk that.
+      - name: Check for an open PR with this bump
+        id: open
+        if: steps.bump.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINS: ${{ steps.bump.outputs.pins }}
+        run: |
+          prs=$(gh pr list --state open --head chore/update-wasm-toolchain --json body,isCrossRepository)
+          marker="<!-- wasm-toolchain-pins: $PINS -->"
+          found=$(jq --arg m "$marker" 'any(.[]; (.body | contains($m)) and (.isCrossRepository | not))' <<<"$prs")
+          if [ "$found" = true ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "An open PR already makes this bump; leaving it alone."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Open pull request
+        if: steps.bump.outputs.changed == 'true' && steps.open.outputs.exists == 'false'
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          branch: chore/update-wasm-toolchain
+          delete-branch: true
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
+            examples/*/Cargo.lock
+          commit-message: ${{ steps.bump.outputs.title }}
+          signoff: true
+          title: ${{ steps.bump.outputs.title }}
+          body-path: ${{ steps.bump.outputs.body-file }}
+          labels: |
+            dependencies
+            rust
