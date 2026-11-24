@@ -60,8 +60,15 @@ CACHE="$(mktemp -d)"
 # succeeds puts them back, so a rerun starts from the same state.
 RESTORE=""
 cleanup() {
+  local f failed=""
   if [[ -n $RESTORE ]]; then
-    (cd "$RESTORE" && find . -type f -exec cp {} "$ROOT/{}" \;)
+    while IFS= read -r -d '' f; do
+      cp "$RESTORE/$f" "$ROOT/$f" || failed=1
+    done < <(cd "$RESTORE" && find . -type f -print0)
+    if [[ -n $failed ]]; then
+      echo "error: could not restore every file; the originals are in $RESTORE" >&2
+      return
+    fi
     echo "restored Cargo.toml and the lockfiles" >&2
   fi
   rm -rf "$CACHE"
@@ -418,18 +425,21 @@ locked_packages() {
 # the root lockfile has on the same line, so the guest side doesn't pick
 # a different (possibly flagged) patch than the host's pins.
 align_examples() {
-  local lock name ver rver root_pkgs
-  root_pkgs="$(registry_packages "$ROOT/Cargo.lock")"
+  local lock name ver vers rver root_pkgs
+  # Runs under `update_lockfiles || die`, where errexit is off: every
+  # step returns its failure explicitly.
+  root_pkgs="$(registry_packages "$ROOT/Cargo.lock")" || return 1
   for lock in "$ROOT"/examples/*/Cargo.lock; do
     # Dependents first, so a downgrade never leaves a dependent asking
     # for a newer patch of what it uses.
     for name in wit-component wasm-metadata wit-parser wasm-encoder wasmparser; do
       # Re-read each time: moving one crate can move its siblings.
-      while read -r ver; do
-        rver="$(awk -v n="$name" -v l="${ver%.*}." '$1 == n && index($2, l) == 1 { print $2 }' <<<"$root_pkgs" | tail -n 1)"
+      vers="$(registry_packages "$lock" | awk -v n="$name" '$1 == n { print $2 }')" || return 1
+      for ver in $vers; do
+        rver="$(awk -v n="$name" -v l="${ver%.*}." '$1 == n && index($2, l) == 1 { print $2 }' <<<"$root_pkgs" | tail -n 1)" || return 1
         [[ -n $rver && $rver != "$ver" ]] || continue
         (cd "$(dirname "$lock")" && cargo update -p "$name@$ver" --precise "$rver") || return 1
-      done < <(registry_packages "$lock" | awk -v n="$name" '$1 == n { print $2 }')
+      done
     done
   done
 }
