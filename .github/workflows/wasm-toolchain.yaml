@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       quarantine-days:
-        description: "Only consider releases published at least this many days ago"
+        description: "Only consider releases published at least this many days ago (7 or more)"
         required: false
         default: "7"
 
