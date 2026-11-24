@@ -42,10 +42,10 @@ use std::time::Duration;
 
 use crate::bindings::wasi::http::outgoing_handler;
 use crate::bindings::wasi::http::types::{
-    ErrorCode, Fields, IncomingBody, Method as WasiMethod, OutgoingBody, OutgoingRequest,
-    RequestOptions, Scheme,
+    ErrorCode, Fields, FutureIncomingResponse, IncomingBody, IncomingResponse,
+    Method as WasiMethod, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
 };
-use crate::bindings::wasi::io::streams::StreamError;
+use crate::bindings::wasi::io::streams::{OutputStream, StreamError};
 
 /// Most redirects one [`Request::send`] follows.
 pub const MAX_REDIRECTS: u8 = 5;
@@ -236,14 +236,13 @@ impl Request {
         let mut url = Url::parse(&current.url)?;
         let mut hops = 0u8;
         loop {
-            let response = current.send_once(&url)?;
-            let Some(location) = redirect_location(&response) else {
-                return Ok(response);
+            let head = current.start(&url)?;
+            let location = match redirect_location(head.status, &head.headers) {
+                Some(location) if current.max_redirects > 0 => location,
+                // The final response: only its body is read.
+                _ => return head.read(current.max_body, &url),
             };
             if hops >= current.max_redirects {
-                if current.max_redirects == 0 {
-                    return Ok(response);
-                }
                 return Err(Error::TooManyRedirects {
                     limit: current.max_redirects,
                 });
@@ -253,7 +252,9 @@ impl Request {
             if url.https && !next.https {
                 return Err(Error::InsecureRedirect(next.to_string()));
             }
-            current.follow(response.status, &url, &next);
+            current.follow(head.status, &url, &next);
+            // The redirect's own body is dropped unread.
+            drop(head);
             url = next;
         }
     }
@@ -280,7 +281,8 @@ impl Request {
         self.url = to.to_string();
     }
 
-    fn send_once(&self, url: &Url) -> Result<Response, Error> {
+    /// Send one request and wait for the response head.
+    fn start(&self, url: &Url) -> Result<Head, Error> {
         let headers = Fields::new();
         for (name, value) in &self.headers {
             if name == "content-length" {
@@ -327,20 +329,22 @@ impl Request {
         let pending = outgoing_handler::handle(request, Some(options)).map_err(Error::Http)?;
         // Written after `handle`: the host buffers one chunk, so a body
         // written before the request starts would never drain.
-        // A failed write drops the body unfinished, which fails the
-        // request, so the response below says why (`HTTP-request-denied`,
-        // a TLS error) or carries what the server answered anyway (a
-        // `413` mid-upload); the write error itself adds nothing.
-        let written = (|| -> Result<(), Error> {
-            let stream = outgoing.write().map_err(|()| fail("body stream"))?;
-            for chunk in self.body.chunks(WRITE_CHUNK) {
-                stream
-                    .blocking_write_and_flush(chunk)
-                    .map_err(|e| Error::Request(format!("writing the body: {e:?}")))?;
-            }
-            Ok(())
-        })();
-        let _ = written.and_then(|()| OutgoingBody::finish(outgoing, None).map_err(Error::Http));
+        // A failed or cut-short write leaves the body unfinished, which
+        // fails the request, so the response below says why
+        // (`HTTP-request-denied`, a TLS error) or carries what the server
+        // answered anyway (a `413` mid-upload); the write error itself
+        // adds nothing.
+        let written = outgoing
+            .write()
+            .map_err(|()| fail("body stream"))
+            .and_then(|stream| write_body(&stream, &self.body, &pending));
+        if let Ok(true) = written {
+            let _ = OutgoingBody::finish(outgoing, None);
+        } else {
+            // Unfinished: ends the request instead of leaving the host
+            // waiting for the rest of the body.
+            drop(outgoing);
+        }
 
         pending.subscribe().block();
         let response = pending
@@ -356,13 +360,79 @@ impl Request {
         let incoming = response
             .consume()
             .map_err(|()| Error::Request("response body already taken".into()))?;
-        let body = read_body(incoming, self.max_body)?;
+        Ok(Head {
+            status,
+            headers,
+            incoming,
+            _response: response,
+        })
+    }
+}
+
+/// A response head, its body not read yet.
+struct Head {
+    status: u16,
+    headers: Vec<(String, Vec<u8>)>,
+    // Dropped before the response it came from.
+    incoming: IncomingBody,
+    _response: IncomingResponse,
+}
+
+impl Head {
+    /// Read the body (at most `max_body` bytes) into a [`Response`].
+    fn read(self, max_body: usize, url: &Url) -> Result<Response, Error> {
+        let Head {
+            status,
+            headers,
+            incoming,
+            _response,
+        } = self;
+        let body = read_body(incoming, max_body)?;
         Ok(Response {
             status,
             headers,
             body,
             url: url.to_string(),
         })
+    }
+}
+
+/// Write `body` and flush it. Returns `false` when the response arrived
+/// first: a server that answers mid-upload and stops reading would
+/// otherwise block the write for good.
+fn write_body(
+    stream: &OutputStream,
+    body: &[u8],
+    pending: &FutureIncomingResponse,
+) -> Result<bool, Error> {
+    let failed = |e: StreamError| Error::Request(format!("writing the body: {e:?}"));
+    let writable = stream.subscribe();
+    let answered = pending.subscribe();
+    let mut rest = body;
+    let mut flushed = false;
+    loop {
+        let room = stream.check_write().map_err(failed)?;
+        if room == 0 {
+            if crate::bindings::wasi::io::poll::poll(&[&writable, &answered]).contains(&1) {
+                return Ok(false);
+            }
+            continue;
+        }
+        if rest.is_empty() {
+            // `check-write` is 0 until a flush completes.
+            if flushed {
+                return Ok(true);
+            }
+            stream.flush().map_err(failed)?;
+            flushed = true;
+            continue;
+        }
+        let n = usize::try_from(room)
+            .unwrap_or(usize::MAX)
+            .min(rest.len())
+            .min(WRITE_CHUNK);
+        stream.write(&rest[..n]).map_err(failed)?;
+        rest = &rest[n..];
     }
 }
 
@@ -377,10 +447,11 @@ fn read_body(incoming: IncomingBody, max_body: usize) -> Result<Vec<u8>, Error> 
             let room = max_body.saturating_sub(body.len()) as u64 + 1;
             match stream.blocking_read(room.min(READ_CHUNK)) {
                 Ok(chunk) => {
-                    body.extend_from_slice(&chunk);
-                    if body.len() > max_body {
+                    // Checked before growing the buffer.
+                    if chunk.len() > max_body - body.len() {
                         return Err(Error::BodyTooLarge { limit: max_body });
                     }
+                    body.extend_from_slice(&chunk);
                 }
                 Err(StreamError::Closed) => break,
                 Err(StreamError::LastOperationFailed(e)) => {
@@ -398,13 +469,14 @@ fn read_body(incoming: IncomingBody, max_body: usize) -> Result<Vec<u8>, Error> 
     Ok(body)
 }
 
-fn redirect_location(response: &Response) -> Option<String> {
-    if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+fn redirect_location(status: u16, headers: &[(String, Vec<u8>)]) -> Option<String> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
         return None;
     }
-    response
-        .header("location")
-        .and_then(|v| std::str::from_utf8(v).ok())
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("location"))
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
         .map(str::to_owned)
 }
 
@@ -588,11 +660,12 @@ impl Url {
     }
 
     fn same_origin(&self, other: &Self) -> bool {
-        self.https == other.https && self.origin() == other.origin()
+        let (host, port) = self.origin();
+        self.https == other.https && port.is_some() && (host, port) == other.origin()
     }
 
     /// Host (lowercase; an IP literal in one spelling) and effective port.
-    fn origin(&self) -> (String, String) {
+    fn origin(&self) -> (String, Option<u16>) {
         let (host, port) = match self.authority.rfind(']') {
             Some(close) => {
                 let (host, rest) = self.authority.split_at(close + 1);
@@ -607,10 +680,12 @@ impl Url {
         let host = bare
             .parse::<std::net::IpAddr>()
             .map_or_else(|_| bare.to_ascii_lowercase(), |ip| ip.to_string());
-        let port = port.map_or_else(
-            || if self.https { "443" } else { "80" }.to_owned(),
-            str::to_owned,
-        );
+        // Numeric, so `:0443` is `:443`; `None` (never the same origin)
+        // for a port that doesn't parse.
+        let port = match port {
+            None => Some(if self.https { 443 } else { 80 }),
+            Some(port) => port.parse().ok(),
+        };
         (host, port)
     }
 }
@@ -715,6 +790,8 @@ mod tests {
         assert!(!url("https://h/a").same_origin(&url("https://h:8443/a")));
         assert!(url("http://[::1]/").same_origin(&url("http://[::1]:80/")));
         assert!(url("https://[fd00::1]/a").same_origin(&url("https://[fd00:0:0:0:0:0:0:1]:443/b")));
+        assert!(url("https://h:0443/a").same_origin(&url("https://h/b")));
+        assert!(!url("https://h:x/a").same_origin(&url("https://h:x/b")));
     }
 
     #[test]
