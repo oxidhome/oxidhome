@@ -92,7 +92,8 @@
 //!   test moves time past the deadline;
 //! - the guest's `wasi:clocks` wall and monotonic clocks;
 //! - event receive times, device-state `received_ms`, and audit-row
-//!   times.
+//!   times (except the command journal's `COMMAND` rows, which keep
+//!   real time).
 //!
 //! [`TestHost::advance`] moves the clock one timer at a time and waits
 //! for the work each one triggers, so ticks and expiries happen in

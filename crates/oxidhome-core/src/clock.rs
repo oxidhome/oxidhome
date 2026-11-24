@@ -25,7 +25,7 @@
 //!
 //! A [`VirtualClock`] is the test seam (`oxidhome-test-host`): time
 //! stands still until the test moves it, so ticks, TTL expiries, the
-//! watchdog, and every recorded timestamp are deterministic.
+//! watchdog, and the timestamps listed above are deterministic.
 //!
 //! Not on the clock: KV, blob and `device_meta` write times, log-store and
 //! command-journal row times (with the journal's `COMMAND` audit

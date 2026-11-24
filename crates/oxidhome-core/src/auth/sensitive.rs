@@ -375,6 +375,27 @@ mod tests {
         assert!(g.charge("p", lock).is_err());
     }
 
+    /// Refilled buckets that all share one frozen `last_observed`
+    /// are evicted in key order, not hash order.
+    #[test]
+    fn eviction_ties_break_by_key() {
+        let v = crate::clock::VirtualClock::new();
+        let audit = Arc::new(
+            AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))).with_clock(v.clone().into()),
+        );
+        let g = SensitiveGuard::new(audit);
+        let lock: SensitiveSet = [SensitiveCategory::Lock].into_iter().collect();
+        for i in 0..MAX_BUCKETS {
+            g.charge(&format!("p{i}"), lock).expect("room");
+        }
+        v.advance(std::time::Duration::from_secs(60));
+        g.charge("newcomer", lock)
+            .expect("a refilled bucket is evicted");
+        let buckets = g.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(!buckets.contains_key(&("p0".to_owned(), SensitiveCategory::Lock)));
+        assert!(buckets.contains_key(&("p1".to_owned(), SensitiveCategory::Lock)));
+    }
+
     fn guard() -> (SensitiveGuard, Arc<AuditLog>) {
         let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
         (SensitiveGuard::new(Arc::clone(&audit)), audit)
