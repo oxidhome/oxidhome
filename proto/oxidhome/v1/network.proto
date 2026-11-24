@@ -12,8 +12,7 @@ service NetworkService {
   // List pins, optionally for one instance. Gated on `instances:list`.
   rpc ListTlsPins(ListTlsPinsRequest) returns (ListTlsPinsResponse);
   // Remove pins so the next request pins again. Owner token only
-  // (`policy.manage`). Unset fields widen the selection: no instance
-  // resets every pin.
+  // (`policy.manage`). Needs an instance, or `all` to reset every pin.
   rpc ResetTlsPins(ResetTlsPinsRequest) returns (ResetTlsPinsResponse);
 }
 
@@ -33,6 +32,8 @@ message ResetTlsPinsRequest {
   optional string host = 2;
   // Only pins for this port.
   optional uint32 port = 3;
+  // Reset every pin; only without the other fields.
+  bool all = 4;
 }
 
 message ResetTlsPinsResponse {

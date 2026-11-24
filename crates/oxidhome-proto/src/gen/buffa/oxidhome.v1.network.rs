@@ -312,6 +312,15 @@ pub struct ResetTlsPinsRequest {
         skip_serializing_if = "::core::option::Option::is_none"
     )]
     pub port: ::core::option::Option<u32>,
+    /// Reset every pin; only without the other fields.
+    ///
+    /// Field 4: `all`
+    #[serde(
+        rename = "all",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub all: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -322,6 +331,7 @@ impl ::core::fmt::Debug for ResetTlsPinsRequest {
             .field("instance_id", &self.instance_id)
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("all", &self.all)
             .finish()
     }
 }
@@ -390,6 +400,9 @@ impl ::buffa::Message for ResetTlsPinsRequest {
         if let Some(v) = self.port {
             size += 1u64 + ::buffa::types::uint32_encoded_len(v) as u64;
         }
+        if self.all {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -408,6 +421,9 @@ impl ::buffa::Message for ResetTlsPinsRequest {
         }
         if let Some(v) = self.port {
             ::buffa::types::put_uint32_field(3u32, v, buf);
+        }
+        if self.all {
+            ::buffa::types::put_bool_field(4u32, self.all, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -453,6 +469,13 @@ impl ::buffa::Message for ResetTlsPinsRequest {
                     ::buffa::types::decode_uint32(buf)?,
                 );
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.all = ::buffa::types::decode_bool(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -464,6 +487,7 @@ impl ::buffa::Message for ResetTlsPinsRequest {
         self.instance_id = ::core::option::Option::None;
         self.host = ::core::option::Option::None;
         self.port = ::core::option::Option::None;
+        self.all = false;
         self.__buffa_unknown_fields.clear();
     }
 }

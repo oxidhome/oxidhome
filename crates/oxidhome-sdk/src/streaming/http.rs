@@ -321,6 +321,10 @@ impl Request {
         let pending = outgoing_handler::handle(request, Some(options)).map_err(Error::Http)?;
         // Written after `handle`: the host buffers one chunk, so a body
         // written before the request starts would never drain.
+        // A failed write drops the body unfinished, which fails the
+        // request, so the response below says why (`HTTP-request-denied`,
+        // a TLS error) or carries what the server answered anyway (a
+        // `413` mid-upload); the write error itself adds nothing.
         let written = (|| -> Result<(), Error> {
             let stream = outgoing.write().map_err(|()| fail("body stream"))?;
             for chunk in self.body.chunks(WRITE_CHUNK) {
@@ -330,21 +334,14 @@ impl Request {
             }
             Ok(())
         })();
-        let written =
-            written.and_then(|()| OutgoingBody::finish(outgoing, None).map_err(Error::Http));
+        let _ = written.and_then(|()| OutgoingBody::finish(outgoing, None).map_err(Error::Http));
 
         pending.subscribe().block();
         let response = pending
             .get()
             .ok_or_else(|| Error::Request("response not ready".into()))?
-            .map_err(|()| Error::Request("response already taken".into()))?;
-        // A refused or failed request closes the body stream: report why
-        // it failed, not the write that noticed.
-        let response = match (response, written) {
-            (Err(code), _) => return Err(Error::Http(code)),
-            (Ok(_), Err(err)) => return Err(err),
-            (Ok(response), Ok(())) => response,
-        };
+            .map_err(|()| Error::Request("response already taken".into()))?
+            .map_err(Error::Http)?;
         let status = response.status();
         let headers = {
             let fields = response.headers();
@@ -527,10 +524,17 @@ impl Url {
     /// forms servers send).
     fn join(&self, location: &str) -> Result<Self, Error> {
         let location = location.trim();
-        // Absolute when a scheme comes before any `/`, `?` or `#`.
+        // Absolute when a scheme comes before any `/`, `?` or `#`; only
+        // `http(s)://` ones are followed (`parse` refuses the rest).
         let head = location.split(['/', '?', '#']).next().unwrap_or_default();
-        if head.ends_with(':') && location[head.len()..].starts_with("//") {
-            return Self::parse(location);
+        if let Some((scheme, _)) = head.split_once(':') {
+            let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+            if is_scheme {
+                return Self::parse(location);
+            }
         }
         let scheme = if self.https { "https" } else { "http" };
         if let Some(rest) = location.strip_prefix("//") {
@@ -664,6 +668,9 @@ mod tests {
             ),
         ] {
             assert_eq!(base.join(location).expect(location).to_string(), expected);
+        }
+        for location in ["mailto:help@example.org", "ftp://cam.lan/x", "https:x"] {
+            assert!(base.join(location).is_err(), "{location}");
         }
     }
 

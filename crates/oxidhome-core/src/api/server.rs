@@ -862,17 +862,32 @@ struct TlsPinParams {
     instance_id: Option<String>,
     host: Option<String>,
     port: Option<u16>,
+    /// `DELETE` only: reset every pin.
+    #[serde(default)]
+    all: bool,
 }
 
 impl TlsPinParams {
-    fn filter(self) -> Result<crate::state::PinFilter, TlsPinError> {
+    fn pin_filter(self) -> crate::state::PinFilter {
         crate::state::PinFilter {
             instance_id: self.instance_id,
             host: self.host,
             port: self.port,
         }
-        .validated()
-        .map_err(TlsPinError::BadRequest)
+    }
+
+    fn filter(self) -> Result<crate::state::PinFilter, TlsPinError> {
+        if self.all {
+            return Err(TlsPinError::BadRequest("`all` is for resets".into()));
+        }
+        self.pin_filter()
+            .validated()
+            .map_err(TlsPinError::BadRequest)
+    }
+
+    fn reset_filter(self) -> Result<crate::state::PinFilter, TlsPinError> {
+        let all = self.all;
+        super::network_admin::reset_filter(self.pin_filter(), all).map_err(TlsPinError::BadRequest)
     }
 }
 
@@ -922,16 +937,17 @@ async fn list_tls_pins(
     }))
 }
 
-/// `DELETE /api/v1/network/tls-pins[?instance_id=…[&host=…[&port=…]]]`
-/// — forget pins, so the next request to each key trusts (and pins)
-/// whatever certificate the device presents. No parameters removes
-/// every pin. Returns the removed pins.
+/// `DELETE /api/v1/network/tls-pins?instance_id=…[&host=…[&port=…]]` or
+/// `?all=true` — forget pins, so the next request to each key trusts (and
+/// pins) whatever certificate the device presents. Returns the removed
+/// pins.
 ///
 /// `policy.manage`: the owner token only; no scope, the wildcard
 /// included, grants it (a reset decides what the host will trust).
 ///
 /// # Errors
-/// - `400` a host without an instance, or a port without a host.
+/// - `400` a host without an instance, a port without a host, neither an
+///   instance nor `all`, or `all` with a filter.
 /// - `403` not the owner.
 /// - `500` the pins couldn't be removed.
 async fn reset_tls_pins(
@@ -940,7 +956,7 @@ async fn reset_tls_pins(
     Query(params): Query<TlsPinParams>,
 ) -> Result<Json<TlsPinsRemovedBody>, TlsPinError> {
     require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TlsPinError::Scope)?;
-    let filter = params.filter()?;
+    let filter = params.reset_filter()?;
     let pins = state.engine.tls_pins();
     let removed = tokio::task::spawn_blocking(move || pins.reset(&filter))
         .await

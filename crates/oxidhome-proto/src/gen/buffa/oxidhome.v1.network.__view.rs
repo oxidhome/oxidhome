@@ -546,6 +546,10 @@ pub struct ResetTlsPinsRequestView<'a> {
     ///
     /// Field 3: `port`
     pub port: ::core::option::Option<u32>,
+    /// Reset every pin; only without the other fields.
+    ///
+    /// Field 4: `all`
+    pub all: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ResetTlsPinsRequestView<'a> {
@@ -597,6 +601,13 @@ impl<'a> ::buffa::MessageView<'a> for ResetTlsPinsRequestView<'a> {
                 )?;
                 view.port = Some(::buffa::types::decode_uint32(&mut cur)?);
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.all = ::buffa::types::decode_bool(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -628,6 +639,7 @@ impl<'a> ::buffa::MessageView<'a> for ResetTlsPinsRequestView<'a> {
             instance_id: self.instance_id.map(|s| s.to_string()),
             host: self.host.map(|s| s.to_string()),
             port: self.port,
+            all: self.all,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -648,6 +660,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ResetTlsPinsRequestView<'a> {
         if let Some(v) = self.port {
             size += 1u64 + ::buffa::types::uint32_encoded_len(v) as u64;
         }
+        if self.all {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -667,6 +682,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ResetTlsPinsRequestView<'a> {
         }
         if let Some(v) = self.port {
             ::buffa::types::put_uint32_field(3u32, v, buf);
+        }
+        if self.all {
+            ::buffa::types::put_bool_field(4u32, self.all, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -697,6 +715,9 @@ impl<'__a> ::serde::Serialize for ResetTlsPinsRequestView<'__a> {
         }
         if let ::core::option::Option::Some(__v) = self.port {
             __map.serialize_entry("port", &::buffa::json_helpers::ProtoJson(&__v))?;
+        }
+        if self.all {
+            __map.serialize_entry("all", &self.all)?;
         }
         __map.end()
     }
@@ -813,6 +834,13 @@ impl ResetTlsPinsRequestOwnedView {
     #[must_use]
     pub fn port(&self) -> ::core::option::Option<u32> {
         self.0.reborrow().port
+    }
+    /// Reset every pin; only without the other fields.
+    ///
+    /// Field 4: `all`
+    #[must_use]
+    pub fn all(&self) -> bool {
+        self.0.reborrow().all
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ResetTlsPinsRequestView<'static>>>

@@ -2074,6 +2074,7 @@ mod tests {
             db.write(|conn| -> rusqlite::Result<()> {
                 conn.execute_batch(
                     "
+                    DROP TABLE network_tls_pin;
                     DROP TABLE auth_role;
                     DROP TABLE sandbox_removal;
                     DROP TABLE device_meta;
@@ -2167,6 +2168,8 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 24: TLS certificate pins.
+                    DROP TABLE network_tls_pin;
                     -- 23: owner-defined roles.
                     DROP TABLE auth_role;
                     -- 22: sandbox removal markers.

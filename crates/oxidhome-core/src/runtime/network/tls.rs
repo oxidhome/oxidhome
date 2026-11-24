@@ -15,7 +15,8 @@
 //!   [`TlsPinStore`]: no pin pins it, the same certificate passes, any
 //!   other is refused and audited. Public addresses, and NAT64 addresses
 //!   (which may translate to public servers), never get this. A pinned
-//!   key also refuses a different certificate the roots do vouch for.
+//!   key also refuses a different certificate the roots do vouch for,
+//!   whatever address the name now resolves to.
 //!   Nothing of the request is sent before that check.
 
 use std::net::{IpAddr, SocketAddr};
@@ -324,21 +325,23 @@ pub(super) async fn connect(
     };
     match trust {
         Some(Trust::Roots(seen)) => {
-            // A pinned LAN device stays pinned until the operator resets
-            // it, whoever vouches for a replacement.
+            // A pinned key stays pinned until the operator resets it,
+            // whoever vouches for a replacement and wherever the name now
+            // resolves.
             match client.pins.pinned(&key) {
-                Some(pinned) if verifier.tofu && pinned != seen => {
-                    Ok(Connected::Refused(PinDenial::Mismatch {
-                        seen: seen.to_hex(),
-                        pinned: pinned.to_hex(),
-                    }))
-                }
+                Some(pinned) if pinned != seen => Ok(Connected::Refused(PinDenial::Mismatch {
+                    seen: seen.to_hex(),
+                    pinned: pinned.to_hex(),
+                })),
                 _ => Ok(Connected::Stream(Box::new(tls))),
             }
         }
         Some(Trust::FirstUse(seen)) => {
             let pins = Arc::clone(&client.pins);
             let (policy, target) = (Arc::clone(policy), target.to_owned());
+            // The audit row's caller: task-locals don't reach the
+            // blocking thread.
+            let ctx = crate::auth::invocation::current();
             // Pinned and audited together on the blocking thread, so a
             // request that times out meanwhile can't leave an unaudited pin.
             let check = tokio::task::spawn_blocking(move || {
@@ -352,7 +355,11 @@ pub(super) async fn connect(
                         sha256 = %seen.to_hex(),
                         "trusting a certificate the system roots don't vouch for, on first use",
                     );
-                    policy.audit_pinned(&target, seen);
+                    let audit = || policy.audit_pinned(&target, seen);
+                    match ctx {
+                        Some(ctx) => crate::auth::invocation::CURRENT.sync_scope(ctx, audit),
+                        None => audit(),
+                    }
                 }
                 check
             })

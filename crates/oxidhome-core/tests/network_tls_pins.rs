@@ -168,16 +168,25 @@ async fn operators_list_and_reset_pins() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(pinned_hosts(&body, "removed"), ["cam/camera.lan:8443"]);
 
-    // Connect: the same gates.
+    // Connect: the same gates, and a reset names its scope.
     let (status, _) = send(
         &router,
         "POST",
         "/oxidhome.v1.NetworkService/ResetTlsPins",
         &wildcard.plaintext,
-        "{}",
+        r#"{"all":true}"#,
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.NetworkService/ResetTlsPins",
+        &owner.plaintext,
+        r#"{"instance":"cam"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, body) = send(
         &router,
         "POST",
@@ -201,12 +210,21 @@ async fn operators_list_and_reset_pins() {
         .collect();
     assert_eq!(left, ["cam/192.168.1.20:443", "plug/10.0.0.7:443"]);
 
-    // No filter resets everything.
+    // Only an explicit `all` resets everything.
     let router = build_router(engine.clone());
-    let (status, body) = send(
+    let (status, _) = send(
         &router,
         "DELETE",
         "/api/v1/network/tls-pins",
+        &owner.plaintext,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = send(
+        &router,
+        "DELETE",
+        "/api/v1/network/tls-pins?all=true",
         &owner.plaintext,
         "",
     )

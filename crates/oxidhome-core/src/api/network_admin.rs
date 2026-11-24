@@ -6,7 +6,7 @@
 //!   exclusive state-dir lock, like the `token` commands; a reset leaves a
 //!   two-phase `LOCAL` audit row (actor `cli`).
 //! - `GET /api/v1/network/tls-pins[?instance_id=…]` (`instances:list`) and
-//!   `DELETE /api/v1/network/tls-pins?instance_id=…[&host=…[&port=…]]`
+//!   `DELETE /api/v1/network/tls-pins?instance_id=…[&host=…[&port=…]]` (or `?all=true`)
 //!   (owner token, `policy.manage`), and the Connect `NetworkService`.
 //! - MCP lists them (`oxidhome://network/tls-pins`), read-only.
 
@@ -42,6 +42,22 @@ impl From<TlsPin> for TlsPinView {
             sha256: pin.fingerprint.to_hex(),
             pinned_ms: pin.pinned_ms,
         }
+    }
+}
+
+/// The filter of a reset: an instance (and maybe a host and port), or
+/// `all` alone. A reset must say which, so a dropped or misspelled field
+/// can't widen it to every pin.
+///
+/// # Errors
+///
+/// A message naming what is missing or contradictory.
+pub fn reset_filter(filter: PinFilter, all: bool) -> Result<PinFilter, String> {
+    let filter = filter.validated()?;
+    match (filter.instance_id.is_some(), all) {
+        (true, false) | (false, true) => Ok(filter),
+        (false, false) => Err("name an instance, or reset all pins explicitly".into()),
+        (true, true) => Err("`all` resets every pin; it takes no other filter".into()),
     }
 }
 

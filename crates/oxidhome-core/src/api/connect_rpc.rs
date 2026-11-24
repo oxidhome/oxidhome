@@ -409,12 +409,14 @@ impl oxidhome_proto::connect::oxidhome::v1::NetworkService for OxidHomeNetwork {
             .map(u16::try_from)
             .transpose()
             .map_err(|_| rpc_err(&ctx, ConnectError::invalid_argument("port out of range")))?;
-        let filter = crate::state::PinFilter {
-            instance_id: req.instance_id,
-            host: req.host,
-            port,
-        }
-        .validated()
+        let filter = crate::api::network_admin::reset_filter(
+            crate::state::PinFilter {
+                instance_id: req.instance_id,
+                host: req.host,
+                port,
+            },
+            req.all,
+        )
         .map_err(|e| rpc_err(&ctx, ConnectError::invalid_argument(e)))?;
         let pins = self.engine.tls_pins();
         let removed = tokio::task::spawn_blocking(move || pins.reset(&filter))

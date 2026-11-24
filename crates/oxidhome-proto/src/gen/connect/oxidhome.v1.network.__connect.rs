@@ -171,8 +171,7 @@ pub trait NetworkService: Send + Sync + 'static {
         >,
     > + Send;
     /// Remove pins so the next request pins again. Owner token only
-    /// (`policy.manage`). Unset fields widen the selection: no instance
-    /// resets every pin.
+    /// (`policy.manage`). Needs an instance, or `all` to reset every pin.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///

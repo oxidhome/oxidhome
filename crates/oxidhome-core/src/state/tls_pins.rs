@@ -151,7 +151,7 @@ pub fn normalize_host(host: &str) -> String {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     // One spelling per address (`::0:1` and `::1` are one key).
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return ip.to_string();
+        return ip.to_canonical().to_string();
     }
     host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
@@ -339,8 +339,10 @@ impl TlsPinStore {
             return Ok(removed);
         }
         if let Some(db) = &self.db {
-            db.write(|conn| -> Result<(), rusqlite::Error> {
-                let tx = conn.transaction()?;
+            // Durable like a new pin: a reset certificate must not come
+            // back after power loss.
+            durable_write(db, |conn| -> Result<(), rusqlite::Error> {
+                let tx = conn.unchecked_transaction()?;
                 {
                     let mut stmt = tx.prepare(
                         "DELETE FROM network_tls_pin \
@@ -406,6 +408,7 @@ mod tests {
     fn hosts_normalize_to_one_spelling() {
         assert_eq!(normalize_host("[::0:1]"), "::1");
         assert_eq!(normalize_host("FE80::0001"), "fe80::1");
+        assert_eq!(normalize_host("[::ffff:192.168.1.2]"), "192.168.1.2");
         assert_eq!(normalize_host("192.168.001.2"), "192.168.001.2");
         assert_eq!(normalize_host("Camera.LAN."), "camera.lan");
     }
