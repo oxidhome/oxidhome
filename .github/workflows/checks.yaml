@@ -28,16 +28,19 @@ env:
 permissions:
   contents: read
 
-# A new push to a PR cancels that PR's run still in progress. Every
-# other run (push to main, schedule, and the tag runs where
-# `publish.yaml` calls this workflow) gets a group of its own through
-# `run_id`, so it is never cancelled and never left pending behind
-# another. Under `workflow_call`, `github.workflow` and `run_id` are the
-# caller's, so the `checks-` prefix keeps this group apart from any
-# group the caller might declare for itself.
+# A new push to a PR cancels that PR's run still in progress, and a new
+# push to main cancels the main run it supersedes, so a burst of merges
+# only spends CI on the newest commit. A re-run of an older main commit
+# keeps its push event and ref, so `run_attempt` keeps it out of the main
+# group; otherwise it would cancel the newest commit's run. Every other
+# run (re-runs, schedule, and the tag runs where `publish.yaml` calls
+# this workflow) gets a group of its own through `run_id`, so it is never
+# cancelled and never left pending behind another. Under `workflow_call`, `github.workflow` and `run_id`
+# are the caller's, so the `checks-` prefix keeps this group apart from
+# any group the caller might declare for itself.
 concurrency:
-  group: checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: checks-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main') || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1') }}
 
 jobs:
   RustMeta:
