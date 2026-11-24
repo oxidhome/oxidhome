@@ -2,7 +2,7 @@
 //! [`crate::SupervisedInstance`]: both look at the same engine stores,
 //! keyed by instance id and installation identity.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use oxidhome_core::Engine;
 use oxidhome_core::state::{
@@ -10,7 +10,7 @@ use oxidhome_core::state::{
 };
 
 use crate::TestHostError;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{CommandRecord, HostRecords, Snapshot, SnapshotOptions};
 use crate::tempdir::TempDir;
 use crate::wit::types::Value;
 
@@ -20,6 +20,10 @@ pub(crate) struct InstanceRef<'a> {
     pub(crate) state_dir: &'a Arc<TempDir>,
     pub(crate) installation_uuid: Arc<str>,
     pub(crate) instance_id: &'a str,
+    /// The host's secret config values, masked in snapshots.
+    pub(crate) secrets: &'a HostRecords,
+    /// Commands the test sent through the harness.
+    pub(crate) commands: &'a Mutex<Vec<CommandRecord>>,
 }
 
 impl InstanceRef<'_> {
@@ -88,8 +92,8 @@ impl InstanceRef<'_> {
             .read_by_name(&self.installation_uuid, self.instance_id, name)?)
     }
 
-    pub(crate) fn snapshot(&self) -> Result<Snapshot, TestHostError> {
-        Snapshot::capture(self)
+    pub(crate) fn snapshot(&self, options: &SnapshotOptions) -> Result<Snapshot, TestHostError> {
+        Snapshot::capture(self, options)
     }
 }
 

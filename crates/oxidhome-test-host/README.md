@@ -67,8 +67,8 @@ async fn toggle_flips_the_switch() -> Result<(), TestHostError> {
         "#
     ));
 
-    // `tick` runs on a virtual clock: with `tick_interval_ms = 1000`,
-    // advancing 3.5 s runs exactly three ticks.
+    // `advance` runs the ticks the manifest schedules: with
+    // `tick_interval_ms = 1000`, advancing 3.5 s runs exactly three.
     assert_eq!(plugin.advance(Duration::from_millis(3500)).await?, 3);
 
     plugin.shutdown().await
@@ -78,7 +78,83 @@ async fn toggle_flips_the_switch() -> Result<(), TestHostError> {
 On a mismatch, `assert_matches` panics with a line diff and the full
 actual snapshot, ready to paste back. To keep a snapshot in a file
 instead, use `assert_matches_file(path)` and run the test once with
-`OXIDHOME_UPDATE_SNAPSHOTS=1` to (re)write it.
+`OXIDHOME_UPDATE_SNAPSHOTS=1` to (re)write it. The text is plain, so
+any golden-file tool (`insta::assert_snapshot!(snapshot.to_string())`,
+say) works too.
+
+## Virtual time
+
+`TestHost::new()` runs on the real clock. `TestHost::with_virtual_clock()`
+runs the engine on a `VirtualClock` that only moves when the test moves
+it, starting at 2026-01-01T00:00:00Z (or wherever
+`VirtualClock::starting_at` says). It drives supervised and direct
+ticks, the `accepted`-command TTL, the liveness watchdog, the guest's
+WASI wall and monotonic clocks, and the host's event, device-state,
+and audit timestamps:
+
+```rust,no_run
+use std::time::Duration;
+
+use oxidhome_test_host::{SnapshotOptions, TestHost};
+
+# async fn demo() -> Result<(), oxidhome_test_host::TestHostError> {
+let host = TestHost::with_virtual_clock()?;
+let counter = host.start("path/to/kv-counter").await?;
+counter.wait_for_running().await?;
+
+// Real time passing ticks nothing. `advance` fires each timer due in
+// the span at its own deadline, and waits for the work it triggers:
+// with `tick_interval_ms = 1000` this runs exactly three ticks.
+host.advance(Duration::from_millis(3500)).await?;
+
+// Times in snapshots are relative to the clock's start.
+let snapshot = counter.snapshot_with(&SnapshotOptions::new().times())?;
+# let _ = snapshot;
+counter.stop().await?;
+# Ok(())
+# }
+```
+
+`host.run_until_idle()` waits for the work already due without moving
+time. Both wait for the timers' owners — a supervised tick, a command
+expiry — not for what those publish: an event a tick sends to another
+instance's `on-event` may still be in flight, so wait for that effect
+itself; likewise a tick that traps — wait for the restart or the
+terminal state. Timers due at the same instant fire together, in no
+set order. Advance a clock from one task at a time, and use a
+multi-thread runtime when a plugin call may hang (a spinning guest
+holds its worker thread). A plugin call that never returns keeps `advance` waiting, so to
+move time past the watchdog, jump the clock itself:
+`host.virtual_clock().unwrap().advance(Duration::from_secs(31))` moves
+time and fires what falls due without waiting for anything.
+
+## Snapshot sections and redaction
+
+`snapshot_with(&SnapshotOptions)` adds sections after the default
+five:
+
+- `.device_state()` — the host's device-state projection for the
+  instance's devices, with ` stale` once it stopped;
+- `.commands()` — every command the test sent through the harness and
+  its outcome (`completed`, `rejected`, `accepted (pending)` /
+  `accepted (resolved)`, `timed_out`, `outcome_unknown`, or
+  `(in flight)` before the reply, `(dropped before the reply)` when
+  the test gave up on it), in the order they were sent;
+- `.audit()` — the audit rows rooted at the instance, e.g. a refused
+  `get-state` (it waits for rows the host writes in the background);
+- `.times()` — `@+1.500s` stamps on events and device state, relative
+  to the virtual clock (`@?` on the real clock). Audit rows stay
+  unstamped: the host writes some of them in the background.
+
+Every snapshot is redacted so it can be committed: host-minted
+`cmd-…` / `call-…` ids become `<cmd-1>`, `<call-1>`, …; the instance's
+`type = "secret"` config values, values under credential-like keys,
+`Bearer` credentials, and `oxh_` tokens are masked as `***` (in
+JSON values too, and in bytes printed as hex); and
+`.redact(text, placeholder)` adds replacements of your own, matched
+against the rendered text. Host-minted ids the harness didn't send
+(a `call-…` id a plugin stored, say) are numbered in the order the
+snapshot prints them.
 
 ## Denying a capability
 
@@ -166,16 +242,20 @@ block_on(counter.tick()).unwrap();
 
 ## Limits
 
-- Time: `advance` controls when `tick` runs. Everything else that reads a
-  clock — the guest's WASI clocks, event receive times, blob timestamps,
-  the watchdog, a supervised instance's tick interval — uses real time,
-  because `oxidhome-core` has no clock injection.
+- Time: even on a virtual clock, a guest's WASI sleep takes real time,
+  as do request and `call-service` deadlines, the event-history read
+  deadline, a streaming plugin's DNS,
+  connect and HTTP timeouts, restart backoff, shutdown grace periods,
+  and KV and blob write times. On a real-clock host,
+  `advance` only schedules a directly driven plugin's ticks.
 - A directly loaded plugin can call services but can't serve them; start
   the provider with `TestHost::start`.
 - The direct path uses the production 30 s watchdog; lower it through
-  `LoadOptions::supervision` on a supervised instance.
-- No streaming or AI mocks yet: the `streaming-plugin` and AI worlds
-  aren't built.
+  `LoadOptions::supervision` on a supervised instance, or move a
+  virtual clock past it.
+- No network or AI mocks yet: a `streaming-plugin` plugin's sockets
+  and HTTP reach the real network, through its policy, and the AI world
+  isn't built.
 
 The crate's own tests (`tests/examples.rs`) exercise every plugin under
 `examples/` and are a good source of patterns.

@@ -69,7 +69,8 @@
 //!
 //! [`TestHost::load`] gives a [`TestPluginInstance`] the test drives
 //! itself: each method calls one export and returns, nothing runs in
-//! between, and `tick` follows a virtual clock. [`TestHost::start`]
+//! between, and [`TestPluginInstance::advance`] runs the ticks the
+//! manifest schedules. [`TestHost::start`]
 //! gives a [`SupervisedInstance`] run by the daemon's own supervisor
 //! task — needed to serve `call-service` requests from other plugins
 //! and to exercise the restart policy and the liveness watchdog.
@@ -79,16 +80,34 @@
 //!
 //! # Time
 //!
-//! [`TestPluginInstance::advance`] moves a per-instance virtual clock
-//! and runs exactly the ticks the manifest's `tick_interval_ms`
-//! schedules in that span, so tick-driven behaviour is deterministic.
-//! That is as far as the harness can take it without faking the host:
-//! `oxidhome-core` has no clock injection, so the guest's WASI clocks,
-//! the host's event receive times, blob timestamps, and the liveness
-//! watchdog all keep reading real time, and a supervised instance
-//! ticks on a real Tokio interval. Assert on what a tick *did*
-//! rather than on timestamps; [`Snapshot`] leaves them out for that
-//! reason.
+//! [`TestHost::new`] runs on the real clock. On
+//! [`TestHost::with_virtual_clock`] the engine reads a [`VirtualClock`]
+//! (`oxidhome-core`'s clock seam; the daemon always uses the system
+//! clock) that stands still until the test moves it. It drives:
+//!
+//! - supervised ticks (`tick_interval_ms`) and directly driven ones
+//!   ([`TestPluginInstance::advance`]);
+//! - the `accepted`-command TTL (H5);
+//! - the liveness watchdog: a hung call is interrupted only once the
+//!   test moves time past the deadline;
+//! - the guest's `wasi:clocks` wall and monotonic clocks;
+//! - event receive times, device-state `received_ms`, and audit-row
+//!   times (except the command journal's `COMMAND` rows, which keep
+//!   real time).
+//!
+//! [`TestHost::advance`] moves the clock one timer at a time and waits
+//! for the work each one triggers, so ticks and expiries happen in
+//! order and exactly as often as the span allows;
+//! [`TestHost::run_until_idle`] waits for that work without moving
+//! time; [`VirtualClock::advance`] jumps without waiting — the way past
+//! a plugin call that never returns. Not on the clock: a guest's WASI
+//! sleep still takes real time, as do request and `call-service`
+//! deadlines, restart backoff, shutdown grace periods, and KV and blob
+//! write times (see [`oxidhome_core::clock`]).
+//!
+//! On a real-clock host, [`TestPluginInstance::advance`] still runs a
+//! directly driven plugin's ticks on schedule, on a clock of its own
+//! that nothing else reads.
 //!
 //! # Snapshots
 //!
@@ -97,7 +116,12 @@
 //! [`Snapshot::assert_matches`] compares against an inline expected
 //! string (or [`Snapshot::assert_matches_file`], a file kept up to
 //! date with `OXIDHOME_UPDATE_SNAPSHOTS=1`), with a line diff on
-//! mismatch.
+//! mismatch. `snapshot_with(&SnapshotOptions)` adds the device-state
+//! projection, the commands the test sent with their H5 outcomes, the
+//! audit rows, and timestamps (relative to the virtual clock). Every
+//! snapshot is redacted: host-minted ids become numbered placeholders
+//! and the instance's secrets are masked, so it can be committed as a
+//! golden file. The text works with any snapshot tool as well.
 //!
 //! # Async
 //!
@@ -109,6 +133,7 @@
 //! The crate's `README.md` walks through testing a plugin end to end.
 
 mod block_on;
+mod clock;
 mod error;
 mod grant;
 mod host;
@@ -124,7 +149,7 @@ pub use error::TestHostError;
 pub use grant::grant_excess;
 pub use host::{LoadOptions, TestHost, test_supervision};
 pub use instance::TestPluginInstance;
-pub use snapshot::{Snapshot, UPDATE_SNAPSHOTS_ENV, render_value};
+pub use snapshot::{Snapshot, SnapshotOptions, UPDATE_SNAPSHOTS_ENV, render_value};
 pub use supervised::SupervisedInstance;
 pub use view::StorageView;
 
@@ -133,7 +158,7 @@ pub use view::StorageView;
 pub use oxidhome_core::state::{BlobInfo, DeviceMeta, HistoricalEvent, ServiceMeta};
 pub use oxidhome_core::{
     CommandOutcome, CommandReport, Engine, InitError, InstanceHandle, InstanceState,
-    SupervisorTuning,
+    SupervisorTuning, VirtualClock,
 };
 pub use oxidhome_manifest::{CapabilitiesSection, ServiceGrant};
 

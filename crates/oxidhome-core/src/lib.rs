@@ -15,6 +15,7 @@
 pub mod api;
 pub mod auth;
 pub mod backup;
+pub mod clock;
 pub mod exclusive_lock;
 pub mod host_impl;
 pub mod native_policy;
@@ -24,6 +25,7 @@ pub mod runtime;
 pub mod state;
 
 pub use auth::{Actor, ActorKind};
+pub use clock::{Clock, VirtualClock};
 pub use runtime::{
     CommandOutcome, CommandReport, Engine, EngineShuttingDown, InitError, InstanceHandle,
     InstanceRegistry, InstanceState, PluginInstance, RegistryError, STOP_WAIT_LIMIT, StopAllReport,

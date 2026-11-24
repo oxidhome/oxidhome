@@ -124,6 +124,8 @@ pub(crate) struct NetworkPolicy {
     resolved: Mutex<Resolved>,
     audit: Mutex<AuditBucket>,
     audit_log: Option<Arc<crate::state::AuditLog>>,
+    /// The engine clock: resolved-grant expiry and the audit bucket.
+    clock: crate::clock::Clock,
     pub(crate) lookups: Arc<tokio::sync::Semaphore>,
     pub(crate) http_requests: Arc<tokio::sync::Semaphore>,
 }
@@ -288,7 +290,10 @@ impl Resolved {
                 && let Some(oldest) = self
                     .entries
                     .iter()
-                    .min_by_key(|(_, e)| e.expires())
+                    // The address breaks ties (a frozen virtual
+                    // clock gives every grant the same expiry), so
+                    // eviction never depends on hash order.
+                    .min_by_key(|(ip, e)| (e.expires(), **ip))
                     .map(|(ip, _)| *ip)
             {
                 self.entries.remove(&oldest);
@@ -327,10 +332,10 @@ struct AuditBucket {
 }
 
 impl AuditBucket {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             tokens: AUDIT_BURST,
-            last: Instant::now(),
+            last: now,
             suppressed: 0,
         }
     }
@@ -357,13 +362,15 @@ impl NetworkPolicy {
         instance_id: &str,
         rules: &[NetworkRule],
         audit_log: Option<Arc<crate::state::AuditLog>>,
+        clock: crate::clock::Clock,
     ) -> Self {
         Self {
             instance_id: Arc::from(instance_id),
             rules: rules.iter().map(CompiledRule::compile).collect(),
             resolved: Mutex::default(),
-            audit: Mutex::new(AuditBucket::new()),
+            audit: Mutex::new(AuditBucket::new(clock.std_instant())),
             audit_log,
+            clock,
             lookups: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOOKUPS)),
             http_requests: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HTTP)),
         }
@@ -403,7 +410,7 @@ impl NetworkPolicy {
                     .resolved
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .rules_for(ip, Instant::now())
+                    .rules_for(ip, self.clock.std_instant())
                     .iter()
                     .any(allowed_by),
             };
@@ -473,7 +480,7 @@ impl NetworkPolicy {
         rules: &[usize],
         only: Option<(Use, u16)>,
     ) -> Vec<IpAddr> {
-        let now = Instant::now();
+        let now = self.clock.std_instant();
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for ip in addrs {
@@ -518,7 +525,7 @@ impl NetworkPolicy {
             .audit
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take(Instant::now())
+            .take(self.clock.std_instant())
         else {
             return;
         };
@@ -551,7 +558,7 @@ mod tests {
 
     fn policy(rules: &[&str]) -> NetworkPolicy {
         let rules: Vec<NetworkRule> = rules.iter().map(|r| r.parse().expect("rule")).collect();
-        NetworkPolicy::new("inst-1", &rules, None)
+        NetworkPolicy::new("inst-1", &rules, None, crate::clock::Clock::system())
     }
 
     fn sa(s: &str) -> SocketAddr {
@@ -907,6 +914,60 @@ mod tests {
     }
 
     #[test]
+    fn grants_and_audit_bucket_follow_the_virtual_clock() {
+        let v = crate::clock::VirtualClock::new();
+        let rules: Vec<NetworkRule> = vec!["tcp://mqtt.example.com:1883".parse().expect("rule")];
+        let p = NetworkPolicy::new("inst-1", &rules, None, v.clone().into());
+        let named = p
+            .name_rules("mqtt.example.com", &[Use::Tcp])
+            .expect("named");
+        p.admit_resolved(vec![ip("93.184.216.34")], &named, None);
+        let addr = sa("93.184.216.34:1883");
+        v.advance(RESOLVED_TTL.saturating_sub(Duration::from_secs(1)));
+        assert_eq!(p.check_addr(Use::Tcp, addr, None), Ok(()));
+        v.advance(Duration::from_secs(2));
+        assert!(p.check_addr(Use::Tcp, addr, None).is_err());
+
+        let suppressed = || {
+            p.audit
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .suppressed
+        };
+        let deny = || p.audit_denial("connect", "10.0.0.1:1", &Denial::Listen);
+        for _ in 0..16 {
+            deny();
+        }
+        assert_eq!(suppressed(), 0);
+        // Frozen time refills nothing; one virtual second does.
+        deny();
+        deny();
+        assert_eq!(suppressed(), 2);
+        v.advance(Duration::from_secs(1));
+        deny();
+        assert_eq!(suppressed(), 0);
+    }
+
+    #[test]
+    fn eviction_ties_break_by_address() {
+        let mut table = Resolved::default();
+        let now = Instant::now();
+        let nth = |i: usize| {
+            IpAddr::from(std::net::Ipv4Addr::from(
+                0x0808_0000 + u32::try_from(i).unwrap(),
+            ))
+        };
+        for i in (0..=MAX_RESOLVED).rev() {
+            table.insert(nth(i), &[0], now);
+        }
+        // Every grant expires together; inserting the last address
+        // evicts the lowest one already held.
+        assert_eq!(table.rules_for(nth(1), now), Vec::<usize>::new());
+        assert_eq!(table.rules_for(nth(0), now), vec![0]);
+        assert_eq!(table.rules_for(nth(2), now), vec![0]);
+    }
+
+    #[test]
     fn overlong_names_are_refused_before_matching() {
         let p = policy(&["tcp://*.example.com:*"]);
         let long = format!("{}.example.com", "a.".repeat(200));
@@ -918,8 +979,8 @@ mod tests {
 
     #[test]
     fn audit_bucket_throttles_and_counts() {
-        let mut bucket = AuditBucket::new();
         let now = Instant::now();
+        let mut bucket = AuditBucket::new(now);
         for _ in 0..16 {
             assert_eq!(bucket.take(now), Some(0));
         }

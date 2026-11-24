@@ -794,9 +794,9 @@ pub(crate) fn topic_of(event: &Event) -> &str {
 }
 
 /// Returns the current Unix time in ms, capped at `i64::MAX` and
-/// `0` on clock-before-epoch. Exposed for the runtime-state caller
-/// in `host_impl::events::publish_event` so the `received_ms` it
-/// stores matches the store's own assumptions.
+/// `0` on clock-before-epoch. The real-time stamp for rows that are
+/// not on the engine clock (see [`crate::clock`]); plugin-published
+/// events are stamped from the engine clock instead.
 #[must_use]
 pub(crate) fn now_unix_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};

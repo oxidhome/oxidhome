@@ -73,6 +73,9 @@ pub enum ObligationError {
 pub struct SensitiveGuard {
     audit: Arc<AuditLog>,
     buckets: Mutex<HashMap<(String, SensitiveCategory), Bucket>>,
+    /// The engine clock (the audit log's), which the buckets refill on
+    /// (see [`crate::clock`]).
+    clock: crate::clock::Clock,
 }
 
 impl SensitiveGuard {
@@ -80,6 +83,7 @@ impl SensitiveGuard {
     #[must_use]
     pub fn new(audit: Arc<AuditLog>) -> Self {
         Self {
+            clock: audit.clock().clone(),
             audit,
             buckets: Mutex::new(HashMap::new()),
         }
@@ -96,7 +100,7 @@ impl SensitiveGuard {
         principal: &str,
         categories: SensitiveSet,
     ) -> Result<(), ObligationError> {
-        let now = Instant::now();
+        let now = self.clock.std_instant();
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         for category in categories.iter() {
             let key = (principal.to_owned(), category);
@@ -300,7 +304,13 @@ fn evict_refilled(
             b.refill(now, capacity, refill);
             b.tokens >= capacity
         })
-        .min_by_key(|(_, b)| b.last_observed)
+        // The key breaks ties (a frozen virtual clock stamps every
+        // bucket alike), so eviction never depends on hash order.
+        .min_by(|(ka, a), (kb, b)| {
+            a.last_observed
+                .cmp(&b.last_observed)
+                .then_with(|| ka.cmp(kb))
+        })
         .map(|(k, _)| k.clone());
     key.is_some_and(|k| buckets.remove(&k).is_some())
 }
@@ -345,6 +355,45 @@ mod tests {
             g.charge("newcomer", both),
             Err(ObligationError::RateLimited { .. })
         ));
+    }
+
+    #[test]
+    fn buckets_refill_on_the_virtual_clock() {
+        let v = crate::clock::VirtualClock::new();
+        let audit = Arc::new(
+            AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))).with_clock(v.clone().into()),
+        );
+        let g = SensitiveGuard::new(audit);
+        let lock: SensitiveSet = [SensitiveCategory::Lock].into_iter().collect();
+        for _ in 0..10 {
+            g.charge("p", lock).expect("allowance");
+        }
+        // Frozen time refills nothing; one virtual minute is one charge.
+        assert!(g.charge("p", lock).is_err());
+        v.advance(std::time::Duration::from_secs(60));
+        g.charge("p", lock).expect("refilled");
+        assert!(g.charge("p", lock).is_err());
+    }
+
+    /// Refilled buckets that all share one frozen `last_observed`
+    /// are evicted in key order, not hash order.
+    #[test]
+    fn eviction_ties_break_by_key() {
+        let v = crate::clock::VirtualClock::new();
+        let audit = Arc::new(
+            AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))).with_clock(v.clone().into()),
+        );
+        let g = SensitiveGuard::new(audit);
+        let lock: SensitiveSet = [SensitiveCategory::Lock].into_iter().collect();
+        for i in 0..MAX_BUCKETS {
+            g.charge(&format!("p{i}"), lock).expect("room");
+        }
+        v.advance(std::time::Duration::from_secs(60));
+        g.charge("newcomer", lock)
+            .expect("a refilled bucket is evicted");
+        let buckets = g.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(!buckets.contains_key(&("p0".to_owned(), SensitiveCategory::Lock)));
+        assert!(buckets.contains_key(&("p1".to_owned(), SensitiveCategory::Lock)));
     }
 
     fn guard() -> (SensitiveGuard, Arc<AuditLog>) {

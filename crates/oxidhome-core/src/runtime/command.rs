@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::auth::invocation::{InvocationContext, audit_cap, mint_prefixed_id};
+use crate::clock::Clock;
 use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue};
 use crate::state::{AuditEntry, AuditLog};
@@ -425,6 +426,8 @@ pub struct PendingCommands {
     entries: Mutex<HashMap<String, Pending>>,
     ttl_ms: AtomicU64,
     journal: Option<CommandJournal>,
+    /// Times the TTL (see [`crate::clock`]).
+    clock: Clock,
 }
 
 impl std::fmt::Debug for PendingCommands {
@@ -452,7 +455,15 @@ impl PendingCommands {
             entries: Mutex::new(HashMap::new()),
             ttl_ms: AtomicU64::new(duration_ms(PENDING_COMMAND_TTL)),
             journal,
+            clock: Clock::system(),
         })
+    }
+
+    /// Time the TTL on `clock` instead of the system clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Wait up to `timeout` for every queued persist and resolution row
@@ -487,6 +498,12 @@ impl PendingCommands {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Whether `command_id` is still pending.
+    #[must_use]
+    pub fn is_pending(&self, command_id: &str) -> bool {
+        self.lock().contains_key(command_id)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Pending>> {
@@ -546,14 +563,20 @@ impl PendingCommands {
             // Spawned under the lock so the timer can't fire before its
             // entry exists; it only takes the lock after sleeping.
             let ttl = Duration::from_millis(self.ttl_ms.load(Ordering::Relaxed));
-            let expires_at = tokio::time::Instant::now() + ttl;
+            let expires_at = self.clock.instant() + ttl;
             let weak: Weak<Self> = Arc::downgrade(self);
             let id = command_id.to_owned();
+            // Created here rather than in the task: a virtual clock
+            // then knows the timer before `register` returns.
+            let mut timer = self.clock.sleep_until(expires_at);
             let expiry = tokio::spawn(async move {
-                tokio::time::sleep_until(expires_at).await;
+                (&mut timer).await;
                 if let Some(table) = weak.upgrade() {
                     table.expire(&id, ExpiryReason::Expired);
                 }
+                // Held until the expiry is done: a virtual clock counts
+                // it in progress until then.
+                drop(timer);
             })
             .abort_handle();
             // Queued under the table lock, so the persist is ahead of
@@ -620,7 +643,7 @@ impl PendingCommands {
             .remove(command_id)
             .expect("entry checked under the same lock");
         // Decided under the lock that claimed the entry.
-        let expired = tokio::time::Instant::now() >= p.expires_at;
+        let expired = self.clock.instant() >= p.expires_at;
         p.expiry.abort();
         if expired {
             // The TTL passed; the timer just hasn't run yet. Expire it
@@ -718,7 +741,7 @@ impl PendingCommands {
                 p.expiry.abort();
                 // A TTL that already ran out is an expiry, whatever
                 // ended the instance (as `take` judges a completion).
-                let reason = if tokio::time::Instant::now() >= p.expires_at {
+                let reason = if self.clock.instant() >= p.expires_at {
                     ExpiryReason::Expired
                 } else {
                     reason

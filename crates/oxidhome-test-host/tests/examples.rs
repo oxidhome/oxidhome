@@ -2,7 +2,8 @@
 //! main path through the harness — and, along the way, the harness
 //! features each one needs: supervised instances and host-side
 //! service calls, blobs, crash and watchdog handling, the virtual
-//! clock, snapshots, and `block_on`. `hello-world`, `simulated-switch`,
+//! clock, snapshots, and `block_on`. `clock-probe` is the fixture for
+//! the guest's view of the virtual clock. `hello-world`, `simulated-switch`,
 //! `kv-counter`, and `event-recorder` also run through the
 //! conformance suite (`tests/conformance.rs`).
 
@@ -15,11 +16,13 @@ use oxidhome_test_host::wit::devices::{Command, CommandResult};
 use oxidhome_test_host::wit::types::{Error as WitError, KeyValue, Value};
 use oxidhome_test_host::{
     CapabilitiesSection, CommandOutcome, InitError, InstanceState, LoadOptions, ServiceGrant,
-    SupervisedInstance, SupervisorTuning, TestHost, TestHostError, block_on, test_supervision,
+    SnapshotOptions, SupervisedInstance, SupervisorTuning, TestHost, TestHostError, VirtualClock,
+    block_on, test_supervision,
 };
 use support::{
-    CRASHER, DEFERRED_SWITCH, HANG, HELLO_WORLD, KV_COUNTER, SCRIPT_HOST, SERVICE_BOUNCER,
-    SERVICE_CALLER, SERVICE_COUNTER, SIMULATED_SWITCH, SNAPSHOT_SAVER, stage_unchanged,
+    CLOCK_PROBE, CRASHER, DEFERRED_SWITCH, HANG, HELLO_WORLD, KV_COUNTER, SCRIPT_HOST,
+    SERVICE_BOUNCER, SERVICE_CALLER, SERVICE_COUNTER, SIMULATED_SWITCH, SNAPSHOT_SAVER,
+    stage_unchanged,
 };
 
 fn config(text: &str) -> toml::Value {
@@ -604,19 +607,52 @@ async fn crasher_restarts_until_the_cap() {
 
 /// A tick that never returns is interrupted by the liveness watchdog
 /// and the instance fails as unresponsive instead of wedging its
-/// supervisor.
+/// supervisor. On the virtual clock this runs the production 30 s
+/// watchdog in no real time, and shows it doesn't fire early: only
+/// moving time past the deadline trips it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hang_tick_is_interrupted_by_the_watchdog() {
     let staged = stage_unchanged(HANG);
-    let host = TestHost::new().unwrap();
+    let host = TestHost::with_virtual_clock().unwrap();
+    let clock = host.virtual_clock().unwrap().clone();
     let hang = host
         .start_with(
             staged.path(),
-            LoadOptions::new().supervision(fast_watchdog()),
+            LoadOptions::new().supervision(SupervisorTuning {
+                max_restarts: 0,
+                ..test_supervision()
+            }),
         )
         .await
         .unwrap();
-    let error = failed_error(hang.wait_terminal().await);
+    hang.wait_for_running().await.unwrap();
+
+    // The first tick is due 10 ms after `Running` and never returns,
+    // so step the clock itself (`TestHost::advance` would wait for the
+    // tick) a second at a time until the watchdog interrupts it. The
+    // watchdog arms its 30 s once the tick starts, so it can't fire
+    // before 30 s of virtual time have passed — however long the
+    // steps take in real time.
+    clock.advance(Duration::from_millis(10));
+    let mut terminal = None;
+    for _ in 0..120 {
+        clock.advance(Duration::from_secs(1));
+        if let Ok(state) =
+            tokio::time::timeout(Duration::from_millis(50), hang.wait_terminal()).await
+        {
+            terminal = Some(state);
+            break;
+        }
+    }
+    let Some(state) = terminal else {
+        // Free the spinning worker before failing, or the runtime's
+        // teardown would wait for it forever.
+        clock.advance(Duration::from_hours(1));
+        let _ = tokio::time::timeout(Duration::from_secs(10), hang.wait_terminal()).await;
+        panic!("the watchdog didn't interrupt the tick within 120 s ({clock:?})");
+    };
+    assert!(clock.elapsed() >= Duration::from_secs(30), "{clock:?}");
+    let error = failed_error(state);
     assert!(error.contains("unresponsive"), "{error}");
 }
 
@@ -713,6 +749,171 @@ async fn advance_stops_at_a_trapping_tick() {
     assert_eq!(crasher.elapsed(), Duration::from_millis(50));
 }
 
+/// A supervised instance ticks on the host's virtual clock: never on
+/// its own, and exactly once per `tick_interval_ms` the clock passes,
+/// however big the step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_ticks_follow_the_virtual_clock() {
+    let staged = stage_unchanged(KV_COUNTER);
+    let host = TestHost::with_virtual_clock().unwrap();
+    let counter = host.start(staged.path()).await.unwrap();
+    counter.wait_for_running().await.unwrap();
+    let count = || match counter.storage().get("count").unwrap() {
+        Some(Value::IntVal(n)) => n,
+        None => 0,
+        other => panic!("unexpected count {other:?}"),
+    };
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(count(), 0, "real time doesn't tick a virtual host");
+    host.advance(Duration::from_millis(999)).await.unwrap();
+    assert_eq!(count(), 0);
+    host.advance(Duration::from_millis(1)).await.unwrap();
+    assert_eq!(count(), 1);
+    host.advance(Duration::from_millis(3500)).await.unwrap();
+    assert_eq!(
+        count(),
+        4,
+        "one tick per interval crossed, not one per step"
+    );
+    host.run_until_idle().await.unwrap();
+    assert_eq!(count(), 4);
+    assert_eq!(
+        host.virtual_clock().unwrap().elapsed(),
+        Duration::from_millis(4500)
+    );
+    counter.stop().await.unwrap();
+
+    // A real-clock host has nothing to advance.
+    let real = TestHost::new().unwrap();
+    assert!(real.virtual_clock().is_none());
+    assert!(matches!(
+        real.advance(Duration::from_secs(1)).await,
+        Err(TestHostError::RealClock)
+    ));
+    assert!(matches!(
+        real.run_until_idle().await,
+        Err(TestHostError::RealClock)
+    ));
+}
+
+/// The guest's WASI clocks read the virtual clock: wall time from its
+/// start, monotonic time from zero, both moving only with it. The
+/// host's event receive times follow the same clock.
+#[tokio::test(flavor = "current_thread")]
+async fn guest_clocks_read_virtual_time() {
+    let staged = stage_unchanged(CLOCK_PROBE);
+    let start = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let host = TestHost::with_clock(VirtualClock::starting_at(start)).unwrap();
+    let mut probe = host.load(staged.path()).await.unwrap();
+    probe.init().await.unwrap();
+    // A direct tick runs at the current virtual time.
+    probe.tick().await.unwrap();
+    assert_eq!(probe.advance(Duration::from_millis(2500)).await.unwrap(), 2);
+    assert_eq!(probe.elapsed(), Duration::from_millis(2500));
+    probe
+        .snapshot_with(&SnapshotOptions::new().times())
+        .unwrap()
+        .assert_matches(
+            r#"
+            devices:
+            services:
+            events:
+              - custom clock {\"wall_ms\":1000000000,\"mono_ms\":0} @+0.000s
+              - custom clock {\"wall_ms\":1000001000,\"mono_ms\":1000} @+1.000s
+              - custom clock {\"wall_ms\":1000002000,\"mono_ms\":2000} @+2.000s
+            storage:
+            blobs:
+            "#,
+        );
+
+    // Loaded later, an instance counts its ticks from its own load.
+    let mut late = host.load(staged.path()).await.unwrap();
+    late.init().await.unwrap();
+    assert_eq!(late.elapsed(), Duration::ZERO);
+    assert_eq!(late.advance(Duration::from_millis(500)).await.unwrap(), 0);
+    assert_eq!(late.advance(Duration::from_millis(500)).await.unwrap(), 1);
+    assert_eq!(probe.elapsed(), Duration::from_millis(3500));
+}
+
+/// Every snapshot masks the instance's secret config values, wherever
+/// the plugin put them, and the optional sections render the
+/// commands' H5 outcomes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshots_mask_secrets() {
+    let staged = stage_unchanged(KV_COUNTER);
+    let manifest = staged.path().join("manifest.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[config.api_key]\ntype = \"secret\"\ndescription = \"Cloud key.\"\n");
+    std::fs::write(&manifest, text).unwrap();
+    let options = || {
+        LoadOptions::new()
+            .instance_id("counter")
+            .config(config("api_key = \"k3y-secret\""))
+    };
+    let expected = r#"
+        devices:
+        services:
+        events:
+        storage:
+          note = "***"
+          other = "a *** inside"
+          password = "***"
+        blobs:
+        commands:
+          "" counter.bogus -> rejected invalid-argument("unsupported action counter::bogus")
+        "#;
+    let bogus = Command {
+        id: "cmd-1".into(),
+        capability: "counter".into(),
+        action: "bogus".into(),
+        args: Vec::new(),
+    };
+    let seed = |storage: oxidhome_test_host::StorageView| {
+        storage
+            .set("note", Value::StringVal("k3y-secret".into()))
+            .unwrap();
+        storage
+            .set("other", Value::StringVal("a k3y-secret inside".into()))
+            .unwrap();
+        storage
+            .set("password", Value::StringVal("hunter2".into()))
+            .unwrap();
+    };
+
+    // Virtual, so the supervised counter doesn't tick into `storage`.
+    let host = TestHost::with_virtual_clock().unwrap();
+    let mut direct = host.load_with(staged.path(), options()).await.unwrap();
+    direct.init().await.unwrap();
+    seed(direct.storage());
+    direct.send_command("", bogus.clone()).await.unwrap();
+    let snapshot = direct
+        .snapshot_with(&SnapshotOptions::new().commands())
+        .unwrap();
+    snapshot.assert_matches(expected);
+    direct.shutdown().await.unwrap();
+
+    // The supervised path resolves secrets the same way. Reloaded
+    // with a rotated key, the old one, still in its storage, stays
+    // masked too.
+    let supervised = host
+        .start_with(
+            staged.path(),
+            LoadOptions::new()
+                .instance_id("counter")
+                .config(config("api_key = \"r0tated-secret\"")),
+        )
+        .await
+        .unwrap();
+    supervised.wait_for_running().await.unwrap();
+    supervised.send_command("", bogus).await;
+    supervised
+        .snapshot_with(&SnapshotOptions::new().commands())
+        .unwrap()
+        .assert_matches(expected);
+    supervised.stop().await.unwrap();
+}
+
 // ── command outcomes (H5) ──────────────────────────────────────────
 
 fn switch_command(action: &str, args: Vec<KeyValue>) -> Command {
@@ -726,18 +927,6 @@ fn switch_command(action: &str, args: Vec<KeyValue>) -> Command {
 
 fn only_device(instance: &SupervisedInstance) -> String {
     instance.devices()[0].id.clone()
-}
-
-/// Poll `done` every 10 ms for up to 5 s.
-async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !done() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 /// Success is `completed` with the plugin's state; a plugin refusal is
@@ -927,12 +1116,17 @@ async fn stop_refuses_queued_commands() {
 
 /// `accepted`: the caller hears it at once, the plugin completes the
 /// command on its next tick with `complete-command`, and the pending
-/// entry goes away with the state projected and published.
+/// entry goes away with the state projected and published. On the
+/// virtual clock nothing happens until the tick is due, and then
+/// exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_accepted_then_completed() {
     let staged = stage_unchanged(DEFERRED_SWITCH);
-    let host = TestHost::new().unwrap();
-    let switch = host.start(staged.path()).await.unwrap();
+    let host = TestHost::with_virtual_clock().unwrap();
+    let switch = host
+        .start_with(staged.path(), LoadOptions::new().instance_id("switch"))
+        .await
+        .unwrap();
     switch.wait_for_running().await.unwrap();
     let device = only_device(&switch);
 
@@ -944,35 +1138,63 @@ async fn command_accepted_then_completed() {
         "{report:?}"
     );
     let pending = switch.pending_commands();
+    // Real time passing changes nothing.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pending.len(), 1);
+    host.advance(Duration::from_millis(49)).await.unwrap();
+    assert_eq!(pending.len(), 1);
     // The fixture publishes no event: the projection changes because
     // the host projects the completion's `ok-with-state`.
-    eventually("the tick to complete and project the command", || {
-        pending.is_empty() && projected_switch(&host, &device) == Some(true)
-    })
-    .await;
+    host.advance(Duration::from_millis(1)).await.unwrap();
+    assert!(pending.is_empty());
+    assert_eq!(projected_switch(&host, &device), Some(true));
+    switch
+        .snapshot_with(&SnapshotOptions::new().device_state().commands().times())
+        .unwrap()
+        .assert_matches(&format!(
+            r#"
+            devices:
+              {device} "Deferred Switch" [switch]
+            services:
+            events:
+            storage:
+            blobs:
+            device-state:
+              {device} switch {{state=true}} @+0.050s
+            commands:
+              {device} switch.toggle -> accepted (resolved)
+            "#
+        ));
     switch.stop().await.unwrap();
 }
 
 /// An accepted command that never completes expires as
-/// `outcome_unknown`; stopping the instance expires what it still held.
+/// `outcome_unknown` when its TTL runs out — on the virtual clock, at
+/// exactly that point; stopping the instance expires what it still
+/// held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn command_accepted_then_expired() {
     let staged = stage_unchanged(DEFERRED_SWITCH);
-    let host = TestHost::new().unwrap();
+    let host = TestHost::with_virtual_clock().unwrap();
     let switch = host.start(staged.path()).await.unwrap();
     switch.wait_for_running().await.unwrap();
     let device = only_device(&switch);
     let lost = || switch_command("toggle", vec![arg("lost", Value::BoolVal(true))]);
     let pending = switch.pending_commands();
 
-    pending.set_ttl(Duration::from_millis(100));
+    // A short TTL keeps the 50 ms tick count down; the default works
+    // the same, in more steps.
+    pending.set_ttl(Duration::from_secs(1));
     let report = switch.send_command(device.clone(), lost()).await;
     assert!(
         matches!(report.outcome, CommandOutcome::Accepted),
         "{report:?}"
     );
-    // No `len() == 1` check here: the short TTL may already have fired.
-    eventually("the pending command to expire", || pending.is_empty()).await;
+    assert!(pending.is_pending(&report.command_id));
+    host.advance(Duration::from_millis(999)).await.unwrap();
+    assert_eq!(pending.len(), 1, "one virtual millisecond to go");
+    host.advance(Duration::from_millis(1)).await.unwrap();
+    assert!(pending.is_empty(), "the TTL ran out");
 
     pending.set_ttl(Duration::from_mins(5));
     let report = switch.send_command(device, lost()).await;

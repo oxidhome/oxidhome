@@ -36,6 +36,7 @@ pub const DEFERRED_SWITCH: (&str, &str) = ("deferred-switch", "deferred_switch.w
 pub const SCRIPT_HOST: (&str, &str) = ("script-host", "script_host.wasm");
 pub const NET_PROBE: (&str, &str) = ("net-probe", "net_probe.wasm");
 pub const NETWORK_DISCOVERY: (&str, &str) = ("network-discovery", "network_discovery.wasm");
+pub const CLOCK_PROBE: (&str, &str) = ("clock-probe", "clock_probe.wasm");
 
 /// Build `examples/<dir>` for `wasm32-wasip2` (once per test binary)
 /// and return the artifact path.

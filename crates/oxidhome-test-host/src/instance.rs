@@ -1,15 +1,15 @@
 //! [`TestPluginInstance`] — one loaded plugin plus assertion helpers.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use oxidhome_core::state::{BlobInfo, DeviceMeta, HistoricalEvent, ServiceMeta};
-use oxidhome_core::{Engine, PluginInstance};
+use oxidhome_core::{CommandOutcome, Engine, PluginInstance, VirtualClock};
 use oxidhome_manifest::PluginManifest;
 
 use crate::TestHostError;
 use crate::live::IdLease;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{CommandRecord, CommandSlot, HostRecords, Snapshot, SnapshotOptions};
 use crate::tempdir::TempDir;
 use crate::view::{InstanceRef, StorageView};
 use crate::wit::devices::{Command, CommandResult};
@@ -44,7 +44,13 @@ pub struct TestPluginInstance {
     engine: Engine,
     lease: IdLease,
     state_dir: Arc<TempDir>,
+    /// Time since load on a real-clock host, moved by `advance`.
     elapsed: Duration,
+    /// On a virtual-clock host: the clock's time at load, which the
+    /// tick schedule counts from.
+    loaded_at: Duration,
+    secrets: Arc<HostRecords>,
+    commands: Mutex<Vec<CommandRecord>>,
 }
 
 impl TestPluginInstance {
@@ -53,13 +59,22 @@ impl TestPluginInstance {
         inner: PluginInstance,
         lease: IdLease,
         state_dir: Arc<TempDir>,
+        secrets: Arc<HostRecords>,
     ) -> Self {
+        secrets.add(oxidhome_core::redact::config_secrets(inner.config()));
+        let loaded_at = engine
+            .clock()
+            .as_virtual()
+            .map_or(Duration::ZERO, VirtualClock::elapsed);
         Self {
             inner,
             engine,
             lease,
             state_dir,
             elapsed: Duration::ZERO,
+            loaded_at,
+            secrets,
+            commands: Mutex::default(),
         }
     }
 
@@ -113,7 +128,11 @@ impl TestPluginInstance {
     /// projection's caps), and an `accepted` reply is registered as a
     /// pending command the plugin can finish with `complete-command`.
     /// `command.id` is passed through as given; use a `cmd-` prefixed
-    /// id if the plugin may answer `accepted`.
+    /// id if the plugin may answer `accepted`, and a fresh one per
+    /// command: the host's pending table is keyed by id alone.
+    ///
+    /// The call and its H5 outcome are recorded for the snapshot's
+    /// `commands` section ([`crate::SnapshotOptions::commands`]).
     ///
     /// # Errors
     ///
@@ -124,10 +143,25 @@ impl TestPluginInstance {
         device: impl Into<DeviceId>,
         command: Command,
     ) -> Result<CommandResult, TestHostError> {
-        self.inner
-            .execute_command(device.into(), command)
-            .await
-            .map_err(|e| TestHostError::call("execute-command", e))
+        let device = device.into();
+        let slot = CommandSlot::reserve(
+            &self.commands,
+            &self.secrets,
+            device.clone(),
+            command.capability.clone(),
+            command.action.clone(),
+        );
+        let command_id = command.id.clone();
+        let result = self.inner.execute_command(device, command).await;
+        let outcome = match &result {
+            Ok(reply) => CommandOutcome::from_plugin(reply.clone()),
+            // The plugin was entered: whatever it did may stand.
+            Err(_) => CommandOutcome::Unknown {
+                message: "execute-command trapped".into(),
+            },
+        };
+        slot.reply(&command_id, outcome);
+        result.map_err(|e| TestHostError::call("execute-command", e))
     }
 
     /// Publish `event` on the host's event bus, then hand this
@@ -239,63 +273,104 @@ impl TestPluginInstance {
         self.view().read_blob(name)
     }
 
-    /// A [`Snapshot`] of everything this instance has in the host.
+    /// A [`Snapshot`] of everything this instance has in the host:
+    /// the default sections ([`SnapshotOptions::default`]).
     ///
     /// # Errors
     ///
     /// When the event log, storage, or blob index can't be read.
     pub fn snapshot(&self) -> Result<Snapshot, TestHostError> {
-        self.view().snapshot()
+        self.snapshot_with(&SnapshotOptions::default())
     }
 
-    /// Virtual time since the instance was loaded, as moved by
-    /// [`Self::advance`]. Starts at zero; real time never moves it.
+    /// A [`Snapshot`] with the sections and stamps `options` asks for.
+    ///
+    /// # Errors
+    ///
+    /// When the event log, storage, blob index, or audit ledger can't
+    /// be read.
+    pub fn snapshot_with(&self, options: &SnapshotOptions) -> Result<Snapshot, TestHostError> {
+        self.view().snapshot(options)
+    }
+
+    /// Time since the instance was loaded, as the tick schedule of
+    /// [`Self::advance`] counts it: on a virtual-clock host, the host
+    /// clock's time since load (whoever moved it); on a real-clock
+    /// host, the instance's own clock, moved only by
+    /// [`Self::advance`]. Real time never moves it.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
-        self.elapsed
+        match self.engine.clock().as_virtual() {
+            Some(clock) => clock.elapsed().saturating_sub(self.loaded_at),
+            None => self.elapsed,
+        }
     }
 
-    /// Move the instance's virtual clock forward by `by` and call
-    /// `tick` once for every `runtime.tick_interval_ms` boundary
-    /// crossed, the way the daemon's supervisor would over that much
-    /// real time: the first tick lands one interval after load (the
-    /// supervisor's first lands one interval after `Running`), then one
-    /// per interval. A plugin without `tick_interval_ms` is never
-    /// ticked. Returns how many ticks ran.
+    /// Move time forward by `by` and call `tick` once for every
+    /// `runtime.tick_interval_ms` boundary crossed, the way the
+    /// daemon's supervisor would over that span: the first tick lands
+    /// one interval after load (the supervisor's first lands one
+    /// interval after `Running`), then one per interval. A plugin
+    /// without `tick_interval_ms` is never ticked. Returns how many
+    /// ticks ran.
     ///
     /// The schedule is the one the supervisor aims for; it doesn't
     /// model a host that falls behind (the supervisor then delays
-    /// rather than bursts missed ticks). The clock is the harness's
-    /// own: the guest's WASI clocks and the host's event timestamps
-    /// still read real time, so a plugin that measures time itself
-    /// doesn't see the jump. See the crate docs, "Time".
+    /// rather than bursts missed ticks).
+    ///
+    /// On a [`crate::TestHost::with_virtual_clock`] host this moves the
+    /// host's clock, so the plugin's WASI clocks and the host's
+    /// timestamps read each tick's time, and the host's other timers
+    /// (supervised ticks, `accepted`-command TTLs) fire in order with
+    /// these ticks, as [`crate::TestHost::advance`] fires them. On a
+    /// real-clock host the clock is the instance's own and only
+    /// schedules its ticks. See the crate docs, "Time".
     ///
     /// # Errors
     ///
     /// [`TestHostError::Call`] when a tick traps or times out. The
     /// clock then stays at that tick's boundary and the remaining
-    /// ticks don't run.
+    /// ticks don't run. [`TestHostError::ClockStalled`] as for
+    /// [`crate::TestHost::advance`].
     pub async fn advance(&mut self, by: Duration) -> Result<usize, TestHostError> {
-        let target = self.elapsed.saturating_add(by);
-        let mut ticks = 0;
-        if let Some(interval) = self
+        let interval = self
             .manifest()
             .runtime
             .tick_interval_ms
             .filter(|ms| *ms > 0)
-            .map(Duration::from_millis)
-        {
-            // Next boundary strictly after the current time; `None`
-            // once it would overflow `Duration`, i.e. never reached.
-            while let Some(next) = next_boundary(self.elapsed, interval)
-                && next <= target
-            {
-                self.elapsed = next;
-                self.tick().await?;
-                ticks += 1;
+            .map(Duration::from_millis);
+        let Some(clock) = self.engine.clock().as_virtual().cloned() else {
+            let target = self.elapsed.saturating_add(by);
+            let mut ticks = 0;
+            if let Some(interval) = interval {
+                // Next boundary strictly after the current time; `None`
+                // once it would overflow `Duration`, i.e. never reached.
+                while let Some(next) = next_boundary(self.elapsed, interval)
+                    && next <= target
+                {
+                    self.elapsed = next;
+                    self.tick().await?;
+                    ticks += 1;
+                }
             }
+            self.elapsed = target;
+            return Ok(ticks);
+        };
+        let target = clock.elapsed().saturating_add(by);
+        let mut ticks = 0;
+        while let Some(next) = interval
+            .and_then(|i| next_boundary(self.elapsed(), i))
+            .and_then(|since_load| self.loaded_at.checked_add(since_load))
+            && next <= target
+        {
+            // The host's timers due up to (and at) the tick go first.
+            crate::clock::run_timers_until(&clock, next).await?;
+            clock.advance_to(next);
+            crate::clock::settle(&clock).await?;
+            self.tick().await?;
+            ticks += 1;
         }
-        self.elapsed = target;
+        crate::clock::advance_to(&clock, target).await?;
         Ok(ticks)
     }
 
@@ -313,6 +388,8 @@ impl TestPluginInstance {
             state_dir: &self.state_dir,
             installation_uuid: self.installation_uuid(),
             instance_id: self.instance_id(),
+            secrets: &self.secrets,
+            commands: &self.commands,
         }
     }
 }

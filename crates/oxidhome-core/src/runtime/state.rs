@@ -266,22 +266,26 @@ pub struct LogRateBucket {
     capacity: f64,
     refill_per_sec: f64,
     last_refill: Instant,
+    /// The engine clock (see [`crate::clock`]).
+    clock: crate::clock::Clock,
 }
 
 impl LogRateBucket {
-    pub(crate) fn new() -> Self {
+    /// A full bucket that refills on `clock`.
+    pub(crate) fn on(clock: crate::clock::Clock) -> Self {
         Self {
             tokens: LOG_RATE_BURST,
             capacity: LOG_RATE_BURST,
             refill_per_sec: LOG_RATE_PER_SEC,
-            last_refill: Instant::now(),
+            last_refill: clock.std_instant(),
+            clock,
         }
     }
 
     /// Consume one token if available; return `false` when
     /// exhausted so the caller can drop the log call.
     pub(crate) fn consume(&mut self) -> bool {
-        let now = Instant::now();
+        let now = self.clock.std_instant();
         let elapsed = now
             .saturating_duration_since(self.last_refill)
             .as_secs_f64();
@@ -475,6 +479,9 @@ pub struct PluginState {
     /// [`Self::network`] (streaming worlds only).
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
     http_hooks: super::network::HttpHooks,
+    /// The engine clock: event receive times and the projection's
+    /// `received_ms` (see [`crate::clock`]).
+    pub(crate) clock: crate::clock::Clock,
 }
 
 impl PluginState {
@@ -499,8 +506,12 @@ impl PluginState {
         instances: Arc<InstanceRegistry>,
     ) -> Self {
         let instance_id: InstanceId = instance_id.into();
-        let log_rate = Arc::new(std::sync::Mutex::new(LogRateBucket::new()));
-        let wasi = build_wasi(&instance_id, &manifest, &config, &log_rate, None);
+        // The guest's `wasi:clocks` and the log bucket read the engine
+        // clock, reached through the device-state store the engine
+        // built on it (a no-op on the system clock).
+        let clock = device_state.clock().clone();
+        let log_rate = Arc::new(std::sync::Mutex::new(LogRateBucket::on(clock.clone())));
+        let wasi = build_wasi(&instance_id, &manifest, &config, &log_rate, &clock, None);
         // C5: `PluginState::new` doesn't know about
         // `InstalledPluginRegistry` (it's the low-level
         // constructor used by tests + the loader). Default the
@@ -534,6 +545,7 @@ impl PluginState {
             instance_id.as_str(),
             &[],
             None,
+            clock.clone(),
         ));
         Self {
             instance_id,
@@ -563,6 +575,7 @@ impl PluginState {
             http_hooks: super::network::HttpHooks::new(Arc::clone(&network)),
             network,
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            clock,
         }
     }
 
@@ -577,12 +590,14 @@ impl PluginState {
             self.instance_id.as_str(),
             &self.granted_capabilities.network,
             self.audit_log.clone(),
+            self.clock.clone(),
         ));
         self.wasi = build_wasi(
             &self.instance_id,
             &self.manifest,
             &self.config,
             &self.log_rate,
+            &self.clock,
             Some(&policy),
         );
         self.http_hooks = super::network::HttpHooks::new(Arc::clone(&policy));
@@ -648,6 +663,7 @@ fn build_wasi(
     manifest: &PluginManifest,
     config: &InstanceConfig,
     log_rate: &Arc<std::sync::Mutex<LogRateBucket>>,
+    clock: &crate::clock::Clock,
     network: Option<&Arc<super::network::NetworkPolicy>>,
 ) -> WasiCtx {
     let (stdout, stderr) = super::plugin_stdio::PluginOutput::pair(
@@ -658,6 +674,9 @@ fn build_wasi(
     );
     let mut wasi = WasiCtxBuilder::new();
     wasi.stdout(stdout).stderr(stderr);
+    // Virtual guest clocks apply to every world, the streaming one
+    // included (see `crate::clock`).
+    clock.configure_wasi(&mut wasi);
     if let Some(policy) = network {
         wasi.allow_tcp(true)
             .allow_udp(true)
@@ -1083,7 +1102,7 @@ impl host_devices::Host for PluginState {
             id, would_be_id,
             "stable_device_id must match try_register's derivation"
         );
-        let received_ms = crate::state::event_log::now_unix_ms();
+        let received_ms = self.clock.now_unix_ms();
         // H9 round-10 finding 1: atomically flip every pre-existing
         // `Fresh` entry for this stable device-id to `Stale`, then
         // seed the current registration's `initial_state`. Handles
@@ -1644,7 +1663,7 @@ impl host_events::Host for PluginState {
         let mirrored = self
             .event_log
             .mirror(
-                crate::state::event_log::now_unix_ms(),
+                self.clock.now_unix_ms(),
                 ev.clone(),
                 self.instance_id.clone(),
                 self.manifest.plugin.id.clone(),
@@ -1679,7 +1698,7 @@ impl host_events::Host for PluginState {
             crate::host_impl::plugin::oxidhome::plugin::events::EventPayload::StateChanged(sc),
         ) = (ev.device.clone(), &ev.payload)
         {
-            let received = crate::state::event_log::now_unix_ms();
+            let received = self.clock.now_unix_ms();
             if super::schema::needs_snapshot_state(&sc.capability) {
                 // Rechecked under the store lock: the slot may have
                 // gone stale since the check above.
@@ -4020,6 +4039,16 @@ mod tests {
             refusal.is_err(),
             "aggregate limiter must refuse; got {refusal:?}",
         );
+    }
+
+    #[test]
+    fn log_bucket_refills_on_the_virtual_clock() {
+        let v = crate::clock::VirtualClock::new();
+        let mut bucket = LogRateBucket::on(v.clone().into());
+        while bucket.consume() {}
+        assert!(!bucket.consume(), "frozen time refills nothing");
+        v.advance(std::time::Duration::from_secs(1));
+        assert!(bucket.consume());
     }
 
     /// C4 review P1 F2: `logging::log` refuses calls past the

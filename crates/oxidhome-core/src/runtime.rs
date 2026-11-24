@@ -47,6 +47,7 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use wasmtime::{Config, Engine as WasmtimeEngine};
 
+use crate::clock::Clock;
 use crate::state::{
     AuditLog, BlobStore, Db, DeviceRegistry, DeviceStateStore, EventBus, EventLog,
     InstalledPluginRegistry, KvStore, LogStore, ServiceRegistry,
@@ -176,6 +177,10 @@ pub struct Engine {
     /// Components compiled so far. A test hook: a restart or a sandbox
     /// reuses its supervisor's compiled component and doesn't count.
     component_compiles: Arc<std::sync::atomic::AtomicU64>,
+    /// The time source every plugin-facing time decision reads (see
+    /// [`crate::clock`]). [`Clock::system`] unless the engine was built
+    /// with [`Self::with_state_dir_and_clock`].
+    clock: Clock,
 }
 
 /// Round-7 F1: error returned by
@@ -303,6 +308,18 @@ impl Engine {
         )
     }
 
+    /// [`Self::with_state_dir`] on `clock` instead of the system
+    /// clock — the test seam `oxidhome-test-host` runs a
+    /// [`crate::VirtualClock`] through. See [`crate::clock`] for what
+    /// the clock drives.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::with_state_dir`].
+    pub fn with_state_dir_and_clock(state_dir: &Path, clock: Clock) -> anyhow::Result<Self> {
+        Self::open_state_dir(state_dir, clock)
+    }
+
     /// Build the engine with a file-backed `SQLite` database at
     /// `<state_dir>/oxidhome.db`. WAL mode + `synchronous = NORMAL`
     /// are applied by [`Db::open_file`]. Creates `state_dir` if it
@@ -313,6 +330,10 @@ impl Engine {
     /// Forwards Wasmtime engine-construction failures and `SQLite`
     /// open / migration errors.
     pub fn with_state_dir(state_dir: &Path) -> anyhow::Result<Self> {
+        Self::open_state_dir(state_dir, Clock::system())
+    }
+
+    fn open_state_dir(state_dir: &Path, clock: Clock) -> anyhow::Result<Self> {
         let blobs_root = state_dir.join("blobs");
         let plugins_root = state_dir.join("plugins");
         // C1b: the installed-plugin registry needs `Db` access to
@@ -349,7 +370,7 @@ impl Engine {
         }
         let installed = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db))
             .with_context(|| format!("scanning installed plugins under {}", state_dir.display()))?;
-        Self::with_db_arc(db, Some(blobs_root), installed)
+        Self::with_db_arc(db, Some(blobs_root), installed, clock)
     }
 
     fn with_db(
@@ -357,13 +378,14 @@ impl Engine {
         blobs_root: Option<PathBuf>,
         installed_plugins: InstalledPluginRegistry,
     ) -> anyhow::Result<Self> {
-        Self::with_db_arc(Arc::new(db), blobs_root, installed_plugins)
+        Self::with_db_arc(Arc::new(db), blobs_root, installed_plugins, Clock::system())
     }
 
     fn with_db_arc(
         db: Arc<Db>,
         blobs_root: Option<PathBuf>,
         installed_plugins: InstalledPluginRegistry,
+        clock: Clock,
     ) -> anyhow::Result<Self> {
         let mut cfg = Config::new();
         cfg.wasm_component_model(true);
@@ -374,7 +396,8 @@ impl Engine {
         // Phase 7a turns on `epoch_interruption` purely as a liveness
         // watchdog: it lets the host trap a wasm call that never
         // returns so the supervisor can always reclaim a wedged
-        // instance. The `EpochTicker` below drives the epoch counter.
+        // instance. The clock drives the epoch counter: the
+        // `EpochTicker` thread on the system clock.
         // We deliberately don't enable `consume_fuel` — OxidHome
         // doesn't cap plugin resource usage (see `watchdog` docs).
         cfg.epoch_interruption(true);
@@ -383,10 +406,10 @@ impl Engine {
                 .map_err(anyhow::Error::from)
                 .context("constructing wasmtime engine")?,
         );
-        watchdog::EpochTicker::spawn(&inner);
-        let audit_log = Arc::new(AuditLog::new(Arc::clone(&db)));
+        clock.drive_epoch(&inner);
+        let audit_log = Arc::new(AuditLog::new(Arc::clone(&db)).with_clock(clock.clone()));
         let event_log = Arc::new(EventLog::new(Arc::clone(&db)));
-        let events = Arc::new(EventBus::new());
+        let events = Arc::new(EventBus::new().with_clock(clock.clone()));
         // H4: rows from earlier runs were never fanned out by this
         // bus; cursor tails replay them from history. A failed read
         // only costs that replay (cursor tails then fill those rows in
@@ -403,7 +426,7 @@ impl Engine {
         }
         // H2: restore the durable projection before any plugin runs,
         // so reads are correct before owners republish.
-        let device_state = DeviceStateStore::open_persistent(Arc::clone(&db))
+        let device_state = DeviceStateStore::open_persistent_with_clock(Arc::clone(&db), &clock)
             .context("restoring the device-state projection")?;
         // H5: resolve the `accepted` commands a previous process left
         // pending, before any plugin runs.
@@ -421,7 +444,8 @@ impl Engine {
         }
         let pending_commands = Arc::new(
             PendingCommands::new(Some(Arc::clone(&audit_log)))
-                .context("starting the command journal")?,
+                .context("starting the command journal")?
+                .with_clock(clock.clone()),
         );
         // H6 slice 2: the durable device-category floor and operator
         // overrides, before any plugin registers a device.
@@ -458,7 +482,14 @@ impl Engine {
             started_at: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             component_compiles: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            clock,
         })
+    }
+
+    /// The engine's time source (see [`crate::clock`]).
+    #[must_use]
+    pub fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// How many times this engine has compiled a plugin component.
