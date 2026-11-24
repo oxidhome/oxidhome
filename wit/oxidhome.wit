@@ -1294,9 +1294,23 @@ interface host-services {
   /// plugin-local code; scripting plugins run each script in its own
   /// sandbox (`host-sandboxes`), so scripts call each other here.
   ///
-  /// If the callee traps after the call reached it, the result is
-  /// `command-result::unknown` (it may have acted); a call that never
-  /// reached it is `unavailable`.
+  /// **Queued vs started.** The call waits in the callee instance's
+  /// queue until that instance is free, and is then started. The
+  /// outcome of a call that doesn't finish normally depends on which
+  /// side of that line it ended on:
+  ///
+  /// - **Still queued.** If the timeout passes before the callee
+  ///   started the call, or the callee refuses it (stopped, or
+  ///   restarting), the call did not run and never will: the result
+  ///   is `err(unavailable)`, and retrying is safe. A call still queued
+  ///   when the callee restarts may instead run in its next life.
+  /// - **Started.** If the callee traps, is stopped, or the timeout
+  ///   passes after it started the call, the result is
+  ///   `ok(command-result::unknown)`: the callee may have acted, so
+  ///   read its state before retrying. A reply the callee produces
+  ///   after the caller stopped waiting is not returned; for an
+  ///   invocation that started outside the host (API, MCP), it is
+  ///   recorded in the host's audit trail.
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
   /// (no matching entry in the caller's `consumes_services`
@@ -1305,7 +1319,7 @@ interface host-services {
   /// declare, or `args` that violate its `params` schema);
   /// `internal` (the callee's `ok-with-state` reply violates the
   /// command's `returns` schema); `unavailable` (owner not
-  /// running, or the call timed out).
+  /// running, or the call ended before the callee started it).
   call-service: func(
     target: service-id,
     command: string,
@@ -1355,15 +1369,18 @@ interface host-sandboxes {
   /// over 64 KiB, the resulting instance id too long, or a live
   /// `local-id` with different source); `unavailable` (the instance's
   /// sandbox limit is reached, a previous sandbox with this `local-id`
-  /// is still stopping, the host is shutting down, or this instance
-  /// isn't supervised).
+  /// is still stopping or its storage is still being purged, the host
+  /// is shutting down, or this instance isn't supervised).
   start-sandbox: func(local-id: string, source: string) -> result<string, error>;
 
-  /// Stop a sandbox this instance started. It leaves the list at once
-  /// and stops in the background; until it has stopped it still counts
-  /// against `script_sandboxes`. Errors: `not-found`;
-  /// `permission-denied` inside a sandbox; `unavailable` in an instance
-  /// the host doesn't supervise.
+  /// Stop a sandbox this instance started and remove it: its storage
+  /// is purged. It leaves the list at once and stops in the
+  /// background; until its storage is purged it still counts against
+  /// `script_sandboxes` and its `local-id` can't be started again.
+  /// Errors: `not-found`; `permission-denied` inside a sandbox;
+  /// `unavailable` in an instance the host doesn't supervise;
+  /// `internal` if the removal couldn't be recorded (the sandbox still
+  /// stops).
   stop-sandbox: func(local-id: string) -> result<_, error>;
 
   /// The sandboxes this instance started that are still live.

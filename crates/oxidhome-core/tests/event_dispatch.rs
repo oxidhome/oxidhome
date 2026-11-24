@@ -143,3 +143,53 @@ async fn drain_events_dispatches_to_plugin_on_event() {
     switch.shutdown().await.expect("switch shutdown");
     recorder.shutdown().await.expect("recorder shutdown");
 }
+
+/// A stop requested while a drain is delivering stops it before the
+/// next `on-event`, not only before the next drain.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_ends_a_drain_between_deliveries() {
+    let _switch_wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
+    let _recorder_wasm = support::build_example("event-recorder", "event_recorder.wasm");
+    let examples = support::workspace_root().join("examples");
+    let engine = Engine::new().expect("engine");
+    let mut switch = PluginInstance::load(&engine, &examples.join("simulated-switch"), "switch")
+        .await
+        .expect("load simulated-switch");
+    let mut recorder = PluginInstance::load(&engine, &examples.join("event-recorder"), "recorder")
+        .await
+        .expect("load event-recorder");
+    recorder.init().await.expect("recorder init");
+    switch.init().await.expect("switch init");
+    let device_id = engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|m| m.owner_instance == switch.instance_id())
+        .expect("switch registered a device")
+        .id
+        .clone();
+    for _ in 0..3 {
+        switch
+            .execute_command(
+                device_id.clone(),
+                WitCommand {
+                    id: String::new(),
+                    capability: "switch".into(),
+                    action: "toggle".into(),
+                    args: Vec::new(),
+                },
+            )
+            .await
+            .expect("execute toggle");
+    }
+    // The stop arrives during the first delivery.
+    let checks = std::cell::Cell::new(0);
+    let delivered = recorder
+        .drain_events_until(|| {
+            checks.set(checks.get() + 1);
+            checks.get() > 1
+        })
+        .await
+        .expect("drain recorder");
+    assert_eq!(delivered, 1, "the drain went on after the stop");
+}

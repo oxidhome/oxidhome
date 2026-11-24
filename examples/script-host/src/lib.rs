@@ -309,6 +309,11 @@ impl ScriptHost {
                     // operator, or this manager isn't supervised):
                     // forgetting the saved script was enough.
                     Err(Error::NotFound(_) | Error::Unavailable(_)) if saved => CommandResult::Ok,
+                    // The script is forgotten and stopping, but its
+                    // removal wasn't confirmed: not a refusal.
+                    Err(Error::Internal(why)) => CommandResult::Unknown(format!(
+                        "the script is stopping, but its removal is unconfirmed: {why}"
+                    )),
                     Err(e) => CommandResult::Err(e),
                 }
             }

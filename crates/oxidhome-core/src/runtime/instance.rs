@@ -994,7 +994,8 @@ impl PluginInstance {
         )
         .with_granted_capabilities(granted_capabilities)
         .with_audit_log(engine.audit_log())
-        .with_pending_commands(engine.pending_commands());
+        .with_pending_commands(engine.pending_commands())
+        .with_storage_ops(engine.storage_ops());
         // Phase 8: streaming worlds get sockets, checked against the
         // effective `network` rules set just above.
         let state = if super::network::is_streaming(manifest_world) {
@@ -1377,6 +1378,14 @@ impl PluginInstance {
     /// drive delivery; the polling shape is a stepping stone, not
     /// the final scheduler.
     pub async fn drain_events(&mut self) -> anyhow::Result<usize> {
+        self.drain_events_until(|| false).await
+    }
+
+    /// [`Self::drain_events`], stopping before the next delivery once
+    /// `stop()` says so (a supervisor asked to stop doesn't enter
+    /// `on-event` again). Events not delivered are dropped with the
+    /// instance.
+    pub async fn drain_events_until(&mut self, stop: impl Fn() -> bool) -> anyhow::Result<usize> {
         // Two-phase to dodge the conflicting borrow: collecting from
         // `subscriptions` mutably borrows `self.store.data_mut()`,
         // but `call_on_event` needs `&mut self.store` exclusively.
@@ -1390,6 +1399,9 @@ impl PluginInstance {
         // these strings don't change for the lifetime of the instance.
         let mut delivered = 0;
         for ev in pending {
+            if stop() {
+                break;
+            }
             let data = self.store.data();
             let span = info_span!(
                 "plugin.on_event",
