@@ -243,7 +243,8 @@ block_on(counter.tick()).unwrap();
 ## Limits
 
 - Time: even on a virtual clock, a guest's WASI sleep takes real time,
-  as do request and `call-service` deadlines, a streaming plugin's DNS,
+  as do request and `call-service` deadlines, the event-history read
+  deadline, a streaming plugin's DNS,
   connect and HTTP timeouts, restart backoff, shutdown grace periods,
   and KV and blob write times. On a real-clock host,
   `advance` only schedules a directly driven plugin's ticks.
@@ -252,8 +253,9 @@ block_on(counter.tick()).unwrap();
 - The direct path uses the production 30 s watchdog; lower it through
   `LoadOptions::supervision` on a supervised instance, or move a
   virtual clock past it.
-- No streaming or AI mocks yet: the `streaming-plugin` and AI worlds
-  aren't built.
+- No network or AI mocks yet: a `streaming-plugin` plugin's sockets
+  and HTTP reach the real network, through its policy, and the AI world
+  isn't built.
 
 The crate's own tests (`tests/examples.rs`) exercise every plugin under
 `examples/` and are a good source of patterns.

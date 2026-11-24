@@ -29,7 +29,7 @@
 //! Not on the clock: KV and blob write times, log-store and
 //! command-journal row times (with the journal's `COMMAND` audit
 //! rows), request and call-service deadlines (H6 invocation
-//! deadlines), restart backoff, shutdown grace periods, retention
+//! deadlines), the event-history read deadline, restart backoff, shutdown grace periods, retention
 //! cutoffs, the API and MCP surfaces' relative time filters, and the
 //! network I/O deadlines of streaming worlds (DNS lookup, TCP connect,
 //! HTTP first-byte and between-bytes timeouts), which bound real
@@ -112,9 +112,11 @@ impl Clock {
         }
     }
 
-    /// [`Self::instant`] as a `std` instant, for host code that keeps
-    /// `std::time::Instant`s: `std::time::Instant::now()` on the system
-    /// clock (as before the seam), the virtual instant on a virtual one.
+    /// The current instant for host code that keeps
+    /// `std::time::Instant`s: the OS monotonic clock
+    /// (`std::time::Instant::now()`, as before the seam, unaffected by
+    /// paused Tokio time) on the system clock, and [`Self::instant`]
+    /// converted on a virtual one.
     #[must_use]
     pub(crate) fn std_instant(&self) -> std::time::Instant {
         match &self.source {
