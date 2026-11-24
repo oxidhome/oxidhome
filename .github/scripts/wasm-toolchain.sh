@@ -18,6 +18,11 @@
 # line. With no in-sync pair nothing is bumped: a lone wasmtime or
 # wit-bindgen bump would put a second wasm-tools copy in the build.
 #
+# Quarantine: only releases published at least QUARANTINE_DAYS (default
+# 7) days ago count, for every crate involved; yanked releases never
+# do. The publish time is the index's `pubtime`, crates.io's
+# `created_at` for the version. A pin never moves backwards.
+#
 # Versions come from the crates.io sparse index (CRATES_INDEX
 # overrides it, e.g. a file:// fixture directory). `apply` writes the
 # PR title / body and `changed` to $GITHUB_OUTPUT when it is set, and
@@ -28,6 +33,10 @@ set -euo pipefail
 shopt -s inherit_errexit
 
 INDEX="${CRATES_INDEX:-https://index.crates.io}"
+QUARANTINE_DAYS="${QUARANTINE_DAYS:-7}"
+[[ $QUARANTINE_DAYS =~ ^[0-9]+$ ]] || { echo "error: QUARANTINE_DAYS must be a whole number of days" >&2; exit 1; }
+# Releases published after this instant are still in quarantine.
+CUTOFF="$(jq -nr --argjson d "$QUARANTINE_DAYS" 'now - $d * 86400 | floor | todate')"
 ROOT="$(git rev-parse --show-toplevel)"
 MANIFEST="$ROOT/Cargo.toml"
 CACHE="$(mktemp -d)"
@@ -53,14 +62,16 @@ index_path() {
   esac
 }
 
-# The crate's stable, non-yanked releases as a JSON array of
-# {vers, deps}, newest first. Cached per run.
+# The crate's stable, non-yanked releases published by $CUTOFF as a
+# JSON array of {vers, deps}, newest first. Cached per run.
 releases() {
   local file="$CACHE/$1.json"
   if [[ ! -s $file ]]; then
     curl -fsSL --retry 3 -A 'oxidhome-wasm-toolchain-bump' \
       "$INDEX/$(index_path "$1")" |
-      jq -s '[.[] | select((.yanked | not) and (.vers | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")))
+      jq -s --arg cutoff "$CUTOFF" '[.[] | select((.yanked | not)
+                     and (.vers | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                     and .pubtime != null and .pubtime <= $cutoff)
               | {vers, deps: [.deps[] | select(.kind != "dev")
                               | {name: (.package // .name), req}]}]
              | sort_by(.vers | split(".") | map(tonumber)) | reverse' >"$file" ||
@@ -131,13 +142,16 @@ bindgen_line() {
   fi
 }
 
-# Prints the plan as "status <current|bump|none>", "line <0.N>", then
-# one "pin <crate> <old> <new>" per pinned crate.
+# Prints the plan as "quarantine <days> <cutoff>", "status
+# <current|bump|none>", "line <0.N>", then one "pin <crate> <old> <new>"
+# per pinned crate.
 plan() {
   local cur_wt cur_wb wts wbs wt wb bl line="" target_wt="" target_wb="" c old new
   cur_wt="$(current_pin wasmtime)"
   cur_wb="$(current_pin wit-bindgen)"
   [[ -n $cur_wt && -n $cur_wb ]] || die "no exact wasmtime / wit-bindgen pin in $MANIFEST"
+  echo "quarantine $QUARANTINE_DAYS $CUTOFF"
+  log "quarantine: $QUARANTINE_DAYS days, only releases published by $CUTOFF"
 
   # Fetch up front so a failed download stops the run here instead of
   # reading as "no release" inside a substitution below.
@@ -146,6 +160,7 @@ plan() {
   done
   wts="$(versions_from wasmtime "$cur_wt")"
   wbs="$(versions_from wit-bindgen "$cur_wb")"
+  [[ -n $wts ]] || log "no wasmtime >= $cur_wt out of quarantine"
 
   for wt in $wts; do
     line="$(wasmtime_line "$wt")"
@@ -164,7 +179,7 @@ plan() {
       target_wt="$wt"
       break
     fi
-    log "wasmtime $wt (wasm-tools $line): no wit-bindgen >= $cur_wb on that line"
+    log "wasmtime $wt (wasm-tools $line): no wit-bindgen >= $cur_wb out of quarantine on that line"
   done
 
   if [[ -z $target_wt ]]; then
@@ -185,7 +200,11 @@ plan() {
       new="$target_wb"
     else
       new="$(newest_on_line "$c" "$line")"
-      [[ -n $new ]] || die "$c has no release on wasm-tools $line"
+      [[ -n $new ]] || die "$c has no release out of quarantine on wasm-tools $line"
+      # A pin newer than anything out of quarantine stays put.
+      if jq -en --arg a "$old" --arg b "$new" "$JQ_LIB"'($a | nums) > ($b | nums)' >/dev/null; then
+        new="$old"
+      fi
     fi
     [[ $old != "$new" ]] && changed=1
     out+="pin $c $old $new"$'\n'
@@ -196,7 +215,7 @@ plan() {
 }
 
 apply() {
-  local p status line c old new wt="" wb="" table=""
+  local p status line days c old new wt="" wb="" table=""
   p="$(plan)"
   printf '%s\n' "$p"
   status="$(awk '$1 == "status" { print $2 }' <<<"$p")"
@@ -206,6 +225,7 @@ apply() {
     return 0
   fi
   line="$(awk '$1 == "line" { print $2 }' <<<"$p")"
+  days="$(awk '$1 == "quarantine" { print $2 }' <<<"$p")"
 
   while read -r _ c old new; do
     [[ $c == wasmtime ]] && wt="$new"
@@ -227,7 +247,7 @@ apply() {
   local title="build(deps): bump wasm toolchain to wasmtime $wt, wit-bindgen $wb"
   local body_file="${PR_BODY_FILE:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/wasm-toolchain-pr.md}"
   cat >"$body_file" <<EOF
-Bumps the exact-pinned wasm toolchain together onto wasm-tools $line, the line wasmtime $wt is built on. wit-bindgen moves to its newest release on the same line, so the host and the guest bindings share one wasm-tools version.
+Bumps the exact-pinned wasm toolchain together onto wasm-tools $line, the line wasmtime $wt is built on. wit-bindgen moves to its newest release on the same line, so the host and the guest bindings share one wasm-tools version. Only releases published at least $days days ago were considered.
 
 | crate | from | to |
 | --- | --- | --- |

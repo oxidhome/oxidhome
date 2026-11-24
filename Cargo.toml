@@ -51,7 +51,8 @@ oxidhome-wit = { path = "crates/oxidhome-wit", default-features = false }
 # `.github/workflows/wasm-toolchain.yaml` bumps it as one unit in its own
 # PR (Dependabot ignores it): to the newest wasmtime for which a
 # `wit-bindgen` release on the same wasm-tools line exists, with the
-# wasm-tools pins on that line's newest release.
+# wasm-tools pins on that line's newest release, counting only releases
+# at least 7 days old.
 #
 # Phase 2 wires `wasmtime-wasi`'s p2 (clocks, io, cli, random, …) so
 # libstd-pulled WASI imports resolve; Phase 8 adds its sockets and

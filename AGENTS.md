@@ -46,8 +46,8 @@ over `mod.rs`. Public structs and enums use `UpperCamelCase`.
 
 Keep exact-pinned dependency bumps isolated for crates that affect generated bindings or runtime embedding. The wasm
 toolchain (`wasmtime*`, `wit-bindgen`, `wit-parser`, `wit-component`) moves only as one unit onto a single wasm-tools
-release: `.github/workflows/wasm-toolchain.yaml` opens that PR weekly (`.github/scripts/wasm-toolchain.sh plan` is its
-dry run), and Dependabot ignores these crates.
+release, using only releases at least 7 days old: `.github/workflows/wasm-toolchain.yaml` opens that PR weekly
+(`.github/scripts/wasm-toolchain.sh plan` is its dry run), and Dependabot ignores these crates.
 
 ## Testing Guidelines
 

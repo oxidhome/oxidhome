@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: "0 5 * * 1"   # Mondays 05:00 UTC
   workflow_dispatch:
+    inputs:
+      quarantine-days:
+        description: "Only consider releases published at least this many days ago"
+        required: false
+        default: "7"
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,6 +31,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
       - name: Bump pins and lockfiles
         id: bump
+        env:
+          # Empty on the schedule: the script's default (7) applies.
+          QUARANTINE_DAYS: ${{ inputs.quarantine-days }}
         run: .github/scripts/wasm-toolchain.sh apply
       # A rerun regenerates the branch from main, which would drop any
       # baseline or binding fixes pushed to the open PR for the same bump
