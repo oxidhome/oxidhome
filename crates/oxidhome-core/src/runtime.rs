@@ -845,7 +845,13 @@ impl Engine {
         // for tombstoned uuids). The reverse — tombstone-then-
         // purge — would strand blob bytes silently on any purge
         // failure (the pre-fix behaviour).
-        self.installed_plugins.uninstall(plugin_id)?;
+        if let Err(err) = self.installed_plugins.uninstall(plugin_id) {
+            // Still installed: its instances may pin again.
+            if let Some(uuid) = &installation_uuid {
+                self.tls.pins().unretire(uuid);
+            }
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -860,10 +866,24 @@ impl Engine {
         plugin_id: &str,
         uuid: &str,
     ) -> Result<(), crate::state::UninstallError> {
+        let pins = self.tls.pins();
+        pins.retire(uuid);
+        let result = self.purge_retired_tls_pins(plugin_id, uuid);
+        if result.is_err() {
+            // Still installed: its instances may pin again.
+            pins.unretire(uuid);
+        }
+        result
+    }
+
+    fn purge_retired_tls_pins(
+        &self,
+        plugin_id: &str,
+        uuid: &str,
+    ) -> Result<(), crate::state::UninstallError> {
         use crate::auth::invocation;
         let io = |what: String| crate::state::UninstallError::Io(std::io::Error::other(what));
         let pins = self.tls.pins();
-        pins.retire(uuid);
         let doomed = pins.list_installation(uuid);
         if doomed.is_empty() {
             return Ok(());
@@ -917,11 +937,22 @@ impl Engine {
             removed = removed.len(),
             "uninstall removed the plugin's TLS certificate pins",
         );
-        for id in intents {
-            if let Err(err) = self
-                .audit_log
-                .finalize(id, 200, "allow", Some("network"), None, None)
-            {
+        for (pin, id) in doomed.iter().zip(intents) {
+            // A pin an operator reset in between was not this purge's.
+            let finalized = if removed.contains(pin) {
+                self.audit_log
+                    .finalize(id, 200, "allow", Some("network"), None, None)
+            } else {
+                self.audit_log.finalize(
+                    id,
+                    404,
+                    "allow",
+                    Some("network"),
+                    None,
+                    Some("already removed by a reset"),
+                )
+            };
+            if let Err(err) = finalized {
                 tracing::error!(target: "host.audit", error = %err, "finalizing a TLS pin purge row failed");
             }
         }

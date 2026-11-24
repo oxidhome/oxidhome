@@ -333,9 +333,13 @@ impl TlsPinStore {
         }
         {
             let pins = self.pins.read().unwrap_or_else(PoisonError::into_inner);
+            // Per instance of this installation: another installation
+            // that once used the instance id doesn't spend its room.
             let owned = pins
                 .keys()
-                .filter(|s| s.key.instance_id == key.instance_id)
+                .filter(|s| {
+                    s.key.instance_id == key.instance_id && s.installation_uuid == installation_uuid
+                })
                 .count();
             if pins.len() >= MAX_PINS_TOTAL || owned >= MAX_PINS_PER_INSTANCE {
                 return Ok(PinCheck::Full);
@@ -437,6 +441,16 @@ impl TlsPinStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(installation_uuid.to_owned());
+    }
+
+    /// Undo [`Self::retire`]: the uninstall that retired the installation
+    /// failed, so it pins again.
+    pub fn unretire(&self, installation_uuid: &str) {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.retired
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(installation_uuid);
     }
 
     /// [`Self::retire`] the installation `installation_uuid` and remove
@@ -664,6 +678,13 @@ mod tests {
         assert_eq!(
             store
                 .check_or_pin(&key("b", "h", 0), "inst-1", fp(1))
+                .unwrap(),
+            PinCheck::Pinned
+        );
+        // Another installation reusing the instance id has its own room.
+        assert_eq!(
+            store
+                .check_or_pin(&key("a", "h", 9999), "inst-2", fp(1))
                 .unwrap(),
             PinCheck::Pinned
         );

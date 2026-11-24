@@ -194,11 +194,13 @@ struct Verifier {
 }
 
 impl Verifier {
-    /// Verify the chain as if the certificates the server presented
-    /// were trusted roots: everything but the issuer is checked (the
-    /// name, validity dates, key usage, the issuing signature). A
-    /// self-signed leaf anchors itself; a leaf from an unknown CA
-    /// verifies when the server also presents that CA.
+    /// Verify the chain as if the server's own certificates were roots:
+    /// everything but the issuer is checked (the name, validity dates,
+    /// key usage, signatures). Only the leaf (a self-signed device) and
+    /// the top of the presented chain (an unknown CA the server sends)
+    /// anchor; intermediates between them are checked like any others,
+    /// dates included. (An anchor's own dates are not checked, as for
+    /// any `WebPKI` root.)
     fn verify_trusting_presented(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -208,7 +210,7 @@ impl Verifier {
         now: UnixTime,
     ) -> Result<(), rustls::Error> {
         let mut presented = RootCertStore::empty();
-        for cert in std::iter::once(end_entity).chain(intermediates) {
+        for cert in std::iter::once(end_entity).chain(intermediates.last()) {
             // A certificate that can't anchor just isn't one.
             let _ = presented.add(cert.clone().into_owned());
         }
