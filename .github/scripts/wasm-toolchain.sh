@@ -60,13 +60,14 @@ CACHE="$(mktemp -d)"
 # succeeds puts them back, so a rerun starts from the same state.
 RESTORE=""
 cleanup() {
-  local f files failed=""
+  local f list="$CACHE/restore.list" failed="" n=0
   if [[ -n $RESTORE ]]; then
-    files="$(cd "$RESTORE" && find . -type f)" || failed=1
-    for f in $files; do
+    (cd "$RESTORE" && find . -type f -print0) >"$list" || failed=1
+    while IFS= read -r -d '' f; do
       cp "$RESTORE/$f" "$ROOT/$f" || failed=1
-    done
-    if [[ -n $failed || -z $files ]]; then
+      n=$((n + 1))
+    done <"$list"
+    if [[ -n $failed || $n -eq 0 ]]; then
       echo "error: could not restore every file; the originals are in $RESTORE" >&2
       exit 1
     fi
@@ -204,6 +205,17 @@ versions_from() {
 # Releases of crate $1 on line $2, newest first.
 versions_on_line() {
   releases "$1" | jq -r --arg l "$2" "$JQ_LIB"'.[] | select(.vers | line == $l) | .vers'
+}
+
+# Like dep_line, for any published release of crate $1 (yanked or still
+# in quarantine too): for versions a lockfile already holds.
+locked_dep_line() {
+  local entries
+  entries="$(index_entries "$1")"
+  jq -r --arg v "$2" --arg d "$3" "$JQ_LIB"'
+    [.[] | select(.vers == $v) | .deps[] | select(.kind != "dev")
+     | select((.package // .name) == $d) | .req | line]
+    | unique | if length > 1 then error("several lines") else (.[0] // "") end' <<<"$entries"
 }
 
 # The line of crate $1 @ $2's requirement on $3 (empty if no such dep).
@@ -457,10 +469,10 @@ guest_lines() {
     vs="$(awk -v n="$c" -v l="$minor" '$1 == n && index($2, l) == 1 { print $2 }' <<<"$pkgs")"
     for v in $vs; do
       if [[ $c == wit-bindgen-core ]]; then
-        out+="$(dep_line "$c" "$v" wit-parser)"$'\n'
+        out+="$(locked_dep_line "$c" "$v" wit-parser)"$'\n'
       else
-        out+="$(dep_line "$c" "$v" wit-component)"$'\n'
-        out+="$(dep_line "$c" "$v" wasm-metadata)"$'\n'
+        out+="$(locked_dep_line "$c" "$v" wit-component)"$'\n'
+        out+="$(locked_dep_line "$c" "$v" wasm-metadata)"$'\n'
       fi
     done
   done
@@ -481,7 +493,7 @@ update_lockfiles() {
 apply() {
   ((10#$QUARANTINE_DAYS >= MIN_QUARANTINE_DAYS)) ||
     die "apply needs QUARANTINE_DAYS >= $MIN_QUARANTINE_DAYS (plan takes any value)"
-  local p status line days c old new wt="" wb="" table="" before after added pkg ver id
+  local p status line days c old new wt="" wb="" table="" before after added pkg ver id found
   command -v osv-scanner >/dev/null || die "osv-scanner is not on PATH"
   p="$(plan)"
   printf '%s\n' "$p"
@@ -528,6 +540,16 @@ apply() {
     [[ -z $n ]] && continue
     eligible "$n" "$v" || fresh+="$f $n $v"$'\n'
   done <<<"$moved"
+  # OSV directly for every package version the update adds or moves, so
+  # an incomplete scanner run can't hide one.
+  local direct="" pvs
+  pvs="$(awk 'NF == 3 { print $2, $3 }' <<<"$moved" | sort -u)"
+  while read -r n v; do
+    [[ -n $n ]] || continue
+    found="$(advisories_of "$v" "$n")"
+    [[ -n $found ]] && direct+="$found"$'\n'
+  done <<<"$pvs"
+
   # Every lockfile's wit-bindgen helpers must sit on the planned line.
   local skew="" gl
   for lock in "$ROOT"/Cargo.lock "$ROOT"/examples/*/Cargo.lock; do
@@ -558,7 +580,13 @@ apply() {
       [[ -n $f ]] && echo "::warning title=wasm-tools line skew::$f"
     done <<<"$skew"
   fi
-  if [[ -n $fresh || -n $added || -n $skew ]]; then
+  if [[ -n $direct ]]; then
+    log "the bump adds package versions with OSV advisories; no PR:"
+    while read -r f; do
+      [[ -n $f ]] && echo "::error title=wasm toolchain bump adds a vulnerability::$f"
+    done <<<"$direct"
+  fi
+  if [[ -n $fresh || -n $added || -n $skew || -n $direct ]]; then
     if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "changed=false" >>"$GITHUB_OUTPUT"; fi
     return 0
   fi
