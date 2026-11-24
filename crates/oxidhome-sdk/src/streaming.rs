@@ -22,12 +22,13 @@
 //! When the manifest sets `tick_interval_ms`, the host also calls
 //! [`Plugin::tick`](crate::Plugin::tick) early when a socket the plugin
 //! keeps open between calls becomes readable: a connected `TcpStream`, or
-//! a `UdpSocket` that has sent or received. The cadence can then be a
-//! slow fallback rather than a polling rate. Wakeups are coalesced (one
-//! tick however much arrived) and start at least 100 ms after the
-//! previous tick returned. Read everything a tick finds and drop sockets
-//! that reached their end: a socket left readable wakes the plugin again
-//! after each gap. Without `tick_interval_ms` the plugin is never ticked.
+//! a `UdpSocket` that has connected, sent, or tried a receive (a
+//! non-blocking `recv_from` that answered `WouldBlock` counts). The
+//! cadence can then be a slow fallback rather than a polling rate.
+//! Wakeups are coalesced (one tick however much arrived) and start at
+//! least 100 ms after the previous tick returned. Read everything a tick
+//! finds and drop sockets that reached their end: a socket left readable
+//! wakes the plugin again after each gap. Without `tick_interval_ms` the plugin is never ticked.
 //!
 //! # HTTP
 //!

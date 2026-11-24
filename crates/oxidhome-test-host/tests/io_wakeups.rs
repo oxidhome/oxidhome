@@ -206,8 +206,11 @@ async fn a_flood_is_coalesced_into_one_rate_bounded_wakeup() {
     // Not a moment before the gap ends.
     host.advance(Duration::from_millis(99)).await.unwrap();
     assert_eq!(int(&storage, "ticks"), 1);
-    // The gap ends: one tick reads the whole flood.
+    // The gap ends: one tick reads the whole flood. Usually within the
+    // advance; if the host hadn't seen the socket readable yet when the
+    // gap ended, as soon as it does.
     host.advance(Duration::from_millis(1)).await.unwrap();
+    wait_for(&storage, "received", 21).await;
     assert_eq!(int(&storage, "ticks"), 2);
     assert_eq!(int(&storage, "received"), 21);
     assert_eq!(string(&storage, "last"), "flood 19");
