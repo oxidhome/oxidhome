@@ -444,7 +444,7 @@ async fn http_requests_are_checked_on_every_hop() {
             // request, refused like any other.
             format!("http http://127.0.0.1:{}/redirect", allowed.port()),
             format!("http http://127.0.0.1:{}/", forbidden.port()),
-            // HTTPS needs an `https` rule (and isn't sent yet anyway).
+            // HTTPS needs an `https` rule.
             format!("http https://127.0.0.1:{}/", allowed.port()),
             // Userinfo never reaches the wire.
             format!("http http://user:pw@127.0.0.1:{}/ok", allowed.port()),
@@ -589,4 +589,287 @@ async fn network_discovery_example_publishes_replies() {
         .collect();
     assert_eq!(replies, vec![format!("{allowed} pong")]);
     wait_for_deny(&host, "send", "discovery", &denied.to_string()).await;
+}
+
+// ── HTTPS (Phase 8.2) ────────────────────────────────────────────
+
+/// A certificate (DER chain head) and its key, made by `rcgen`.
+struct Cert {
+    der: Vec<u8>,
+    key: Vec<u8>,
+}
+
+/// A CA and a leaf it signed for `127.0.0.1`.
+fn ca_and_leaf() -> (Vec<u8>, Cert) {
+    let ca_key = rcgen::KeyPair::generate().expect("ca key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "OxidHome test CA");
+    let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+    let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+        .expect("leaf params")
+        .signed_by(&leaf_key, &issuer)
+        .expect("leaf cert");
+    (
+        ca.der().to_vec(),
+        Cert {
+            der: leaf.der().to_vec(),
+            key: leaf_key.serialize_der(),
+        },
+    )
+}
+
+/// A self-signed certificate for `names`.
+fn self_signed(names: &[&str]) -> Cert {
+    let key = rcgen::KeyPair::generate().expect("key");
+    let cert =
+        rcgen::CertificateParams::new(names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>())
+            .expect("params")
+            .self_signed(&key)
+            .expect("cert");
+    Cert {
+        der: cert.der().to_vec(),
+        key: key.serialize_der(),
+    }
+}
+
+/// The certificate a [`TlsServer`] presents; swappable.
+#[derive(Debug)]
+struct CurrentCert(std::sync::Mutex<Arc<rustls::sign::CertifiedKey>>);
+
+impl rustls::server::ResolvesServerCert for CurrentCert {
+    fn resolve(
+        &self,
+        _hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(Arc::clone(&self.0.lock().unwrap()))
+    }
+}
+
+fn certified(cert: &Cert) -> Arc<rustls::sign::CertifiedKey> {
+    let provider = rustls::crypto::ring::default_provider();
+    let key = provider
+        .key_provider
+        .load_private_key(rustls::pki_types::PrivateKeyDer::Pkcs8(
+            cert.key.clone().into(),
+        ))
+        .expect("signing key");
+    Arc::new(rustls::sign::CertifiedKey::new(
+        vec![rustls::pki_types::CertificateDer::from(cert.der.clone())],
+        key,
+    ))
+}
+
+/// An HTTPS server on loopback answering `respond(path)`, counting the
+/// handshakes that completed.
+struct TlsServer {
+    addr: SocketAddr,
+    cert: Arc<CurrentCert>,
+    served: Arc<AtomicUsize>,
+}
+
+impl TlsServer {
+    fn start(cert: &Cert, respond: impl Fn(&str) -> String + Send + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tls server");
+        let addr = listener.local_addr().expect("local addr");
+        let current = Arc::new(CurrentCert(std::sync::Mutex::new(certified(cert))));
+        let config =
+            Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_cert_resolver(
+                    Arc::clone(&current) as Arc<dyn rustls::server::ResolvesServerCert>
+                ),
+            );
+        let served = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&served);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&config)) else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(conn, stream);
+                let mut reader = BufReader::new(&mut tls);
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() || first.is_empty() {
+                    continue;
+                }
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                drop(reader);
+                count.fetch_add(1, Ordering::SeqCst);
+                let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let _ = tls.write_all(respond(&path).as_bytes());
+                let _ = tls.flush();
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        Self {
+            addr,
+            cert: current,
+            served,
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    fn served(&self) -> usize {
+        self.served.load(Ordering::SeqCst)
+    }
+
+    fn swap(&self, cert: &Cert) {
+        *self.cert.0.lock().unwrap() = certified(cert);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_reaches_servers_the_roots_vouch_for() {
+    let (ca, leaf) = ca_and_leaf();
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca], false);
+    let server = TlsServer::start(&leaf, |_| http_ok("secure"));
+    let wrong_name = TlsServer::start(&self_signed(&["camera.example"]), |_| http_ok("no"));
+    let results = probe(
+        &host,
+        "https",
+        &[
+            format!("https://127.0.0.1:{}", server.port()),
+            format!("https://127.0.0.1:{}", wrong_name.port()),
+        ],
+        &[
+            format!("get https://127.0.0.1:{}/ok", server.port()),
+            // Loopback isn't a LAN device: no trust on first use.
+            format!("get https://127.0.0.1:{}/ok", wrong_name.port()),
+        ],
+    )
+    .await;
+    assert_eq!(results[0], "ok:200:secure");
+    assert_eq!(results[1], "err:Http(ErrorCode::TlsCertificateError)");
+    assert_eq!(server.served(), 1);
+    assert_eq!(wrong_name.served(), 0);
+    assert_eq!(
+        host.engine()
+            .tls_pins()
+            .list(&oxidhome_core::state::PinFilter::default()),
+        Vec::new()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lan_certificates_are_pinned_on_first_use() {
+    // Loopback stands in for a LAN address here.
+    let host = TestHost::new()
+        .unwrap()
+        .with_tls_for_tests(Vec::new(), true);
+    let first = self_signed(&["camera.lan"]);
+    let server = TlsServer::start(&first, |_| http_ok("frame"));
+    let rule = format!("https://127.0.0.1:{}", server.port());
+    let get = format!("get https://127.0.0.1:{}/snap", server.port());
+    let results = probe(
+        &host,
+        "cam",
+        std::slice::from_ref(&rule),
+        &[get.clone(), get.clone()],
+    )
+    .await;
+    assert_eq!(
+        results,
+        vec!["ok:200:frame".to_owned(), "ok:200:frame".to_owned()]
+    );
+    let pins = host
+        .engine()
+        .tls_pins()
+        .list(&oxidhome_core::state::PinFilter::default());
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    assert_eq!(pins[0].key.instance_id, "cam");
+    assert_eq!(pins[0].key.host, "127.0.0.1");
+    assert_eq!(pins[0].key.port, server.port());
+
+    // Another certificate at the same place is refused, before any
+    // request bytes are sent, and audited.
+    server.swap(&self_signed(&["camera.lan"]));
+    let results = probe(
+        &host,
+        "cam",
+        std::slice::from_ref(&rule),
+        std::slice::from_ref(&get),
+    )
+    .await;
+    assert_eq!(
+        results,
+        vec!["err:Http(ErrorCode::TlsCertificateError)".to_owned()]
+    );
+    assert_eq!(server.served(), 2);
+    let row = wait_for_deny(&host, "tls", "cam", &format!("127.0.0.1:{}", server.port())).await;
+    assert!(
+        row.domain_error.is_some_and(|e| e.contains("pinned")),
+        "domain_error"
+    );
+
+    // The operator resets the pin; the next request pins the new one.
+    let removed = host
+        .engine()
+        .tls_pins()
+        .reset(&oxidhome_core::state::PinFilter {
+            instance_id: Some("cam".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(removed.len(), 1);
+    let results = probe(&host, "cam", &[rule], &[get]).await;
+    assert_eq!(results, vec!["ok:200:frame".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sdk_client_follows_redirects_without_downgrading() {
+    let (ca, leaf) = ca_and_leaf();
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca], false);
+    let plain = TcpServer::http(|_| http_ok("plain"));
+    let plain_url = format!("http://127.0.0.1:{}/x", plain.port());
+    let secure = TlsServer::start(&leaf, move |path| match path {
+        "/down" => http_redirect(&plain_url),
+        "/hop" => http_redirect("/ok"),
+        _ => http_ok("secure"),
+    });
+    let hop = TcpServer::http(|path| match path {
+        "/loop" => http_redirect("/loop"),
+        _ => http_ok("hopped"),
+    });
+    let results = probe(
+        &host,
+        "redirects",
+        &[
+            format!("https://127.0.0.1:{}", secure.port()),
+            format!("tcp://127.0.0.1:{}", plain.port()),
+            format!("tcp://127.0.0.1:{}", hop.port()),
+        ],
+        &[
+            format!("get https://127.0.0.1:{}/hop", secure.port()),
+            format!("get https://127.0.0.1:{}/down", secure.port()),
+            format!("get http://127.0.0.1:{}/loop", hop.port()),
+        ],
+    )
+    .await;
+    assert_eq!(results[0], "ok:200:secure");
+    assert!(
+        results[1].starts_with("err:InsecureRedirect"),
+        "{results:?}"
+    );
+    assert_eq!(results[2], "err:TooManyRedirects { limit: 5 }");
+    assert_eq!(plain.accepted(), 0, "https must not be downgraded");
+    assert_eq!(hop.accepted(), 6);
 }

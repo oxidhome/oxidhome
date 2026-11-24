@@ -1,0 +1,55 @@
+// OxidHome v1 network service.
+//
+// Operator view of the TLS certificates streaming plugins pinned on
+// first use (Phase 8): mirrors `GET` / `DELETE /api/v1/network/tls-pins`
+// on the JSON API and `oxidhome tls-pin` on the CLI.
+syntax = "proto3";
+
+package oxidhome.v1;
+
+// NetworkService — trust-on-first-use certificate pins.
+service NetworkService {
+  // List pins, optionally for one instance. Gated on `instances:list`.
+  rpc ListTlsPins(ListTlsPinsRequest) returns (ListTlsPinsResponse);
+  // Remove pins so the next request pins again. Owner token only
+  // (`policy.manage`). Unset fields widen the selection: no instance
+  // resets every pin.
+  rpc ResetTlsPins(ResetTlsPinsRequest) returns (ResetTlsPinsResponse);
+}
+
+message ListTlsPinsRequest {
+  // Only this instance's pins.
+  optional string instance_id = 1;
+}
+
+message ListTlsPinsResponse {
+  repeated TlsPin pins = 1;
+}
+
+message ResetTlsPinsRequest {
+  // Only this instance's pins; required with `host`.
+  optional string instance_id = 1;
+  // Only pins for this host; required with `port`.
+  optional string host = 2;
+  // Only pins for this port.
+  optional uint32 port = 3;
+}
+
+message ResetTlsPinsResponse {
+  // The pins that were removed.
+  repeated TlsPin removed = 1;
+}
+
+// One pinned certificate.
+message TlsPin {
+  // Instance that made the request.
+  string instance_id = 1;
+  // Host as the request named it (lowercase DNS name or IP literal).
+  string host = 2;
+  // Port.
+  uint32 port = 3;
+  // SHA-256 of the pinned leaf certificate, lowercase hex.
+  string sha256 = 4;
+  // When it was pinned, Unix milliseconds.
+  int64 pinned_ms = 5;
+}

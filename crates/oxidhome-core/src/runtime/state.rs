@@ -578,7 +578,13 @@ impl PluginState {
             limits,
             log_rate,
             sandbox: None,
-            http_hooks: super::network::HttpHooks::new(Arc::clone(&network)),
+            // No network until `with_network_access`: no pins either.
+            http_hooks: super::network::HttpHooks::new(
+                Arc::clone(&network),
+                Arc::new(super::network::TlsClient::new(Arc::new(
+                    crate::state::TlsPinStore::detached(),
+                ))),
+            ),
             network,
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             clock,
@@ -588,10 +594,11 @@ impl PluginState {
     /// Phase 8: give a streaming-world instance its network policy,
     /// built from the effective (granted) `network` rules. Rebuilds the
     /// WASI context with TCP / UDP enabled and every socket address
-    /// checked by the policy. Call before instantiation, after
+    /// checked by the policy, and `https://` requests verified by `tls`.
+    /// Call before instantiation, after
     /// [`Self::with_granted_capabilities`] and [`Self::with_audit_log`].
     #[must_use]
-    pub(crate) fn with_network_access(mut self) -> Self {
+    pub(crate) fn with_network_access(mut self, tls: Arc<super::network::TlsClient>) -> Self {
         let policy = Arc::new(super::network::NetworkPolicy::new(
             self.instance_id.as_str(),
             &self.granted_capabilities.network,
@@ -606,7 +613,7 @@ impl PluginState {
             &self.clock,
             Some(&policy),
         );
-        self.http_hooks = super::network::HttpHooks::new(Arc::clone(&policy));
+        self.http_hooks = super::network::HttpHooks::new(Arc::clone(&policy), tls);
         self.http_ctx
             .set_field_size_limit(super::network::FIELD_SIZE_LIMIT);
         self.network = policy;

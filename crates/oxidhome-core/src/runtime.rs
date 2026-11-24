@@ -187,6 +187,9 @@ pub struct Engine {
     /// [`crate::clock`]). [`Clock::system`] unless the engine was built
     /// with [`Self::with_state_dir_and_clock`].
     clock: Clock,
+    /// Phase 8.2: TLS for streaming instances' `https://` requests —
+    /// the system roots and the trust-on-first-use pins.
+    tls: Arc<network::TlsClient>,
 }
 
 /// Round-7 F1: error returned by
@@ -467,7 +470,10 @@ impl Engine {
         // keep their ids blocked.
         let removals = sandbox_purge::resume(&db, &kv, &blobs)
             .context("reading the pending script sandbox purges")?;
+        let tls_pins = crate::state::TlsPinStore::open(Arc::clone(&db))
+            .context("loading TLS certificate pins")?;
         Ok(Self {
+            tls: Arc::new(network::TlsClient::new(Arc::new(tls_pins))),
             inner,
             pending_commands,
             sensitive,
@@ -498,6 +504,33 @@ impl Engine {
             component_compiles: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             clock,
         })
+    }
+
+    /// Phase 8.2: certificates streaming instances trusted on first use
+    /// for LAN devices; the operator lists and resets them here.
+    #[must_use]
+    pub fn tls_pins(&self) -> Arc<crate::state::TlsPinStore> {
+        Arc::clone(self.tls.pins())
+    }
+
+    /// Test hook: also trust the DER certificates `roots` for `https://`
+    /// requests, and with `tofu_loopback` treat loopback servers like
+    /// LAN devices for trust on first use (tests have no LAN). Keeps the
+    /// pins. Not for production: it widens what the host trusts.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_tls_for_tests(mut self, roots: Vec<Vec<u8>>, tofu_loopback: bool) -> Self {
+        self.tls = Arc::new(network::TlsClient::for_tests(
+            Arc::clone(self.tls.pins()),
+            roots,
+            tofu_loopback,
+        ));
+        self
+    }
+
+    /// The TLS client streaming instances' `https://` requests use.
+    pub(crate) fn tls(&self) -> Arc<network::TlsClient> {
+        Arc::clone(&self.tls)
     }
 
     /// The engine's time source (see [`crate::clock`]).

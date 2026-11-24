@@ -126,6 +126,9 @@ pub(crate) enum Denial {
     Bind(SocketAddr),
     #[error("listening for incoming connections is not allowed")]
     Listen,
+    /// A TLS server refused by its certificate pin.
+    #[error("{0}")]
+    Tls(String),
 }
 
 /// The per-instance policy object. Shared (`Arc`) between the socket
@@ -656,6 +659,25 @@ impl NetworkPolicy {
         rules
             .iter()
             .any(|idx| self.rules.get(*idx).is_some_and(|r| r.name_grants(class)))
+    }
+
+    /// The instance this policy belongs to.
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Record that a request to `target` pinned a LAN device's
+    /// certificate on first use: an audit `allow` row (`net.tls_pin`).
+    /// Not rate-limited: pins are capped per instance.
+    pub(crate) fn audit_pinned(&self, target: &str, fingerprint: crate::state::Fingerprint) {
+        crate::runtime::state_read::queue_deny_audit(
+            self.audit_log.clone(),
+            &self.instance_id,
+            crate::runtime::state_read::DeniedRead::TlsPinned {
+                target: crate::auth::invocation::audit_cap(target).to_owned(),
+                sha256: fingerprint.to_hex(),
+            },
+        );
     }
 
     /// Record a refusal: a `tracing` warning and an audit `deny` row,

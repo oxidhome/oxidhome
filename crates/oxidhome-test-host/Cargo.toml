@@ -56,3 +56,6 @@ toml.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
+# Local HTTPS servers for the network tests.
+rcgen.workspace = true
+rustls.workspace = true

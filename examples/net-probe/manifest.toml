@@ -30,6 +30,7 @@ storage_quota_kb = 16
 #   dns <host>         resolve the name, list the addresses
 #   http <url>         GET over wasi:http, following up to 3 redirects
 #   httppoll <url>     GET once, polling `get` instead of the pollable
+#   get <url>          GET with the SDK client (`streaming::http`)
 #   hdr <len>          append a header with a <len>-byte name to new fields
 #   bind <addr:port>   bind a UDP socket
 #   listen <addr:port> bind + listen a TCP socket

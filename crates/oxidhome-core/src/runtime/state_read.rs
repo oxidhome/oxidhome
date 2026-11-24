@@ -141,6 +141,10 @@ pub(crate) enum DeniedRead {
         target: String,
         reason: String,
     },
+    /// Not a refusal: an `https://` request trusted a LAN device's
+    /// certificate on first use (Phase 8.2), recorded as an `allow` row
+    /// so the operator sees every new pin.
+    TlsPinned { target: String, sha256: String },
 }
 
 /// Queue the audit `deny` row for a `get-state` that found state the
@@ -290,11 +294,21 @@ fn deny_audit_worker(
                 ),
                 "network",
             ),
+            DeniedRead::TlsPinned { target, sha256 } => (
+                NETWORK_AUDIT_METHOD,
+                format!(
+                    "net.tls_pin/{}/{}/sha256:{sha256}",
+                    invocation::audit_cap(&job.instance_id),
+                    invocation::audit_cap(target)
+                ),
+                "network",
+            ),
         };
         let domain_error = match &job.read {
             DeniedRead::Network { reason, .. } => Some(reason.clone()),
-            DeniedRead::State { .. } | DeniedRead::Events => None,
+            DeniedRead::State { .. } | DeniedRead::Events | DeniedRead::TlsPinned { .. } => None,
         };
+        let allowed = matches!(job.read, DeniedRead::TlsPinned { .. });
         let ctx = job
             .ctx
             .unwrap_or_else(|| invocation::InvocationContext::host_origin(&job.instance_id));
@@ -307,8 +321,8 @@ fn deny_audit_worker(
             actor_kind: root.kind().as_str().to_owned(),
             method: method.to_owned(),
             path,
-            status: 403,
-            decision: "deny".into(),
+            status: if allowed { 200 } else { 403 },
+            decision: if allowed { "allow" } else { "deny" }.into(),
             required_scope: Some(scope.into()),
             execution_outcome: None,
             domain_error,
@@ -318,7 +332,8 @@ fn deny_audit_worker(
             command_id: None,
             command_outcome: None,
 
-            level: None,
+            // A new pin is trust the operator should see.
+            level: allowed.then(|| "warn".to_owned()),
         };
         if let Err(err) = job.log.record_completed(&entry) {
             tracing::error!(target: "host.audit", method, error = %err, "plugin-read deny row failed");

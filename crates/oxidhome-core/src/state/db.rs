@@ -959,6 +959,19 @@ const MIGRATIONS: &[&str] = &[
         updated_ms  INTEGER NOT NULL
     ) WITHOUT ROWID;
     ",
+    // 24 — Phase 8.2: certificates streaming instances trusted on first
+    // use for LAN devices, keyed by the request's host and port. The
+    // operator resets them (`oxidhome tls-pin reset`, REST, Connect).
+    "
+    CREATE TABLE network_tls_pin (
+        instance_id TEXT NOT NULL,
+        host        TEXT NOT NULL,
+        port        INTEGER NOT NULL,
+        sha256      TEXT NOT NULL,
+        pinned_ms   INTEGER NOT NULL,
+        PRIMARY KEY (instance_id, host, port)
+    ) WITHOUT ROWID;
+    ",
 ];
 
 /// File name of the host database inside the state dir.

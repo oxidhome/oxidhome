@@ -190,6 +190,16 @@ pub(super) fn list_resources() -> Vec<Resource> {
                  `oxidhome://plugins/{id}`. Mirrors `GET /api/v1/config`.",
             )
             .with_mime_type("application/json"),
+        Resource::new("oxidhome://network/tls-pins", "network.tls-pins")
+            .with_title("TLS certificate pins")
+            .with_description(
+                "JSON `{pins: [...]}`: the certificates streaming plugins trusted on \
+                 first use for LAN devices — `instance_id`, `host`, `port`, `sha256` \
+                 (leaf certificate, lowercase hex), `pinned_ms`. Read-only; the owner \
+                 resets pins with `oxidhome tls-pin reset` or \
+                 `DELETE /api/v1/network/tls-pins`. Mirrors `GET /api/v1/network/tls-pins`.",
+            )
+            .with_mime_type("application/json"),
     ]
 }
 
@@ -564,6 +574,7 @@ enum Kind<'a> {
     Logs,
     Status,
     Config,
+    TlsPins,
     /// `(instance_id, name)`. Both segments are already validated
     /// by the routing match — non-empty and, for `instance_id`,
     /// slash-free. `name` may contain further path segments; the
@@ -587,6 +598,7 @@ impl Kind<'_> {
             Kind::PluginsList | Kind::PluginsDetail(_) => AuthResource::plugins(),
             Kind::Events => AuthResource::events(),
             Kind::Logs | Kind::Status | Kind::Config => AuthResource::Host,
+            Kind::TlsPins => AuthResource::instances(),
             Kind::Blob(instance, name) => blob_resource(engine, instance, name),
         }
     }
@@ -704,6 +716,12 @@ fn resolve_route(uri: &str) -> Route<'_> {
             action: Action::HostStatus,
             kind: Kind::Config,
         },
+        // Same gate as `GET /api/v1/network/tls-pins`.
+        ("network", Some("tls-pins")) => Route::Dispatch {
+            family: "network.tls_pins",
+            action: Action::InstanceRead,
+            kind: Kind::TlsPins,
+        },
         // Blobs URI: `oxidhome://blobs/<instance_id>/<name>`.
         // Split the tail on the *first* `/` — instance ids are
         // slash-free (validated by the blob store's
@@ -802,6 +820,19 @@ async fn read_inner(
         Kind::Logs => logs_read(engine, query_str).await,
         Kind::Status => status_read(engine.clone()).await,
         Kind::Config => encode(&super::config::config_body(), "config"),
+        Kind::TlsPins => {
+            #[derive(Serialize)]
+            struct Pins {
+                pins: Vec<crate::api::network_admin::TlsPinView>,
+            }
+            let pins = engine
+                .tls_pins()
+                .list(&crate::state::PinFilter::default())
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            encode(&Pins { pins }, "network.tls_pins")
+        }
         // Blob reads also hit `SQLite` (the blob index) plus
         // a filesystem `read()`, so run under `spawn_blocking`
         // like the events / logs paths.

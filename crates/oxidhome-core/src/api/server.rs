@@ -97,6 +97,11 @@ pub fn build_router(engine: Engine) -> Router {
         .route("/api/v1/tokens", get(list_tokens).post(create_token))
         .route("/api/v1/roles", get(list_roles).post(create_role))
         .route("/api/v1/roles/{name}", put(update_role).delete(delete_role))
+        // Phase 8.2: TLS certificates pinned on first use.
+        .route(
+            "/api/v1/network/tls-pins",
+            get(list_tls_pins).delete(reset_tls_pins),
+        )
         .route("/api/v1/plugins", get(list_plugins).post(install_plugin))
         .route(
             "/api/v1/plugins/{plugin_id}",
@@ -845,6 +850,111 @@ fn rest_admin(call_id: &str) -> super::token_admin::Audited<'_> {
         actor_kind: "api",
         call_id: Some(call_id),
     }
+}
+
+// ── TLS certificate pins (Phase 8.2) ─────────────────────────────
+
+/// Query of `GET` / `DELETE /api/v1/network/tls-pins`.
+#[derive(Deserialize)]
+struct TlsPinParams {
+    instance_id: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+impl TlsPinParams {
+    fn filter(self) -> Result<crate::state::PinFilter, TlsPinError> {
+        crate::state::PinFilter {
+            instance_id: self.instance_id,
+            host: self.host,
+            port: self.port,
+        }
+        .validated()
+        .map_err(TlsPinError::BadRequest)
+    }
+}
+
+#[derive(Serialize)]
+struct TlsPinsBody {
+    pins: Vec<super::network_admin::TlsPinView>,
+}
+
+#[derive(Serialize)]
+struct TlsPinsRemovedBody {
+    removed: Vec<super::network_admin::TlsPinView>,
+}
+
+enum TlsPinError {
+    Scope(ScopeDenied),
+    BadRequest(String),
+    Internal,
+}
+
+impl IntoResponse for TlsPinError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+}
+
+/// `GET /api/v1/network/tls-pins[?instance_id=…[&host=…[&port=…]]]` —
+/// the certificates streaming instances pinned on first use for LAN
+/// devices, ordered by instance, host and port. `instances:list`.
+///
+/// # Errors
+/// - `400` a host without an instance, or a port without a host.
+/// - `403` missing scope.
+async fn list_tls_pins(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Query(params): Query<TlsPinParams>,
+) -> Result<Json<TlsPinsBody>, TlsPinError> {
+    require(&ctx, Action::InstanceRead, &Resource::instances()).map_err(TlsPinError::Scope)?;
+    let filter = params.filter()?;
+    let pins = state.engine.tls_pins().list(&filter);
+    Ok(Json(TlsPinsBody {
+        pins: pins.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// `DELETE /api/v1/network/tls-pins[?instance_id=…[&host=…[&port=…]]]`
+/// — forget pins, so the next request to each key trusts (and pins)
+/// whatever certificate the device presents. No parameters removes
+/// every pin. Returns the removed pins.
+///
+/// `policy.manage`: the owner token only; no scope, the wildcard
+/// included, grants it (a reset decides what the host will trust).
+///
+/// # Errors
+/// - `400` a host without an instance, or a port without a host.
+/// - `403` not the owner.
+/// - `500` the pins couldn't be removed.
+async fn reset_tls_pins(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Query(params): Query<TlsPinParams>,
+) -> Result<Json<TlsPinsRemovedBody>, TlsPinError> {
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TlsPinError::Scope)?;
+    let filter = params.filter()?;
+    let pins = state.engine.tls_pins();
+    let removed = tokio::task::spawn_blocking(move || pins.reset(&filter))
+        .await
+        .map_err(|_| TlsPinError::Internal)?
+        .map_err(|err| {
+            tracing::error!(target: "api.network", error = %err, "removing TLS pins failed");
+            TlsPinError::Internal
+        })?;
+    tracing::warn!(
+        target: "host.network",
+        removed = removed.len(),
+        "TLS certificate pins reset",
+    );
+    Ok(Json(TlsPinsRemovedBody {
+        removed: removed.into_iter().map(Into::into).collect(),
+    }))
 }
 
 // ── Device state (H9 host-owned projection) ──────────────────────

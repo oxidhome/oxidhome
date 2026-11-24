@@ -199,6 +199,17 @@ impl TestHost {
         })
     }
 
+    /// Trust the DER certificates `roots` for streaming plugins'
+    /// `https://` requests, on top of the system roots, and with
+    /// `tofu_loopback` treat loopback servers like LAN devices for trust
+    /// on first use (a test's servers bind loopback). Call before loading
+    /// plugins. The pins stay in [`Engine::tls_pins`].
+    #[must_use]
+    pub fn with_tls_for_tests(mut self, roots: Vec<Vec<u8>>, tofu_loopback: bool) -> Self {
+        self.engine = self.engine.clone().with_tls_for_tests(roots, tofu_loopback);
+        self
+    }
+
     /// The underlying production engine, for assertions the harness
     /// doesn't wrap (device-state projection, event bus subscriptions,
     /// blob store, …).

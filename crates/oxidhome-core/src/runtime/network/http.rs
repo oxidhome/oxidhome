@@ -8,9 +8,12 @@
 //! 2. resolves the request's host itself (a name must match a name rule)
 //!    and checks every address with the instance's [`NetworkPolicy`]
 //!    (`tcp` / `any` rules for `http://`, `https` / `any` for `https://`);
-//! 3. refuses `https://` — TLS isn't implemented yet;
-//! 4. connects to the first allowed address — the one it checked, with
-//!    no second lookup — and sends the request over HTTP/1.1.
+//! 3. connects to the first allowed address — the one it checked, with
+//!    no second lookup;
+//! 4. for `https://`, runs the TLS handshake for the host the request
+//!    named ([`super::tls`]), refusing (and auditing) a LAN device whose
+//!    certificate doesn't match its pin;
+//! 5. sends the request over HTTP/1.1.
 //!
 //! `wasi:http` doesn't follow redirects: a 3xx goes back to the plugin,
 //! and following it is a new request that runs these steps again.
@@ -36,6 +39,11 @@ use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, HostOutgoingRequ
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
 use super::policy::{Denial, NetworkPolicy, Use};
+use super::tls::{Connected, TlsClient};
+
+/// What the HTTP connection runs over: plain TCP or TLS.
+trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
 /// Connect timeout when the plugin sets none.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -291,11 +299,12 @@ type SendFuture = Box<
 /// `wasmtime-wasi-http` hooks for one streaming instance.
 pub(crate) struct HttpHooks {
     policy: Arc<NetworkPolicy>,
+    tls: Arc<TlsClient>,
 }
 
 impl HttpHooks {
-    pub(crate) fn new(policy: Arc<NetworkPolicy>) -> Self {
-        Self { policy }
+    pub(crate) fn new(policy: Arc<NetworkPolicy>, tls: Arc<TlsClient>) -> Self {
+        Self { policy, tls }
     }
 }
 
@@ -317,10 +326,11 @@ impl WasiHttpHooks for HttpHooks {
             return Box::new(std::future::ready(Err(Error::ConnectionLimitReached)));
         };
         let policy = Arc::clone(&self.policy);
+        let tls = Arc::clone(&self.tls);
         // Sent on a spawned task: carry the invocation for audit rows.
         let ctx = crate::auth::invocation::current();
         Box::new(super::in_invocation(ctx, async move {
-            send(policy, permit, request, options).await
+            send(policy, tls, permit, request, options).await
         }))
     }
 
@@ -392,14 +402,45 @@ async fn checked_addresses(
     Ok(allowed)
 }
 
+/// TLS handshake for `host` on `stream`, by `deadline`; audits a new
+/// pin, and refuses (and audits) a certificate that doesn't match one.
+async fn secure(
+    policy: &NetworkPolicy,
+    client: &TlsClient,
+    stream: tokio::net::TcpStream,
+    target: &str,
+    host: &str,
+    port: u16,
+    deadline: tokio::time::Instant,
+) -> Result<Box<dyn Io>, Error> {
+    let peer = stream.peer_addr().map_err(Error::Connect)?;
+    let connected = tokio::time::timeout_at(
+        deadline,
+        super::tls::connect(client, policy.instance_id(), stream, peer, host, port),
+    )
+    .await
+    .map_err(|_| Error::ConnectionTimeout)??;
+    match connected {
+        Connected::Stream(stream, None) => Ok(stream),
+        Connected::Stream(stream, Some(pinned)) => {
+            policy.audit_pinned(target, pinned);
+            Ok(stream)
+        }
+        Connected::Refused(denial) => {
+            policy.audit_denial("tls", target, &Denial::Tls(denial.to_string()));
+            Err(Error::TlsCertificateError)
+        }
+    }
+}
+
 /// HTTP/1.1 handshake on `stream`, by `deadline`.
 async fn handshake(
-    stream: tokio::net::TcpStream,
+    stream: Box<dyn Io>,
     deadline: tokio::time::Instant,
 ) -> Result<
     (
         hyper::client::conn::http1::SendRequest<WasiBody>,
-        hyper::client::conn::http1::Connection<TokioIo<tokio::net::TcpStream>, WasiBody>,
+        hyper::client::conn::http1::Connection<TokioIo<Box<dyn Io>>, WasiBody>,
     ),
     Error,
 > {
@@ -486,6 +527,7 @@ fn plain_authority(authority: &http::uri::Authority) -> bool {
 
 async fn send(
     policy: Arc<NetworkPolicy>,
+    tls_client: Arc<TlsClient>,
     permit: tokio::sync::OwnedSemaphorePermit,
     mut request: http::Request<WasiBody>,
     options: Option<RequestOptions>,
@@ -528,8 +570,8 @@ async fn send(
         .between_bytes_timeout
         .unwrap_or(BETWEEN_BYTES_TIMEOUT)
         .max(Duration::from_millis(1));
-    // One connect deadline covers the lookup, every address tried and
-    // the HTTP handshake.
+    // One connect deadline covers the lookup, every address tried, the
+    // TLS handshake and the HTTP handshake.
     let deadline = tokio::time::Instant::now() + connect_timeout;
     let addrs = tokio::time::timeout_at(
         deadline,
@@ -537,15 +579,13 @@ async fn send(
     )
     .await
     .map_err(|_| Error::ConnectionTimeout)??;
-    if tls {
-        // Checked first, so a target the rules don't allow is refused
-        // (and audited) as such.
-        return Err(Error::InternalError(Some(
-            "https is not supported by this host yet; only http:// requests are sent".into(),
-        )));
-    }
 
     let stream = connect_any(addrs, deadline).await?;
+    let stream: Box<dyn Io> = if tls {
+        secure(&policy, &tls_client, stream, &target, &host, port, deadline).await?
+    } else {
+        Box::new(stream)
+    };
     let (mut sender, conn) = handshake(stream, deadline).await?;
 
     // The request line carries only the path; the authority went into

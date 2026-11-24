@@ -25,7 +25,8 @@
 //! - Socket creation is capped per instance.
 //! - `wasi:http` requests are sent by [`http::HttpHooks`]: the host
 //!   resolves the request's host, checks each address, and connects to
-//!   exactly the address it checked.
+//!   exactly the address it checked; `https://` adds TLS ([`tls`]), with
+//!   trust on first use for self-signed LAN devices.
 //!
 //! Refusals are audited (`method = NET`) through the shared deny-audit
 //! worker, rate-limited per instance.
@@ -33,10 +34,12 @@
 mod http;
 mod policy;
 mod sockets;
+mod tls;
 
 pub(crate) use http::{FIELD_SIZE_LIMIT, HttpHooks};
 pub(crate) use policy::{NetworkPolicy, covers as rule_covers};
 pub(crate) use sockets::address_check;
+pub(crate) use tls::TlsClient;
 
 use oxidhome_manifest::World;
 use wasmtime::component::Linker;

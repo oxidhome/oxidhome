@@ -1,0 +1,356 @@
+//! TLS for outgoing `https://` requests of streaming instances.
+//!
+//! - **Stack.** rustls with the `ring` provider, TLS 1.3 and 1.2. Server
+//!   certificates are verified against the operating system's roots
+//!   (`rustls-native-certs`, loaded once, on the first `https://`
+//!   request); no bundled root list.
+//! - **Names.** SNI and certificate name checks use the host the request
+//!   named, never the address it was resolved to; an IP-literal host is
+//!   checked against the certificate's IP addresses and sends no SNI.
+//! - **Trust on first use.** When the connected address is *private* or
+//!   *link-local* and the roots don't vouch for the certificate (a device
+//!   with a self-signed certificate), the handshake still proves the
+//!   server holds the leaf certificate's key, and the leaf's SHA-256 is
+//!   checked against the instance's pin for `(host, port)` in the
+//!   [`TlsPinStore`]: no pin pins it, the same certificate passes, any
+//!   other is refused and audited. Public addresses never get this.
+//!   Nothing of the request is sent before that check.
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
+use wasmtime_wasi_http::Error;
+
+use crate::native_policy::endpoint::{AddressClass, classify};
+use crate::state::tls_pins::{Fingerprint, PinCheck, PinKey, TlsPinStore};
+
+/// Host-wide TLS client state: the root verifier (built on first use) and
+/// the pin store. One per [`Engine`](crate::Engine).
+pub(crate) struct TlsClient {
+    provider: Arc<CryptoProvider>,
+    /// `None` when the system has no usable roots: only pinned LAN
+    /// devices can then be reached.
+    roots: tokio::sync::OnceCell<Option<Arc<WebPkiServerVerifier>>>,
+    extra_roots: Vec<CertificateDer<'static>>,
+    pins: Arc<TlsPinStore>,
+    /// Test hook: also trust loopback servers on first use.
+    tofu_loopback: bool,
+}
+
+impl std::fmt::Debug for TlsClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsClient")
+            .field("extra_roots", &self.extra_roots.len())
+            .field("tofu_loopback", &self.tofu_loopback)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TlsClient {
+    /// A client verifying against the system roots, with `pins`.
+    #[must_use]
+    pub(crate) fn new(pins: Arc<TlsPinStore>) -> Self {
+        Self {
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            roots: tokio::sync::OnceCell::new(),
+            extra_roots: Vec::new(),
+            pins,
+            tofu_loopback: false,
+        }
+    }
+
+    /// Test hook: add the DER certificates `roots` to the system roots,
+    /// and with `tofu_loopback` treat loopback servers like LAN devices
+    /// for trust on first use. Not for production.
+    #[must_use]
+    pub(crate) fn for_tests(
+        pins: Arc<TlsPinStore>,
+        roots: Vec<Vec<u8>>,
+        tofu_loopback: bool,
+    ) -> Self {
+        Self {
+            extra_roots: roots.into_iter().map(CertificateDer::from).collect(),
+            tofu_loopback,
+            ..Self::new(pins)
+        }
+    }
+
+    /// The pin store.
+    #[must_use]
+    pub(crate) fn pins(&self) -> &Arc<TlsPinStore> {
+        &self.pins
+    }
+
+    async fn root_verifier(&self) -> Option<Arc<WebPkiServerVerifier>> {
+        self.roots
+            .get_or_init(|| async {
+                let extra = self.extra_roots.clone();
+                let provider = Arc::clone(&self.provider);
+                tokio::task::spawn_blocking(move || build_root_verifier(&provider, extra))
+                    .await
+                    .ok()
+                    .flatten()
+            })
+            .await
+            .clone()
+    }
+
+    /// Whether a server at `addr` may be trusted on first use.
+    fn tofu_allowed(&self, addr: SocketAddr) -> bool {
+        match classify(addr.ip().to_canonical()) {
+            AddressClass::Private | AddressClass::LinkLocal => true,
+            AddressClass::Loopback => self.tofu_loopback,
+            AddressClass::Public | AddressClass::Forbidden => false,
+        }
+    }
+}
+
+fn build_root_verifier(
+    provider: &Arc<CryptoProvider>,
+    extra: Vec<CertificateDer<'static>>,
+) -> Option<Arc<WebPkiServerVerifier>> {
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        tracing::warn!(
+            target: "host.network",
+            errors = native.errors.len(),
+            "some system root certificates couldn't be loaded",
+        );
+    }
+    let mut store = RootCertStore::empty();
+    let (added, ignored) = store.add_parsable_certificates(native.certs.into_iter().chain(extra));
+    if ignored > 0 {
+        tracing::debug!(target: "host.network", ignored, "skipped unparsable root certificates");
+    }
+    if added == 0 {
+        tracing::warn!(
+            target: "host.network",
+            "no system root certificates; https:// requests reach only pinned LAN devices",
+        );
+        return None;
+    }
+    WebPkiServerVerifier::builder_with_provider(Arc::new(store), Arc::clone(provider))
+        .build()
+        .map_err(|err| {
+            tracing::warn!(target: "host.network", error = %err, "building the TLS root verifier failed");
+        })
+        .ok()
+}
+
+/// What the handshake's certificate check concluded.
+#[derive(Debug, Clone, Copy)]
+enum Trust {
+    /// The roots vouch for it.
+    Roots,
+    /// Not vouched for, but the server is on the LAN: check the pin.
+    FirstUse(Fingerprint),
+}
+
+/// One connection's certificate verifier.
+#[derive(Debug)]
+struct Verifier {
+    roots: Option<Arc<WebPkiServerVerifier>>,
+    provider: Arc<CryptoProvider>,
+    tofu: bool,
+    trust: Mutex<Option<Trust>>,
+}
+
+impl ServerCertVerifier for Verifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let verdict = match &self.roots {
+            Some(roots) => {
+                roots.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            }
+            None => Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            )),
+        };
+        let trust = match verdict {
+            Ok(verified) => {
+                *self.trust.lock().unwrap_or_else(PoisonError::into_inner) = Some(Trust::Roots);
+                return Ok(verified);
+            }
+            Err(rustls::Error::InvalidCertificate(_)) if self.tofu => {
+                Trust::FirstUse(Fingerprint::of_der(end_entity))
+            }
+            Err(err) => return Err(err),
+        };
+        *self.trust.lock().unwrap_or_else(PoisonError::into_inner) = Some(trust);
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A TLS-wrapped connection.
+pub(super) type TlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+
+/// Why a TLS connection was refused by policy (pins), as opposed to
+/// failing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(super) enum PinDenial {
+    #[error(
+        "the certificate (sha256 {seen}) differs from the one pinned on first use (sha256 \
+         {pinned}); reset the pin if the device's certificate changed"
+    )]
+    Mismatch { seen: String, pinned: String },
+    #[error("the instance or host holds the most TLS pins it may; reset unused pins")]
+    Full,
+    #[error("storing the certificate pin failed")]
+    Store,
+}
+
+/// Outcome of [`connect`].
+pub(super) enum Connected {
+    /// Ready for HTTP; with the fingerprint when this connection pinned
+    /// the server's certificate (the caller audits it).
+    Stream(Box<TlsStream>, Option<Fingerprint>),
+    /// A pin refused the server; the caller audits it.
+    Refused(PinDenial),
+}
+
+/// TLS handshake with the server on `stream` (connected to `peer`) for
+/// `host:port` as the request named it, for instance `instance_id`.
+pub(super) async fn connect(
+    client: &TlsClient,
+    instance_id: &str,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    host: &str,
+    port: u16,
+) -> Result<Connected, Error> {
+    let server_name = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ServerName::IpAddress(ip.into()),
+        Err(_) => {
+            ServerName::try_from(host.to_owned()).map_err(|_| Error::HttpRequestUriInvalid)?
+        }
+    };
+    let verifier = Arc::new(Verifier {
+        roots: client.root_verifier().await,
+        provider: Arc::clone(&client.provider),
+        tofu: client.tofu_allowed(peer),
+        trust: Mutex::new(None),
+    });
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&client.provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| Error::TlsProtocolError)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::clone(&verifier) as Arc<dyn ServerCertVerifier>)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(server_name, stream)
+        .await
+        .map_err(|err| tls_error(&err))?;
+    let trust = *verifier
+        .trust
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    match trust {
+        Some(Trust::Roots) => Ok(Connected::Stream(Box::new(tls), None)),
+        Some(Trust::FirstUse(seen)) => {
+            let key = PinKey {
+                instance_id: instance_id.to_owned(),
+                host: crate::state::tls_pins::normalize_host(host),
+                port,
+            };
+            let pins = Arc::clone(&client.pins);
+            let check = tokio::task::spawn_blocking(move || pins.check_or_pin(&key, seen))
+                .await
+                .map_err(|_| Error::InternalError(Some("pin check failed".into())))?;
+            match check {
+                Ok(PinCheck::Matches) => Ok(Connected::Stream(Box::new(tls), None)),
+                Ok(PinCheck::Pinned) => {
+                    tracing::warn!(
+                        target: "host.network",
+                        instance_id,
+                        host,
+                        port,
+                        sha256 = %seen.to_hex(),
+                        "trusting a certificate the system roots don't vouch for, on first use",
+                    );
+                    Ok(Connected::Stream(Box::new(tls), Some(seen)))
+                }
+                Ok(PinCheck::Mismatch(pinned)) => Ok(Connected::Refused(PinDenial::Mismatch {
+                    seen: seen.to_hex(),
+                    pinned: pinned.to_hex(),
+                })),
+                Ok(PinCheck::Full) => Ok(Connected::Refused(PinDenial::Full)),
+                Err(err) => {
+                    tracing::error!(target: "host.network", error = %err, "storing a TLS pin failed");
+                    Ok(Connected::Refused(PinDenial::Store))
+                }
+            }
+        }
+        // rustls always verifies the certificate before completing.
+        None => Err(Error::TlsCertificateError),
+    }
+}
+
+/// Map a handshake error to the `wasi:http` error code.
+fn tls_error(err: &std::io::Error) -> Error {
+    if let Some(err) = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<rustls::Error>())
+    {
+        return match err {
+            rustls::Error::InvalidCertificate(_) => Error::TlsCertificateError,
+            rustls::Error::AlertReceived(alert) => Error::TlsAlertReceived {
+                alert_id: Some(u8::from(*alert)),
+                alert_message: None,
+            },
+            _ => Error::TlsProtocolError,
+        };
+    }
+    match err.kind() {
+        std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::UnexpectedEof => Error::ConnectionTerminated,
+        _ => Error::TlsProtocolError,
+    }
+}
