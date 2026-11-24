@@ -477,7 +477,8 @@ pub struct PendingCommands {
     entries: Mutex<HashMap<String, Pending>>,
     ttl_ms: AtomicU64,
     journal: Option<CommandJournal>,
-    /// Times the TTL (see [`crate::clock`]).
+    /// Times the TTL and stamps [`Self::record_entry`] rows (see
+    /// [`crate::clock`]).
     clock: Clock,
 }
 
@@ -777,7 +778,8 @@ impl PendingCommands {
     /// and drained at shutdown. Never blocks; a full journal drops it.
     pub(crate) fn record_entry(&self, entry: AuditEntry) {
         if let Some(journal) = &self.journal {
-            journal.resolve(entry, None);
+            // Stamped now, from the ledger's clock (see `crate::clock`).
+            journal.record(entry, self.clock.now_unix_ms());
         }
     }
 

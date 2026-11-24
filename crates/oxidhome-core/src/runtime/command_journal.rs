@@ -96,6 +96,12 @@ enum Job {
         forget: Option<String>,
     },
     Finalize(Finalize),
+    /// A completed row that is not a command resolution (a late
+    /// service-call result), stamped `at` from its ledger's clock.
+    Record {
+        entry: AuditEntry,
+        at: i64,
+    },
 }
 
 /// Phase 2 of a two-phase audit row (an H6 hop): its outcome, stamped
@@ -233,6 +239,23 @@ impl CommandJournal {
         self.shared.work.notify_one();
     }
 
+    /// Queue a completed row stamped `at`; dropped (and counted) when
+    /// the queue is full or closed, like a resolution with nothing to
+    /// forget.
+    pub(crate) fn record(&self, entry: AuditEntry, at: i64) {
+        let mut q = self.shared.lock();
+        if q.closed || q.jobs.len() >= MAX_JOURNAL_QUEUE {
+            q.dropped += 1;
+            if q.closed {
+                tracing::warn!(target: "host.audit", "audit row after the journal closed; not recorded");
+            }
+            return;
+        }
+        q.jobs.push_back(Job::Record { entry, at });
+        drop(q);
+        self.shared.work.notify_one();
+    }
+
     /// Queue the outcome of a two-phase audit row. `false` when the
     /// journal is closed or holds twice [`MAX_JOURNAL_QUEUE`] jobs: the
     /// row then stays `pending`.
@@ -364,7 +387,7 @@ fn run(shared: &Shared, db: &Db) {
             shared.lock().lost += batch.len() as u64;
             unwritten.extend(batch.iter().filter_map(|job| match job {
                 Job::Persist(row) => Some(row.command_id.clone()),
-                Job::Resolve { .. } | Job::Finalize(_) => None,
+                Job::Resolve { .. } | Job::Finalize(_) | Job::Record { .. } => None,
             }));
             break;
         }
@@ -485,6 +508,9 @@ fn write_batch(db: &Db, batch: &[Job], unwritten: &HashSet<String>) -> Result<()
                         }
                     }
                     AuditLog::insert_completed_row(&tx, now, entry)?;
+                }
+                Job::Record { entry, at } => {
+                    AuditLog::insert_completed_row(&tx, *at, entry)?;
                 }
                 Job::Finalize(f) => {
                     let rows = AuditLog::finalize_row(
