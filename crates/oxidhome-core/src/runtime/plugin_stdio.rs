@@ -361,7 +361,7 @@ mod tests {
                 line.to_owned(),
             ));
         });
-        let rate = Arc::new(Mutex::new(LogRateBucket::new()));
+        let rate = Arc::new(Mutex::new(LogRateBucket::on(crate::clock::Clock::system())));
         let (out, err) = PluginOutput::pair_with_sink("i-1", "example.p", secrets, &rate, &sink);
         (out, err, lines)
     }
@@ -502,7 +502,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            let rate = Arc::new(Mutex::new(LogRateBucket::new()));
+            let rate = Arc::new(Mutex::new(LogRateBucket::on(crate::clock::Clock::system())));
             let (out, _err) = PluginOutput::pair("i-1", "example.p", &["hunter2-secret"], &rate);
             let mut stream = out.p2_stream();
             assert_eq!(stream.check_write().unwrap(), P2_WRITE_BUDGET);

@@ -266,22 +266,26 @@ pub struct LogRateBucket {
     capacity: f64,
     refill_per_sec: f64,
     last_refill: Instant,
+    /// The engine clock (see [`crate::clock`]).
+    clock: crate::clock::Clock,
 }
 
 impl LogRateBucket {
-    pub(crate) fn new() -> Self {
+    /// A full bucket that refills on `clock`.
+    pub(crate) fn on(clock: crate::clock::Clock) -> Self {
         Self {
             tokens: LOG_RATE_BURST,
             capacity: LOG_RATE_BURST,
             refill_per_sec: LOG_RATE_PER_SEC,
-            last_refill: Instant::now(),
+            last_refill: clock.std_instant(),
+            clock,
         }
     }
 
     /// Consume one token if available; return `false` when
     /// exhausted so the caller can drop the log call.
     pub(crate) fn consume(&mut self) -> bool {
-        let now = Instant::now();
+        let now = self.clock.std_instant();
         let elapsed = now
             .saturating_duration_since(self.last_refill)
             .as_secs_f64();
@@ -502,11 +506,11 @@ impl PluginState {
         instances: Arc<InstanceRegistry>,
     ) -> Self {
         let instance_id: InstanceId = instance_id.into();
-        let log_rate = Arc::new(std::sync::Mutex::new(LogRateBucket::new()));
-        // The guest's `wasi:clocks` read the engine clock, reached
-        // through the device-state store the engine built on it (a
-        // no-op on the system clock).
+        // The guest's `wasi:clocks` and the log bucket read the engine
+        // clock, reached through the device-state store the engine
+        // built on it (a no-op on the system clock).
         let clock = device_state.clock().clone();
+        let log_rate = Arc::new(std::sync::Mutex::new(LogRateBucket::on(clock.clone())));
         let wasi = build_wasi(&instance_id, &manifest, &config, &log_rate, &clock, None);
         // C5: `PluginState::new` doesn't know about
         // `InstalledPluginRegistry` (it's the low-level
@@ -4035,6 +4039,16 @@ mod tests {
             refusal.is_err(),
             "aggregate limiter must refuse; got {refusal:?}",
         );
+    }
+
+    #[test]
+    fn log_bucket_refills_on_the_virtual_clock() {
+        let v = crate::clock::VirtualClock::new();
+        let mut bucket = LogRateBucket::on(v.clone().into());
+        while bucket.consume() {}
+        assert!(!bucket.consume(), "frozen time refills nothing");
+        v.advance(std::time::Duration::from_secs(1));
+        assert!(bucket.consume());
     }
 
     /// C4 review P1 F2: `logging::log` refuses calls past the

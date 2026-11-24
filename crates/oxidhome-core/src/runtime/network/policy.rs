@@ -290,7 +290,10 @@ impl Resolved {
                 && let Some(oldest) = self
                     .entries
                     .iter()
-                    .min_by_key(|(_, e)| e.expires())
+                    // The address breaks ties (a frozen virtual
+                    // clock gives every grant the same expiry), so
+                    // eviction never depends on hash order.
+                    .min_by_key(|(ip, e)| (e.expires(), **ip))
                     .map(|(ip, _)| *ip)
             {
                 self.entries.remove(&oldest);
@@ -925,17 +928,43 @@ mod tests {
         v.advance(Duration::from_secs(2));
         assert!(p.check_addr(Use::Tcp, addr, None).is_err());
 
-        let take = || {
+        let suppressed = || {
             p.audit
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .take(p.clock.std_instant())
+                .suppressed
         };
-        while take().is_some() {}
+        let deny = || p.audit_denial("connect", "10.0.0.1:1", &Denial::Listen);
+        for _ in 0..16 {
+            deny();
+        }
+        assert_eq!(suppressed(), 0);
         // Frozen time refills nothing; one virtual second does.
-        assert_eq!(take(), None);
+        deny();
+        deny();
+        assert_eq!(suppressed(), 2);
         v.advance(Duration::from_secs(1));
-        assert_eq!(take(), Some(2));
+        deny();
+        assert_eq!(suppressed(), 0);
+    }
+
+    #[test]
+    fn eviction_ties_break_by_address() {
+        let mut table = Resolved::default();
+        let now = Instant::now();
+        let nth = |i: usize| {
+            IpAddr::from(std::net::Ipv4Addr::from(
+                0x0808_0000 + u32::try_from(i).unwrap(),
+            ))
+        };
+        for i in (0..=MAX_RESOLVED).rev() {
+            table.insert(nth(i), &[0], now);
+        }
+        // Every grant expires together; inserting the last address
+        // evicts the lowest one already held.
+        assert_eq!(table.rules_for(nth(1), now), Vec::<usize>::new());
+        assert_eq!(table.rules_for(nth(0), now), vec![0]);
+        assert_eq!(table.rules_for(nth(2), now), vec![0]);
     }
 
     #[test]
