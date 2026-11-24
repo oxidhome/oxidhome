@@ -1914,33 +1914,30 @@ fn io_gate_after(clock: &Clock, last_tick: Option<Instant>) -> Option<Sleep> {
 /// virtual clock sees it registered without a gap. Like the tick
 /// interval, a gate that falls due while the loop runs other guest work
 /// (a command, event delivery) keeps a virtual clock unsettled until the
-/// loop comes back to it. When the gate is
-/// what held a ready socket back, the fired gate is returned and kept
-/// until the tick it triggers is done (a virtual clock then waits for
-/// that tick, see [`Clock::sleep_until`]). A wait that then goes on for
-/// real I/O drops it first: the clock didn't trigger what follows.
+/// loop comes back to it. When the gate is what held a ready socket
+/// back, the fired gate is returned and kept until the tick it triggers
+/// is done (a virtual clock then waits for that tick, see
+/// [`Clock::sleep_until`]). A wait that then goes on for real I/O drops
+/// it first: the clock didn't trigger what follows.
 async fn io_ready(
     instance: &mut PluginInstance,
     clock: &Clock,
     last_tick: Option<Instant>,
     gate: &mut Option<Sleep>,
 ) -> Option<Sleep> {
-    let mut readable = instance.io_readable();
-    if readable.is_empty() {
-        // Kept until it fires, so a socket a command opens meanwhile
-        // still waits out the gap; then dropped, so a virtual clock
-        // doesn't wait for a tick that has nothing to read.
-        if let Some(sleep) = gate.as_mut() {
-            sleep.await;
-        }
-        *gate = None;
-        return std::future::pending().await;
-    }
     if gate.is_none() {
         *gate = io_gate_after(clock, last_tick);
     }
+    // The gap first: no table scan while it is closed. A gate that
+    // fires with nothing to watch is dropped, so a virtual clock
+    // doesn't wait for a tick that has nothing to read.
     if let Some(sleep) = gate.as_mut() {
         sleep.await;
+    }
+    let mut readable = instance.io_readable();
+    if readable.is_empty() {
+        *gate = None;
+        return std::future::pending().await;
     }
     let gate = gate.take();
     let now = std::future::poll_fn(|cx| {
@@ -2036,8 +2033,10 @@ async fn serve_loop(
                 io_gate = gate;
                 // A periodic tick due now is this same tick: taken here,
                 // so the two don't run back to back.
+                // Unconstrained: Tokio's task budget must not hide a due
+                // tick.
                 if let Some(interval) = tick.as_mut() {
-                    let _ = interval.tick().now_or_never();
+                    let _ = tokio::task::unconstrained(interval.tick()).now_or_never();
                 }
                 let outcome = tick_now(instance, stop, &clock, &mut last_tick).await;
                 // Registered before `io_gate` goes, so a virtual clock

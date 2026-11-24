@@ -26,9 +26,10 @@
 //! non-blocking `recv_from` that answered `WouldBlock` counts). The
 //! cadence can then be a slow fallback rather than a polling rate.
 //! Wakeups are coalesced (one tick however much arrived) and start at
-//! least 100 ms after the previous tick returned. Read everything a tick
-//! finds and drop sockets that reached their end: a socket left readable
-//! wakes the plugin again after each gap. Without `tick_interval_ms` the plugin is never ticked.
+//! least 100 ms after the previous tick returned. Read what a tick finds,
+//! up to a bound per tick so a busy peer can't hold the call, and drop
+//! sockets that reached their end: a socket left readable (data still
+//! queued, or at its end) wakes the plugin again after each gap. Without `tick_interval_ms` the plugin is never ticked.
 //!
 //! # HTTP
 //!
