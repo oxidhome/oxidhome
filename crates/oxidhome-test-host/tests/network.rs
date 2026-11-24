@@ -965,6 +965,10 @@ async fn an_upload_refused_mid_way_returns_the_refusal() {
     // body: the SDK must stop uploading and return the answer, not block.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
+    // When the refusal went out: the bound is measured from there, not
+    // from staging the plugin (which may build it).
+    let refused_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let refused = Arc::clone(&refused_at);
     std::thread::spawn(move || {
         let Ok((mut stream, _)) = listener.accept() else {
             return;
@@ -976,12 +980,12 @@ async fn an_upload_refused_mid_way_returns_the_refusal() {
         }
         let _ =
             stream.write_all(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 4\r\n\r\nbig!");
+        *refused.lock().unwrap() = Some(Instant::now());
         // Hold the connection open, reading nothing.
         std::thread::sleep(Duration::from_secs(20));
         drop(stream);
     });
     let host = TestHost::new().unwrap();
-    let started = Instant::now();
     let results = probe(
         &host,
         "uploader",
@@ -990,9 +994,6 @@ async fn an_upload_refused_mid_way_returns_the_refusal() {
     )
     .await;
     assert_eq!(results, ["ok:413:big!"]);
-    assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "{:?}",
-        started.elapsed()
-    );
+    let since = refused_at.lock().unwrap().expect("refused").elapsed();
+    assert!(since < Duration::from_secs(10), "{since:?}");
 }

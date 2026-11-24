@@ -646,7 +646,12 @@ impl std::fmt::Debug for Response {
 
 /// `raw` with any `user:password@` in its authority replaced by `***@`.
 fn redact_userinfo(raw: &str) -> String {
-    let start = raw.find("://").map_or(0, |i| i + 3);
+    // After `scheme://`, or a scheme-relative `//`.
+    let start = raw
+        .find("://")
+        .map(|i| i + 3)
+        .or_else(|| raw.starts_with("//").then_some(2))
+        .unwrap_or(0);
     let end = raw[start..]
         .find(['/', '?', '#'])
         .map_or(raw.len(), |i| start + i);
@@ -878,6 +883,9 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(redact_userinfo("http://cam.lan/a@b"), "http://cam.lan/a@b");
+        assert_eq!(redact_userinfo("//u:pw@cam.lan/live"), "//***@cam.lan/live");
+        let shown = format!("{:?}", Request::get("//u:pw@cam.lan/live"));
+        assert!(!shown.contains("pw"), "{shown}");
     }
 
     #[test]
