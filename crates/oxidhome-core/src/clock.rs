@@ -9,6 +9,8 @@
 //! - the supervisor's `tick_interval_ms` schedule;
 //! - the `accepted`-command TTL (H5);
 //! - the event bus's per-instance publish rate buckets;
+//! - the network policy's resolved-address grant TTL and its
+//!   denial-audit rate bucket (streaming worlds);
 //! - the liveness watchdog's epoch counter.
 //!
 //! [`Clock::system`] — the default, and the only clock the daemon
@@ -27,8 +29,10 @@
 //! command-journal row times (with the journal's `COMMAND` audit
 //! rows), request and call-service deadlines (H6 invocation
 //! deadlines), restart backoff, shutdown grace periods, retention
-//! cutoffs, and the API and MCP surfaces' relative time filters. They
-//! keep reading real time under a virtual clock too.
+//! cutoffs, the API and MCP surfaces' relative time filters, and the
+//! network I/O deadlines of streaming worlds (DNS lookup, TCP connect,
+//! HTTP first-byte and between-bytes timeouts), which bound real
+//! sockets. They keep reading real time under a virtual clock too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -104,6 +108,17 @@ impl Clock {
         match &self.source {
             Source::System => Instant::now(),
             Source::Virtual(v) => v.instant(),
+        }
+    }
+
+    /// [`Self::instant`] as a `std` instant, for host code that keeps
+    /// `std::time::Instant`s: `std::time::Instant::now()` on the system
+    /// clock (as before the seam), the virtual instant on a virtual one.
+    #[must_use]
+    pub(crate) fn std_instant(&self) -> std::time::Instant {
+        match &self.source {
+            Source::System => std::time::Instant::now(),
+            Source::Virtual(v) => v.instant().into_std(),
         }
     }
 

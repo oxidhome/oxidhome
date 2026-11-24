@@ -541,6 +541,7 @@ impl PluginState {
             instance_id.as_str(),
             &[],
             None,
+            clock.clone(),
         ));
         Self {
             instance_id,
@@ -585,6 +586,7 @@ impl PluginState {
             self.instance_id.as_str(),
             &self.granted_capabilities.network,
             self.audit_log.clone(),
+            self.clock.clone(),
         ));
         self.wasi = build_wasi(
             &self.instance_id,

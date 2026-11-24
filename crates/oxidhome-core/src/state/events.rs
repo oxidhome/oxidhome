@@ -355,9 +355,7 @@ impl RateLimiter {
     /// `std::time::Instant::now()` on the system clock (as before the
     /// clock seam), the virtual instant on a virtual one.
     fn now(clock: &crate::clock::Clock) -> Instant {
-        clock
-            .as_virtual()
-            .map_or_else(Instant::now, |v| v.instant().into_std())
+        clock.std_instant()
     }
 
     fn consume(&self) -> bool {

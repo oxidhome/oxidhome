@@ -243,8 +243,9 @@ block_on(counter.tick()).unwrap();
 ## Limits
 
 - Time: even on a virtual clock, a guest's WASI sleep takes real time,
-  as do request and `call-service` deadlines, restart backoff, shutdown
-  grace periods, and KV and blob write times. On a real-clock host,
+  as do request and `call-service` deadlines, a streaming plugin's DNS,
+  connect and HTTP timeouts, restart backoff, shutdown grace periods,
+  and KV and blob write times. On a real-clock host,
   `advance` only schedules a directly driven plugin's ticks.
 - A directly loaded plugin can call services but can't serve them; start
   the provider with `TestHost::start`.
