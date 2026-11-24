@@ -32,6 +32,8 @@ pub struct TlsPinView {
     pub sha256: String,
     /// When it was pinned, Unix milliseconds.
     pub pinned_ms: i64,
+    /// The plugin installation whose instance made it.
+    pub installation_uuid: String,
 }
 
 impl From<TlsPin> for TlsPinView {
@@ -42,6 +44,7 @@ impl From<TlsPin> for TlsPinView {
             port: pin.key.port,
             sha256: pin.fingerprint.to_hex(),
             pinned_ms: pin.pinned_ms,
+            installation_uuid: pin.installation_uuid,
         }
     }
 }

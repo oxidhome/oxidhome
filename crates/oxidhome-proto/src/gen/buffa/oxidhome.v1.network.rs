@@ -713,6 +713,17 @@ pub struct TlsPin {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
     )]
     pub pinned_ms: i64,
+    /// The plugin installation whose instance made it (uninstalling the
+    /// plugin deletes it).
+    ///
+    /// Field 6: `installation_uuid`
+    #[serde(
+        rename = "installationUuid",
+        alias = "installation_uuid",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub installation_uuid: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -725,6 +736,7 @@ impl ::core::fmt::Debug for TlsPin {
             .field("port", &self.port)
             .field("sha256", &self.sha256)
             .field("pinned_ms", &self.pinned_ms)
+            .field("installation_uuid", &self.installation_uuid)
             .finish()
     }
 }
@@ -770,6 +782,11 @@ impl ::buffa::Message for TlsPin {
         if self.pinned_ms != 0i64 {
             size += 1u64 + ::buffa::types::int64_encoded_len(self.pinned_ms) as u64;
         }
+        if !self.installation_uuid.is_empty() {
+            size
+                += 1u64
+                    + ::buffa::types::string_encoded_len(&self.installation_uuid) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -794,6 +811,9 @@ impl ::buffa::Message for TlsPin {
         }
         if self.pinned_ms != 0i64 {
             ::buffa::types::put_int64_field(5u32, self.pinned_ms, buf);
+        }
+        if !self.installation_uuid.is_empty() {
+            ::buffa::types::put_string_field(6u32, &self.installation_uuid, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -843,6 +863,13 @@ impl ::buffa::Message for TlsPin {
                 )?;
                 self.pinned_ms = ::buffa::types::decode_int64(buf)?;
             }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.installation_uuid, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -856,6 +883,7 @@ impl ::buffa::Message for TlsPin {
         self.port = 0u32;
         self.sha256.clear();
         self.pinned_ms = 0i64;
+        self.installation_uuid.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

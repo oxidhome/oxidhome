@@ -61,8 +61,9 @@ is checked against the host-held pin for `(instance, host, port)`: no pin pins i
 certificate passes, a different one is refused and audited, even one the roots vouch for. Any other certificate
 fault (expired, issued for another name, not for server use) is refused, never pinned. Public addresses, and NAT64
 addresses (`64:ff9b::/96`, `64:ff9b:1::/48`, which may translate to public servers), never get this. Pins are bounded
-(256 per instance, 4096 in all), survive restarts, and record the plugin installation whose instance made them:
-uninstalling the plugin deletes them (audited, like its storage). The operator lists and resets them
+(256 per instance, 4096 in all), survive restarts, and belong to the plugin installation whose instance made them
+(an instance id another plugin reuses inherits nothing): uninstalling the plugin deletes them, each audited, like its
+storage. The operator lists and resets them
 (`oxidhome tls-pin`, REST, Connect; MCP lists them).
 
 **Fixed ceilings, no knobs** (as in ADR-0006): per instance 64 live sockets, 4 concurrent name lookups (5 s each,

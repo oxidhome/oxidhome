@@ -967,12 +967,13 @@ fn run_tls_pin() -> anyhow::Result<()> {
     }
     for pin in pins {
         println!(
-            "{}\t{}:{}\tsha256:{}\tpinned_ms={}",
+            "{}\t{}:{}\tsha256:{}\tpinned_ms={}\tinstallation={}",
             pin.key.instance_id,
             pin.key.host,
             pin.key.port,
             pin.fingerprint.to_hex(),
-            pin.pinned_ms
+            pin.pinned_ms,
+            pin.installation_uuid
         );
     }
     Ok(())

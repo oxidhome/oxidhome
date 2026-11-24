@@ -1180,6 +1180,11 @@ pub struct TlsPinView<'a> {
     ///
     /// Field 5: `pinned_ms`
     pub pinned_ms: i64,
+    /// The plugin installation whose instance made it (uninstalling the
+    /// plugin deletes it).
+    ///
+    /// Field 6: `installation_uuid`
+    pub installation_uuid: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for TlsPinView<'a> {
@@ -1245,6 +1250,13 @@ impl<'a> ::buffa::MessageView<'a> for TlsPinView<'a> {
                 )?;
                 view.pinned_ms = ::buffa::types::decode_int64(&mut cur)?;
             }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.installation_uuid = ::buffa::types::borrow_str(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -1272,6 +1284,7 @@ impl<'a> ::buffa::MessageView<'a> for TlsPinView<'a> {
             port: self.port,
             sha256: self.sha256.to_string(),
             pinned_ms: self.pinned_ms,
+            installation_uuid: self.installation_uuid.to_string(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1298,6 +1311,11 @@ impl<'a> ::buffa::ViewEncode<'a> for TlsPinView<'a> {
         if self.pinned_ms != 0i64 {
             size += 1u64 + ::buffa::types::int64_encoded_len(self.pinned_ms) as u64;
         }
+        if !self.installation_uuid.is_empty() {
+            size
+                += 1u64
+                    + ::buffa::types::string_encoded_len(&self.installation_uuid) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1323,6 +1341,9 @@ impl<'a> ::buffa::ViewEncode<'a> for TlsPinView<'a> {
         }
         if self.pinned_ms != 0i64 {
             ::buffa::types::put_int64_field(5u32, self.pinned_ms, buf);
+        }
+        if !self.installation_uuid.is_empty() {
+            ::buffa::types::put_string_field(6u32, &self.installation_uuid, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1364,6 +1385,9 @@ impl<'__a> ::serde::Serialize for TlsPinView<'__a> {
                     "pinnedMs",
                     &::buffa::json_helpers::ProtoJson(&self.pinned_ms),
                 )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.installation_uuid) {
+            __map.serialize_entry("installationUuid", self.installation_uuid)?;
         }
         __map.end()
     }
@@ -1486,6 +1510,14 @@ impl TlsPinOwnedView {
     #[must_use]
     pub fn pinned_ms(&self) -> i64 {
         self.0.reborrow().pinned_ms
+    }
+    /// The plugin installation whose instance made it (uninstalling the
+    /// plugin deletes it).
+    ///
+    /// Field 6: `installation_uuid`
+    #[must_use]
+    pub fn installation_uuid(&self) -> &'_ str {
+        self.0.reborrow().installation_uuid
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<TlsPinView<'static>>> for TlsPinOwnedView {

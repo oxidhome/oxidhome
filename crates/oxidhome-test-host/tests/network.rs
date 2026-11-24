@@ -765,9 +765,10 @@ async fn https_reaches_servers_the_roots_vouch_for() {
     // Signed by the trusted CA, for another name: only the name check
     // fails, and that is refused even where trust on first use applies.
     let wrong_name = TlsServer::start(&leaf(&issuer, "camera.example"), |_| http_ok("no"));
-    // Self-signed but expired: refused, not pinned (only an unknown
-    // issuer is trusted on first use).
+    // Self-signed but expired, or for another name: refused, not pinned
+    // (an unknown issuer must be the certificate's only fault).
     let expired = TlsServer::start(&expired_self_signed("127.0.0.1"), |_| http_ok("no"));
+    let other_name = TlsServer::start(&self_signed(&["camera.lan"]), |_| http_ok("no"));
     let results = probe(
         &host,
         "https",
@@ -775,17 +776,21 @@ async fn https_reaches_servers_the_roots_vouch_for() {
             format!("https://127.0.0.1:{}", server.port()),
             format!("https://127.0.0.1:{}", wrong_name.port()),
             format!("https://127.0.0.1:{}", expired.port()),
+            format!("https://127.0.0.1:{}", other_name.port()),
         ],
         &[
             format!("get https://127.0.0.1:{}/ok", server.port()),
             format!("get https://127.0.0.1:{}/ok", wrong_name.port()),
             format!("get https://127.0.0.1:{}/ok", expired.port()),
+            format!("get https://127.0.0.1:{}/ok", other_name.port()),
         ],
     )
     .await;
     assert_eq!(results[0], "ok:200:secure");
-    assert_eq!(results[1], "err:Http(ErrorCode::TlsCertificateError)");
-    assert_eq!(results[2], "err:Http(ErrorCode::TlsCertificateError)");
+    for refused in &results[1..] {
+        assert_eq!(refused, "err:Http(ErrorCode::TlsCertificateError)");
+    }
+    assert_eq!(other_name.served(), 0);
     assert_eq!(server.served(), 1);
     assert_eq!(wrong_name.served(), 0);
     assert_eq!(expired.served(), 0);
@@ -801,7 +806,7 @@ async fn https_reaches_servers_the_roots_vouch_for() {
 async fn lan_certificates_are_pinned_on_first_use() {
     // Loopback is trusted on first use like a LAN address.
     let host = TestHost::new().unwrap().with_tls_for_tests(Vec::new());
-    let first = self_signed(&["camera.lan"]);
+    let first = self_signed(&["127.0.0.1"]);
     let server = TlsServer::start(&first, |_| http_ok("frame"));
     let rule = format!("https://127.0.0.1:{}", server.port());
     let get = format!("get https://127.0.0.1:{}/snap", server.port());
@@ -827,7 +832,7 @@ async fn lan_certificates_are_pinned_on_first_use() {
 
     // Another certificate at the same place is refused, before any
     // request bytes are sent, and audited.
-    server.swap(&self_signed(&["camera.lan"]));
+    server.swap(&self_signed(&["127.0.0.1"]));
     let results = probe(
         &host,
         "cam",
@@ -914,7 +919,8 @@ async fn a_pin_holds_against_a_root_vouched_replacement() {
         .tls_pins()
         .check_or_pin(
             &key,
-            "test-installation",
+            // A dev load's installation is its plugin id.
+            "example.net-probe",
             oxidhome_core::state::Fingerprint::of_der(b"the device's old certificate"),
         )
         .unwrap();
@@ -952,7 +958,8 @@ async fn a_changed_untrusted_certificate_is_audited_as_a_pin_mismatch() {
                 host: "127.0.0.1".into(),
                 port: server.port(),
             },
-            "test-installation",
+            // A dev load's installation is its plugin id.
+            "example.net-probe",
             oxidhome_core::state::Fingerprint::of_der(b"the device's old certificate"),
         )
         .unwrap();

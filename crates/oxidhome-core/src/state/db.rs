@@ -971,7 +971,7 @@ const MIGRATIONS: &[&str] = &[
         sha256      TEXT NOT NULL,
         pinned_ms   INTEGER NOT NULL,
         installation_uuid TEXT NOT NULL,
-        PRIMARY KEY (instance_id, host, port)
+        PRIMARY KEY (instance_id, host, port, installation_uuid)
     ) WITHOUT ROWID;
     ",
 ];

@@ -195,7 +195,7 @@ pub(super) fn list_resources() -> Vec<Resource> {
             .with_description(
                 "JSON `{pins: [...]}`: the certificates streaming plugins trusted on \
                  first use for LAN devices — `instance_id`, `host`, `port`, `sha256` \
-                 (leaf certificate, lowercase hex), `pinned_ms`. Read-only; the owner \
+                 (leaf certificate, lowercase hex), `pinned_ms`, `installation_uuid`. Read-only; the owner \
                  resets pins with `oxidhome tls-pin reset` or \
                  `DELETE /api/v1/network/tls-pins`. Mirrors `GET /api/v1/network/tls-pins`.",
             )

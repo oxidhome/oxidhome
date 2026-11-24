@@ -53,4 +53,7 @@ message TlsPin {
   string sha256 = 4;
   // When it was pinned, Unix milliseconds.
   int64 pinned_ms = 5;
+  // The plugin installation whose instance made it (uninstalling the
+  // plugin deletes it).
+  string installation_uuid = 6;
 }

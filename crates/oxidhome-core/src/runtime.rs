@@ -836,12 +836,7 @@ impl Engine {
             // Phase 8.2: the certificates its instances trusted on first
             // use go with it, so a reinstall under the same instance id
             // trusts nothing it didn't see itself.
-            let removed = self.tls.pins().purge_installation(uuid).map_err(|err| {
-                crate::state::UninstallError::Io(std::io::Error::other(format!(
-                    "TLS pin purge failed for install {uuid}: {err}"
-                )))
-            })?;
-            self.audit_pin_purge(plugin_id, &removed);
+            self.purge_tls_pins(plugin_id, uuid)?;
         }
         // Tombstone the registry row last. Ordering matters: a
         // crash between purge success and tombstone leaves the
@@ -854,22 +849,29 @@ impl Engine {
         Ok(())
     }
 
-    /// One audit `allow` row (level `warn`) per TLS pin an uninstall
-    /// deleted: `net.tls_pin_purge/<instance>/<host>:<port>/sha256:<hex>`.
-    fn audit_pin_purge(&self, plugin_id: &str, removed: &[crate::state::TlsPin]) {
+    /// Delete the TLS pins the installation `uuid`'s instances made,
+    /// each one audited: a durable intent row
+    /// (`net.tls_pin_purge/<instance>/<host>:<port>/sha256:<hex>`) before
+    /// the delete, finalized after it, so a crash in between still
+    /// leaves the record. The installation is retired first, so no pin
+    /// write still in flight lands after the purge.
+    fn purge_tls_pins(
+        &self,
+        plugin_id: &str,
+        uuid: &str,
+    ) -> Result<(), crate::state::UninstallError> {
         use crate::auth::invocation;
-        if removed.is_empty() {
-            return;
+        let io = |what: String| crate::state::UninstallError::Io(std::io::Error::other(what));
+        let pins = self.tls.pins();
+        pins.retire(uuid);
+        let doomed = pins.list_installation(uuid);
+        if doomed.is_empty() {
+            return Ok(());
         }
-        tracing::warn!(
-            target: "host.network",
-            plugin_id,
-            removed = removed.len(),
-            "uninstall removed the plugin's TLS certificate pins",
-        );
         let ctx = invocation::current_or_host(plugin_id);
         let root = ctx.root();
-        for pin in removed {
+        let mut intents = Vec::with_capacity(doomed.len());
+        for pin in &doomed {
             let entry = crate::state::AuditEntry {
                 id: 0,
                 intent_ms: 0,
@@ -884,9 +886,9 @@ impl Engine {
                     pin.key.port,
                     pin.fingerprint.to_hex()
                 ),
-                status: 200,
-                decision: "allow".into(),
-                required_scope: Some("network".into()),
+                status: 0,
+                decision: "pending".into(),
+                required_scope: None,
                 execution_outcome: None,
                 domain_error: None,
                 credential_fp: None,
@@ -894,12 +896,36 @@ impl Engine {
                 invocation: Some(ctx.audit_json()),
                 command_id: None,
                 command_outcome: None,
-                level: Some("warn".into()),
+                level: None,
             };
-            if let Err(err) = self.audit_log.record_completed(&entry) {
-                tracing::error!(target: "host.audit", error = %err, "TLS pin purge row failed");
+            intents.push(
+                self.audit_log
+                    .record_intent_durable(&entry)
+                    .map_err(|err| {
+                        io(format!(
+                            "auditing the TLS pin purge for install {uuid} failed: {err}"
+                        ))
+                    })?,
+            );
+        }
+        let removed = pins
+            .purge_installation(uuid)
+            .map_err(|err| io(format!("TLS pin purge failed for install {uuid}: {err}")))?;
+        tracing::warn!(
+            target: "host.network",
+            plugin_id,
+            removed = removed.len(),
+            "uninstall removed the plugin's TLS certificate pins",
+        );
+        for id in intents {
+            if let Err(err) = self
+                .audit_log
+                .finalize(id, 200, "allow", Some("network"), None, None)
+            {
+                tracing::error!(target: "host.audit", error = %err, "finalizing a TLS pin purge row failed");
             }
         }
+        Ok(())
     }
 
     /// Start a supervised plugin instance under this engine. Reads

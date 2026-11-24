@@ -365,6 +365,7 @@ fn proto_tls_pin(pin: crate::state::TlsPin) -> oxidhome_proto::proto::oxidhome::
         port: u32::from(pin.key.port),
         sha256: pin.fingerprint.to_hex(),
         pinned_ms: pin.pinned_ms,
+        installation_uuid: pin.installation_uuid,
         ..Default::default()
     }
 }
@@ -1194,9 +1195,15 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         // state.
         let engine = self.engine.clone();
         let id_for_blocking = req.plugin_id.clone();
+        // The caller, for the audit rows the uninstall writes.
+        let caller = ctx.extensions().get::<InvocationContext>().cloned();
         let result = tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            engine.uninstall_plugin(&id_for_blocking)
+            let uninstall = || engine.uninstall_plugin(&id_for_blocking);
+            match caller {
+                Some(caller) => crate::auth::invocation::CURRENT.sync_scope(caller, uninstall),
+                None => uninstall(),
+            }
         })
         .await
         .map_err(|err| {

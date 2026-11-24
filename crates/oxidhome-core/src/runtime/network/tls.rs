@@ -193,6 +193,38 @@ struct Verifier {
     seen: Mutex<Option<Fingerprint>>,
 }
 
+impl Verifier {
+    /// Verify the chain as if the certificates the server presented
+    /// were trusted roots: everything but the issuer is checked (the
+    /// name, validity dates, key usage, the issuing signature). A
+    /// self-signed leaf anchors itself; a leaf from an unknown CA
+    /// verifies when the server also presents that CA.
+    fn verify_trusting_presented(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<(), rustls::Error> {
+        let mut presented = RootCertStore::empty();
+        for cert in std::iter::once(end_entity).chain(intermediates) {
+            // A certificate that can't anchor just isn't one.
+            let _ = presented.add(cert.clone().into_owned());
+        }
+        if presented.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        WebPkiServerVerifier::builder_with_provider(Arc::new(presented), Arc::clone(&self.provider))
+            .build()
+            .map_err(|err| rustls::Error::General(err.to_string()))?
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .map(|_| ())
+    }
+}
+
 impl ServerCertVerifier for Verifier {
     fn verify_server_cert(
         &self,
@@ -218,12 +250,20 @@ impl ServerCertVerifier for Verifier {
                     Some(Trust::Roots(Fingerprint::of_der(end_entity)));
                 return Ok(verified);
             }
-            // Only an issuer the roots don't know (a self-signed device):
+            // Only an issuer the roots don't know (a self-signed device),
+            // and only once the rest checks out with that issuer trusted:
             // an expired certificate, one for another name or one for
             // another use is refused like anywhere else.
             Err(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))
                 if self.tofu =>
             {
+                self.verify_trusting_presented(
+                    end_entity,
+                    intermediates,
+                    server_name,
+                    ocsp_response,
+                    now,
+                )?;
                 Trust::FirstUse(Fingerprint::of_der(end_entity))
             }
             Err(err) => return Err(err),
@@ -283,6 +323,8 @@ pub(super) enum PinDenial {
     Full,
     #[error("storing the certificate pin failed")]
     Store,
+    #[error("the plugin is being uninstalled; nothing new is pinned for it")]
+    Retired,
 }
 
 /// Outcome of [`connect`].
@@ -340,7 +382,7 @@ pub(super) async fn connect(
             // A pinned key presenting another certificate is a pin
             // refusal (audited), whatever else failed with it.
             let seen = *verifier.seen.lock().unwrap_or_else(PoisonError::into_inner);
-            return match (seen, client.pins.pinned(&key)) {
+            return match (seen, client.pins.pinned(&key, policy.installation_uuid())) {
                 (Some(seen), Some(pinned)) if seen != pinned => {
                     Ok(Connected::Refused(PinDenial::Mismatch {
                         seen: seen.to_hex(),
@@ -360,7 +402,7 @@ pub(super) async fn connect(
             // A pinned key stays pinned until the operator resets it,
             // whoever vouches for a replacement and wherever the name now
             // resolves.
-            match client.pins.pinned(&key) {
+            match client.pins.pinned(&key, policy.installation_uuid()) {
                 Some(pinned) if pinned != seen => Ok(Connected::Refused(PinDenial::Mismatch {
                     seen: seen.to_hex(),
                     pinned: pinned.to_hex(),
@@ -398,21 +440,31 @@ pub(super) async fn connect(
             })
             .await
             .map_err(|_| Error::InternalError(Some("pin check failed".into())))?;
-            match check {
-                Ok(PinCheck::Matches | PinCheck::Pinned) => Ok(Connected::Stream(Box::new(tls))),
-                Ok(PinCheck::Mismatch(pinned)) => Ok(Connected::Refused(PinDenial::Mismatch {
-                    seen: seen.to_hex(),
-                    pinned: pinned.to_hex(),
-                })),
-                Ok(PinCheck::Full) => Ok(Connected::Refused(PinDenial::Full)),
-                Err(err) => {
-                    tracing::error!(target: "host.network", error = %err, "storing a TLS pin failed");
-                    Ok(Connected::Refused(PinDenial::Store))
-                }
-            }
+            Ok(first_use_outcome(check, seen, tls))
         }
         // rustls always verifies the certificate before completing.
         None => Err(Error::TlsCertificateError),
+    }
+}
+
+/// The connection, or the refusal, a first-use pin check decided.
+fn first_use_outcome(
+    check: Result<PinCheck, rusqlite::Error>,
+    seen: Fingerprint,
+    tls: TlsStream,
+) -> Connected {
+    match check {
+        Ok(PinCheck::Matches | PinCheck::Pinned) => Connected::Stream(Box::new(tls)),
+        Ok(PinCheck::Mismatch(pinned)) => Connected::Refused(PinDenial::Mismatch {
+            seen: seen.to_hex(),
+            pinned: pinned.to_hex(),
+        }),
+        Ok(PinCheck::Full) => Connected::Refused(PinDenial::Full),
+        Ok(PinCheck::Retired) => Connected::Refused(PinDenial::Retired),
+        Err(err) => {
+            tracing::error!(target: "host.network", error = %err, "storing a TLS pin failed");
+            Connected::Refused(PinDenial::Store)
+        }
     }
 }
 

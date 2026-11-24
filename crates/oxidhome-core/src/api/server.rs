@@ -2370,9 +2370,12 @@ async fn uninstall_plugin(
     // `plugin_id` starts with an empty per-instance keyspace.
     let engine = state.engine.clone();
     let id_for_blocking = plugin_id.clone();
+    // The caller, for the audit rows the uninstall writes.
+    let caller = ctx.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        engine.uninstall_plugin(&id_for_blocking)
+        crate::auth::invocation::CURRENT
+            .sync_scope(caller, || engine.uninstall_plugin(&id_for_blocking))
     })
     .await
     .map_err(|err| PluginLifecycleError::Internal(err.into()))?;
