@@ -44,8 +44,10 @@ introduced. Public items should have useful doc comments.
 Prefer descriptive snake_case for modules, functions, and tests. Prefer direct sibling modules such as `host_impl.rs`
 over `mod.rs`. Public structs and enums use `UpperCamelCase`.
 
-Keep exact-pinned dependency bumps isolated for crates that affect generated bindings or runtime embedding, especially
-`wit-bindgen` in `oxidhome-wit` and `wasmtime` in `oxidhome-core`.
+Keep exact-pinned dependency bumps isolated for crates that affect generated bindings or runtime embedding. The wasm
+toolchain (`wasmtime*`, `wit-bindgen`, `wit-parser`, `wit-component`) moves only as one unit onto a single wasm-tools
+release: `.github/workflows/wasm-toolchain.yaml` opens that PR weekly (`.github/scripts/wasm-toolchain.sh plan` is its
+dry run), and Dependabot ignores these crates.
 
 ## Testing Guidelines
 
