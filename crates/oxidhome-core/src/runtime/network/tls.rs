@@ -13,11 +13,13 @@
 //!   server holds the leaf certificate's key, and the leaf's SHA-256 is
 //!   checked against the instance's pin for `(host, port)` in the
 //!   [`TlsPinStore`]: no pin pins it, the same certificate passes, any
-//!   other is refused and audited. Public addresses never get this.
+//!   other is refused and audited. Public addresses, and NAT64 addresses
+//!   (which may translate to public servers), never get this. A pinned
+//!   key also refuses a different certificate the roots do vouch for.
 //!   Nothing of the request is sent before that check.
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -26,6 +28,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use wasmtime_wasi_http::Error;
 
+use super::policy::NetworkPolicy;
 use crate::native_policy::endpoint::{AddressClass, classify};
 use crate::state::tls_pins::{Fingerprint, PinCheck, PinKey, TlsPinStore};
 
@@ -35,7 +38,9 @@ pub(crate) struct TlsClient {
     provider: Arc<CryptoProvider>,
     /// `None` when the system has no usable roots: only pinned LAN
     /// devices can then be reached.
-    roots: tokio::sync::OnceCell<Option<Arc<WebPkiServerVerifier>>>,
+    /// Built once on a blocking thread; requests that give up waiting
+    /// leave the one load running rather than starting more.
+    roots: Arc<OnceLock<Option<Arc<WebPkiServerVerifier>>>>,
     extra_roots: Vec<CertificateDer<'static>>,
     pins: Arc<TlsPinStore>,
     /// Test hook: also trust loopback servers on first use.
@@ -57,7 +62,7 @@ impl TlsClient {
     pub(crate) fn new(pins: Arc<TlsPinStore>) -> Self {
         Self {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
-            roots: tokio::sync::OnceCell::new(),
+            roots: Arc::new(OnceLock::new()),
             extra_roots: Vec::new(),
             pins,
             tofu_loopback: false,
@@ -87,26 +92,45 @@ impl TlsClient {
     }
 
     async fn root_verifier(&self) -> Option<Arc<WebPkiServerVerifier>> {
-        self.roots
-            .get_or_init(|| async {
-                let extra = self.extra_roots.clone();
-                let provider = Arc::clone(&self.provider);
-                tokio::task::spawn_blocking(move || build_root_verifier(&provider, extra))
-                    .await
-                    .ok()
-                    .flatten()
-            })
-            .await
-            .clone()
+        if let Some(roots) = self.roots.get() {
+            return roots.clone();
+        }
+        let roots = Arc::clone(&self.roots);
+        let extra = self.extra_roots.clone();
+        let provider = Arc::clone(&self.provider);
+        tokio::task::spawn_blocking(move || {
+            roots
+                .get_or_init(|| build_root_verifier(&provider, extra))
+                .clone()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Whether a server at `addr` may be trusted on first use.
     fn tofu_allowed(&self, addr: SocketAddr) -> bool {
-        match classify(addr.ip().to_canonical()) {
+        let ip = addr.ip().to_canonical();
+        if is_nat64(ip) {
+            return false;
+        }
+        match classify(ip) {
             AddressClass::Private | AddressClass::LinkLocal => true,
             AddressClass::Loopback => self.tofu_loopback,
             AddressClass::Public | AddressClass::Forbidden => false,
         }
+    }
+}
+
+/// `64:ff9b::/96` (RFC 6052) and `64:ff9b:1::/48` (RFC 8215): a
+/// translator may map these to any IPv4 server, public ones included.
+fn is_nat64(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0x64 && s[1] == 0xff9b && (s[2] == 1 || s[2..6] == [0, 0, 0, 0])
+        }
+        IpAddr::V4(_) => false,
     }
 }
 
@@ -146,7 +170,7 @@ fn build_root_verifier(
 #[derive(Debug, Clone, Copy)]
 enum Trust {
     /// The roots vouch for it.
-    Roots,
+    Roots(Fingerprint),
     /// Not vouched for, but the server is on the LAN: check the pin.
     FirstUse(Fingerprint),
 }
@@ -179,7 +203,8 @@ impl ServerCertVerifier for Verifier {
         };
         let trust = match verdict {
             Ok(verified) => {
-                *self.trust.lock().unwrap_or_else(PoisonError::into_inner) = Some(Trust::Roots);
+                *self.trust.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Trust::Roots(Fingerprint::of_der(end_entity)));
                 return Ok(verified);
             }
             Err(rustls::Error::InvalidCertificate(_)) if self.tofu => {
@@ -246,18 +271,20 @@ pub(super) enum PinDenial {
 
 /// Outcome of [`connect`].
 pub(super) enum Connected {
-    /// Ready for HTTP; with the fingerprint when this connection pinned
-    /// the server's certificate (the caller audits it).
-    Stream(Box<TlsStream>, Option<Fingerprint>),
+    /// Ready for HTTP.
+    Stream(Box<TlsStream>),
     /// A pin refused the server; the caller audits it.
     Refused(PinDenial),
 }
 
 /// TLS handshake with the server on `stream` (connected to `peer`) for
-/// `host:port` as the request named it, for instance `instance_id`.
+/// `host:port` as the request named it (`target`), for `policy`'s
+/// instance. A new pin is logged and audited here, even when the
+/// request is abandoned meanwhile.
 pub(super) async fn connect(
     client: &TlsClient,
-    instance_id: &str,
+    policy: &Arc<NetworkPolicy>,
+    target: &str,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     host: &str,
@@ -290,31 +317,49 @@ pub(super) async fn connect(
         .trust
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    let key = PinKey {
+        instance_id: policy.instance_id().to_owned(),
+        host: crate::state::tls_pins::normalize_host(host),
+        port,
+    };
     match trust {
-        Some(Trust::Roots) => Ok(Connected::Stream(Box::new(tls), None)),
+        Some(Trust::Roots(seen)) => {
+            // A pinned LAN device stays pinned until the operator resets
+            // it, whoever vouches for a replacement.
+            match client.pins.pinned(&key) {
+                Some(pinned) if verifier.tofu && pinned != seen => {
+                    Ok(Connected::Refused(PinDenial::Mismatch {
+                        seen: seen.to_hex(),
+                        pinned: pinned.to_hex(),
+                    }))
+                }
+                _ => Ok(Connected::Stream(Box::new(tls))),
+            }
+        }
         Some(Trust::FirstUse(seen)) => {
-            let key = PinKey {
-                instance_id: instance_id.to_owned(),
-                host: crate::state::tls_pins::normalize_host(host),
-                port,
-            };
             let pins = Arc::clone(&client.pins);
-            let check = tokio::task::spawn_blocking(move || pins.check_or_pin(&key, seen))
-                .await
-                .map_err(|_| Error::InternalError(Some("pin check failed".into())))?;
-            match check {
-                Ok(PinCheck::Matches) => Ok(Connected::Stream(Box::new(tls), None)),
-                Ok(PinCheck::Pinned) => {
+            let (policy, target) = (Arc::clone(policy), target.to_owned());
+            // Pinned and audited together on the blocking thread, so a
+            // request that times out meanwhile can't leave an unaudited pin.
+            let check = tokio::task::spawn_blocking(move || {
+                let check = pins.check_or_pin(&key, seen);
+                if matches!(check, Ok(PinCheck::Pinned)) {
                     tracing::warn!(
                         target: "host.network",
-                        instance_id,
-                        host,
-                        port,
+                        instance_id = %key.instance_id,
+                        host = %key.host,
+                        port = key.port,
                         sha256 = %seen.to_hex(),
                         "trusting a certificate the system roots don't vouch for, on first use",
                     );
-                    Ok(Connected::Stream(Box::new(tls), Some(seen)))
+                    policy.audit_pinned(&target, seen);
                 }
+                check
+            })
+            .await
+            .map_err(|_| Error::InternalError(Some("pin check failed".into())))?;
+            match check {
+                Ok(PinCheck::Matches | PinCheck::Pinned) => Ok(Connected::Stream(Box::new(tls))),
                 Ok(PinCheck::Mismatch(pinned)) => Ok(Connected::Refused(PinDenial::Mismatch {
                     seen: seen.to_hex(),
                     pinned: pinned.to_hex(),

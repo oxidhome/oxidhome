@@ -601,6 +601,12 @@ struct Cert {
 
 /// A CA and a leaf it signed for `127.0.0.1`.
 fn ca_and_leaf() -> (Vec<u8>, Cert) {
+    let (ca, issuer) = test_ca();
+    (ca, leaf(&issuer, "127.0.0.1"))
+}
+
+/// A CA certificate (DER) and the issuer that signs with it.
+fn test_ca() -> (Vec<u8>, rcgen::Issuer<'static, rcgen::KeyPair>) {
     let ca_key = rcgen::KeyPair::generate().expect("ca key");
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -608,19 +614,20 @@ fn ca_and_leaf() -> (Vec<u8>, Cert) {
         .distinguished_name
         .push(rcgen::DnType::CommonName, "OxidHome test CA");
     let ca = ca_params.self_signed(&ca_key).expect("ca cert");
-    let issuer = rcgen::Issuer::new(ca_params, ca_key);
-    let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
-    let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+    (ca.der().to_vec(), rcgen::Issuer::new(ca_params, ca_key))
+}
+
+/// A leaf for `name` signed by `issuer`.
+fn leaf(issuer: &rcgen::Issuer<'static, rcgen::KeyPair>, name: &str) -> Cert {
+    let key = rcgen::KeyPair::generate().expect("leaf key");
+    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
         .expect("leaf params")
-        .signed_by(&leaf_key, &issuer)
+        .signed_by(&key, issuer)
         .expect("leaf cert");
-    (
-        ca.der().to_vec(),
-        Cert {
-            der: leaf.der().to_vec(),
-            key: leaf_key.serialize_der(),
-        },
-    )
+    Cert {
+        der: cert.der().to_vec(),
+        key: key.serialize_der(),
+    }
 }
 
 /// A self-signed certificate for `names`.
@@ -739,10 +746,11 @@ impl TlsServer {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn https_reaches_servers_the_roots_vouch_for() {
-    let (ca, leaf) = ca_and_leaf();
+    let (ca, issuer) = test_ca();
     let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca], false);
-    let server = TlsServer::start(&leaf, |_| http_ok("secure"));
-    let wrong_name = TlsServer::start(&self_signed(&["camera.example"]), |_| http_ok("no"));
+    let server = TlsServer::start(&leaf(&issuer, "127.0.0.1"), |_| http_ok("secure"));
+    // Signed by the trusted CA, for another name: only the name check fails.
+    let wrong_name = TlsServer::start(&leaf(&issuer, "camera.example"), |_| http_ok("no"));
     let results = probe(
         &host,
         "https",
@@ -872,4 +880,40 @@ async fn the_sdk_client_follows_redirects_without_downgrading() {
     assert_eq!(results[2], "err:TooManyRedirects { limit: 5 }");
     assert_eq!(plain.accepted(), 0, "https must not be downgraded");
     assert_eq!(hop.accepted(), 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pin_holds_against_a_root_vouched_replacement() {
+    let (ca, issuer) = test_ca();
+    // Loopback stands in for a LAN address here.
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca], true);
+    let server = TlsServer::start(&leaf(&issuer, "127.0.0.1"), |_| http_ok("secure"));
+    let key = oxidhome_core::state::PinKey {
+        instance_id: "held".into(),
+        host: "127.0.0.1".into(),
+        port: server.port(),
+    };
+    host.engine()
+        .tls_pins()
+        .check_or_pin(
+            &key,
+            oxidhome_core::state::Fingerprint::of_der(b"the device's old certificate"),
+        )
+        .unwrap();
+    let results = probe(
+        &host,
+        "held",
+        &[format!("https://127.0.0.1:{}", server.port())],
+        &[format!("get https://127.0.0.1:{}/", server.port())],
+    )
+    .await;
+    assert_eq!(results, ["err:Http(ErrorCode::TlsCertificateError)"]);
+    assert_eq!(server.served(), 0);
+    wait_for_deny(
+        &host,
+        "tls",
+        "held",
+        &format!("127.0.0.1:{}", server.port()),
+    )
+    .await;
 }

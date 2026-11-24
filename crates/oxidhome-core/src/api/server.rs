@@ -854,8 +854,10 @@ fn rest_admin(call_id: &str) -> super::token_admin::Audited<'_> {
 
 // ── TLS certificate pins (Phase 8.2) ─────────────────────────────
 
-/// Query of `GET` / `DELETE /api/v1/network/tls-pins`.
+/// Query of `GET` / `DELETE /api/v1/network/tls-pins`. Unknown fields
+/// are refused, so a misspelled filter can't widen a reset to every pin.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TlsPinParams {
     instance_id: Option<String>,
     host: Option<String>,

@@ -57,8 +57,9 @@ host the request named. The network rule check runs before the connection is mad
 **Self-signed LAN devices are trusted on first use.** When the connected address is private or link-local and the
 system roots don't vouch for the certificate, the handshake must still prove the server holds the leaf
 certificate's key, and the leaf's SHA-256 is checked against the host-held pin for `(instance, host, port)`: no
-pin pins it (logged and audited), the same certificate passes, a different one is refused and audited. Public
-addresses never get this. Pins are bounded (256 per instance, 4096 in all) and survive restarts; the operator lists
+pin pins it (logged and audited), the same certificate passes, a different one is refused and audited, even one
+the roots vouch for. Public addresses, and NAT64 addresses (`64:ff9b::/96`, `64:ff9b:1::/48`, which may translate to
+public servers), never get this. Pins are bounded (256 per instance, 4096 in all) and survive restarts; the operator lists
 and resets them (`oxidhome tls-pin`, REST, Connect; MCP lists them).
 
 **Fixed ceilings, no knobs** (as in ADR-0006): per instance 64 live sockets, 4 concurrent name lookups (5 s each,
@@ -88,7 +89,8 @@ and outgoing-body writes of at most 16 KiB with at most two buffered.
 
 ## Consequences
 
-- LAN devices reached by name need a local-only name (`camera.lan`) or an IP / CIDR rule.
+- LAN devices reached by name need a local-only name rule (`camera.lan`), or a name rule plus an IP / CIDR rule
+  covering the address it resolves to; an IP / CIDR rule alone reaches IP-literal requests only.
 - Hosts with no usable system roots reach only pinned LAN devices over `https://`.
 - A device whose certificate changes is refused until the operator resets its pin.
 - Old devices offering only CBC suites or TLS ≤ 1.1 are unreachable over `https://`.

@@ -402,10 +402,10 @@ async fn checked_addresses(
     Ok(allowed)
 }
 
-/// TLS handshake for `host` on `stream`, by `deadline`; audits a new
-/// pin, and refuses (and audits) a certificate that doesn't match one.
+/// TLS handshake for `host` on `stream`, by `deadline`; refuses (and
+/// audits) a certificate that doesn't match its pin.
 async fn secure(
-    policy: &NetworkPolicy,
+    policy: &Arc<NetworkPolicy>,
     client: &TlsClient,
     stream: tokio::net::TcpStream,
     target: &str,
@@ -416,16 +416,12 @@ async fn secure(
     let peer = stream.peer_addr().map_err(Error::Connect)?;
     let connected = tokio::time::timeout_at(
         deadline,
-        super::tls::connect(client, policy.instance_id(), stream, peer, host, port),
+        super::tls::connect(client, policy, target, stream, peer, host, port),
     )
     .await
     .map_err(|_| Error::ConnectionTimeout)??;
     match connected {
-        Connected::Stream(stream, None) => Ok(stream),
-        Connected::Stream(stream, Some(pinned)) => {
-            policy.audit_pinned(target, pinned);
-            Ok(stream)
-        }
+        Connected::Stream(stream) => Ok(stream),
         Connected::Refused(denial) => {
             policy.audit_denial("tls", target, &Denial::Tls(denial.to_string()));
             Err(Error::TlsCertificateError)

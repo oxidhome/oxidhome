@@ -77,6 +77,7 @@ fn pinned_hosts(body: &Value, field: &str) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn operators_list_and_reset_pins() {
     let state = support::tempdir("tls-pins");
     let engine = Engine::with_state_dir(state.path()).expect("engine");
@@ -146,6 +147,18 @@ async fn operators_list_and_reset_pins() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "a host needs an instance");
+
+    // A misspelled filter is refused, not widened to every pin.
+    let (status, _) = send(
+        &router,
+        "DELETE",
+        "/api/v1/network/tls-pins?instanceId=cam",
+        &owner.plaintext,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(engine.tls_pins().list(&PinFilter::default()).len(), 3);
 
     // Resetting is the owner's alone; the wildcard doesn't reach it.
     let reset_one = "/api/v1/network/tls-pins?instance_id=cam&host=Camera.LAN&port=8443";

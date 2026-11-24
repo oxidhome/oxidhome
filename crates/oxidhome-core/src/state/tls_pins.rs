@@ -149,6 +149,10 @@ impl PinFilter {
 #[must_use]
 pub fn normalize_host(host: &str) -> String {
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    // One spelling per address (`::0:1` and `::1` are one key).
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.to_string();
+    }
     host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
 
@@ -261,10 +265,12 @@ impl TlsPinStore {
         }
         let now = now_unix_ms();
         if let Some(db) = &self.db {
-            db.write(|conn| {
+            // `REPLACE`: a row `open` skipped as malformed has no pin in
+            // memory, so this key is first-used again.
+            durable_write(db, |conn| {
                 conn.execute(
-                    "INSERT INTO network_tls_pin (instance_id, host, port, sha256, pinned_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT OR REPLACE INTO network_tls_pin \
+                     (instance_id, host, port, sha256, pinned_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         key.instance_id,
                         key.host,
@@ -280,6 +286,16 @@ impl TlsPinStore {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key.clone(), (fingerprint, now));
         Ok(PinCheck::Pinned)
+    }
+
+    /// `key`'s pinned fingerprint, if any.
+    #[must_use]
+    pub fn pinned(&self, key: &PinKey) -> Option<Fingerprint> {
+        self.pins
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .map(|(fingerprint, _)| *fingerprint)
     }
 
     fn check(&self, key: &PinKey, fingerprint: Fingerprint) -> Option<PinCheck> {
@@ -349,6 +365,27 @@ impl TlsPinStore {
     }
 }
 
+/// One write at `synchronous = FULL`: a pin decides what the host
+/// trusts after the request it was made for, so it must survive power
+/// loss (like the device-category and token policy writes).
+fn durable_write<R: Send>(
+    db: &Db,
+    f: impl FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error>,
+) -> Result<R, rusqlite::Error> {
+    db.write(move |conn| -> Result<R, rusqlite::Error> {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let result = f(conn);
+        if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+            tracing::warn!(
+                target: "host.network",
+                error = %err,
+                "failed to restore synchronous = NORMAL; connection stays at FULL",
+            );
+        }
+        result
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +400,14 @@ mod tests {
 
     fn fp(b: u8) -> Fingerprint {
         Fingerprint([b; 32])
+    }
+
+    #[test]
+    fn hosts_normalize_to_one_spelling() {
+        assert_eq!(normalize_host("[::0:1]"), "::1");
+        assert_eq!(normalize_host("FE80::0001"), "fe80::1");
+        assert_eq!(normalize_host("192.168.001.2"), "192.168.001.2");
+        assert_eq!(normalize_host("Camera.LAN."), "camera.lan");
     }
 
     #[test]

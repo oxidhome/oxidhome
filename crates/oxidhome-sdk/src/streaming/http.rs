@@ -28,8 +28,10 @@
 //!   checks against the instance's network rules again. A redirect from
 //!   `https` to `http` is refused ([`Error::InsecureRedirect`]); a
 //!   redirect to another origin drops `authorization`, `cookie` and
-//!   `proxy-authorization`. `303`, and `301` / `302` after anything but
-//!   `GET` / `HEAD`, continue as a `GET` without a body.
+//!   `proxy-authorization` (other headers, such as an API key header,
+//!   are kept: set [`Request::max_redirects`] to `0` to follow redirects
+//!   yourself). `303`, and `301` / `302` after a `POST`, continue as a
+//!   `GET` without a body.
 //! - **HTTPS.** The host verifies certificates against the system's
 //!   roots. A device on the LAN (a private or link-local address) with a
 //!   self-signed certificate is trusted on first use: the host pins the
@@ -260,7 +262,7 @@ impl Request {
     /// `from` to `to`.
     fn follow(&mut self, status: u16, from: &Url, to: &Url) {
         let keeps_method = matches!(status, 307 | 308)
-            || (matches!(status, 301 | 302) && matches!(self.method, Method::Get | Method::Head));
+            || (matches!(status, 301 | 302) && self.method != Method::Post);
         if !keeps_method {
             if self.method != Method::Head {
                 self.method = Method::Get;
@@ -319,22 +321,30 @@ impl Request {
         let pending = outgoing_handler::handle(request, Some(options)).map_err(Error::Http)?;
         // Written after `handle`: the host buffers one chunk, so a body
         // written before the request starts would never drain.
-        {
+        let written = (|| -> Result<(), Error> {
             let stream = outgoing.write().map_err(|()| fail("body stream"))?;
             for chunk in self.body.chunks(WRITE_CHUNK) {
                 stream
                     .blocking_write_and_flush(chunk)
                     .map_err(|e| Error::Request(format!("writing the body: {e:?}")))?;
             }
-        }
-        OutgoingBody::finish(outgoing, None).map_err(Error::Http)?;
+            Ok(())
+        })();
+        let written =
+            written.and_then(|()| OutgoingBody::finish(outgoing, None).map_err(Error::Http));
 
         pending.subscribe().block();
         let response = pending
             .get()
             .ok_or_else(|| Error::Request("response not ready".into()))?
-            .map_err(|()| Error::Request("response already taken".into()))?
-            .map_err(Error::Http)?;
+            .map_err(|()| Error::Request("response already taken".into()))?;
+        // A refused or failed request closes the body stream: report why
+        // it failed, not the write that noticed.
+        let response = match (response, written) {
+            (Err(code), _) => return Err(Error::Http(code)),
+            (Ok(_), Err(err)) => return Err(err),
+            (Ok(response), Ok(())) => response,
+        };
         let status = response.status();
         let headers = {
             let fields = response.headers();
@@ -343,35 +353,7 @@ impl Request {
         let incoming = response
             .consume()
             .map_err(|()| Error::Request("response body already taken".into()))?;
-        let mut body = Vec::new();
-        {
-            let stream = incoming
-                .stream()
-                .map_err(|()| Error::Request("response stream already taken".into()))?;
-            loop {
-                let room = self.max_body.saturating_sub(body.len()) as u64 + 1;
-                match stream.blocking_read(room.min(READ_CHUNK)) {
-                    Ok(chunk) => {
-                        body.extend_from_slice(&chunk);
-                        if body.len() > self.max_body {
-                            return Err(Error::BodyTooLarge {
-                                limit: self.max_body,
-                            });
-                        }
-                    }
-                    Err(StreamError::Closed) => break,
-                    Err(StreamError::LastOperationFailed(e)) => {
-                        return Err(
-                            match crate::bindings::wasi::http::types::http_error_code(&e) {
-                                Some(code) => Error::Http(code),
-                                None => Error::Request(e.to_debug_string()),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        drop(IncomingBody::finish(incoming));
+        let body = read_body(incoming, self.max_body)?;
         Ok(Response {
             status,
             headers,
@@ -379,6 +361,38 @@ impl Request {
             url: url.to_string(),
         })
     }
+}
+
+/// Read a whole response body, refusing more than `max_body` bytes.
+fn read_body(incoming: IncomingBody, max_body: usize) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    {
+        let stream = incoming
+            .stream()
+            .map_err(|()| Error::Request("response stream already taken".into()))?;
+        loop {
+            let room = max_body.saturating_sub(body.len()) as u64 + 1;
+            match stream.blocking_read(room.min(READ_CHUNK)) {
+                Ok(chunk) => {
+                    body.extend_from_slice(&chunk);
+                    if body.len() > max_body {
+                        return Err(Error::BodyTooLarge { limit: max_body });
+                    }
+                }
+                Err(StreamError::Closed) => break,
+                Err(StreamError::LastOperationFailed(e)) => {
+                    return Err(
+                        match crate::bindings::wasi::http::types::http_error_code(&e) {
+                            Some(code) => Error::Http(code),
+                            None => Error::Request(e.to_debug_string()),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    drop(IncomingBody::finish(incoming));
+    Ok(body)
 }
 
 fn redirect_location(response: &Response) -> Option<String> {
@@ -513,7 +527,9 @@ impl Url {
     /// forms servers send).
     fn join(&self, location: &str) -> Result<Self, Error> {
         let location = location.trim();
-        if location.contains("://") && !location.starts_with('/') && !location.starts_with('?') {
+        // Absolute when a scheme comes before any `/`, `?` or `#`.
+        let head = location.split(['/', '?', '#']).next().unwrap_or_default();
+        if head.ends_with(':') && location[head.len()..].starts_with("//") {
             return Self::parse(location);
         }
         let scheme = if self.https { "https" } else { "http" };
@@ -642,6 +658,10 @@ mod tests {
             ("?y=2", "https://cam.lan/api/v1/status?y=2"),
             ("/a/./b/../c#f", "https://cam.lan/a/c"),
             ("http://cam.lan/plain", "http://cam.lan/plain"),
+            (
+                "next?return=https://cam.lan/s",
+                "https://cam.lan/api/v1/next?return=https://cam.lan/s",
+            ),
         ] {
             assert_eq!(base.join(location).expect(location).to_string(), expected);
         }
@@ -683,6 +703,16 @@ mod tests {
         let mut r = Request::new(Method::Head, "https://a.example/x");
         r.follow(302, &from, &same);
         assert_eq!(r.method, Method::Head);
+
+        // Only a POST becomes a GET on 301 / 302; other writes keep
+        // their method and body.
+        let mut r = post();
+        r.follow(301, &from, &same);
+        assert_eq!(r.method, Method::Get);
+        let mut r = Request::put("https://a.example/x").body("on");
+        r.follow(302, &from, &same);
+        assert_eq!(r.method, Method::Put);
+        assert_eq!(r.body, b"on");
     }
 
     #[test]
